@@ -267,6 +267,55 @@ class BatchedEngine(BaseEngine):
                 model, processor = custom_loaded
                 return model, getattr(processor, "tokenizer", processor)
 
+            # --- JANG model support (text-only batched engine) ---
+            # Detect jang_config.json, route kimi_k25/deepseek-derived models
+            # (flat JANGTQ weights the stock mlx_lm sanitize can't handle) to
+            # load_jangtq_model for flat->nested key bridging, and all other
+            # JANG models to the v1/v2 text loader, bypassing jang_tools VLM
+            # detection (needs torchvision; routes through mlx_vlm, which is
+            # incompatible with the batched cache).
+            from pathlib import Path
+            import json
+            import logging
+            _jang_logger = logging.getLogger("omlx.engine.batched")
+            _jang_path = Path(self._model_name)
+            _jang_cfg_path = _jang_path / "jang_config.json"
+            if _jang_cfg_path.exists():
+                try:
+                    from jang_tools.loader import _load_jang_v2, _is_v2_model
+                except ImportError:
+                    raise ImportError(
+                        "JANG model detected but jang-tools not installed. "
+                        "Install with: pip install 'jang[mlx]'"
+                    )
+                with open(_jang_cfg_path) as _f:
+                    _jang_cfg = json.load(_f)
+                _jang_logger.info(f"Loading JANG model (text): {self._model_name}")
+                _cfg = json.loads((_jang_path / "config.json").read_text())
+                _mtype = _cfg.get("model_type", "")
+                _ttype = (_cfg.get("text_config") or {}).get("model_type", "")
+                if _mtype in ("kimi_k25", "deepseek_v3", "deepseek_v4") or \
+                   _ttype in ("kimi_k25", "deepseek_v3", "deepseek_v4"):
+                    # Stock mlx_lm sanitize hard-indexes weights["language_model"]
+                    # but JANGTQ shards are flat -> KeyError. load_jangtq_model
+                    # does the flat->nested key bridging (proven ~19 tok/s).
+                    # Neutralize the ~70%-RAM wired_limit auto-cap (sysctl
+                    # iogpu.wired_limit_mb is already provisioned high).
+                    import jang_tools.load_jangtq as _LJ
+                    _LJ._apply_wired_limit_safe_default = lambda *a, **k: None
+                    from jang_tools.load_jangtq import load_jangtq_model
+                    _jang_logger.info(
+                        f"Routing {_mtype or _ttype} to load_jangtq_model "
+                        f"(language_model key-bridging; wired-cap neutralized)"
+                    )
+                    return load_jangtq_model(str(_jang_path))
+                if _is_v2_model(_jang_path):
+                    return _load_jang_v2(_jang_path, _jang_cfg)
+                else:
+                    from jang_tools.loader import _load_jang_v1
+                    return _load_jang_v1(_jang_path, _jang_cfg, _jang_path / "config.json")
+            # --- end JANG support ---
+
             return lm_load_compat(
                 self._model_name,
                 tokenizer_config=tokenizer_config,
