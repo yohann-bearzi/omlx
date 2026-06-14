@@ -1878,6 +1878,25 @@ class EnginePool:
                         f"Successfully loaded {model_id} as LLM " f"(fallback from VLM)"
                     )
                 else:
+                    # No fallback applies (e.g. a plain LLM/BatchedEngine whose
+                    # start() failed). Release the orphaned weight allocation
+                    # before re-raising; otherwise the ~hundreds-of-GB stay
+                    # resident with entry.engine=None, and the pre-load
+                    # admission check counts them as used but cannot evict an
+                    # unregistered engine -> permanent load wedge. Mirror the
+                    # cleanup the fallback branches and the abort path perform.
+                    try:
+                        await engine.stop()
+                    except Exception:
+                        pass
+                    engine = None
+                    entry.engine = None
+                    gc.collect()
+                    _loop = asyncio.get_running_loop()
+                    await _loop.run_in_executor(
+                        get_mlx_executor(),
+                        lambda: (mx.synchronize(), mx.clear_cache()),
+                    )
                     raise
 
             # Check if memory enforcer requested abort during loading
