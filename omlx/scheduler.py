@@ -1989,6 +1989,26 @@ class Scheduler:
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
     @staticmethod
+    def _bound_in_memory_snapshots(self, request_id: str, max_in_memory: int = 4) -> None:
+        """claude: cap RAM-resident boundary snapshots per request.
+
+        SSD save() has been observed to fail silently (empty _boundary_snapshots
+        dir), making every snapshot fall back to memory; each fallback also
+        forces a mid-generation eval, and all of them are re-eval'd at
+        completion -> unbounded scheduler stalls (#810/#2121 symptom class).
+        Keep only the newest ``max_in_memory`` in-memory snapshots (None
+        markers = SSD-backed, never touched). Dropped intermediates only
+        coarsen mid-sequence prefix granularity; the final-boundary store is
+        unaffected."""
+        snaps = self._boundary_cache_snapshots.get(request_id)
+        if not snaps:
+            return
+        in_mem = [tc for tc, v in snaps.items() if v is not None]
+        if len(in_mem) <= max_in_memory:
+            return
+        for tc in sorted(in_mem)[:-max_in_memory]:
+            del snaps[tc]
+
     def _collect_arrays_from_extracted_cache(
         extracted_cache: list[Any],
     ) -> list[Any]:
@@ -5022,9 +5042,11 @@ class Scheduler:
                 # worker only ever slices already-evaluated buffers.
                 self._eval_snapshot_cache(snapshot_cache)
                 self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+                self._bound_in_memory_snapshots(request_id)
         else:
             self._eval_snapshot_cache(snapshot_cache)
             self._boundary_cache_snapshots[request_id][token_count] = snapshot_cache
+            self._bound_in_memory_snapshots(request_id)
 
         self._boundary_snapshot_required = True
         logger.debug(

@@ -212,7 +212,7 @@ class BoundarySnapshotSSDStore:
             return True
 
         except Exception as e:
-            logger.debug("Failed to save boundary snapshot: %s", e)
+            logger.warning("Failed to save boundary snapshot (falling back to in-memory): %s", e)
             return False
 
     def load(
