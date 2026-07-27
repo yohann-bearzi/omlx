@@ -1,3 +1,10 @@
+> **This branch adds GLM-5.2 JANGTQ support and a steel-tiled TurboQuant MoE
+> kernel to oMLX.** See [GLM52_JANGTQ.md](GLM52_JANGTQ.md) for what it does, how
+> to build it, and measured numbers. Weights:
+> [bearzi/GLM-5.2-JANGTQ_K-mxfp4attn](https://huggingface.co/bearzi/GLM-5.2-JANGTQ_K-mxfp4attn)
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/icon-rounded-dark.svg" width="140">
