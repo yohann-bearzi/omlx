@@ -1340,7 +1340,11 @@ class SchedulerConfig:
     completion_batch_size: int = 32
     # Per-forward embedding input chunk size
     embedding_batch_size: int = 32
-    prefill_step_size: int = 2048
+    prefill_step_size: int = field(
+        default_factory=lambda: int(
+            __import__("os").environ.get("OMLX_PREFILL_STEP_SIZE", "2048")
+        )
+    )
     # When True, long prefills are processed one chunk per step() call,
     # interleaved with decode steps for already-running requests. This
     # reduces TTFT for concurrent requests but adds per-step overhead.
@@ -1988,7 +1992,6 @@ class Scheduler:
             return False
         return mx.get_cache_memory() > self._periodic_clear_threshold_bytes()
 
-    @staticmethod
     def _bound_in_memory_snapshots(self, request_id: str, max_in_memory: int = 4) -> None:
         """claude: cap RAM-resident boundary snapshots per request.
 
@@ -2009,6 +2012,7 @@ class Scheduler:
         for tc in sorted(in_mem)[:-max_in_memory]:
             del snaps[tc]
 
+    @staticmethod
     def _collect_arrays_from_extracted_cache(
         extracted_cache: list[Any],
     ) -> list[Any]:
