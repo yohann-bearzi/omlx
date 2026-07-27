@@ -36,7 +36,8 @@ target_sources(
   ${CMAKE_CURRENT_LIST_DIR}/deepseek_v4_sparse_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.cpp
   ${CMAKE_CURRENT_LIST_DIR}/fused_moe.cpp
-  ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp)
+  ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/turboquant_moe.cpp)
 target_include_directories(
   omlx_glm_kernel_ops
   PUBLIC ${CMAKE_CURRENT_LIST_DIR} ${OMLX_CUSTOM_KERNEL_COMMON_DIR})
@@ -53,7 +54,8 @@ if(MLX_BUILD_METAL)
       ${CMAKE_CURRENT_LIST_DIR}/dsa_indexer.metal
       ${CMAKE_CURRENT_LIST_DIR}/exact_block_attention.metal
       ${CMAKE_CURRENT_LIST_DIR}/fused_moe.metal
-      ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal)
+      ${CMAKE_CURRENT_LIST_DIR}/sparse_mla.metal
+      ${CMAKE_CURRENT_LIST_DIR}/turboquant_moe.metal)
   file(GLOB_RECURSE OMLX_GLM_METAL_HEADERS CONFIGURE_DEPENDS
        ${CMAKE_CURRENT_LIST_DIR}/*.h
        ${OMLX_CUSTOM_KERNEL_COMMON_DIR}/kernels/*.h

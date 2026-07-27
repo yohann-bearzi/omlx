@@ -8,6 +8,7 @@
 #include "exact_block_attention.h"
 #include "fused_moe.h"
 #include "sparse_mla.h"
+#include "turboquant_moe.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -26,6 +27,19 @@ NB_MODULE(_ext, m) {
         return static_cast<int64_t>(a.size());
       },
       "a"_a);
+
+  m.def(
+      "turboquant_gather_blocks",
+      &omlx::glm_kernels::turboquant_gather_blocks,
+      "x"_a,
+      "weight"_a,
+      "norms"_a,
+      "codebook"_a,
+      "block_meta"_a,
+      "block_count"_a,
+      "variant"_a = 2,
+      "bits"_a = 2,
+      "stream"_a = nb::none());
 
   m.def(
       "dsa_indexer_scores",
