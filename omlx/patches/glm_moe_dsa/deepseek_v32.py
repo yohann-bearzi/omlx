@@ -53,13 +53,20 @@ def _dequant_mla_proj_mode(args) -> str:
     return "0"
 
 
+# Loaders for checkpoints whose per-expert weights are stored unfused
+# (JANGTQ ships separate gate_proj/up_proj) set this to False before
+# building the model; fusing would leave their hydrator with no target
+# module. None means "decide from model_type" as usual.
+FUSED_GATE_UP_OVERRIDE: bool | None = None
+
+
 def _use_glm_moe_fused_gate_up(args) -> bool:
-    # JANGTQ bundles ship separate gate_proj/up_proj per expert; fusing them
-    # into gate_up_proj leaves the TQ hydrator with no target module. Allow
-    # the split layout via OMLX_GLM_FUSED_GATE_UP=0.
     import os as _os
-    if _os.environ.get("OMLX_GLM_FUSED_GATE_UP", "1") == "0":
-        return False
+    _env = _os.environ.get("OMLX_GLM_FUSED_GATE_UP")
+    if _env is not None:
+        return _env != "0"
+    if FUSED_GATE_UP_OVERRIDE is not None:
+        return FUSED_GATE_UP_OVERRIDE
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
 
