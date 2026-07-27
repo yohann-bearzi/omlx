@@ -54,6 +54,12 @@ def _dequant_mla_proj_mode(args) -> str:
 
 
 def _use_glm_moe_fused_gate_up(args) -> bool:
+    # JANGTQ bundles ship separate gate_proj/up_proj per expert; fusing them
+    # into gate_up_proj leaves the TQ hydrator with no target module. Allow
+    # the split layout via OMLX_GLM_FUSED_GATE_UP=0.
+    import os as _os
+    if _os.environ.get("OMLX_GLM_FUSED_GATE_UP", "1") == "0":
+        return False
     return getattr(args, "model_type", None) == "glm_moe_dsa"
 
 
