@@ -294,8 +294,8 @@ class BatchedEngine(BaseEngine):
                 _cfg = json.loads((_jang_path / "config.json").read_text())
                 _mtype = _cfg.get("model_type", "")
                 _ttype = (_cfg.get("text_config") or {}).get("model_type", "")
-                if _mtype in ("kimi_k25", "deepseek_v3", "deepseek_v4") or \
-                   _ttype in ("kimi_k25", "deepseek_v3", "deepseek_v4"):
+                if _mtype in ("kimi_k25", "deepseek_v3", "deepseek_v4", "glm_moe_dsa") or \
+                   _ttype in ("kimi_k25", "deepseek_v3", "deepseek_v4", "glm_moe_dsa"):
                     # Stock mlx_lm sanitize hard-indexes weights["language_model"]
                     # but JANGTQ shards are flat -> KeyError. load_jangtq_model
                     # does the flat->nested key bridging (proven ~19 tok/s).
