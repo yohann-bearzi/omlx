@@ -192,7 +192,7 @@ class SpecRunner:
     """Lossless c=1 speculative decoding for DeepSeek-V4-Flash-0731's DSpark module.
     greedy: exact-match verify (bitwise up to near-tie chunk numerics).
     sampled: temp-1.0 rejection sampling (distributionally lossless, Eq.8-audited)."""
-    def __init__(self, model_dir, model, tok, dsv4, hcm, thr=0.6):
+    def __init__(self, model_dir, model, tok, dsv4, hcm, thr=0.6, policy=None):
         self.model, self.tok, self.thr = model, tok, thr
         self.D = DSpark(model_dir, model, dsv4, hcm)
         wmap = json.load(open(f"{model_dir}/model.safetensors.index.json"))["weight_map"]
@@ -202,6 +202,7 @@ class SpecRunner:
         from omlx.patches.mlx_lm_mtp import cache_rollback as _cr
         _cr.apply(); self.cr = _cr
         self.eos = tok.eos_token_id
+        self.policy = policy if policy is not None else make_static_policy(thr)
     def _draft(self, anchor_id, a, sample):
         D = self.D; S2 = D.stages[2]
         x = D.inner.embed_tokens(mx.array([[anchor_id, NOISE, NOISE, NOISE, NOISE]]))
@@ -247,7 +248,7 @@ class SpecRunner:
         while len(out) < n and out[-1] != EOS_:
             tc0 = time.perf_counter()
             d, cf, PD = self._draft(anchor, C, sample)
-            ell = next((i for i, cv in enumerate(cf) if cv < thr), BLK)
+            ell = self.policy(cf)
             s["prop"] += ell
             snaps = _snapshot(cache) if ell > 0 else None
             D.REC[0] = True; cr.set_undo_armed(ell > 0)
@@ -312,3 +313,23 @@ class SpecRunner:
         s["tau"] = s["acc"] / s["cyc"] if s["cyc"] else 0.0
         s["eq8"] = (s["real"] / s["tstd"], s["exp"] / s["tstd"]) if s["tstd"] else (0.0, 0.0)
         return out, tps, s
+
+
+# ---- gating policies (S28: calibration ~wash; joint product self-adapts with depth) ----
+DEFAULT_STS = [1.5, 1.75, 1.15, 0.6, 1.0]
+def _cal(c, t):
+    import math
+    c = min(max(c, 1e-4), 1 - 1e-4)
+    return 1.0 / (1.0 + math.exp(-math.log(c / (1 - c)) / t))
+def make_static_policy(thr):
+    return lambda cf: next((i for i, c in enumerate(cf) if c < thr), BLK)
+def make_joint_policy(p=0.35, temps=None):
+    T = temps or DEFAULT_STS
+    def pol(cf):
+        a, ell = 1.0, 0
+        for i in range(BLK):
+            a *= _cal(cf[i], T[i])
+            if a < p: break
+            ell = i + 1
+        return ell
+    return pol
