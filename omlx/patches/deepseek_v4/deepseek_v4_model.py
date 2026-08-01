@@ -381,7 +381,7 @@ def _sparse_pooled_attention(
         and topk.dtype == mx.uint32
         and B >= 1
         and H == 64
-        and L > 1
+        and L >= 64
         and D == 512
         and local_kv.ndim == 4
         and local_kv.shape[1] == 1
