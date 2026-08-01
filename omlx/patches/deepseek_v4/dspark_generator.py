@@ -26,7 +26,9 @@ def _dd():
         import importlib.util
         p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dspark_draft.py")
         sp = importlib.util.spec_from_file_location("omlx_dspark_draft_rt", p)
-        m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+        m = importlib.util.module_from_spec(sp)
+        sys.modules["omlx_dspark_draft_rt"] = m
+        sp.loader.exec_module(m)
         _DD = m
     return _DD
 
@@ -301,11 +303,15 @@ def _reconcile(gb, st) -> bool:
     name, _ = _cache_of(gb)
     setattr(gb, name, new_cache)
     nt = st.queue[0][0] if st.queue else int(mx.argmax(lg[0, -1]).item())
+    row = lg[0, -1].astype(mx.float32)
+    lp = row - mx.logsumexp(row)   # correct dist for queue[0]'s position in both branches
+    mx.eval(lp)
     v = getattr(gb, "_next_tokens", None)
     try:
         gb._next_tokens = mx.array([nt], dtype=v.dtype) if (v is not None and hasattr(v, "dtype")) else mx.array([nt])
+        gb._next_logprobs = [lp]
     except Exception as e:
-        logger.warning("dspark reconcile: _next_tokens set failed: %r", e); return False
+        logger.warning("dspark reconcile: state set failed: %r", e); return False
     return True
 
 def _reconcile_and_drop(gb, why):

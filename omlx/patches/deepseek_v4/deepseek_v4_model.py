@@ -1363,6 +1363,8 @@ if __import__("os").environ.get("OMLX_DSPARK_SPEC"):
         import importlib.util as _dsu, os as _dso
         _dsp = _dso.path.join(_dso.path.dirname(_dso.path.abspath(__file__)), "dspark_generator.py")
         _dss = _dsu.spec_from_file_location("omlx_dspark_generator", _dsp)
-        _dsm = _dsu.module_from_spec(_dss); _dss.loader.exec_module(_dsm); _dsm.enable()
+        _dsm = _dsu.module_from_spec(_dss)
+        __import__("sys").modules["omlx_dspark_generator"] = _dsm
+        _dss.loader.exec_module(_dsm); _dsm.enable()
     except Exception as _dse:
-        __import__("logging").getLogger(__name__).warning("dspark hook failed: %r", _dse)
+        __import__("logging").getLogger(__name__).warning("dspark hook failed: %r", _dse, exc_info=True)
