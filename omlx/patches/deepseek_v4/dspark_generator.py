@@ -47,9 +47,9 @@ class _State:
 def _log_stats(st, finish):
     tot = sum(st.emits.values()); dt = time.perf_counter() - st.t0
     logger.info("DSPARK[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d "
-                "emits=%s resto=%d wall=%.2fs (%.2f tok/s)",
+                "emits=%s skips=%d resto=%d wall=%.2fs (%.2f tok/s)",
                 st.uid, finish, tot, st.cyc, tot / st.cyc if st.cyc else 0.0,
-                st.acc, st.drafted, st.emits, st.resto, dt, tot / dt if dt > 0 else 0.0)
+                st.acc, st.drafted, st.emits, getattr(st, "skips", 0), st.resto, dt, tot / dt if dt > 0 else 0.0)
 
 def _drop(gb, why):
     if getattr(gb, "_omlx_dspark_state", None) is not None:
@@ -183,8 +183,25 @@ def _run_cycle(gb, st):
     BLK = dd.BLK; EOS = R.eos
     _, cache = _cache_of(gb)
     D = R.D; cr = R.cr
+    if getattr(st, "cool", 0) > 0:
+        st.cool -= 1
+        st.skips = getattr(st, "skips", 0) + 1
+        D.REC[0] = True
+        vlog = gb.model(mx.array([[st.anchor]]), cache=cache)
+        D.REC[0] = False
+        if st.sample:
+            PT = mx.softmax(vlog[0, -1].astype(mx.float32), axis=-1)
+            nxt = int(mx.random.categorical(mx.log(PT + 1e-30)[None])[0].item())
+        else:
+            t_ = mx.argmax(vlog[0, -1]); mx.eval(t_); nxt = int(t_.item())
+        D.extend_rings(D.take_taps(), st.C)
+        st.queue.append((nxt, None, "step"))
+        st.cyc += 1; st.C += 1; st.anchor = nxt
+        return
     d, cf, PD = _draft_ramp(R, dd, st.anchor, st.C, st.base, st.sample)
     ell = R.policy(cf)
+    if ell == 0 and os.environ.get("OMLX_DSPARK_COOLDOWN"):
+        st.cool = getattr(st, "cool", 0) + 1
     st.drafted += ell
     snaps = dd._snapshot(cache) if ell > 0 else None
     D.REC[0] = True; cr.set_undo_armed(ell > 0)
