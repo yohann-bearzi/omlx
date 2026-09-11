@@ -275,6 +275,17 @@ class _TinyRowLRU:
 # short-lived executor so nested weight/scale/chunk work cannot deadlock.
 _PREFETCH_POOL: Optional[ThreadPoolExecutor] = None
 
+
+def _prefetch_pool() -> ThreadPoolExecutor:
+    """Lazy singleton for whole-layer Engram prefetch jobs."""
+    global _PREFETCH_POOL
+    if _PREFETCH_POOL is None:
+        _PREFETCH_POOL = ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="engram-prefetch"
+        )
+    return _PREFETCH_POOL
+
+
 # Module-level E4M3 LUT (built once).
 def _threaded_memmap_gather(mm: np.memmap, idxs: np.ndarray, n_workers: int) -> np.ndarray:
     """Gather rows from memmap; use threads when idxs is large (SSD random I/O)."""
@@ -423,7 +434,7 @@ class MmapEngramTable:
         When a quantized hot-cache is bound, the job also returns the FP8+scale
         rows so ``gather`` can insert them without a second SSD round-trip.
         """
-        if uniq.size == 0:
+        if not self._do_prefetch or uniq.size == 0:
             return
         self._prefetch_uniq = np.asarray(uniq, dtype=np.int64)
         ids = self._prefetch_uniq

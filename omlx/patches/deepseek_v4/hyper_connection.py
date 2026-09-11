@@ -162,6 +162,142 @@ def _make_hc_sinkhorn_collapse_kernel():
 _hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()
 
 
+def _make_hc_sinkhorn_only_kernel():
+    """Sinkhorn-only Metal kernel for deferred HC (V4.1).
+
+    V4.1 collapses with a *different* pre_mix than the one produced by the
+    current mixes() call, so the fused sinkhorn+collapse kernel cannot be
+    used. This keeps the branchless sinkhorn from that kernel and emits
+    (pre, post, comb) only.
+    """
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+
+    source = """
+        uint tid  = thread_position_in_threadgroup.x;
+        uint row  = threadgroup_position_in_grid.x;
+        uint lane = tid % 32;
+        uint sg   = tid / 32;
+
+        constexpr int MIX      = (2 + HC) * HC;
+        constexpr int BASE_OFF = 2 * HC;
+        constexpr float EPS = EPS_INT * 1e-9;
+
+        const device float* mix      = (const device float*)mixes + row * MIX;
+        device float*       pre_out  = (device float*)pre + row * HC;
+        device float*       post_out = (device float*)post + row * HC;
+        device float*       comb_out = (device float*)comb + row * HC * HC;
+
+        if (sg == 0) {
+            const float pre_scale  = scale[0];
+            const float post_scale = scale[1];
+            const float comb_scale = scale[2];
+
+            const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
+            const uint  llane  = metal::min(lane, (uint)(HC - 1));
+
+            float pre_z  = mix[llane]      * pre_scale  + base[llane];
+            float post_z = mix[HC + llane] * post_scale + base[HC + llane];
+            float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
+            float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
+
+            if (lane < (uint)HC) {
+                pre_out[lane]  = pre_v;
+                post_out[lane] = post_v;
+            }
+
+            float4 v = (*(const device float4*)(mix  + BASE_OFF + llane * HC)
+                            * comb_scale
+                      + *(const device float4*)(base + BASE_OFF + llane * HC))
+                     * active;
+
+            float row_max = metal::max(metal::max(v.x, v.y),
+                                       metal::max(v.z, v.w));
+            float4 e = metal::fast::exp(v - row_max) * active;
+            float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS))
+                     + EPS * active;
+
+            float4 col_inv = 1.0f / (float4(
+                simd_sum(r.x), simd_sum(r.y),
+                simd_sum(r.z), simd_sum(r.w)
+            ) + EPS);
+            r *= col_inv;
+
+            for (int iter = 1; iter < ITERS; ++iter) {
+                r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
+                col_inv = 1.0f / (float4(
+                    simd_sum(r.x), simd_sum(r.y),
+                    simd_sum(r.z), simd_sum(r.w)
+                ) + EPS);
+                r *= col_inv;
+            }
+
+            if (lane < (uint)HC) {
+                *(device float4*)(comb_out + lane * HC) = r;
+            }
+        }
+    """
+
+    return mx.fast.metal_kernel(
+        name="hc_sinkhorn_only",
+        input_names=["mixes", "scale", "base"],
+        output_names=["pre", "post", "comb"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_sinkhorn_only_kernel = _make_hc_sinkhorn_only_kernel()
+
+
+def _hc_sinkhorn_only(
+    mixes: mx.array,
+    scale: mx.array,
+    base: mx.array,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    eps: float,
+    batch_shape: tuple[int, ...],
+) -> Tuple[mx.array, mx.array, mx.array]:
+    """Metal sinkhorn matching ``_hc_split_sinkhorn_ops`` for deferred HC."""
+    if (
+        _hc_sinkhorn_only_kernel is None
+        or mx.default_device() != mx.gpu
+        or not mx.metal.is_available()
+        or hc_mult != 4
+    ):
+        return _hc_split_sinkhorn_ops(
+            mixes, scale, base, hc_mult, sinkhorn_iters, eps
+        )
+
+    mixes_f = mixes.astype(mx.float32)
+    # Flatten token rows: [B, L, MIX] -> [B*L, MIX]
+    mix_flat = mixes_f.reshape(-1, mixes_f.shape[-1])
+    rows = mix_flat.shape[0]
+    pre, post, comb = _hc_sinkhorn_only_kernel(
+        inputs=[mix_flat, scale.astype(mx.float32), base.astype(mx.float32)],
+        template=[
+            ("HC", hc_mult),
+            ("ITERS", sinkhorn_iters),
+            ("EPS_INT", round(eps / 1e-9)),
+        ],
+        # 32 lanes suffice; use 32 threads (one simdgroup) per row.
+        grid=(rows * 32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[
+            (rows, hc_mult),
+            (rows, hc_mult),
+            (rows, hc_mult, hc_mult),
+        ],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    pre = pre.reshape(*batch_shape, hc_mult)
+    post = post.reshape(*batch_shape, hc_mult)
+    comb = comb.reshape(*batch_shape, hc_mult, hc_mult)
+    return pre, post, comb
+
+
+
 def _hc_kernel(x, y, mixes, scale, base, hc_mult, sinkhorn_iters, eps):
     B, L, H, D = x.shape
 
@@ -263,7 +399,112 @@ def _hc_expand_op(x, residual, post, comb):
     return y.astype(x.dtype)
 
 
+def _make_hc_expand_kernel():
+    """Fused HC expand for HC=4: out[h] = post[h]*x + sum_k comb[k,h]*residual[k]."""
+    if mx.default_device() != mx.gpu or not mx.metal.is_available():
+        return None
+    # comb is stored [B,L,HC,HC] with last dim = columns used as comb[k,h]
+    # Python: matmul(comb.swapaxes(-1,-2), residual) => (comb^T @ residual)
+    # out[h,d] = sum_k comb[k,h] * residual[k,d] + post[h]*x[d]
+    source = """
+        uint tid = thread_position_in_threadgroup.x;
+        uint row = threadgroup_position_in_grid.x;
+        const float p0 = post[row * HC + 0];
+        const float p1 = post[row * HC + 1];
+        const float p2 = post[row * HC + 2];
+        const float p3 = post[row * HC + 3];
+        // comb row-major [HC, HC]: comb[k, h] at k*HC + h
+        uint cbase = row * HC * HC;
+        float c00 = comb[cbase + 0*HC + 0]; float c10 = comb[cbase + 1*HC + 0];
+        float c20 = comb[cbase + 2*HC + 0]; float c30 = comb[cbase + 3*HC + 0];
+        float c01 = comb[cbase + 0*HC + 1]; float c11 = comb[cbase + 1*HC + 1];
+        float c21 = comb[cbase + 2*HC + 1]; float c31 = comb[cbase + 3*HC + 1];
+        float c02 = comb[cbase + 0*HC + 2]; float c12 = comb[cbase + 1*HC + 2];
+        float c22 = comb[cbase + 2*HC + 2]; float c32 = comb[cbase + 3*HC + 2];
+        float c03 = comb[cbase + 0*HC + 3]; float c13 = comb[cbase + 1*HC + 3];
+        float c23 = comb[cbase + 2*HC + 3]; float c33 = comb[cbase + 3*HC + 3];
+        uint x_base = row * D;
+        uint r_base = row * HC * D;
+        uint o_base = row * HC * D;
+        constexpr uint D4 = (uint)D / 4;
+        for (uint d4 = tid; d4 < D4; d4 += 256) {
+            uint d = d4 * 4;
+            float4 xv = float4(
+                float(x_in[x_base + d + 0]), float(x_in[x_base + d + 1]),
+                float(x_in[x_base + d + 2]), float(x_in[x_base + d + 3]));
+            float4 r0 = float4(
+                float(residual[r_base + 0*D + d + 0]), float(residual[r_base + 0*D + d + 1]),
+                float(residual[r_base + 0*D + d + 2]), float(residual[r_base + 0*D + d + 3]));
+            float4 r1 = float4(
+                float(residual[r_base + 1*D + d + 0]), float(residual[r_base + 1*D + d + 1]),
+                float(residual[r_base + 1*D + d + 2]), float(residual[r_base + 1*D + d + 3]));
+            float4 r2 = float4(
+                float(residual[r_base + 2*D + d + 0]), float(residual[r_base + 2*D + d + 1]),
+                float(residual[r_base + 2*D + d + 2]), float(residual[r_base + 2*D + d + 3]));
+            float4 r3 = float4(
+                float(residual[r_base + 3*D + d + 0]), float(residual[r_base + 3*D + d + 1]),
+                float(residual[r_base + 3*D + d + 2]), float(residual[r_base + 3*D + d + 3]));
+            // out[h] = post[h]*x + sum_k comb[k,h]*residual[k]
+            float4 o0 = fma(float4(p0), xv,
+                        fma(float4(c00), r0, fma(float4(c10), r1, fma(float4(c20), r2, float4(c30)*r3))));
+            float4 o1 = fma(float4(p1), xv,
+                        fma(float4(c01), r0, fma(float4(c11), r1, fma(float4(c21), r2, float4(c31)*r3))));
+            float4 o2 = fma(float4(p2), xv,
+                        fma(float4(c02), r0, fma(float4(c12), r1, fma(float4(c22), r2, float4(c32)*r3))));
+            float4 o3 = fma(float4(p3), xv,
+                        fma(float4(c03), r0, fma(float4(c13), r1, fma(float4(c23), r2, float4(c33)*r3))));
+            out[o_base + 0*D + d + 0] = T(o0.x); out[o_base + 0*D + d + 1] = T(o0.y);
+            out[o_base + 0*D + d + 2] = T(o0.z); out[o_base + 0*D + d + 3] = T(o0.w);
+            out[o_base + 1*D + d + 0] = T(o1.x); out[o_base + 1*D + d + 1] = T(o1.y);
+            out[o_base + 1*D + d + 2] = T(o1.z); out[o_base + 1*D + d + 3] = T(o1.w);
+            out[o_base + 2*D + d + 0] = T(o2.x); out[o_base + 2*D + d + 1] = T(o2.y);
+            out[o_base + 2*D + d + 2] = T(o2.z); out[o_base + 2*D + d + 3] = T(o2.w);
+            out[o_base + 3*D + d + 0] = T(o3.x); out[o_base + 3*D + d + 1] = T(o3.y);
+            out[o_base + 3*D + d + 2] = T(o3.z); out[o_base + 3*D + d + 3] = T(o3.w);
+        }
+    """
+    return mx.fast.metal_kernel(
+        name="hc_expand_only",
+        input_names=["x_in", "residual", "post", "comb"],
+        output_names=["out"],
+        source=source,
+        ensure_row_contiguous=True,
+    )
+
+
+_hc_expand_kernel = _make_hc_expand_kernel()
+
+
 def hc_expand(x, residual, post, comb):
+    # Metal expand wins on prefill-sized token counts; decode L=1 stays on
+    # the compiled MLX path (similar speed, slightly tighter numerics).
+    if (
+        _hc_expand_kernel is not None
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+        and residual.ndim == 4
+        and residual.shape[2] == 4
+        and residual.shape[3] % 4 == 0
+        and x.shape[-1] == residual.shape[3]
+        and post.shape[-1] == 4
+        and comb.shape[-2:] == (4, 4)
+        and residual.shape[0] * residual.shape[1] >= 64
+    ):
+        B, L, HC, D = residual.shape
+        # x is [B,L,D]
+        flat_x = x.reshape(B * L, D)
+        flat_r = residual.reshape(B * L, HC, D)
+        flat_post = post.astype(mx.float32).reshape(B * L, HC)
+        flat_comb = comb.astype(mx.float32).reshape(B * L, HC, HC)
+        (out,) = _hc_expand_kernel(
+            inputs=[flat_x, flat_r, flat_post, flat_comb],
+            template=[("T", x.dtype), ("HC", HC), ("D", D)],
+            grid=(B * L * 256, 1, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(B * L, HC, D)],
+            output_dtypes=[x.dtype],
+        )
+        return out.reshape(B, L, HC, D)
     return _hc_expand_op(x, residual, post, comb)
 
 
