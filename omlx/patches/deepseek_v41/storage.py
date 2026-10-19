@@ -38,6 +38,9 @@ SAFETENSORS_NUMPY_DTYPES = {
 }
 PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
 PAGE_IO_WORKERS = 48
+# Bulk row-cache misses: random small reads top out near 200k/s system-wide; past ~16
+# threads more only add contention.
+FETCH_WORKERS = 16
 _PAGE_IO_POOL = ThreadPoolExecutor(
     max_workers=PAGE_IO_WORKERS, thread_name_prefix="v41-page-io"
 )
@@ -123,6 +126,158 @@ def _resident_buffer(shape, dtype):
     mx.eval(mx.sum(value[corner].astype(mx.float32)))
     mx.synchronize()
     return np.asarray(value)
+
+
+class EngramRowCache:
+    """A fixed-size host cache of Engram table rows, filled with uncached disk reads.
+
+    The mapped-file path leaves residency to the unified buffer cache, which keeps every
+    16 KiB page it ever touched; resident mode pins the whole table. This cache bounds the
+    Engram footprint to `budget_bytes`: rows live in a 4-way set-associative table (LRU per
+    set) and misses are read with positioned reads on a descriptor opened with F_NOCACHE,
+    so no file pages linger outside the budget. Like the resident tables, the cache lives in
+    Metal-backed buffers (counted in MLX's active memory, kept resident under its wired
+    limit), so the OS does not swap it out from under a hit. Small row tensors (affine
+    scales / biases, FP8 block scales) are held whole when they fit in half the budget:
+    random small reads are capped by the I/O stack (about 200k/s on an M3 Ultra, whatever
+    the thread count), so one read per miss instead of three triples the miss rate the
+    cache can serve. Lookups copy rows out under the caller's lock, so eviction never races
+    a consumer. Cached bytes are the file's bytes and are decoded by the same code as the
+    mapped path: results are bit-identical.
+    """
+
+    WAYS = 4
+
+    def __init__(self, parts, budget_bytes):
+        # parts: [(TensorFile, key)] for weight [, scales, biases]
+        self._parts, self._fds = [], {}
+        rows = None
+        for reader, key in parts:
+            entry = reader.header[key]
+            dt = np.dtype(SAFETENSORS_NUMPY_DTYPES[entry["dtype"]])
+            rows = entry["shape"][0] if rows is None else rows
+            if entry["shape"][0] != rows:
+                raise ValueError("Engram tensors disagree on the row count")
+            width = math.prod(entry["shape"][1:])
+            self._parts.append({
+                "reader": reader, "key": key, "path": reader._file.name, "dtype": entry["dtype"],
+                "np": dt, "width": width, "base": reader._start + entry["data_offsets"][0],
+                "row_bytes": width * dt.itemsize,
+            })
+        budget = int(budget_bytes)
+        small = sum(p["row_bytes"] for p in self._parts[1:]) * rows
+        try:
+            if small and small <= budget // 2:
+                for part in self._parts[1:]:
+                    part["resident"] = part["reader"].read(part["key"], metal_backed=True)[0]
+                budget -= small
+            self._cached = [p for p in self._parts if "resident" not in p]
+            row_bytes = sum(p["row_bytes"] for p in self._cached)
+            # 8 bytes of index (int32 tag, uint32 stamp) per slot count against the budget.
+            sets = max(1, budget // ((row_bytes + 8) * self.WAYS))
+            sets = min(sets, -(-rows // self.WAYS))   # rows map to sets by id: no more is useful
+            self.rows, self.row_bytes, self.sets = rows, row_bytes, sets
+            self.capacity = sets * self.WAYS
+            self._resident_bytes = small if len(self._cached) < len(self._parts) else 0
+            self._tags = np.full((sets, self.WAYS), -1, np.int32)
+            self._stamp = np.zeros((sets, self.WAYS), np.uint32)
+            self._clock = 0
+            for part in self._cached:
+                if part["path"] not in self._fds:
+                    fd = os.open(part["path"], os.O_RDONLY)
+                    self._fds[part["path"]] = fd
+                    if hasattr(fcntl, "F_NOCACHE"):
+                        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+                part["fd"] = self._fds[part["path"]]
+                # Metal-backed like the resident tables: pageable host memory got swapped out
+                # under memory pressure, turning cache hits into swap-ins.
+                part["store"] = _resident_buffer((self.capacity, part["width"]), part["np"])
+        except BaseException:
+            self.close()
+            raise
+        self.hits = self.misses = 0
+
+    @property
+    def nbytes(self):
+        return self.capacity * (self.row_bytes + 8) + self._resident_bytes
+
+    def read(self, rows):
+        """[(raw rows, safetensors dtype)] per part, like TensorFile.read(key, rows)."""
+        rows = np.asarray(rows, np.int64).reshape(-1)
+        if rows.size and (rows.min() < 0 or rows.max() >= self.rows):
+            raise IndexError("Engram row outside table")
+        uniq, inverse = np.unique(rows, return_inverse=True)
+        sets = uniq % self.sets
+        ways = self._tags[sets] == uniq[:, None]
+        hit = ways.any(1)
+        slot = sets * self.WAYS + ways.argmax(1)
+        self._clock = (self._clock + 1) & 0xFFFFFFFF
+        out = [np.empty((uniq.size, p["width"]), p["np"]) for p in self._cached]
+        h = np.flatnonzero(hit)
+        for part, o in zip(self._cached, out):
+            o[h] = part["store"][slot[h]]   # copied before any eviction below
+        self._stamp.reshape(-1)[slot[h]] = self._clock
+        miss = np.flatnonzero(~hit)
+        self.hits += h.size
+        self.misses += miss.size
+        if miss.size:
+            # The k-th miss of a set takes the set's k-th least recently used way (hits of
+            # this call were just stamped, so they go last). With more than WAYS misses in a
+            # set the later ones reuse ways: only the last row per way is kept, and every
+            # row's bytes still land in `out`, which is what this call returns.
+            ms = sets[miss]
+            order = np.argsort(ms, kind="stable")
+            ranked = ms[order]
+            first = np.r_[0, np.flatnonzero(ranked[1:] != ranked[:-1]) + 1]
+            rank = np.empty(miss.size, np.int64)
+            rank[order] = np.arange(miss.size) - np.repeat(first, np.diff(np.r_[first, miss.size]))
+            now = np.uint32(self._clock)
+            lru = np.argsort(-(now - self._stamp[ms]).astype(np.int64), axis=1, kind="stable")
+            victims = ms * self.WAYS + lru[np.arange(miss.size), rank % self.WAYS]
+            _, last = np.unique(victims[::-1], return_index=True)
+            keep = victims.size - 1 - last
+            tags, stamp = self._tags.reshape(-1), self._stamp.reshape(-1)
+            tags[victims] = -1   # nothing points at a way until its row is stored
+            self._fetch(uniq[miss], miss, out)
+            for part, o in zip(self._cached, out):
+                part["store"][victims[keep]] = o[miss[keep]]
+            tags[victims[keep]] = uniq[miss[keep]]
+            stamp[victims[keep]] = now
+        out = iter(out)
+        return [(p["resident"][rows] if "resident" in p else next(out)[inverse], p["dtype"]) for p in self._parts]
+
+    def _fetch(self, ids, dest, out):
+        jobs = [(p["fd"], p["base"], p["row_bytes"], memoryview(o).cast("B")) for p, o in zip(self._cached, out)]
+        ids, dest = ids.tolist(), dest.tolist()
+
+        def read(lo, hi):
+            preadv = os.preadv
+            for row, d in zip(ids[lo:hi], dest[lo:hi]):
+                for fd, base, size, view in jobs:
+                    at = d * size
+                    done = preadv(fd, [view[at : at + size]], base + row * size)
+                    while done < size:   # short read: continue where it stopped
+                        count = preadv(fd, [view[at + done : at + size]], base + row * size + done)
+                        if not count:
+                            raise ValueError("Truncated Engram table")
+                        done += count
+
+        # Few misses (decode) are latency-bound: spread them wide. Many (prefill) run into the
+        # small-read ceiling, where more threads only add contention.
+        tasks = PAGE_IO_WORKERS if len(ids) <= 4096 else FETCH_WORKERS
+        step = max(2, -(-len(ids) // tasks))
+        futures = [_PAGE_IO_POOL.submit(read, lo, min(lo + step, len(ids))) for lo in range(0, len(ids), step)]
+        wait(futures)
+        for future in futures:
+            future.result()
+
+    def close(self):
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds = {}
+        for part in self._parts:
+            part.pop("store", None)
+            part.pop("resident", None)
 
 
 class TensorFile:
@@ -303,6 +458,26 @@ class DiskEngramEmbedding(nn.Module):
         self._closed = False
         self._resident = None
         self._prefetched = None
+        self._row_cache = None
+
+    def table_bytes(self):
+        total = 0
+        for reader, key in ((self._weights, self._weight_key), (self._scales, self._scale_key), (self._scales, self._bias_key)):
+            if key is not None:
+                start, end = reader.header[key]["data_offsets"]
+                total += end - start
+        return total
+
+    def enable_row_cache(self, budget_bytes):
+        """Serve lookups from a bounded EngramRowCache instead of the mapped file."""
+        parts = [(self._weights, self._weight_key)]
+        if self._scale_key is not None:
+            parts.append((self._scales, self._scale_key))
+        if self._bias_key is not None:
+            parts.append((self._scales, self._bias_key))
+        with self._lock:
+            self._row_cache = EngramRowCache(parts, budget_bytes)
+        return self._row_cache
 
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
@@ -342,6 +517,8 @@ class DiskEngramEmbedding(nn.Module):
         with self._lock:
             if self._closed:
                 raise RuntimeError("Engram embedding is closed")
+            if self._row_cache is not None:
+                return self._row_cache.read(host.reshape(-1))
             result = []
             for reader, key in (
                 (self._weights, self._weight_key),
@@ -391,6 +568,9 @@ class DiskEngramEmbedding(nn.Module):
         with self._lock:
             self._closed = True
             self._resident = None
+            if self._row_cache is not None:
+                self._row_cache.close()
+                self._row_cache = None
             self._weights.close()
             if self._scales is not self._weights:
                 self._scales.close()

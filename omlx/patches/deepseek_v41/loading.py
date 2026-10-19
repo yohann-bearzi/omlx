@@ -21,6 +21,27 @@ from .storage import DiskEngramEmbedding, EngramPrefetch, TensorFile, decode_arr
 
 logger = logging.getLogger(__name__)
 
+# SSD-mode Engram row cache, opt-in. The memory-mapped tables leave their residency to the
+# unified buffer cache, which keeps touched pages until memory pressure reclaims them. A
+# deployment that must bound the Engram footprint sets OMLX_DSV41_ENGRAM_CACHE_GB (the cache
+# size) or OMLX_DSV41_RESIDENCY_CAP_GB (loaded weights plus cache); without either the tables
+# stay plainly memory-mapped. On an M3 Ultra (oQ4e) decode speed is the same either way,
+# while a cold prefill reads its misses from the SSD instead of the file cache.
+GiB = 1 << 30
+
+
+def _engram_cache_budget(tables, requested):
+    import os
+
+    table_bytes = sum(table.table_bytes() for table in tables)
+    if requested is None and os.environ.get("OMLX_DSV41_ENGRAM_CACHE_GB"):
+        requested = float(os.environ["OMLX_DSV41_ENGRAM_CACHE_GB"]) * GiB
+    if requested is None and os.environ.get("OMLX_DSV41_RESIDENCY_CAP_GB"):
+        requested = float(os.environ["OMLX_DSV41_RESIDENCY_CAP_GB"]) * GiB - mx.get_active_memory()
+    if requested is None:
+        requested = 0
+    return int(max(0, min(requested, table_bytes))), table_bytes
+
 
 def _load_shard(path):
     # The model retains a full Metal copy. Avoid filling the unified file cache
@@ -85,6 +106,7 @@ def load(
     ced_prefill=False,
     stage=None,
     tensor=None,
+    engram_cache_bytes=None,
 ):
     """Load a converted or source checkpoint.
 
@@ -399,6 +421,21 @@ def load(
                 ):
                     layer.engram.embed.make_resident()
         mx.eval(model.parameters())
+        tables = [
+            layer.engram.embed
+            for layer in model.language_model.pipeline_layers
+            if "engram" in layer and isinstance(layer.engram.embed, DiskEngramEmbedding)
+        ]
+        if engram_ssd_offload and tables:
+            budget, table_bytes = _engram_cache_budget(tables, engram_cache_bytes)
+            if budget >= min(GiB, table_bytes):
+                for table in tables:
+                    table.enable_row_cache(budget * table.table_bytes() // table_bytes)
+                logger.info(
+                    "DeepSeek V4.1 Engram row cache: %.1f GiB of %.1f GiB tables",
+                    budget / GiB,
+                    table_bytes / GiB,
+                )
         model.eval()
         return model, processor
     except BaseException:
