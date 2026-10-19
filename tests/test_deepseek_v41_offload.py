@@ -730,3 +730,144 @@ def test_slow_warm_gather_rearms_page_prefetch(tmp_path, monkeypatch):
         assert reader._seen_pages is not None
     finally:
         reader.close()
+
+
+
+def _affine_table(tmp_path, rows=64):
+    rng = np.random.default_rng(7)
+    path = tmp_path / "affine.safetensors"
+    packed = rng.integers(0, 2**32, (rows, 8), dtype=np.uint32)
+    scales = rng.integers(0x3C00, 0x3E00, (rows, 2), dtype=np.uint16)
+    biases = rng.integers(0xBC00, 0xBE00, (rows, 2), dtype=np.uint16)
+    raw_safetensors(path, {"w": (packed, "U32"), "s": (scales, "BF16"), "b": (biases, "BF16")})
+    return lambda: DiskEngramEmbedding(path, "w", "s", bias_key="b", bits=4, group_size=32)
+
+
+@pytest.mark.parametrize("budget_rows", [8, 20, 1000])
+def test_row_cache_matches_mapped_reads_under_eviction(tmp_path, budget_rows):
+    make = _affine_table(tmp_path)
+    mapped, cached = make(), make()
+    cache = cached.enable_row_cache(budget_rows * (cached.selected_bytes(1) + 8))
+    rng = np.random.default_rng(3)
+    try:
+        assert cache.capacity <= max(budget_rows, cache.WAYS) and cache.capacity <= 64
+        for step in range(40):
+            # repeats within a call and across calls, plus more misses than ways per set
+            ids = rng.integers(0, 64 if step % 3 else 6, (2, 1 + step % 7, 3))
+            np.testing.assert_array_equal(
+                np.asarray(cached(mx.array(ids)).astype(mx.float32)),
+                np.asarray(mapped(mx.array(ids)).astype(mx.float32)),
+            )
+        assert cache.hits > 0 and cache.misses > 0
+        filled = cache._tags.reshape(-1) >= 0
+        assert len(cache._cached) == (1 if budget_rows == 1000 else 3)   # small tensors held whole when they fit
+        for part in cache._cached:
+            raw, _ = part["reader"].read(part["key"], cache._tags.reshape(-1)[filled].astype(np.int64))
+            np.testing.assert_array_equal(part["store"][filled], raw)
+        with pytest.raises(IndexError):
+            cached(mx.array([[64]]))
+    finally:
+        mapped.close()
+        cached.close()
+    assert cache._fds == {}
+
+
+def test_row_cache_failed_read_leaves_no_stale_rows(tmp_path, monkeypatch):
+    make = _affine_table(tmp_path)
+    cached = make()
+    cache = cached.enable_row_cache(10**6)
+    try:
+        monkeypatch.setattr(storage.os, "preadv", lambda *a: 0)
+        with pytest.raises(ValueError, match="Truncated"):
+            cached(mx.array([[1, 2, 3]]))
+        assert (cache._tags == -1).all()
+        monkeypatch.undo()
+        expected = make()
+        np.testing.assert_array_equal(
+            np.asarray(cached(mx.array([[1, 2, 3]])).astype(mx.float32)),
+            np.asarray(expected(mx.array([[1, 2, 3]])).astype(mx.float32)),
+        )
+        expected.close()
+    finally:
+        cached.close()
+
+
+def test_ssd_load_bounds_engram_cache(converted, monkeypatch):
+    from omlx.patches.deepseek_v41 import loading as loader
+
+    resident, _ = load(converted, engram_ssd_offload=False)
+    monkeypatch.setenv("OMLX_DSV41_ENGRAM_CACHE_GB", "0")
+    plain, _ = load(converted, engram_ssd_offload=True)
+    monkeypatch.delenv("OMLX_DSV41_ENGRAM_CACHE_GB")
+    tables = []
+    try:
+        embeds = [l.engram.embed for l in plain.language_model.layers if "engram" in l]
+        assert embeds and all(e._row_cache is None for e in embeds)
+        total = sum(e.table_bytes() for e in embeds)
+        monkeypatch.setattr(loader, "GiB", 1)   # let a tiny budget through the 1 GiB floor
+        cached, _ = load(converted, engram_ssd_offload=True, engram_cache_bytes=total // 3)
+        tables = [l.engram.embed for l in cached.language_model.layers if "engram" in l]
+        assert all(t._row_cache is not None for t in tables)
+        assert sum(t._row_cache.nbytes for t in tables) <= total // 3
+        caches = [m.language_model.make_cache() for m in (resident, cached)]
+        for ids in ([[3, 4, 5]], [[6, 7]], [[8]], [[3, 4, 5]], [[9]]):
+            out = [m(mx.array(ids), cache=c) for m, c in zip((resident, cached), caches)]
+            mx.eval(out)
+            np.testing.assert_array_equal(out[0], out[1])
+        assert sum(t._row_cache.hits for t in tables) > 0
+    finally:
+        for m in (resident, plain) + ((cached,) if tables else ()):
+            m.close()
+    assert all(t._row_cache is None for t in tables)
+
+
+def test_row_cache_storage_is_metal_backed(tmp_path):
+    """Cached rows and the small tensors held whole live in Metal-backed buffers like the
+    resident tables (counted in MLX active memory, kept resident under its wired limit), not
+    in pageable host memory that the OS swapped out under pressure, turning hits into
+    swap-ins."""
+    import gc
+
+    make = _affine_table(tmp_path)
+    table = make()
+    mx.synchronize()
+    gc.collect()
+    before = mx.get_active_memory()
+    try:
+        cache = table.enable_row_cache(1000 * (table.selected_bytes(1) + 8))
+        stores = [p["store"] for p in cache._cached]
+        resident = [p["resident"] for p in cache._parts if "resident" in p]
+        assert stores and resident   # small tensors held whole at this budget
+        assert not any(a.flags.owndata for a in stores + resident)
+        assert mx.get_active_memory() >= before + sum(a.nbytes for a in stores + resident)
+    finally:
+        table.close()
+
+
+def test_engram_cache_budget_is_opt_in(monkeypatch):
+    """Without OMLX_DSV41_ENGRAM_CACHE_GB or OMLX_DSV41_RESIDENCY_CAP_GB the Engram tables stay
+    memory-mapped. The cap bounds weights plus cache, the cache size wins over it, an explicit
+    size wins over both, and the cache never exceeds the tables."""
+    from omlx.patches.deepseek_v41 import loading as loader
+
+    gib = loader.GiB
+
+    class Table:
+        def table_bytes(self):
+            return 300 * gib
+
+    tables = [Table(), Table()]
+    for name in ("OMLX_DSV41_ENGRAM_CACHE_GB", "OMLX_DSV41_RESIDENCY_CAP_GB"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(loader.mx, "get_active_memory", lambda: 288 * gib)
+    assert loader._engram_cache_budget(tables, None) == (0, 600 * gib)
+    monkeypatch.setenv("OMLX_DSV41_RESIDENCY_CAP_GB", "350")
+    assert loader._engram_cache_budget(tables, None)[0] == 62 * gib
+    monkeypatch.setenv("OMLX_DSV41_RESIDENCY_CAP_GB", "200")
+    assert loader._engram_cache_budget(tables, None)[0] == 0
+    monkeypatch.setenv("OMLX_DSV41_ENGRAM_CACHE_GB", "8")
+    assert loader._engram_cache_budget(tables, None)[0] == 8 * gib
+    monkeypatch.setenv("OMLX_DSV41_ENGRAM_CACHE_GB", "0")
+    assert loader._engram_cache_budget(tables, None)[0] == 0
+    assert loader._engram_cache_budget(tables, 5 * gib)[0] == 5 * gib
+    assert loader._engram_cache_budget(tables, 900 * gib)[0] == 600 * gib
