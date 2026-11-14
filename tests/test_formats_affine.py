@@ -92,6 +92,7 @@ def test_stacked_weights_follow_gather_qmm_dispatch():
     # Gathered QMV is fast only for whole output tiles of 8 rows.
     fast, slow = (affine.face(4, 64, fast, mx.bfloat16) for fast in (True, False))
     assert formats.dot(_stacked(2, 512, 16, 4, 64), 512, 16) is fast
+    assert formats.dot(_stacked(2, 512, 24, 4, 64), 512, 24) is fast
     assert formats.dot(_stacked(2, 512, 12, 4, 64), 512, 12) is slow
     assert formats.dot(_linear(512, 12, 4, 64), 512, 12) is fast
 
@@ -118,10 +119,11 @@ def test_each_layout_is_one_face():
         (4, mx.bfloat16, 256, 16),  # not the matrix asked for
         (4, mx.bfloat16, 512, 8),
         (5, mx.bfloat16, 513, 16),  # the same words of codes, not whole groups
+        (5, mx.bfloat16, 516, 16),
     ],
 )
 def test_no_face_outside_what_the_transcription_covers(bits, dtype, k, n):
-    assert formats.dot(_linear(512, 16, bits, 64, dtype), k, n) is None
+    assert affine.FORMAT.dot(_linear(512, 16, bits, 64, dtype), k, n) is None
 
 
 @pytest.mark.parametrize("bits, group_size", [(3, 64), (4, 16), (4, 256)])
@@ -136,12 +138,15 @@ def test_no_face_for_a_group_size_mlx_does_not_quantize_to():
     assert affine.FORMAT.dot(linear, 512, 16) is None
 
 
-def test_no_face_without_biases_in_the_scales_dtype():
+def test_no_face_without_scales_and_biases_of_one_dtype():
     linear = _linear(512, 16, 4, 64)
     linear.biases = linear.biases.astype(mx.float16)
-    assert formats.dot(linear, 512, 16) is None
+    assert affine.FORMAT.dot(linear, 512, 16) is None
     linear.pop("biases")
-    assert formats.dot(linear, 512, 16) is None
+    assert affine.FORMAT.dot(linear, 512, 16) is None
+    linear = _linear(512, 16, 4, 64)
+    linear.pop("scales")
+    assert affine.FORMAT.dot(linear, 512, 16) is None
 
 
 def test_no_face_for_tensors_mlx_binds_as_constants():
@@ -149,6 +154,8 @@ def test_no_face_for_tensors_mlx_binds_as_constants():
     assert formats.dot(_linear(640, 1, 6, 128), 640, 1) is None
     assert formats.dot(_linear(896, 1, 6, 128), 896, 1) is None
     assert formats.dot(_linear(1024, 1, 6, 128), 1024, 1) is not None
+    # Counted in one expert: this stack of two has 10.
+    assert formats.dot(_stacked(2, 640, 1, 6, 128), 640, 1) is None
 
 
 @metal
@@ -239,11 +246,11 @@ def test_the_traversal_sums_in_mlx_order(bits, k, n, stacked):
         (bits, group_size, k)
         for bits in (4, 5, 6, 8)
         for group_size in (32, 64, 128)
-        # At 4 and 5 bits, in blocks of 512: a partial block alone (up to
-        # 448), one whole block and two, whole blocks and a partial one
-        # (1280). At 6 and 8 bits, in blocks of 256: a partial block alone (up
-        # to 192), a whole block and a partial one (288 to 448), whole blocks.
-        for k in (96, 128, 192, 288, 384, 448, 512, 1024, 1280)
+        # qmv_fast where K is whole blocks of 512 (4 and 5 bits) or of 256 (6
+        # and 8 bits): one block and more. Elsewhere qmv, in blocks of half
+        # that: a partial block alone (from 96), whole blocks alone, whole
+        # blocks and a partial one (640 at 4 and 5 bits: two and a half).
+        for k in (96, 128, 192, 256, 288, 384, 448, 512, 640, 1024, 1280)
         if k % group_size == 0 and (k, bits) not in _QUAD
     ],
 )
@@ -257,7 +264,7 @@ def test_rows_have_mlx_bits(bits, group_size, k, dtype):
 
 
 @metal
-@pytest.mark.parametrize("n", [16, 12])  # whole output tiles of 8 rows, or not
+@pytest.mark.parametrize("n", [16, 24, 12])  # whole output tiles of 8 rows, or not
 @pytest.mark.parametrize("k", [512, 384, 128])
 @pytest.mark.parametrize("bits", [4, 6])
 def test_stacked_rows_have_gather_qmm_bits(bits, k, n):

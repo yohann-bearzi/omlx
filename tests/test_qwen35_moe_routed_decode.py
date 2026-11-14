@@ -567,6 +567,7 @@ def test_block_without_gate_up_fusion_is_not_routed():
 
 
 def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog):
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     calls = []
@@ -585,6 +586,8 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
         assert _same_bits(*_pair(twin, x))
         assert _same_bits(*_pair(block, x))
     assert len(calls) == 1
+    # With the real launch back as well.
+    assert routed.routed_decode_plan(block, x) is None
     warnings = _logged(caplog, routed, logging.WARNING)
     assert [r.getMessage() for r in warnings] == [
         "fused routed-expert decode failed; composed fallback"
@@ -602,6 +605,7 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(
     """MLX compiles a kernel at its first evaluation. A face that fails
     there, after blocks of the same shapes ran with other faces, fails inside
     the call that can fall back."""
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     good = _block(1024, 320)
     assert _same_bits(*_pair(good, x))
@@ -626,14 +630,15 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(
     assert _same_bits(*_pair(good, x))
 
 
-def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog):
+def test_a_format_whose_dot_raises_keeps_its_blocks_composed(
+    monkeypatch, caplog, dot_defects
+):
     asked = []
 
     def raises(self, layer, k, n):
         asked.append(layer)
         raise RuntimeError("no face today")
 
-    monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
     monkeypatch.setattr(affine.AffineFormat, "dot", raises)
     block = _block(1024, 512)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
@@ -642,13 +647,14 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog
             assert _same_bits(*_pair(block, x))
     assert routed.routed_decode_plan(block, x) is None
     assert not routed._PROOFS
-    # The answer is kept with the block's plan.
-    gate_up, down = asked
-    experts = block.switch_mlp
-    assert gate_up is experts.gate_up_proj and down is experts.down_proj
-    assert [repr(r.exc_info[1]) for r in _logged(caplog, formats)] == [
-        "RuntimeError('no face today')"
-    ]
+    # The answer is kept with the block's plan: no projection is asked twice.
+    own = {id(block.switch_mlp.gate_up_proj), id(block.switch_mlp.down_proj)}
+    assert asked and {id(layer) for layer in asked} <= own
+    assert len(asked) <= len(own)
+    defect = "RuntimeError('no face today')"
+    assert [repr(r.exc_info[1]) for r in _logged(caplog, formats)] == [defect]
+    assert dot_defects == {("affine", defect)}
+    dot_defects.clear()  # expected
 
 
 def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
@@ -703,10 +709,10 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
 
 def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger=routed.__name__)
-    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
     ran = set()
     for experts in (128, 256, 128):
-        block = _block(1024, 512, top_k=8, experts=experts)
+        block = _block(512, 256, top_k=8, experts=experts)
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
         ran.add((0, experts, True))

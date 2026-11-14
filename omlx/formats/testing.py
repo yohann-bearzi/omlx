@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Checks for a format's faces, for the format's own tests: a face runs here
-in the skeletons oMLX's kernels are built from, outside any model.
+"""Checks for a format's tests. ``dot_rows`` runs a face in the skeletons
+oMLX's kernels are built from, outside any model. ``no_dot_defects`` fails a
+test in which a format's ``dot()`` was defective.
 """
 
 from __future__ import annotations
@@ -37,11 +38,12 @@ def no_dot_defects():
     """Fail on leaving the block when a format's ``dot()`` was defective in it.
 
     ``omlx.formats.dot`` logs a defect and answers None: a model keeps its
-    composed path. A test wants the failure. oMLX runs each of its tests in
-    this block, and so can a plugin, from an autouse fixture.
+    composed path. A test wants the failure. oMLX runs each test under
+    ``tests/`` in this block, and so can a plugin, from an autouse fixture.
+    An exception of the block's body is raised in place of this failure.
 
     The block's value is the set of the defects met so far, each a format's
-    mode and the error. A test that expects one removes it."""
+    mode and the error's ``repr``. A test that expects one removes it."""
     defects: set = set()
     kept, formats._DOT_DEFECTS = formats._DOT_DEFECTS, defects
     try:

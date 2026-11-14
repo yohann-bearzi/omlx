@@ -60,7 +60,6 @@ def plugins(monkeypatch):
     monkeypatch.setattr(formats, "_FORMATS", {})
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
-    monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
     monkeypatch.setattr(formats, "BUILTIN", ())
     monkeypatch.setattr(
         formats,
@@ -342,8 +341,11 @@ class _Raises(_Format):
 
 
 class _NotADot(_Format):
+    class Dot:
+        """Not ``omlx.formats.Dot``."""
+
     def dot(self, layer, k, n):
-        return _FACE.key
+        return self.Dot()
 
 
 class _TwoTensors(_Format):
@@ -364,7 +366,7 @@ def _layer_with_a_child_named_scales():
         (
             _NotADot(),
             _layer(),
-            "TypeError(\"dot() returned a <class 'str'>, not a Dot\")",
+            f'TypeError("dot() returned a {_NotADot.Dot!r}, not a Dot")',
         ),
         # _FACE reads scales.
         (
@@ -394,7 +396,7 @@ def _layer_with_a_child_named_scales():
         ),
     ],
 )
-def test_a_defective_dot_is_no_face(plugins, caplog, fmt, layer, defect):
+def test_a_defective_dot_is_no_face(plugins, caplog, dot_defects, fmt, layer, defect):
     formats.register(fmt)
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         assert formats.dot(layer, 64, 8) is None
@@ -404,9 +406,11 @@ def test_a_defective_dot_is_no_face(plugins, caplog, fmt, layer, defect):
         "the layer keeps its composed path"
     )
     assert repr(record.exc_info[1]) == defect
+    assert dot_defects == {("toy", defect)}
+    dot_defects.clear()  # expected
 
 
-def test_each_defect_of_a_format_is_logged_once(plugins, caplog):
+def test_each_defect_of_a_format_is_logged_once(plugins, caplog, dot_defects):
     for fmt in (_Format(), _Raises("other"), _Raises("third")):
         formats.register(fmt)
     no_scales, no_weight = _layer(tensors=("weight",)), _layer(tensors=("scales",))
@@ -426,38 +430,49 @@ def test_each_defect_of_a_format_is_logged_once(plugins, caplog):
         assert formats.dot(no_scales, 128, 16) is None
         # Only a defect's layers lose the face.
         assert formats.dot(_layer(), 64, 8) is _FACE
-    assert [(r.args[0], repr(r.exc_info[1])) for r in caplog.records] == [
+    logged = [(r.args[0], repr(r.exc_info[1])) for r in caplog.records]
+    assert logged == [
         ("toy", "ValueError('face toy_b4: the layer has no array scales')"),
         ("toy", "ValueError('face toy_b4: the layer has no array weight')"),
         ("other", "_DefectError('no biases')"),
         ("third", "_DefectError('no biases')"),
     ]
+    assert dot_defects == set(logged)
+    dot_defects.clear()  # expected
 
 
-def test_a_defect_fails_a_block_that_admits_none(plugins):
+def test_a_defect_fails_a_block_that_admits_none(plugins, dot_defects):
     formats.register(_Raises())
-    collected = formats._DOT_DEFECTS
-    defect = "_DefectError('no biases')"
+    defect = ("toy", "_DefectError('no biases')")
     with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
         assert formats.dot(_layer(), 64, 8) is None
-    assert str(failure.value).endswith(f"dot() is defective: {[('toy', defect)]}")
+    assert str(failure.value).endswith(f"dot() is defective: {[defect]}")
     # The defect is the block's: nothing outside collected it.
-    assert formats._DOT_DEFECTS is collected and not collected
+    assert formats._DOT_DEFECTS is dot_defects and not dot_defects
     with testing.no_dot_defects() as defects:
         assert formats.dot(_layer("other"), 64, 8) is None
         assert formats.dot(_layer(), 64, 8) is None
-        assert defects == {("toy", defect)}
+        assert defects == {defect}
         defects.clear()  # expected
     with pytest.raises(KeyError), testing.no_dot_defects():
         formats.dot(_layer(), 64, 8)
-        raise KeyError  # the block's own failure is the one reported
-    assert formats._DOT_DEFECTS is collected
+        raise KeyError  # the body's failure is the one reported
+    assert formats._DOT_DEFECTS is dot_defects
+    # Nor is a defect met outside a block that block's.
+    assert formats.dot(_layer(), 64, 8) is None
+    with testing.no_dot_defects():
+        pass
+    assert dot_defects == {defect}
+    dot_defects.clear()  # expected
 
 
-def test_omlx_tests_run_in_a_block_that_admits_no_dot_defect(request):
-    name = "_quant_format_defects_fail_the_test"
-    assert name in request.fixturenames  # of every test
-    assert formats._DOT_DEFECTS is request.getfixturevalue(name)
+def test_each_test_runs_in_a_block_that_admits_no_dot_defect(request, monkeypatch):
+    assert "dot_defects" in request.fixturenames  # though the test does not ask
+    defects = request.getfixturevalue("dot_defects")
+    assert formats._DOT_DEFECTS is defects
+    # The block is not a patch that a test's monkeypatch undoes.
+    monkeypatch.undo()
+    assert formats._DOT_DEFECTS is defects
 
 
 def test_an_interrupt_inside_dot_is_not_a_defect(plugins):

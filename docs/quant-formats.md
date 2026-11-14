@@ -58,16 +58,20 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors`, as below, so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails when a `dot()` was defective in the block:
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` was defective in it (an exception of the block's body is raised in its place):
 
 ```python
+import pytest
+from omlx.formats import testing
+
+
 @pytest.fixture(autouse=True)
-def _dot_defects_fail_the_test():
+def dot_defects():
     with testing.no_dot_defects() as defects:
         yield defects
 ```
 
-The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it.
+The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it. A kernel keeps the answer with what it builds for the layer, so only the first forward of a layer meets its defect: a model that a module or session fixture runs in its setup meets it outside this block.
 
 | `Dot` field | Meaning |
 |---|---|
@@ -324,7 +328,7 @@ Worth testing for every layout a format gives a face for:
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
-- the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. A face is a template over the activations' type `T`, so `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32: the activations, and the tensors that share their dtype.
+- the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. `dot_rows` compiles the skeleton for `x.dtype` and refuses a dtype the face is not exact for. For a face whose tensors are typed `T`, `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32, on fp32 activations and fp32 copies of those tensors.
 
 ## Affine
 
@@ -340,7 +344,7 @@ Worth testing for every layout a format gives a face for:
 
 Any other affine layer has no face and runs MLX's ops:
 
-- another bit width or group size, fp32 scales, no biases, a K that is not whole groups,
+- another bit width or group size, fp32 scales, no scales or no biases, a K that is not whole groups, weights that are neither 2-D nor 3-D,
 - a matrix of fewer than 8 groups, counted in one expert for stacked weights (MLX binds an input of fewer than 8 elements as constants, not as a buffer),
 - a 2-D matrix of K 64 or 128 at 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
 
