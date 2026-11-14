@@ -63,7 +63,7 @@ METAL_FUNC void omlx_qmv_block(
     thread float* x_thread,
     thread float* result) {
   constexpr int NA = sizeof...(RA);
-  const float aux = L::load(x, x_thread);
+  const auto aux = L::load(x, x_thread);
   ((result[RA] = L::madd(result[RA], a.row(RA), x_thread, aux)), ...);
   ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), x_thread, aux)), ...);
 }

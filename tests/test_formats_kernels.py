@@ -135,6 +135,49 @@ def test_rows_are_the_dequantized_products(k, packs):
     assert mx.array_equal(got, want).item()
 
 
+# The toy's rows with the codes as stored, re-centred in madd with the sum of
+# the lane's inputs: what load returns is a struct of the face's own.
+_LOAD = r"""
+    template <typename X>
+    static float load(const device X* x, thread float* xt) {
+      copy(omlx_iota<VPT>(), x, xt);
+      return 0;
+    }
+    static float madd(float acc, Row r, thread const float* xt, float) {
+      return acc + dot(omlx_iota<VPT>(), r.w, xt);
+    }
+"""
+_LOAD_STRUCT = r"""
+    struct Inputs {
+      float sum;
+    };
+    template <int... I>
+    static float sum(omlx_ints<I...>, thread const float* xt) {
+      return (... + xt[I]);
+    }
+    template <typename X>
+    static Inputs load(const device X* x, thread float* xt) {
+      copy(omlx_iota<VPT>(), x, xt);
+      return {sum(omlx_iota<VPT>(), xt)};
+    }
+    static float madd(float acc, Row r, thread const float* xt, Inputs inputs) {
+      return acc + (dot(omlx_iota<VPT>(), r.w, xt) - 128.0f * inputs.sum);
+    }
+"""
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 384])
+def test_what_load_returns_is_the_faces_own_type(k):
+    assert _LOAD in _TOY
+    source = _TOY.replace(_LOAD, _LOAD_STRUCT).replace(
+        "(float(w[I]) - 128.0f) * xt[I]", "float(w[I]) * xt[I]"
+    )
+    operands, x, want = _matrix(16, k, seed=k)
+    got = testing.dot_rows(_toy("aux", source=source), operands, x, 16, (2, 2))
+    assert mx.array_equal(got, want).item()
+
+
 @metal
 def test_two_formats_run_in_one_kernel():
     a, b = _toy("first"), _toy("second")

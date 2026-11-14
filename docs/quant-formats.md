@@ -87,8 +87,8 @@ struct Dot {
 | `Lanes(Dot m, size_t row, uint lane)` | Lane `lane` at the first block of row `row`. |
 | `struct Row` and `Row row(int r) const` | What `madd` needs of the current block of row `row + r`: pointers, the group's scale. |
 | `void step()` | Move to the next block. |
-| `template <typename X> static float load(const device X* x, thread float* xt)` | Read the lane's `VPT` inputs into `xt` as floats. Its result is passed to every `madd` of the block as `aux` (affine returns the sum of the inputs, for the bias term). |
-| `static float madd(float acc, Row r, thread const float* xt, float aux)` | `acc` plus the lane's share of the row's product for the block. |
+| `template <typename X> static A load(const device X* x, thread float* xt)` | Read the lane's `VPT` inputs into `xt` as floats. Its result is passed to every `madd` of the block as `aux`. `A` is the face's choice: a `float` (affine returns the sum of the inputs, for the bias term) or a struct of its own. |
+| `static float madd(float acc, Row r, thread const float* xt, A aux)` | `acc` plus the lane's share of the row's product for the block. |
 | `float finish(int r, float sum) const` | Row `row + r`'s result from the sum of `acc` over the lanes (for example times a row scale). |
 
 A kernel runs a face in this order, in every lane, for each of its rows `r`:
@@ -108,6 +108,7 @@ Rules:
 
 - `BLOCK == 32 * VPT`, and K is a multiple of `VPT`. A kernel asserts both when it is compiled, so a format's `dot()` returns `None` for a K that is not.
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
+- A face only reads the matrix. Its members store to nothing but the cursor's own state and `xt`: a kernel may build and step a cursor for a block it then skips.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
 
 ### An example
