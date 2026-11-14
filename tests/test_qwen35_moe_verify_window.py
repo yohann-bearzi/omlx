@@ -50,8 +50,7 @@ def _patched(monkeypatch):
     cls = vlm_moe.Qwen3_5MoeSparseMoeBlock
     call = cls.__call__
     had_flag = "_omlx_routed_decode" in cls.__dict__
-    for name in ("_DISABLED", "_PROVEN", "_WINDOW_DISABLED", "_WINDOW_PROVEN"):
-        monkeypatch.setattr(routed, name, False)
+    monkeypatch.setattr(routed, "_PROOFS", {})
     assert routed.apply_qwen35_moe_routed_decode_patch()
     yield
     qwen35_verify_qmm.set_verify_qmm_armed(False)
@@ -212,6 +211,10 @@ def test_window_rows_equal_one_token_decode(topk_fold, engaged):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
     _check(block, _inputs(3, 1, batch=2), engaged)
+    assert plan.proof.ran >= {
+        (rows, BLOCK_EXPERTS, topk_fold and rows <= routed._TOPK_FOLD_MAX_ROWS)
+        for rows in (*window_rows, 6)
+    }
 
 
 @pytest.mark.parametrize("rows", [2, 5, 8])
@@ -266,17 +269,55 @@ def test_router_ties_and_high_experts(engaged):
         block.gate.weight = weight  # The block stays cached for later tests.
 
 
-def test_kernel_failure_falls_back_to_the_composed_verifier(monkeypatch, engaged):
+def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifier(
+    monkeypatch, engaged
+):
     block = _block(0)
     x = _inputs(4, 1)
     old = _verify(block, x, window=False)
+    plan = routed.routed_decode_plan(block, x[:, :1])
+    # The block stays cached for later tests, with its plan and what it ran.
+    monkeypatch.setattr(plan.proof, "ran", set())
+    monkeypatch.setattr(plan.proof, "window_failed", False)
+    kernel = mx.fast.metal_kernel(
+        name="does_not_compile",
+        input_names=["h"],
+        output_names=["y"],
+        source="does not compile;",
+    )
+    calls = []
 
-    def broken(*args):
-        raise RuntimeError("no pipeline")
+    def broken(plan, h, indices, scores):
+        # MLX compiles the kernel when its output is evaluated.
+        calls.append(1)
+        return kernel(
+            inputs=[h],
+            grid=(1, 1, 1),
+            threadgroup=(1, 1, 1),
+            output_shapes=[(indices.shape[0], plan.hidden)],
+            output_dtypes=[plan.dtype],
+        )[0]
 
     monkeypatch.setattr(routed, "_window_down", broken)
+    for _ in range(2):
+        out = _verify(block, x, window=True)
+        assert engaged[-1] is False and plan.proof.window_failed
+        assert _same_bits(out, old)
+    assert len(calls) == 1 and not plan.proof.ran
+    # One token still takes the fused launches.
+    assert not plan.proof.failed
+    assert routed.routed_decode_plan(block, x[:, :1]) is plan
+
+
+def test_a_failed_one_token_launch_keeps_windows_composed(monkeypatch, engaged):
+    block = _block(0)
+    x = _inputs(4, 1)
+    old = _verify(block, x, window=False)
+    plan = routed.routed_decode_plan(block, x[:, :1])
+    monkeypatch.setattr(plan.proof, "failed", True)
+    assert routed.routed_decode_plan(block, x[:, :1]) is None
     out = _verify(block, x, window=True)
-    assert engaged[-1] is False and routed._WINDOW_DISABLED
+    assert engaged[-1] is False
     assert _same_bits(out, old)
 
 

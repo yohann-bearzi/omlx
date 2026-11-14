@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -11,6 +13,7 @@ import mlx.nn as nn
 import pytest
 
 import omlx.patches.qwen35_moe_routed_decode as routed
+from omlx import formats
 from omlx.formats import affine
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -37,8 +40,7 @@ def _patched_block(monkeypatch):
     assert cls._omlx_router_fused
     call = cls.__call__
     original = getattr(call, "_omlx_routed_decode_original", call)
-    monkeypatch.setattr(routed, "_DISABLED", False)
-    monkeypatch.setattr(routed, "_PROVEN", False)
+    monkeypatch.setattr(routed, "_PROOFS", {})
     cls.__call__ = original
     if "_omlx_routed_decode" in cls.__dict__:
         delattr(cls, "_omlx_routed_decode")
@@ -100,13 +102,20 @@ def _block(
 
 
 def _pair(block, x):
-    routed._DISABLED = True
-    ref = block(x)
+    """The composed body's output and the patched call's."""
+    ref = type(block).__call__._omlx_routed_decode_original(block, x)
     mx.eval(ref)
-    routed._DISABLED = False
     out = block(x)
     mx.eval(out)
     return ref, out
+
+
+def _engaged():
+    """Whether the launches of every plan built since the test began ran."""
+    proofs = routed._PROOFS.values()
+    return bool(proofs) and all(
+        proof.ran and not (proof.failed or proof.window_failed) for proof in proofs
+    )
 
 
 def _same_bits(a, b):
@@ -144,7 +153,7 @@ def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypa
             ref, out = _pair(block, x)
             assert _same_bits(ref, out)
     assert len(calls) == 12
-    assert not routed._DISABLED
+    assert _engaged()
 
 
 @pytest.mark.parametrize("experts", [EXPERTS, 128])
@@ -160,7 +169,7 @@ def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
         assert routed._topk_folds(plan, block.gate(x)) == (experts == 128)
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
-    assert routed._PROVEN and not routed._DISABLED
+    assert _engaged()
 
 
 @pytest.mark.parametrize("bits", [4, 5])
@@ -357,7 +366,7 @@ def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
         assert plan.fold and plan.dtype == dtype and plan.top_k == top_k
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
-    assert not routed._DISABLED
+    assert _engaged()
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
@@ -375,7 +384,7 @@ def test_top8_routing_folded_into_gate_up_is_bit_identical(dtype, quantized_shar
         assert routed._topk_folds(plan, block.gate(x))
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
-    assert routed._PROVEN and not routed._DISABLED
+    assert _engaged()
 
 
 def test_mismatched_dtypes_keep_the_composed_body():
@@ -454,22 +463,125 @@ def test_block_without_gate_up_fusion_is_not_routed():
     assert routed.routed_decode_plan(block, x) is None
 
 
-def test_kernel_failure_falls_back_once(monkeypatch):
+def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog):
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    routed._DISABLED = True
-    ref = block(x)
-    routed._DISABLED = False
+    calls = []
 
     def broken(*args):
+        calls.append(1)
         raise RuntimeError("no pipeline")
 
     monkeypatch.setattr(routed, "routed_decode", broken)
-    out = block(x)
-    mx.eval(ref, out)
-    assert _same_bits(ref, out)
-    assert routed._DISABLED
+    assert _same_bits(*_pair(block, x))
     assert routed.routed_decode_plan(block, x) is None
+    # Another block of these faces and shapes does not try again.
+    twin = _block(1024, 320, seed=1)
+    assert routed.routed_decode_plan(twin, x) is None
+    assert _same_bits(*_pair(twin, x))
+    assert _same_bits(*_pair(block, x))
+    assert len(calls) == 1
+    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert warnings == ["fused routed-expert decode failed; composed fallback"]
+    # Other shapes still route.
+    monkeypatch.undo()
+    other = _block(1024, 512)
+    assert routed.routed_decode_plan(other, x) is not None
+    assert _same_bits(*_pair(other, x))
+    assert routed.routed_decode_plan(other, x).proof.ran
+
+
+def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(monkeypatch):
+    """MLX compiles a kernel at its first evaluation. A face that fails
+    there, after blocks of the same shapes ran with other faces, fails inside
+    the call that can fall back."""
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    good = _block(1024, 320)
+    assert _same_bits(*_pair(good, x))
+    assert _engaged()
+    dot = formats.dot
+
+    def broken(layer, k, n):
+        face = dot(layer, k, n)
+        if face is None or k != 320:
+            return face
+        source = face.source + 'static_assert(false, "does not compile");\n'
+        return replace(face, key=face.key + "_broken", source=source)
+
+    monkeypatch.setattr(formats, "dot", broken)
+    bad = _block(1024, 320, seed=1)
+    assert _same_bits(*_pair(bad, x))
+    assert routed.routed_decode_plan(bad, x) is None
+    assert routed.routed_decode_plan(good, x) is not None
+    assert _same_bits(*_pair(good, x))
+
+
+def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
+    def unfolded(hidden=1024, inter=320, **kwargs):
+        return _block(hidden, inter, quantized_shared=False, **kwargs)
+
+    def proof(block):
+        x = mx.zeros((1, 1, block.switch_mlp.down_proj.weight.shape[1]), mx.bfloat16)
+        return routed.routed_decode_plan(block, x).proof
+
+    base, folded = proof(unfolded()), proof(_block(1024, 320))
+    assert proof(unfolded(seed=1)) is base
+    assert proof(_block(1024, 320, seed=1)) is folded
+    assert folded is not base
+    # One shape apart, with the same faces.
+    assert proof(unfolded(hidden=2048)) is not base
+    assert proof(unfolded(inter=448)) is not base
+    assert proof(unfolded(top_k=8)) is not base
+    # With 128 experts the router is the fused gemv.
+    assert proof(unfolded(experts=128)) is not base
+    dot = formats.dot
+
+    def patched(face_of):
+        monkeypatch.setattr(
+            formats, "dot", lambda layer, k, n: face_of(layer, dot(layer, k, n))
+        )
+
+    def renamed(block, *layers):
+        other = {id(layer) for layer in layers}
+
+        def face_of(layer, face):
+            return replace(face, key="other") if id(layer) in other else face
+
+        patched(face_of)
+        return proof(block)
+
+    # One face apart.
+    for name in ("gate_up_proj", "down_proj"):
+        block = unfolded(seed=2)
+        assert renamed(block, block.switch_mlp[name]) is not base
+    for names in (("gate_proj", "up_proj"), ("down_proj",)):
+        block = _block(1024, 320, seed=2)
+        layers = (block.shared_expert[name] for name in names)
+        assert renamed(block, *layers) is not folded
+    block = _block(1024, 320, seed=2)
+    assert renamed(block, block.shared_expert_gate) is not folded
+    # The same faces on tensors of another dtype.
+    block = unfolded(dtype=mx.float16)
+    patched(lambda layer, face: replace(face, dtypes=(mx.bfloat16,)))
+    assert proof(block) is not base
+
+
+def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=routed.__name__)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    ran = set()
+    for experts in (128, 256, 128):
+        block = _block(1024, 512, top_k=8, experts=experts)
+        for _ in range(2):
+            assert _same_bits(*_pair(block, x))
+        ran.add((0, experts, True))
+        assert routed.routed_decode_plan(block, x).proof.ran == ran
+    monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
+    assert _same_bits(*_pair(block, x))
+    assert routed.routed_decode_plan(block, x).proof.ran == ran | {(0, 128, False)}
+    assert [r.getMessage() for r in caplog.records] == [
+        "Qwen MoE fused routed-expert decode engaged"
+    ] * 3
 
 
 def test_apply_requires_the_fused_router(_patched_block):

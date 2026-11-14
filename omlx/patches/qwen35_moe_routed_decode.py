@@ -48,8 +48,10 @@ experts with scales in the activation dtype (Qwen3.5/3.6-35B-A3B: hidden
 each take ``qmv_fast`` or ``qmv``. A shared expert or gate outside
 that format (unquantized, packed, ...) runs as composed launches and only its outputs
 enter the combine. Prefill, multi-row calls and every other shape keep the
-original body. If the first launch fails, the patch disables itself and the
-block keeps its composed body.
+original body. MLX compiles a kernel when it first evaluates it, so a launch
+is evaluated inside the call the first time blocks of its faces, tensor
+dtypes and shapes build it; if that fails, those blocks keep their composed
+body.
 
 Row-exact MTP verify windows (1..8 rows whose logits must equal serial
 decode) run the same arithmetic for the whole window in the same launches:
@@ -63,8 +65,9 @@ rows on the recomputed selections cost more than the routing launch
 bit-identical to the fused one-token call on that row. This replaces the
 verifier's composed MoE (about fifteen launches, two of them binding the
 whole stacked experts) only while row-exact verify is armed and the block
-folds its shared expert; one-row windows run the one-token launches. If the
-first window launch fails, the verifier keeps its composed MoE.
+folds its shared expert; one-row windows run the one-token launches. If a
+window launch fails the first time it is built, the verifier keeps its
+composed MoE for blocks of these faces and shapes.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -79,6 +82,7 @@ nothing to bound here. Only scheduling changes.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from functools import cache, wraps
 from typing import NamedTuple
 
@@ -107,8 +111,6 @@ TOP_KS = (8, 10)
 _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
 _GATE_UP_SIMDGROUPS = 2
 _DOWN_ROWS = 4  # down rows per simdgroup unless tuned by window width
-_DISABLED = False
-_PROVEN = False
 # Every gate+up simdgroup recomputes its row's selection, so the folded
 # routing's ALU grows with the rows while the launch it saves does not: from
 # four rows on the gate+up launch runs out of ALU headroom and the separate
@@ -117,8 +119,24 @@ _TOPK_FOLD_MAX_ROWS = 3
 # Row-exact verify windows up to the hyper-connection and GDN verify
 # kernels' 16-row ceiling; the kernels index rows from the grid.
 WINDOW_MAX_ROWS = 16
-_WINDOW_DISABLED = False
-_WINDOW_PROVEN = False
+
+
+@dataclass
+class _Proof:
+    """What is known of the launches that blocks of the same faces, tensor
+    dtypes and shapes compile.
+
+    MLX compiles a kernel when it first evaluates it. So a launch is
+    evaluated the first time it is built, while the call can still fall
+    back, and one that fails keeps these blocks on their composed body."""
+
+    # (window rows or 0 for one token, router width, top-k folded in)
+    ran: set = field(default_factory=set)
+    failed: bool = False  # a one-token launch: nothing of the plan runs
+    window_failed: bool = False  # a window launch: one token still runs
+
+
+_PROOFS: dict[tuple, _Proof] = {}
 
 
 def _down_rows(rows: int) -> int:
@@ -522,6 +540,7 @@ class _Plan(NamedTuple):
     dtype: mx.Dtype  # activations, outputs and quantization scales
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
+    proof: _Proof
     gate_up_kernel: object
     gate_up_operands: tuple
     gate_up_template: list
@@ -618,6 +637,23 @@ def _build_plan(block) -> _Plan | None:
         and gate["weight"].dtype == dtype
     ):
         router_logits = router_gemv(gate["weight"])
+    # What the launches are compiled from, beside a launch's rows and routing.
+    operands = gate_up_operands + down_operands
+    if shared is not None:
+        operands += shared[4] + shared[5]
+    proof = _PROOFS.setdefault(
+        (
+            gu_fmt,
+            d_fmt,
+            shared[:4] if shared is not None else None,
+            tuple(a.dtype for a in operands),
+            hidden,
+            inter,
+            top_k,
+            router_logits is not None,
+        ),
+        _Proof(),
+    )
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     gate_up_template = [
         ("T", dtype),
@@ -640,6 +676,7 @@ def _build_plan(block) -> _Plan | None:
             top_k=top_k,
             router_logits=router_logits,
             fold=False,
+            proof=proof,
             gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
             gate_up_operands=gate_up_operands,
             gate_up_template=gate_up_template,
@@ -660,6 +697,7 @@ def _build_plan(block) -> _Plan | None:
         top_k=top_k,
         router_logits=router_logits,
         fold=True,
+        proof=proof,
         gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
         gate_up_operands=gate_up_operands,
         gate_up_template=gate_up_template + [("NS", width)],
@@ -685,18 +723,19 @@ def _build_plan(block) -> _Plan | None:
 
 def routed_decode_plan(block, x) -> _Plan | None:
     """The block's cached plan when ``x`` is one bf16 or fp16 token it can route."""
-    if (
-        _DISABLED
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or block.top_k not in TOP_KS
-    ):
+    if x.dtype not in (mx.bfloat16, mx.float16) or block.top_k not in TOP_KS:
         return None
     hidden = x.shape[-1]
     if x.size != hidden:
         return None
     # Depth 2 keys the plan on the expert and shared-expert weight arrays.
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
-    if plan is None or plan.hidden != hidden or plan.dtype != x.dtype:
+    if (
+        plan is None
+        or plan.proof.failed
+        or plan.hidden != hidden
+        or plan.dtype != x.dtype
+    ):
         return None
     return plan
 
@@ -809,11 +848,8 @@ def routed_verify_window(block, x):
 
     Router gemv, gate+up (with the softmax + top-k folded in) and
     down/combine each run once for the whole window."""
-    global _WINDOW_DISABLED, _WINDOW_PROVEN
     if (
-        _WINDOW_DISABLED
-        or _DISABLED
-        or x.ndim != 3
+        x.ndim != 3
         or x.dtype not in (mx.bfloat16, mx.float16)
         or block.top_k not in TOP_KS
     ):
@@ -827,6 +863,8 @@ def routed_verify_window(block, x):
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
     if (
         plan is None
+        or plan.proof.failed
+        or plan.proof.window_failed
         or plan.hidden != hidden
         or plan.dtype != x.dtype
         or not plan.fold
@@ -841,6 +879,7 @@ def routed_verify_window(block, x):
         if routing is None:
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), plan.top_k)
         inds, scores = routing
+    launch = (rows, logits.shape[-1], folded)
     try:
         if folded:
             y = (routed_decode_logits if rows == 1 else routed_window_logits)(plan, x, logits)
@@ -848,12 +887,12 @@ def routed_verify_window(block, x):
             y = routed_decode(plan, x, inds, scores)
         else:
             y = routed_window(plan, x, inds, scores)
-        if not _WINDOW_PROVEN:
+        if launch not in plan.proof.ran:
             mx.eval(y)
-            _WINDOW_PROVEN = True
-            logger.info("Qwen MoE fused verify-window experts engaged")
+            plan.proof.ran.add(launch)
+            logger.info("Qwen MoE fused verify-window experts engaged (%d rows)", rows)
     except Exception:
-        _WINDOW_DISABLED = True
+        plan.proof.window_failed = True
         logger.warning("fused verify-window experts failed; verifier fallback", exc_info=True)
         return None
     return y
@@ -903,7 +942,6 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     orig_call = cls.__call__
 
     def patched_call(self, x):
-        global _DISABLED, _PROVEN
         plan = routed_decode_plan(self, x)
         if plan is None and x.ndim == 3 and x.shape[1] == 1 and x.shape[0] > 1:
             # Batched one-token decode: every row runs the one-token
@@ -932,19 +970,20 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             inds, scores = routing
             if scores.dtype != x.dtype:
                 return orig_call(self, x)
+        launch = (0, logits.shape[-1], folded)
         try:
             if folded:
                 y = routed_decode_logits(plan, x, logits, shared, shared_gate)
             else:
                 y = routed_decode(plan, x, inds, scores, shared, shared_gate)
-            if not _PROVEN:
+            if launch not in plan.proof.ran:
                 # Surface a kernel build failure while the call can still
-                # fall back, once per process.
+                # fall back.
                 mx.eval(y)
-                _PROVEN = True
+                plan.proof.ran.add(launch)
                 logger.info("Qwen MoE fused routed-expert decode engaged")
         except Exception:
-            _DISABLED = True
+            plan.proof.failed = True
             logger.warning(
                 "fused routed-expert decode failed; composed fallback",
                 exc_info=True,

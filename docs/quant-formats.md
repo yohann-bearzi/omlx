@@ -343,3 +343,5 @@ The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFo
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 
 The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype.
+
+A face that does not compile does not fail the model. The decode evaluates a launch inside the call the first time blocks of the same faces, tensor dtypes and shapes build it. If that fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path. Blocks of other faces or shapes are not affected.
