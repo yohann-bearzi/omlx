@@ -8,11 +8,14 @@ oMLX's fused kernels are not written for one format. A kernel is a skeleton: it 
 - a format written once runs in every kernel built on that face,
 - a format costs what its own arithmetic costs.
 
+MLX's affine quantization (the oQ and oQe checkpoints) is registered the same way as a plugin, so the plugin path is the path those checkpoints take. See [Affine](#affine).
+
 | File | What it holds |
 |---|---|
 | `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/testing.py` | checks for a format's own tests |
+| `omlx/formats/affine.py` | affine, the built-in format |
 
 ## Register a format
 
@@ -304,3 +307,17 @@ Worth testing for every layout a format gives a face for:
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
 - a K with a tail and a K without, if the face has both.
+
+## Affine
+
+`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits of `mx.quantized_matmul`.
+
+| | Covered |
+|---|---|
+| Bits | 4, 5, 6, 8 |
+| Group size | 32, 64, 128 |
+| Scales and biases | both bf16 or both fp16. The face is exact for activations of that dtype. |
+| Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise, with `TAIL`. |
+| Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
+
+Any other affine layer (2 or 3 bits, fp32 scales, no biases) has no face and runs MLX's ops.

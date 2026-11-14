@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 ENTRY_POINT_GROUP = "omlx.quant_formats"
 
 # Formats that ship with oMLX, as entry-point values ("module:attribute").
-BUILTIN: tuple[str, ...] = ()
+BUILTIN: tuple[str, ...] = ("omlx.formats.affine:FORMAT",)
 
 
 @dataclass(frozen=True)
