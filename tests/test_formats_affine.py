@@ -91,6 +91,7 @@ def test_the_face_follows_mlx_one_row_dispatch(k, bits, fast):
 def test_stacked_weights_follow_gather_qmm_dispatch():
     # Gathered QMV is fast only for whole output tiles of 8 rows.
     fast, slow = (affine.face(4, 64, fast, mx.bfloat16) for fast in (True, False))
+    assert formats.dot(_stacked(2, 512, 8, 4, 64), 512, 8) is fast
     assert formats.dot(_stacked(2, 512, 16, 4, 64), 512, 16) is fast
     assert formats.dot(_stacked(2, 512, 24, 4, 64), 512, 24) is fast
     assert formats.dot(_stacked(2, 512, 12, 4, 64), 512, 12) is slow
@@ -151,11 +152,11 @@ def test_no_face_without_scales_and_biases_of_one_dtype():
 
 def test_no_face_for_tensors_mlx_binds_as_constants():
     # One row of 5 groups, as a small shared expert's gate: 5 scales.
-    assert formats.dot(_linear(640, 1, 6, 128), 640, 1) is None
-    assert formats.dot(_linear(896, 1, 6, 128), 896, 1) is None
+    assert affine.FORMAT.dot(_linear(640, 1, 6, 128), 640, 1) is None
+    assert affine.FORMAT.dot(_linear(896, 1, 6, 128), 896, 1) is None
     assert formats.dot(_linear(1024, 1, 6, 128), 1024, 1) is not None
     # Counted in one expert: this stack of two has 10.
-    assert formats.dot(_stacked(2, 640, 1, 6, 128), 640, 1) is None
+    assert affine.FORMAT.dot(_stacked(2, 640, 1, 6, 128), 640, 1) is None
 
 
 @metal
@@ -173,7 +174,7 @@ _QUAD = [(k, bits) for k in (64, 128) for bits in (4, 8)]
 
 def test_no_face_where_mlx_runs_qmv_quad():
     for k, bits in _QUAD:
-        assert formats.dot(_linear(k, 16, bits, 32), k, 16) is None
+        assert affine.FORMAT.dot(_linear(k, 16, bits, 32), k, 16) is None
         # gather_qmm has no such kernel.
         assert formats.dot(_stacked(2, k, 16, bits, 32), k, 16) is not None
     # Only K 64 and 128, only 4 and 8 bits.
@@ -186,7 +187,7 @@ def test_no_face_for_weights_that_are_not_a_matrix_or_a_stack_of_them():
     assert formats.dot(stacked, 512, 16) is not None
     for name in ("weight", "scales", "biases"):
         stacked[name] = stacked[name][None]
-    assert formats.dot(stacked, 512, 16) is None
+    assert affine.FORMAT.dot(stacked, 512, 16) is None
 
 
 @metal

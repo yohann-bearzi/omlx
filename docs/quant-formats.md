@@ -71,7 +71,7 @@ def dot_defects():
         yield defects
 ```
 
-The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it. A kernel keeps the answer with what it builds for the layer, so only the first forward of a layer meets its defect: a model that a module or session fixture runs in its setup meets it outside this block.
+The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it. A kernel keeps the answer with what it builds for the layer, so only the first forward that asks for a layer's face meets its defect: a model that a module or session fixture runs in its setup (or a function fixture set up ahead of this one) meets it outside this block.
 
 | `Dot` field | Meaning |
 |---|---|
@@ -344,7 +344,7 @@ Worth testing for every layout a format gives a face for:
 
 Any other affine layer has no face and runs MLX's ops:
 
-- another bit width or group size, fp32 scales, no scales or no biases, a K that is not whole groups, weights that are neither 2-D nor 3-D,
+- another bit width or group size, fp32 scales, biases of another dtype than the scales, no scales or no biases, a K that is not whole groups, weights that are neither 2-D nor 3-D or that are not the N by K asked for,
 - a matrix of fewer than 8 groups, counted in one expert for stacked weights (MLX binds an input of fewer than 8 elements as constants, not as a buffer),
 - a 2-D matrix of K 64 or 128 at 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
 
@@ -356,6 +356,6 @@ The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFo
 |---|---|---|
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 
-The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype.
+The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
 
 A face that does not compile does not fail the model. The decode evaluates a launch inside the call the first time blocks of the same faces, tensor dtypes and shapes build it, once the block's input is evaluated (a failure ahead of the block is raised as it is). If a one-token launch fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path. If the launch of a verify window or of batched rows fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.

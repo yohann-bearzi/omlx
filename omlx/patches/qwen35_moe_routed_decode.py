@@ -43,8 +43,9 @@ picks ``qmv_fast`` when K is a multiple of its kernel block
 (512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
 Routed experts are taken for one bf16 or fp16 token, top-k 8 or 10, experts
-whose format has dot faces exact for the token's dtype (affine: scales in
-that dtype; Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512;
+whose gate+up face is exact for one dtype, the token's, and whose down
+face is exact for it (affine: scales in that dtype;
+Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512;
 Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down each take ``qmv_fast``
 or ``qmv``. A shared expert or gate without such faces (unquantized,
 packed, ...) runs as composed launches and only its outputs enter the
@@ -631,7 +632,7 @@ def _build_plan(block) -> _Plan | None:
         or not d_fmt.exact_for(gu_fmt.dtypes[0])
         # The launches cover whole groups of rows.
         or inter % rows
-        or any(hidden % _down_rows(window) for window in (1, 2))
+        or any(hidden % _down_rows(window) for window in range(1, WINDOW_MAX_ROWS + 1))
     ):
         return None
     dtype, top_k = gu_fmt.dtypes[0], block.top_k
@@ -955,8 +956,13 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     if getattr(cls, "_omlx_routed_decode", False):
         return True
     # Read the weight formats with the model rather than in its first token.
-    # A registry that cannot load leaves the block unpatched.
-    formats.load()
+    # A registry that cannot load leaves the block unpatched. The engine
+    # applies its patches under a guard that logs at debug level.
+    try:
+        formats.load()
+    except Exception:
+        logger.exception("quant formats did not load; routed decode not applied")
+        raise
     orig_call = cls.__call__
 
     def patched_call(self, x):

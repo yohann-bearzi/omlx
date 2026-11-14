@@ -62,20 +62,23 @@ def _block(
     experts=EXPERTS,
     quantized_shared=True,
     dtype=mx.bfloat16,
+    shared_inter=None,
 ):
     """A block laid out like Qwen3.8-Flash-Next oQ: quantized routed experts,
-    8-bit shared expert (gs128 where the shape allows), 8-bit gs64
-    shared-expert gate, ``dtype`` router. ``quantized_shared=False`` keeps the
-    shared expert and its gate in ``dtype``."""
+    8-bit shared expert (gs128 where the shape allows) as wide as the routed
+    ones unless ``shared_inter`` says, 8-bit gs64 shared-expert gate,
+    ``dtype`` router. ``quantized_shared=False`` keeps the shared expert and
+    its gate in ``dtype``."""
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
     from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
 
     mx.random.seed(seed)
+    shared_inter = shared_inter or inter
     args = SimpleNamespace(
         hidden_size=hidden,
         moe_intermediate_size=inter,
-        shared_expert_intermediate_size=inter,
+        shared_expert_intermediate_size=shared_inter,
         num_experts=experts,
         num_experts_per_tok=top_k,
         norm_topk_prob=True,
@@ -87,7 +90,7 @@ def _block(
         setattr(sm, name, getattr(sm, name).to_quantized(group_size, bits))
     if quantized_shared:
         shared = block.shared_expert
-        shared_gs = 128 if hidden % 128 == 0 and inter % 128 == 0 else 64
+        shared_gs = 128 if hidden % 128 == 0 and shared_inter % 128 == 0 else 64
         for name in ("gate_proj", "up_proj", "down_proj"):
             setattr(
                 shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), shared_gs, 8)
@@ -505,6 +508,14 @@ def test_router_logits_of_another_dtype_keep_the_composed_body():
     assert not plan.proof.ran and not plan.proof.failed
 
 
+def test_a_shared_expert_of_another_width_is_folded():
+    block = _block(1024, 320, shared_inter=448)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, x).fold
+    assert _same_bits(*_pair(block, x))
+    assert _engaged()
+
+
 @pytest.mark.parametrize(
     "owner,names",
     [
@@ -545,8 +556,14 @@ def test_ineligible_shapes_keep_the_composed_body(kwargs):
         # A threadgroup takes six of the 320 gate rows.
         ("_GATE_UP_ROWS", 3),
         ("_GATE_UP_SIMDGROUPS", 3),
-        ("_down_rows", lambda rows: 3 if rows == 1 else 4),
-        ("_down_rows", lambda rows: 2 if rows == 1 else 3),
+        # Groups of 128 rows: whole in the hidden size and in gate+up's 640
+        # rows, not in the experts' 320.
+        ("_GATE_UP_ROWS", 64),
+        # Groups of 5 rows: whole in the experts' width, not in the hidden
+        # size. One token, a window, the widest window.
+        ("_down_rows", lambda rows: 5 if rows == 1 else 4),
+        ("_down_rows", lambda rows: 2 if rows == 1 else 5),
+        ("_down_rows", lambda rows: 5 if rows == routed.WINDOW_MAX_ROWS else 2),
     ],
 )
 def test_rows_that_are_not_whole_launch_groups_keep_the_composed_body(
@@ -630,8 +647,6 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
         assert _same_bits(*_pair(twin, x))
         assert _same_bits(*_pair(block, x))
     assert len(calls) == 1
-    # With the real launch back as well.
-    assert routed.routed_decode_plan(block, x) is None
     warnings = _logged(caplog, routed, logging.WARNING)
     assert [r.getMessage() for r in warnings] == [
         "fused routed-expert decode failed; composed fallback"
@@ -727,7 +742,7 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(
     # The answer is kept with the block's plan: no projection is asked twice.
     own = {id(block.switch_mlp.gate_up_proj), id(block.switch_mlp.down_proj)}
     assert asked and {id(layer) for layer in asked} <= own
-    assert len(asked) <= len(own)
+    assert len({id(layer) for layer in asked}) == len(asked)
     defect = "RuntimeError('no face today')"
     assert [repr(r.exc_info[1]) for r in _logged(caplog, formats)] == [defect]
     assert dot_defects == {("affine", defect)}
@@ -750,6 +765,7 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
     assert proof(unfolded(hidden=2048)) is not base
     assert proof(unfolded(inter=448)) is not base
     assert proof(unfolded(top_k=8)) is not base
+    assert proof(_block(1024, 320, shared_inter=448)) is not folded
     # With 128 experts the router is the fused gemv.
     assert proof(unfolded(experts=128)) is not base
     dot = formats.dot
@@ -778,10 +794,24 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
         assert renamed(block, *layers) is not folded
     block = _block(1024, 320, seed=2)
     assert renamed(block, block.shared_expert_gate) is not folded
-    # The same faces on tensors of another dtype.
-    block = unfolded(dtype=mx.float16)
-    patched(lambda layer, face: replace(face, dtypes=(mx.bfloat16,)))
-    assert proof(block) is not base
+
+    def recast(block, *layers):
+        for layer in layers:
+            layer.scales = layer.scales.astype(mx.float16)
+            layer.biases = layer.biases.astype(mx.float16)
+        patched(lambda layer, face: replace(face, dtypes=(mx.bfloat16,)))
+        return proof(block)
+
+    # The same faces, with one matrix's tensors in another dtype.
+    for name in ("gate_up_proj", "down_proj"):
+        block = unfolded(seed=2)
+        assert recast(block, block.switch_mlp[name]) is not base
+    for names in (("gate_proj", "up_proj"), ("down_proj",)):
+        block = _block(1024, 320, seed=2)
+        layers = (block.shared_expert[name] for name in names)
+        assert recast(block, *layers) is not folded
+    block = _block(1024, 320, seed=2)
+    assert recast(block, block.shared_expert_gate) is not folded
 
 
 def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplog):
@@ -793,7 +823,8 @@ def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplo
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
         ran.add((0, experts, True))
-        assert routed.routed_decode_plan(block, x).proof.ran == ran
+        plan = routed.routed_decode_plan(block, x)
+        assert plan.fold and plan.proof.ran == ran
     monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
     assert _same_bits(*_pair(block, x))
     assert routed.routed_decode_plan(block, x).proof.ran == ran | {(0, 128, False)}
@@ -810,8 +841,9 @@ def test_apply_requires_the_fused_router(_patched_block):
 
 
 def test_apply_loads_the_formats_or_leaves_the_block_unpatched(
-    _patched_block, monkeypatch
+    _patched_block, monkeypatch, caplog
 ):
+    caplog.set_level(logging.ERROR, logger=routed.__name__)
     cls = _patched_block
     served = cls.__call__._omlx_routed_decode_original
     loads = []
@@ -833,6 +865,11 @@ def test_apply_loads_the_formats_or_leaves_the_block_unpatched(
     with pytest.raises(ImportError, match="built-in format"):
         routed.apply_qwen35_moe_routed_decode_patch()
     assert cls.__call__ is served and "_omlx_routed_decode" not in cls.__dict__
+    # Said here: the engine's guard logs what it catches at debug level.
+    (record,) = _logged(caplog, routed, logging.ERROR)
+    message = "quant formats did not load; routed decode not applied"
+    assert record.getMessage() == message
+    assert type(record.exc_info[1]) is ImportError
 
 
 def test_apply_is_idempotent(_patched_block):

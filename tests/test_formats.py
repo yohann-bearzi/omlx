@@ -446,7 +446,7 @@ def test_a_defect_fails_a_block_that_admits_none(plugins, dot_defects):
     defect = ("toy", "_DefectError('no biases')")
     with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
         assert formats.dot(_layer(), 64, 8) is None
-    assert str(failure.value).endswith(f"dot() is defective: {[defect]}")
+    assert str(failure.value) == f"a quant format's dot() is defective: {[defect]}"
     # The defect is the block's: nothing outside collected it.
     assert formats._DOT_DEFECTS is dot_defects and not dot_defects
     with testing.no_dot_defects() as defects:
@@ -473,6 +473,15 @@ def test_each_test_runs_in_a_block_that_admits_no_dot_defect(request, monkeypatc
     # The block is not a patch that a test's monkeypatch undoes.
     monkeypatch.undo()
     assert formats._DOT_DEFECTS is defects
+
+
+_BLOCKS: list = []
+
+
+@pytest.mark.parametrize("_", range(2))
+def test_each_test_has_a_block_of_its_own(dot_defects, _):
+    assert all(dot_defects is not seen for seen in _BLOCKS)
+    _BLOCKS.append(dot_defects)
 
 
 def test_an_interrupt_inside_dot_is_not_a_defect(plugins):
