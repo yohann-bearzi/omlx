@@ -13,8 +13,8 @@ same arithmetic in two launches after the router:
 1. gate+up with a SwiGLU epilogue, for the selected experts and the
    shared expert, plus the shared-expert gate row. Each simdgroup computes
    the gate rows and the matching up rows of one expert with MLX's
-   ``qmv_fast`` lane partition and add order, rounds both to the activation
-   dtype, then applies MLX's ``Sigmoid`` and the two multiplies of the
+   ``qmv_fast`` or ``qmv`` lane partition and add order, rounds both to the
+   activation dtype, then applies MLX's ``Sigmoid`` and the two multiplies of the
    compiled ``swiglu`` in its order. The gate row follows MLX's ordinary
    one-row QMV dispatch; its threadgroup comes first in the grid.
 2. down with the combine. Simdgroup ``j`` of a threadgroup runs the stock
@@ -42,10 +42,10 @@ weight format. The affine format's is the MLX 0.32.4 transcription in
 picks ``qmv_fast`` when K is a multiple of its kernel block
 (512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
-Routed experts are taken where gate+up takes ``qmv_fast``: one bf16 or fp16
-token, top-k 8 or 10, affine experts with scales in the activation dtype
-(Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512; Qwen3.8-Flash-Next: 2560
-and 640). Down takes ``qmv_fast`` or ``qmv``. A shared expert or gate outside
+Routed experts are taken for one bf16 or fp16 token, top-k 8 or 10, affine
+experts with scales in the activation dtype (Qwen3.5/3.6-35B-A3B: hidden
+2048, intermediate 512; Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down
+each take ``qmv_fast`` or ``qmv``. A shared expert or gate outside
 that format (unquantized, packed, ...) runs as composed launches and only its outputs
 enter the combine. Prefill, multi-row calls and every other shape keep the
 original body. If the first launch fails, the patch disables itself and the
@@ -600,7 +600,6 @@ def _build_plan(block) -> _Plan | None:
     if (
         gu_fmt is None
         or d_fmt is None
-        or gu_fmt.tail
         or gate_up["weight"].shape[0] != down["weight"].shape[0]
         or gu_fmt.dtype is None
         or not d_fmt.exact_for(gu_fmt.dtype)

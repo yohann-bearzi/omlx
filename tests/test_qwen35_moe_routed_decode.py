@@ -121,6 +121,12 @@ def _same_bits(a, b):
         (1024, 320, 5, 32),
         (1024, 384, 6, 128),
         (1024, 320, 8, 64),
+        # Gate+up takes qmv: K ends in a partial kernel block, or is whole
+        # blocks of qmv's but not of qmv_fast's.
+        (960, 320, 4, 64),
+        (1280, 320, 5, 64),
+        (896, 320, 6, 64),
+        (832, 320, 8, 64),
     ],
 )
 def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypatch):
@@ -410,7 +416,6 @@ def test_plan_follows_replaced_weights(owner, names):
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"hidden": 960, "inter": 320},  # gate+up would take qmv
         {"hidden": 1024, "inter": 320, "top_k": 6},
         {"hidden": 1024, "inter": 320, "bits": 3},
     ],

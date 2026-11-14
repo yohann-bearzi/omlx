@@ -297,6 +297,22 @@ def test_top8_window_and_batched_rows_equal_one_token_decode(dtype, engaged):
     assert _same_bits(got, _serial(block, x).reshape(got.shape))
 
 
+def test_gate_up_qmv_window_and_batched_rows_equal_one_token_decode(engaged):
+    """Gate+up as MLX's ``qmv`` (hidden 1152 at 4 bits ends in a partial
+    kernel block): verify windows and batched decode rows equal the fused
+    one-token decode of each row."""
+    hidden = 1152
+    block = _block(5, bits=4, hidden=hidden, inter=384, top_k=8)
+    for rows in (1, 3, 8, 16):
+        for step in range(3):
+            _check(block, _inputs(rows, step, hidden=hidden), engaged)
+    x = _inputs(5, 0, hidden=hidden).reshape(5, 1, hidden)
+    count = len(engaged)
+    got = block(x)
+    assert engaged[count:] == [True]
+    assert _same_bits(got, _serial(block, x).reshape(got.shape))
+
+
 def _quantized(shape, group_size, bits):
     return mx.quantize(mx.random.normal(shape) * 0.05, group_size, bits)
 
