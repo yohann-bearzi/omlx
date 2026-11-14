@@ -57,8 +57,8 @@ template <typename L, typename T, int... RA, int... RB>
 METAL_FUNC void omlx_qmv_block(
     omlx_ints<RA...>,
     omlx_ints<RB...>,
-    L a,
-    L b,
+    thread const L& a,
+    thread const L& b,
     const device T* x,
     thread float* x_thread,
     thread float* result) {
@@ -138,14 +138,24 @@ class Matrices:
     def add(self, name: str, face: Dot) -> list[str]:
         """Add matrix ``name``. Returns its kernel inputs: the weight, then
         the face's tensors in order."""
+        inputs = _inputs(name, face)
+        taken = [i for other in self._faces.items() for i in _inputs(*other)]
+        if len({*taken, *inputs}) != len(taken) + len(inputs):
+            raise ValueError(
+                f"matrix {name!r}: {', '.join(inputs)} would repeat an input of "
+                "the kernel"
+            )
         self._faces[name] = face
-        return _inputs(name, face)
+        return inputs
 
     @property
     def header(self) -> str:
         """The Metal the kernel includes: the index packs, each distinct
-        format source once, then the skeletons."""
-        sources = {face.source: face.key for face in self._faces.values()}
+        format source once (cited under the key of the first face that has
+        it), then the skeletons."""
+        sources: dict[str, str] = {}
+        for face in self._faces.values():
+            sources.setdefault(face.source, face.key)
         return (
             _named(_SKELETONS, _INDEX_PACKS)
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
@@ -165,8 +175,9 @@ class Matrices:
 
 def _named(name: str, source: str, line: int = 1) -> str:
     """``source`` as the Metal compiler will cite it: under ``name``, its
-    first line numbered ``line``."""
-    return f'#line {line} "{name}"\n{source}'
+    first line numbered ``line``. The directive opens a line of its own,
+    whatever the text before it ends with."""
+    return f'\n#line {line} "{name}"\n{source}'
 
 
 def _inputs(name: str, face: Dot) -> list[str]:

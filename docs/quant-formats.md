@@ -97,10 +97,13 @@ A kernel runs a face in this order, in every lane, for each of its rows `r`:
 
 ```
 acc[r] = 0
-for each block the lane has inputs in:
+for each whole block of K:
     aux = load(x, xt)
     acc[r] = madd(acc[r], row(r), xt, aux)
     step()
+if K ends inside a block, in the lanes that have inputs in it:
+    aux = load(x, xt)
+    acc[r] = madd(acc[r], row(r), xt, aux)
 result[r] = finish(r, simd_sum(acc[r]))
 ```
 
@@ -110,7 +113,10 @@ Rules:
 
 - `BLOCK == 32 * VPT`, and K is a multiple of `VPT`. A kernel asserts both when it is compiled, so a format's `dot()` returns `None` for a K that is not.
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
-- A face only reads the matrix. Its members store to nothing but the cursor's own state and `xt`: a kernel may build and step a cursor for a block it then skips.
+- A face never writes the matrix: its members store to nothing but the cursor's own state and `xt`.
+- The constructor and `step()` only move pointers and read nothing. A kernel may build a cursor on a row past the matrix (for an empty pack of rows) and step it into a block it then skips. `row`, `load`, `madd` and `finish` run only for rows and blocks the kernel computes; `row` is `const`.
+- `row`, `load` and `madd` use no simdgroup or threadgroup operation (`simd_sum`, `simd_shuffle`, a barrier): in a last, partial block only some of the lanes run them. A face that needs whole blocks returns `None` from `dot()` for any other K.
+- `finish` runs where the walk left the cursor, which is not one place: past the last whole block, or on a last, partial one. It reads only what `step()` does not move.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
 
 ### An example
@@ -175,7 +181,7 @@ Dot(
 
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body.
+A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_w` and `<name>_<tensor>`; `add` refuses a matrix that would repeat an input.
 
 ```python
 import mlx.core as mx

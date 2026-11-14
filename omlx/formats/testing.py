@@ -55,12 +55,21 @@ def dot_rows(
     kernel is compiled for ``face`` and K.
     """
     na, nb = packs
+    if min(na, nb) < 0 or na + nb == 0:
+        raise ValueError(f"packs={packs}: a launch takes one row or more")
     if n % (na + nb):
         raise ValueError(f"n={n} is not a multiple of the {na + nb} rows of a launch")
+    if x.ndim != 1:
+        raise ValueError(f"x is one vector of K activations, not of shape {x.shape}")
+    operands, names = tuple(operands), ("weight", *face.tensors)
+    if len(operands) != len(names):
+        raise ValueError(
+            f"face {face.key} reads {', '.join(names)}: {len(operands)} operands given"
+        )
     if not face.exact_for(x.dtype):
         exact = ", ".join(str(dtype) for dtype in face.dtypes)
         raise ValueError(f"face {face.key} is exact for {exact}, x is {x.dtype}")
-    for name, operand in zip(("weight", *face.tensors), operands, strict=True):
+    for name, operand in zip(names, operands, strict=True):
         if operand.size < 8:
             raise ValueError(
                 f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
