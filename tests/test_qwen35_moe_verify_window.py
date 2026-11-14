@@ -131,6 +131,24 @@ def _same_bits(a, b):
     return a.shape == b.shape and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
 
 
+def _does_not_compile(a, shape=None):
+    """An array like ``a`` (of ``shape``) that fails when it is evaluated: MLX
+    compiles a kernel then."""
+    kernel = mx.fast.metal_kernel(
+        name="does_not_compile",
+        input_names=["a"],
+        output_names=["y"],
+        source="does not compile;",
+    )
+    return kernel(
+        inputs=[a],
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+        output_shapes=[shape or a.shape],
+        output_dtypes=[a.dtype],
+    )[0]
+
+
 def _serial(block, x):
     """The served one-token decode of every row (the fused routed call)."""
     rows = x.reshape(-1, 1, 1, x.shape[-1])
@@ -281,24 +299,11 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     old = _verify(block, x, window=False)
     plan = routed.routed_decode_plan(block, x[:, :1])
     assert not plan.proof.ran
-    kernel = mx.fast.metal_kernel(
-        name="does_not_compile",
-        input_names=["h"],
-        output_names=["y"],
-        source="does not compile;",
-    )
     calls = []
 
     def broken(plan, h, indices, scores):
-        # MLX compiles the kernel when its output is evaluated.
         calls.append(1)
-        return kernel(
-            inputs=[h],
-            grid=(1, 1, 1),
-            threadgroup=(1, 1, 1),
-            output_shapes=[(indices.shape[0], plan.hidden)],
-            output_dtypes=[plan.dtype],
-        )[0]
+        return _does_not_compile(h, (indices.shape[0], plan.hidden))
 
     monkeypatch.setattr(routed, "_window_down", broken)
     for _ in range(2):
@@ -310,6 +315,36 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     assert routed.routed_decode_plan(block, x[:, :1]) is plan
     assert _same_bits(_serial(block, x), old)
     assert plan.proof.ran == {(0, BLOCK_EXPERTS, True)} and not plan.proof.failed
+
+
+def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
+    block = _block(0)
+    x = _inputs(4, 1)
+    plan = routed.routed_decode_plan(block, x[:, :1])
+    with pytest.raises(RuntimeError, match="Unable to build metal library"):
+        routed.routed_verify_window(block, _does_not_compile(x))
+    assert engaged == [] and not plan.proof.window_failed and not plan.proof.ran
+    _check(block, x, engaged)
+
+
+def test_only_an_unproven_window_launch_is_evaluated_in_the_call(monkeypatch):
+    block = _block(0)
+    x = _inputs(4, 1)
+    routed.routed_decode_plan(block, x[:, :1])  # evaluates the experts' views
+    evaluate, evaluated = mx.eval, []
+
+    def recorded(*arrays):
+        evaluated.append(arrays)
+        evaluate(*arrays)
+
+    monkeypatch.setattr(mx, "eval", recorded)
+    y = routed.routed_verify_window(block, x)
+    # The window's rows first, outside the launch's guard, then the launch.
+    assert [len(arrays) for arrays in evaluated] == [1, 1]
+    assert evaluated[0][0].shape == (4, HIDDEN) and evaluated[1][0] is y
+    del evaluated[:]
+    assert routed.routed_verify_window(block, x) is not None
+    assert not evaluated
 
 
 def test_a_failed_one_token_launch_keeps_windows_composed(monkeypatch, engaged):

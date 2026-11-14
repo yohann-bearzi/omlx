@@ -130,6 +130,36 @@ def _same_bits(a, b):
     return a.shape == b.shape and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
 
 
+def _does_not_compile(a):
+    """An array like ``a`` that fails when it is evaluated: MLX compiles a
+    kernel then."""
+    kernel = mx.fast.metal_kernel(
+        name="does_not_compile",
+        input_names=["a"],
+        output_names=["y"],
+        source="does not compile;",
+    )
+    return kernel(
+        inputs=[a],
+        grid=(1, 1, 1),
+        threadgroup=(1, 1, 1),
+        output_shapes=[a.shape],
+        output_dtypes=[a.dtype],
+    )[0]
+
+
+class _CastGate(nn.Module):
+    """A router whose logits are not in its input's dtype."""
+
+    def __init__(self, gate, dtype):
+        super().__init__()
+        self.gate = gate
+        self.dtype = dtype
+
+    def __call__(self, x):
+        return self.gate(x).astype(self.dtype)
+
+
 @pytest.mark.parametrize(
     "hidden,inter,bits,group_size",
     [
@@ -461,6 +491,20 @@ def test_mismatched_dtypes_keep_the_composed_body():
     assert routed.routed_decode_plan(block, x) is None
 
 
+def test_router_logits_of_another_dtype_keep_the_composed_body():
+    block = _block(512, 256, top_k=8, experts=128)
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    logits = block.gate(x)
+    block.gate = _CastGate(block.gate, mx.float16)
+    plan = routed.routed_decode_plan(block, x)
+    assert plan.router_logits is None
+    # The folded routing takes fp16 logits, in a launch compiled for fp16.
+    assert routed._topk_folds(plan, logits)
+    assert not routed._topk_folds(plan, block.gate(x))
+    assert _same_bits(*_pair(block, x))
+    assert not plan.proof.ran and not plan.proof.failed
+
+
 @pytest.mark.parametrize(
     "owner,names",
     [
@@ -597,6 +641,39 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
     assert routed.routed_decode_plan(other, x) is not None
     assert _same_bits(*_pair(other, x))
     assert routed.routed_decode_plan(other, x).proof.ran
+
+
+def test_a_failure_ahead_of_the_block_is_raised_and_not_its_launch_s(caplog):
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
+    block = _block(1024, 320)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    plan = routed.routed_decode_plan(block, x)
+    with pytest.raises(RuntimeError, match="Unable to build metal library"):
+        block(_does_not_compile(x))
+    assert not plan.proof.failed and not plan.proof.ran
+    assert not _logged(caplog, routed, logging.WARNING)
+    assert _same_bits(*_pair(block, x))
+    assert _engaged()
+
+
+def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
+    block = _block(1024, 320)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    routed.routed_decode_plan(block, x)  # evaluates the experts' views
+    evaluate, evaluated = mx.eval, []
+
+    def recorded(*arrays):
+        evaluated.append(arrays)
+        evaluate(*arrays)
+
+    monkeypatch.setattr(mx, "eval", recorded)
+    y = block(x)
+    # The input first, outside the launch's guard, then the launch.
+    assert [len(arrays) for arrays in evaluated] == [1, 1]
+    assert evaluated[0][0] is x and evaluated[1][0] is y
+    del evaluated[:]
+    block(x)
+    assert not evaluated
 
 
 def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(

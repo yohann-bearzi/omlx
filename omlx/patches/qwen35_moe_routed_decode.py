@@ -129,7 +129,8 @@ class _Proof:
 
     MLX compiles a kernel when it first evaluates it. So a launch is
     evaluated the first time it is built, while the call can still fall
-    back, and one that fails keeps these blocks on their composed body."""
+    back, and one that fails keeps these blocks on their composed body. The
+    block's input is evaluated ahead of it: its failure is the caller's."""
 
     # (window rows or 0 for one token, router width, top-k folded in)
     ran: set = field(default_factory=set)
@@ -786,6 +787,8 @@ def routed_decode(plan: _Plan, x, indices, scores, shared=None, gate=None):
 def _topk_folds(plan: _Plan, logits) -> bool:
     return (
         plan.topk_kernel is not None
+        # The launch reads the logits in the plan's dtype.
+        and logits.dtype == plan.dtype
         and logits.size // logits.shape[-1] <= _TOPK_FOLD_MAX_ROWS
         and softmax_topk_eligible(logits)
     )
@@ -888,6 +891,10 @@ def routed_verify_window(block, x):
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), plan.top_k)
         inds, scores = routing
     launch = (rows, logits.shape[-1], folded)
+    proven = launch in plan.proof.ran
+    if not proven:
+        # What fails ahead of the block is not the launch's failure.
+        mx.eval(x)
     try:
         if folded:
             y = (routed_decode_logits if rows == 1 else routed_window_logits)(plan, x, logits)
@@ -895,7 +902,7 @@ def routed_verify_window(block, x):
             y = routed_decode(plan, x, inds, scores)
         else:
             y = routed_window(plan, x, inds, scores)
-        if launch not in plan.proof.ran:
+        if not proven:
             mx.eval(y)
             plan.proof.ran.add(launch)
             logger.info("Qwen MoE fused verify-window experts engaged (%d rows)", rows)
@@ -982,12 +989,16 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             if scores.dtype != x.dtype:
                 return orig_call(self, x)
         launch = (0, logits.shape[-1], folded)
+        proven = launch in plan.proof.ran
+        if not proven:
+            # What fails ahead of the block is not the launch's failure.
+            mx.eval(x)
         try:
             if folded:
                 y = routed_decode_logits(plan, x, logits, shared, shared_gate)
             else:
                 y = routed_decode(plan, x, inds, scores, shared, shared_gate)
-            if launch not in plan.proof.ran:
+            if not proven:
                 # Surface a kernel build failure while the call can still
                 # fall back.
                 mx.eval(y)
