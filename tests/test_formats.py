@@ -321,6 +321,10 @@ def test_a_face_names_metal_identifiers(names):
         ({"tensors": ["scales"]}, "tensors and dtypes are tuples"),
         ({"dtypes": mx.float16}, "tensors and dtypes are tuples"),
         ({"tensors": ("scales", "scales")}, "a tensor is named twice"),
+        ({"dtypes": (None,)}, "dtypes are distinct mx.Dtype"),
+        ({"dtypes": ("float16",)}, "dtypes are distinct mx.Dtype"),
+        ({"dtypes": (mx.float16, [])}, "dtypes are distinct mx.Dtype"),
+        ({"dtypes": (mx.float16, mx.float16)}, "dtypes are distinct mx.Dtype"),
     ],
 )
 def test_a_face_lists_its_tensors_and_dtypes_in_tuples(fields, message):

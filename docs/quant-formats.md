@@ -64,7 +64,7 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. |
 | `tensors` | The layer's parameters beside `weight` that the face reads, as a tuple. They become kernel inputs in this order. Identifiers, each named once. |
-| `dtypes` | The activation dtypes the face is exact for, as a tuple; empty (the default) for any. Ask with `face.exact_for(dtype)`. |
+| `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype`; empty (the default) for any. Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
 
 ## The dot face
 
@@ -328,3 +328,5 @@ Any other affine layer (2 or 3 bits, fp32 scales, no biases) has no face and run
 | Kernel | Face | Code |
 |---|---|---|
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
+
+The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path.

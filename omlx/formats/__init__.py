@@ -26,7 +26,8 @@ import logging
 import threading
 from dataclasses import dataclass
 from importlib.metadata import EntryPoint, entry_points
-from typing import Any
+
+import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class Dot:
     source: str
     type: str
     tensors: tuple[str, ...]
-    dtypes: tuple[Any, ...] = ()  # the activation dtypes it is exact for; any if empty
+    dtypes: tuple[mx.Dtype, ...] = ()  # the activations it is exact for; any if empty
 
     def __post_init__(self) -> None:
         if not (isinstance(self.tensors, tuple) and isinstance(self.dtypes, tuple)):
@@ -70,6 +71,12 @@ class Dot:
             raise ValueError(
                 f"quant format face {self.key!r}: a tensor is named twice in "
                 f"{self.tensors!r}"
+            )
+        dtypes = {dtype for dtype in self.dtypes if isinstance(dtype, mx.Dtype)}
+        if len(dtypes) != len(self.dtypes):
+            raise ValueError(
+                f"quant format face {self.key!r}: dtypes are distinct mx.Dtype, "
+                f"not {self.dtypes!r}"
             )
 
     def exact_for(self, dtype) -> bool:
