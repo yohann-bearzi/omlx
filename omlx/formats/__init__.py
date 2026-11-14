@@ -192,7 +192,7 @@ def dot(layer, k: int, n: int) -> Dot | None:
         if face is None:
             return None
         if not isinstance(face, Dot):
-            raise TypeError(f"dot() returned a {type(face).__name__}, not a Dot")
+            raise TypeError(f"dot() returned a {type(face)!r}, not a Dot")
         lacking = [
             name
             for name in ("weight", *face.tensors)

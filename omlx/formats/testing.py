@@ -5,10 +5,12 @@ in the skeletons oMLX's kernels are built from, outside any model.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import cache
 
 import mlx.core as mx
 
+from .. import formats
 from . import Dot, kernels
 
 _STORE = r"""
@@ -28,6 +30,26 @@ _ROWS = r"""
       store_rows(omlx_iota<NA + NB>(), result, y + row);
     }
 """
+
+
+@contextmanager
+def no_dot_defects():
+    """Fail on leaving the block when a format's ``dot()`` was defective in it.
+
+    ``omlx.formats.dot`` logs a defect and answers None: a model keeps its
+    composed path. A test wants the failure. oMLX runs each of its tests in
+    this block, and so can a plugin, from an autouse fixture.
+
+    The block's value is the set of the defects met so far, each a format's
+    mode and the error. A test that expects one removes it."""
+    defects: set = set()
+    kept, formats._DOT_DEFECTS = formats._DOT_DEFECTS, defects
+    try:
+        yield defects
+    finally:
+        formats._DOT_DEFECTS = kept
+    if defects:
+        raise AssertionError(f"a quant format's dot() is defective: {sorted(defects)}")
 
 
 @cache

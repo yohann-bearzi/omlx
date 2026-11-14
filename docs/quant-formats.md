@@ -58,7 +58,16 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors`, as below, so that these defects fail them.
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors`, as below, so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails when a `dot()` was defective in the block:
+
+```python
+@pytest.fixture(autouse=True)
+def _dot_defects_fail_the_test():
+    with testing.no_dot_defects() as defects:
+        yield defects
+```
+
+The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it.
 
 | `Dot` field | Meaning |
 |---|---|

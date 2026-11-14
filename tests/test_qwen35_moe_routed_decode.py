@@ -532,7 +532,10 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(
 
 
 def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog):
+    asked = []
+
     def raises(self, layer, k, n):
+        asked.append(layer)
         raise RuntimeError("no face today")
 
     monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
@@ -545,6 +548,9 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog
     assert routed.routed_decode_plan(block, x) is None
     assert not routed._PROOFS
     # The answer is kept with the block's plan.
+    gate_up, down = asked
+    experts = block.switch_mlp
+    assert gate_up is experts.gate_up_proj and down is experts.down_proj
     assert [repr(r.exc_info[1]) for r in _logged(caplog, formats)] == [
         "RuntimeError('no face today')"
     ]

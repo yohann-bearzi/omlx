@@ -15,6 +15,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx import formats
+from omlx.formats import testing
 
 _FACE = formats.Dot(
     key="toy_b4",
@@ -319,9 +320,13 @@ class _NoFace(_Format):
         return None
 
 
+class _DefectError(Exception):
+    """No exception oMLX or Python raises."""
+
+
 class _Raises(_Format):
     def dot(self, layer, k, n):
-        raise RuntimeError("no biases")
+        raise _DefectError("no biases")
 
 
 class _NotADot(_Format):
@@ -343,8 +348,12 @@ def _layer_with_a_child_named_scales():
 @pytest.mark.parametrize(
     "fmt, layer, defect",
     [
-        (_Raises(), _layer(), "RuntimeError('no biases')"),
-        (_NotADot(), _layer(), "TypeError('dot() returned a str, not a Dot')"),
+        (_Raises(), _layer(), "_DefectError('no biases')"),
+        (
+            _NotADot(),
+            _layer(),
+            "TypeError(\"dot() returned a <class 'str'>, not a Dot\")",
+        ),
         # _FACE reads scales.
         (
             _Format(),
@@ -401,14 +410,42 @@ def test_each_defect_of_a_format_is_logged_once(plugins, caplog):
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         for layer in asked:
             assert formats.dot(layer, 64, 8) is None
+        # Whatever the matrix asked for.
+        assert formats.dot(no_scales, 128, 16) is None
         # Only a defect's layers lose the face.
         assert formats.dot(_layer(), 64, 8) is _FACE
     assert [(r.args[0], repr(r.exc_info[1])) for r in caplog.records] == [
         ("toy", "ValueError('face toy_b4: the layer has no array scales')"),
         ("toy", "ValueError('face toy_b4: the layer has no array weight')"),
-        ("other", "RuntimeError('no biases')"),
-        ("third", "RuntimeError('no biases')"),
+        ("other", "_DefectError('no biases')"),
+        ("third", "_DefectError('no biases')"),
     ]
+
+
+def test_a_defect_fails_a_block_that_admits_none(plugins):
+    formats.register(_Raises())
+    collected = formats._DOT_DEFECTS
+    defect = "_DefectError('no biases')"
+    with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
+        assert formats.dot(_layer(), 64, 8) is None
+    assert str(failure.value).endswith(f"dot() is defective: {[('toy', defect)]}")
+    # The defect is the block's: nothing outside collected it.
+    assert formats._DOT_DEFECTS is collected and not collected
+    with testing.no_dot_defects() as defects:
+        assert formats.dot(_layer("other"), 64, 8) is None
+        assert formats.dot(_layer(), 64, 8) is None
+        assert defects == {("toy", defect)}
+        defects.clear()  # expected
+    with pytest.raises(KeyError), testing.no_dot_defects():
+        formats.dot(_layer(), 64, 8)
+        raise KeyError  # the block's own failure is the one reported
+    assert formats._DOT_DEFECTS is collected
+
+
+def test_omlx_tests_run_in_a_block_that_admits_no_dot_defect(request):
+    name = "_quant_format_defects_fail_the_test"
+    assert name in request.fixturenames  # of every test
+    assert formats._DOT_DEFECTS is request.getfixturevalue(name)
 
 
 def test_an_interrupt_inside_dot_is_not_a_defect(plugins):
