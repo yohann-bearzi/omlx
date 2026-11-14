@@ -120,12 +120,12 @@ def register(fmt: QuantFormat) -> None:
             f"quant format {mode!r}: tensors must be a tuple of the parameter "
             "names beside 'weight' and 'bias'"
         )
-    _load()
+    load()
     if _FORMATS.setdefault(mode, fmt) is not fmt:
         raise ValueError(f"quant format {mode!r} is already registered")
 
 
-def _load() -> None:
+def load() -> None:
     """Register the built-in formats, then every installed plugin's, in the
     order of their entry points' names, then values. A plugin that fails to
     load is logged and skipped, with every format registered while it loaded:
@@ -134,7 +134,10 @@ def _load() -> None:
     here and at every later lookup.
 
     A lookup the loading thread makes while the load runs sees the formats
-    registered so far. Plugins do not rely on it (docs/quant-formats.md)."""
+    registered so far. Plugins do not rely on it (docs/quant-formats.md).
+
+    Every lookup loads first. A caller loads ahead of a model's first token,
+    so that the token neither waits for the load nor meets its failure."""
     global _loaded, _loading
     if _loaded:
         return
@@ -165,7 +168,7 @@ def _load() -> None:
 
 def get(mode: str | None) -> QuantFormat | None:
     """The format registered for ``mode``, or None."""
-    _load()
+    load()
     return _FORMATS.get(mode)
 
 

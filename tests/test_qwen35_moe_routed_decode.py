@@ -180,16 +180,45 @@ def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
     assert _engaged()
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("quantized_shared", [True, False])
+@pytest.mark.parametrize(
+    "hidden,inter,bits,group_size",
+    [(960, 320, 4, 32), (896, 384, 5, 128), (832, 320, 6, 32), (896, 384, 8, 128)],
+)
+def test_qmv_gate_up_is_bit_identical(
+    hidden, inter, bits, group_size, quantized_shared, dtype
+):
+    """K ends in a partial kernel block: gate+up, the shared expert's and the
+    gate row take ``qmv``."""
+    block = _block(
+        hidden,
+        inter,
+        bits=bits,
+        group_size=group_size,
+        quantized_shared=quantized_shared,
+        dtype=dtype,
+    )
+    for step in range(4):
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(dtype)
+        assert routed.routed_decode_plan(block, x).fold == quantized_shared
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert _engaged()
+
+
+@pytest.mark.parametrize("hidden", [2560, 2432])
 @pytest.mark.parametrize("bits", [4, 5])
-def test_fp32_kernels_match_mlx_mat_vecs(bits):
+def test_fp32_kernels_match_mlx_mat_vecs(bits, hidden):
     """BF16 outputs hide one-ulp FP32 differences, so run both launches in
     FP32 against MLX's FP32 mat-vecs: the gate+up rows after SwiGLU of the
     experts and the shared expert plus the gate row, then every down row
     read through the combine (a one-hot score with the gate at sigmoid 0
-    reads one expert; zero scores with the gate at sigmoid 1 the shared one)."""
+    reads one expert; zero scores with the gate at sigmoid 1 the shared one).
+    Hidden 2560 is whole kernel blocks (``qmv_fast``), 2432 is not (``qmv``)."""
     from mlx_vlm.models.activations import swiglu
 
-    hidden, inter, gs, top_k = 2560, 640, 64, 10
+    inter, gs, top_k, fast = 640, 64, 10, hidden == 2560
     f32 = mx.float32
     mx.random.seed(40 + bits)
 
@@ -206,7 +235,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
     gate_row = quantized((1, hidden), 64, 8)
     fmt = partial(affine.face, dtype=f32)
     gate_up_kernel = routed._gate_up_kernel(
-        fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, True)
+        fmt(bits, gs, fast), fmt(8, 128, fast), fmt(8, 64, fast)
     )
     down_kernel = routed._down_kernel(fmt(bits, gs, False), fmt(8, 128, False))
     for step in range(3):
@@ -341,6 +370,28 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
         assert _same_bits(ref, out)
 
 
+@pytest.mark.parametrize(
+    "shape,viewed",
+    [
+        ((4, 8, 2), True),
+        ((4, 8), True),
+        # MLX binds an input of fewer than 8 elements as constants.
+        ((4, 7), False),
+        ((4, 4, 1), False),
+        ((16,), False),
+        ((), False),
+    ],
+)
+def test_an_expert_of_fewer_than_8_elements_is_bound_with_its_stack(shape, viewed):
+    a = mx.zeros(shape)
+    mx.eval(a)
+    view = routed._expert_view(a)
+    if viewed:
+        assert view.shape == (1, *shape[1:])
+    else:
+        assert view is a
+
+
 def test_tied_router_logits_route_like_the_served_block():
     """Duplicated router rows give exactly tied probabilities; ties must pick
     the same experts, in the same order, with the same scores as the served
@@ -442,6 +493,50 @@ def test_ineligible_shapes_keep_the_composed_body(kwargs):
     hidden = kwargs["hidden"]
     x = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
     assert routed.routed_decode_plan(block, x) is None
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        # A threadgroup takes six of the 320 gate rows.
+        ("_GATE_UP_ROWS", 3),
+        ("_GATE_UP_SIMDGROUPS", 3),
+        ("_down_rows", lambda rows: 3 if rows == 1 else 4),
+        ("_down_rows", lambda rows: 2 if rows == 1 else 3),
+    ],
+)
+def test_rows_that_are_not_whole_launch_groups_keep_the_composed_body(
+    name, value, monkeypatch
+):
+    """The grids divide the rows by a launch's rows per group. Affine experts
+    are whole groups at every shape MLX quantizes; another format's are not
+    bound to be."""
+    monkeypatch.setattr(routed, name, value)
+    block = _block(1024, 320)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, x) is None
+    assert _same_bits(*_pair(block, x))
+    assert not routed._PROOFS
+
+
+@pytest.mark.parametrize("dtypes", [(), (mx.bfloat16, mx.float16)])
+def test_a_gate_up_face_names_the_one_dtype_of_the_launches(dtypes, monkeypatch):
+    """The launches are compiled for the activations the gate+up face is
+    exact for; a face exact for several does not say which."""
+    face = affine.AffineFormat.dot
+
+    def several(self, layer, k, n):
+        found = face(self, layer, k, n)
+        if found is None or layer["weight"].ndim == 2 or k != 1024:
+            return found
+        return replace(found, dtypes=dtypes)
+
+    monkeypatch.setattr(affine.AffineFormat, "dot", several)
+    block = _block(1024, 320)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    assert routed.routed_decode_plan(block, x) is None
+    assert _same_bits(*_pair(block, x))
+    assert not routed._PROOFS
 
 
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
@@ -629,6 +724,32 @@ def test_apply_requires_the_fused_router(_patched_block):
     del cls._omlx_routed_decode
     cls._omlx_router_fused = False
     assert not routed.apply_qwen35_moe_routed_decode_patch()
+
+
+def test_apply_loads_the_formats_or_leaves_the_block_unpatched(
+    _patched_block, monkeypatch
+):
+    cls = _patched_block
+    served = cls.__call__._omlx_routed_decode_original
+    loads = []
+
+    def unpatched():
+        cls.__call__ = served
+        del cls._omlx_routed_decode
+
+    unpatched()
+    monkeypatch.setattr(formats, "load", lambda: loads.append(1))
+    assert routed.apply_qwen35_moe_routed_decode_patch()
+    assert loads == [1]  # with the model, ahead of its first token
+
+    def broken():
+        raise ImportError("a built-in format does not import")
+
+    unpatched()
+    monkeypatch.setattr(formats, "load", broken)
+    with pytest.raises(ImportError, match="built-in format"):
+        routed.apply_qwen35_moe_routed_decode_patch()
+    assert cls.__call__ is served and "_omlx_routed_decode" not in cls.__dict__
 
 
 def test_apply_is_idempotent(_patched_block):

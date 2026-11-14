@@ -42,18 +42,19 @@ weight format. The affine format's is the MLX 0.32.4 transcription in
 picks ``qmv_fast`` when K is a multiple of its kernel block
 (512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
-Routed experts are taken for one bf16 or fp16 token, top-k 8 or 10, affine
-experts with scales in the activation dtype (Qwen3.5/3.6-35B-A3B: hidden
-2048, intermediate 512; Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down
-each take ``qmv_fast`` or ``qmv``. A shared expert or gate outside
-that format (unquantized, packed, ...) runs as composed launches and only its outputs
-enter the combine. Prefill, multi-row calls and every other shape keep the
+Routed experts are taken for one bf16 or fp16 token, top-k 8 or 10, experts
+whose format has dot faces exact for the token's dtype (affine: scales in
+that dtype; Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512;
+Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down each take ``qmv_fast``
+or ``qmv``. A shared expert or gate without such faces (unquantized,
+packed, ...) runs as composed launches and only its outputs enter the
+combine. Prefill, multi-row calls and every other shape keep the
 original body. MLX compiles a kernel when it first evaluates it, so a launch
 is evaluated inside the call the first time blocks of its faces, tensor
 dtypes and shapes build it; if that fails, those blocks keep their composed
 body.
 
-Row-exact MTP verify windows (1..8 rows whose logits must equal serial
+Row-exact MTP verify windows (up to 16 rows whose logits must equal serial
 decode) run the same arithmetic for the whole window in the same launches:
 the router gemv over all rows (``qwen35_moe_router.router_gemv``), then
 window variants of the launches above in which each threadgroup serves one
@@ -526,7 +527,11 @@ def _expert_view(a: mx.array) -> mx.array:
 
     The kernels index every expert from the bound pointer, so a view that
     were copied (or offset) would read the wrong bytes; keep the whole array
-    unless the first-expert slice provably aliases it."""
+    unless the first-expert slice provably aliases it. An expert of fewer
+    than 8 elements keeps the whole array too: MLX binds so small an input
+    as constants, not as the buffer a face reads."""
+    if a.ndim < 2 or a.size < 8 * a.shape[0]:
+        return a
     view = a[:1]
     mx.eval(view)
     whole, first = memoryview(a), memoryview(view)
@@ -537,7 +542,7 @@ def _expert_view(a: mx.array) -> mx.array:
 
 class _Plan(NamedTuple):
     hidden: int
-    dtype: mx.Dtype  # activations, outputs and quantization scales
+    dtype: mx.Dtype  # activations and outputs: what the gate+up face is exact for
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
     proof: _Proof
@@ -616,12 +621,16 @@ def _build_plan(block) -> _Plan | None:
     inter = gate_up["weight"].shape[1] // 2
     gu_fmt = formats.dot(gate_up, hidden, 2 * inter)
     d_fmt = formats.dot(down, inter, hidden)
+    rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     if (
         gu_fmt is None
         or d_fmt is None
         or gate_up["weight"].shape[0] != down["weight"].shape[0]
         or len(gu_fmt.dtypes) != 1
         or not d_fmt.exact_for(gu_fmt.dtypes[0])
+        # The launches cover whole groups of rows.
+        or inter % rows
+        or any(hidden % _down_rows(window) for window in (1, 2))
     ):
         return None
     dtype, top_k = gu_fmt.dtypes[0], block.top_k
@@ -654,7 +663,6 @@ def _build_plan(block) -> _Plan | None:
         ),
         _Proof(),
     )
-    rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     gate_up_template = [
         ("T", dtype),
         ("K", hidden),
@@ -939,6 +947,9 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
         return False
     if getattr(cls, "_omlx_routed_decode", False):
         return True
+    # Read the weight formats with the model rather than in its first token.
+    # A registry that cannot load leaves the block unpatched.
+    formats.load()
     orig_call = cls.__call__
 
     def patched_call(self, x):

@@ -168,6 +168,18 @@ def test_a_builtin_that_fails_to_load_raises_at_every_lookup(plugins, monkeypatc
     for _ in range(2):
         with pytest.raises(AttributeError, match="_NO_SUCH_FORMAT"):
             formats.get("builtin")
+        with pytest.raises(AttributeError, match="_NO_SUCH_FORMAT"):
+            formats.load()
+
+
+def test_load_registers_every_format_ahead_of_a_lookup(plugins, monkeypatch):
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
+    fmt = _Format()
+    plugins.append(_Entry("toy", fmt))
+    formats.load()
+    assert dict(formats._FORMATS) == {"builtin": _BUILTIN, "toy": fmt}
+    formats.load()
+    assert plugins[0].loaded == 1
 
 
 def test_plugins_load_once_from_their_entry_points(plugins):

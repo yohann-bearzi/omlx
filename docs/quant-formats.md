@@ -41,7 +41,7 @@ FORMAT = MyFormat()
 myformat = "my_package:FORMAT"
 ```
 
-Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.get`, `dot` or `register`).
+Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
 - A mode has one format. A second format for a registered mode is refused.
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
