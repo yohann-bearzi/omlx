@@ -11,6 +11,8 @@ oMLX's fused kernels are not written for one format. A kernel is a skeleton: it 
 | File | What it holds |
 |---|---|
 | `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
+| `omlx/formats/kernels.py` | the skeletons and `Matrices` |
+| `omlx/formats/testing.py` | checks for a format's own tests |
 
 ## Register a format
 
@@ -107,3 +109,198 @@ Rules:
 
 - `BLOCK == 32 * VPT`, and K is a multiple of `BLOCK` unless `TAIL`. A kernel asserts both when it is compiled.
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
+- The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
+
+### An example
+
+The format `tests/test_formats_kernels.py` runs: 8-bit codes around 128, one float scale per row, K a multiple of 256.
+
+```cpp
+namespace omlx_myformat_b8 {
+struct Dot {
+  const device uint8_t* codes;
+  const device float* scales;
+
+  template <int K>
+  struct Lanes {
+    static constant constexpr int VPT = 8;
+    static constant constexpr int BLOCK = 32 * VPT;
+    static constant constexpr bool TAIL = false;
+
+    const device uint8_t* w;
+    const device float* s;
+
+    Lanes(Dot m, size_t row, uint lane)
+        : w(m.codes + row * K + lane * VPT), s(m.scales + row) {}
+
+    struct Row {
+      const device uint8_t* w;
+      float s;
+    };
+    Row row(int r) const { return {w + r * K, s[r]}; }
+    void step() { w += BLOCK; }
+
+    template <typename X, int... I>
+    static void copy(omlx_ints<I...>, const device X* x, thread float* xt) {
+      ((xt[I] = float(x[I])), ...);
+    }
+    template <int... I>
+    static float dot(omlx_ints<I...>, const device uint8_t* w, thread const float* xt) {
+      return (... + ((float(w[I]) - 128.0f) * xt[I]));
+    }
+
+    template <typename X>
+    static float load(const device X* x, thread float* xt) {
+      copy(omlx_iota<VPT>(), x, xt);
+      return 0;
+    }
+    static float madd(float acc, Row r, thread const float* xt, float) {
+      return acc + r.s * dot(omlx_iota<VPT>(), r.w, xt);
+    }
+
+    float finish(int, float sum) const { return sum; }
+  };
+};
+}  // namespace omlx_myformat_b8
+```
+
+```python
+Dot(
+    key="myformat_b8",
+    source=SOURCE,
+    type="omlx_myformat_b8::Dot",
+    tensors=("scales",),
+    tail=False,
+)
+```
+
+## Kernels over faces
+
+A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body.
+
+```python
+import mlx.core as mx
+from omlx.formats import kernels
+
+matrices = kernels.Matrices()
+inputs = ["x", *matrices.add("m", face)]  # ["x", "m_w", "m_scales"]
+
+kernel = mx.fast.metal_kernel(
+    name=f"two_rows_{face.key}",
+    input_names=inputs,
+    output_names=["y"],
+    header=matrices.header,
+    source=matrices.declarations + r"""
+    const uint lane = thread_index_in_simdgroup;
+    const size_t row = size_t(threadgroup_position_in_grid.y) * 2;
+    float result[2];
+    qmv_rows<T, K, 1, 1>(m, row, m, row + 1, x, lane, result);
+    if (lane == 0) {
+      y[row] = static_cast<T>(result[0]);
+      y[row + 1] = static_cast<T>(result[1]);
+    }
+""",
+)
+
+y = kernel(
+    inputs=[x, weight, scales],
+    template=[("T", x.dtype), ("K", k)],
+    grid=(32, n // 2, 1),
+    threadgroup=(32, 1, 1),
+    output_shapes=[(n,)],
+    output_dtypes=[x.dtype],
+)[0]
+```
+
+`qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. A kernel that reads two formats calls it once per format.
+
+What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores.
+
+## Compile-time rules
+
+Kernels are compiled on the user's Mac by the Metal compiler when they are first run. Metal 4.1 is C++17. It has fold expressions, `if constexpr`, `constexpr` functions, `static_assert`, alias templates and packs of integers. It has no `template for`, pack indexing, concepts, `consteval`, `auto` parameters or derived classes.
+
+- What is known when a kernel is compiled is a template parameter or a `constexpr`: K, the bit width, the group size, the rows of a launch.
+- A choice between code paths is `if constexpr`. A face without a tail needs no tail members: the tail branch is discarded.
+- A run over a fixed count is a fold over an index pack, unless the loop measures faster. `omlx_iota<N>()` is `omlx_ints<0, ..., N - 1>`; a format's source may use both:
+
+```cpp
+template <int... I>
+static float dot(omlx_ints<I...>, const device uint8_t* w, thread const float* xt) {
+  return (... + ((float(w[I]) - 128.0f) * xt[I]));
+}
+// dot(omlx_iota<VPT>(), w, xt)
+```
+
+The walk over the blocks of K in `qmv_rows` is a loop: unrolled into a fold, the fused Qwen decode ran 3 to 8% slower on an M5 Max. The rows of a block are folds.
+
+## Reading compile errors
+
+MLX compiles a kernel at the first `mx.eval` of its output. A failure is a `RuntimeError`, `[metal::Device] Unable to build metal library from source`, followed by the compiler's messages. Each message cites one of:
+
+| Cited as | What it is |
+|---|---|
+| `<quant format KEY>` | The `source` of the face with that key, with its own line numbers. |
+| `<omlx skeletons, docs/quant-formats.md>` | The skeletons in `omlx/formats/kernels.py`. The line that fails is a use of the face: read the message, then this page. |
+| `<kernel header>` | What a kernel adds to its header, MLX's generated signature and the matrix declarations. |
+| `<kernel>` | The kernel body, with its own line numbers. |
+
+A face that breaks a rule the compiler cannot see fails with the rule:
+
+```
+<omlx skeletons, docs/quant-formats.md>:70:3: error: static_assert failed due to requirement
+'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
+each of a simdgroup's 32 lanes"
+<kernel>:6:5: note: in instantiation of function template specialization
+'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
+```
+
+```
+<omlx skeletons, docs/quant-formats.md>:73:3: error: static_assert failed due to requirement
+'Lanes<384>::TAIL || 384 % Lanes<384>::BLOCK == 0' "dot face: K is not a whole number of
+BLOCKs, so Lanes<K>::TAIL must be true"
+```
+
+A mistake inside the format is cited in the format:
+
+```
+<quant format myformat_b8>:41:22: error: no member named 'scale' in
+'omlx_myformat_b8::Dot::Lanes<512>::Row'
+```
+
+A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
+
+```
+<omlx skeletons, docs/quant-formats.md>:56:20: error: no member named 'finish' in
+'omlx_myformat_b8::Dot::Lanes<512>'
+```
+
+```
+error: too few arguments to function call, expected 5, have 4
+<quant format myformat_b8>:49:18: note: 'madd' declared here
+```
+
+The last one is a face that has only the `n` form of `madd`.
+
+## Test a format
+
+`omlx.formats.testing.dot_rows` runs a face in the row skeleton, outside any model:
+
+```python
+import mlx.core as mx
+from omlx.formats import testing
+
+
+def test_rows_are_the_dequantized_products():
+    face = FORMAT.dot(layer, k, n)
+    y = testing.dot_rows(face, (layer["weight"], layer["scales"]), x, n, packs=(2, 2))
+    assert mx.array_equal(y, dequantize(layer) @ x)
+```
+
+`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes; `n` is a multiple of `NA + NB`. The kernel also asserts that `Dot.tail` is the Metal `Lanes<K>::TAIL`.
+
+Worth testing for every layout a format gives a face for:
+
+- rows against the format's reference, bit for bit when the format has an exact composed path,
+- the same rows with different `packs`: they must not change by a bit,
+- a K with a tail and a K without, if the face has both.
