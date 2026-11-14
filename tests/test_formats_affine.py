@@ -5,6 +5,8 @@ and computes every row with MLX's bits.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
@@ -25,9 +27,9 @@ def _linear(k, n, bits, group_size, dtype=mx.bfloat16, seed=0):
     return linear
 
 
-def _stacked(experts, k, n, bits, group_size):
+def _stacked(experts, k, n, bits, group_size, dtype=mx.bfloat16):
     """The parameters of a ``QuantizedSwitchLinear``: one matrix per expert."""
-    layers = [_linear(k, n, bits, group_size, seed=e) for e in range(experts)]
+    layers = [_linear(k, n, bits, group_size, dtype, seed=e) for e in range(experts)]
     stacked = nn.QuantizedLinear(k, n, bias=False, group_size=group_size, bits=bits)
     for name in ("weight", "scales", "biases"):
         stacked[name] = mx.stack([layer[name] for layer in layers])
@@ -35,7 +37,23 @@ def _stacked(experts, k, n, bits, group_size):
 
 
 def _bit_equal(a, b):
-    return mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+    bits = mx.uint32 if a.dtype == mx.float32 else mx.uint16
+    return mx.array_equal(a.view(bits), b.view(bits)).item()
+
+
+def _mlx_rows(layer, x, expert=None):
+    """One row of activations through MLX: ``quantized_matmul``, or
+    ``gather_qmm`` on ``expert`` of stacked weights."""
+    tensors = (layer.weight, layer.scales, layer.biases)
+    layout = {"transpose": True, "group_size": layer.group_size, "bits": layer.bits}
+    if expert is None:
+        return mx.quantized_matmul(x[None], *tensors, **layout)[0]
+    return mx.gather_qmm(
+        x[None, None],
+        *tensors,
+        rhs_indices=mx.array([expert], dtype=mx.uint32),
+        **layout,
+    )[0, 0]
 
 
 def test_affine_ships_as_a_builtin_plugin():
@@ -98,6 +116,12 @@ def test_no_face_outside_what_the_transcription_covers(bits, dtype, k, n):
     assert formats.dot(_linear(512, 16, bits, 64, dtype), k, n) is None
 
 
+@pytest.mark.parametrize("bits, group_size", [(3, 64), (4, 16), (4, 256)])
+def test_a_face_built_by_hand_is_one_the_transcription_has(bits, group_size):
+    with pytest.raises(ValueError, match="no MLX transcription"):
+        affine.face(bits, group_size, False, mx.bfloat16)
+
+
 def test_no_face_without_biases_in_the_scales_dtype():
     linear = _linear(512, 16, 4, 64)
     linear.biases = linear.biases.astype(mx.float16)
@@ -109,7 +133,87 @@ def test_no_face_without_biases_in_the_scales_dtype():
 def test_no_face_for_tensors_mlx_binds_as_constants():
     # One row of 5 groups, as a small shared expert's gate: 5 scales.
     assert formats.dot(_linear(640, 1, 6, 128), 640, 1) is None
+    assert formats.dot(_linear(896, 1, 6, 128), 896, 1) is None
     assert formats.dot(_linear(1024, 1, 6, 128), 1024, 1) is not None
+
+
+@metal
+def test_a_matrix_of_8_groups_is_bound_as_buffers():
+    # MLX's own threshold: 8 scales, 8 biases.
+    linear = _linear(1024, 1, 6, 128)
+    x = mx.random.normal((1024,)).astype(mx.bfloat16)
+    got = testing.dot_rows(
+        formats.dot(linear, 1024, 1),
+        [linear.weight, linear.scales, linear.biases],
+        x,
+        1,
+        packs=(1, 0),
+    )
+    assert _bit_equal(got, _mlx_rows(linear, x))
+
+
+_QUAD = [(k, bits) for k in (64, 128) for bits in (4, 8)]
+
+
+def test_no_face_where_mlx_runs_qmv_quad():
+    for k, bits in _QUAD:
+        assert formats.dot(_linear(k, 16, bits, 32), k, 16) is None
+        # gather_qmm has no such kernel.
+        assert formats.dot(_stacked(2, k, 16, bits, 32), k, 16) is not None
+    for k, bits in [(64, 5), (128, 6), (192, 4), (256, 8)]:
+        assert formats.dot(_linear(k, 16, bits, 32), k, 16) is not None
+
+
+@metal
+@pytest.mark.parametrize("k, bits", _QUAD)
+def test_qmv_quad_is_not_the_qmv_sum(k, bits):
+    # Why such a matrix has no face: built by hand, the qmv face gives it the
+    # right products, summed in another order than MLX's.
+    layer = _linear(k, 16, bits, 32, mx.float32)
+    x = mx.random.normal((k,))
+    got = testing.dot_rows(
+        affine.face(bits, 32, False, mx.float32),
+        [layer.weight, layer.scales, layer.biases],
+        x,
+        16,
+        packs=(2, 2),
+    )
+    want = _mlx_rows(layer, x)
+    assert not _bit_equal(got, want)
+    assert mx.allclose(got, want, rtol=1e-4, atol=1e-5).item()
+
+
+@metal
+@pytest.mark.parametrize(
+    "bits, k, n, stacked",
+    [
+        (bits, k, n, stacked)
+        for stacked in (False, True)
+        for n in (16, 12)  # whole output tiles of 8 rows, or not
+        for k in (64, 128, 256, 288, 384, 448, 512, 1280)
+        for bits in (4, 5, 6, 8)
+        if stacked or (k, bits) not in _QUAD
+    ],
+)
+def test_the_traversal_sums_in_mlx_order(bits, k, n, stacked):
+    """Rounded to bf16 or fp16, a row summed in another order than MLX's
+    differs about once in a thousand; in fp32 most rows do. So the traversal
+    ``dot`` gives a layout runs here on fp32 tensors, against MLX's fp32 rows."""
+    f32 = mx.float32
+    x = mx.random.normal((k,))
+    if stacked:
+        face = replace(formats.dot(_stacked(2, k, n, bits, 32), k, n), dtypes=(f32,))
+        layer = _stacked(2, k, n, bits, 32, f32)
+        for expert in range(2):
+            operands = [layer[name][expert] for name in ("weight", "scales", "biases")]
+            got = testing.dot_rows(face, operands, x, n, packs=(2, 2))
+            assert _bit_equal(got, _mlx_rows(layer, x, expert))
+    else:
+        face = replace(formats.dot(_linear(k, n, bits, 32), k, n), dtypes=(f32,))
+        layer = _linear(k, n, bits, 32, f32)
+        operands = [layer.weight, layer.scales, layer.biases]
+        got = testing.dot_rows(face, operands, x, n, packs=(2, 2))
+        assert _bit_equal(got, _mlx_rows(layer, x))
 
 
 @metal
@@ -119,8 +223,8 @@ def test_no_face_for_tensors_mlx_binds_as_constants():
     [
         (group_size, k)
         for group_size in (32, 64, 128)
-        # Whole blocks, and a last block of 4 to 24 lanes.
-        for k in (128, 288, 384, 448, 512, 1280)
+        # Whole blocks, whole blocks and a partial one, a partial block alone.
+        for k in (192, 288, 384, 448, 512, 1280)
         if k % group_size == 0
     ],
 )
@@ -133,16 +237,7 @@ def test_rows_have_mlx_bits(bits, group_size, k, dtype):
     got = testing.dot_rows(
         face, [linear.weight, linear.scales, linear.biases], x, n, packs=(2, 2)
     )
-    want = mx.quantized_matmul(
-        x[None],
-        linear.weight,
-        linear.scales,
-        linear.biases,
-        transpose=True,
-        group_size=group_size,
-        bits=bits,
-    )[0]
-    assert _bit_equal(got, want)
+    assert _bit_equal(got, _mlx_rows(linear, x))
 
 
 @metal
@@ -155,17 +250,8 @@ def test_stacked_rows_have_gather_qmm_bits(bits, k, n):
     face = formats.dot(stacked, k, n)
     for expert in range(3):
         operands = [stacked[name][expert] for name in ("weight", "scales", "biases")]
-        want = mx.gather_qmm(
-            x[None, None],
-            stacked.weight,
-            stacked.scales,
-            stacked.biases,
-            rhs_indices=mx.array([expert], dtype=mx.uint32),
-            transpose=True,
-            group_size=64,
-            bits=bits,
-        )[0, 0]
-        assert _bit_equal(testing.dot_rows(face, operands, x, n, packs=(2, 2)), want)
+        got = testing.dot_rows(face, operands, x, n, packs=(2, 2))
+        assert _bit_equal(got, _mlx_rows(stacked, x, expert))
 
 
 @metal
@@ -181,16 +267,7 @@ def test_a_matrix_that_is_not_whole_output_tiles_has_mlx_bits(bits, k):
         12,
         packs=(2, 2),
     )
-    want = mx.quantized_matmul(
-        x[None],
-        linear.weight,
-        linear.scales,
-        linear.biases,
-        transpose=True,
-        group_size=64,
-        bits=bits,
-    )[0]
-    assert _bit_equal(got, want)
+    assert _bit_equal(got, _mlx_rows(linear, x))
 
 
 @metal
@@ -218,8 +295,9 @@ def test_the_face_is_exact_for_its_own_dtype_only():
 
 @metal
 def test_the_fast_face_refuses_a_k_that_is_not_whole_blocks():
-    # AffineFormat.dot gives K = 384 the qmv face; built by hand, the
-    # qmv_fast one would walk it without its last block.
+    # AffineFormat.dot gives K = 384 the qmv face, as MLX runs it. Built by
+    # hand, the qmv_fast one would sum each row in qmv_fast's lanes: the
+    # right product, not MLX's bits.
     linear = _linear(384, 16, 4, 64)
     rows = testing.dot_rows(
         affine.face(4, 64, True, mx.bfloat16),

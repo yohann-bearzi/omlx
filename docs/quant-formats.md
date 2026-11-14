@@ -311,11 +311,12 @@ Worth testing for every layout a format gives a face for:
 
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
-- a K of whole blocks and a K that ends in a partial block, if the face takes both.
+- a K of whole blocks and a K that ends in a partial block, if the face takes both,
+- the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in about one row in a thousand, in fp32 in most rows.
 
 ## Affine
 
-`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits of `mx.quantized_matmul`.
+`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits MLX gives one row of activations, through `mx.quantized_matmul` or, for stacked expert weights, `mx.gather_qmm`.
 
 | | Covered |
 |---|---|
@@ -325,7 +326,11 @@ Worth testing for every layout a format gives a face for:
 | Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
-Any other affine layer has no face and runs MLX's ops: 2 or 3 bits, fp32 scales, no biases, a K that is not whole groups, or a matrix of fewer than 8 groups (MLX binds an input of fewer than 8 elements as constants, not as a buffer).
+Any other affine layer has no face and runs MLX's ops:
+
+- another bit width or group size, fp32 scales, no biases, a K that is not whole groups,
+- a matrix of fewer than 8 groups, counted in one expert for stacked weights (MLX binds an input of fewer than 8 elements as constants, not as a buffer),
+- a 2-D matrix of K 64 or 128 at 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
 
 The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFormat.dot` is what gives a matrix its traversal.
 

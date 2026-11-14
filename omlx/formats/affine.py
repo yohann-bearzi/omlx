@@ -6,7 +6,8 @@ The dot face is the MLX 0.32.4 ``quantized.h`` transcription in
 ``omlx.patches.moe_verify_gather``: a kernel instantiated with it computes
 each row as MLX's ``qmv_fast`` (K a multiple of the kernel block) or ``qmv``
 does, bit for bit, for bf16 or fp16 activations with scales in the same
-dtype.
+dtype. One row of a narrow 2-D matrix is a third MLX kernel, ``qmv_quad``,
+which sums in another order: such a matrix has no face.
 """
 
 from __future__ import annotations
@@ -85,6 +86,12 @@ struct Dot {
 def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     """The dot face of ``bits``-bit weights with ``group_size`` groups, as
     MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal."""
+    if bits not in _BITS or group_size not in _GROUP_SIZES:
+        # The transcription compiles for others, and computes zeros.
+        raise ValueError(
+            f"affine face: no MLX transcription of {bits} bits in groups of "
+            f"{group_size}"
+        )
     key = f"affine_b{bits}g{group_size}{'f' if fast else 's'}"
     header = (
         _HEADER.replace("__BITS__", str(bits))
@@ -116,6 +123,9 @@ class AffineFormat(QuantFormat):
             # MLX binds an input of fewer than 8 elements as constants; the
             # scales and the biases are a matrix's smallest.
             or n * k // layer.group_size < 8
+            # qmv_quad: MLX's kernel for one row of a 2-D matrix of K 64 or
+            # 128 at a power-of-two bit width.
+            or (layer["weight"].ndim == 2 and k in (64, 128) and layer.bits in (4, 8))
         ):
             return None
         # Stacked (3-D) weights are the ones MLX runs through gather_qmm.
