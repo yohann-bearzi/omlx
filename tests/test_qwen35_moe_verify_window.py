@@ -87,6 +87,9 @@ def _block(
     expert, 8-bit gs64 shared-expert gate, ``dtype`` router."""
     key = (seed, bits, experts, hidden, inter, top_k, dtype)
     if key in _BLOCKS:
+        # A test proves its own launches: the plan is built again, with a
+        # proof from this test's registry.
+        _BLOCKS[key].__dict__.pop("_omlx_routed_decode_plan", None)
         return _BLOCKS[key]
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
@@ -211,9 +214,10 @@ def test_window_rows_equal_one_token_decode(topk_fold, engaged):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
     _check(block, _inputs(3, 1, batch=2), engaged)
-    assert plan.proof.ran >= {
+    # One token is launch 0.
+    assert plan.proof.ran == {
         (rows, BLOCK_EXPERTS, topk_fold and rows <= routed._TOPK_FOLD_MAX_ROWS)
-        for rows in (*window_rows, 6)
+        for rows in (0, *window_rows, 6)
     }
 
 
@@ -276,9 +280,7 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     x = _inputs(4, 1)
     old = _verify(block, x, window=False)
     plan = routed.routed_decode_plan(block, x[:, :1])
-    # The block stays cached for later tests, with its plan and what it ran.
-    monkeypatch.setattr(plan.proof, "ran", set())
-    monkeypatch.setattr(plan.proof, "window_failed", False)
+    assert not plan.proof.ran
     kernel = mx.fast.metal_kernel(
         name="does_not_compile",
         input_names=["h"],
@@ -305,8 +307,9 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
         assert _same_bits(out, old)
     assert len(calls) == 1 and not plan.proof.ran
     # One token still takes the fused launches.
-    assert not plan.proof.failed
     assert routed.routed_decode_plan(block, x[:, :1]) is plan
+    assert _same_bits(_serial(block, x), old)
+    assert plan.proof.ran == {(0, BLOCK_EXPERTS, True)} and not plan.proof.failed
 
 
 def test_a_failed_one_token_launch_keeps_windows_composed(monkeypatch, engaged):

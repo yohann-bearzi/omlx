@@ -118,6 +118,14 @@ def _engaged():
     )
 
 
+def _logged(caplog, module, level=logging.DEBUG):
+    """What ``module`` logged. Other loggers are at whatever level the tests
+    before this one left them."""
+    return [
+        r for r in caplog.records if r.name == module.__name__ and r.levelno >= level
+    ]
+
+
 def _same_bits(a, b):
     return a.shape == b.shape and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
 
@@ -472,26 +480,30 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
         calls.append(1)
         raise RuntimeError("no pipeline")
 
-    monkeypatch.setattr(routed, "routed_decode", broken)
-    assert _same_bits(*_pair(block, x))
-    assert routed.routed_decode_plan(block, x) is None
-    # Another block of these faces and shapes does not try again.
-    twin = _block(1024, 320, seed=1)
-    assert routed.routed_decode_plan(twin, x) is None
-    assert _same_bits(*_pair(twin, x))
-    assert _same_bits(*_pair(block, x))
+    with monkeypatch.context() as patch:
+        patch.setattr(routed, "routed_decode", broken)
+        assert _same_bits(*_pair(block, x))
+        assert routed.routed_decode_plan(block, x) is None
+        # Another block of these faces and shapes does not try again.
+        twin = _block(1024, 320, seed=1)
+        assert routed.routed_decode_plan(twin, x) is None
+        assert _same_bits(*_pair(twin, x))
+        assert _same_bits(*_pair(block, x))
     assert len(calls) == 1
-    warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-    assert warnings == ["fused routed-expert decode failed; composed fallback"]
+    warnings = _logged(caplog, routed, logging.WARNING)
+    assert [r.getMessage() for r in warnings] == [
+        "fused routed-expert decode failed; composed fallback"
+    ]
     # Other shapes still route.
-    monkeypatch.undo()
     other = _block(1024, 512)
     assert routed.routed_decode_plan(other, x) is not None
     assert _same_bits(*_pair(other, x))
     assert routed.routed_decode_plan(other, x).proof.ran
 
 
-def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(monkeypatch):
+def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(
+    monkeypatch, caplog
+):
     """MLX compiles a kernel at its first evaluation. A face that fails
     there, after blocks of the same shapes ran with other faces, fails inside
     the call that can fall back."""
@@ -511,6 +523,9 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(monkeypatch
     monkeypatch.setattr(formats, "dot", broken)
     bad = _block(1024, 320, seed=1)
     assert _same_bits(*_pair(bad, x))
+    # The warning carries the compiler's message.
+    (warning,) = _logged(caplog, routed, logging.WARNING)
+    assert "does not compile" in str(warning.exc_info[1])
     assert routed.routed_decode_plan(bad, x) is None
     assert routed.routed_decode_plan(good, x) is not None
     assert _same_bits(*_pair(good, x))
@@ -530,7 +545,7 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog
     assert routed.routed_decode_plan(block, x) is None
     assert not routed._PROOFS
     # The answer is kept with the block's plan.
-    assert [repr(r.exc_info[1]) for r in caplog.records] == [
+    assert [repr(r.exc_info[1]) for r in _logged(caplog, formats)] == [
         "RuntimeError('no face today')"
     ]
 
@@ -598,7 +613,7 @@ def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplo
     monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
     assert _same_bits(*_pair(block, x))
     assert routed.routed_decode_plan(block, x).proof.ran == ran | {(0, 128, False)}
-    assert [r.getMessage() for r in caplog.records] == [
+    assert [r.getMessage() for r in _logged(caplog, routed)] == [
         "Qwen MoE fused routed-expert decode engaged"
     ] * 3
 

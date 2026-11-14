@@ -108,8 +108,10 @@ _GPU_SERIAL_TESTS = {
         "test_fused_combine_sigmoid_matches_every_gate_encoding",
     },
     "test_qwen35_moe_verify_window.py": {
+        "test_a_failed_one_token_launch_keeps_windows_composed",
+        "test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifier",
         "test_batched_decode_rows_equal_one_token_decode",
-        "test_kernel_failure_falls_back_to_the_composed_verifier",
+        "test_gate_up_qmv_window_and_batched_rows_equal_one_token_decode",
         "test_router_ties_and_high_experts",
         "test_top8_window_and_batched_rows_equal_one_token_decode",
         "test_window_rows_equal_one_token_decode",
