@@ -115,14 +115,14 @@ def test_a_kernel_has_each_input_once():
     # sg + d_scales and sg_d + scales are one input name.
     other = kernels.Matrices()
     other.add("sg", replace(_toy("a"), tensors=("d_scales",)))
-    with pytest.raises(ValueError, match="matrix 'sg_d': sg_d_w, sg_d_scales would"):
+    with pytest.raises(ValueError, match="matrix 'sg_d': sg_d_scales would repeat"):
         other.add("sg_d", _toy("b"))
     # ... and a tensor named w is the weight's.
-    with pytest.raises(ValueError, match="matrix 'm': m_w, m_w would repeat"):
+    with pytest.raises(ValueError, match="matrix 'm': m_w would repeat"):
         kernels.Matrices().add("m", replace(_toy("a"), tensors=("w",)))
     # A refused matrix is not in the kernel.
-    assert matrices.add("rt", _toy("b")) == ["rt_w", "rt_scales"]
-    assert matrices.declarations.count("const auto") == 2
+    assert "omlx_toy_b" not in matrices.declarations + other.declarations
+    assert other.declarations.count("const auto") == 1
 
 
 def test_a_kernel_includes_each_format_source_once():
@@ -325,12 +325,14 @@ def test_an_error_the_skeleton_brings_out_cites_the_formats_own_line():
     message = _error(_toy("member", source=source))
     assert f"<quant format toy_member>:{_line(source, 'r.weights')}:" in message
     assert "no member named 'weights'" in message
+    # ... and the skeleton's line that asked for it.
+    assert "<omlx skeletons, docs/quant-formats.md>:" in message
+    assert "in instantiation of member function" in message
 
 
 @metal
-def test_a_row_that_changes_its_cursor_is_refused():
+def test_a_row_that_is_not_const_is_refused():
     source = _TOY.replace("Row row(int r) const {", "Row row(int r) {")
-    assert source != _TOY
     message = _error(_toy("mutable", source=source))
     assert "'row'" in message and "not marked const" in message
 
@@ -382,8 +384,9 @@ def test_an_error_in_a_kernel_body_cites_the_bodys_own_line():
 
 def test_dot_rows_refuses_what_the_launch_cannot_cover():
     operands, x, _ = _matrix(8, 512)
-    with pytest.raises(ValueError, match="n=7 is not a multiple of the 2 rows"):
-        testing.dot_rows(_toy("a"), operands, x, 7)
+    for n in (7, 0, -2):
+        with pytest.raises(ValueError, match=f"n={n} is not one launch or more of 2"):
+            testing.dot_rows(_toy("a"), operands, x, n)
     half = replace(_toy("half"), dtypes=(mx.float16,))
     with pytest.raises(ValueError, match="toy_half is exact for mlx.core.float16"):
         testing.dot_rows(half, operands, x, 8)
@@ -391,10 +394,12 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
     with pytest.raises(ValueError, match="toy_a: scales has 4 elements"):
         testing.dot_rows(_toy("a"), (codes, scales), x, 4)
     operands, x, _ = _matrix(8, 512)
-    with pytest.raises(ValueError, match="toy_a reads weight, scales: 1 operands"):
+    with pytest.raises(ValueError, match="toy_a: x has 4 elements"):
+        testing.dot_rows(_toy("a"), operands, x[:4], 8)
+    with pytest.raises(ValueError, match="weight, scales; operands given: 1"):
         testing.dot_rows(_toy("a"), operands[:1], x, 8)
     with pytest.raises(ValueError, match="one vector of K activations"):
         testing.dot_rows(_toy("a"), operands, mx.stack([x, x]), 8)
     for packs in [(0, 0), (-1, 2)]:
-        with pytest.raises(ValueError, match="a launch takes one row or more"):
+        with pytest.raises(ValueError, match="one row or more in all"):
             testing.dot_rows(_toy("a"), operands, x, 8, packs)

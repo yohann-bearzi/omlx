@@ -93,19 +93,21 @@ struct Dot {
 | `static float madd(float acc, Row r, thread const float* xt, A aux)` | `acc` plus the lane's share of the row's product for the block. |
 | `float finish(int r, float sum) const` | Row `row + r`'s result from the sum of `acc` over the lanes (for example times a row scale). |
 
-A kernel runs a face in this order, in every lane, for each of its rows `r`:
+A kernel runs a face in this order, in every lane, on the rows `r` it computes together:
 
 ```
-acc[r] = 0
+acc[r] = 0                                   for each r
 for each whole block of K:
-    aux = load(x, xt)
-    acc[r] = madd(acc[r], row(r), xt, aux)
-    step()
+    aux = load(x, xt)                        once
+    acc[r] = madd(acc[r], row(r), xt, aux)   for each r
+    step()                                   once
 if K ends inside a block, in the lanes that have inputs in it:
-    aux = load(x, xt)
-    acc[r] = madd(acc[r], row(r), xt, aux)
-result[r] = finish(r, simd_sum(acc[r]))
+    aux = load(x, xt)                        once
+    acc[r] = madd(acc[r], row(r), xt, aux)   for each r
+result[r] = finish(r, simd_sum(acc[r]))      for each r
 ```
+
+Rows of two matrices (the skeleton's two packs) have a cursor each, and the block's one `load`.
 
 K need not be a multiple of `BLOCK`. Where it is not, the last block is partial: its first `K % BLOCK / VPT` lanes have their `VPT` inputs, the other lanes have none and skip it. A face only ever sees whole runs of `VPT` inputs, and the lanes of the last block are known when the kernel is compiled.
 
@@ -115,8 +117,10 @@ Rules:
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
 - A face never writes the matrix: its members store to nothing but the cursor's own state and `xt`.
 - The constructor and `step()` only move pointers and read nothing. A kernel may build a cursor on a row past the matrix (for an empty pack of rows) and step it into a block it then skips. `row`, `load`, `madd` and `finish` run only for rows and blocks the kernel computes; `row` is `const`.
-- `row`, `load` and `madd` use no simdgroup or threadgroup operation (`simd_sum`, `simd_shuffle`, a barrier): in a last, partial block only some of the lanes run them. A face that needs whole blocks returns `None` from `dot()` for any other K.
-- `finish` runs where the walk left the cursor, which is not one place: past the last whole block, or on a last, partial one. It reads only what `step()` does not move.
+- No member uses a threadgroup operation or threadgroup memory (a barrier): the simdgroups of a kernel need not all run the skeleton, or run it over the same K.
+- `row`, `load` and `madd` use a simdgroup operation (`simd_sum`, `simd_shuffle`) only in a face whose `dot()` returns `None` for every K that ends inside a block: in a last, partial block only some of the lanes run them.
+- `finish` runs where the walk left the cursor, which is not one place: past the last whole block, or on a last, partial one. It reads only what `step()` does not move, and nothing that depends on the lane: after it every lane holds the row's result.
+- `r` is a constant at every call, an element of the kernel's pack of rows. `row` and `finish` do arithmetic on it that folds (`r * K`), not a loop over the rows.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
 
 ### An example
@@ -199,7 +203,7 @@ kernel = mx.fast.metal_kernel(
     const uint lane = thread_index_in_simdgroup;
     const size_t row = size_t(threadgroup_position_in_grid.y) * 2;
     float result[2];
-    qmv_rows<T, K, 1, 1>(m, row, m, row + 1, x, lane, result);
+    qmv_rows<T, K, 2, 0>(m, row, m, row, x, lane, result);
     if (lane == 0) {
       y[row] = static_cast<T>(result[0]);
       y[row + 1] = static_cast<T>(result[1]);
@@ -217,7 +221,7 @@ y = kernel(
 )[0]
 ```
 
-`qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. A kernel that reads two formats calls it once per format.
+`qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. Rows of one matrix go in one pack, as above: the second pack is for the rows of another matrix (a gate and an up projection), and is empty (`NB = 0`) without one. A kernel that reads two formats calls it once per format.
 
 What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores.
 

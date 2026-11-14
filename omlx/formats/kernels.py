@@ -139,10 +139,11 @@ class Matrices:
         """Add matrix ``name``. Returns its kernel inputs: the weight, then
         the face's tensors in order."""
         inputs = _inputs(name, face)
-        taken = [i for other in self._faces.items() for i in _inputs(*other)]
-        if len({*taken, *inputs}) != len(taken) + len(inputs):
+        taken = {i for other in self._faces.items() for i in _inputs(*other)}
+        repeated = dict.fromkeys(i for i in inputs if i in taken or inputs.count(i) > 1)
+        if repeated:
             raise ValueError(
-                f"matrix {name!r}: {', '.join(inputs)} would repeat an input of "
+                f"matrix {name!r}: {', '.join(repeated)} would repeat an input of "
                 "the kernel"
             )
         self._faces[name] = face

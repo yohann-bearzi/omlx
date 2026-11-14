@@ -56,24 +56,24 @@ def dot_rows(
     """
     na, nb = packs
     if min(na, nb) < 0 or na + nb == 0:
-        raise ValueError(f"packs={packs}: a launch takes one row or more")
-    if n % (na + nb):
-        raise ValueError(f"n={n} is not a multiple of the {na + nb} rows of a launch")
+        raise ValueError(f"packs={packs}: two counts of rows, one row or more in all")
+    if n <= 0 or n % (na + nb):
+        raise ValueError(f"n={n} is not one launch or more of {na + nb} rows")
     if x.ndim != 1:
         raise ValueError(f"x is one vector of K activations, not of shape {x.shape}")
     operands, names = tuple(operands), ("weight", *face.tensors)
     if len(operands) != len(names):
         raise ValueError(
-            f"face {face.key} reads {', '.join(names)}: {len(operands)} operands given"
+            f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
         )
     if not face.exact_for(x.dtype):
         exact = ", ".join(str(dtype) for dtype in face.dtypes)
         raise ValueError(f"face {face.key} is exact for {exact}, x is {x.dtype}")
-    for name, operand in zip(names, operands, strict=True):
+    for name, operand in zip(("x", *names), (x, *operands), strict=True):
         if operand.size < 8:
             raise ValueError(
                 f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
-                "input of fewer than 8 as constants, not as the device pointer of a face"
+                "input of fewer than 8 as constants, not as a device buffer"
             )
     return _dot_rows_kernel(face)(
         inputs=[x, *operands],
