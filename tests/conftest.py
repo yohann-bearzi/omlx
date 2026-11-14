@@ -505,6 +505,19 @@ def _hermetic_discovery_links(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _quant_format_defects_fail_the_test(monkeypatch):
+    """A quant format's defective dot() costs a model its fused kernels, not
+    its forward (omlx.formats.dot). A test that meets one fails, unless it
+    collects the defects itself."""
+    from omlx import formats
+
+    defects: set = set()
+    monkeypatch.setattr(formats, "_DOT_DEFECTS", defects)
+    yield
+    assert not defects, f"a quant format's dot() is defective: {sorted(defects)}"
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_key_failures():
     """Keep the process-global wrong API key budget hermetic per test."""
     auth = sys.modules.get("omlx.admin.auth")

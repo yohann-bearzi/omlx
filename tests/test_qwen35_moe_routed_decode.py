@@ -516,6 +516,25 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(monkeypatch
     assert _same_bits(*_pair(good, x))
 
 
+def test_a_format_whose_dot_raises_keeps_its_blocks_composed(monkeypatch, caplog):
+    def raises(self, layer, k, n):
+        raise RuntimeError("no face today")
+
+    monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
+    monkeypatch.setattr(affine.AffineFormat, "dot", raises)
+    block = _block(1024, 512)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for _ in range(2):
+            assert _same_bits(*_pair(block, x))
+    assert routed.routed_decode_plan(block, x) is None
+    assert not routed._PROOFS
+    # The answer is kept with the block's plan.
+    assert [repr(r.exc_info[1]) for r in caplog.records] == [
+        "RuntimeError('no face today')"
+    ]
+
+
 def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
     def unfolded(hidden=1024, inter=320, **kwargs):
         return _block(hidden, inter, quantized_shared=False, **kwargs)

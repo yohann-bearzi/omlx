@@ -169,19 +169,22 @@ def get(mode: str | None) -> QuantFormat | None:
     return _FORMATS.get(mode)
 
 
-# The modes whose dot() defect is logged.
-_DOT_DEFECTS: set[str] = set()
+# The dot() defects that are logged: a format's mode and the error's repr.
+_DOT_DEFECTS: set[tuple[str, str]] = set()
 
 
 def dot(layer, k: int, n: int) -> Dot | None:
     """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None when
     its format (``layer.mode``) is unknown or has none for it.
 
-    A kernel asks for a face inside a model's forward. So a format whose
-    ``dot`` raises, or returns anything but a ``Dot`` of tensors the layer
-    has, has no face for the layer either, and the model keeps its composed
-    path. The defect is logged, once per format."""
-    fmt = get(getattr(layer, "mode", None))
+    A kernel asks for a face inside a model's forward, and keeps the answer
+    with what it builds for the layer. So a format whose ``dot`` raises, or
+    returns anything but None or a ``Dot`` of arrays the layer has (the
+    weight and the face's tensors), has no face for the layer either, and
+    the model keeps its composed path there. Each defect of a format is
+    logged once."""
+    mode = getattr(layer, "mode", None)
+    fmt = get(mode)
     if fmt is None:
         return None
     try:
@@ -189,13 +192,27 @@ def dot(layer, k: int, n: int) -> Dot | None:
         if face is None:
             return None
         if not isinstance(face, Dot):
-            raise TypeError(f"dot() returned {face!r}, not a Dot")
-        lacking = [name for name in ("weight", *face.tensors) if name not in layer]
+            raise TypeError(f"dot() returned a {type(face).__name__}, not a Dot")
+        lacking = [
+            name
+            for name in ("weight", *face.tensors)
+            if not isinstance(layer.get(name), mx.array)
+        ]
         if lacking:
-            raise ValueError(f"face {face.key}: the layer has no {', '.join(lacking)}")
-    except Exception:
-        if fmt.mode not in _DOT_DEFECTS:
-            _DOT_DEFECTS.add(fmt.mode)
-            logger.exception("quant format %s gave no usable dot face", fmt.mode)
+            raise ValueError(
+                f"face {face.key}: the layer has no array {', '.join(lacking)}"
+            )
+    except Exception as error:
+        defect = (mode, repr(error))
+        if defect not in _DOT_DEFECTS:
+            _DOT_DEFECTS.add(defect)
+            logger.exception(
+                "quant format %s gave no usable dot face for a %s (n=%s, k=%s); "
+                "the layer keeps its composed path",
+                mode,
+                type(layer).__name__,
+                n,
+                k,
+            )
         return None
     return face

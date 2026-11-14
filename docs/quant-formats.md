@@ -58,7 +58,7 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward. A `dot()` that raises, or that returns anything but a `Dot` whose `tensors` the layer has, counts as `None` there, and is logged once per format (`quant format MODE gave no usable dot face`, with the traceback). A format's own tests call `FORMAT.dot` directly, so that the defect fails them.
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors`, as below, so that these defects fail them.
 
 | `Dot` field | Meaning |
 |---|---|
@@ -303,7 +303,8 @@ from omlx.formats import testing
 
 def test_rows_are_the_dequantized_products():
     face = FORMAT.dot(layer, k, n)
-    y = testing.dot_rows(face, (layer["weight"], layer["scales"]), x, n, packs=(2, 2))
+    operands = [layer[name] for name in ("weight", *face.tensors)]
+    y = testing.dot_rows(face, operands, x, n, packs=(2, 2))
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
 

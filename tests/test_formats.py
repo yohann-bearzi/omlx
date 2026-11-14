@@ -321,7 +321,7 @@ class _NoFace(_Format):
 
 class _Raises(_Format):
     def dot(self, layer, k, n):
-        raise KeyError("biases")
+        raise RuntimeError("no biases")
 
 
 class _NotADot(_Format):
@@ -329,42 +329,96 @@ class _NotADot(_Format):
         return _FACE.key
 
 
+class _TwoTensors(_Format):
+    def dot(self, layer, k, n):
+        return replace(_FACE, tensors=("scales", "biases"))
+
+
+def _layer_with_a_child_named_scales():
+    layer = _layer(tensors=("weight",))
+    layer.scales = nn.Module()
+    return layer
+
+
 @pytest.mark.parametrize(
     "fmt, layer, defect",
     [
-        (_Raises(), _layer(), "KeyError: 'biases'"),
-        (_NotADot(), _layer(), "TypeError: dot() returned 'toy_b4', not a Dot"),
+        (_Raises(), _layer(), "RuntimeError('no biases')"),
+        (_NotADot(), _layer(), "TypeError('dot() returned a str, not a Dot')"),
         # _FACE reads scales.
         (
             _Format(),
             _layer(tensors=("weight",)),
-            "ValueError: face toy_b4: the layer has no scales",
+            "ValueError('face toy_b4: the layer has no array scales')",
         ),
         (
             _Format(),
             _layer(tensors=("scales",)),
-            "ValueError: face toy_b4: the layer has no weight",
+            "ValueError('face toy_b4: the layer has no array weight')",
         ),
-        (_Format(), SimpleNamespace(mode="toy"), "TypeError: "),  # no parameters
+        (
+            _Format(),
+            _layer(tensors=()),
+            "ValueError('face toy_b4: the layer has no array weight, scales')",
+        ),
+        (
+            _Format(),
+            _layer_with_a_child_named_scales(),
+            "ValueError('face toy_b4: the layer has no array scales')",
+        ),
+        (
+            _TwoTensors(),
+            _layer(),
+            "ValueError('face toy_b4: the layer has no array biases')",
+        ),
     ],
 )
-def test_a_defective_dot_is_no_face_and_logged_once(
-    plugins, caplog, fmt, layer, defect
-):
+def test_a_defective_dot_is_no_face(plugins, caplog, fmt, layer, defect):
     formats.register(fmt)
-    formats.register(_Raises("other"))
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         assert formats.dot(layer, 64, 8) is None
-        assert formats.dot(layer, 64, 8) is None
-        assert formats.dot(_layer("other"), 64, 8) is None
-    # Once per format: one that fails does not hide another's defect.
-    assert [r.getMessage() for r in caplog.records] == [
-        "quant format toy gave no usable dot face",
-        "quant format other gave no usable dot face",
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "quant format toy gave no usable dot face for a Module (n=8, k=64); "
+        "the layer keeps its composed path"
+    )
+    assert repr(record.exc_info[1]) == defect
+
+
+def test_each_defect_of_a_format_is_logged_once(plugins, caplog):
+    for fmt in (_Format(), _Raises("other"), _Raises("third")):
+        formats.register(fmt)
+    no_scales, no_weight = _layer(tensors=("weight",)), _layer(tensors=("scales",))
+    asked = (
+        no_scales,
+        _layer(tensors=("weight",)),
+        no_weight,
+        no_scales,
+        _layer("other"),
+        _layer("third"),
+        _layer("other"),
+    )
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for layer in asked:
+            assert formats.dot(layer, 64, 8) is None
+        # Only a defect's layers lose the face.
+        assert formats.dot(_layer(), 64, 8) is _FACE
+    assert [(r.args[0], repr(r.exc_info[1])) for r in caplog.records] == [
+        ("toy", "ValueError('face toy_b4: the layer has no array scales')"),
+        ("toy", "ValueError('face toy_b4: the layer has no array weight')"),
+        ("other", "RuntimeError('no biases')"),
+        ("third", "RuntimeError('no biases')"),
     ]
-    assert all(r.exc_info for r in caplog.records)
-    error = caplog.records[0].exc_info[1]
-    assert f"{type(error).__name__}: {error}".startswith(defect)
+
+
+def test_an_interrupt_inside_dot_is_not_a_defect(plugins):
+    class Interrupted(_Format):
+        def dot(self, layer, k, n):
+            raise KeyboardInterrupt
+
+    formats.register(Interrupted())
+    with pytest.raises(KeyboardInterrupt):
+        formats.dot(_layer(), 64, 8)
 
 
 def test_a_format_without_a_face_for_a_layer_is_no_defect(plugins, caplog):
