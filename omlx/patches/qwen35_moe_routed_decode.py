@@ -36,8 +36,9 @@ dependent launches instead of four. Other shapes run the softmax and top-k
 as their own launch (``qwen35_moe_router.softmax_topk_row``).
 
 The result is bit-identical to the composed path. The quantized dot products
-reuse the MLX 0.32.4 transcription in ``moe_verify_gather`` (4, 5, 6 and
-8 bits; group size 32, 64 or 128), one instantiation per weight format. MLX
+are the weight format's dot face (``omlx.formats``), one instantiation per
+weight format. The affine format's is the MLX 0.32.4 transcription in
+``moe_verify_gather`` (4, 5, 6 and 8 bits; group size 32, 64 or 128). MLX
 picks ``qmv_fast`` when K is a multiple of its kernel block
 (512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
@@ -85,9 +86,9 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .. import formats
+from ..formats import Dot, kernels
 from .module_cache import cached_per_module
-from .moe_verify_gather import _BITS, _GROUP_SIZES, qmv_fast_layout
-from .moe_verify_gather import _HEADER as _QMV_HEADER
 from .qwen35_moe_router import (
     TOPK_HEADER,
     fused_router_topk,
@@ -127,88 +128,6 @@ def _down_rows(rows: int) -> int:
     keep four, which served windows measured fastest on (M5 Ultra, oQ5e)."""
     return 2 if rows == 1 else _DOWN_ROWS
 
-
-class _Format(NamedTuple):
-    """One weight format: MLX's ``qmv_fast`` (fast) or ``qmv`` traversal."""
-
-    bits: int
-    group_size: int
-    fast: bool
-
-
-# Rows of one mat-vec, per format namespace: MLX's qmv_fast (FAST) or qmv
-# traversal (full K blocks, then the guarded tail) of one input vector. Rows
-# [0, NA) are rows row_a.. of (wa, sa, ba), rows [NA, NA + NB) rows row_b..
-# of (wb, sb, bb); result[row] ends as the row's simd_sum.
-_ROWS = r"""
-template <typename T, int K, int NA, int NB>
-METAL_FUNC void qmv_rows(
-    const device uint8_t* wa,
-    const device T* sa,
-    const device T* ba,
-    size_t row_a,
-    const device uint8_t* wb,
-    const device T* sb,
-    const device T* bb,
-    size_t row_b,
-    const device T* x,
-    uint simd_lid,
-    thread float* result) {
-  constexpr int in_vec_size_w = K * BYTES_PER_PACK / PACK_FACTOR;
-  constexpr int in_vec_size_g = K / GS;
-  const int lane_w = int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-  const int lane_g = int(simd_lid) / SCALE_STEP_PER_THREAD;
-  wa += row_a * in_vec_size_w + lane_w;
-  sa += row_a * in_vec_size_g + lane_g;
-  ba += row_a * in_vec_size_g + lane_g;
-  wb += row_b * in_vec_size_w + lane_w;
-  sb += row_b * in_vec_size_g + lane_g;
-  bb += row_b * in_vec_size_g + lane_g;
-  x += int(simd_lid) * VALUES_PER_THREAD;
-
-  float x_thread[VALUES_PER_THREAD];
-  for (int row = 0; row < NA + NB; row++) {
-    result[row] = 0;
-  }
-  int k = 0;
-  for (; k < (FAST ? K : K - BLOCK_SIZE); k += BLOCK_SIZE) {
-    float sum = load_vector<T>(x, x_thread);
-    for (int row = 0; row < NA + NB; row++) {
-      const bool a = row < NA;
-      const int r = a ? row : row - NA;
-      const device uint8_t* wl = (a ? wa : wb) + r * in_vec_size_w;
-      float s = (a ? sa : sb)[r * in_vec_size_g];
-      float b = (a ? ba : bb)[r * in_vec_size_g];
-      result[row] += qdot_n(wl, x_thread, s, b, sum, VALUES_PER_THREAD);
-    }
-    wa += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-    wb += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-    sa += BLOCK_SIZE / GS;
-    ba += BLOCK_SIZE / GS;
-    sb += BLOCK_SIZE / GS;
-    bb += BLOCK_SIZE / GS;
-    x += BLOCK_SIZE;
-  }
-  if (!FAST) {
-    const int remaining = clamp(
-        int(K - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
-    if (remaining > 0) {
-      float sum = load_vector_safe<T>(x, x_thread, remaining);
-      for (int row = 0; row < NA + NB; row++) {
-        const bool a = row < NA;
-        const int r = a ? row : row - NA;
-        const device uint8_t* wl = (a ? wa : wb) + r * in_vec_size_w;
-        float s = (a ? sa : sb)[r * in_vec_size_g];
-        float b = (a ? ba : bb)[r * in_vec_size_g];
-        result[row] += qdot_n(wl, x_thread, s, b, sum, remaining);
-      }
-    }
-  }
-  for (int row = 0; row < NA + NB; row++) {
-    result[row] = simd_sum(result[row]);
-  }
-}
-"""
 
 _COMMON = r"""
 using namespace metal;
@@ -253,10 +172,7 @@ _GATE_UP_SHARED = r"""
       // shared_expert_gate: MLX's qmv for its one output row. First in the
       // grid, so its serial K walk overlaps the expert blocks.
       if (simd_gid == 0) {
-        gt::qmv_rows<T, K, 1, 0>(
-            (const device uint8_t*)g_w, g_s, g_b, 0,
-            (const device uint8_t*)g_w, g_s, g_b, 0,
-            x, simd_lid, result);
+        qmv_rows<T, K, 1, 0>(gt, 0, gt, 0, x, simd_lid, result);
         if (simd_lid == 0) {
           y[TOPK * NI + NS] = static_cast<T>(result[0]);
         }
@@ -265,10 +181,7 @@ _GATE_UP_SHARED = r"""
     }
     if (b <= NS / ROWS) {
       const int out_row = (b - 1) * ROWS + int(simd_gid) * RPS;
-      st::qmv_rows<T, K, RPS, RPS>(
-          (const device uint8_t*)sg_w, sg_s, sg_b, out_row,
-          (const device uint8_t*)su_w, su_s, su_b, out_row,
-          x, simd_lid, result);
+      qmv_rows<T, K, RPS, RPS>(sg, out_row, su, out_row, x, simd_lid, result);
       swiglu_store<T, RPS>(result, y + TOPK * NI + out_row, simd_lid);
       return;
     }
@@ -279,9 +192,8 @@ _GATE_UP_ROUTED = r"""
     const int slot = b / (NI / ROWS);
     const int out_row = (b % (NI / ROWS)) * ROWS + int(simd_gid) * RPS;
     const size_t expert = size_t(rhs[slot]);
-    rt::qmv_rows<T, K, RPS, RPS>(
-        (const device uint8_t*)w, scales, biases, expert * (2 * NI) + out_row,
-        (const device uint8_t*)w, scales, biases, expert * (2 * NI) + NI + out_row,
+    qmv_rows<T, K, RPS, RPS>(
+        rt, expert * (2 * NI) + out_row, rt, expert * (2 * NI) + NI + out_row,
         x, simd_lid, result);
     swiglu_store<T, RPS>(result, y + size_t(slot) * NI + out_row, simd_lid);
 """
@@ -301,19 +213,15 @@ _DOWN_HEAD = r"""
 
 _DOWN_SHARED_ROWS = r"""
     if (slot == TOPK) {
-      sd::qmv_rows<T, KS, RPS, 0>(
-          (const device uint8_t*)sd_w, sd_s, sd_b, out_row,
-          (const device uint8_t*)sd_w, sd_s, sd_b, out_row,
-          x + TOPK * K, simd_lid, result);
+      qmv_rows<T, KS, RPS, 0>(sd, out_row, sd, out_row, x + TOPK * K, simd_lid, result);
     } else
 """
 
 _DOWN_TAIL = r"""
     {
       const size_t expert = size_t(rhs[slot]);
-      rd::qmv_rows<T, K, RPS, 0>(
-          (const device uint8_t*)w, scales, biases, expert * N + out_row,
-          (const device uint8_t*)w, scales, biases, expert * N + out_row,
+      qmv_rows<T, K, RPS, 0>(
+          rd, expert * N + out_row, rd, expert * N + out_row,
           x + slot * K, simd_lid, result);
     }
     if (simd_lid == 0) {
@@ -439,56 +347,56 @@ _GATE_UP_TOPK_ROUTED = _GATE_UP_ROUTED.replace(
 )
 
 
-def _format_header(namespace: str, fmt: _Format) -> str:
-    header = (
-        _QMV_HEADER.replace("__BITS__", str(fmt.bits))
-        .replace("__GS__", str(fmt.group_size))
-        .replace("__FAST__", "1" if fmt.fast else "0")
+def _add_shared_gate_up(
+    matrices: kernels.Matrices, shared: Dot, gate: Dot
+) -> list[str]:
+    """The shared expert's gate (``sg``) and up (``su``) rows and the
+    shared-expert gate row (``gt``)."""
+    return (
+        matrices.add("sg", shared)
+        + matrices.add("su", shared)
+        + matrices.add("gt", gate)
     )
-    return f"namespace {namespace} {{\n{header}\n{_ROWS}\n}}  // namespace {namespace}\n"
-
-
-def _name(fmt: _Format) -> str:
-    return f"b{fmt.bits}g{fmt.group_size}{'f' if fmt.fast else 's'}"
 
 
 @cache
-def _gate_up_kernel(routed: _Format, shared: _Format | None, gate: _Format | None):
-    """Gate+up/SwiGLU launch; with ``shared`` (and ``gate``) it also runs the
-    shared expert's gate+up and the shared-expert gate row."""
-    header = _COMMON + _format_header("rt", routed)
-    inputs = ["x", "w", "scales", "biases", "rhs"]
+def _gate_up_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
+    """Gate+up/SwiGLU launch over the stacked gate+up rows (``rt``); with
+    ``shared`` (and ``gate``) it also runs the shared expert's gate+up and
+    the shared-expert gate row."""
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", routed), "rhs"]
     source = _GATE_UP_HEAD
-    name = f"omlx_qwen35_moe_gate_up_decode_{_name(routed)}"
+    name = f"omlx_qwen35_moe_gate_up_decode_{routed.key}"
     if shared is not None:
-        header += _format_header("st", shared) + _format_header("gt", gate)
-        inputs += ["sg_w", "sg_s", "sg_b", "su_w", "su_s", "su_b", "g_w", "g_s", "g_b"]
+        inputs += _add_shared_gate_up(matrices, shared, gate)
         source += _GATE_UP_SHARED
-        name += f"_shared_{_name(shared)}_gate_{_name(gate)}"
+        name += f"_shared_{shared.key}_gate_{gate.key}"
     return mx.fast.metal_kernel(
         name=name,
         input_names=inputs,
         output_names=["y"],
-        header=header,
-        source=source + _GATE_UP_ROUTED,
+        header=_COMMON + matrices.header,
+        source=matrices.declarations + source + _GATE_UP_ROUTED,
     )
 
 
 @cache
-def _down_kernel(routed: _Format, shared: _Format | None):
-    """Down/combine launch; with ``shared`` it also runs the shared expert's
-    down rows, otherwise the shared expert's output is an input."""
-    header = _COMMON + _format_header("rd", routed)
-    name = f"omlx_qwen35_moe_down_combine_decode_{_name(routed)}"
+def _down_kernel(routed: Dot, shared: Dot | None):
+    """Down/combine launch over the stacked down rows (``rd``); with
+    ``shared`` it also runs the shared expert's down rows (``sd``),
+    otherwise the shared expert's output is an input."""
+    matrices = kernels.Matrices()
+    routed_inputs = matrices.add("rd", routed)
+    name = f"omlx_qwen35_moe_down_combine_decode_{routed.key}"
     if shared is None:
-        inputs = ["shared", "gate", "x", "w", "scales", "biases", "rhs", "scores"]
+        inputs = ["shared", "gate", "x", *routed_inputs, "rhs", "scores"]
         source = _DOWN_HEAD + _DOWN_TAIL.replace("SHARED_VALUE", "shared[h]").replace(
             "GATE_VALUE", "gate[0]"
         )
     else:
-        header += _format_header("sd", shared)
         # x is the gate+up output: expert rows, shared rows, gate row.
-        inputs = ["x", "w", "scales", "biases", "sd_w", "sd_s", "sd_b", "rhs", "scores"]
+        inputs = ["x", *routed_inputs, *matrices.add("sd", shared), "rhs", "scores"]
         source = (
             _DOWN_HEAD
             + _DOWN_SHARED_ROWS
@@ -496,106 +404,99 @@ def _down_kernel(routed: _Format, shared: _Format | None):
                 "GATE_VALUE", "x[TOPK * K + KS]"
             )
         )
-        name += f"_shared_{_name(shared)}"
+        name += f"_shared_{shared.key}"
     return mx.fast.metal_kernel(
         name=name,
         input_names=inputs,
         output_names=["y"],
-        header=header,
-        source=source,
+        header=_COMMON + matrices.header,
+        source=matrices.declarations + source,
     )
 
 
 @cache
-def _gate_up_window_kernel(routed: _Format, shared: _Format, gate: _Format):
+def _gate_up_window_kernel(routed: Dot, shared: Dot, gate: Dot):
     """The folded gate+up/SwiGLU launch for every row of a verify window."""
-    header = (
-        _COMMON
-        + _format_header("rt", routed)
-        + _format_header("st", shared)
-        + _format_header("gt", gate)
-    )
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", routed), "rhs"]
+    inputs += _add_shared_gate_up(matrices, shared, gate)
     return mx.fast.metal_kernel(
         name=(
-            f"omlx_qwen35_moe_gate_up_window_{_name(routed)}"
-            f"_shared_{_name(shared)}_gate_{_name(gate)}"
+            f"omlx_qwen35_moe_gate_up_window_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
         ),
-        input_names=[
-            "x", "w", "scales", "biases", "rhs",
-            "sg_w", "sg_s", "sg_b", "su_w", "su_s", "su_b", "g_w", "g_s", "g_b",
-        ],
+        input_names=inputs,
         output_names=["y"],
-        header=header,
-        source=_GATE_UP_WINDOW_HEAD + _GATE_UP_SHARED + _GATE_UP_ROUTED + "    }\n",
+        header=_COMMON + matrices.header,
+        source=(
+            matrices.declarations
+            + _GATE_UP_WINDOW_HEAD
+            + _GATE_UP_SHARED
+            + _GATE_UP_ROUTED
+            + "    }\n"
+        ),
     )
 
 
 @cache
-def _down_window_kernel(routed: _Format, shared: _Format):
+def _down_window_kernel(routed: Dot, shared: Dot):
     """The folded down/combine launch for every row of a verify window."""
-    header = _COMMON + _format_header("rd", routed) + _format_header("sd", shared)
+    matrices = kernels.Matrices()
+    inputs = [
+        "x",
+        *matrices.add("rd", routed),
+        *matrices.add("sd", shared),
+        "rhs",
+        "scores",
+    ]
     tail = _DOWN_TAIL.replace("SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]").replace(
         "GATE_VALUE", "x[TOPK * K + KS]"
     )
     return mx.fast.metal_kernel(
-        name=f"omlx_qwen35_moe_down_combine_window_{_name(routed)}_shared_{_name(shared)}",
-        input_names=["x", "w", "scales", "biases", "sd_w", "sd_s", "sd_b", "rhs", "scores"],
+        name=f"omlx_qwen35_moe_down_combine_window_{routed.key}_shared_{shared.key}",
+        input_names=inputs,
         output_names=["y"],
-        header=header,
-        source=_DOWN_WINDOW_HEAD + _DOWN_SHARED_ROWS + tail + "    }\n",
+        header=_COMMON + matrices.header,
+        source=matrices.declarations
+        + _DOWN_WINDOW_HEAD
+        + _DOWN_SHARED_ROWS
+        + tail
+        + "    }\n",
     )
 
 
 @cache
-def _gate_up_topk_kernel(routed: _Format, shared: _Format | None, gate: _Format | None):
+def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
     """Gate+up/SwiGLU with the router softmax + top-k folded in, for M rows;
     with ``shared`` (and ``gate``) it also runs the shared expert's gate+up
     and the shared-expert gate row."""
-    header = _COMMON + TOPK_HEADER + _format_header("rt", routed)
-    inputs = ["x", "w", "scales", "biases", "logits"]
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", routed), "logits"]
     source = _GATE_UP_TOPK_HEAD
-    name = f"omlx_qwen35_moe_gate_up_topk_{_name(routed)}"
+    name = f"omlx_qwen35_moe_gate_up_topk_{routed.key}"
     if shared is None:
         source += _GATE_UP_TOPK_UNSHARED
     else:
-        header += _format_header("st", shared) + _format_header("gt", gate)
-        inputs += ["sg_w", "sg_s", "sg_b", "su_w", "su_s", "su_b", "g_w", "g_s", "g_b"]
+        inputs += _add_shared_gate_up(matrices, shared, gate)
         source += _GATE_UP_SHARED
-        name += f"_shared_{_name(shared)}_gate_{_name(gate)}"
+        name += f"_shared_{shared.key}_gate_{gate.key}"
     return mx.fast.metal_kernel(
         name=name,
         input_names=inputs,
         output_names=["y", "indices", "scores"],
-        header=header,
-        source=source + _GATE_UP_TOPK_ROUTED + "    }\n",
+        header=_COMMON + TOPK_HEADER + matrices.header,
+        source=matrices.declarations + source + _GATE_UP_TOPK_ROUTED + "    }\n",
     )
 
 
-def _quantized_ok(layer, cls) -> bool:
+def _plain(layer, cls) -> bool:
     # Exactly the class whose call is a bare quantized_matmul / gather_qmm;
     # subclasses and repacked layers may compute differently.
-    return (
-        type(layer) is cls
-        and layer.bits in _BITS
-        and layer.group_size in _GROUP_SIZES
-        and layer.mode == "affine"
-        and "biases" in layer
-        and "bias" not in layer
-        and layer["scales"].dtype in (mx.bfloat16, mx.float16)
-        and layer["biases"].dtype == layer["scales"].dtype
-    )
+    return type(layer) is cls and "bias" not in layer
 
 
-def _mlx_format(layer, k: int, n: int) -> _Format | None:
-    """The format MLX's one-row mat-vec runs for ``layer`` ([n, k] weights),
-    or None when the packed shape does not match."""
-    if layer["weight"].shape[-2:] != (n, k * layer.bits // 32) or k % layer.group_size:
-        return None
-    return _Format(
-        layer.bits,
-        layer.group_size,
-        qmv_fast_layout(k, n, layer.bits, gathered=layer["weight"].ndim == 3),
-    )
+def _operands(layer, face: Dot) -> tuple:
+    return tuple(layer[name] for name in ("weight", *face.tensors))
 
 
 def _address(a: mx.array) -> int:
@@ -641,7 +542,7 @@ class _Plan(NamedTuple):
 
 
 def _shared_formats(block, hidden: int, dtype: mx.Dtype):
-    """(gate+up, down, gate) formats and operands of a foldable shared
+    """(gate+up, down, gate) dot faces and operands of a foldable shared
     expert and gate, or None."""
     from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
 
@@ -649,32 +550,31 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     if type(shared) is not Qwen3_5MLP:
         return None
     layers = (shared.get("gate_proj"), shared.get("up_proj"), shared.get("down_proj"), gate)
-    if not all(
-        _quantized_ok(layer, nn.QuantizedLinear) and layer["scales"].dtype == dtype
-        for layer in layers
-    ):
+    if not all(_plain(layer, nn.QuantizedLinear) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
     width = gate_proj["weight"].shape[0]
-    gu_fmt = _mlx_format(gate_proj, hidden, width)
-    d_fmt = _mlx_format(down_proj, width, hidden)
-    g_fmt = _mlx_format(gate, hidden, 1)
+    gu_fmt = formats.dot(gate_proj, hidden, width)
+    d_fmt = formats.dot(down_proj, width, hidden)
+    g_fmt = formats.dot(gate, hidden, 1)
     if (
         gu_fmt is None
         or d_fmt is None
         or g_fmt is None
-        or _mlx_format(up_proj, hidden, width) != gu_fmt
+        or formats.dot(up_proj, hidden, width) != gu_fmt
+        or not all(face.exact_for(dtype) for face in (gu_fmt, d_fmt, g_fmt))
         or width % (_GATE_UP_ROWS * _GATE_UP_SIMDGROUPS)
     ):
         return None
-    operands = lambda layer: tuple(layer[k] for k in ("weight", "scales", "biases"))
     return (
         width,
         gu_fmt,
         d_fmt,
         g_fmt,
-        operands(gate_proj) + operands(up_proj) + operands(gate),
-        operands(down_proj),
+        _operands(gate_proj, gu_fmt)
+        + _operands(up_proj, gu_fmt)
+        + _operands(gate, g_fmt),
+        _operands(down_proj, d_fmt),
     )
 
 
@@ -690,27 +590,25 @@ def _build_plan(block) -> _Plan | None:
     gate_up = switch_mlp.get("gate_up_proj")
     down = switch_mlp.get("down_proj")
     if not (
-        _quantized_ok(gate_up, QuantizedSwitchLinear)
-        and _quantized_ok(down, QuantizedSwitchLinear)
+        _plain(gate_up, QuantizedSwitchLinear) and _plain(down, QuantizedSwitchLinear)
     ):
         return None
     hidden = down["weight"].shape[1]
-    inter = down["weight"].shape[-1] * 32 // down.bits
-    gu_fmt = _mlx_format(gate_up, hidden, 2 * inter)
-    d_fmt = _mlx_format(down, inter, hidden)
+    inter = gate_up["weight"].shape[1] // 2
+    gu_fmt = formats.dot(gate_up, hidden, 2 * inter)
+    d_fmt = formats.dot(down, inter, hidden)
     if (
         gu_fmt is None
         or d_fmt is None
-        or not gu_fmt.fast
+        or gu_fmt.tail
         or gate_up["weight"].shape[0] != down["weight"].shape[0]
-        or down["scales"].dtype != gate_up["scales"].dtype
+        or gu_fmt.dtype is None
+        or not d_fmt.exact_for(gu_fmt.dtype)
     ):
         return None
-    dtype, top_k = gate_up["scales"].dtype, block.top_k
-    gate_up_operands = tuple(
-        _expert_view(gate_up[k]) for k in ("weight", "scales", "biases")
-    )
-    down_operands = tuple(_expert_view(down[k]) for k in ("weight", "scales", "biases"))
+    dtype, top_k = gu_fmt.dtype, block.top_k
+    gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
+    down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
     shared = _shared_formats(block, hidden, dtype)
     gate = block.get("gate")
     router_logits = None

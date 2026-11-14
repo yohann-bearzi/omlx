@@ -7,6 +7,7 @@ verifier's composed MoE returned for the window before."""
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -14,6 +15,7 @@ import mlx.nn as nn
 import pytest
 
 import omlx.patches.qwen35_moe_routed_decode as routed
+from omlx.formats import affine
 from omlx.patches import qwen35_moe_router as router
 from omlx.patches import qwen35_verify_qmm
 
@@ -310,7 +312,7 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps
     verify window must equal one-token decode under either grouping."""
     f32, top_k, experts, rows = mx.float32, 10, 64, 4
     mx.random.seed(60 + bits)
-    fmt = routed._Format
+    fmt = partial(affine.face, dtype=f32)
     routed_gu, shared_gu, gate_fmt = fmt(bits, 64, True), fmt(8, 128, True), fmt(8, 64, False)
     routed_d, shared_d = fmt(bits, 64, False), fmt(8, 128, False)
     experts_gate_up = _quantized((experts, 2 * INTER, HIDDEN), 64, bits)

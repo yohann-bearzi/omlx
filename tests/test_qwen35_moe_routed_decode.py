@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -10,6 +11,7 @@ import mlx.nn as nn
 import pytest
 
 import omlx.patches.qwen35_moe_routed_decode as routed
+from omlx.formats import affine
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -179,7 +181,7 @@ def test_fp32_kernels_match_mlx_mat_vecs(bits):
     shared_gate, shared_up = quantized((inter, hidden), 128, 8), quantized((inter, hidden), 128, 8)
     shared_down = quantized((hidden, inter), 128, 8)
     gate_row = quantized((1, hidden), 64, 8)
-    fmt = routed._Format
+    fmt = partial(affine.face, dtype=f32)
     gate_up_kernel = routed._gate_up_kernel(
         fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, True)
     )
@@ -254,7 +256,7 @@ def test_fp32_folded_routing_matches_the_routing_launch(bits):
     experts_gate_up = quantized((experts, 2 * inter, hidden), gs, bits)
     shared = quantized((inter, hidden), 128, 8) + quantized((inter, hidden), 128, 8)
     gate_row = quantized((1, hidden), 64, 8)
-    fmt = routed._Format
+    fmt = partial(affine.face, dtype=f32)
     formats = (fmt(bits, gs, True), fmt(8, 128, True), fmt(8, 64, False))
     x = mx.random.normal((rows, hidden))
     logits = mx.random.normal((rows, experts // 2)) * 2

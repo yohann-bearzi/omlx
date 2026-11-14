@@ -321,3 +321,9 @@ Worth testing for every layout a format gives a face for:
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
 Any other affine layer (2 or 3 bits, fp32 scales, no biases) has no face and runs MLX's ops.
+
+## Kernels built on faces
+
+| Kernel | Face | Code |
+|---|---|---|
+| Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |

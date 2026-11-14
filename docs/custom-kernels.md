@@ -44,7 +44,7 @@ Each package has:
 
 ANE offload is off by default. See [Qwen ANE/GPU prefill](experimental/qwen35_ane_prefill.md).
 
-Some kernels are not in this directory. Small JIT kernels (`mx.fast.metal_kernel`) live next to the model code in `omlx/patches`. They compile at runtime and need no build.
+Some kernels are not in this directory. Small JIT kernels (`mx.fast.metal_kernel`) live next to the model code in `omlx/patches`. They compile at runtime and need no build. A JIT kernel that reads quantized weights can be written over a quant format's face, and then runs every format that has the face. See [Quant formats](quant-formats.md).
 
 ## Build
 
