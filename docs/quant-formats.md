@@ -63,8 +63,8 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. |
-| `tensors` | The layer's parameters beside `weight` that the face reads. They become kernel inputs in this order. Identifiers. |
-| `dtype` | The only activation dtype the face is exact for, or `None` for any. Ask with `face.exact_for(dtype)`: an `mx.Dtype` does not compare with `None`. |
+| `tensors` | The layer's parameters beside `weight` that the face reads, as a tuple. They become kernel inputs in this order. Identifiers, each named once. |
+| `dtypes` | The activation dtypes the face is exact for, as a tuple; empty (the default) for any. Ask with `face.exact_for(dtype)`. |
 
 ## The dot face
 

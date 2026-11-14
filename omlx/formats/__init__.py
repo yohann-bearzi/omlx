@@ -53,21 +53,29 @@ class Dot:
     source: str
     type: str
     tensors: tuple[str, ...]
-    dtype: Any = None  # the only activation dtype the face is exact for, if any
+    dtypes: tuple[Any, ...] = ()  # the activation dtypes it is exact for; any if empty
 
     def __post_init__(self) -> None:
+        if not (isinstance(self.tensors, tuple) and isinstance(self.dtypes, tuple)):
+            raise ValueError(
+                f"quant format face {self.key!r}: tensors and dtypes are tuples"
+            )
         # Both are spliced into Metal identifiers.
         for name in (self.key, *self.tensors):
             if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
                 raise ValueError(
                     f"quant format face {self.key!r}: {name!r} is not an identifier"
                 )
+        if len(set(self.tensors)) != len(self.tensors):
+            raise ValueError(
+                f"quant format face {self.key!r}: a tensor is named twice in "
+                f"{self.tensors!r}"
+            )
 
     def exact_for(self, dtype) -> bool:
         """Whether the face computes its format's rows for ``dtype``
         activations."""
-        # mx.Dtype does not compare with None.
-        return self.dtype is None or self.dtype == dtype
+        return not self.dtypes or dtype in self.dtypes
 
 
 class QuantFormat:

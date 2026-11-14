@@ -220,6 +220,15 @@ def test_equal_faces_are_one_cache_key():
     assert len({same, _FACE}) == 1
 
 
+def test_faces_compare_by_their_dtypes_too():
+    half = replace(_FACE, dtypes=(mx.float16,))
+    # A dtype read off an array, not the module's constant.
+    again = replace(_FACE, dtypes=(mx.zeros(1, mx.float16).dtype,))
+    assert half == again and hash(half) == hash(again)
+    assert half != _FACE  # exact for one dtype, exact for any
+    assert half != replace(_FACE, dtypes=(mx.bfloat16,))
+
+
 @pytest.mark.parametrize(
     "names",
     [
@@ -237,7 +246,23 @@ def test_a_face_names_metal_identifiers(names):
         replace(_FACE, **names)
 
 
-def test_a_face_is_exact_for_its_dtype_or_for_any():
+@pytest.mark.parametrize(
+    "fields, message",
+    [
+        ({"tensors": "scales"}, "tensors and dtypes are tuples"),
+        ({"tensors": ["scales"]}, "tensors and dtypes are tuples"),
+        ({"dtypes": mx.float16}, "tensors and dtypes are tuples"),
+        ({"tensors": ("scales", "scales")}, "a tensor is named twice"),
+    ],
+)
+def test_a_face_lists_its_tensors_and_dtypes_in_tuples(fields, message):
+    with pytest.raises(ValueError, match=message):
+        replace(_FACE, **fields)
+
+
+def test_a_face_is_exact_for_its_dtypes_or_for_any():
     assert _FACE.exact_for(mx.float16) and _FACE.exact_for(mx.bfloat16)
-    half = replace(_FACE, dtype=mx.float16)
+    half = replace(_FACE, dtypes=(mx.float16,))
     assert half.exact_for(mx.float16) and not half.exact_for(mx.bfloat16)
+    halves = replace(_FACE, dtypes=(mx.float16, mx.bfloat16))
+    assert halves.exact_for(mx.bfloat16) and not halves.exact_for(mx.float32)

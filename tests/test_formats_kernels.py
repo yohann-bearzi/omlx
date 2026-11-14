@@ -288,7 +288,7 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
     operands, x, _ = _matrix(8, 512)
     with pytest.raises(ValueError, match="n=7 is not a multiple of the 2 rows"):
         testing.dot_rows(_toy("a"), operands, x, 7)
-    half = replace(_toy("half"), dtype=mx.float16)
+    half = replace(_toy("half"), dtypes=(mx.float16,))
     with pytest.raises(ValueError, match="toy_half is exact for mlx.core.float16"):
         testing.dot_rows(half, operands, x, 8)
     (codes, scales), x, _ = _matrix(4, 512)

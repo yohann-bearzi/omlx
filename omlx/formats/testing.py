@@ -58,7 +58,8 @@ def dot_rows(
     if n % (na + nb):
         raise ValueError(f"n={n} is not a multiple of the {na + nb} rows of a launch")
     if not face.exact_for(x.dtype):
-        raise ValueError(f"face {face.key} is exact for {face.dtype}, x is {x.dtype}")
+        exact = ", ".join(str(dtype) for dtype in face.dtypes)
+        raise ValueError(f"face {face.key} is exact for {exact}, x is {x.dtype}")
     for name, operand in zip(("weight", *face.tensors), operands, strict=True):
         if operand.size < 8:
             raise ValueError(

@@ -61,7 +61,7 @@ def test_the_face_follows_mlx_one_row_dispatch(k, bits, fast):
     face = formats.dot(_linear(k, 16, bits, 64), k, 16)
     assert face == affine.face(bits, 64, fast, mx.bfloat16)
     assert face != affine.face(bits, 64, not fast, mx.bfloat16)
-    assert (face.dtype, face.tensors) == (mx.bfloat16, ("scales", "biases"))
+    assert (face.dtypes, face.tensors) == ((mx.bfloat16,), ("scales", "biases"))
 
 
 def test_stacked_weights_follow_gather_qmm_dispatch():

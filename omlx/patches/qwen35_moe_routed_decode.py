@@ -601,11 +601,11 @@ def _build_plan(block) -> _Plan | None:
         gu_fmt is None
         or d_fmt is None
         or gate_up["weight"].shape[0] != down["weight"].shape[0]
-        or gu_fmt.dtype is None
-        or not d_fmt.exact_for(gu_fmt.dtype)
+        or len(gu_fmt.dtypes) != 1
+        or not d_fmt.exact_for(gu_fmt.dtypes[0])
     ):
         return None
-    dtype, top_k = gu_fmt.dtype, block.top_k
+    dtype, top_k = gu_fmt.dtypes[0], block.top_k
     gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
     shared = _shared_formats(block, hidden, dtype)

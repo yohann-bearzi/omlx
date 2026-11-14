@@ -93,7 +93,7 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
         source=f"namespace omlx_{key} {{\n{header}\n{_DOT}\n}}  // namespace omlx_{key}\n",
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
-        dtype=dtype,
+        dtypes=(dtype,),
     )
 
 
