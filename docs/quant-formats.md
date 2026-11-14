@@ -45,7 +45,9 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 
 - A mode has one format. A second format for a registered mode is refused.
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
+- Plugins register in the order of their entry points' names. Of two that claim one mode, the first is kept.
 - A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped. The server still starts.
+- A plugin's module may call `omlx.formats.get` when it is imported. It sees the built-in formats; another plugin may not be registered yet.
 
 ## Faces
 

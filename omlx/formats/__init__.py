@@ -9,7 +9,7 @@ structs that decode its tensors. oMLX's kernels are skeletons over a face
 the kernel; the loads and the arithmetic of one weight run belong to the
 format), so a kernel tuned for one format runs every format that has the
 face, and a format written once runs in every such kernel. A kernel is
-compiled per format instance and the face is inlined into it.
+compiled once per face, with the face inlined into it.
 
 Formats come from oMLX itself (``BUILTIN``) and from installed distributions
 that declare an entry point in the ``omlx.quant_formats`` group:
@@ -25,8 +25,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from importlib import import_module
-from importlib.metadata import entry_points
+from importlib.metadata import EntryPoint, entry_points
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -85,13 +84,20 @@ class QuantFormat:
 
 
 _FORMATS: dict[str, QuantFormat] = {}
-_LOCK = threading.Lock()
+# Held for the whole load. Reentrant: the modules a load imports may look
+# formats up or register some themselves.
+_LOCK = threading.RLock()
 _loaded = False
+_loading = False
 
 
 def register(fmt: QuantFormat) -> None:
-    """Add ``fmt`` under its mode; a mode has one format."""
-    mode, tensors = fmt.mode, fmt.tensors
+    """Add ``fmt`` under its mode; a mode has one format, and the built-in
+    formats have theirs first."""
+    if not isinstance(fmt, QuantFormat):
+        raise TypeError(f"{fmt!r} is not a QuantFormat instance")
+    _load()
+    mode, tensors = getattr(fmt, "mode", None), getattr(fmt, "tensors", None)
     if not isinstance(mode, str) or not mode:
         raise ValueError(f"quant format {fmt!r} has no mode")
     if not isinstance(tensors, tuple) or {"weight", "bias"} & set(tensors):
@@ -104,32 +110,42 @@ def register(fmt: QuantFormat) -> None:
 
 
 def _load() -> None:
-    """Register the built-in formats, then every installed plugin's. A plugin
-    that fails to load is logged and skipped: its checkpoints then fail to
-    load with an unknown mode, everything else is served."""
-    global _loaded
+    """Register the built-in formats, then every installed plugin's, in the
+    order of their entry points' names. A plugin that fails to load is logged
+    and skipped: its checkpoints then fail to load with an unknown mode,
+    everything else is served. A built-in that fails to load is oMLX's own
+    defect and raises, here and at every later lookup.
+
+    A lookup made while the load runs (by a module the load imports) sees
+    the formats registered so far: every built-in, for a plugin."""
+    global _loaded, _loading
+    if _loaded:
+        return
     with _LOCK:
-        if _loaded:
+        if _loaded or _loading:
             return
-        for value in BUILTIN:
-            module, _, attribute = value.partition(":")
-            register(getattr(import_module(module), attribute))
-        for entry in entry_points(group=ENTRY_POINT_GROUP):
-            try:
-                register(entry.load())
-            except Exception:
-                logger.exception(
-                    "quant format plugin %s (%s) failed to load",
-                    entry.name,
-                    entry.value,
-                )
-        _loaded = True
+        _loading = True
+        try:
+            for value in BUILTIN:
+                register(EntryPoint("builtin", value, ENTRY_POINT_GROUP).load())
+            plugins = entry_points(group=ENTRY_POINT_GROUP)
+            for entry in sorted(plugins, key=lambda entry: entry.name):
+                try:
+                    register(entry.load())
+                except Exception:
+                    logger.exception(
+                        "quant format plugin %s (%s) failed to load",
+                        entry.name,
+                        entry.value,
+                    )
+            _loaded = True
+        finally:
+            _loading = False
 
 
 def get(mode: str | None) -> QuantFormat | None:
     """The format registered for ``mode``, or None."""
-    if not _loaded:
-        _load()
+    _load()
     return _FORMATS.get(mode)
 
 

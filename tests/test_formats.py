@@ -6,6 +6,7 @@ their mode through one door, and a plugin that fails to load is skipped.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ class _Format(formats.QuantFormat):
         self.mode, self.tensors = mode, tensors
 
     def dot(self, layer, k, n):
+        self.asked = (layer, k, n)
         return _FACE
 
 
@@ -44,7 +46,7 @@ class _Entry:
         self.loaded += 1
         if isinstance(self.loads, Exception):
             raise self.loads
-        return self.loads
+        return self.loads() if callable(self.loads) else self.loads
 
 
 @pytest.fixture
@@ -54,6 +56,7 @@ def plugins(monkeypatch):
     installed = []
     monkeypatch.setattr(formats, "_FORMATS", {})
     monkeypatch.setattr(formats, "_loaded", False)
+    monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
     monkeypatch.setattr(
         formats,
@@ -96,15 +99,41 @@ def test_register_refuses_a_malformed_format(plugins, mode, tensors):
     assert formats.get(mode) is None
 
 
+def test_register_refuses_what_is_not_a_format_instance(plugins):
+    with pytest.raises(TypeError, match="is not a QuantFormat instance"):
+        formats.register(_Format)  # the class
+    with pytest.raises(ValueError, match="has no mode"):
+        formats.register(formats.QuantFormat())
+    assert formats.get("toy") is None
+
+
 def test_builtins_register_through_register(plugins, monkeypatch):
     monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
     registered = []
     register = formats.register
-    monkeypatch.setattr(
-        formats, "register", lambda fmt: (registered.append(fmt), register(fmt))[1]
-    )
+
+    def recorded(fmt):
+        registered.append(fmt)
+        register(fmt)
+
+    monkeypatch.setattr(formats, "register", recorded)
     assert formats.get("builtin") is _BUILTIN
     assert registered == [_BUILTIN]
+
+
+def test_a_builtin_has_its_mode_before_anything_registers(plugins, monkeypatch):
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
+    # The first call into the registry is a register, not a lookup.
+    with pytest.raises(ValueError, match="'builtin' is already registered"):
+        formats.register(_Format("builtin"))
+    assert formats.get("builtin") is _BUILTIN
+
+
+def test_a_builtin_that_fails_to_load_raises_at_every_lookup(plugins, monkeypatch):
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_NO_SUCH_FORMAT",))
+    for _ in range(2):
+        with pytest.raises(AttributeError, match="_NO_SUCH_FORMAT"):
+            formats.get("builtin")
 
 
 def test_plugins_load_once_from_their_entry_points(plugins):
@@ -135,12 +164,46 @@ def test_a_plugin_cannot_take_a_builtins_mode(plugins, monkeypatch, caplog):
     plugins.append(_Entry("shadow", _Format("builtin")))
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         assert formats.get("builtin") is _BUILTIN
-    assert "shadow" in caplog.text
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin shadow (shadow:FORMAT) failed to load"
+    ]
+
+
+def test_of_two_plugins_for_a_mode_the_first_by_name_is_kept(plugins, caplog):
+    first, second = _Format(), _Format()
+    plugins += [_Entry("zeta", second), _Entry("alpha", first)]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.get("toy") is first
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin zeta (zeta:FORMAT) failed to load"
+    ]
+
+
+def test_a_plugin_may_look_formats_up_while_it_loads(plugins, monkeypatch):
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
+    fmt, seen = _Format(), []
+
+    def load():
+        # What a plugin's module does at import to build on another format.
+        seen.append(formats.get("builtin"))
+        formats.register(fmt)  # ... or to register by itself
+        return fmt
+
+    plugins.append(_Entry("toy", load))
+    found = []
+    lookup = threading.Thread(target=lambda: found.append(formats.get("toy")))
+    lookup.start()
+    lookup.join(10)
+    assert not lookup.is_alive(), "the lookup inside the load deadlocked"
+    assert seen == [_BUILTIN] and found == [fmt]
+    assert plugins[0].loaded == 1
 
 
 def test_dot_asks_the_format_of_the_layers_mode(plugins):
-    formats.register(_Format())
-    assert formats.dot(SimpleNamespace(mode="toy"), 64, 8) is _FACE
+    fmt, layer = _Format(), SimpleNamespace(mode="toy")
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.asked == (layer, 64, 8)
     assert formats.dot(SimpleNamespace(mode="other"), 64, 8) is None
     assert formats.dot(SimpleNamespace(), 64, 8) is None  # not quantized
 
