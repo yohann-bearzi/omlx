@@ -18,6 +18,8 @@ that declare an entry point in the ``omlx.quant_formats`` group:
     myformat = "my_package:FORMAT"
 
 Both register through ``register``. ``docs/quant-formats.md`` is the contract.
+It has a revision number (``CONTRACT``), and a format states the revision it
+is written for.
 """
 
 from __future__ import annotations
@@ -35,6 +37,11 @@ ENTRY_POINT_GROUP = "omlx.quant_formats"
 
 # Formats that ship with oMLX, as entry-point values ("module:attribute").
 BUILTIN: tuple[str, ...] = ("omlx.formats.affine:FORMAT",)
+
+# The revision of the contract (docs/quant-formats.md, Versions) that this
+# oMLX implements, and the oldest one whose formats it still runs.
+CONTRACT = 1
+OLDEST_CONTRACT = 1
 
 
 @dataclass(frozen=True)
@@ -86,12 +93,13 @@ class Dot:
 
 
 class QuantFormat:
-    """One weight format. A subclass sets ``mode`` and ``tensors`` and
-    overrides the faces it has; a kernel whose face a format lacks keeps its
-    composed path."""
+    """One weight format. A subclass sets ``mode``, ``tensors`` and
+    ``contract``, and overrides the faces it has; a kernel whose face a
+    format lacks keeps its composed path."""
 
     mode: str  # a linear's "mode" in the quantization config
     tensors: tuple[str, ...]  # its parameters beside "weight" (and "bias")
+    contract: int  # the revision of the contract it is written for
 
     def dot(self, layer, k: int, n: int) -> Dot | None:
         """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None."""
@@ -109,7 +117,8 @@ _loading = False
 def register(fmt: QuantFormat) -> None:
     """Add ``fmt`` under its mode. A mode has one format, and the formats
     oMLX loads by itself (the built-in ones, then the installed plugins')
-    have theirs first."""
+    have theirs first. A format written for a revision of the contract that
+    this oMLX does not run is refused."""
     if not isinstance(fmt, QuantFormat):
         raise TypeError(f"{fmt!r} is not a QuantFormat instance")
     mode, tensors = getattr(fmt, "mode", None), getattr(fmt, "tensors", None)
@@ -119,6 +128,18 @@ def register(fmt: QuantFormat) -> None:
         raise ValueError(
             f"quant format {mode!r}: tensors must be a tuple of the parameter "
             "names beside 'weight' and 'bias'"
+        )
+    contract = getattr(fmt, "contract", None)
+    if type(contract) is not int:
+        raise ValueError(
+            f"quant format {mode!r} does not state the revision of the format "
+            "contract it is written for (contract)"
+        )
+    if not OLDEST_CONTRACT <= contract <= CONTRACT:
+        raise ValueError(
+            f"quant format {mode!r} is written for revision {contract} of the "
+            f"format contract; this oMLX runs revisions {OLDEST_CONTRACT} to "
+            f"{CONTRACT}: update {'oMLX' if contract > CONTRACT else 'the format'}"
         )
     load()
     if _FORMATS.setdefault(mode, fmt) is not fmt:

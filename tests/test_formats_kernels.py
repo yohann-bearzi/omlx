@@ -12,6 +12,7 @@ from dataclasses import replace
 import mlx.core as mx
 import pytest
 
+from omlx import formats
 from omlx.formats import Dot, kernels, testing
 
 metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -20,6 +21,7 @@ metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 _TOY = r"""
 namespace omlx_toy_KEY {
 struct Dot {
+  static constant constexpr int CONTRACT = 1;
   const device uint8_t* codes;
   const device float* scales;
 
@@ -131,6 +133,12 @@ def test_a_kernel_includes_each_format_source_once():
     for name, face in (("sg", a), ("su", a), ("rt", b)):
         matrices.add(name, face)
     header = matrices.header
+    # The revisions come ahead of the first cited line.
+    assert header.startswith(
+        f"#define OMLX_CONTRACT {formats.CONTRACT}\n"
+        f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}\n"
+        '\n#line 1 "<omlx skeletons, docs/quant-formats.md>"\n'
+    )
     assert header.count(a.source) == header.count(b.source) == 1
     # Formats may use the index packs; the skeletons use the formats.
     assert (
@@ -308,6 +316,38 @@ def test_a_block_that_is_not_32_lanes_is_refused_in_words():
 def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
     message = _error(_toy("ragged"), k=60)
     assert "dot face: K must be a whole number of a lane's VPT inputs" in message
+
+
+def _revision(contract) -> Dot:
+    source = _TOY.replace("CONTRACT = 1;", f"CONTRACT = {contract};")
+    return _toy(f"revision_{contract}", source=source)
+
+
+@metal
+def test_a_kernel_runs_the_faces_of_the_revisions_omlx_runs(monkeypatch):
+    # As an oMLX of revision 3 that still runs the formats of revision 2.
+    revisions = "#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
+    monkeypatch.setattr(kernels, "_REVISIONS", revisions)
+    operands, x, want = _matrix(8, 512)
+    for contract in (2, 3):
+        got = testing.dot_rows(_revision(contract), operands, x, 8)
+        assert mx.array_equal(got, want).item()
+    for contract, rule in (
+        (4, "a later revision of the contract than this oMLX runs"),
+        (1, "a revision of the contract this oMLX no longer runs"),
+    ):
+        message = _error(_revision(contract))
+        assert f"dot face: written for {rule}" in message
+        assert "<omlx skeletons, docs/quant-formats.md>:" in message
+        # The other rule holds, and is not cited.
+        assert message.count("dot face: ") == 1
+
+
+@metal
+def test_a_face_that_states_no_revision_is_told_which_member_it_lacks():
+    source = _TOY.replace("  static constant constexpr int CONTRACT = 1;\n", "")
+    message = _error(_toy("no_revision", source=source))
+    assert "no member named 'CONTRACT' in 'omlx_toy_no_revision::Dot'" in message
 
 
 @metal

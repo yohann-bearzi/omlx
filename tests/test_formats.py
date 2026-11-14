@@ -6,8 +6,10 @@ their mode through one door, and a plugin that fails to load is skipped.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -26,8 +28,8 @@ _FACE = formats.Dot(
 
 
 class _Format(formats.QuantFormat):
-    def __init__(self, mode="toy", tensors=("scales",)):
-        self.mode, self.tensors = mode, tensors
+    def __init__(self, mode="toy", tensors=("scales",), contract=1):
+        self.mode, self.tensors, self.contract = mode, tensors, contract
 
     def dot(self, layer, k, n):
         self.asked = (layer, k, n)
@@ -124,6 +126,12 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
 
     with pytest.raises(ValueError, match="'toy': tensors must be a tuple"):
         formats.register(ModeOnly())
+
+    class NoRevision(ModeOnly):
+        tensors = ("scales",)
+
+    with pytest.raises(ValueError, match="'toy' does not state the revision"):
+        formats.register(NoRevision())
     assert formats.get("toy") is None
 
 
@@ -131,7 +139,58 @@ def test_a_malformed_format_is_refused_before_anything_loads(plugins):
     plugins.append(_Entry("toy", _Format()))
     with pytest.raises(ValueError, match="has no mode"):
         formats.register(formats.QuantFormat())
+    with pytest.raises(ValueError, match="update oMLX"):
+        formats.register(_Format(contract=formats.CONTRACT + 1))
     assert plugins[0].loaded == 0
+
+
+# The revision is an int: True, which isinstance takes for one, is refused.
+@pytest.mark.parametrize("contract", [None, "1", 1.0, True])
+def test_register_refuses_a_format_that_states_no_revision(plugins, contract):
+    with pytest.raises(ValueError, match="'toy' does not state the revision"):
+        formats.register(_Format(contract=contract))
+    assert formats.get("toy") is None
+
+
+def test_a_format_registers_under_the_revisions_omlx_runs(plugins, monkeypatch):
+    monkeypatch.setattr(formats, "CONTRACT", 4)
+    monkeypatch.setattr(formats, "OLDEST_CONTRACT", 2)
+    for contract in (2, 3, 4):
+        fmt = _Format(f"toy{contract}", contract=contract)
+        formats.register(fmt)
+        assert formats.get(f"toy{contract}") is fmt
+    for contract, update in ((5, "oMLX"), (1, "the format"), (0, "the format")):
+        with pytest.raises(ValueError) as refusal:
+            formats.register(_Format("other", contract=contract))
+        assert str(refusal.value) == (
+            f"quant format 'other' is written for revision {contract} of the "
+            f"format contract; this oMLX runs revisions 2 to 4: update {update}"
+        )
+    assert formats.get("other") is None
+
+
+def test_a_plugin_of_another_revision_is_logged_and_skipped(plugins, caplog):
+    good = _Format("good")
+    plugins += [
+        _Entry("later", _Format("later", contract=formats.CONTRACT + 1)),
+        _Entry("good", good),
+    ]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.get("good") is good
+    assert formats.get("later") is None
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "quant format plugin later (later:FORMAT) failed to load"
+    )
+    assert "update oMLX" in str(record.exc_info[1])
+
+
+def test_the_contract_page_lists_every_revision():
+    page = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
+    versions = page.split("\n## Versions\n")[1].split("\n## ")[0]
+    revisions = [int(n) for n in re.findall(r"^\| (\d+) \|", versions, re.M)]
+    assert revisions == list(range(1, formats.CONTRACT + 1))
+    assert 1 <= formats.OLDEST_CONTRACT <= formats.CONTRACT
 
 
 def test_builtins_register_through_register(plugins, monkeypatch):

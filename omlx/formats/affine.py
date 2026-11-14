@@ -30,6 +30,7 @@ from . import Dot, QuantFormat
 _DOT = r"""
 template <typename T>
 struct Dot {
+  static constant constexpr int CONTRACT = 1;
   const device uint8_t* codes;
   const device T* scales;
   const device T* biases;
@@ -113,6 +114,7 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
 class AffineFormat(QuantFormat):
     mode = "affine"
     tensors = ("scales", "biases")
+    contract = 1
 
     def dot(self, layer, k: int, n: int) -> Dot | None:
         if (

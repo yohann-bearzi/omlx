@@ -10,6 +10,8 @@ oMLX's fused kernels are not written for one format. A kernel is a skeleton: it 
 
 MLX's affine quantization (the oQ and oQe checkpoints) is registered the same way as a plugin, so the plugin path is the path those checkpoints take. See [Affine](#affine).
 
+This page is the contract between oMLX and a format. It has a revision number, and a format states the revision it is written for, so that formats keep running as the contract grows. See [Versions](#versions).
+
 | File | What it holds |
 |---|---|
 | `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
@@ -27,6 +29,7 @@ from omlx.formats import Dot, QuantFormat
 class MyFormat(QuantFormat):
     mode = "myformat"      # a linear's "mode" in the quantization config
     tensors = ("scales",)  # its parameters beside "weight" and "bias"
+    contract = 1           # the revision of this page it is written for
 
     def dot(self, layer, k, n) -> Dot | None:
         ...
@@ -44,6 +47,7 @@ myformat = "my_package:FORMAT"
 Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
 - A mode has one format. A second format for a registered mode is refused.
+- A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
 - A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
@@ -83,10 +87,11 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 
 ## The dot face
 
-The struct named by `type` is the matrix. It is an aggregate: the weight as bytes, then one device pointer per name in `tensors`, in order. Each pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype).
+The struct named by `type` is the matrix. It is an aggregate: the weight as bytes, then one device pointer per name in `tensors`, in order. Each pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
 
 ```cpp
 struct Dot {
+  static constant constexpr int CONTRACT = 1;
   const device uint8_t* codes;
   const device float* scales;
 
@@ -145,6 +150,7 @@ The format `tests/test_formats_kernels.py` runs: 8-bit codes around 128, one flo
 ```cpp
 namespace omlx_myformat_b8 {
 struct Dot {
+  static constant constexpr int CONTRACT = 1;
   const device uint8_t* codes;
   const device float* scales;
 
@@ -287,7 +293,7 @@ each of a simdgroup's 32 lanes"
 A mistake inside the format is cited in the format:
 
 ```
-<quant format myformat_b8>:20:36: error: use of undeclared identifier 'weights'
+<quant format myformat_b8>:21:36: error: use of undeclared identifier 'weights'
 ```
 
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
@@ -300,7 +306,7 @@ A missing or mismatched member is cited where the skeleton uses it, with a note 
 ```
 <omlx skeletons, docs/quant-formats.md>:27:59: error: too many arguments to function call,
 expected 3, have 4
-<quant format myformat_b8>:37:18: note: 'madd' declared here
+<quant format myformat_b8>:38:18: note: 'madd' declared here
 ```
 
 The last one is a `madd` declared without its `aux` parameter.
@@ -330,9 +336,81 @@ Worth testing for every layout a format gives a face for:
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
 - the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. `dot_rows` compiles the skeleton for `x.dtype` and refuses a dtype the face is not exact for. For a face whose tensors are typed `T`, `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32, on fp32 activations and fp32 copies of those tensors.
 
+## Versions
+
+This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
+
+- the names of `omlx.formats` and `omlx.formats.testing` that this page describes, and the `omlx.quant_formats` entry-point group,
+- the members of a face, the order a kernel runs them in and the rules a face follows.
+
+The contract has a revision, a whole number that goes up by one with each change. `omlx.formats.CONTRACT` is the revision this oMLX implements. `omlx.formats.OLDEST_CONTRACT` is the oldest revision whose formats it still runs.
+
+| Revision | In oMLX since | What it adds |
+|---|---|---|
+| 1 | not released yet | The registry, the dot face, `omlx.formats.testing`. |
+
+A format states the revision it is written for in two places, with the same number: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face.
+
+```python
+class MyFormat(QuantFormat):
+    contract = 1
+```
+
+```cpp
+struct Dot {
+  static constant constexpr int CONTRACT = 1;
+```
+
+oMLX runs the formats of revisions `OLDEST_CONTRACT` to `CONTRACT`. A format of another revision is refused when it registers. For a plugin that means it is logged and skipped, and oMLX runs as it does without the plugin:
+
+```
+quant format 'myformat' is written for revision 2 of the format contract; this oMLX runs
+revisions 1 to 1: update oMLX
+```
+
+A face of another revision does not compile:
+
+```
+<omlx skeletons, docs/quant-formats.md>:86:3: error: static_assert failed due to requirement
+'Dot::CONTRACT <= 1' "dot face: written for a later revision of the contract than this oMLX
+runs"
+<kernel>:5:5: note: in instantiation of function template specialization
+'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
+```
+
+What a revision can change:
+
+- **An addition** is a new revision: a member of a face, a kind of face, a name in `omlx.formats`. Formats of earlier revisions run as before, to the bit. A kernel calls a member added in revision N only on a face that states N or later, so a format moves to a later revision when it wants what that revision adds, and not before.
+- **A change to something formats rely on** (a member's signature, the run order, a rule) is a new revision that also raises `OLDEST_CONTRACT`: every format of an earlier revision is refused until it is updated. Where an addition can do the job, it is done as one: a new member beside the old one.
+- **oMLX's own side** is not in the contract and changes without a revision: which kernels are built on a face, their launch shapes, `omlx.formats.kernels` (see [Kernels over faces](#kernels-over-faces)), speed.
+
+A format states the oldest revision that has everything it uses: it then runs on every oMLX from that revision's first release until `OLDEST_CONTRACT` passes it. A format that can use a later revision's additions and still run without them reads `omlx.formats.CONTRACT` and states the newest revision it knows that this oMLX runs.
+
+A revision that no release of oMLX has shipped can still change. Revision 1 is one.
+
+### Add to the contract
+
+The contract holds what a format uses, and grows when a format needs more. To add a member to a face:
+
+1. In the skeleton, call the member behind the revision that adds it. Faces of earlier revisions compile as before, without it:
+
+   ```cpp
+   if constexpr (D::CONTRACT >= 2) {
+     ...  // the call
+   }
+   ```
+
+2. Raise `CONTRACT` in `omlx/formats/__init__.py`, add a row to the table above, and document the member on this page with its revision.
+3. Test it with a face of the new revision that uses the member, with one that states the new revision and lacks the member (it must fail to compile, with a message that names the member), and with faces of earlier revisions: their rows must not change by a bit. Affine's rows stay MLX's.
+4. Measure the kernels built on the face against the commit before, in pairs, on the formats that do not have the member. It must cost them nothing.
+
+No member is added ahead of a format that uses it.
+
+A format whose product is not computed row by row over blocks of the inputs (one that shares partial products between rows through a codebook, for example) does not fit the dot face at any revision. It needs a kind of face of its own, and skeletons built on it: a larger change to oMLX, and still an addition.
+
 ## Affine
 
-`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits MLX gives one row of activations, through `mx.quantized_matmul` or, for stacked expert weights, `mx.gather_qmm`.
+`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format, written for revision 1 of this page. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits MLX gives one row of activations, through `mx.quantized_matmul` or, for stacked expert weights, `mx.gather_qmm`.
 
 | | Covered |
 |---|---|

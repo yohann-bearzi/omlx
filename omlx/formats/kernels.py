@@ -16,10 +16,17 @@ faster.
 
 from __future__ import annotations
 
-from . import Dot
+from . import CONTRACT, OLDEST_CONTRACT, Dot
 
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
+
+# The contract revisions the skeletons run a face of. A kernel has them ahead
+# of its first cited line.
+_REVISIONS = (
+    f"#define OMLX_CONTRACT {CONTRACT}\n"
+    f"#define OMLX_OLDEST_CONTRACT {OLDEST_CONTRACT}\n"
+)
 
 # Compile-time index packs, for folds over a fixed count (a kernel's rows, a
 # lane's values): omlx_iota<N>() is omlx_ints<0, ..., N - 1>. Formats' sources
@@ -123,6 +130,12 @@ METAL_FUNC void qmv_rows(
   static_assert(
       K % L::VPT == 0,
       "dot face: K must be a whole number of a lane's VPT inputs");
+  static_assert(
+      D::CONTRACT <= OMLX_CONTRACT,
+      "dot face: written for a later revision of the contract than this oMLX runs");
+  static_assert(
+      D::CONTRACT >= OMLX_OLDEST_CONTRACT,
+      "dot face: written for a revision of the contract this oMLX no longer runs");
   omlx_qmv_rows<T, K>(
       omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
 }
@@ -151,14 +164,15 @@ class Matrices:
 
     @property
     def header(self) -> str:
-        """The Metal the kernel includes: the index packs, each distinct
-        format source once (cited under the key of the first face that has
-        it), then the skeletons."""
+        """The Metal the kernel includes: the contract revisions, the index
+        packs, each distinct format source once (cited under the key of the
+        first face that has it), then the skeletons."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
         return (
-            _named(_SKELETONS, _INDEX_PACKS)
+            _REVISIONS
+            + _named(_SKELETONS, _INDEX_PACKS)
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
             + _named(_SKELETONS, _QMV_ROWS, line=_INDEX_PACKS.count("\n") + 1)
             + _named("<kernel header>", "")
