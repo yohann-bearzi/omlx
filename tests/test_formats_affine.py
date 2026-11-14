@@ -60,18 +60,16 @@ def test_affine_ships_as_a_builtin_plugin():
 def test_the_face_follows_mlx_one_row_dispatch(k, bits, fast):
     face = formats.dot(_linear(k, 16, bits, 64), k, 16)
     assert face == affine.face(bits, 64, fast, mx.bfloat16)
-    assert (face.tail, face.dtype, face.tensors) == (
-        not fast,
-        mx.bfloat16,
-        ("scales", "biases"),
-    )
+    assert face != affine.face(bits, 64, not fast, mx.bfloat16)
+    assert (face.dtype, face.tensors) == (mx.bfloat16, ("scales", "biases"))
 
 
 def test_stacked_weights_follow_gather_qmm_dispatch():
     # Gathered QMV is fast only for whole output tiles of 8 rows.
-    assert not formats.dot(_stacked(2, 512, 16, 4, 64), 512, 16).tail
-    assert formats.dot(_stacked(2, 512, 12, 4, 64), 512, 12).tail
-    assert not formats.dot(_linear(512, 12, 4, 64), 512, 12).tail
+    fast, slow = (affine.face(4, 64, fast, mx.bfloat16) for fast in (True, False))
+    assert formats.dot(_stacked(2, 512, 16, 4, 64), 512, 16) is fast
+    assert formats.dot(_stacked(2, 512, 12, 4, 64), 512, 12) is slow
+    assert formats.dot(_linear(512, 12, 4, 64), 512, 12) is fast
 
 
 def test_each_layout_is_one_face():

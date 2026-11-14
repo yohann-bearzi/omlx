@@ -19,7 +19,11 @@ from ..patches.moe_verify_gather import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_l
 from . import Dot, QuantFormat
 
 # One lane of qmv_fast_impl (FAST) or qmv_impl: its pack(s) of each row's
-# block, the group's scale and bias, and MLX's qdot on them.
+# block, the group's scale and bias, and MLX's qdot on them. qmv_impl reads
+# its last block through load_vector_safe and qdot_safe; a lane has all of
+# its VALUES_PER_THREAD inputs there or none (K is a multiple of the group
+# size), and for all of them the two are load_vector and qdot, operation for
+# operation.
 _DOT = r"""
 template <typename T>
 struct Dot {
@@ -31,7 +35,6 @@ struct Dot {
   struct Lanes {
     static constant constexpr int VPT = VALUES_PER_THREAD;
     static constant constexpr int BLOCK = BLOCK_SIZE;
-    static constant constexpr bool TAIL = !FAST;
     static constant constexpr int ROW_W = K * BYTES_PER_PACK / PACK_FACTOR;
     static constant constexpr int ROW_G = K / GS;
 
@@ -65,17 +68,8 @@ struct Dot {
       return load_vector<X>(x, x_thread);
     }
 
-    template <typename X>
-    static float load(const device X* x, thread float* x_thread, int n) {
-      return load_vector_safe<X>(x, x_thread, n);
-    }
-
     static float madd(float acc, Row r, const thread float* x_thread, float sum) {
       return acc + qdot_n(r.w, x_thread, r.s, r.b, sum, VALUES_PER_THREAD);
-    }
-
-    static float madd(float acc, Row r, const thread float* x_thread, float sum, int n) {
-      return acc + qdot_n(r.w, x_thread, r.s, r.b, sum, n);
     }
 
     float finish(int, float sum) const { return sum; }
@@ -99,7 +93,6 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
         source=f"namespace omlx_{key} {{\n{header}\n{_DOT}\n}}  // namespace omlx_{key}\n",
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
-        tail=not fast,
         dtype=dtype,
     )
 

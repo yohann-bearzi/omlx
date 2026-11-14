@@ -27,7 +27,6 @@ struct Dot {
   struct Lanes {
     static constant constexpr int VPT = 8;
     static constant constexpr int BLOCK = 32 * VPT;
-    static constant constexpr bool TAIL = IS_TAIL;
 
     const device uint8_t* w;
     const device float* s;
@@ -60,17 +59,6 @@ struct Dot {
       return acc + r.s * dot(omlx_iota<VPT>(), r.w, xt);
     }
 
-    template <typename X>
-    static float load(const device X* x, thread float* xt, int n) {
-      for (int i = 0; i < n; i++) xt[i] = float(x[i]);
-      return 0;
-    }
-    static float madd(float acc, Row r, thread const float* xt, float, int n) {
-      float d = 0;
-      for (int i = 0; i < n; i++) d += (float(r.w[i]) - 128.0f) * xt[i];
-      return acc + r.s * d;
-    }
-
     float finish(int, float sum) const { return sum; }
   };
 };
@@ -78,15 +66,12 @@ struct Dot {
 """
 
 
-def _toy(key, tail=False, source=_TOY) -> Dot:
+def _toy(key, source=_TOY) -> Dot:
     return Dot(
         key=f"toy_{key}",
-        source=source.replace("KEY", key).replace(
-            "IS_TAIL", "true" if tail else "false"
-        ),
+        source=source.replace("KEY", key),
         type=f"omlx_toy_{key}::Dot",
         tensors=("scales",),
-        tail=tail,
     )
 
 
@@ -139,20 +124,21 @@ def test_a_kernel_includes_each_format_source_once():
     )
 
 
+# K as whole blocks of 256 inputs (512, 768), whole blocks then a last one
+# that 16 of the 32 lanes have inputs in (384), and a last block only: of
+# 8 lanes, 31 lanes, one lane.
 @metal
 @pytest.mark.parametrize("packs", [(1, 0), (1, 1), (2, 2), (4, 0), (3, 1)])
-@pytest.mark.parametrize(
-    "k, tail", [(512, False), (512, True), (384, True), (64, True)]
-)
-def test_rows_are_the_dequantized_products(k, tail, packs):
+@pytest.mark.parametrize("k", [512, 768, 384, 64, 248, 8])
+def test_rows_are_the_dequantized_products(k, packs):
     operands, x, want = _matrix(16, k, seed=k + sum(packs))
-    got = testing.dot_rows(_toy(f"rows_{int(tail)}", tail), operands, x, 16, packs)
+    got = testing.dot_rows(_toy("rows"), operands, x, 16, packs)
     assert mx.array_equal(got, want).item()
 
 
 @metal
 def test_two_formats_run_in_one_kernel():
-    a, b = _toy("first"), _toy("second", tail=True)
+    a, b = _toy("first"), _toy("second")
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("a", a), *matrices.add("b", b)]
     kernel = mx.fast.metal_kernel(
@@ -187,17 +173,6 @@ def test_two_formats_run_in_one_kernel():
 
 
 @metal
-def test_a_format_without_a_tail_needs_no_tail_members():
-    start = _TOY.index(
-        "    template <typename X>\n    static float load(const device X* x, thread float* xt, int n)"
-    )
-    tail_members = _TOY[start : _TOY.index("    float finish")]
-    face = _toy("fast_only", source=_TOY.replace(tail_members, ""))
-    operands, x, want = _matrix(8, 512)
-    assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want).item()
-
-
-@metal
 def test_a_block_that_is_not_32_lanes_is_refused_in_words():
     source = _TOY.replace("BLOCK = 32 * VPT", "BLOCK = 16 * VPT")
     message = _error(_toy("half_block", source=source))
@@ -209,12 +184,9 @@ def test_a_block_that_is_not_32_lanes_is_refused_in_words():
 
 
 @metal
-def test_a_k_that_needs_a_tail_is_refused_in_words():
-    message = _error(_toy("no_tail"), k=384)
-    assert (
-        "dot face: K is not a whole number of BLOCKs, so Lanes<K>::TAIL must be true"
-        in message
-    )
+def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
+    message = _error(_toy("ragged"), k=60)
+    assert "dot face: K must be a whole number of a lane's VPT inputs" in message
 
 
 @metal
@@ -268,12 +240,6 @@ def test_an_error_in_a_kernel_body_cites_the_bodys_own_line():
             )
         )
     assert f"<kernel>:{_line(body, 'no_such_function')}:" in str(failure.value)
-
-
-@metal
-def test_a_face_whose_tail_is_not_its_metal_tail_is_refused():
-    message = _error(replace(_toy("tail_lie", tail=True), tail=False))
-    assert "quant format face toy_tail_lie: Dot.tail is not Lanes<K>::TAIL" in message
 
 
 def test_dot_rows_refuses_what_the_launch_cannot_cover():

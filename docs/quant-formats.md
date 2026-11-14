@@ -62,7 +62,6 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. |
 | `tensors` | The layer's parameters beside `weight` that the face reads. They become kernel inputs in this order. Identifiers. |
-| `tail` | The face's `Lanes<K>::TAIL` (below). A kernel without a tail path does not take a face that has one. |
 | `dtype` | The only activation dtype the face is exact for, or `None` for any. Ask with `face.exact_for(dtype)`: an `mx.Dtype` does not compare with `None`. |
 
 ## The dot face
@@ -83,40 +82,37 @@ struct Dot {
 
 | Member of `Lanes<K>` | Role |
 |---|---|
-| `static constant constexpr int VPT` | Inputs a lane reads per block. |
+| `static constant constexpr int VPT` | Inputs a lane reads per block. K is a multiple of it. |
 | `static constant constexpr int BLOCK` | Inputs the simdgroup covers per block: `32 * VPT`. |
-| `static constant constexpr bool TAIL` | Whether the walk ends with a block of `n` forms (below). `false` needs K to be a multiple of `BLOCK`. |
 | `Lanes(Dot m, size_t row, uint lane)` | Lane `lane` at the first block of row `row`. |
 | `struct Row` and `Row row(int r) const` | What `madd` needs of the current block of row `row + r`: pointers, the group's scale. |
 | `void step()` | Move to the next block. |
 | `template <typename X> static float load(const device X* x, thread float* xt)` | Read the lane's `VPT` inputs into `xt` as floats. Its result is passed to every `madd` of the block as `aux` (affine returns the sum of the inputs, for the bias term). |
 | `static float madd(float acc, Row r, thread const float* xt, float aux)` | `acc` plus the lane's share of the row's product for the block. |
-| `load(x, xt, int n)` and `madd(acc, r, xt, aux, int n)` | Only with `TAIL`: the same over the lane's first `n` inputs, `0 < n <= VPT`. |
 | `float finish(int r, float sum) const` | Row `row + r`'s result from the sum of `acc` over the lanes (for example times a row scale). |
 
 A kernel runs a face in this order, in every lane, for each of its rows `r`:
 
 ```
 acc[r] = 0
-for each whole block:           (all blocks but the last with TAIL)
+for each block the lane has inputs in:
     aux = load(x, xt)
     acc[r] = madd(acc[r], row(r), xt, aux)
     step()
-with TAIL, for the last block, whole or partial, with n > 0 inputs in this lane:
-    aux = load(x, xt, n)
-    acc[r] = madd(acc[r], row(r), xt, aux, n)
 result[r] = finish(r, simd_sum(acc[r]))
 ```
 
+K need not be a multiple of `BLOCK`. Where it is not, the last block is partial: its first `K % BLOCK / VPT` lanes have their `VPT` inputs, the other lanes have none and skip it. A face only ever sees whole runs of `VPT` inputs, and the lanes of the last block are known when the kernel is compiled.
+
 Rules:
 
-- `BLOCK == 32 * VPT`, and K is a multiple of `BLOCK` unless `TAIL`. A kernel asserts both when it is compiled.
+- `BLOCK == 32 * VPT`, and K is a multiple of `VPT`. A kernel asserts both when it is compiled, so a format's `dot()` returns `None` for a K that is not.
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
 
 ### An example
 
-The format `tests/test_formats_kernels.py` runs: 8-bit codes around 128, one float scale per row, K a multiple of 256.
+The format `tests/test_formats_kernels.py` runs: 8-bit codes around 128, one float scale per row, K a multiple of 8.
 
 ```cpp
 namespace omlx_myformat_b8 {
@@ -128,7 +124,6 @@ struct Dot {
   struct Lanes {
     static constant constexpr int VPT = 8;
     static constant constexpr int BLOCK = 32 * VPT;
-    static constant constexpr bool TAIL = false;
 
     const device uint8_t* w;
     const device float* s;
@@ -173,7 +168,6 @@ Dot(
     source=SOURCE,
     type="omlx_myformat_b8::Dot",
     tensors=("scales",),
-    tail=False,
 )
 ```
 
@@ -224,7 +218,7 @@ What the kernel does around the call is its own: which rows a simdgroup takes, t
 Kernels are compiled on the user's Mac by the Metal compiler when they are first run. Metal 4.1 is C++17. It has fold expressions, `if constexpr`, `constexpr` functions, `static_assert`, alias templates and packs of integers. It has no `template for`, pack indexing, concepts, `consteval`, `auto` parameters or derived classes.
 
 - What is known when a kernel is compiled is a template parameter or a `constexpr`: K, the bit width, the group size, the rows of a launch.
-- A choice between code paths is `if constexpr`. A face without a tail needs no tail members: the tail branch is discarded.
+- A choice between code paths is `if constexpr`: a kernel whose K is whole blocks has no code for a last, partial one.
 - A run over a fixed count is a fold over an index pack, unless the loop measures faster. `omlx_iota<N>()` is `omlx_ints<0, ..., N - 1>`; a format's source may use both:
 
 ```cpp
@@ -251,39 +245,39 @@ MLX compiles a kernel at the first `mx.eval` of its output. A failure is a `Runt
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:70:3: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:80:3: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
-<kernel>:6:5: note: in instantiation of function template specialization
+<kernel>:5:5: note: in instantiation of function template specialization
 'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:73:3: error: static_assert failed due to requirement
-'Lanes<384>::TAIL || 384 % Lanes<384>::BLOCK == 0' "dot face: K is not a whole number of
-BLOCKs, so Lanes<K>::TAIL must be true"
+<omlx skeletons, docs/quant-formats.md>:83:3: error: static_assert failed due to requirement
+'60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 
 A mistake inside the format is cited in the format:
 
 ```
-<quant format myformat_b8>:41:22: error: no member named 'scale' in
+<quant format myformat_b8>:39:22: error: no member named 'scale' in
 'omlx_myformat_b8::Dot::Lanes<512>::Row'
 ```
 
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:56:20: error: no member named 'finish' in
+<omlx skeletons, docs/quant-formats.md>:66:20: error: no member named 'finish' in
 'omlx_myformat_b8::Dot::Lanes<512>'
 ```
 
 ```
-error: too few arguments to function call, expected 5, have 4
-<quant format myformat_b8>:49:18: note: 'madd' declared here
+<omlx skeletons, docs/quant-formats.md>:27:59: error: too many arguments to function call,
+expected 3, have 4
+<quant format myformat_b8>:38:18: note: 'madd' declared here
 ```
 
-The last one is a face that has only the `n` form of `madd`.
+The last one is a `madd` declared without its `aux` parameter.
 
 ## Test a format
 
@@ -300,13 +294,13 @@ def test_rows_are_the_dequantized_products():
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
 
-`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes; `n` is a multiple of `NA + NB`. The kernel also asserts that `Dot.tail` is the Metal `Lanes<K>::TAIL`.
+`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes; `n` is a multiple of `NA + NB`.
 
 Worth testing for every layout a format gives a face for:
 
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
-- a K with a tail and a K without, if the face has both.
+- a K of whole blocks and a K that ends in a partial block, if the face takes both.
 
 ## Affine
 
@@ -317,7 +311,7 @@ Worth testing for every layout a format gives a face for:
 | Bits | 4, 5, 6, 8 |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16. The face is exact for activations of that dtype. |
-| Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise, with `TAIL`. |
+| Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
 Any other affine layer (2 or 3 bits, fp32 scales, no biases) has no face and runs MLX's ops.

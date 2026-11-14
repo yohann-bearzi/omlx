@@ -19,7 +19,6 @@ _FACE = formats.Dot(
     source="namespace omlx_toy_b4 { struct Dot {}; }\n",
     type="omlx_toy_b4::Dot",
     tensors=("scales",),
-    tail=False,
 )
 
 

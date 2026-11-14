@@ -45,16 +45,33 @@ using omlx_iota = typename omlx_iota_<N>::type;
 # in the face's blocks; result[row] ends as the row's product. The rows are
 # packs (RA, RB), so every block is straight-line code over them. The walk
 # stays a loop: unrolled over a pack of blocks, the fused Qwen decode ran
-# 3-8% slower (M5 Max).
+# 3-8% slower (M5 Max). Where K ends inside a block, the lanes with inputs
+# in that last block are known when the kernel is compiled.
 #
 # qmv_rows is what a kernel calls. It states the parts of the contract the
 # compiler would not report on its own, so a face that breaks one fails with
 # that sentence instead of computing garbage.
 _QMV_ROWS = r"""
-template <typename T, int K, typename D, int... RA, int... RB>
-METAL_FUNC void omlx_qmv_rows(
+// One block of a lane: its VPT inputs against each row's weights.
+template <typename L, typename T, int... RA, int... RB>
+METAL_FUNC void omlx_qmv_block(
     omlx_ints<RA...>,
     omlx_ints<RB...>,
+    L a,
+    L b,
+    const device T* x,
+    thread float* x_thread,
+    thread float* result) {
+  constexpr int NA = sizeof...(RA);
+  const float aux = L::load(x, x_thread);
+  ((result[RA] = L::madd(result[RA], a.row(RA), x_thread, aux)), ...);
+  ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), x_thread, aux)), ...);
+}
+
+template <typename T, int K, typename D, int... RA, int... RB>
+METAL_FUNC void omlx_qmv_rows(
+    omlx_ints<RA...> ra,
+    omlx_ints<RB...> rb,
     D ma,
     size_t row_a,
     D mb,
@@ -64,7 +81,10 @@ METAL_FUNC void omlx_qmv_rows(
     thread float* result) {
   using L = typename D::template Lanes<K>;
   constexpr int NA = sizeof...(RA);
-  constexpr int FULL = L::TAIL ? K - L::BLOCK : K;
+  // K is WHOLE inputs in whole blocks, then a last block in which only the
+  // first LAST lanes have inputs.
+  constexpr int WHOLE = K - K % L::BLOCK;
+  constexpr int LAST = K % L::BLOCK / L::VPT;
   L a(ma, row_a, simd_lid);
   L b(mb, row_b, simd_lid);
   x += int(simd_lid) * L::VPT;
@@ -72,24 +92,15 @@ METAL_FUNC void omlx_qmv_rows(
   float x_thread[L::VPT];
   ((result[RA] = 0), ...);
   ((result[NA + RB] = 0), ...);
-  int k = 0;
-  for (; k < FULL; k += L::BLOCK) {
-    const float aux = L::load(x, x_thread);
-    ((result[RA] = L::madd(result[RA], a.row(RA), x_thread, aux)), ...);
-    ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), x_thread, aux)), ...);
+  for (int k = 0; k < WHOLE; k += L::BLOCK) {
+    omlx_qmv_block(ra, rb, a, b, x, x_thread, result);
     a.step();
     b.step();
     x += L::BLOCK;
   }
-  if constexpr (L::TAIL) {
-    const int remaining =
-        metal::clamp(int(K - k - int(simd_lid) * L::VPT), 0, int(L::VPT));
-    if (remaining > 0) {
-      const float aux = L::load(x, x_thread, remaining);
-      ((result[RA] = L::madd(result[RA], a.row(RA), x_thread, aux, remaining)), ...);
-      ((result[NA + RB] =
-            L::madd(result[NA + RB], b.row(RB), x_thread, aux, remaining)),
-       ...);
+  if constexpr (LAST > 0) {
+    if (simd_lid < uint(LAST)) {
+      omlx_qmv_block(ra, rb, a, b, x, x_thread, result);
     }
   }
   ((result[RA] = a.finish(RA, metal::simd_sum(result[RA]))), ...);
@@ -110,8 +121,8 @@ METAL_FUNC void qmv_rows(
       L::BLOCK == 32 * L::VPT,
       "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 lanes");
   static_assert(
-      L::TAIL || K % L::BLOCK == 0,
-      "dot face: K is not a whole number of BLOCKs, so Lanes<K>::TAIL must be true");
+      K % L::VPT == 0,
+      "dot face: K must be a whole number of a lane's VPT inputs");
   omlx_qmv_rows<T, K>(
       omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
 }

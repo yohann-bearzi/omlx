@@ -34,18 +34,12 @@ _ROWS = r"""
 def _dot_rows_kernel(face: Dot):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("m", face)]
-    tail = "true" if face.tail else "false"
     return mx.fast.metal_kernel(
         name=f"omlx_format_dot_rows_{face.key}",
         input_names=inputs,
         output_names=["y"],
         header=matrices.header + _STORE,
-        source=(
-            matrices.declarations
-            + f"    static_assert({face.type}::template Lanes<K>::TAIL == {tail},\n"
-            + f'        "quant format face {face.key}: Dot.tail is not Lanes<K>::TAIL");'
-            + _ROWS
-        ),
+        source=matrices.declarations + _ROWS,
     )
 
 
@@ -58,8 +52,7 @@ def dot_rows(
     ``operands`` are the matrix's weight and the face's tensors, in order.
     A launch takes ``packs[0]`` rows as the skeleton's first pack and the
     next ``packs[1]`` as its second; ``n`` is a multiple of their sum. The
-    kernel is compiled for ``face`` and K, and fails to compile if
-    ``face.tail`` is not the Metal ``Lanes<K>::TAIL``.
+    kernel is compiled for ``face`` and K.
     """
     na, nb = packs
     if n % (na + nb):

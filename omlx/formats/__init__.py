@@ -54,7 +54,6 @@ class Dot:
     source: str
     type: str
     tensors: tuple[str, ...]
-    tail: bool  # Lanes<K>::TAIL: K is not a whole number of the walk's blocks
     dtype: Any = None  # the only activation dtype the face is exact for, if any
 
     def __post_init__(self) -> None:
