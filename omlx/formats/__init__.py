@@ -100,11 +100,11 @@ _loading = False
 
 
 def register(fmt: QuantFormat) -> None:
-    """Add ``fmt`` under its mode; a mode has one format, and the built-in
-    formats have theirs first."""
+    """Add ``fmt`` under its mode. A mode has one format, and the formats
+    oMLX loads by itself (the built-in ones, then the installed plugins')
+    have theirs first."""
     if not isinstance(fmt, QuantFormat):
         raise TypeError(f"{fmt!r} is not a QuantFormat instance")
-    _load()
     mode, tensors = getattr(fmt, "mode", None), getattr(fmt, "tensors", None)
     if not isinstance(mode, str) or not mode:
         raise ValueError(f"quant format {fmt!r} has no mode")
@@ -113,16 +113,18 @@ def register(fmt: QuantFormat) -> None:
             f"quant format {mode!r}: tensors must be a tuple of the parameter "
             "names beside 'weight' and 'bias'"
         )
+    _load()
     if _FORMATS.setdefault(mode, fmt) is not fmt:
         raise ValueError(f"quant format {mode!r} is already registered")
 
 
 def _load() -> None:
     """Register the built-in formats, then every installed plugin's, in the
-    order of their entry points' names. A plugin that fails to load is logged
-    and skipped: its checkpoints then fail to load with an unknown mode,
-    everything else is served. A built-in that fails to load is oMLX's own
-    defect and raises, here and at every later lookup.
+    order of their entry points' names, then values. A plugin that fails to
+    load is logged and skipped, with what its module registered by itself:
+    its checkpoints then fail to load with an unknown mode, everything else
+    is served. A built-in that fails to load is oMLX's own defect and raises,
+    here and at every later lookup.
 
     A lookup made while the load runs (by a module the load imports) sees
     the formats registered so far: every built-in, for a plugin."""
@@ -137,10 +139,13 @@ def _load() -> None:
             for value in BUILTIN:
                 register(EntryPoint("builtin", value, ENTRY_POINT_GROUP).load())
             plugins = entry_points(group=ENTRY_POINT_GROUP)
-            for entry in sorted(plugins, key=lambda entry: entry.name):
+            for entry in sorted(plugins, key=lambda entry: (entry.name, entry.value)):
+                before = set(_FORMATS)
                 try:
                     register(entry.load())
                 except Exception:
+                    for mode in _FORMATS.keys() - before:
+                        del _FORMATS[mode]
                     logger.exception(
                         "quant format plugin %s (%s) failed to load",
                         entry.name,

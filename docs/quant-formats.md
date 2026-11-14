@@ -41,13 +41,13 @@ FORMAT = MyFormat()
 myformat = "my_package:FORMAT"
 ```
 
-Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time a format is looked up (`omlx.formats.get(mode)`).
+Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.get`, `dot` or `register`).
 
 - A mode has one format. A second format for a registered mode is refused.
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
-- Plugins register in the order of their entry points' names. Of two that claim one mode, the first is kept.
-- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped. The server still starts.
-- A plugin's module may call `omlx.formats.get` when it is imported. It sees the built-in formats; another plugin may not be registered yet.
+- Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
+- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with any format its module registered by itself. The server still starts.
+- A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading, and another plugin may not be registered yet.
 
 ## Faces
 

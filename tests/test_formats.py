@@ -33,13 +33,14 @@ class _Format(formats.QuantFormat):
 
 
 _BUILTIN = _Format("builtin")
+_HOLDER = SimpleNamespace(fmt=_BUILTIN)
 
 
 class _Entry:
     """An installed distribution's entry point."""
 
-    def __init__(self, name, loads):
-        self.name, self.value = name, f"{name}:FORMAT"
+    def __init__(self, name, loads, value=None):
+        self.name, self.value = name, value or f"{name}:FORMAT"
         self.loads, self.loaded = loads, 0
 
     def load(self):
@@ -55,6 +56,7 @@ def plugins(monkeypatch):
     plugins' entry points."""
     installed = []
     monkeypatch.setattr(formats, "_FORMATS", {})
+    monkeypatch.setattr(formats, "_LOCK", threading.RLock())
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
@@ -104,6 +106,12 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
         formats.register(_Format)  # the class
     with pytest.raises(ValueError, match="has no mode"):
         formats.register(formats.QuantFormat())
+
+    class ModeOnly(formats.QuantFormat):
+        mode = "toy"
+
+    with pytest.raises(ValueError, match="'toy': tensors must be a tuple"):
+        formats.register(ModeOnly())
     assert formats.get("toy") is None
 
 
@@ -119,6 +127,12 @@ def test_builtins_register_through_register(plugins, monkeypatch):
     monkeypatch.setattr(formats, "register", recorded)
     assert formats.get("builtin") is _BUILTIN
     assert registered == [_BUILTIN]
+
+
+def test_a_builtin_is_named_like_an_entry_point(plugins, monkeypatch):
+    # "module:attribute", where the attribute may be dotted.
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_HOLDER.fmt",))
+    assert formats.get("builtin") is _BUILTIN
 
 
 def test_a_builtin_has_its_mode_before_anything_registers(plugins, monkeypatch):
@@ -159,6 +173,22 @@ def test_a_plugin_that_fails_to_load_is_logged_and_skipped(plugins, caplog):
     ]
 
 
+def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
+    good = _Format("good")
+
+    def load():
+        formats.register(_Format("early"))  # its module, by itself
+        raise ImportError("and then the import failed")
+
+    plugins += [_Entry("good", good), _Entry("toy", load)]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.get("early") is None
+    assert formats.get("good") is good
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin toy (toy:FORMAT) failed to load"
+    ]
+
+
 def test_a_plugin_cannot_take_a_builtins_mode(plugins, monkeypatch, caplog):
     monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
     plugins.append(_Entry("shadow", _Format("builtin")))
@@ -179,23 +209,61 @@ def test_of_two_plugins_for_a_mode_the_first_by_name_is_kept(plugins, caplog):
     ]
 
 
-def test_a_plugin_may_look_formats_up_while_it_loads(plugins, monkeypatch):
+def test_of_two_plugins_of_one_name_the_first_by_value_is_kept(plugins, caplog):
+    first, second = _Format(), _Format()
+    plugins += [
+        _Entry("toy", second, "package_b:FORMAT"),
+        _Entry("toy", first, "package_a:FORMAT"),
+    ]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.get("toy") is first
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin toy (package_b:FORMAT) failed to load"
+    ]
+
+
+def test_a_lookup_inside_the_load_sees_the_formats_registered_so_far(
+    plugins, monkeypatch
+):
     monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
     fmt, seen = _Format(), []
 
     def load():
-        # What a plugin's module does at import to build on another format.
-        seen.append(formats.get("builtin"))
-        formats.register(fmt)  # ... or to register by itself
+        # A module the load imports uses the registry.
+        seen.append((formats.get("builtin"), formats.get("toy")))
+        formats.register(fmt)
         return fmt
 
     plugins.append(_Entry("toy", load))
-    found = []
-    lookup = threading.Thread(target=lambda: found.append(formats.get("toy")))
-    lookup.start()
-    lookup.join(10)
-    assert not lookup.is_alive(), "the lookup inside the load deadlocked"
-    assert seen == [_BUILTIN] and found == [fmt]
+    assert formats.get("toy") is fmt
+    assert seen == [(_BUILTIN, None)]
+    assert plugins[0].loaded == 1
+
+
+def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
+    fmt, found = _Format(), []
+    loading, release = threading.Event(), threading.Event()
+
+    def load():
+        loading.set()
+        assert release.wait(10)
+        return fmt
+
+    def lookup():
+        found.append(formats.get("toy"))
+
+    plugins.append(_Entry("toy", load))
+    first = threading.Thread(target=lookup, daemon=True)
+    second = threading.Thread(target=lookup, daemon=True)
+    first.start()
+    assert loading.wait(10)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive(), "the lookup did not wait for the load"
+    release.set()
+    first.join(10)
+    second.join(10)
+    assert found == [fmt, fmt]
     assert plugins[0].loaded == 1
 
 
