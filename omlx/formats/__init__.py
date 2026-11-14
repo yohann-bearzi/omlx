@@ -169,8 +169,33 @@ def get(mode: str | None) -> QuantFormat | None:
     return _FORMATS.get(mode)
 
 
+# The modes whose dot() defect is logged.
+_DOT_DEFECTS: set[str] = set()
+
+
 def dot(layer, k: int, n: int) -> Dot | None:
     """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None when
-    its format (``layer.mode``) is unknown or has none for it."""
+    its format (``layer.mode``) is unknown or has none for it.
+
+    A kernel asks for a face inside a model's forward. So a format whose
+    ``dot`` raises, or returns anything but a ``Dot`` of tensors the layer
+    has, has no face for the layer either, and the model keeps its composed
+    path. The defect is logged, once per format."""
     fmt = get(getattr(layer, "mode", None))
-    return None if fmt is None else fmt.dot(layer, k, n)
+    if fmt is None:
+        return None
+    try:
+        face = fmt.dot(layer, k, n)
+        if face is None:
+            return None
+        if not isinstance(face, Dot):
+            raise TypeError(f"dot() returned {face!r}, not a Dot")
+        lacking = [name for name in ("weight", *face.tensors) if name not in layer]
+        if lacking:
+            raise ValueError(f"face {face.key}: the layer has no {', '.join(lacking)}")
+    except Exception:
+        if fmt.mode not in _DOT_DEFECTS:
+            _DOT_DEFECTS.add(fmt.mode)
+            logger.exception("quant format %s gave no usable dot face", fmt.mode)
+        return None
+    return face

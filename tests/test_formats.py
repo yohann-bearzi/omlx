@@ -11,6 +11,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from omlx import formats
@@ -58,6 +59,7 @@ def plugins(monkeypatch):
     monkeypatch.setattr(formats, "_FORMATS", {})
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
+    monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
     monkeypatch.setattr(formats, "BUILTIN", ())
     monkeypatch.setattr(
         formats,
@@ -292,13 +294,84 @@ def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
     assert plugins[0].loaded == 1
 
 
-def test_dot_asks_the_format_of_the_layers_mode(plugins):
-    fmt, layer = _Format(), SimpleNamespace(mode="toy")
+def _layer(mode="toy", tensors=("weight", "scales")):
+    """A quantized linear: its mode, and its parameters by name."""
+    layer = nn.Module()
+    layer.mode = mode
+    for name in tensors:
+        layer[name] = mx.zeros((8,))
+    return layer
+
+
+def test_dot_asks_the_format_of_the_layers_mode(plugins, caplog):
+    fmt, layer = _Format(), _layer()
     formats.register(fmt)
-    assert formats.dot(layer, 64, 8) is _FACE
-    assert fmt.asked == (layer, 64, 8)
-    assert formats.dot(SimpleNamespace(mode="other"), 64, 8) is None
-    assert formats.dot(SimpleNamespace(), 64, 8) is None  # not quantized
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.dot(layer, 64, 8) is _FACE
+        assert fmt.asked == (layer, 64, 8)
+        assert formats.dot(_layer("other"), 64, 8) is None
+        assert formats.dot(nn.Module(), 64, 8) is None  # not quantized
+    assert not caplog.records
+
+
+class _NoFace(_Format):
+    def dot(self, layer, k, n):
+        return None
+
+
+class _Raises(_Format):
+    def dot(self, layer, k, n):
+        raise KeyError("biases")
+
+
+class _NotADot(_Format):
+    def dot(self, layer, k, n):
+        return _FACE.key
+
+
+@pytest.mark.parametrize(
+    "fmt, layer, defect",
+    [
+        (_Raises(), _layer(), "KeyError: 'biases'"),
+        (_NotADot(), _layer(), "TypeError: dot() returned 'toy_b4', not a Dot"),
+        # _FACE reads scales.
+        (
+            _Format(),
+            _layer(tensors=("weight",)),
+            "ValueError: face toy_b4: the layer has no scales",
+        ),
+        (
+            _Format(),
+            _layer(tensors=("scales",)),
+            "ValueError: face toy_b4: the layer has no weight",
+        ),
+        (_Format(), SimpleNamespace(mode="toy"), "TypeError: "),  # no parameters
+    ],
+)
+def test_a_defective_dot_is_no_face_and_logged_once(
+    plugins, caplog, fmt, layer, defect
+):
+    formats.register(fmt)
+    formats.register(_Raises("other"))
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.dot(layer, 64, 8) is None
+        assert formats.dot(layer, 64, 8) is None
+        assert formats.dot(_layer("other"), 64, 8) is None
+    # Once per format: one that fails does not hide another's defect.
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format toy gave no usable dot face",
+        "quant format other gave no usable dot face",
+    ]
+    assert all(r.exc_info for r in caplog.records)
+    error = caplog.records[0].exc_info[1]
+    assert f"{type(error).__name__}: {error}".startswith(defect)
+
+
+def test_a_format_without_a_face_for_a_layer_is_no_defect(plugins, caplog):
+    formats.register(_NoFace())
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.dot(_layer(), 64, 8) is None
+    assert not caplog.records
 
 
 def test_a_format_has_no_face_until_it_gives_one():

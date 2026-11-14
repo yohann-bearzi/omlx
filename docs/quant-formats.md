@@ -58,6 +58,8 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward. A `dot()` that raises, or that returns anything but a `Dot` whose `tensors` the layer has, counts as `None` there, and is logged once per format (`quant format MODE gave no usable dot face`, with the traceback). A format's own tests call `FORMAT.dot` directly, so that the defect fails them.
+
 | `Dot` field | Meaning |
 |---|---|
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
