@@ -315,7 +315,7 @@ Worth testing for every layout a format gives a face for:
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
-- the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in about one row in a thousand, in fp32 in most rows.
+- the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. A face is a template over the activations' type `T`, so `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32: the activations, and the tensors that share their dtype.
 
 ## Affine
 

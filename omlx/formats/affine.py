@@ -4,10 +4,12 @@ as a weight format.
 
 The dot face is the MLX 0.32.4 ``quantized.h`` transcription in
 ``omlx.patches.moe_verify_gather``: a kernel instantiated with it computes
-each row as MLX's ``qmv_fast`` (K a multiple of the kernel block) or ``qmv``
-does, bit for bit, for bf16 or fp16 activations with scales in the same
-dtype. One row of a narrow 2-D matrix is a third MLX kernel, ``qmv_quad``,
-which sums in another order: such a matrix has no face.
+each row as MLX's ``qmv_fast`` or ``qmv`` does, bit for bit, for bf16 or fp16
+activations with scales in the same dtype. MLX runs ``qmv_fast`` when K is a
+multiple of the kernel block, and for stacked weights (``gather_qmm``) when
+N is a multiple of 8 as well. One row of a 2-D matrix of K 64 or 128 at 4 or
+8 bits is a third MLX kernel, ``qmv_quad``, which sums in another order: such
+a matrix has no face.
 """
 
 from __future__ import annotations
@@ -87,7 +89,8 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     """The dot face of ``bits``-bit weights with ``group_size`` groups, as
     MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal."""
     if bits not in _BITS or group_size not in _GROUP_SIZES:
-        # The transcription compiles for others, and computes zeros.
+        # MLX has no kernel for another group size. For another bit width the
+        # transcription compiles, and computes zeros.
         raise ValueError(
             f"affine face: no MLX transcription of {bits} bits in groups of "
             f"{group_size}"
@@ -118,6 +121,8 @@ class AffineFormat(QuantFormat):
             or "biases" not in layer
             or layer["scales"].dtype not in (mx.bfloat16, mx.float16)
             or layer["biases"].dtype != layer["scales"].dtype
+            # One matrix, or a stack of them (a switch layer's experts).
+            or layer["weight"].ndim not in (2, 3)
             or layer["weight"].shape[-2:] != (n, k * layer.bits // 32)
             or k % layer.group_size
             # MLX binds an input of fewer than 8 elements as constants; the
