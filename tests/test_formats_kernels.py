@@ -36,9 +36,8 @@ struct Dot {
 
     struct Row {
       const device uint8_t* w;
-      float s;
     };
-    Row row(int r) const { return {w + r * K, s[r]}; }
+    Row row(int r) const { return {w + r * K}; }
     void step() { w += BLOCK; }
 
     template <typename X, int... I>
@@ -56,10 +55,10 @@ struct Dot {
       return 0;
     }
     static float madd(float acc, Row r, thread const float* xt, float) {
-      return acc + r.s * dot(omlx_iota<VPT>(), r.w, xt);
+      return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
 
-    float finish(int, float sum) const { return sum; }
+    float finish(int r, float sum) const { return sum * s[r]; }
   };
 };
 }  // namespace omlx_toy_KEY
@@ -191,16 +190,16 @@ def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
 
 @metal
 def test_an_error_in_a_format_cites_the_formats_own_line():
-    source = _TOY.replace("return acc + r.s * dot(", "return acc + r.scale * dot(")
+    source = _TOY.replace("return {w + r * K};", "return {weights + r * K};")
     message = _error(_toy("typo", source=source))
-    assert f"<quant format toy_typo>:{_line(source, 'r.scale')}:" in message
-    assert "no member named 'scale'" in message
+    assert f"<quant format toy_typo>:{_line(source, 'weights + r')}:" in message
+    assert "undeclared identifier 'weights'" in message
 
 
 @metal
 def test_a_missing_member_is_named_where_the_skeleton_needs_it():
     source = _TOY.replace(
-        "    float finish(int, float sum) const { return sum; }\n", ""
+        "    float finish(int r, float sum) const { return sum * s[r]; }\n", ""
     )
     message = _error(_toy("no_finish", source=source))
     assert "no member named 'finish'" in message

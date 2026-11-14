@@ -133,9 +133,8 @@ struct Dot {
 
     struct Row {
       const device uint8_t* w;
-      float s;
     };
-    Row row(int r) const { return {w + r * K, s[r]}; }
+    Row row(int r) const { return {w + r * K}; }
     void step() { w += BLOCK; }
 
     template <typename X, int... I>
@@ -153,10 +152,10 @@ struct Dot {
       return 0;
     }
     static float madd(float acc, Row r, thread const float* xt, float) {
-      return acc + r.s * dot(omlx_iota<VPT>(), r.w, xt);
+      return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
 
-    float finish(int, float sum) const { return sum; }
+    float finish(int r, float sum) const { return sum * s[r]; }
   };
 };
 }  // namespace omlx_myformat_b8
@@ -260,8 +259,7 @@ each of a simdgroup's 32 lanes"
 A mistake inside the format is cited in the format:
 
 ```
-<quant format myformat_b8>:39:22: error: no member named 'scale' in
-'omlx_myformat_b8::Dot::Lanes<512>::Row'
+<quant format myformat_b8>:20:36: error: use of undeclared identifier 'weights'
 ```
 
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
@@ -274,7 +272,7 @@ A missing or mismatched member is cited where the skeleton uses it, with a note 
 ```
 <omlx skeletons, docs/quant-formats.md>:27:59: error: too many arguments to function call,
 expected 3, have 4
-<quant format myformat_b8>:38:18: note: 'madd' declared here
+<quant format myformat_b8>:37:18: note: 'madd' declared here
 ```
 
 The last one is a `madd` declared without its `aux` parameter.
