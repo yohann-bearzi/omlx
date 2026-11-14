@@ -56,7 +56,6 @@ def plugins(monkeypatch):
     plugins' entry points."""
     installed = []
     monkeypatch.setattr(formats, "_FORMATS", {})
-    monkeypatch.setattr(formats, "_LOCK", threading.RLock())
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
@@ -66,6 +65,17 @@ def plugins(monkeypatch):
         lambda group: installed if group == formats.ENTRY_POINT_GROUP else [],
     )
     return installed
+
+
+def test_the_load_may_register_under_its_own_lock():
+    # register() runs inside the load: under a lock that is not reentrant
+    # the first lookup would hang.
+    assert formats._LOCK.acquire(blocking=False)
+    try:
+        assert formats._LOCK.acquire(blocking=False)
+        formats._LOCK.release()
+    finally:
+        formats._LOCK.release()
 
 
 def test_registered_format_is_found_by_its_mode(plugins):
@@ -113,6 +123,13 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
     with pytest.raises(ValueError, match="'toy': tensors must be a tuple"):
         formats.register(ModeOnly())
     assert formats.get("toy") is None
+
+
+def test_a_malformed_format_is_refused_before_anything_loads(plugins):
+    plugins.append(_Entry("toy", _Format()))
+    with pytest.raises(ValueError, match="has no mode"):
+        formats.register(formats.QuantFormat())
+    assert plugins[0].loaded == 0
 
 
 def test_builtins_register_through_register(plugins, monkeypatch):
@@ -201,11 +218,15 @@ def test_a_plugin_cannot_take_a_builtins_mode(plugins, monkeypatch, caplog):
 
 def test_of_two_plugins_for_a_mode_the_first_by_name_is_kept(plugins, caplog):
     first, second = _Format(), _Format()
-    plugins += [_Entry("zeta", second), _Entry("alpha", first)]
+    # The names decide, whatever the values.
+    plugins += [
+        _Entry("zeta", second, "package_a:FORMAT"),
+        _Entry("alpha", first, "package_z:FORMAT"),
+    ]
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         assert formats.get("toy") is first
     assert [r.getMessage() for r in caplog.records] == [
-        "quant format plugin zeta (zeta:FORMAT) failed to load"
+        "quant format plugin zeta (package_a:FORMAT) failed to load"
     ]
 
 
@@ -229,7 +250,7 @@ def test_a_lookup_inside_the_load_sees_the_formats_registered_so_far(
     fmt, seen = _Format(), []
 
     def load():
-        # A module the load imports uses the registry.
+        # Not for a plugin to rely on; it neither hangs nor loads twice.
         seen.append((formats.get("builtin"), formats.get("toy")))
         formats.register(fmt)
         return fmt
@@ -256,13 +277,17 @@ def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
     first = threading.Thread(target=lookup, daemon=True)
     second = threading.Thread(target=lookup, daemon=True)
     first.start()
-    assert loading.wait(10)
-    second.start()
-    second.join(0.2)
-    assert second.is_alive(), "the lookup did not wait for the load"
-    release.set()
-    first.join(10)
-    second.join(10)
+    try:
+        assert loading.wait(10)
+        second.start()
+        second.join(0.2)
+        assert second.is_alive(), "the lookup did not wait for the load"
+    finally:
+        # A loader left waiting would fail later, in another test's registry.
+        release.set()
+        for thread in (first, second):
+            if thread.ident is not None:
+                thread.join(10)
     assert found == [fmt, fmt]
     assert plugins[0].loaded == 1
 

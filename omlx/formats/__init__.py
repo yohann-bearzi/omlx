@@ -99,8 +99,8 @@ class QuantFormat:
 
 
 _FORMATS: dict[str, QuantFormat] = {}
-# Held for the whole load. Reentrant: the modules a load imports may look
-# formats up or register some themselves.
+# Held for the whole load. Reentrant: the load registers through register(),
+# which loads first.
 _LOCK = threading.RLock()
 _loaded = False
 _loading = False
@@ -128,13 +128,13 @@ def register(fmt: QuantFormat) -> None:
 def _load() -> None:
     """Register the built-in formats, then every installed plugin's, in the
     order of their entry points' names, then values. A plugin that fails to
-    load is logged and skipped, with what its module registered by itself:
+    load is logged and skipped, with every format registered while it loaded:
     its checkpoints then fail to load with an unknown mode, everything else
     is served. A built-in that fails to load is oMLX's own defect and raises,
     here and at every later lookup.
 
-    A lookup made while the load runs (by a module the load imports) sees
-    the formats registered so far: every built-in, for a plugin."""
+    A lookup the loading thread makes while the load runs sees the formats
+    registered so far. Plugins do not rely on it (docs/quant-formats.md)."""
     global _loaded, _loading
     if _loaded:
         return

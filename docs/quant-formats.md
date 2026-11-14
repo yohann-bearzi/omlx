@@ -46,8 +46,8 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - A mode has one format. A second format for a registered mode is refused.
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
-- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with any format its module registered by itself. The server still starts.
-- A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading, and another plugin may not be registered yet.
+- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
+- A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read fails to load and is skipped, and an import in one thread can deadlock with the first lookup in another.
 
 ## Faces
 
@@ -335,4 +335,4 @@ The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFo
 |---|---|---|
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 
-The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path.
+The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype.
