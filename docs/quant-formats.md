@@ -317,11 +317,13 @@ Worth testing for every layout a format gives a face for:
 |---|---|
 | Bits | 4, 5, 6, 8 |
 | Group size | 32, 64, 128 |
-| Scales and biases | both bf16 or both fp16. The face is exact for activations of that dtype. |
+| Scales and biases | both bf16 or both fp16. The face is exact for activations of that dtype (its `dtypes`); no kernel is built on it for another. |
 | Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
-Any other affine layer (2 or 3 bits, fp32 scales, no biases) has no face and runs MLX's ops.
+Any other affine layer has no face and runs MLX's ops: 2 or 3 bits, fp32 scales, no biases, a K that is not whole groups, or a matrix of fewer than 8 groups (MLX binds an input of fewer than 8 elements as constants, not as a buffer).
+
+The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFormat.dot` is what gives a matrix its traversal.
 
 ## Kernels built on faces
 

@@ -37,15 +37,18 @@ struct Dot {
     static constant constexpr int BLOCK = BLOCK_SIZE;
     static constant constexpr int ROW_W = K * BYTES_PER_PACK / PACK_FACTOR;
     static constant constexpr int ROW_G = K / GS;
+    static_assert(
+        !FAST || K % BLOCK_SIZE == 0,
+        "affine qmv_fast face: K must be whole blocks; AffineFormat.dot gives a K its face");
 
     const device uint8_t* w;
     const device T* s;
     const device T* b;
 
     Lanes(Dot m, size_t row, uint lane)
-        : w(m.codes + row * ROW_W + int(lane) * PACKS_PER_THREAD * BYTES_PER_PACK),
-          s(m.scales + row * ROW_G + int(lane) / SCALE_STEP_PER_THREAD),
-          b(m.biases + row * ROW_G + int(lane) / SCALE_STEP_PER_THREAD) {}
+        : w(m.codes + row * ROW_W + lane * PACKS_PER_THREAD * BYTES_PER_PACK),
+          s(m.scales + row * ROW_G + lane / SCALE_STEP_PER_THREAD),
+          b(m.biases + row * ROW_G + lane / SCALE_STEP_PER_THREAD) {}
 
     struct Row {
       const device uint8_t* w;
@@ -110,6 +113,9 @@ class AffineFormat(QuantFormat):
             or layer["biases"].dtype != layer["scales"].dtype
             or layer["weight"].shape[-2:] != (n, k * layer.bits // 32)
             or k % layer.group_size
+            # MLX binds an input of fewer than 8 elements as constants; the
+            # scales and the biases are a matrix's smallest.
+            or n * k // layer.group_size < 8
         ):
             return None
         # Stacked (3-D) weights are the ones MLX runs through gather_qmm.

@@ -60,7 +60,6 @@ def test_affine_ships_as_a_builtin_plugin():
 def test_the_face_follows_mlx_one_row_dispatch(k, bits, fast):
     face = formats.dot(_linear(k, 16, bits, 64), k, 16)
     assert face == affine.face(bits, 64, fast, mx.bfloat16)
-    assert face != affine.face(bits, 64, not fast, mx.bfloat16)
     assert (face.dtypes, face.tensors) == ((mx.bfloat16,), ("scales", "biases"))
 
 
@@ -107,10 +106,24 @@ def test_no_face_without_biases_in_the_scales_dtype():
     assert formats.dot(linear, 512, 16) is None
 
 
+def test_no_face_for_tensors_mlx_binds_as_constants():
+    # One row of 5 groups, as a small shared expert's gate: 5 scales.
+    assert formats.dot(_linear(640, 1, 6, 128), 640, 1) is None
+    assert formats.dot(_linear(1024, 1, 6, 128), 1024, 1) is not None
+
+
 @metal
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("k", [512, 384, 1280])
-@pytest.mark.parametrize("group_size", [32, 64, 128])
+@pytest.mark.parametrize(
+    "group_size, k",
+    [
+        (group_size, k)
+        for group_size in (32, 64, 128)
+        # Whole blocks, and a last block of 4 to 24 lanes.
+        for k in (128, 288, 384, 448, 512, 1280)
+        if k % group_size == 0
+    ],
+)
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_rows_have_mlx_bits(bits, group_size, k, dtype):
     n = 16
@@ -133,6 +146,54 @@ def test_rows_have_mlx_bits(bits, group_size, k, dtype):
 
 
 @metal
+@pytest.mark.parametrize("n", [16, 12])  # whole output tiles of 8 rows, or not
+@pytest.mark.parametrize("k", [512, 384, 128])
+@pytest.mark.parametrize("bits", [4, 6])
+def test_stacked_rows_have_gather_qmm_bits(bits, k, n):
+    stacked = _stacked(3, k, n, bits, 64)
+    x = mx.random.normal((k,)).astype(mx.bfloat16)
+    face = formats.dot(stacked, k, n)
+    for expert in range(3):
+        operands = [stacked[name][expert] for name in ("weight", "scales", "biases")]
+        want = mx.gather_qmm(
+            x[None, None],
+            stacked.weight,
+            stacked.scales,
+            stacked.biases,
+            rhs_indices=mx.array([expert], dtype=mx.uint32),
+            transpose=True,
+            group_size=64,
+            bits=bits,
+        )[0, 0]
+        assert _bit_equal(testing.dot_rows(face, operands, x, n, packs=(2, 2)), want)
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 384])
+@pytest.mark.parametrize("bits", [4, 8])
+def test_a_matrix_that_is_not_whole_output_tiles_has_mlx_bits(bits, k):
+    linear = _linear(k, 12, bits, 64, seed=k)
+    x = mx.random.normal((k,)).astype(mx.bfloat16)
+    got = testing.dot_rows(
+        formats.dot(linear, k, 12),
+        [linear.weight, linear.scales, linear.biases],
+        x,
+        12,
+        packs=(2, 2),
+    )
+    want = mx.quantized_matmul(
+        x[None],
+        linear.weight,
+        linear.scales,
+        linear.biases,
+        transpose=True,
+        group_size=64,
+        bits=bits,
+    )[0]
+    assert _bit_equal(got, want)
+
+
+@metal
 @pytest.mark.parametrize("packs", [(1, 0), (1, 1), (4, 0), (3, 1), (4, 4)])
 @pytest.mark.parametrize("k", [512, 384])
 def test_a_row_does_not_depend_on_the_rows_it_runs_with(k, packs):
@@ -146,7 +207,6 @@ def test_a_row_does_not_depend_on_the_rows_it_runs_with(k, packs):
     )
 
 
-@metal
 def test_the_face_is_exact_for_its_own_dtype_only():
     linear = _linear(512, 16, 4, 64)
     operands = [linear.weight, linear.scales, linear.biases]
@@ -154,3 +214,18 @@ def test_the_face_is_exact_for_its_own_dtype_only():
         testing.dot_rows(
             formats.dot(linear, 512, 16), operands, mx.zeros((512,), mx.float16), 16
         )
+
+
+@metal
+def test_the_fast_face_refuses_a_k_that_is_not_whole_blocks():
+    # AffineFormat.dot gives K = 384 the qmv face; built by hand, the
+    # qmv_fast one would walk it without its last block.
+    linear = _linear(384, 16, 4, 64)
+    rows = testing.dot_rows(
+        affine.face(4, 64, True, mx.bfloat16),
+        [linear.weight, linear.scales, linear.biases],
+        mx.zeros((384,), mx.bfloat16),
+        16,
+    )
+    with pytest.raises(RuntimeError, match="affine qmv_fast face: K must be whole"):
+        mx.eval(rows)
