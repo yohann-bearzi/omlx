@@ -75,8 +75,10 @@ def dot_rows(
 
     ``operands`` are the matrix's weight and the face's tensors, in order.
     A launch takes ``packs[0]`` rows as the skeleton's first pack and the
-    next ``packs[1]`` as its second; ``n`` is a multiple of their sum. The
-    kernel is compiled for ``face`` and K.
+    next ``packs[1]`` as its second; ``n`` is one or more times their sum,
+    and no more than the matrix's rows (which is not checked). ``x`` and
+    each operand have 8 elements or more. The kernel is compiled for
+    ``face`` and K.
     """
     na, nb = packs
     if min(na, nb) < 0 or na + nb == 0:

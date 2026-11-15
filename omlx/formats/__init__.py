@@ -74,10 +74,10 @@ class Dot:
                 raise ValueError(
                     f"quant format face {self.key!r}: {name!r} is not an identifier"
                 )
-        if len(set(self.tensors)) != len(self.tensors):
+        if "weight" in self.tensors or len(set(self.tensors)) != len(self.tensors):
             raise ValueError(
-                f"quant format face {self.key!r}: a tensor is named twice in "
-                f"{self.tensors!r}"
+                f"quant format face {self.key!r}: tensors are the parameters "
+                f"beside 'weight', each named once, not {self.tensors!r}"
             )
         dtypes = {dtype for dtype in self.dtypes if isinstance(dtype, mx.Dtype)}
         if len(dtypes) != len(self.dtypes):

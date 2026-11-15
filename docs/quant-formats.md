@@ -51,7 +51,7 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
 - A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
-- A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read fails to load and is skipped, and an import in one thread can deadlock with the first lookup in another.
+- A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read can fail to load (it is then skipped), and an import in one thread can deadlock with the first lookup in another.
 
 ## Faces
 
@@ -137,8 +137,8 @@ Rules:
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
 - A face never writes the matrix: its members store to nothing but the cursor's own state and `xt`.
 - The constructor and `step()` only move pointers and read nothing. A kernel may build a cursor on a row past the matrix (for an empty pack of rows) and step it into a block it then skips. `row`, `load`, `madd` and `finish` run only for rows and blocks the kernel computes; `row` is `const`.
-- No member uses a threadgroup operation or threadgroup memory (a barrier): the simdgroups of a kernel need not all run the skeleton, or run it over the same K.
-- `row`, `load` and `madd` use a simdgroup operation (`simd_sum`, `simd_shuffle`) only in a face whose `dot()` returns `None` for every K that ends inside a block: in a last, partial block only some of the lanes run them.
+- No member uses a threadgroup operation (a barrier) or threadgroup memory: the simdgroups of a kernel need not all run the skeleton, or run it over the same K.
+- `row`, `load` and `madd` use a simdgroup operation (`simd_sum`, `simd_shuffle`) only in a face that takes whole blocks alone (its format's `dot()` never returns it for a K that ends inside a block): in a last, partial block only some of the lanes run them.
 - `finish` runs where the walk left the cursor, which is not one place: past the last whole block, or on a last, partial one. It reads only what `step()` does not move, and nothing that depends on the lane: after it every lane holds the row's result.
 - `r` is a constant at every call, an element of the kernel's pack of rows. `row` and `finish` do arithmetic on it that folds (`r * K`), not a loop over the rows.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
@@ -206,14 +206,14 @@ Dot(
 
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_w` and `<name>_<tensor>`; `add` refuses a matrix that would repeat an input.
+A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. The matrix and its inputs are names of the kernel: `add` refuses a matrix that would repeat one.
 
 ```python
 import mlx.core as mx
 from omlx.formats import kernels
 
 matrices = kernels.Matrices()
-inputs = ["x", *matrices.add("m", face)]  # ["x", "m_w", "m_scales"]
+inputs = ["x", *matrices.add("m", face)]  # ["x", "m_weight", "m_scales"]
 
 kernel = mx.fast.metal_kernel(
     name=f"two_rows_{face.key}",
@@ -242,7 +242,7 @@ y = kernel(
 )[0]
 ```
 
-`qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. Rows of one matrix go in one pack, as above: the second pack is for the rows of another matrix (a gate and an up projection), and is empty (`NB = 0`) without one. A kernel that reads two formats calls it once per format.
+`qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. Adjacent rows of one matrix go in one pack, as above. The second pack is for rows elsewhere: another matrix's (a gate and an up projection), or a run of the same matrix that does not follow the first. It is empty (`NB = 0`) when there are none. A kernel that reads two formats calls it once per format.
 
 What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores.
 
@@ -327,7 +327,7 @@ def test_rows_are_the_dequantized_products():
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
 
-`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes; `n` is a multiple of `NA + NB`.
+`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants.
 
 Worth testing for every layout a format gives a face for:
 

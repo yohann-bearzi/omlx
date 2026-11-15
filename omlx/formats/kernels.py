@@ -141,19 +141,21 @@ class Matrices:
 
     def __init__(self) -> None:
         self._faces: dict[str, Dot] = {}
+        self._names: set[str] = set()
 
     def add(self, name: str, face: Dot) -> list[str]:
         """Add matrix ``name``. Returns its kernel inputs: the weight, then
-        the face's tensors in order."""
+        the face's tensors in order. The matrix and its inputs are names of
+        the kernel, each its own."""
         inputs = _inputs(name, face)
-        taken = {i for other in self._faces.items() for i in _inputs(*other)}
-        repeated = dict.fromkeys(i for i in inputs if i in taken or inputs.count(i) > 1)
+        repeated = [n for n in (name, *inputs) if n in self._names]
         if repeated:
             raise ValueError(
-                f"matrix {name!r}: {', '.join(repeated)} would repeat an input of "
+                f"matrix {name!r}: {', '.join(repeated)} would repeat a name of "
                 "the kernel"
             )
         self._faces[name] = face
+        self._names.update((name, *inputs))
         return inputs
 
     @property
@@ -201,7 +203,7 @@ def _named(name: str, source: str, line: int = 1) -> str:
 
 
 def _inputs(name: str, face: Dot) -> list[str]:
-    return [f"{name}_w", *(f"{name}_{tensor}" for tensor in face.tensors)]
+    return [f"{name}_weight", *(f"{name}_{tensor}" for tensor in face.tensors)]
 
 
 def _members(name: str, face: Dot) -> str:

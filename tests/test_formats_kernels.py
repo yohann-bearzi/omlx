@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import replace
+from functools import cache
+from itertools import takewhile
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
@@ -100,31 +103,42 @@ def _line(source, text) -> int:
 
 def test_a_matrix_is_its_weight_then_its_tensors():
     matrices = kernels.Matrices()
-    assert matrices.add("sg", _toy("a")) == ["sg_w", "sg_scales"]
-    assert matrices.add("rt", _toy("b")) == ["rt_w", "rt_scales"]
+    assert matrices.add("sg", _toy("a")) == ["sg_weight", "sg_scales"]
+    assert matrices.add("rt", _toy("b")) == ["rt_weight", "rt_scales"]
     assert matrices.declarations == (
-        "    const auto sg = omlx_toy_a::Dot{(const device uint8_t*)sg_w, sg_scales};\n"
-        "    const auto rt = omlx_toy_b::Dot{(const device uint8_t*)rt_w, rt_scales};\n"
+        "    const auto sg = omlx_toy_a::Dot{"
+        "(const device uint8_t*)sg_weight, sg_scales};\n"
+        "    const auto rt = omlx_toy_b::Dot{"
+        "(const device uint8_t*)rt_weight, rt_scales};\n"
         '\n#line 1 "<kernel>"\n'
     )
 
 
-def test_a_kernel_has_each_input_once():
+def test_a_kernel_has_each_name_once():
     matrices = kernels.Matrices()
     matrices.add("sg", _toy("a"))
-    with pytest.raises(ValueError, match="matrix 'sg': sg_w, sg_scales would repeat"):
+    with pytest.raises(ValueError) as refusal:
         matrices.add("sg", _toy("b"))
+    assert str(refusal.value) == (
+        "matrix 'sg': sg, sg_weight, sg_scales would repeat a name of the kernel"
+    )
     # sg + d_scales and sg_d + scales are one input name.
     other = kernels.Matrices()
     other.add("sg", replace(_toy("a"), tensors=("d_scales",)))
     with pytest.raises(ValueError, match="matrix 'sg_d': sg_d_scales would repeat"):
         other.add("sg_d", _toy("b"))
-    # ... and a tensor named w is the weight's.
-    with pytest.raises(ValueError, match="matrix 'm': m_w would repeat"):
-        kernels.Matrices().add("m", replace(_toy("a"), tensors=("w",)))
-    # A refused matrix is not in the kernel.
+    # A matrix is declared under its name: no input has it, whichever of the
+    # two comes first.
+    with pytest.raises(ValueError, match="matrix 'sg_d_scales': sg_d_scales would"):
+        other.add("sg_d_scales", _toy("b"))
+    first = kernels.Matrices()
+    first.add("rt_scales", _toy("a"))
+    with pytest.raises(ValueError, match="matrix 'rt': rt_scales would repeat"):
+        first.add("rt", _toy("b"))
+    # A refused matrix is not in the kernel, and its names are not taken.
     assert "omlx_toy_b" not in matrices.declarations + other.declarations
     assert other.declarations.count("const auto") == 1
+    assert other.add("sg_d_weight", _toy("b"))[0] == "sg_d_weight_weight"
 
 
 def test_a_kernel_includes_each_format_source_once():
@@ -443,9 +457,9 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
     half = replace(_toy("half"), dtypes=(mx.float16,))
     with pytest.raises(ValueError, match="toy_half is exact for mlx.core.float16"):
         testing.dot_rows(half, operands, x, 8)
-    (codes, scales), x, _ = _matrix(4, 512)
-    with pytest.raises(ValueError, match="toy_a: scales has 4 elements"):
-        testing.dot_rows(_toy("a"), (codes, scales), x, 4)
+    (codes, scales), x, _ = _matrix(7, 512)
+    with pytest.raises(ValueError, match="toy_a: scales has 7 elements"):
+        testing.dot_rows(_toy("a"), (codes, scales), x, 7, (1, 0))
     operands, x, _ = _matrix(8, 512)
     with pytest.raises(ValueError, match="toy_a: x has 4 elements"):
         testing.dot_rows(_toy("a"), operands, x[:4], 8)
@@ -453,6 +467,126 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
         testing.dot_rows(_toy("a"), operands[:1], x, 8)
     with pytest.raises(ValueError, match="one vector of K activations"):
         testing.dot_rows(_toy("a"), operands, mx.stack([x, x]), 8)
-    for packs in [(0, 0), (-1, 2)]:
+    for packs in [(0, 0), (-1, 2), (2, -1)]:
         with pytest.raises(ValueError, match="one row or more in all"):
             testing.dot_rows(_toy("a"), operands, x, 8, packs)
+
+
+# docs/quant-formats.md shows a format and what the compiler says of its
+# mistakes. The example is the toy above; each message is the compiler's for
+# one edit of it.
+_PAGE = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
+
+
+def _fenced(page) -> list[tuple[str, str]]:
+    """The page's fenced blocks, each as its language and its text."""
+    lines = iter(page.splitlines())
+    return [
+        (
+            line.strip()[3:],
+            "\n".join(takewhile(lambda inner: inner.strip() != "```", lines)),
+        )
+        for line in lines
+        if line.strip().startswith("```")
+    ]
+
+
+_BLOCKS = _fenced(_PAGE)
+# What the page quotes of the Metal compiler, on one line each.
+_SAMPLES = [
+    " ".join(text.split())
+    for language, text in _BLOCKS
+    if not language and text.startswith("<")
+]
+# A phrase of each quoted message, and what brings the message out of the
+# page's example: K, and an edit of the example's source.
+_BREAKS = {
+    "BLOCK must be VPT inputs": {
+        "old": "BLOCK = 32 * VPT;",
+        "new": "BLOCK = 16 * VPT;",
+    },
+    "K must be a whole number": {"k": 60},
+    "undeclared identifier 'weights'": {
+        "old": "return {w + r * K};",
+        "new": "return {weights + r * K};",
+    },
+    "no member named 'finish'": {
+        "old": "    float finish(int r, float sum) const { return sum * s[r]; }\n",
+    },
+    "too many arguments": {
+        "old": "thread const float* xt, float) {",
+        "new": "thread const float* xt) {",
+    },
+    "a later revision": {
+        "old": "CONTRACT = 1;",
+        "new": f"CONTRACT = {formats.CONTRACT + 1};",
+    },
+}
+
+
+@cache
+def _example() -> Dot:
+    """The face of the page's example."""
+    (source,) = (
+        text
+        for language, text in _BLOCKS
+        if language == "cpp" and text.startswith("namespace omlx_myformat_b8 {")
+    )
+    (face,) = (
+        text for language, text in _BLOCKS if language == "python" and "SOURCE" in text
+    )
+    return eval(face, {"Dot": Dot, "SOURCE": source})
+
+
+def _page_error(k=512, old="", new="") -> str:
+    """The compiler's messages for the page's example over K inputs, with
+    ``old`` in its source replaced by ``new``."""
+    face = _example()
+    assert old in face.source
+    return _error(replace(face, source=face.source.replace(old, new)), k)
+
+
+def test_the_pages_example_is_the_toy_format():
+    face = _example()
+    assert face == Dot(
+        key="myformat_b8",
+        source=_TOY.strip().replace("omlx_toy_KEY", "omlx_myformat_b8"),
+        type="omlx_myformat_b8::Dot",
+        tensors=("scales",),
+    )
+
+
+@metal
+def test_the_pages_kernel_computes_its_examples_rows():
+    (kernel,) = (
+        text
+        for language, text in _BLOCKS
+        if language == "python" and "qmv_rows<" in text
+    )
+    (weight, scales), x, want = _matrix(8, 512)
+    scope = dict(face=_example(), weight=weight, scales=scales, x=x, k=512, n=8)
+    exec(kernel, scope)
+    assert f"# {scope['inputs']!r}".replace("'", '"') in kernel
+    assert mx.array_equal(scope["y"], want)
+
+
+def test_each_compiler_message_of_the_page_has_its_break():
+    broken = [
+        index
+        for phrase in _BREAKS
+        for index, sample in enumerate(_SAMPLES)
+        if phrase in sample
+    ]
+    assert sorted(broken) == list(range(len(_SAMPLES)))
+    assert len(broken) == len(_BREAKS)
+
+
+# Pinned: the lines oMLX's own Metal is cited at, the kind of each message
+# and the rules oMLX words. The rest is the Metal compiler's wording.
+@metal
+@pytest.mark.parametrize("phrase", _BREAKS)
+def test_the_page_cites_the_lines_the_compiler_cites(phrase):
+    (sample,) = (sample for sample in _SAMPLES if phrase in sample)
+    cited = re.findall(r'<[^<>]*>:\d+:\d+: \w+|"dot face: [^"]*"', sample)
+    message = " ".join(_page_error(**_BREAKS[phrase]).split())
+    assert cited and [c for c in cited if c not in message] == []

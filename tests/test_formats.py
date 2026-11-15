@@ -19,6 +19,8 @@ import pytest
 from omlx import formats
 from omlx.formats import testing
 
+_PAGE = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
+
 _FACE = formats.Dot(
     key="toy_b4",
     source="namespace omlx_toy_b4 { struct Dot {}; }\n",
@@ -74,9 +76,9 @@ def plugins(monkeypatch):
 def test_the_load_may_register_under_its_own_lock():
     # register() runs inside the load: under a lock that is not reentrant
     # the first lookup would hang.
-    assert formats._LOCK.acquire(blocking=False)
+    assert formats._LOCK.acquire(timeout=5), "another thread holds the lock"
     try:
-        assert formats._LOCK.acquire(blocking=False)
+        assert formats._LOCK.acquire(blocking=False), "the lock is not reentrant"
         formats._LOCK.release()
     finally:
         formats._LOCK.release()
@@ -104,6 +106,7 @@ def test_a_mode_has_one_format(plugins):
     [
         ("", ("scales",)),
         (None, ("scales",)),
+        (7, ("scales",)),
         ("toy", ["scales"]),
         ("toy", ("weight", "scales")),
         ("toy", ("scales", "bias")),
@@ -139,6 +142,10 @@ def test_a_malformed_format_is_refused_before_anything_loads(plugins):
     plugins.append(_Entry("toy", _Format()))
     with pytest.raises(ValueError, match="has no mode"):
         formats.register(formats.QuantFormat())
+    with pytest.raises(ValueError, match="tensors must be a tuple"):
+        formats.register(_Format(tensors=["scales"]))
+    with pytest.raises(ValueError, match="contract is the revision"):
+        formats.register(_Format(contract=None))
     with pytest.raises(ValueError, match="update oMLX"):
         formats.register(_Format(contract=formats.CONTRACT + 1))
     assert plugins[0].loaded == 0
@@ -197,11 +204,21 @@ def test_a_plugin_of_another_revision_is_logged_and_skipped(plugins, caplog):
 
 
 def test_the_contract_page_lists_every_revision():
-    page = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
-    versions = page.split("\n## Versions\n")[1].split("\n## ")[0]
+    versions = _PAGE.split("\n## Versions\n")[1].split("\n## ")[0]
     revisions = [int(n) for n in re.findall(r"^\| (\d+) \|", versions, re.M)]
     assert revisions == list(range(1, formats.CONTRACT + 1))
     assert 1 <= formats.OLDEST_CONTRACT <= formats.CONTRACT
+
+
+def test_the_contract_page_quotes_the_refusal_of_a_later_revision(plugins):
+    with pytest.raises(ValueError) as refusal:
+        formats.register(_Format("myformat", contract=formats.CONTRACT + 1))
+    assert str(refusal.value) in " ".join(_PAGE.split())
+
+
+def test_plugins_are_found_in_the_group_the_contract_page_names():
+    assert formats.ENTRY_POINT_GROUP == "omlx.quant_formats"
+    assert '\n[project.entry-points."omlx.quant_formats"]\n' in _PAGE
 
 
 def test_builtins_register_through_register(plugins, monkeypatch):
@@ -272,6 +289,24 @@ def test_a_plugin_that_fails_to_load_is_logged_and_skipped(plugins, caplog):
         "quant format plugin missing (missing:FORMAT) failed to load",
         "quant format plugin not_a_format (not_a_format:FORMAT) failed to load",
     ]
+    # Each with the error that failed it.
+    assert [type(r.exc_info[1]) for r in caplog.records] == [ImportError, TypeError]
+
+
+def test_an_interrupt_inside_a_plugins_load_is_not_a_failed_plugin(plugins, caplog):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    plugins.append(_Entry("toy", interrupted))
+    caplog.set_level(logging.ERROR, logger=formats.__name__)
+    with pytest.raises(KeyboardInterrupt):
+        formats.get("toy")
+    assert not caplog.records
+    # The load did not end: the next lookup loads again.
+    fmt = _Format()
+    plugins[0].loads = fmt
+    assert formats.get("toy") is fmt
+    assert plugins[0].loaded == 2
 
 
 def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
@@ -615,7 +650,9 @@ def test_a_face_names_metal_identifiers(names):
         ({"tensors": "scales"}, "tensors and dtypes are tuples"),
         ({"tensors": ["scales"]}, "tensors and dtypes are tuples"),
         ({"dtypes": mx.float16}, "tensors and dtypes are tuples"),
-        ({"tensors": ("scales", "scales")}, "a tensor is named twice"),
+        ({"tensors": ("scales", "scales")}, "beside 'weight', each named once"),
+        ({"tensors": ("weight",)}, "beside 'weight', each named once"),
+        ({"tensors": ("scales", "weight")}, "beside 'weight', each named once"),
         ({"dtypes": (None,)}, "dtypes are distinct mx.Dtype"),
         ({"dtypes": ("float16",)}, "dtypes are distinct mx.Dtype"),
         ({"dtypes": (mx.float16, [])}, "dtypes are distinct mx.Dtype"),
