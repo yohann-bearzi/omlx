@@ -518,6 +518,18 @@ def dot_defects():
 
 
 @pytest.fixture(autouse=True)
+def kernel_proofs(monkeypatch):
+    """A launch that fails keeps every kernel of its faces and shapes on the
+    composed path for the life of the process (omlx.formats.kernels.Proof).
+    Each test proves its own launches."""
+    from omlx.formats import kernels
+
+    proofs: dict = {}
+    monkeypatch.setattr(kernels, "_PROOFS", proofs)
+    return proofs
+
+
+@pytest.fixture(autouse=True)
 def _reset_api_key_failures():
     """Keep the process-global wrong API key budget hermetic per test."""
     auth = sys.modules.get("omlx.admin.auth")

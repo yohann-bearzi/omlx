@@ -702,3 +702,11 @@ def test_a_face_is_exact_for_its_dtypes_or_for_any():
     assert half.exact_for(mx.float16) and not half.exact_for(mx.bfloat16)
     halves = replace(_FACE, dtypes=(mx.float16, mx.bfloat16))
     assert halves.exact_for(mx.bfloat16) and not halves.exact_for(mx.float32)
+
+
+def test_a_format_without_a_decode_says_so():
+    class Bare(formats.QuantFormat):
+        mode, tensors, contract = "bare", (), formats.CONTRACT
+
+    with pytest.raises(NotImplementedError, match="quant format 'bare' has no decode"):
+        Bare().decode({"weight": mx.zeros((8, 8))}, 4, 32)

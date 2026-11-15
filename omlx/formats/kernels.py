@@ -168,9 +168,9 @@ class Proof:
 
     MLX compiles a kernel when it first evaluates it. So a kernel evaluates
     each launch the first time it is built, while the call can still fall
-    back, and a launch that fails keeps what shares the proof on its composed
-    path. The launch's inputs are evaluated ahead of it: their failure is the
-    caller's."""
+    back, and a launch that fails, whatever failed in that evaluation, keeps
+    what shares the proof on its composed path until the process ends. The
+    launch's inputs are evaluated ahead of it: their failure is the caller's."""
 
     ran: set = field(default_factory=set)  # the launches that compiled
     failed: bool = False
@@ -179,11 +179,11 @@ class Proof:
 _PROOFS: dict[tuple, Proof] = {}
 
 
-def proof(*key) -> Proof:
-    """The proof of the launches compiled from ``key``: the kernel, then its
+def proof(kernel: str, *key) -> Proof:
+    """The proof of the launches that ``kernel`` compiles from ``key``: its
     faces and what else its source is instantiated with, beside what the
     kernel keeps in ``Proof.ran``."""
-    return _PROOFS.setdefault(key, Proof())
+    return _PROOFS.setdefault((kernel, *key), Proof())
 
 
 class Matrices:

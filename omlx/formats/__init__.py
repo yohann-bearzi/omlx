@@ -94,8 +94,8 @@ class Dot:
 
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
-    ``contract``, and overrides the faces it has; a kernel whose face a
-    format lacks keeps its composed path."""
+    ``contract``, and overrides ``decode`` and the faces it has; a kernel
+    whose face a format lacks keeps its composed path."""
 
     mode: str  # a linear's "mode" in the quantization config
     tensors: tuple[str, ...]  # its parameters beside "weight" (and "bias")
@@ -104,6 +104,14 @@ class QuantFormat:
     def dot(self, layer, k: int, n: int) -> Dot | None:
         """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None."""
         return None
+
+    def decode(
+        self, tensors: dict[str, mx.array], bits: int, group_size: int
+    ) -> mx.array:
+        """A matrix's weights as floats, ``(..., n, k)``. ``tensors`` are its
+        ``weight`` and the format's tensors, by name: one matrix's, or those
+        of several, with the same axes ahead of the matrix's in each."""
+        raise NotImplementedError(f"quant format {self.mode!r} has no decode")
 
 
 _FORMATS: dict[str, QuantFormat] = {}

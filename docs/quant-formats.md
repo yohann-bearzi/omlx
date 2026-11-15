@@ -16,6 +16,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 |---|---|
 | `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
+| `omlx/formats/linear.py` | the layers that hold a format's tensors |
 | `omlx/formats/testing.py` | checks for a format's own tests |
 | `omlx/formats/affine.py` | affine, the built-in format |
 
@@ -31,8 +32,11 @@ class MyFormat(QuantFormat):
     tensors = ("scales",)  # its parameters beside "weight" and "bias"
     contract = 1           # the revision of this page it is written for
 
+    def decode(self, tensors, bits, group_size):
+        ...                # the weights as floats
+
     def dot(self, layer, k, n) -> Dot | None:
-        ...
+        ...                # the face that oMLX's kernels run them through
 
 
 FORMAT = MyFormat()
@@ -52,6 +56,41 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
 - A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
 - A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read can fail to load (it is then skipped), and an import in one thread can deadlock with the first lookup in another.
+
+## Decode
+
+`QuantFormat.decode(tensors, bits, group_size)` returns a matrix's weights as floats, of shape `(..., n, k)`. It is the format's reference: what a layer runs where no kernel takes its rows, and what a format's tests compare a face with.
+
+- `tensors` holds `weight` and the format's `tensors`, by name. They are one matrix's, or those of several: a switch layer passes the experts a call asks for, gathered tensor by tensor (`tensor[indices]`). Each tensor then has the same axes ahead of its own, and so do the weights returned.
+- `bits` and `group_size` are the layer's, from the checkpoint's quantization config.
+
+## Layers
+
+`omlx.formats.linear` has the layers that hold a format's tensors. `FormatLinear` is to a format what `nn.QuantizedLinear` is to MLX's modes, and `FormatSwitchLinear` what mlx-vlm's `QuantizedSwitchLinear` is: a stack of matrices (a switch layer's experts), called with the indices of the ones to run.
+
+```python
+from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+
+linear = FormatLinear("myformat", bits, group_size, k, {"weight": codes, "scales": scales})
+y = linear(x)  # x @ W.T, plus the bias if the layer is given one
+
+experts = FormatSwitchLinear("myformat", bits, group_size, k, stacked, bias=bias)
+y = experts(x, indices)  # as mlx-vlm calls a switch layer
+```
+
+A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), so the kernels of [Kernels built on faces](#kernels-built-on-faces) ask for its face as they ask for an MLX layer's. A layer is given every tensor the format names, and no other:
+
+- the weight of a matrix has two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
+- in a stack every tensor has the stack's axis first, and the weight then two more. What follows the stack's axis in another tensor is the format's own.
+
+| Call | What runs |
+|---|---|
+| `FormatLinear`, 1 to 16 rows of `x` (`linear.MAX_ROWS`: a decode step and the short blocks around one) | the dot face in the mat-vec skeleton, in one launch. Each row has the bits it has alone. |
+| `FormatLinear`, more rows | `decode`, then MLX's matmul |
+| `FormatSwitchLinear` | each pair (a row of `x` and its expert) through the dot face, in one launch, as MLX's `gather_qmm` runs a decode step's pairs. Each pair has the bits it has alone. |
+| either, with no dot face that is exact for `x`'s dtype, an N that is not a multiple of 8, or a K under 8 | `decode`, then MLX's matmul |
+
+A format without a dot face is correct and slow: every call decodes, a switch layer one matrix for each pair. The rows kernel is proved as every kernel in a model's forward (see [Kernels over faces](#kernels-over-faces)): a face that does not compile is logged with the compiler's messages (`quant format face <key>: rows kernel failed; decode fallback`), and the layers of the same face, tensor dtypes and shape run through `decode`.
 
 ## Faces
 
@@ -244,9 +283,9 @@ y = kernel(
 
 `qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. Adjacent rows of one matrix go in one pack, as above. The second pack is for rows elsewhere: another matrix's (a gate and an up projection), or a run of the same matrix that does not follow the first. It is empty (`NB = 0`) when there are none. A kernel that reads two formats calls it once per format.
 
-What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores. For the plain store, a kernel adds `kernels.STORE_ROWS` to its header: `store_rows(omlx_iota<N>(), result, y + row)` rounds a simdgroup's `N` results to the output's type, in the one lane that calls it.
+What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores. For the plain store, a kernel adds `kernels.STORE_ROWS` to its header: `store_rows(omlx_iota<N>(), result, y + row)` rounds a simdgroup's `N` results to the output's type. The kernel calls it from one lane (the example above stores its two rows by hand).
 
-MLX compiles a kernel when it first evaluates it, which in a model is wherever the graph is evaluated: too late to fall back. So a kernel in a model's forward evaluates a launch inside the call that builds it first, and keeps what it learns in a `kernels.Proof`: the launches that compiled (`ran`) and whether one failed (`failed`). `kernels.proof(...)` gives the one proof of a key, which names the kernel, its faces and what else its source is instantiated with (the tensors' dtypes, the shapes), so that layers of the same layout share it. Once a launch has failed, what shares the proof keeps its composed path.
+MLX compiles a kernel when it first evaluates it, which in a model is wherever the graph is evaluated: too late to fall back. So a kernel in a model's forward evaluates a launch inside the call that builds it first, and keeps what it learns in a `kernels.Proof`: the launches that compiled (`ran`) and whether one failed (`failed`). `kernels.proof(kernel, ...)` gives the one proof of a key: the kernel's name, its faces and what else its source is instantiated with (the tensors' dtypes, the shapes), so that layers of the same layout share it. Once a launch has failed, whatever the failure of its first evaluation was, what shares the proof keeps its composed path until the process ends.
 
 ## Compile-time rules
 
@@ -423,7 +462,9 @@ A format whose product is not computed row by row over blocks of the inputs (one
 
 ## Affine
 
-`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format, written for revision 1 of this page. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits MLX gives one row of activations, through `mx.quantized_matmul` or, for stacked expert weights, `mx.gather_qmm`.
+`omlx/formats/affine.py` registers MLX's affine quantization (`mode="affine"`) as a format, written for revision 1 of this page. Its face is the MLX 0.32.4 `quantized.h` code: a row computed through it has the bits MLX gives one row of activations, through `mx.quantized_matmul` or, for stacked expert weights, `mx.gather_qmm`. Its `decode` is `mx.dequantize`.
+
+An affine checkpoint's linears stay MLX's layers (`nn.QuantizedLinear`, `QuantizedSwitchLinear`), which the kernels below read through the affine face. oMLX's tests run the affine format through [the format layers](#layers) as well, against MLX's layers bit for bit: the layers are tested on a format oMLX ships.
 
 | | Covered |
 |---|---|
@@ -447,6 +488,7 @@ The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFo
 |---|---|---|
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 | Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
+| A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |
 
 The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
 

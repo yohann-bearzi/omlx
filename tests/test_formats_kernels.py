@@ -102,8 +102,7 @@ def _line(source, text) -> int:
     return source[: source.index(text)].count("\n") + 1
 
 
-def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key(monkeypatch):
-    monkeypatch.setattr(kernels, "_PROOFS", {})
+def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key():
     face = _toy("proof")
     proof = kernels.proof("kernel", face, mx.float32, 512)
     assert proof == kernels.Proof(ran=set(), failed=False)

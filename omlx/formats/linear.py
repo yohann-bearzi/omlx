@@ -1,0 +1,309 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Linear layers whose weights are kept in a registered format: what
+``nn.QuantizedLinear`` and mlx-vlm's ``QuantizedSwitchLinear`` are to the
+formats MLX knows.
+
+A layer holds a matrix's tensors under the names its format gives them, and
+asks the registry how to run them:
+
+- the rows of a decode step, or of the short blocks around one, go through
+  the format's dot face in the mat-vec skeleton, one launch for all of them,
+  each row with the bits it has alone;
+- everything else (more rows of one matrix, a layout the face does not
+  cover, a format without the face, a face that did not compile) is the
+  format's ``decode``, then MLX's matmul.
+"""
+
+from __future__ import annotations
+
+import logging
+from functools import cache
+from typing import Any, NamedTuple
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from .. import formats
+from ..patches.module_cache import cached_per_module
+from . import Dot, kernels
+
+logger = logging.getLogger(__name__)
+
+# The rows of one ``FormatLinear`` call that go through the dot face: a decode
+# step and the short blocks around it (an MTP verify window). Each has the
+# bits of its one-row call, whatever rows it is launched with.
+MAX_ROWS = 16
+
+# One threadgroup per pair (a row of x and the matrix it meets) and tile of 8
+# of the pair's outputs: 4 for each of the threadgroup's two simdgroups.
+# __MATRIX__ is the pair's matrix in the stack, __X_ROW__ its row of x.
+_SOURCE = r"""
+    constexpr int RPS = 4;  // output rows of a simdgroup
+    static_assert(
+        N_SIZE % (2 * RPS) == 0,
+        "format linear: N must be whole tiles of 8 outputs");
+    const uint pair = threadgroup_position_in_grid.y;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const size_t out_row =
+        size_t(threadgroup_position_in_grid.z) * (2 * RPS) + simd_gid * RPS;
+    float result[RPS];
+    qmv_rows<T, K_SIZE, RPS, 0>(
+        m, size_t(__MATRIX__) * N_SIZE + out_row, m, 0,
+        x + size_t(__X_ROW__) * K_SIZE, simd_lid, result);
+    if (simd_lid == 0) {
+      store_rows(omlx_iota<RPS>(), result, y + size_t(pair) * N_SIZE + out_row);
+    }
+"""
+
+
+@cache
+def _kernel(face: Dot, stacked: bool):
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("m", face)]
+    if stacked:
+        inputs.append("rhs")
+        matrix, x_row = "rhs[pair]", "pair / uint(PAIRS_PER_ROW)"
+    else:
+        matrix, x_row = "0", "pair"
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_{'switch_linear' if stacked else 'linear'}_{face.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations
+        + _SOURCE.replace("__MATRIX__", matrix).replace("__X_ROW__", x_row),
+    )
+
+
+class _Plan(NamedTuple):
+    face: Dot
+    kernel: Any
+    operands: tuple  # the weight, then the face's tensors
+    proof: kernels.Proof
+
+
+def _plan(layer) -> _Plan | None:
+    """How ``layer``'s rows run through its format's dot face, or None: the
+    format has no face for the matrix, or a launch could not take it."""
+    k, n = layer.input_dims, layer.output_dims
+    # MLX binds x as a buffer from 8 elements; a launch is whole tiles.
+    if k < 8 or n % 8:
+        return None
+    face = formats.dot(layer, k, n)
+    if face is None:
+        return None
+    operands = tuple(layer[name] for name in ("weight", *face.tensors))
+    stacked = layer["weight"].ndim == 3
+    # What a launch is compiled from, beside what the layer keeps in ran.
+    proof = kernels.proof(
+        "format_switch_linear" if stacked else "format_linear",
+        face,
+        tuple(a.dtype for a in operands),
+        k,
+        n,
+    )
+    return _Plan(face, _kernel(face, stacked), operands, proof)
+
+
+def _runs(plan: _Plan | None, dtype) -> bool:
+    return plan is not None and not plan.proof.failed and plan.face.exact_for(dtype)
+
+
+def _rows(plan: _Plan, x: mx.array, n: int, rhs=None, pairs_per_row: int = 1):
+    """One mat-vec per pair. Pair ``p`` is row ``p // pairs_per_row`` of
+    ``x`` (``[R, K]``) with the matrix, or with matrix ``rhs[p]`` of the
+    stack. Returns ``[P, N]``."""
+    inputs = [x, *plan.operands]
+    template = [("T", x.dtype), ("K_SIZE", x.shape[1]), ("N_SIZE", n)]
+    pairs = x.shape[0]
+    if rhs is not None:
+        inputs.append(rhs)
+        template.append(("PAIRS_PER_ROW", pairs_per_row))
+        pairs = rhs.shape[0]
+    return plan.kernel(
+        inputs=inputs,
+        template=template,
+        grid=(32, 2 * pairs, n // 8),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+def _proven(plan: _Plan, launch, inputs: tuple, run):
+    """``run()``'s rows, or None when its launch does not compile.
+
+    The launch is evaluated here the first time it is built, once ``inputs``
+    are: what fails ahead of it is raised as it is."""
+    proof = plan.proof
+    if launch in proof.ran:
+        return run()
+    mx.eval(*inputs)
+    y = run()
+    try:
+        # Surface a kernel build failure while the call can still fall back.
+        mx.eval(y)
+    except Exception:
+        proof.failed = True
+        logger.warning(
+            "quant format face %s: rows kernel failed; decode fallback",
+            plan.face.key,
+            exc_info=True,
+        )
+        return None
+    proof.ran.add(launch)
+    logger.info("quant format face %s: rows kernel engaged", plan.face.key)
+    return y
+
+
+class _FormatLayer(nn.Module):
+    """What the two layers share: a format's tensors as frozen parameters,
+    and the attributes of MLX's quantized layers."""
+
+    _STACK = 0  # the axes ahead of one matrix's, in each of its tensors
+
+    def __init__(
+        self,
+        mode: str,
+        bits: int,
+        group_size: int,
+        input_dims: int,
+        tensors: dict[str, mx.array],
+        bias: mx.array | None = None,
+    ) -> None:
+        super().__init__()
+        fmt = formats.get(mode)
+        if fmt is None:
+            raise ValueError(f"no quant format is registered for mode {mode!r}")
+        names = ("weight", *fmt.tensors)
+        if set(tensors) != set(names):
+            raise ValueError(
+                f"quant format {mode!r} keeps a matrix as {', '.join(names)}, "
+                f"not as {', '.join(sorted(tensors))}"
+            )
+        weight = tensors["weight"]
+        if weight.ndim != self._STACK + 2:
+            raise ValueError(
+                f"{type(self).__name__}: the weight has {self._STACK + 2} axes, "
+                f"not the shape {weight.shape}"
+            )
+        # What lets a stack's matrices be gathered, tensor by tensor.
+        stack = weight.shape[: self._STACK]
+        ragged = [name for name in names if tensors[name].shape[: self._STACK] != stack]
+        if ragged:
+            raise ValueError(
+                f"{type(self).__name__}: {', '.join(ragged)} does not open with "
+                f"the weight's stack of {stack}"
+            )
+        self.mode, self.bits, self.group_size = mode, bits, group_size
+        self.input_dims = input_dims
+        for name in names:
+            self[name] = tensors[name]
+        if bias is not None:
+            self["bias"] = bias
+        self.freeze()
+
+    @property
+    def output_dims(self) -> int:
+        return self["weight"].shape[-2]
+
+    def _decoded(self, indices: mx.array | None = None) -> mx.array:
+        """The layer's weights as floats: all of them, or the matrices at
+        ``indices`` of the stack."""
+        fmt = formats.get(self.mode)
+        tensors = {name: self[name] for name in ("weight", *fmt.tensors)}
+        if indices is not None:
+            tensors = {name: tensor[indices] for name, tensor in tensors.items()}
+        return fmt.decode(tensors, self.bits, self.group_size)
+
+    def _extra_repr(self) -> str:
+        return (
+            f"input_dims={self.input_dims}, output_dims={self.output_dims}, "
+            f"bias={'bias' in self}, group_size={self.group_size}, "
+            f"bits={self.bits}, mode={self.mode}"
+        )
+
+
+class FormatLinear(_FormatLayer):
+    """``x @ W.T + bias`` for a matrix ``W`` kept in format ``mode``:
+    ``tensors`` are its ``weight`` and the format's tensors, by name."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        k, n = self.input_dims, self.output_dims
+        if x.shape[-1] != k:
+            raise ValueError(f"x has {x.shape[-1]} features, the layer takes {k}")
+        rows = x.size // k
+        y = None
+        if 0 < rows <= MAX_ROWS:
+            plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
+            if _runs(plan, x.dtype):
+                y = _proven(
+                    plan, x.dtype, (x,), lambda: _rows(plan, x.reshape(rows, k), n)
+                )
+        if y is None:
+            y = x @ self._decoded().astype(x.dtype).T
+        else:
+            y = y.reshape(*x.shape[:-1], n)
+        if "bias" in self:
+            y = y + self["bias"]
+        return y
+
+
+class FormatSwitchLinear(_FormatLayer):
+    """A stack of matrices kept in format ``mode`` (a switch layer's
+    experts), called as mlx-vlm's ``QuantizedSwitchLinear``: ``x`` is
+    ``(..., M, K)``, ``indices`` name a matrix for each of ``x``'s leading
+    axes, broadcast together, and the result is ``(..., M, N)``."""
+
+    _STACK = 1
+
+    @property
+    def num_experts(self) -> int:
+        return self["weight"].shape[0]
+
+    def __call__(
+        self, x: mx.array, indices: mx.array, sorted_indices: bool = False
+    ) -> mx.array:
+        # sorted_indices is mlx-vlm's hint to gather_qmm: every pair is one
+        # mat-vec here, in any order.
+        k, n = self.input_dims, self.output_dims
+        if x.ndim < 2 or x.shape[-1] != k:
+            raise ValueError(f"x is (..., M, {k}), not of shape {x.shape}")
+        lead, m = x.shape[:-2], x.shape[-2]
+        batch = mx.broadcast_shapes(lead, indices.shape)
+        y = None
+        plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
+        if _runs(plan, x.dtype) and indices.size * x.size:
+            own = len(lead)  # x's leading axes ahead of its trailing ones of 1
+            while own and lead[own - 1] == 1:
+                own -= 1
+            if (
+                m == 1
+                and indices.shape == batch
+                and len(lead) == len(batch)
+                and lead[:own] == batch[:own]
+            ):
+                # Each row of x meets its own run of experts: nothing is
+                # broadcast in memory.
+                rows, rhs = x.reshape(-1, k), indices.reshape(-1)
+                per_row = rhs.size // rows.shape[0]
+            else:
+                rows = mx.broadcast_to(x, (*batch, m, k)).reshape(-1, k)
+                rhs = mx.repeat(mx.broadcast_to(indices, batch).reshape(-1), m)
+                per_row = 1
+            rhs = rhs.astype(mx.uint32)
+            y = _proven(
+                plan,
+                # MLX binds fewer than 8 indices as constants: other Metal.
+                (x.dtype, per_row, rhs.size < 8),
+                (x, indices),
+                lambda: _rows(plan, rows, n, rhs, per_row),
+            )
+        if y is None:
+            y = x @ self._decoded(indices).astype(x.dtype).swapaxes(-1, -2)
+        else:
+            y = y.reshape(*batch, m, n)
+        if "bias" in self:
+            y = y + mx.expand_dims(self["bias"][indices], -2)
+        return y

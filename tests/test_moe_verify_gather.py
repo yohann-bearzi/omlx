@@ -27,11 +27,6 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 EXPERTS, TOP_K, HIDDEN, INTER = 8, 6, 512, 64
 
 
-@pytest.fixture(autouse=True)
-def _no_proofs(monkeypatch):
-    monkeypatch.setattr(kernels, "_PROOFS", {})
-
-
 def _experts(k, n, bits=4, bias=False, dtype=mx.bfloat16):
     linear = SwitchLinear(k, n, EXPERTS, bias=bias)
     linear.set_dtype(dtype)

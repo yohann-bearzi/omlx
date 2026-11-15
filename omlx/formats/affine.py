@@ -313,5 +313,15 @@ class AffineFormat(QuantFormat):
         fast = qmv_fast_layout(k, n, layer.bits, gathered=layer["weight"].ndim == 3)
         return face(layer.bits, layer.group_size, fast, layer["scales"].dtype)
 
+    def decode(self, tensors, bits: int, group_size: int) -> mx.array:
+        return mx.dequantize(
+            tensors["weight"],
+            tensors["scales"],
+            tensors["biases"],
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+        )
+
 
 FORMAT = AffineFormat()
