@@ -348,7 +348,7 @@ def test_views_of_x_and_of_the_indices_are_read_as_their_rows():
     quantized, layer = _pair(320, 72)
     switched, switch = _switch_pair(320, 72)
     wide, tall = _x((4, 2, 640)), _x((320, 4), seed=5)
-    # Unproven, then proven: the first is evaluated ahead of the launch.
+    # Unproven, then proven.
     for x in (wide[:, 1, ::2], tall.T, wide[1:3, 0, 320:]):
         alone = [quantized(x[row : row + 1]) for row in range(x.shape[0])]
         assert _same_bits(layer(x), mx.concatenate(alone))
@@ -763,20 +763,38 @@ def test_a_face_that_does_not_compile_leaves_the_layers_to_the_decode(
     assert len(_logged(caplog, linear)) == 2
 
 
-def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(caplog):
+def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(
+    monkeypatch, caplog
+):
     caplog.set_level(logging.WARNING, logger=linear.__name__)
     quantized, layer = _pair(320, 72)
-    x = _x((1, 320))
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        layer(_does_not_compile(x))
     switched, switch = _switch_pair(320, 72)
+    x = _x((1, 320))
     rows, indices = _x((16, 1, 320)), _experts((16,))
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        switch(_does_not_compile(rows), indices)
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        switch(rows, _does_not_compile(indices))
-    # Nor is a tensor of the layer's that cannot be evaluated.
+
+    def refused(*launch):
+        raise RuntimeError("no launch")
+
+    # What fails as a launch is built, and a tensor of the layer's that
+    # cannot be evaluated, are raised by the call that would prove the launch.
+    # Only MLX's refusal of a trace's arrays is not: a ValueError that opens
+    # with its words (another error of MLX's eval opens with them too).
+    unreadable = (
+        ValueError("no such tensor"),
+        ValueError("in [eval] Attempting to eval an array during function"),
+        RuntimeError("[eval] Attempting to eval an array without a primitive."),
+    )
     for held, call in ((layer, (x,)), (switch, (rows, indices))):
+        with monkeypatch.context() as patch:
+            patch.setattr(linear, "_rows", refused)
+            with pytest.raises(RuntimeError, match="no launch"):
+                held(*call)
+        for error in unreadable:
+            with monkeypatch.context() as patch:
+                patch.setattr(mx, "eval", lambda *arrays, error=error: _raise(error))
+                with pytest.raises(type(error)) as raised:
+                    held(*call)
+            assert raised.value is error
         scales = held["scales"]
         held["scales"] = _does_not_compile(scales)
         with pytest.raises(RuntimeError, match="Unable to build metal library"):
@@ -784,17 +802,43 @@ def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(caplog)
         held["scales"] = scales
     assert len(kernels._PROOFS) == 2
     for proof in kernels._PROOFS.values():
-        assert not proof.failed and not proof.ran
+        assert not proof.failed and not proof.ran and not proof.graphs
+    assert not _logged(caplog, linear)
+    # x and the indices are their caller's to evaluate: the call that proves
+    # a launch does not read them, and what fails in them is raised where
+    # the result is evaluated. One row for every pair is a launch of its own.
+    failing = (
+        layer(_does_not_compile(x)),
+        switch(_does_not_compile(rows), indices),
+        switch(rows[:1], _does_not_compile(indices)),
+    )
+    for y in failing:
+        with pytest.raises(RuntimeError, match="Unable to build metal library"):
+            mx.eval(y)
+    proven = [proof.ran for proof in kernels._PROOFS.values()]
+    assert proven == [
+        {mx.bfloat16},
+        {(mx.bfloat16, 1, False), (mx.bfloat16, 16, False)},
+    ]
+    assert not any(proof.failed for proof in kernels._PROOFS.values())
     assert not _logged(caplog, linear)
     assert _same_bits(layer(x), quantized(x))
     assert _same_bits(switch(rows, indices), switched(rows, indices))
+    # A proven launch that cannot be built for other rows is not kept.
+    proof, _ = kernels._PROOFS.values()
+    with monkeypatch.context() as patch:
+        patch.setattr(linear, "_rows", refused)
+        with pytest.raises(RuntimeError, match="no launch"):
+            layer(_x((2, 320)))
+    assert set(proof.graphs) == {((1, 320), mx.bfloat16)} and not proof.failed
 
 
-def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
-    quantized, layer = _pair(320, 72)
-    switched, switch = _switch_pair(320, 72)
-    x, more = _x((3, 320)), _x((5, 320))
-    rows, indices = _x((16, 1, 320)), _experts((16,))
+def _raise(error):
+    raise error
+
+
+def _evaluations(monkeypatch):
+    """What ``mx.eval`` is given, call by call."""
     evaluate, evaluated = mx.eval, []
 
     def recorded(*arrays):
@@ -802,26 +846,44 @@ def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
         evaluate(*arrays)
 
     monkeypatch.setattr(mx, "eval", recorded)
-    layer(x)
-    # The inputs and the layer's tensors first, outside the launch's guard,
-    # then the rows.
-    assert [len(arrays) for arrays in evaluated] == [4, 1]
-    assert evaluated[0][0] is x and evaluated[1][0].shape == (3, 72)
-    assert all(a is layer[name] for a, name in zip(evaluated[0][1:], _NAMES))
+    return evaluated
+
+
+def _zeros(a):
+    return mx.array_equal(a, mx.zeros(a.shape, a.dtype)).item()
+
+
+def test_an_unproven_launch_is_evaluated_on_zeros_and_a_proven_one_not_at_all(
+    monkeypatch,
+):
+    quantized, layer = _pair(320, 72)
+    switched, switch = _switch_pair(320, 72)
+    x, more = _x((3, 320)), _x((5, 320))
+    rows, indices = _x((16, 1, 320)), _experts((16,))
+    evaluated = _evaluations(monkeypatch)
+    y = layer(x)
+    # The layer's tensors first, outside the launch's guard, then the rows of
+    # zeros in x's place: neither x nor the call's result.
+    assert [len(arrays) for arrays in evaluated] == [3, 1]
+    assert all(a is layer[name] for a, name in zip(evaluated[0], _NAMES))
+    (proving,) = evaluated[1]
+    assert proving is not y and proving.shape == (3, 72)
+    assert proving.dtype == mx.bfloat16 and _zeros(proving) and not _zeros(y)
     del evaluated[:]
     layer(x), layer(more)
     assert not evaluated
-    switch(rows, indices)
-    assert [len(arrays) for arrays in evaluated] == [5, 1]
-    assert evaluated[0][0] is rows and evaluated[0][1] is indices
-    assert all(a is switch[name] for a, name in zip(evaluated[0][2:], _NAMES))
-    assert evaluated[1][0].shape == (16, 1, 72)
+    y = switch(rows, indices)
+    assert [len(arrays) for arrays in evaluated] == [3, 1]
+    assert all(a is switch[name] for a, name in zip(evaluated[0], _NAMES))
+    (proving,) = evaluated[1]
+    assert proving is not y and proving.shape == (16, 1, 72)
+    assert proving.dtype == mx.bfloat16 and _zeros(proving) and not _zeros(y)
     del evaluated[:]
     switch(rows, indices), switch(rows[4:12] + 0, indices[4:12] + 0)
     assert not evaluated
     # Another launch: one row for every pair.
     switch(rows[:1], indices)
-    assert [len(arrays) for arrays in evaluated] == [5, 1]
+    assert [len(arrays) for arrays in evaluated] == [3, 1]
 
 
 def _built(monkeypatch):
@@ -956,6 +1018,132 @@ def test_a_proven_launch_is_built_into_a_function_that_mlx_compiles():
             assert _same_bits(pairs, switched(rows, indices) * 2)
     for proof in kernels._PROOFS.values():
         assert len(proof.graphs) == 2 and not proof.failed
+
+
+def test_an_unproven_launch_is_proven_in_a_function_that_mlx_compiles(
+    monkeypatch, caplog
+):
+    """A layer's first call may be the one MLX's compile makes, over an x
+    that cannot be evaluated: the launch is proven on zeros of x's shape and
+    type, over the layer's tensors."""
+    caplog.set_level(logging.INFO, logger=linear.__name__)
+    quantized, layer = _pair(320, 72, bias=True)
+    x, later = _x((1, 320)), _x((1, 320), seed=4)
+    built = _built(monkeypatch)
+    compiled = mx.compile(lambda x: layer(x) * 2)
+    # No row is no launch: nothing to prove, and no zeros in its place.
+    assert compiled(x[:0]).shape == (0, 72)
+    (proof,) = kernels._PROOFS.values()
+    assert not proof.ran and not proof.graphs and not built
+    assert _same_bits(compiled(x), quantized(x) * 2)
+    assert proof.ran == {mx.bfloat16} and not proof.failed
+    assert set(proof.graphs) == {((1, 320), mx.bfloat16)}
+    # Built for the zeros, then for the function's x.
+    assert built == [(1, 320)] * 2
+    face = formats.dot(layer, 320, 72)
+    assert [r.getMessage() for r in _logged(caplog, linear)] == [
+        f"quant format face {face.key}: rows kernel engaged"
+    ]
+    # Outside the function the kept graph is replayed: nothing is built,
+    # evaluated or proven again.
+    evaluated = _evaluations(monkeypatch)
+    assert _same_bits(layer(later), quantized(later))
+    assert _same_bits(compiled(later), quantized(later) * 2)
+    assert built == [(1, 320)] * 2 and not evaluated
+    assert len(_logged(caplog, linear)) == 1 and len(proof.graphs) == 1
+
+
+def test_an_unproven_stack_s_launch_is_proven_in_a_function_that_mlx_compiles(
+    monkeypatch, caplog
+):
+    """The indices of a stack's first call cannot be evaluated either: the
+    zeros in their place name the stack's first matrix."""
+    caplog.set_level(logging.INFO, logger=linear.__name__)
+    switched, switch = _switch_pair(320, 72, bias=True)
+    rows, indices = _x((4, 1, 1, 320)), _experts((4, 3))
+    later, others = _x((4, 1, 1, 320), seed=4), _experts((4, 3), seed=4)
+    built = _built(monkeypatch)
+    compiled = mx.compile(lambda x, indices: switch(x, indices) * 2)
+    # No pair is no launch.
+    assert compiled(rows[:0], indices[:0]).shape == (0, 3, 1, 72)
+    (proof,) = kernels._PROOFS.values()
+    assert not proof.ran and not proof.graphs and not built
+    assert _same_bits(compiled(rows, indices), switched(rows, indices) * 2)
+    assert proof.ran == {(mx.bfloat16, 3, False)} and not proof.failed
+    assert set(proof.graphs) == {((4, 1, 1, 320), mx.bfloat16, (4, 3))}
+    assert built == [(4, 1, 1, 320)] * 2
+    assert len(_logged(caplog, linear)) == 1
+    evaluated = _evaluations(monkeypatch)
+    assert _same_bits(switch(later, others), switched(later, others))
+    assert _same_bits(compiled(later, others), switched(later, others) * 2)
+    assert built == [(4, 1, 1, 320)] * 2 and not evaluated
+    assert len(_logged(caplog, linear)) == 1 and len(proof.graphs) == 1
+
+
+def test_a_face_that_does_not_compile_in_a_function_that_mlx_compiles_is_the_decode(
+    toy, monkeypatch, caplog
+):
+    """The zeros fail as the launch would: the function is built over the
+    decode."""
+    caplog.set_level(logging.WARNING, logger=linear.__name__)
+    toy(_toy("broken", _TOY + 'static_assert(false, "does not compile");\n'))
+    layer, x, want = _toy_linear(40, 320)
+    switch = _toy_switch(40, 320)
+    rows, indices = _ints((16, 1, 320)), _experts((16,))
+    decode, decoded = _ToyFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        decoded.append(tensors["weight"].shape)
+        return decode(self, tensors, bits, group_size)
+
+    monkeypatch.setattr(_ToyFormat, "decode", recorded)
+    built = _built(monkeypatch)
+
+    def block(x, rows, indices):
+        return layer(x), switch(rows, indices)
+
+    y, pairs = mx.compile(block)(x, rows, indices)
+    assert _equal(y, want)
+    assert np.array_equal(np.array(pairs), _want(switch, rows, indices))
+    # Each was built once, for its zeros, and not for the function's arrays.
+    assert x.shape == (320,) and built == [(320,), (16, 1, 320)]
+    assert decoded == [(40, 320), (EXPERTS, 40, 320)]
+    message = "quant format face toy_broken: rows kernel failed; decode fallback"
+    warnings = _logged(caplog, linear, logging.WARNING)
+    assert [warning.getMessage() for warning in warnings] == [message] * 2
+    assert all("does not compile" in str(w.exc_info[1]) for w in warnings)
+    assert len(kernels._PROOFS) == 2
+    for proof in kernels._PROOFS.values():
+        assert proof.failed and not proof.ran and not proof.graphs
+
+
+def test_a_launch_over_tensors_that_cannot_be_evaluated_is_built_unproven(
+    monkeypatch, caplog
+):
+    """``mx.compile(fn, inputs=state)`` hands a layer its own tensors as
+    arrays that cannot be evaluated: there is nothing to prove a launch
+    over. It is built as it is, and the proof neither marks nor keeps it."""
+    caplog.set_level(logging.INFO, logger=linear.__name__)
+    quantized, layer = _pair(320, 72, bias=True)
+    switched, switch = _switch_pair(320, 72)
+    x, rows, indices = _x((1, 320)), _x((4, 1, 1, 320)), _experts((4, 3))
+    built = _built(monkeypatch)
+    compiled = mx.compile(lambda x: layer(x) * 2, inputs=layer.state)
+    assert _same_bits(compiled(x), quantized(x) * 2)
+    stacked = mx.compile(lambda x, i: switch(x, i) * 2, inputs=switch.state)
+    assert _same_bits(stacked(rows, indices), switched(rows, indices) * 2)
+    # The launches, not the decode.
+    assert built == [(1, 320), (4, 1, 1, 320)]
+    assert len(kernels._PROOFS) == 2
+    for proof in kernels._PROOFS.values():
+        assert not proof.ran and not proof.graphs and not proof.failed
+    assert not _logged(caplog, linear)
+    # The first call outside such a function proves the launch.
+    assert _same_bits(layer(x), quantized(x))
+    assert _same_bits(switch(rows, indices), switched(rows, indices))
+    for proof in kernels._PROOFS.values():
+        assert len(proof.ran) == 1 and len(proof.graphs) == 1
+    assert len(_logged(caplog, linear)) == 2
 
 
 def test_a_layer_holds_a_registered_format_s_tensors(toy):

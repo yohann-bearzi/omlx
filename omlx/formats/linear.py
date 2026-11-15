@@ -37,6 +37,10 @@ logger = logging.getLogger(__name__)
 # bits of its one-row call, whatever rows it is launched with.
 MAX_ROWS = 16
 
+# What opens the ValueError of MLX's eval for an array of a function that it
+# is tracing (compile, vmap).
+_TRACED = "[eval] Attempting to eval"
+
 # One threadgroup per pair (a row of x and the matrix it meets) and tile of 8
 # of the pair's outputs: 4 for each of the threadgroup's two simdgroups.
 # __MATRIX__ is the pair's matrix in the stack, __X_ROW__ its row of x.
@@ -193,9 +197,17 @@ def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
     ``signature``, which is what it depends on (the arrays' shapes and x's
     type): a layer's call asks for the kept graph first, and replays it.
 
-    The launch is evaluated here the first time its Metal is built, once
-    ``arrays`` and the layer's tensors are: what fails ahead of it is raised
-    as it is."""
+    The first time its Metal is built, the launch is proven here on zeros
+    in the place of ``arrays``: their shapes and types are all the Metal
+    depends on, and index 0 is a matrix of any stack. ``arrays`` may belong
+    to a trace (a model calls its layers in functions that MLX compiles),
+    where they cannot be evaluated; neither they nor the call's result ever
+    are, here. The layer's tensors are evaluated ahead of the proof: what
+    fails there is raised as it is. Tensors that belong to a trace
+    themselves (the function's ``inputs``) leave nothing to prove the launch
+    over: it is built unproven, and is not kept. MLX's refusal to evaluate
+    them stays in here: an error that leaves such a function leaves the
+    trace's arrays in its state."""
     if plan is None:
         return None
     proof = plan.proof
@@ -206,13 +218,19 @@ def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
         return None
     metal, graph = launch
     graph = mx.compile(graph)
-    y = graph(*arrays, *plan.operands)
     if metal not in proof.ran:
-        mx.eval(*arrays, *plan.operands)
+        try:
+            mx.eval(*plan.operands)
+        except ValueError as error:
+            if not str(error).startswith(_TRACED):
+                raise
+            return graph(*arrays, *plan.operands)
+        zeros = (mx.zeros(a.shape, a.dtype) for a in arrays)
+        proving = graph(*zeros, *plan.operands)
         try:
             # Surface a kernel build failure while the call can still fall
             # back.
-            mx.eval(y)
+            mx.eval(proving)
         except Exception:
             proof.fail()
             logger.warning(
@@ -223,6 +241,7 @@ def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
             return None
         proof.ran.add(metal)
         logger.info("quant format face %s: rows kernel engaged", plan.face.key)
+    y = graph(*arrays, *plan.operands)
     proof.keep(signature, graph)
     return y
 
