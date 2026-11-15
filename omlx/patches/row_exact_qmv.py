@@ -7,7 +7,7 @@ speculative verify row and the serial decode step for the same token get
 different bits from the same projection. Here every row runs MLX 0.32.4's
 one-row ``qmv_fast`` (K of the kernel block: 512 for
 4/5-bit, 256 for 6/8-bit weights) or ``qmv`` traversal, transcribed in
-``moe_verify_gather``, so row ``r`` of the output equals
+``omlx.formats.affine``, so row ``r`` of the output equals
 ``quantized_matmul(x[r:r+1])`` bit for bit.
 
 A threadgroup computes one ``2 * RPS``-column output tile for ``ROWS`` rows:
@@ -29,7 +29,7 @@ from functools import cache
 import mlx.core as mx
 import mlx.nn as nn
 
-from .moe_verify_gather import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
+from ..formats.affine import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 

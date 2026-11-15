@@ -38,7 +38,7 @@ as their own launch (``qwen35_moe_router.softmax_topk_row``).
 The result is bit-identical to the composed path. The quantized dot products
 are the weight format's dot face (``omlx.formats``), one instantiation per
 weight format. The affine format's is the MLX 0.32.4 transcription in
-``moe_verify_gather`` (4, 5, 6 and 8 bits; group size 32, 64 or 128). MLX
+``omlx.formats.affine`` (4, 5, 6 and 8 bits; group size 32, 64 or 128). MLX
 picks ``qmv_fast`` when K is a multiple of its kernel block
 (512 for 4/5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
