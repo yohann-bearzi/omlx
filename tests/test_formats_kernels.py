@@ -7,6 +7,9 @@ compile with a message that names the format's own source.
 from __future__ import annotations
 
 import re
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import cache
 from itertools import takewhile
@@ -105,7 +108,7 @@ def _line(source, text) -> int:
 def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key():
     face = _toy("proof")
     proof = kernels.proof("kernel", face, mx.float32, 512)
-    assert proof == kernels.Proof(ran=set(), failed=False, graphs={})
+    assert proof == kernels.Proof(ran=set(), failed=False) and proof.graphs == {}
     assert kernels.proof("kernel", _toy("proof"), mx.float32, 512) is proof
     others = (
         kernels.proof("other", face, mx.float32, 512),
@@ -133,6 +136,95 @@ def test_a_proof_keeps_graphs_until_it_has_too_many_or_a_launch_fails(monkeypatc
     assert not proof.failed
     proof.fail()
     assert proof.failed and proof.graphs == {} and proof.ran == {"launch"}
+    # Nothing is kept on a proof that failed.
+    proof.keep("f", "F")
+    assert proof.graphs == {}
+
+
+class _Graph:
+    """What a proof keeps, in the place of a function that MLX compiled."""
+
+
+def test_a_proof_s_graphs_are_those_of_the_thread_that_asks(monkeypatch):
+    """MLX keeps what it traces a compiled function into thread by thread:
+    a thread keeps, and finds, the graphs it built, and no other thread's."""
+    monkeypatch.setattr(kernels, "MAX_GRAPHS", 2)
+    proofs, ended = [kernels.Proof()], []
+
+    def keep(name):
+        graph = _Graph()
+        weakref.finalize(graph, lambda: ended.append((name, threading.get_ident())))
+        proofs[0].keep(name, graph)
+        return kept()
+
+    def kept():
+        return sorted(proofs[0].graphs)
+
+    here = threading.get_ident()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        there = pool.submit(threading.get_ident).result()
+        assert keep("a") == ["a"]
+        assert pool.submit(kept).result() == []
+        assert pool.submit(keep, "b").result() == ["b"] and kept() == ["a"]
+        # A thread keeps MAX_GRAPHS of a proof: one more drops its own.
+        assert pool.submit(keep, "c").result() == ["b", "c"]
+        assert pool.submit(keep, "d").result() == ["d"] and kept() == ["a"]
+        assert ended == [("b", there), ("c", there)]
+        # A failure drops every thread's, on the thread that reports it.
+        pool.submit(proofs[0].fail).result()
+        assert proofs[0].failed and kept() == [] and pool.submit(kept).result() == []
+        assert sorted(ended[2:]) == [("a", there), ("d", there)]
+        # Nothing is kept from then on, by either thread.
+        assert pool.submit(keep, "e").result() == [] and keep("f") == []
+    proofs[0], ended[:] = kernels.Proof(), []
+    pool = ThreadPoolExecutor(max_workers=1)
+    there = pool.submit(threading.get_ident).result()
+    assert pool.submit(keep, "g").result() == ["g"] and keep("h") == ["h"]
+    # A thread's graphs end with it, on it; the proof and the others' live on.
+    pool.shutdown()
+    assert ended == [("g", there)] and kept() == ["h"]
+    # A thread that follows it, of the same ident or another, has none.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(kept).result() == []
+        assert pool.submit(keep, "i").result() == ["i"]
+        # The proof's end is the end of every thread's, where it ends.
+        del proofs[:]
+        assert sorted(ended[1:]) == [("h", here), ("i", here)]
+    assert "`proof.graphs` is the calling thread's own" in " ".join(_PAGE.split())
+
+
+def test_no_graph_is_kept_while_a_failure_is_recorded(monkeypatch):
+    """A launch can fail on one thread while another builds one: keeping a
+    graph (the look at the failure, then the graph) and recording a failure
+    (the failure, then the graphs' end) each wait for the other."""
+    proof, lock = kernels.Proof(), kernels._KEEPING
+    keeping = threading.Thread(target=proof.keep, args=("a", _Graph()))
+    failing = threading.Thread(target=proof.fail)
+    with lock:
+        for thread in (keeping, failing):
+            thread.start()
+            thread.join(0.1)
+            assert thread.is_alive()
+        assert not proof.failed
+    keeping.join()
+    failing.join()
+    assert proof.failed and proof.graphs == {}
+
+    # A graph that waits to be kept while a failure is recorded is not kept:
+    # the look at the failure waits too.
+    class FailedMeanwhile:
+        def __enter__(self):
+            monkeypatch.setattr(kernels, "_KEEPING", lock)
+            proof.fail()
+            lock.acquire()
+
+        def __exit__(self, *error):
+            lock.release()
+
+    proof = kernels.Proof()
+    monkeypatch.setattr(kernels, "_KEEPING", FailedMeanwhile())
+    proof.keep("b", _Graph())
+    assert proof.failed and proof.graphs == {}
 
 
 def test_a_matrix_is_its_weight_then_its_tensors():

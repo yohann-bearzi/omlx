@@ -195,7 +195,8 @@ def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
 
     The launch's graph (``describe``) is compiled by MLX and kept under
     ``signature``, which is what it depends on (the arrays' shapes and x's
-    type): a layer's call asks for the kept graph first, and replays it.
+    type), by the thread that builds it: a layer's call asks for the graph
+    its thread kept first, and replays it.
 
     The first time its Metal is built, the launch is proven here on zeros
     in the place of ``arrays``: their shapes and types are all the Metal

@@ -16,6 +16,7 @@ faster.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 
 from .. import formats
@@ -161,6 +162,20 @@ METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T
 """
 
 
+class _Kept(threading.local):
+    """The graphs that a thread keeps of one proof, each under its launch's
+    signature. Every thread that asks has a dict of its own, which ends with
+    the thread, or with the proof."""
+
+    def __init__(self) -> None:
+        self.graphs: dict = {}
+
+
+# Held to keep a graph and to record a failure: a proof that fails while a
+# launch is built keeps no graph of it.
+_KEEPING = threading.Lock()
+
+
 @dataclass
 class Proof:
     """What is known of the launches that one kernel compiles from the same
@@ -175,28 +190,53 @@ class Proof:
     A launch's graph is a function of its arrays' shapes and types alone, so
     a kernel builds it once for each, through MLX's compile, and keeps it
     here (``keep``): a call then replays the graph, where building it anew
-    has MLX write the kernel's source out again, launch after launch."""
+    has MLX write the kernel's source out again, launch after launch.
+
+    Several threads run launches (each model's engine has its own). What
+    the launches proved is the process's: MLX builds a kernel's Metal once
+    for the device, so ``ran`` and ``failed`` hold for every thread. The
+    graphs are kept thread by thread (``graphs`` is the calling thread's):
+    MLX keeps what it traces a compiled function into in the thread that
+    calls it, under the function's address, and the function's end removes
+    it from one thread alone, the last that called it. Another thread that
+    had called it would be left with a launch that the next function at the
+    address replays there. A thread calls the graphs it built, and no
+    other."""
 
     ran: set = field(default_factory=set)  # the launches that compiled
     failed: bool = False
-    graphs: dict = field(default_factory=dict)  # a launch's signature: its graph
+    _kept: _Kept = field(default_factory=_Kept, init=False, repr=False, compare=False)
+
+    @property
+    def graphs(self) -> dict:
+        """The calling thread's graphs, each under its launch's signature."""
+        return self._kept.graphs
 
     def keep(self, signature, graph) -> None:
-        """Keep ``graph``, a function that ``mx.compile`` gave, for the
-        launches of ``signature``: what the graph depends on, beside what
-        MLX's compile tells apart itself (its arrays' shapes and types)."""
-        if len(self.graphs) >= MAX_GRAPHS:
-            self.graphs.clear()
-        self.graphs[signature] = graph
+        """Keep ``graph``, a function that ``mx.compile`` gave and that the
+        calling thread built, for the thread's launches of ``signature``:
+        what the graph depends on, beside what MLX's compile tells apart
+        itself (its arrays' shapes and types). A proof that failed, on any
+        thread, keeps nothing."""
+        with _KEEPING:
+            if self.failed:
+                return
+            graphs = self._kept.graphs
+            if len(graphs) >= MAX_GRAPHS:
+                graphs.clear()
+            graphs[signature] = graph
 
     def fail(self) -> None:
-        """A launch failed: nothing that shares the proof is launched again."""
-        self.failed = True
-        self.graphs.clear()
+        """A launch failed: nothing that shares the proof is launched again,
+        on any thread. Every thread's graphs end here."""
+        with _KEEPING:
+            self.failed = True
+            self._kept = _Kept()
 
 
-# The graphs of one proof: a decode step's, those of the short blocks around
-# it, a few prompts' chunks. One more drops them all, to be built as called.
+# The graphs a thread keeps of one proof: a decode step's, those of the short
+# blocks around it, a few prompts' chunks. One more drops them all, to be
+# built as called.
 MAX_GRAPHS = 64
 
 

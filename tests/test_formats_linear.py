@@ -11,6 +11,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1144,6 +1147,317 @@ def test_a_launch_over_tensors_that_cannot_be_evaluated_is_built_unproven(
     for proof in kernels._PROOFS.values():
         assert len(proof.ran) == 1 and len(proof.graphs) == 1
     assert len(_logged(caplog, linear)) == 2
+
+
+class _Thread:
+    """A thread that runs MLX as oMLX's do: the one worker of an executor (a
+    model's engine, or the loads')."""
+
+    def __init__(self, name):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
+        # MLX gives a thread its default stream when the thread first uses
+        # one, and traces a compiled function once more for it.
+        self(lambda: mx.zeros((1,)).item())
+        self.ident = self(threading.get_ident)
+
+    def __call__(self, fn, *args):
+        return self.pool.submit(fn, *args).result()
+
+    def end(self):
+        self.pool.shutdown()
+
+
+@pytest.fixture
+def threads():
+    """Starts threads by name, and ends them with the test."""
+    started = []
+
+    def start(name):
+        started.append(_Thread(name))
+        return started[-1]
+
+    yield start
+    for thread in started:
+        thread.end()
+
+
+def _called(layer, *arrays):
+    """A layer's result, evaluated by the thread that calls the layer."""
+    y = layer(*arrays)
+    mx.eval(y)
+    return y
+
+
+def _here(fn, *args):
+    return fn(*args)
+
+
+def test_a_launch_s_graph_is_called_by_the_thread_that_built_it(threads, monkeypatch):
+    """MLX keeps what it traces a compiled function into thread by thread,
+    and the function's end forgets it for one thread alone: the last that
+    called it. A graph that two threads called would leave the other one its
+    launch, which the next function at the graph's address replays there.
+    So a thread keeps the graphs it builds, and calls no other's."""
+    quantized, layer = _pair(320, 72, bias=True)
+    switched, switch = _switch_pair(320, 72)
+    x, rows, indices = _x((1, 320)), _x((4, 1, 1, 320)), _experts((4, 3))
+    want, pairs = quantized(x), switched(rows, indices)
+    mx.eval(want, pairs)
+    compile_, callers = mx.compile, []
+
+    def compiled(fn):
+        graph, seen = compile_(fn), set()
+        callers.append(seen)
+
+        def called(*arrays):
+            seen.add(threading.get_ident())
+            return graph(*arrays)
+
+        return called
+
+    monkeypatch.setattr(mx, "compile", compiled)
+    engine, other = threads("mlx-engine-a"), threads("mlx-engine-b")
+    for run in (engine, _here, other, engine, _here, other):
+        assert _same_bits(run(_called, layer, x), want)
+        assert _same_bits(run(_called, switch, rows, indices), pairs)
+    # A graph for each layer and thread, which that thread alone calls.
+    assert len(callers) == 6 and all(len(seen) == 1 for seen in callers)
+    idents = {engine.ident, other.ident, threading.get_ident()}
+    assert len(idents) == 3 and set.union(*callers) == idents
+    # What the launches proved is the process's: once.
+    assert [proof.ran for proof in kernels._PROOFS.values()] == [
+        {mx.bfloat16},
+        {(mx.bfloat16, 3, False)},
+    ]
+
+
+class _TwiceFormat(_ToyFormat):
+    """Another format of the toy's tensors: twice its weights."""
+
+    mode = "twice"
+
+    def decode(self, tensors, bits, group_size):
+        return 2 * super().decode(tensors, bits, group_size)
+
+
+def _half_typed():
+    """The toy face with a load that compiles for float32 activations alone:
+    halves are another instance of its Metal, which does not compile."""
+    floats = 'static_assert(sizeof(X) == 4, "floats alone");\n      return 0;'
+    source = _TOY.replace("      return 0;", "      " + floats)
+    assert source.count("floats alone") == 1
+    return _toy("floats", source)
+
+
+@pytest.mark.parametrize(
+    "end", ["its thread's overflow", "a failure", "its proof's end", "a caller's end"]
+)
+def test_a_graph_s_end_leaves_no_thread_the_launch_of_its_face(
+    toy, threads, monkeypatch, end
+):
+    """Two formats of one tensor layout, a layer of each, of the same shapes:
+    their launches have other Metal and the same arrays. A graph of the first
+    that two threads called would end, one way or another, with its launch
+    left in a thread, where a graph of the second, at the address of the
+    first, would replay it: the first format's product, of the second's
+    tensors."""
+    toy(_half_typed())
+    finish = "return sum * s[r];"
+    assert _TOY.count(finish) == 1
+    twice = _toy("twice", _TOY.replace(finish, "return 2 * sum * s[r];"))
+    monkeypatch.setitem(formats._FORMATS, "twice", _TwiceFormat(twice))
+    first, x, want = _toy_linear(40, 320)
+    (codes, scales), _, _ = _matrix(40, 320, seed=1)
+    second = FormatLinear("twice", 8, 1, 320, {"weight": codes, "scales": scales})
+    more, half = _ints((3, 320)), x.astype(mx.float16)
+    mx.eval(first.parameters(), second.parameters(), x, more, half)
+    doubled = 2 * _want(second, x)
+    # The second layer's plan, without a launch: nothing is made between the
+    # first graph's end and the second's launch.
+    several = _ints((MAX_ROWS + 1, 320))
+    assert np.array_equal(np.array(second(several)), 2 * _want(second, several))
+    described, addresses, sought = linear._linear, [], []
+
+    def at_the_first_address(*launch):
+        """A launch and, once ``sought``, one whose graph is at the address
+        of the first graph built, if one of 64 functions lands there."""
+        held = []
+        for _ in range(64 if sought else 1):
+            metal, graph = described(*launch)
+            if not sought or id(graph) == addresses[0]:
+                break
+            held.append(graph)
+        addresses.append(id(graph))
+        return metal, graph
+
+    monkeypatch.setattr(linear, "_linear", at_the_first_address)
+    engine = threads("mlx-engine-a")
+    for run in (engine, _here):
+        assert _equal(run(_called, first, x), want)
+    (key,) = (key for key in kernels._PROOFS if key[1].key == "toy_floats")
+    ended = weakref.ref(kernels._PROOFS[key])
+    if end == "a caller's end":
+        other = threads("mlx-engine-b")
+        assert _equal(other(_called, first, x), want)
+        other.end()
+    if end in ("its thread's overflow", "a caller's end"):
+        monkeypatch.setattr(kernels, "MAX_GRAPHS", 1)
+    held = [first]
+    del first
+
+    def ends_then_the_second_is_launched():
+        if end == "a failure":
+            _called(held[0], half)
+        elif end == "its proof's end":
+            del kernels._PROOFS[key]
+            held.pop()
+        else:
+            # One more graph than the thread keeps.
+            _called(held[0], more)
+        sought.append(True)
+        return _called(second, x)
+
+    got = engine(ends_then_the_second_is_launched)
+    assert np.array_equal(np.array(got), doubled)
+    assert (ended() is None) == (end == "its proof's end")
+    if end == "a failure":
+        assert ended().failed
+    proof = kernels._PROOFS[("format_linear", twice, (mx.uint8, mx.float32), 320, 40)]
+    assert proof.ran == {mx.float32} and not proof.failed
+
+
+def test_tensors_that_one_thread_evaluates_are_launched_by_others(
+    threads, monkeypatch, caplog
+):
+    """A model's tensors are evaluated by the thread that loads it, and its
+    layers are called by its engine's thread, in the engine's stream. What a
+    launch proves is the process's: a second thread builds its own launch
+    of the proven Metal, keeps it, and proves nothing again."""
+    caplog.set_level(logging.INFO, logger=linear.__name__)
+    load = threads("mlx-global")
+
+    def loaded():
+        quantized, layer = _pair(320, 72, bias=True)
+        switched, switch = _switch_pair(320, 72)
+        mx.eval(quantized.parameters(), switched.parameters())
+        mx.eval(layer.parameters(), switch.parameters())
+        return quantized, layer, switched, switch
+
+    quantized, layer, switched, switch = load(loaded)
+    steps = [
+        (_x((1, 320), seed=s), _x((4, 1, 1, 320), seed=s), _experts((4, 3), seed=s))
+        for s in range(6)
+    ]
+    built = _built(monkeypatch)
+
+    def kept():
+        """The graphs that the calling thread keeps, proof by proof."""
+        return [len(proof.graphs) for proof in kernels._PROOFS.values()]
+
+    def step(stream, x, rows, indices):
+        """A step in an engine's stream: whether the layers have the bits
+        of MLX's, and the graphs the thread then keeps."""
+        with mx.stream(stream):
+            same = _same_bits(layer(x), quantized(x))
+            same = same and _same_bits(switch(rows, indices), switched(rows, indices))
+        return same, kept()
+
+    def engine(name):
+        return threads(name), mx.new_thread_local_stream(mx.default_device())
+
+    first, stream = engine("mlx-engine-a")
+    assert first(step, stream, *steps[0]) == (True, [1, 1])
+    ran = [{mx.bfloat16}, {(mx.bfloat16, 3, False)}]
+    assert [proof.ran for proof in kernels._PROOFS.values()] == ran
+    assert built == [(1, 320), (4, 1, 1, 320)] and len(_logged(caplog, linear)) == 2
+    assert first(step, stream, *steps[1]) == (True, [1, 1]) and len(built) == 2
+    # The graphs are the engine's thread's: neither the thread of the loads
+    # nor this one has launched.
+    assert kept() == [0, 0] and load(kept) == [0, 0]
+    # Another engine's thread builds its launches, keeps them and replays
+    # them. Nothing is proven again: no array is evaluated, nothing logged.
+    second, other = engine("mlx-engine-b")
+    evaluated = _evaluations(monkeypatch)
+    assert second(kept) == [0, 0]
+    assert second(step, other, *steps[2]) == (True, [1, 1])
+    assert built == [(1, 320), (4, 1, 1, 320)] * 2
+    assert second(step, other, *steps[3]) == (True, [1, 1]) and len(built) == 4
+    # A thread's graphs end with it. The model's next engine, a thread of
+    # the ident of the one that ended or of another, builds its own.
+    first.end()
+    third, stream = engine("mlx-engine-a")
+    assert third(kept) == [0, 0]
+    assert third(step, stream, *steps[4]) == (True, [1, 1]) and len(built) == 6
+    assert third(step, stream, *steps[5]) == (True, [1, 1]) and len(built) == 6
+    assert not evaluated and len(_logged(caplog, linear)) == 2
+    assert [proof.ran for proof in kernels._PROOFS.values()] == ran
+    assert not any(proof.failed for proof in kernels._PROOFS.values())
+
+
+def test_a_launch_that_fails_on_one_thread_stops_every_thread_s(
+    toy, threads, monkeypatch, caplog
+):
+    """A proof's launches stop together, whichever thread kept their graphs."""
+    caplog.set_level(logging.WARNING, logger=linear.__name__)
+    toy(_half_typed())
+    layer, x, want = _toy_linear(40, 320)
+    half = x.astype(mx.float16)
+    decoded = half @ layer._decoded().astype(mx.float16).T
+    mx.eval(layer.parameters(), x, half, decoded)
+    engine = threads("mlx-engine-a")
+    assert _equal(engine(_called, layer, x), want) and _equal(layer(x), want)
+    (proof,) = kernels._PROOFS.values()
+    assert engine(lambda: len(proof.graphs)) == 1 and len(proof.graphs) == 1
+    # Halves, on this thread: the launch fails.
+    assert _equal(layer(half), decoded)
+    assert proof.failed and len(_logged(caplog, linear, logging.WARNING)) == 1
+    # The engine's thread keeps no graph, and builds none: its calls decode.
+    decode, decodes = _ToyFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        decodes.append(threading.get_ident())
+        return decode(self, tensors, bits, group_size)
+
+    monkeypatch.setattr(_ToyFormat, "decode", recorded)
+    monkeypatch.setattr(linear, "_rows", lambda *launch: pytest.fail("built"))
+    assert engine(lambda: len(proof.graphs)) == 0 and not proof.graphs
+    assert _equal(engine(_called, layer, x), want)
+    assert _equal(engine(_called, layer, half), decoded)
+    assert decodes == [engine.ident] * 2
+    assert len(_logged(caplog, linear, logging.WARNING)) == 1
+
+
+def test_a_launch_built_while_another_thread_s_fails_is_not_kept(
+    toy, threads, monkeypatch
+):
+    """A launch is built on one thread, of Metal that compiles, while one
+    of the same proof fails on another: the call has its launch, and the
+    proof, which failed, keeps no graph of it."""
+    toy(_half_typed())
+    layer, x, want = _toy_linear(40, 320)
+    half = x.astype(mx.float16)
+    decoded = half @ layer._decoded().astype(mx.float16).T
+    mx.eval(layer.parameters(), x, half, decoded)
+    engine = threads("mlx-engine-a")
+    rows, launched = linear._rows, []
+
+    def meanwhile(*launch):
+        launched.append(launch[3].dtype)
+        if launched == [mx.float32]:
+            # The other thread's launch fails, from its first call to its
+            # decode, before this one is built.
+            assert _equal(engine(_called, layer, half), decoded)
+        return rows(*launch)
+
+    monkeypatch.setattr(linear, "_rows", meanwhile)
+    assert _equal(layer(x), want)
+    assert launched == [mx.float32, mx.float16]
+    (proof,) = kernels._PROOFS.values()
+    assert proof.failed and proof.ran == {mx.float32}
+    assert not proof.graphs and engine(lambda: len(proof.graphs)) == 0
+    # The calls after are the decode's, on either thread.
+    monkeypatch.setattr(linear, "_rows", lambda *launch: pytest.fail("built"))
+    assert _equal(layer(x), want) and _equal(engine(_called, layer, x), want)
 
 
 def test_a_layer_holds_a_registered_format_s_tensors(toy):
