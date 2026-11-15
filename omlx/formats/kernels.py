@@ -51,7 +51,9 @@ using omlx_iota = typename omlx_iota_<N>::type;
 #
 # qmv_rows is what a kernel calls. It states the parts of the contract the
 # compiler would not report on its own, so a face that breaks one fails with
-# that sentence instead of computing garbage.
+# that sentence instead of computing garbage. The face's revision comes
+# first: the rest is compiled only for a face of a revision oMLX runs, so a
+# face of another one fails with that and nothing else.
 _QMV_ROWS = r"""
 // One block of a lane: its VPT inputs against each row's weights.
 template <typename L, typename T, int... RA, int... RB>
@@ -108,6 +110,18 @@ METAL_FUNC void omlx_qmv_rows(
   ((result[NA + RB] = b.finish(RB, metal::simd_sum(result[NA + RB]))), ...);
 }
 
+// The revision FACE that a face states, against the ones oMLX runs. FACE is
+// a template parameter so that a failed assert prints both numbers.
+template <int FACE>
+struct omlx_revision {
+  static_assert(
+      FACE <= OMLX_CONTRACT,
+      "dot face: written for a later revision of the contract than this oMLX runs");
+  static_assert(
+      FACE >= OMLX_OLDEST_CONTRACT,
+      "dot face: written for a revision of the contract this oMLX no longer runs");
+};
+
 template <typename T, int K, int NA, int NB, typename D>
 METAL_FUNC void qmv_rows(
     D ma,
@@ -117,21 +131,20 @@ METAL_FUNC void qmv_rows(
     const device T* x,
     uint simd_lid,
     thread float* result) {
-  using L = typename D::template Lanes<K>;
-  static_assert(
-      L::BLOCK == 32 * L::VPT,
-      "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 lanes");
-  static_assert(
-      K % L::VPT == 0,
-      "dot face: K must be a whole number of a lane's VPT inputs");
-  static_assert(
-      D::CONTRACT <= OMLX_CONTRACT,
-      "dot face: written for a later revision of the contract than this oMLX runs");
-  static_assert(
-      D::CONTRACT >= OMLX_OLDEST_CONTRACT,
-      "dot face: written for a revision of the contract this oMLX no longer runs");
-  omlx_qmv_rows<T, K>(
-      omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
+  constexpr int FACE = D::CONTRACT;
+  (void)sizeof(omlx_revision<FACE>);  // instantiates it: its asserts run
+  if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
+    using L = typename D::template Lanes<K>;
+    static_assert(
+        L::BLOCK == 32 * L::VPT,
+        "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
+        "lanes");
+    static_assert(
+        K % L::VPT == 0,
+        "dot face: K must be a whole number of a lane's VPT inputs");
+    omlx_qmv_rows<T, K>(
+        omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
+  }
 }
 """
 
@@ -162,15 +175,19 @@ class Matrices:
     def header(self) -> str:
         """The Metal the kernel includes: the index packs, each distinct
         format source once (cited under the key of the first face that has
-        it), then the skeletons between the contract revisions' macros."""
+        it), then the skeletons, from the contract revisions' macros to the
+        macros' end."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
         return (
             _named(_SKELETONS, _INDEX_PACKS)
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
-            + _revisions()
-            + _named(_SKELETONS, _QMV_ROWS, line=_INDEX_PACKS.count("\n") + 1)
+            + _named(
+                _SKELETONS,
+                _revisions() + _QMV_ROWS,
+                line=_INDEX_PACKS.count("\n") + 1,
+            )
             + _REVISIONS_END
             + _named("<kernel header>", "")
         )
@@ -187,13 +204,12 @@ class Matrices:
 
 def _revisions() -> str:
     """The contract revisions the skeletons run a face of, as the kernel is
-    built. Macros, so that a failed assert prints the number, and the
-    skeletons' alone: they follow the formats' sources and end with the
-    skeletons (``_REVISIONS_END``), so nothing a format gives reads them. A
-    format picks its revision in Python. The first opens a line of its own,
-    whether or not a source ends with a newline."""
+    built: the skeletons' first two lines. Macros, so that a failed assert
+    prints the number, and the skeletons' alone: they follow the formats'
+    sources and end with the skeletons (``_REVISIONS_END``), so nothing a
+    format gives reads them. A format picks its revision in Python."""
     return (
-        f"\n#define OMLX_CONTRACT {formats.CONTRACT}\n"
+        f"#define OMLX_CONTRACT {formats.CONTRACT}\n"
         f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}"
     )
 

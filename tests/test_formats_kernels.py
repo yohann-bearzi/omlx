@@ -166,7 +166,11 @@ def test_a_kernel_has_the_revisions_omlx_runs_when_it_is_built(monkeypatch):
     matrices.add("m", a)
     matrices.add("n", b)
     header = matrices.header
-    revisions = "\n#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
+    # The skeletons' first lines, cited as the skeletons'.
+    revisions = (
+        f'\n#line {kernels._INDEX_PACKS.count(chr(10)) + 1} "{kernels._SKELETONS}"\n'
+        "#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
+    )
     assert header.count("#define") == 2
     # They follow the formats' sources, none of which reads them, and end
     # with the skeletons: nor does a face's type, or the kernel.
@@ -381,17 +385,39 @@ def test_a_kernel_runs_the_faces_of_the_revisions_omlx_runs(monkeypatch):
     for contract in (2, 3):
         got = testing.dot_rows(_revision(contract), operands, x, 8)
         assert mx.array_equal(got, want).item()
-    for contract, rule in (
-        (4, "a later revision of the contract than this oMLX runs"),
-        (1, "a revision of the contract this oMLX no longer runs"),
+    for contract, rule, revisions in (
+        (4, "a later revision of the contract than this oMLX runs", "'4 <= 3'"),
+        (1, "a revision of the contract this oMLX no longer runs", "'1 >= 2'"),
     ):
         message = _error(_revision(contract))
         assert f"dot face: written for {rule}" in message
+        # The face's revision against oMLX's, in numbers.
+        assert f"due to requirement {revisions}" in message
         assert "<omlx skeletons, docs/quant-formats.md>:" in message
-        # The other rule holds, and is not cited. Nor is the format's source,
-        # under whose name the macros' lines are.
+        # The other rule holds, and is not cited. Nor is a format's source:
+        # the revisions are lines of the skeletons.
         assert message.count("dot face: ") == 1
         assert "<quant format" not in message
+
+
+@metal
+@pytest.mark.parametrize(
+    "contract", [formats.CONTRACT + 1, formats.OLDEST_CONTRACT - 1]
+)
+def test_a_face_of_another_revision_is_told_that_and_nothing_else(contract):
+    # A face of another revision as this oMLX may meet one: without a member
+    # it calls, and with a layout it refuses.
+    source = (
+        _TOY.replace("CONTRACT = 1;", f"CONTRACT = {contract};")
+        .replace("BLOCK = 32 * VPT;", "BLOCK = 16 * VPT;")
+        .replace(
+            "    float finish(int r, float sum) const { return sum * s[r]; }\n", ""
+        )
+    )
+    assert "finish" not in source and "BLOCK = 16 * VPT;" in source
+    message = _error(_toy(f"another_{contract}", source=source))
+    assert "dot face: written for a" in message
+    assert message.count("error:") == 1
 
 
 @metal
@@ -611,6 +637,9 @@ def test_each_compiler_message_of_the_page_has_its_break():
 @pytest.mark.parametrize("phrase", _BREAKS)
 def test_the_page_cites_the_lines_the_compiler_cites(phrase):
     (sample,) = (sample for sample in _SAMPLES if phrase in sample)
-    cited = re.findall(r'<[^<>]*>:\d+:\d+: \w+|"dot face: [^"]*"', sample)
+    cited = re.findall(
+        r"""<[^<>]*>:\d+:\d+: \w+|"dot face: [^"]*"|requirement '\d+ <= \d+'""",
+        sample,
+    )
     message = " ".join(_page_error(**_BREAKS[phrase]).split())
     assert cited and [c for c in cited if c not in message] == []

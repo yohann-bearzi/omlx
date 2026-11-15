@@ -279,7 +279,7 @@ MLX compiles a kernel at the first `mx.eval` of its output. A failure is a `Runt
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:80:3: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:96:5: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
 <kernel>:5:5: note: in instantiation of function template specialization
@@ -287,7 +287,7 @@ each of a simdgroup's 32 lanes"
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:83:3: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:100:5: error: static_assert failed due to requirement
 '60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 
@@ -300,12 +300,12 @@ A mistake inside the format is cited in the format:
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:66:20: error: no member named 'finish' in
+<omlx skeletons, docs/quant-formats.md>:67:20: error: no member named 'finish' in
 'omlx_myformat_b8::Dot::Lanes<512>'
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:27:59: error: too many arguments to function call,
+<omlx skeletons, docs/quant-formats.md>:28:59: error: too many arguments to function call,
 expected 3, have 4
 <quant format myformat_b8>:38:18: note: 'madd' declared here
 ```
@@ -370,12 +370,13 @@ quant format 'myformat' is written for revision 2 of the format contract; this o
 revision 1: update oMLX
 ```
 
-A face of another revision does not compile:
+A face of another revision does not compile. The requirement that fails is the face's revision against oMLX's, here a face of revision 2 on an oMLX of revision 1. It is the only error: a kernel checks the revision first, and asks nothing else of a face whose revision it does not run.
 
 ```
-<omlx skeletons, docs/quant-formats.md>:86:3: error: static_assert failed due to requirement
-'Dot::CONTRACT <= 1' "dot face: written for a later revision of the contract than this oMLX
-runs"
+<omlx skeletons, docs/quant-formats.md>:75:3: error: static_assert failed due to requirement
+'2 <= 1' "dot face: written for a later revision of the contract than this oMLX runs"
+<omlx skeletons, docs/quant-formats.md>:93:9: note: in instantiation of template class
+'omlx_revision<2>' requested here
 <kernel>:5:5: note: in instantiation of function template specialization
 'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
 ```
