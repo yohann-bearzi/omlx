@@ -6,15 +6,18 @@ in a toy format and loaded back.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import textwrap
 from types import SimpleNamespace
 
 import mlx.core as mx
+import numpy as np
 import pytest
 from mlx.utils import tree_flatten
-from mlx_lm.models import qwen3_5_moe
+from mlx_lm.models import qwen3_5_moe, qwen3_next
+from mlx_lm.models import switch_layers as lm_switch
 from mlx_lm.utils import load_model
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
@@ -538,3 +541,153 @@ def test_a_writer_of_its_own_writes_without_a_format(tmp_path, monkeypatch):
     output = tmp_path / "written"
     oq.quantize_oq_streaming(str(source), str(output), 4, enhanced=True)
     assert wrote == [str(output)]
+
+
+@pytest.fixture
+def own_switch(monkeypatch):
+    """Qwen3.5's experts in a switch layer of the family's own, as DeepSeek
+    V4's and GLM's are: a ``to_quantized`` of its own, which builds MLX's
+    modes and no format's layer."""
+
+    class SwitchLinear(lm_switch.SwitchLinear):
+        def to_quantized(self, group_size=64, bits=4, mode="affine"):
+            built = inspect.unwrap(lm_switch.SwitchLinear.to_quantized)
+            return built(self, group_size, bits, mode)
+
+    class SwitchGLU(lm_switch.SwitchGLU):
+        def __init__(self, input_dims, hidden_dims, num_experts, **kwargs):
+            super().__init__(input_dims, hidden_dims, num_experts, **kwargs)
+            bias = "bias" in self.gate_proj
+            self.gate_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias)
+            self.up_proj = SwitchLinear(input_dims, hidden_dims, num_experts, bias)
+            self.down_proj = SwitchLinear(hidden_dims, input_dims, num_experts, bias)
+
+    monkeypatch.setattr(qwen3_next, "SwitchGLU", SwitchGLU)
+    return f"{SwitchLinear.__module__}.{SwitchLinear.__qualname__}"
+
+
+def test_a_layer_whose_class_loads_no_format_stays_affine(
+    source, plain, toy, own_switch, tmp_path, caplog
+):
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    output = tmp_path / "oqe-own"
+    tensors, config, applied = _quantize(source, output, quant_format="toy")
+    entries = _in_format(config)
+    # The stacks of experts are the family's own layers: oQ's affine. The
+    # linears beside them, a shared expert's among them, are the format's.
+    stacks = [name for name in applied if ".switch_mlp." in name]
+    assert len(stacks) == 6
+    assert sorted(entries) == sorted(set(applied) - set(stacks))
+    assert any(".shared_expert." in name for name in entries)
+    assert all(tensors[f"{name}.weight"].dtype == mx.uint32 for name in stacks)
+    assert len(toy.encoded) == len(entries)
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    said = (
+        "oQ4: 6 matrices stay oQ's affine: a quant format's layer is not "
+        f"built for their class ({own_switch})"
+    )
+    assert warnings == [said]
+    v4 = "omlx.patches.deepseek_v4.switch_layers.SwitchLinear"
+    assert _quoted(said.replace(own_switch, v4))
+    _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
+    # So the checkpoint loads, through the family's own to_quantized.
+    maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
+    kinds = {type(layer).__name__ for name, layer in model.named_modules()}
+    assert {"FormatLinear", "QuantizedSwitchLinear"} <= kinds
+    assert "FormatSwitchLinear" not in kinds
+    logits = model(mx.array([[1, 2, 3, 4]]))
+    assert logits.shape == (1, 4, 64) and mx.isfinite(logits).all()
+
+
+_MEASURED = (".in_sum2", ".counts")  # what an imatrix cache kept of an entry
+
+
+def _without_classes(path):
+    """The imatrix cache at ``path`` as one written before each entry kept
+    the class of its layer."""
+    with np.load(path) as data:
+        kept = {name: data[name] for name in data.files}
+    np.savez_compressed(
+        path, **{name: a for name, a in kept.items() if name.endswith(_MEASURED)}
+    )
+
+
+def test_a_cache_without_the_layers_classes_is_collected_again_for_a_format(
+    source, toy, tmp_path
+):
+    cache = tmp_path / "imatrix.npz"
+
+    def reused(name, **kwargs):
+        output = tmp_path / name
+        _quantize(source, output, imatrix_cache_path=str(cache), **kwargs)
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        return report["cache_reused"]
+
+    assert not reused("first")
+    _without_classes(cache)
+    # A run without a format reuses it; a run with one collects again, and
+    # keeps the class of each entry's layer.
+    assert reused("plain")
+    assert not reused("toy", quant_format="toy")
+    entries = oq._load_oqe_imatrix(cache).entries
+    assert all(type(entry.module_class) is str for entry in entries.values())
+    assert {name: entry.module_class for name, entry in entries.items()} == {
+        name: (
+            "mlx_lm.models.switch_layers.SwitchLinear"
+            if ".switch_mlp." in name
+            else "mlx.nn.layers.linear.Linear"
+        )
+        for name in entries
+    }
+    assert reused("toy again", quant_format="toy")
+
+
+_GLM5_NEXT = (
+    "its linear attention fuses its input projections by hand, as MLX's affine "
+    "layers or as floats"
+)
+
+
+@pytest.mark.parametrize(
+    "family, config, why",
+    [
+        ("glm5_next", {"model_type": "glm5_next"}, _GLM5_NEXT),
+        (
+            "glm5_next_text",
+            {"model_type": "glm5", "text_config": {"model_type": "glm5_next_text"}},
+            _GLM5_NEXT,
+        ),
+        (
+            "clef",
+            # A Clef checkpoint is a Qwen3.5 one with Clef's joint head beside it.
+            {"model_type": "qwen3_5"},
+            "it reads rows of its output head by hand, as MLX's quantized "
+            "layers or as floats",
+        ),
+    ],
+    ids=["model type", "text model type", "decision family"],
+)
+def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
+    toy, tmp_path, family, config, why
+):
+    source = tmp_path / "source"
+    source.mkdir()
+    if family == "clef":
+        for name in ("joint_head.safetensors", "joint_head_config.json"):
+            (source / name).write_text("{}")
+    (source / "config.json").write_text(json.dumps(config))
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format="toy"
+        )
+    assert str(refusal.value) == (
+        f"oQ writes no {family} checkpoint in quant format 'toy': {why}"
+    )
+    assert _quoted(str(refusal.value).replace("glm5_next_text", "glm5_next"))
+    assert not output.exists() and toy.offered == []

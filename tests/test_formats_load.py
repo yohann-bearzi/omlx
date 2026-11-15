@@ -243,6 +243,33 @@ def test_a_format_of_one_of_mlx_s_modes_takes_the_matrices_it_lays_out(
     assert type(layer) is nn.QuantizedLinear and layer.mode == "mxfp4"
 
 
+def _class_name(cls):
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
+def test_the_classes_whose_matrices_load_in_a_format(unpatched):
+    # The classes whose to_quantized the patch wraps, and the layers MLX
+    # builds of them: a calibration over a quantized checkpoint meets those.
+    for cls in _PATCHED:
+        built = cls(64, 16, EXPERTS) if cls is not nn.Linear else cls(64, 16)
+        for loaded in (cls, type(built.to_quantized(32, 4))):
+            assert format_load.loads_in_format(_class_name(loaded)), loaded
+    assert format_load.loads_in_format("mlx.nn.layers.quantized.QuantizedLinear")
+    # Not a family's own switch layer, nor MLA's, nor a class by its name
+    # alone.
+    for name in (
+        "omlx.patches.deepseek_v4.switch_layers.SwitchLinear",
+        "omlx.patches.glm_moe_dsa.switch_layers.QuantizedSwitchLinear",
+        "mlx_lm.models.mla.MultiLinear",
+        "mlx_lm.models.mla.QuantizedMultiLinear",
+        "mlx_lm.models.switch_layers.SwitchGLU",
+        "omlx.formats.linear.FormatLinear",
+        "SwitchLinear",
+        "",
+    ):
+        assert not format_load.loads_in_format(name), name
+
+
 def test_the_patch_is_applied_once(toy):
     wrappers = [cls.to_quantized for cls in _PATCHED]
     assert all(wrapper._omlx_format_load for wrapper in wrappers)

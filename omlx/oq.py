@@ -586,6 +586,9 @@ class OQImatrixEntry:
 
     in_sum2: np.ndarray
     counts: np.ndarray
+    # The class of the module whose inputs were measured, as its module and
+    # qualified name; empty in a cache written before it was kept.
+    module_class: str = ""
 
 
 @dataclass
@@ -6284,6 +6287,7 @@ def _save_oqe_imatrix(
     for name, entry in sorted(entries.items()):
         arrays[f"{name}.in_sum2"] = np.asarray(entry.in_sum2, dtype=np.float32)
         arrays[f"{name}.counts"] = np.asarray(entry.counts, dtype=np.int64)
+        arrays[f"{name}.module_class"] = np.asarray(entry.module_class)
     np.savez_compressed(path, **arrays)
     _imatrix_metadata_path(path).write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
@@ -6305,9 +6309,11 @@ def _load_oqe_imatrix(path: Path) -> OQImatrixData:
             counts_key = f"{name}.counts"
             if counts_key not in data.files:
                 continue
+            class_key = f"{name}.module_class"
             entries[name] = OQImatrixEntry(
                 in_sum2=np.asarray(data[f"{name}.in_sum2"], dtype=np.float32),
                 counts=np.asarray(data[counts_key], dtype=np.int64),
+                module_class=(str(data[class_key]) if class_key in data.files else ""),
             )
     return OQImatrixData(entries=entries, metadata=metadata, path=str(path))
 
@@ -6885,6 +6891,32 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
+# Families whose own code reads a layer's quantized tensors by hand and takes
+# a format's layer for MLX's or for floats, instead of calling it. oQ writes
+# them in no quant format until a commit whose tests show each such reader
+# declining a format's layer takes the family off. Keyed by model type (of
+# the checkpoint or of its text_config), or by the decision family
+# (model_discovery.decision_kind) of a decision model.
+_GLM5_NEXT_MISREAD = (
+    # Glm5NextLinearAttention._fused_in_proj concatenates q, k, v, f_a, g_a
+    # and b: as affine when the first has "scales", else as float weights
+    # (mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py).
+    "its linear attention fuses its input projections by hand, as MLX's "
+    "affine layers or as floats"
+)
+_QUANT_FORMAT_MISREAD = {
+    "glm5_next": _GLM5_NEXT_MISREAD,
+    "glm5_next_text": _GLM5_NEXT_MISREAD,
+    # Clef pools rows of its output head (models/clef.py) that
+    # DecisionBackbone.output_rows dequantizes for MLX's quantized layers
+    # and reads as float weights from any other (models/decision.py).
+    "clef": (
+        "it reads rows of its output head by hand, as MLX's quantized "
+        "layers or as floats"
+    ),
+}
+
+
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
@@ -7161,6 +7193,7 @@ def quantize_oq_streaming(
     quant_fmt = None
     if quant_format is not None:
         from . import formats
+        from .patches.format_load import loads_in_format
 
         if not enhanced:
             raise ValueError(
@@ -7221,6 +7254,19 @@ def quantize_oq_streaming(
             f"oQ writes a {config.get('model_type')} checkpoint through a writer "
             "of its own, which takes no quant format"
         )
+    if quant_fmt is not None:
+        text_config = config.get("text_config")
+        families = (
+            normalized_model_type,
+            text_config.get("model_type") if isinstance(text_config, dict) else None,
+            decision_kind(source, config),
+        )
+        for family in families:
+            if family in _QUANT_FORMAT_MISREAD:
+                raise ValueError(
+                    f"oQ writes no {family} checkpoint in quant format "
+                    f"{quant_format!r}: {_QUANT_FORMAT_MISREAD[family]}"
+                )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -7504,6 +7550,7 @@ def quantize_oq_streaming(
                 sensitivity_num_samples=_SENS_NUM_SAMPLES,
                 sensitivity_seq_length=_SENS_SEQ_LENGTH,
                 require_mtp_entries=preserve_mtp,
+                require_module_classes=quant_fmt is not None,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -7816,6 +7863,7 @@ def quantize_oq_streaming(
     quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
     per_layer_config = {}
     format_layers = 0
+    unloaded = []  # the classes of matrices no format's layer loads for
     start_time = _time.monotonic()
     last_quant_display_pct = -1
     last_quant_emit_time = 0.0
@@ -7941,12 +7989,17 @@ def quantize_oq_streaming(
                     if base.endswith(".weight"):
                         base = base[:-7]
 
-                    # The format is offered the source's own floats.
+                    # The format is offered the source's own floats, of a
+                    # matrix that loads as its layer.
                     encoded = None
                     if quant_fmt is not None and importance is not None:
-                        encoded = _encode_in_format(
-                            quant_fmt, tensor_name, w_mx, importance, bits, gs
-                        )
+                        held = imatrix_data.entries[base].module_class
+                        if loads_in_format(held):
+                            encoded = _encode_in_format(
+                                quant_fmt, tensor_name, w_mx, importance, bits, gs
+                            )
+                        else:
+                            unloaded.append(held)
                     if encoded is not None:
                         for name, tensor in encoded.items():
                             out_shard_data[f"{base}.{name}"] = tensor
@@ -8195,6 +8248,14 @@ def quantize_oq_streaming(
             "oQ%s: quant format %s took no layer: the output is as without it",
             f"{oq_level:g}",
             quant_format,
+        )
+    if unloaded:
+        logger.warning(
+            "oQ%s: %d matrices stay oQ's affine: a quant format's layer is not "
+            "built for their class (%s)",
+            f"{oq_level:g}",
+            len(unloaded),
+            ", ".join(sorted(set(unloaded))),
         )
     if minimax_nvfp4_experts:
         output_config["text_config"] = {
@@ -9512,12 +9573,16 @@ class OQImatrixCollector:
             setattr(module, attribute, value)
         self._saved_attributes.clear()
 
-    def _ensure_entry(self, name: str, sums_shape, counts_shape) -> OQImatrixEntry:
+    def _ensure_entry(
+        self, name: str, module, sums_shape, counts_shape
+    ) -> OQImatrixEntry:
         entry = self.entries.get(name)
         if entry is None:
+            cls = type(module)
             entry = OQImatrixEntry(
                 in_sum2=np.zeros(sums_shape, dtype=np.float32),
                 counts=np.zeros(counts_shape, dtype=np.int64),
+                module_class=f"{cls.__module__}.{cls.__qualname__}",
             )
             self.entries[name] = entry
         return entry
@@ -9531,7 +9596,7 @@ class OQImatrixCollector:
             x_np = np.asarray(x.astype(mx.float32)).reshape(-1, in_dim)
             if x_np.shape[0] == 0:
                 return
-            entry = self._ensure_entry(name, (in_dim,), (1,))
+            entry = self._ensure_entry(name, module, (in_dim,), (1,))
             entry.in_sum2 += np.square(x_np, dtype=np.float32).sum(axis=0)
             entry.counts[0] += x_np.shape[0]
         except Exception as e:
@@ -9564,7 +9629,7 @@ class OQImatrixCollector:
             else:
                 shared = x_np.reshape(-1, in_dim)
                 per_head = np.repeat(shared[None], n_heads, axis=0)
-            entry = self._ensure_entry(name, (n_heads, in_dim), (n_heads,))
+            entry = self._ensure_entry(name, module, (n_heads, in_dim), (n_heads,))
             entry.in_sum2 += np.square(per_head, dtype=np.float32).sum(axis=1)
             entry.counts += per_head.shape[1]
         except Exception as e:
@@ -9669,7 +9734,7 @@ class OQImatrixCollector:
                 x_source = x_source[valid]
             else:
                 token_ids = token_ids[valid]
-            entry = self._ensure_entry(name, (n_experts, in_dim), (n_experts,))
+            entry = self._ensure_entry(name, module, (n_experts, in_dim), (n_experts,))
             self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
         except Exception as e:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
@@ -11386,6 +11451,7 @@ def _load_or_collect_imatrix(
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
     require_mtp_entries: bool = True,
+    require_module_classes: bool = False,
 ) -> OQImatrixData:
     source = Path(model_path)
     path = Path(cache_path)
@@ -11419,6 +11485,14 @@ def _load_or_collect_imatrix(
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
+                    path,
+                )
+            elif require_module_classes and not all(
+                entry.module_class for entry in cache.entries.values()
+            ):
+                logger.info(
+                    "oQe imatrix: cache predates the class of each layer, "
+                    "which a quant format is offered by, recollecting %s",
                     path,
                 )
             elif _oqe_cache_has_required_expert_coverage(cache):

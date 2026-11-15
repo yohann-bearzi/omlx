@@ -90,14 +90,34 @@ def _patch(cls, layer_cls) -> None:
     cls.to_quantized = to_quantized
 
 
-def apply_format_load_patch() -> None:
-    """Have ``nn.Linear`` and the switch layers of mlx-lm and mlx-vlm load a
-    registered format's mode as its layers. Idempotent."""
-    formats.load()
-    _patch(nn.Linear, FormatLinear)
+def _wrapped():
+    """Each class whose ``to_quantized`` this patch wraps, with the format
+    layer it builds and the layer that MLX's own ``to_quantized`` builds."""
+    yield nn.Linear, FormatLinear, nn.QuantizedLinear
     for name in _SWITCH_MODULES:
         try:
             module = importlib.import_module(name)
         except ImportError:
             continue
-        _patch(module.SwitchLinear, FormatSwitchLinear)
+        yield module.SwitchLinear, FormatSwitchLinear, module.QuantizedSwitchLinear
+
+
+def loads_in_format(module_class: str) -> bool:
+    """Whether a checkpoint's matrix that a module of ``module_class`` (its
+    module and qualified name) holds loads as a format's layer: this patch
+    wraps the class's ``to_quantized``, or the class is the layer that MLX
+    builds of one it wraps (which a calibration over a quantized checkpoint
+    meets)."""
+    return any(
+        module_class == f"{cls.__module__}.{cls.__qualname__}"
+        for wrapped, _, built in _wrapped()
+        for cls in (wrapped, built)
+    )
+
+
+def apply_format_load_patch() -> None:
+    """Have ``nn.Linear`` and the switch layers of mlx-lm and mlx-vlm load a
+    registered format's mode as its layers. Idempotent."""
+    formats.load()
+    for cls, layer_cls, _ in _wrapped():
+        _patch(cls, layer_cls)
