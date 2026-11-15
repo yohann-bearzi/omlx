@@ -720,6 +720,18 @@ def test_the_tile_face_is_the_decode_in_float32():
 - the codes and the scales at their largest values and at random ones, with float fields finite, and at zero: rules 1, 2 and 7 of [The tile face](#the-tile-face). A NaN the decode gives compares as a NaN, not by its bits,
 - a K whose last group is partial, if the face takes one.
 
+
+A layer runs a call's rows through its face, or through the format's `decode` (see [Layers](#layers)), and when the face is exact the two give the same rows: comparing a layer's rows with the face's does not tell which ran. `omlx.formats.testing.layer_calls()` records the calls of format layers that its block's thread makes, each a `LayerCall`: the layer, the face whose launch ran the rows (`face`), and what that launch's Metal is built for beside the face (`metal`: the activations' dtype; for a stack, also the pairs of a row of `x` and whether there are fewer than 8 pairs). Both are None for a call that `decode` ran:
+
+```python
+with testing.layer_calls() as calls:
+    y = layer(x)
+(call,) = calls
+assert call.face == FORMAT.dot(layer, k, n)  # its face, not decode
+```
+
+A face that does not compile leaves its layers to `decode`: a call recorded with its face ran that face's launch. The layers are wrapped while a block is open in any thread, and a call in a thread without one is not recorded; with no block open, a call is the layer's own and costs nothing more. A call that raises is not recorded, nor is what runs no Python of the layer: a call that a function compiled by `mx.compile` replays, or a fused kernel's launch over a layer's tensors.
+
 ## Versions
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
