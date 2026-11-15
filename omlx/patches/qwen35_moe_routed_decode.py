@@ -84,7 +84,6 @@ nothing to bound here. Only scheduling changes.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from functools import cache, wraps
 from typing import NamedTuple
 
@@ -121,25 +120,6 @@ _TOPK_FOLD_MAX_ROWS = 3
 # Row-exact verify windows up to the hyper-connection and GDN verify
 # kernels' 16-row ceiling; the kernels index rows from the grid.
 WINDOW_MAX_ROWS = 16
-
-
-@dataclass
-class _Proof:
-    """What is known of the launches that blocks of the same faces, tensor
-    dtypes and shapes compile.
-
-    MLX compiles a kernel when it first evaluates it. So a launch is
-    evaluated the first time it is built, while the call can still fall
-    back, and one that fails keeps these blocks on their composed body. The
-    block's input is evaluated ahead of it: its failure is the caller's."""
-
-    # (window rows or 0 for one token, router width, top-k folded in)
-    ran: set = field(default_factory=set)
-    failed: bool = False  # a one-token launch: nothing of the plan runs
-    window_failed: bool = False  # a window launch: one token still runs
-
-
-_PROOFS: dict[tuple, _Proof] = {}
 
 
 def _down_rows(rows: int) -> int:
@@ -547,7 +527,8 @@ class _Plan(NamedTuple):
     dtype: mx.Dtype  # activations and outputs: what the gate+up face is exact for
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
-    proof: _Proof
+    proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
+    window: kernels.Proof  # a window's launches; failed: one token still runs
     gate_up_kernel: object
     gate_up_operands: tuple
     gate_up_template: list
@@ -652,19 +633,18 @@ def _build_plan(block) -> _Plan | None:
     operands = gate_up_operands + down_operands
     if shared is not None:
         operands += shared[4] + shared[5]
-    proof = _PROOFS.setdefault(
-        (
-            gu_fmt,
-            d_fmt,
-            shared[:4] if shared is not None else None,
-            tuple(a.dtype for a in operands),
-            hidden,
-            inter,
-            top_k,
-            router_logits is not None,
-        ),
-        _Proof(),
+    key = (
+        gu_fmt,
+        d_fmt,
+        shared[:4] if shared is not None else None,
+        tuple(a.dtype for a in operands),
+        hidden,
+        inter,
+        top_k,
+        router_logits is not None,
     )
+    proof = kernels.proof("routed_decode", *key)
+    window = kernels.proof("routed_window", *key)
     gate_up_template = [
         ("T", dtype),
         ("K", hidden),
@@ -687,6 +667,7 @@ def _build_plan(block) -> _Plan | None:
             router_logits=router_logits,
             fold=False,
             proof=proof,
+            window=window,
             gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
             gate_up_operands=gate_up_operands,
             gate_up_template=gate_up_template,
@@ -708,6 +689,7 @@ def _build_plan(block) -> _Plan | None:
         router_logits=router_logits,
         fold=True,
         proof=proof,
+        window=window,
         gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
         gate_up_operands=gate_up_operands,
         gate_up_template=gate_up_template + [("NS", width)],
@@ -876,7 +858,7 @@ def routed_verify_window(block, x):
     if (
         plan is None
         or plan.proof.failed
-        or plan.proof.window_failed
+        or plan.window.failed
         or plan.hidden != hidden
         or plan.dtype != x.dtype
         or not plan.fold
@@ -892,7 +874,7 @@ def routed_verify_window(block, x):
             routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), plan.top_k)
         inds, scores = routing
     launch = (rows, logits.shape[-1], folded)
-    proven = launch in plan.proof.ran
+    proven = launch in plan.window.ran
     if not proven:
         # What fails ahead of the block is not the launch's failure.
         mx.eval(x)
@@ -905,10 +887,10 @@ def routed_verify_window(block, x):
             y = routed_window(plan, x, inds, scores)
         if not proven:
             mx.eval(y)
-            plan.proof.ran.add(launch)
+            plan.window.ran.add(launch)
             logger.info("Qwen MoE fused verify-window experts engaged (%d rows)", rows)
     except Exception:
-        plan.proof.window_failed = True
+        plan.window.failed = True
         logger.warning("fused verify-window experts failed; verifier fallback", exc_info=True)
         return None
     return y
@@ -994,7 +976,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             inds, scores = routing
             if scores.dtype != x.dtype:
                 return orig_call(self, x)
-        launch = (0, logits.shape[-1], folded)
+        launch = (logits.shape[-1], folded)
         proven = launch in plan.proof.ran
         if not proven:
             # What fails ahead of the block is not the launch's failure.

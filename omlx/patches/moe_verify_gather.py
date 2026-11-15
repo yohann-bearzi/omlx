@@ -148,7 +148,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
     the block size is outside this kernel, a projection has no dot face that
-    is exact for ``x``'s dtype, or a block of these faces and shapes failed.
+    is exact for ``x``'s dtype, the activation gives another dtype or width
+    than the gate's and up's, or a block of these faces and shapes failed.
     """
     batch, length, width = x.shape
     rows = batch * length
@@ -177,7 +178,11 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     try:
         gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k)
         gate, up = mx.split(gate_up, 2, axis=-1)
-        out = gather_qmv(plan.down, switch_mlp.activation(up, gate), pairs, 1)
+        hidden = switch_mlp.activation(up, gate)
+        if hidden.dtype != x.dtype or hidden.shape != up.shape:
+            # Not the rows that the down launch is planned and proven for.
+            return None
+        out = gather_qmv(plan.down, hidden, pairs, 1)
         if not proven:
             # Surface a kernel build failure while the call can still fall
             # back.

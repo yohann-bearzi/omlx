@@ -14,7 +14,7 @@ import pytest
 
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
-from omlx.formats import affine
+from omlx.formats import affine, kernels
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -40,7 +40,6 @@ def _patched_block(monkeypatch):
     assert cls._omlx_router_fused
     call = cls.__call__
     original = getattr(call, "_omlx_routed_decode_original", call)
-    monkeypatch.setattr(routed, "_PROOFS", {})
     cls.__call__ = original
     if "_omlx_routed_decode" in cls.__dict__:
         delattr(cls, "_omlx_routed_decode")
@@ -114,10 +113,16 @@ def _pair(block, x):
 
 
 def _engaged():
-    """Whether the launches of every plan built since the test began ran."""
-    proofs = routed._PROOFS.values()
-    return bool(proofs) and all(
-        proof.ran and not (proof.failed or proof.window_failed) for proof in proofs
+    """Whether one token's launches ran for every plan built since the test
+    began, and no window's failed."""
+    tokens, windows = (
+        [proof for (kernel, *_), proof in kernels._PROOFS.items() if kernel == name]
+        for name in ("routed_decode", "routed_window")
+    )
+    return (
+        bool(tokens)
+        and all(proof.ran and not proof.failed for proof in tokens)
+        and not any(proof.failed for proof in windows)
     )
 
 
@@ -577,7 +582,7 @@ def test_rows_that_are_not_whole_launch_groups_keep_the_composed_body(
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     assert routed.routed_decode_plan(block, x) is None
     assert _same_bits(*_pair(block, x))
-    assert not routed._PROOFS
+    assert not kernels._PROOFS
 
 
 @pytest.mark.parametrize("dtypes", [(), (mx.bfloat16, mx.float16)])
@@ -597,7 +602,7 @@ def test_a_gate_up_face_names_the_one_dtype_of_the_launches(dtypes, monkeypatch)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     assert routed.routed_decode_plan(block, x) is None
     assert _same_bits(*_pair(block, x))
-    assert not routed._PROOFS
+    assert not kernels._PROOFS
 
 
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
@@ -738,7 +743,7 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
     assert routed.routed_decode_plan(block, x) is None
-    assert not routed._PROOFS
+    assert not kernels._PROOFS
     # The answer is kept with the block's plan: no projection is asked twice.
     own = {id(block.switch_mlp.gate_up_proj), id(block.switch_mlp.down_proj)}
     assert asked and {id(layer) for layer in asked} <= own
@@ -822,12 +827,12 @@ def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplo
         block = _block(512, 256, top_k=8, experts=experts)
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
-        ran.add((0, experts, True))
+        ran.add((experts, True))
         plan = routed.routed_decode_plan(block, x)
         assert plan.fold and plan.proof.ran == ran
     monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
     assert _same_bits(*_pair(block, x))
-    assert routed.routed_decode_plan(block, x).proof.ran == ran | {(0, 128, False)}
+    assert routed.routed_decode_plan(block, x).proof.ran == ran | {(128, False)}
     assert [r.getMessage() for r in _logged(caplog, routed)] == [
         "Qwen MoE fused routed-expert decode engaged"
     ] * 3

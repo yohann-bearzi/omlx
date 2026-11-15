@@ -50,7 +50,6 @@ def _patched(monkeypatch):
     cls = vlm_moe.Qwen3_5MoeSparseMoeBlock
     call = cls.__call__
     had_flag = "_omlx_routed_decode" in cls.__dict__
-    monkeypatch.setattr(routed, "_PROOFS", {})
     assert routed.apply_qwen35_moe_routed_decode_patch()
     yield
     qwen35_verify_qmm.set_verify_qmm_armed(False)
@@ -232,11 +231,13 @@ def test_window_rows_equal_one_token_decode(topk_fold, engaged):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
     _check(block, _inputs(3, 1, batch=2), engaged)
-    # One token is launch 0.
-    assert plan.proof.ran == {
+    assert plan.window.ran == {
         (rows, BLOCK_EXPERTS, topk_fold and rows <= routed._TOPK_FOLD_MAX_ROWS)
-        for rows in (0, *window_rows, 6)
+        for rows in (*window_rows, 6)
     }
+    # One token's launches are proven beside the windows'.
+    assert plan.proof.ran == {(BLOCK_EXPERTS, topk_fold)}
+    assert not plan.proof.failed and not plan.window.failed
 
 
 @pytest.mark.parametrize("rows", [2, 5, 8])
@@ -298,7 +299,7 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     x = _inputs(4, 1)
     old = _verify(block, x, window=False)
     plan = routed.routed_decode_plan(block, x[:, :1])
-    assert not plan.proof.ran
+    assert not plan.proof.ran and not plan.window.ran
     calls = []
 
     def broken(plan, h, indices, scores):
@@ -308,13 +309,13 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     monkeypatch.setattr(routed, "_window_down", broken)
     for _ in range(2):
         out = _verify(block, x, window=True)
-        assert engaged[-1] is False and plan.proof.window_failed
+        assert engaged[-1] is False and plan.window.failed
         assert _same_bits(out, old)
-    assert len(calls) == 1 and not plan.proof.ran
+    assert len(calls) == 1 and not plan.window.ran and not plan.proof.ran
     # One token still takes the fused launches.
     assert routed.routed_decode_plan(block, x[:, :1]) is plan
     assert _same_bits(_serial(block, x), old)
-    assert plan.proof.ran == {(0, BLOCK_EXPERTS, True)} and not plan.proof.failed
+    assert plan.proof.ran == {(BLOCK_EXPERTS, True)} and not plan.proof.failed
 
 
 def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
@@ -323,7 +324,7 @@ def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
     plan = routed.routed_decode_plan(block, x[:, :1])
     with pytest.raises(RuntimeError, match="Unable to build metal library"):
         routed.routed_verify_window(block, _does_not_compile(x))
-    assert engaged == [] and not plan.proof.window_failed and not plan.proof.ran
+    assert engaged == [] and not plan.window.failed and not plan.window.ran
     _check(block, x, engaged)
 
 
