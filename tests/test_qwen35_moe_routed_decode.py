@@ -29,7 +29,7 @@ _FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
 
 
 @pytest.fixture(autouse=True)
-def _patched_block(monkeypatch):
+def _patched_block():
     """Apply router + routed patches, restore the class afterwards."""
     from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
 
@@ -758,21 +758,34 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
     def unfolded(hidden=1024, inter=320, **kwargs):
         return _block(hidden, inter, quantized_shared=False, **kwargs)
 
-    def proof(block):
+    def proofs(block):
+        """One token's proof, then a window's: only a folded plan has window
+        launches."""
         x = mx.zeros((1, 1, block.switch_mlp.down_proj.weight.shape[1]), mx.bfloat16)
-        return routed.routed_decode_plan(block, x).proof
+        plan = routed.routed_decode_plan(block, x)
+        if not plan.fold:
+            assert plan.window is None
+            return (plan.proof,)
+        assert plan.window is not plan.proof
+        return plan.proof, plan.window
 
-    base, folded = proof(unfolded()), proof(_block(1024, 320))
-    assert proof(unfolded(seed=1)) is base
-    assert proof(_block(1024, 320, seed=1)) is folded
-    assert folded is not base
+    def shared(a, b):
+        return all(p is q for p, q in zip(a, b, strict=True))
+
+    def apart(a, b):
+        return not any(p is q for p, q in zip(a, b, strict=True))
+
+    base, folded = proofs(unfolded()), proofs(_block(1024, 320))
+    assert shared(proofs(unfolded(seed=1)), base)
+    assert shared(proofs(_block(1024, 320, seed=1)), folded)
+    assert apart(folded[:1], base)
     # One shape apart, with the same faces.
-    assert proof(unfolded(hidden=2048)) is not base
-    assert proof(unfolded(inter=448)) is not base
-    assert proof(unfolded(top_k=8)) is not base
-    assert proof(_block(1024, 320, shared_inter=448)) is not folded
+    assert apart(proofs(unfolded(hidden=2048)), base)
+    assert apart(proofs(unfolded(inter=448)), base)
+    assert apart(proofs(unfolded(top_k=8)), base)
+    assert apart(proofs(_block(1024, 320, shared_inter=448)), folded)
     # With 128 experts the router is the fused gemv.
-    assert proof(unfolded(experts=128)) is not base
+    assert apart(proofs(unfolded(experts=128)), base)
     dot = formats.dot
 
     def patched(face_of):
@@ -787,36 +800,67 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
             return replace(face, key="other") if id(layer) in other else face
 
         patched(face_of)
-        return proof(block)
+        return proofs(block)
 
     # One face apart.
     for name in ("gate_up_proj", "down_proj"):
         block = unfolded(seed=2)
-        assert renamed(block, block.switch_mlp[name]) is not base
+        assert apart(renamed(block, block.switch_mlp[name]), base)
     for names in (("gate_proj", "up_proj"), ("down_proj",)):
         block = _block(1024, 320, seed=2)
         layers = (block.shared_expert[name] for name in names)
-        assert renamed(block, *layers) is not folded
+        assert apart(renamed(block, *layers), folded)
     block = _block(1024, 320, seed=2)
-    assert renamed(block, block.shared_expert_gate) is not folded
+    assert apart(renamed(block, block.shared_expert_gate), folded)
 
     def recast(block, *layers):
         for layer in layers:
             layer.scales = layer.scales.astype(mx.float16)
             layer.biases = layer.biases.astype(mx.float16)
         patched(lambda layer, face: replace(face, dtypes=(mx.bfloat16,)))
-        return proof(block)
+        return proofs(block)
 
     # The same faces, with one matrix's tensors in another dtype.
     for name in ("gate_up_proj", "down_proj"):
         block = unfolded(seed=2)
-        assert recast(block, block.switch_mlp[name]) is not base
+        assert apart(recast(block, block.switch_mlp[name]), base)
     for names in (("gate_proj", "up_proj"), ("down_proj",)):
         block = _block(1024, 320, seed=2)
         layers = (block.shared_expert[name] for name in names)
-        assert recast(block, *layers) is not folded
+        assert apart(recast(block, *layers), folded)
     block = _block(1024, 320, seed=2)
-    assert recast(block, block.shared_expert_gate) is not folded
+    assert apart(recast(block, block.shared_expert_gate), folded)
+
+
+def test_a_window_that_fails_keeps_its_twin_s_windows_composed(monkeypatch):
+    """Blocks of the same faces and shapes share a window's proof as they
+    share one token's: the twin does not build the launch again."""
+    first, twin = (_block(512, 256, top_k=8, experts=128, seed=seed) for seed in (0, 1))
+    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+    built = []
+
+    def broken(plan, h, indices, scores):
+        built.append(plan)
+        rows = mx.zeros((indices.shape[0], plan.hidden), plan.dtype)
+        return _does_not_compile(rows)
+
+    monkeypatch.setattr(routed, "_window_down", broken)
+    for block in (first, twin, first):
+        assert routed.routed_verify_window(block, x) is None
+    assert len(built) == 1
+    # One token still takes the fused launches, in both.
+    for block in (first, twin):
+        assert _same_bits(*_pair(block, x[:, :1]))
+        plan = routed.routed_decode_plan(block, x[:, :1])
+        assert plan.window.failed and not plan.window.ran
+        assert plan.proof.ran == {(128, True)} and not plan.proof.failed
+
+
+def test_a_plan_that_folds_no_shared_expert_has_no_window():
+    block = _block(512, 256, top_k=8, experts=128, quantized_shared=False)
+    x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
+    assert routed.routed_verify_window(block, x) is None
+    assert [kernel for kernel, *_ in kernels._PROOFS] == ["routed_decode"]
 
 
 def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplog):

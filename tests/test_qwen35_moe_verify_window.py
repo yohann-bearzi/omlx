@@ -37,7 +37,7 @@ _FakeQwen4Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
 
 
 @pytest.fixture(autouse=True)
-def _patched(monkeypatch):
+def _patched():
     """Served patch chain: verify linears, fused router, fused routed decode
     (which installs the verify-window entry). Restores the block class."""
     from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
@@ -86,10 +86,12 @@ def _block(
     expert, 8-bit gs64 shared-expert gate, ``dtype`` router."""
     key = (seed, bits, experts, hidden, inter, top_k, dtype)
     if key in _BLOCKS:
-        # A test proves its own launches: the plan is built again, with a
-        # proof from this test's registry.
-        _BLOCKS[key].__dict__.pop("_omlx_routed_decode_plan", None)
-        return _BLOCKS[key]
+        # A test proves its own launches: the plans are built again, with
+        # proofs from this test's registry.
+        block = _BLOCKS[key]
+        block.__dict__.pop("_omlx_routed_decode_plan", None)
+        block.switch_mlp.__dict__.pop("_omlx_verify_gather_plan", None)
+        return block
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
     from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion

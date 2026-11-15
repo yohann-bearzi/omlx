@@ -528,7 +528,6 @@ class _Plan(NamedTuple):
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
     proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
-    window: kernels.Proof  # a window's launches; failed: one token still runs
     gate_up_kernel: object
     gate_up_operands: tuple
     gate_up_template: list
@@ -543,6 +542,7 @@ class _Plan(NamedTuple):
     router_logits: object = None  # qwen35_moe_router.router_gemv launcher
     window_gate_up_kernel: object = None  # verify-window launches (fold)
     window_down_kernel: object = None
+    window: kernels.Proof | None = None  # theirs; failed: one token still runs
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
@@ -644,7 +644,6 @@ def _build_plan(block) -> _Plan | None:
         router_logits is not None,
     )
     proof = kernels.proof("routed_decode", *key)
-    window = kernels.proof("routed_window", *key)
     gate_up_template = [
         ("T", dtype),
         ("K", hidden),
@@ -667,7 +666,6 @@ def _build_plan(block) -> _Plan | None:
             router_logits=router_logits,
             fold=False,
             proof=proof,
-            window=window,
             gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
             gate_up_operands=gate_up_operands,
             gate_up_template=gate_up_template,
@@ -689,7 +687,7 @@ def _build_plan(block) -> _Plan | None:
         router_logits=router_logits,
         fold=True,
         proof=proof,
-        window=window,
+        window=kernels.proof("routed_window", *key),
         gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
         gate_up_operands=gate_up_operands,
         gate_up_template=gate_up_template + [("NS", width)],
@@ -858,10 +856,10 @@ def routed_verify_window(block, x):
     if (
         plan is None
         or plan.proof.failed
+        or not plan.fold
         or plan.window.failed
         or plan.hidden != hidden
         or plan.dtype != x.dtype
-        or not plan.fold
         or plan.router_logits is None
     ):
         return None

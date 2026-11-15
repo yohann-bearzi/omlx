@@ -146,7 +146,8 @@ def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
 
 def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
     """What ``projection`` and ``fused_switch`` rule out, for a caller of the
-    launch itself: outputs no tile writes, pairs that are not whole rows."""
+    launch itself: outputs no tile writes, pairs that are not whole rows, a
+    row of no expert."""
     k, n = 320, 64
     projection = gather.projection(_experts(k, n), k)
     x = mx.random.normal((2, k)).astype(mx.bfloat16)
@@ -156,6 +157,8 @@ def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
         mx.eval(gather.gather_qmv(projection._replace(n=60), x, rhs, 4))
     with pytest.raises(RuntimeError, match="pairs are whole rows of LHS_DIV experts"):
         mx.eval(gather.gather_qmv(projection, x, rhs[:6], 4))
+    with pytest.raises(RuntimeError, match="LHS_DIV is the experts of a row, 1 or"):
+        mx.eval(gather.gather_qmv(projection, x, rhs, 0))
 
 
 def test_a_block_outside_the_kernel_is_left_to_the_composed_route():
@@ -283,7 +286,7 @@ def test_a_format_oMLX_does_not_know_runs_the_route(toy):  # noqa: N802
     assert len(proof.ran) == gather.MAX_ROWS - 1 and not proof.failed
 
 
-def test_an_activation_of_another_dtype_or_width_leaves_the_block_composed(
+def test_an_activation_of_another_dtype_or_shape_leaves_the_block_composed(
     toy, monkeypatch
 ):
     """The down launch is planned for the rows the gate and up give, and
@@ -291,20 +294,35 @@ def test_an_activation_of_another_dtype_or_width_leaves_the_block_composed(
     toy(_toy("gather"))
     switch = _ToySwitch(k=320, inter=72, n=40)
     x, indices = _toy_block(switch, 3)
-    assert gather.fused_switch(switch, x, indices) is not None
     activation, launch, launched = switch.activation, gather.gather_qmv, []
     monkeypatch.setattr(
         gather, "gather_qmv", lambda p, *a: (launched.append(p.n), launch(p, *a))[1]
     )
-    for other in (
+    others = (
         lambda up, gate: activation(up, gate).astype(mx.float16),
         lambda up, gate: activation(up, gate)[:, :64],
-    ):
-        monkeypatch.setattr(switch, "activation", other)
-        assert gather.fused_switch(switch, x, indices) is None
-    # The gate and up of each block, and no down.
-    assert launched == [144, 144]
+        # A row more than the pairs'.
+        lambda up, gate: mx.pad(activation(up, gate), ((0, 1), (0, 0))),
+    )
+
+    def composed():
+        for other in others:
+            with monkeypatch.context() as patch:
+                patch.setattr(switch, "activation", other)
+                assert gather.fused_switch(switch, x, indices) is None
+        # The gate and up of each block, and no down.
+        assert launched == [144] * len(others)
+        del launched[:]
+
+    # Ahead of the block's proof: it is not the launches' failure.
+    composed()
     (proof,) = _proofs()
+    assert not proof.ran and not proof.failed
+    assert gather.fused_switch(switch, x, indices) is not None
+    assert launched == [144, 40] and len(proof.ran) == 1
+    del launched[:]
+    # Then with the block proven.
+    composed()
     assert len(proof.ran) == 1 and not proof.failed
 
 

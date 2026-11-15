@@ -45,6 +45,9 @@ _SOURCE = r"""
         N_SIZE % (2 * RPS) == 0,
         "verify gather: N must be whole tiles of 8 outputs");
     static_assert(
+        LHS_DIV >= 1,
+        "verify gather: LHS_DIV is the experts of a row, 1 or more");
+    static_assert(
         N_PAIRS % LHS_DIV == 0,
         "verify gather: pairs are whole rows of LHS_DIV experts");
     const int pos = int(threadgroup_position_in_grid.y);
@@ -148,8 +151,9 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
     the block size is outside this kernel, a projection has no dot face that
-    is exact for ``x``'s dtype, the activation gives another dtype or width
-    than the gate's and up's, or a block of these faces and shapes failed.
+    is exact for ``x``'s dtype, the activation gives another dtype than
+    ``x``'s or another shape than the up's, or a block of these faces and
+    shapes failed.
     """
     batch, length, width = x.shape
     rows = batch * length
@@ -181,6 +185,7 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         hidden = switch_mlp.activation(up, gate)
         if hidden.dtype != x.dtype or hidden.shape != up.shape:
             # Not the rows that the down launch is planned and proven for.
+            # Nothing is kept of it: the next block asks its activation again.
             return None
         out = gather_qmv(plan.down, hidden, pairs, 1)
         if not proven:
