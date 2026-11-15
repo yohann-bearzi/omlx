@@ -194,11 +194,13 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
 
 def test_fusion_loads_the_formats_or_leaves_the_model_unfused(monkeypatch, caplog):
     caplog.set_level(logging.ERROR, logger=patch_mod.__name__)
+    # Built first: quantizing a layer looks its mode's format up, which loads.
+    other = _make_model(model_cls=_FakeOtherModel)
+    model, unfused = _make_model(n_blocks=1), _make_model(n_blocks=1)
     loads = []
     monkeypatch.setattr(formats, "load", lambda: loads.append(1))
-    assert apply_qwen35_moe_gate_up_fusion(_make_model(model_cls=_FakeOtherModel)) == 0
+    assert apply_qwen35_moe_gate_up_fusion(other) == 0
     assert not loads  # nothing to fuse
-    model = _make_model(n_blocks=1)
     assert apply_qwen35_moe_gate_up_fusion(model) == 1
     assert loads == [1]  # with the model, ahead of its first verify block
     assert apply_qwen35_moe_gate_up_fusion(model) == 0
@@ -208,7 +210,7 @@ def test_fusion_loads_the_formats_or_leaves_the_model_unfused(monkeypatch, caplo
         raise ImportError("a built-in format does not import")
 
     monkeypatch.setattr(formats, "load", broken)
-    model = _make_model(n_blocks=1)
+    model = unfused
     with pytest.raises(ImportError, match="built-in format"):
         apply_qwen35_moe_gate_up_fusion(model)
     glu = model.blocks[0]

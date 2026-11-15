@@ -281,6 +281,26 @@ def test_plugins_load_once_from_their_entry_points(plugins):
     assert plugins[0].loaded == 1
 
 
+def test_a_loaded_plugin_is_logged_with_its_distribution(plugins, monkeypatch, caplog):
+    def two():
+        formats.register(_Format("also"))
+        return _Format("second")
+
+    installed = _Entry("toy", _Format())
+    installed.dist = SimpleNamespace(name="omlx-toy", version="0.3.1")
+    plugins += [_Entry("two", two), installed]
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
+    with caplog.at_level(logging.INFO, logger=formats.__name__):
+        formats.load()
+    # Each plugin with the distribution that installed it, or with its entry
+    # point's value. The built-in formats are not plugins.
+    assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin toy (omlx-toy 0.3.1) registered toy",
+        "quant format plugin two (two:FORMAT) registered also, second",
+    ]
+    assert sorted(formats._FORMATS) == ["also", "builtin", "second", "toy"]
+
+
 def test_a_plugin_that_fails_to_load_is_logged_and_skipped(plugins, caplog):
     good = _Format("good")
     plugins += [
@@ -288,14 +308,17 @@ def test_a_plugin_that_fails_to_load_is_logged_and_skipped(plugins, caplog):
         _Entry("not_a_format", object()),
         _Entry("good", good),
     ]
-    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+    with caplog.at_level(logging.INFO, logger=formats.__name__):
         assert formats.get("good") is good
+    # A plugin that failed is logged as failed, and not as registered.
     assert [r.getMessage() for r in caplog.records] == [
+        "quant format plugin good (good:FORMAT) registered good",
         "quant format plugin missing (missing:FORMAT) failed to load",
         "quant format plugin not_a_format (not_a_format:FORMAT) failed to load",
     ]
     # Each with the error that failed it.
-    assert [type(r.exc_info[1]) for r in caplog.records] == [ImportError, TypeError]
+    failed = caplog.records[1:]
+    assert [type(r.exc_info[1]) for r in failed] == [ImportError, TypeError]
 
 
 def test_an_interrupt_inside_a_plugins_load_is_not_a_failed_plugin(plugins, caplog):

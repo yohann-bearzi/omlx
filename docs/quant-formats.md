@@ -17,6 +17,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 | `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/linear.py` | the layers that hold a format's tensors |
+| `omlx/patches/format_load.py` | what loads a format's checkpoint into them |
 | `omlx/formats/testing.py` | checks for a format's own tests |
 | `omlx/formats/affine.py` | affine, the built-in format |
 
@@ -34,6 +35,9 @@ class MyFormat(QuantFormat):
 
     def decode(self, tensors, bits, group_size):
         ...                # the weights as floats
+
+    def layout(self, k, n, bits, group_size):
+        ...                # what a checkpoint keeps of one matrix
 
     def dot(self, layer, k, n) -> Dot | None:
         ...                # the face that oMLX's kernels run them through
@@ -54,6 +58,7 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
+- A plugin is logged when it is loaded, with the distribution that installed it and the modes it registered: `quant format plugin myformat (my-package 0.1.0) registered myformat`.
 - A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
 - A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read can fail to load (it is then skipped), and an import in one thread can deadlock with the first lookup in another.
 
@@ -92,6 +97,36 @@ A layer keeps the tensors under their names, frozen, with the attributes of MLX'
 | either, with no dot face that is exact for `x`'s dtype, an N that is not a multiple of 8, or a K under 8 | `decode`, then MLX's matmul. A switch layer decodes the matrices its indices name or, from as many indices as its stack has matrices, the stack once (then MLX's `gather_mm`). The bits are those of the MLX kernel the call lands on, not a pair's own. |
 
 A format without a dot face is correct and slow: every call decodes, a switch layer its stack at most. A switch layer's kernel takes any number of pairs, one mat-vec each. Over affine weights on an M5 Max, up to 256 pairs it takes 0.75 to 1.05 of the time of MLX's `gather_qmm`, and at a prefill's 1024 to 8192 pairs MLX's sorted `gather_qmm` is 1.6 to 6.2 times faster. The rows kernel is proved as every kernel in a model's forward (see [Kernels over faces](#kernels-over-faces)): a face that does not compile is logged with the compiler's messages (`quant format face <key>: rows kernel failed; decode fallback`), and the layers of the same face, tensor dtypes and shape run through `decode`.
+
+## Load a checkpoint
+
+mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a layer the quantization config names is replaced by its `to_quantized(group_size, bits, mode)`, and the checkpoint's tensors are then loaded over the model's, strictly. oMLX has `nn.Linear` and the `SwitchLinear` of mlx-lm and of mlx-vlm build a `FormatLinear` or a `FormatSwitchLinear` for a mode whose format lays the matrix out:
+
+```python
+    def layout(self, k, n, bits, group_size):
+        if bits != 8:
+            return None
+        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+```
+
+`layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there, by MLX.
+
+`layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' lays out no (16, 64) matrix of 4 bits in groups of 2`. A format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
+
+A checkpoint names each layer of the format in its quantization config:
+
+```json
+"quantization": {
+    "group_size": 64, "bits": 4, "mode": "affine",
+    "model.layers.0.mlp.gate_proj": {"group_size": 1, "bits": 8, "mode": "myformat"}
+}
+```
+
+- A layer's entry holds `group_size`, `bits` and `mode`, and nothing else: the loader calls the layer's `to_quantized` with it.
+- The top-level `mode` stays one of MLX's. A layer the config does not name takes the top-level values, and the loaders find such a layer by its `scales` tensor.
+- A checkpoint of a format that is not installed fails to load: `no quant format is registered for mode 'myformat': install the plugin the checkpoint was written with`.
+- A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
+- A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three.
 
 ## Faces
 

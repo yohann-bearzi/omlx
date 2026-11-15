@@ -633,6 +633,12 @@ def maybe_apply_pre_load_patches(
 
     apply_batched_decode_qmm_patch()
 
+    # Model-independent: a checkpoint's layers of a registered quant format's
+    # mode load as the format's layers (docs/quant-formats.md).
+    from ..patches.format_load import apply_format_load_patch
+
+    apply_format_load_patch()
+
     # Model-independent: unused ArraysCache padding metadata otherwise grows
     # lazy graphs until a long-lived BatchGenerator hits the Metal resource limit.
     apply_arrays_cache_metadata_patch()

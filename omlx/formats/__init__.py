@@ -94,8 +94,9 @@ class Dot:
 
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
-    ``contract``, and overrides ``decode`` and the faces it has; a kernel
-    whose face a format lacks keeps its composed path."""
+    ``contract``, and overrides ``decode``, ``layout`` (what loads its
+    checkpoints) and the faces it has; a kernel whose face a format lacks
+    keeps its composed path."""
 
     mode: str  # a linear's "mode" in the quantization config
     tensors: tuple[str, ...]  # its parameters beside "weight" (and "bias")
@@ -112,6 +113,15 @@ class QuantFormat:
         ``weight`` and the format's tensors, by name: one matrix's, or those
         of several, with the same axes ahead of the matrix's in each."""
         raise NotImplementedError(f"quant format {self.mode!r} has no decode")
+
+    def layout(
+        self, k: int, n: int, bits: int, group_size: int
+    ) -> dict[str, tuple[tuple[int, ...], mx.Dtype]] | None:
+        """How a checkpoint keeps one ``(n, k)`` matrix: the shape and dtype
+        of its ``weight`` and of each of the format's tensors, by name. None
+        when the format keeps no such matrix, or when its layers are MLX's
+        to build (affine)."""
+        return None
 
 
 _FORMATS: dict[str, QuantFormat] = {}
@@ -162,8 +172,9 @@ def register(fmt: QuantFormat) -> None:
 
 def load() -> None:
     """Register the built-in formats, then every installed plugin's, in the
-    order of their entry points' names, then values. A plugin that fails to
-    load is logged and skipped, with every format registered while it loaded:
+    order of their entry points' names, then values. A plugin is logged with
+    its distribution and the modes it registered. One that fails to load is
+    logged and skipped, with every format registered while it loaded:
     its checkpoints then fail to load with an unknown mode, everything else
     is served. A built-in that fails to load is oMLX's own defect and raises,
     here and at every later lookup.
@@ -195,6 +206,14 @@ def load() -> None:
                         "quant format plugin %s (%s) failed to load",
                         entry.name,
                         entry.value,
+                    )
+                else:
+                    dist = getattr(entry, "dist", None)
+                    logger.info(
+                        "quant format plugin %s (%s) registered %s",
+                        entry.name,
+                        f"{dist.name} {dist.version}" if dist else entry.value,
+                        ", ".join(sorted(_FORMATS.keys() - before)),
                     )
             _loaded = True
         finally:
