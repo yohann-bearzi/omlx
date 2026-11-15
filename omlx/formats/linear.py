@@ -37,10 +37,6 @@ logger = logging.getLogger(__name__)
 # bits of its one-row call, whatever rows it is launched with.
 MAX_ROWS = 16
 
-# What opens the ValueError of MLX's eval for an array of a function that it
-# is tracing (compile, vmap).
-_TRACED = "[eval] Attempting to eval"
-
 # One threadgroup per pair (a row of x and the matrix it meets) and tile of 8
 # of the pair's outputs: 4 for each of the threadgroup's two simdgroups.
 # __MATRIX__ is the pair's matrix in the stack, __X_ROW__ its row of x.
@@ -96,6 +92,7 @@ class _Plan(NamedTuple):
     proof: kernels.Proof
     k: int
     n: int
+    said: tuple[str, str]  # what a proof logs: the launches engaged, or failed
 
 
 def _plan(layer) -> _Plan | None:
@@ -118,7 +115,11 @@ def _plan(layer) -> _Plan | None:
         k,
         n,
     )
-    return _Plan(face, _kernel(face, stacked), operands, proof, k, n)
+    said = (
+        f"quant format face {face.key}: rows kernel engaged",
+        f"quant format face {face.key}: rows kernel failed; decode fallback",
+    )
+    return _Plan(face, _kernel(face, stacked), operands, proof, k, n, said)
 
 
 def _rows(kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1):
@@ -154,6 +155,16 @@ def _linear(kernel, k: int, n: int, x):
     return x.dtype, graph
 
 
+def _linear_stand_in(plan: _Plan, metal) -> mx.array:
+    """The smallest launch of a matrix that MLX generates the Metal of
+    ``metal`` for (x's type), over zeros: one vector, and the whole of each
+    tensor. What follows the rows in a matrix's tensors is the format's
+    own, so no part of a tensor is known to be all that a row reads."""
+    tensors = [mx.zeros(a.shape, a.dtype) for a in plan.operands]
+    x = mx.zeros((plan.k,), metal)
+    return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,))
+
+
 def _switch(kernel, k: int, n: int, x, indices):
     """A stack's launch for ``x`` and ``indices``, as ``_linear`` gives a
     matrix's, with the indices ahead of the operands; None when there is no
@@ -187,7 +198,25 @@ def _switch(kernel, k: int, n: int, x, indices):
     return (x.dtype, per_row, pairs < 8), graph
 
 
-def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
+def _switch_stand_in(plan: _Plan, metal) -> mx.array:
+    """The smallest launch of a stack that MLX generates the Metal of
+    ``metal`` for, over zeros. MLX binds an input of fewer than 8 elements
+    as constants, which is other Metal: the stand-in has the fewest rows of
+    x whose pairs are 8 or more, or fewer, as the call's are, and the
+    fewest matrices that leave each tensor 8 elements. Every pair is with
+    matrix 0."""
+    dtype, per_row, few = metal
+    rows = 1 if few else -(-8 // per_row)
+    pairs = rows * per_row
+    matrices = max(-(-8 * a.shape[0] // a.size) for a in plan.operands)
+    tensors = [mx.zeros((matrices, *a.shape[1:]), a.dtype) for a in plan.operands]
+    x = mx.zeros((rows, plan.k), dtype)
+    rhs = mx.zeros((pairs,), mx.uint32)
+    shape = (pairs, plan.n)
+    return _rows(plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row)
+
+
+def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     """``arrays`` (x, then a stack's indices) through the rows kernel, the
     first time for ``signature``, or None: the layer has no plan, the face
     is not exact for x's type, there is nothing to launch, or the launch
@@ -198,50 +227,24 @@ def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
     type), by the thread that builds it: a layer's call asks for the graph
     its thread kept first, and replays it.
 
-    The first time its Metal is built, the launch is proven here on zeros
-    in the place of ``arrays``: their shapes and types are all the Metal
-    depends on, and index 0 is a matrix of any stack. ``arrays`` may belong
-    to a trace (a model calls its layers in functions that MLX compiles),
-    where they cannot be evaluated; neither they nor the call's result ever
-    are, here. The layer's tensors are evaluated ahead of the proof: what
-    fails there is raised as it is. Tensors that belong to a trace
-    themselves (the function's ``inputs``) leave nothing to prove the launch
-    over: it is built unproven, and is not kept. MLX's refusal to evaluate
-    them stays in here: an error that leaves such a function leaves the
-    trace's arrays in its state."""
-    if plan is None:
-        return None
-    proof = plan.proof
-    if proof.failed or not plan.face.exact_for(arrays[0].dtype):
+    The first time its Metal is built, it is proven on ``stand_in``: the
+    smallest launch that MLX generates the same Metal for, over zeros in
+    the place of x, of the indices and of the layer's tensors. Nothing of
+    the call is evaluated here: not ``arrays``, not a tensor, not the
+    result. Any of them may belong to a trace (a model calls its layers in
+    functions that MLX compiles, over its state too), where it cannot be
+    evaluated, and what fails in one is raised where the caller evaluates
+    the result."""
+    if plan is None or not plan.face.exact_for(arrays[0].dtype):
         return None
     launch = describe(plan.kernel, plan.k, plan.n, *arrays)
     if launch is None:
         return None
     metal, graph = launch
+    proof = plan.proof
+    if not proof.prove(metal, lambda: stand_in(plan, metal), logger, *plan.said):
+        return None
     graph = mx.compile(graph)
-    if metal not in proof.ran:
-        try:
-            mx.eval(*plan.operands)
-        except ValueError as error:
-            if not str(error).startswith(_TRACED):
-                raise
-            return graph(*arrays, *plan.operands)
-        zeros = (mx.zeros(a.shape, a.dtype) for a in arrays)
-        proving = graph(*zeros, *plan.operands)
-        try:
-            # Surface a kernel build failure while the call can still fall
-            # back.
-            mx.eval(proving)
-        except Exception:
-            proof.fail()
-            logger.warning(
-                "quant format face %s: rows kernel failed; decode fallback",
-                plan.face.key,
-                exc_info=True,
-            )
-            return None
-        proof.ran.add(metal)
-        logger.info("quant format face %s: rows kernel engaged", plan.face.key)
     y = graph(*arrays, *plan.operands)
     proof.keep(signature, graph)
     return y
@@ -332,7 +335,7 @@ class FormatLinear(_FormatLayer):
                 raise ValueError(f"x has {shape[-1]} features, the layer takes {k}")
             y = None
             if 0 < x.size // k <= MAX_ROWS:
-                y = _launch(plan, (shape, dtype), _linear, x)
+                y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
         if "bias" in self:
@@ -368,7 +371,7 @@ class FormatSwitchLinear(_FormatLayer):
             k = self.input_dims
             if len(shape) < 2 or shape[-1] != k:
                 raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
-            y = _launch(plan, signature, _switch, x, indices)
+            y = _launch(plan, signature, _switch, _switch_stand_in, x, indices)
             if y is None and indices.size < self.num_experts:
                 # A decode step's indices: their matrices alone are decoded.
                 weights = self._decoded(indices).astype(dtype)

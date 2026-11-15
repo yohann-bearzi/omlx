@@ -19,6 +19,8 @@ from __future__ import annotations
 import threading
 from dataclasses import dataclass, field
 
+import mlx.core as mx
+
 from .. import formats
 from . import Dot
 
@@ -182,10 +184,12 @@ class Proof:
     faces, tensor dtypes and shapes.
 
     MLX compiles a kernel when it first evaluates it. So a kernel evaluates
-    each launch the first time it is built, while the call can still fall
-    back, and a launch that fails, whatever failed in that evaluation, keeps
-    what shares the proof on its composed path until the process ends. The
-    launch's inputs are evaluated ahead of it: their failure is the caller's.
+    a launch of each Metal it is instantiated as before it builds a call's
+    (``prove``), while the call can still fall back, and a launch that
+    fails, whatever failed in that evaluation, keeps what shares the proof
+    on its composed path until the process ends. A kernel that evaluates the
+    call's own launch for this evaluates the launch's inputs ahead of it:
+    their failure is the caller's.
 
     A launch's graph is a function of its arrays' shapes and types alone, so
     a kernel builds it once for each, through MLX's compile, and keeps it
@@ -212,6 +216,58 @@ class Proof:
         """The calling thread's graphs, each under its launch's signature."""
         return self._kept.graphs
 
+    def prove(self, metal, build, log, engaged: str, failed: str) -> bool:
+        """Whether the kernel's launches of ``metal`` run: one ran before,
+        or the launch that ``build`` gives is evaluated here, and runs.
+
+        ``metal`` names one Metal of the proof's kernel: what its source is
+        instantiated with beside the proof's key (x's type, a template
+        value, an input that MLX binds another way). ``build`` gives a
+        launch of that Metal, not evaluated. Its caller answers for two
+        things:
+
+        - the launch reads stand-ins alone, arrays that the kernel makes
+          for it (zeros): no array of the call, no tensor of a layer. Those
+          may belong to a function that MLX is tracing, which refuses to
+          evaluate them; what fails in them is their owner's failure, not
+          the Metal's; and they have the call's size, where a proof needs
+          the smallest.
+        - MLX generates the source of the call's launch for it: the same
+          kernel, template values and output dtypes and, input by input,
+          the same dtype, fewer than 8 elements or not, an axis or none.
+          Shapes, the grid and the output's shape are no part of the source.
+
+        What ``build`` raises is raised: a launch that cannot be built is
+        the kernel's defect, or its caller's. What the evaluation raises,
+        of any type, is the Metal's failure: the proof fails (``fail``),
+        ``failed`` is logged to ``log`` with the error, and the answer is
+        False, as it is from then on for every Metal. A launch that runs
+        marks ``metal`` in ``ran`` and logs ``engaged``.
+
+        Threads: no lock is held while the launch is built and evaluated,
+        so two threads that meet ``metal`` unproven at once each prove it
+        and log it; MLX builds the Metal once for the device, and it is
+        marked once. A failure is recorded under the lock that ``keep``
+        takes, for every thread. A thread whose launch ran while another's
+        failed has the answer True: its call has its launch, and ``keep``
+        keeps no graph of it."""
+        if self.failed:
+            return False
+        if metal in self.ran:
+            return True
+        launch = build()
+        try:
+            # Surface a kernel build failure while the call can still fall
+            # back.
+            mx.eval(launch)
+        except Exception:
+            self.fail()
+            log.warning(failed, exc_info=True)
+            return False
+        self.ran.add(metal)
+        log.info(engaged)
+        return True
+
     def keep(self, signature, graph) -> None:
         """Keep ``graph``, a function that ``mx.compile`` gave and that the
         calling thread built, for the thread's launches of ``signature``:
@@ -222,20 +278,27 @@ class Proof:
         others with the rest as the first call left it: under a signature
         that leaves a shape out, a call replays the launch of another's
         rows. A proof that failed, on any thread, keeps nothing."""
+        ended = None
         with _KEEPING:
             if self.failed:
                 return
-            graphs = self._kept.graphs
-            if len(graphs) >= MAX_GRAPHS:
-                graphs.clear()
-            graphs[signature] = graph
+            kept = self._kept
+            if len(kept.graphs) >= MAX_GRAPHS:
+                ended, kept.graphs = kept.graphs, {}
+            kept.graphs[signature] = graph
+        # The graphs that one more dropped end here, the lock released: as
+        # many as MAX_GRAPHS launches for MLX to end.
+        del ended
 
     def fail(self) -> None:
         """A launch failed: nothing that shares the proof is launched again,
-        on any thread. Every thread's graphs end here."""
+        on any thread. Every thread's graphs are dropped with the failure,
+        in one step for a thread that keeps one meanwhile, and end once the
+        lock is released."""
         with _KEEPING:
             self.failed = True
-            self._kept = _Kept()
+            ended, self._kept = self._kept, _Kept()
+        del ended
 
 
 # The graphs a thread keeps of one proof: a decode step's, those of the short

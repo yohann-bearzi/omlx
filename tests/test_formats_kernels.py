@@ -6,6 +6,7 @@ compile with a message that names the format's own source.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import weakref
@@ -242,6 +243,182 @@ def test_no_graph_is_kept_while_a_failure_is_recorded(monkeypatch):
     monkeypatch.setattr(kernels, "_KEEPING", FailedMeanwhile())
     proof.keep("b", _Graph())
     assert proof.failed and proof.graphs == {}
+
+
+def test_a_graph_kept_while_a_failure_waits_ends_with_it(monkeypatch):
+    """The other order: a graph is kept as a failure reaches for the lock.
+    The failure and the graphs' end are one step for a thread that keeps."""
+    lock = kernels._KEEPING
+
+    class KeptMeanwhile:
+        def __enter__(self):
+            monkeypatch.setattr(kernels, "_KEEPING", lock)
+            proof.keep("a", _Graph())
+            lock.acquire()
+
+        def __exit__(self, *error):
+            lock.release()
+
+    proof = kernels.Proof()
+    monkeypatch.setattr(kernels, "_KEEPING", KeptMeanwhile())
+    proof.fail()
+    assert proof.failed and proof.graphs == {}
+
+
+def test_a_thread_finds_its_graphs_without_the_lock(monkeypatch):
+    """A decode step's lookup waits for no thread that keeps a graph, or
+    that ends as many as it kept."""
+    proof = kernels.Proof()
+    proof.keep("a", "A")
+
+    class Taken:
+        def __enter__(self):
+            pytest.fail("the lookup took the lock")
+
+        def __exit__(self, *error):
+            pass
+
+    monkeypatch.setattr(kernels, "_KEEPING", Taken())
+    assert proof.graphs.get("a") == "A"
+
+
+def test_graphs_end_once_the_lock_is_released(monkeypatch):
+    """A compiled function's end is MLX's work, for as many graphs as a
+    thread kept, or as every thread did: nothing waits for it behind the
+    lock."""
+    monkeypatch.setattr(kernels, "MAX_GRAPHS", 2)
+    proof, ended = kernels.Proof(), []
+
+    def keep(name):
+        graph = _Graph()
+        weakref.finalize(graph, lambda: ended.append((name, kernels._KEEPING.locked())))
+        proof.keep(name, graph)
+
+    for name in "abc":
+        keep(name)
+    # The third dropped the two that were kept; a failure drops the third.
+    assert ended == [("a", False), ("b", False)]
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(keep, "d").result()
+        proof.fail()
+        assert sorted(ended[2:]) == [("c", False), ("d", False)]
+
+
+_LOG = logging.getLogger("omlx.formats.a_kernel")
+
+
+def _said(caplog):
+    """What a proof logged for its kernel: each record's level, sentence
+    and error."""
+    return [
+        (r.levelname, r.getMessage(), r.exc_info and r.exc_info[1])
+        for r in caplog.records
+        if r.name == _LOG.name
+    ]
+
+
+def _proves(proof, metal, build):
+    return proof.prove(metal, build, _LOG, "engaged", "failed; fallback")
+
+
+def test_a_proof_evaluates_the_launch_it_is_given_once_for_a_metal(monkeypatch, caplog):
+    """A kernel hands a proof the smallest launch of a Metal: the proof
+    builds it, evaluates it and marks the Metal, in the kernel's words."""
+    caplog.set_level(logging.INFO, logger=_LOG.name)
+    proof, built, evaluated = kernels.Proof(), [], []
+    evaluate = mx.eval
+
+    def recorded(*arrays):
+        evaluated.append(arrays)
+        evaluate(*arrays)
+
+    def build():
+        built.append(mx.zeros((8,)) + len(built))
+        return built[-1]
+
+    monkeypatch.setattr(mx, "eval", recorded)
+    assert _proves(proof, "metal", build) is True
+    assert proof.ran == {"metal"} and not proof.failed
+    assert len(built) == 1 and evaluated == [(built[0],)]
+    assert _said(caplog) == [("INFO", "engaged", None)]
+    # A Metal that ran is neither built nor evaluated again. Another one is.
+    assert _proves(proof, "metal", build) is True
+    assert len(built) == 1 and len(evaluated) == 1 and len(_said(caplog)) == 1
+    assert _proves(proof, "other", build) is True
+    assert proof.ran == {"metal", "other"} and evaluated[1:] == [(built[1],)]
+    assert len(_said(caplog)) == 2
+    # A proof keeps no graph by itself.
+    assert proof.graphs == {}
+
+
+class _ProofError(Exception):
+    """An error of a type that is no other's."""
+
+
+def _raise(error):
+    raise error
+
+
+def test_a_launch_that_fails_its_evaluation_fails_the_proof(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_LOG.name)
+    proof, error, built = kernels.Proof(), _ProofError("not evaluated"), []
+    proof.ran.add("ran")
+    proof.keep("signature", _Graph())
+
+    def build():
+        built.append(mx.zeros((8,)))
+        return built[-1]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "eval", lambda *arrays: _raise(error))
+        assert _proves(proof, "metal", build) is False
+    assert proof.failed and proof.ran == {"ran"} and proof.graphs == {}
+    assert _said(caplog) == [("WARNING", "failed; fallback", error)]
+    # Nothing is built for a proof that failed: for another Metal, or for
+    # one that ran.
+    assert _proves(proof, "other", build) is False
+    assert _proves(proof, "ran", build) is False
+    assert len(built) == 1 and len(_said(caplog)) == 1
+
+
+def test_what_fails_as_a_proof_s_launch_is_built_is_raised(caplog):
+    """A launch that cannot be built is not one that failed: the error is
+    the kernel's own, or its caller's."""
+    caplog.set_level(logging.INFO, logger=_LOG.name)
+    proof, error = kernels.Proof(), _ProofError("no launch")
+    with pytest.raises(_ProofError) as raised:
+        _proves(proof, "metal", lambda: _raise(error))
+    assert raised.value is error
+    assert not proof.failed and not proof.ran and not _said(caplog)
+
+
+def test_two_threads_prove_a_metal_at_once_without_waiting_for_each_other(
+    monkeypatch,
+):
+    """No lock is held while a launch is built, nor while it is evaluated:
+    each of the threads that meet a Metal unproven proves it, and it is
+    marked once."""
+    proof, together = kernels.Proof(), threading.Barrier(2, timeout=10)
+    evaluate, met = mx.eval, []
+
+    def build():
+        met.append(("built", threading.get_ident()))
+        together.wait()
+        return mx.zeros((8,))
+
+    def evaluated(*arrays):
+        met.append(("evaluated", threading.get_ident()))
+        together.wait()
+        evaluate(*arrays)
+
+    monkeypatch.setattr(mx, "eval", evaluated)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        proving = [pool.submit(_proves, proof, "metal", build) for _ in range(2)]
+        assert [proved.result(timeout=30) for proved in proving] == [True, True]
+    # Both threads were in the build together, then in the evaluation.
+    assert [step for step, _ in met] == ["built"] * 2 + ["evaluated"] * 2
+    assert len({thread for _, thread in met}) == 2
+    assert proof.ran == {"metal"} and not proof.failed
 
 
 def test_a_matrix_is_its_weight_then_its_tensors():
