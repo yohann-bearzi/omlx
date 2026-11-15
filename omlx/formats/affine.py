@@ -38,8 +38,6 @@ constant constexpr int PACKS_PER_THREAD = FAST ? 2 : 1;
 constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
 constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
 constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
-constant constexpr int RESULTS_PER_SIMDGROUP = 4;
-constant constexpr int BN = 8;
 
 template <typename T>
 inline float load_vector(const device T* x, thread float* x_thread) {

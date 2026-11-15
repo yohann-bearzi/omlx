@@ -3,11 +3,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import mlx.core as mx
 import pytest
 from mlx_lm.models.switch_layers import SwitchGLU
 
 import omlx.patches.qwen35_moe_gate_up as patch_mod
+from omlx import formats
 from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
 
 E, TOPK, HIDDEN, INTER = 8, 2, 64, 32
@@ -189,6 +192,31 @@ def test_qwen4_exp_family_is_eligible_for_gate_up_fusion():
     assert hasattr(model.blocks[0], "gate_up_proj")
 
 
+def test_fusion_loads_the_formats_or_leaves_the_model_unfused(monkeypatch, caplog):
+    caplog.set_level(logging.ERROR, logger=patch_mod.__name__)
+    loads = []
+    monkeypatch.setattr(formats, "load", lambda: loads.append(1))
+    assert apply_qwen35_moe_gate_up_fusion(_make_model(model_cls=_FakeOtherModel)) == 0
+    assert not loads  # nothing to fuse
+    assert apply_qwen35_moe_gate_up_fusion(_make_model(n_blocks=1)) == 1
+    assert loads == [1]  # with the model, ahead of its first verify block
+
+    def broken():
+        raise ImportError("a built-in format does not import")
+
+    monkeypatch.setattr(formats, "load", broken)
+    model = _make_model(n_blocks=1)
+    with pytest.raises(ImportError, match="built-in format"):
+        apply_qwen35_moe_gate_up_fusion(model)
+    glu = model.blocks[0]
+    assert hasattr(glu, "gate_proj") and not hasattr(glu, "gate_up_proj")
+    # Said here: the engine's guard logs what it catches at debug level.
+    (record,) = [r for r in caplog.records if r.name == patch_mod.__name__]
+    message = "quant formats did not load; MoE gate+up fusion not applied"
+    assert record.levelno == logging.ERROR and record.getMessage() == message
+    assert type(record.exc_info[1]) is ImportError
+
+
 def test_unsupported_family_skipped():
     model = _make_model(model_cls=_FakeOtherModel)
     assert apply_qwen35_moe_gate_up_fusion(model) == 0
@@ -348,7 +376,8 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
         linear = VLMSwitchLinear(k, n, experts, bias=False)
         linear.set_dtype(mx.bfloat16)
         linear = linear.to_quantized(group_size=32, bits=bits)
-        assert moe_verify_gather.supported(linear, mx.bfloat16)
+        projection = moe_verify_gather.projection(linear, k)
+        assert projection.face.exact_for(mx.bfloat16)
         for rows in (2, 8):
             indices = mx.stack(
                 [mx.random.permutation(experts)[:top_k] for _ in range(rows)]
@@ -364,7 +393,9 @@ def test_expert_ordered_verify_gather_matches_gather_qmm(bits):
                 group_size=32,
                 bits=bits,
             ).reshape(rows * top_k, n)
-            got = moe_verify_gather.gather_qmv(linear, x, indices.reshape(-1), top_k)
+            got = moe_verify_gather.gather_qmv(
+                projection, x, indices.reshape(-1), top_k
+            )
             assert mx.array_equal(got, expected).item()
 
 

@@ -444,7 +444,10 @@ The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFo
 | Kernel | Face | Code |
 |---|---|---|
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
+| Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
 
 The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
 
 A face that does not compile does not fail the model. The decode evaluates a launch inside the call the first time blocks of the same faces, tensor dtypes and shapes build it, once the block's input is evaluated (a failure ahead of the block is raised as it is). If a one-token launch fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path. If the launch of a verify window or of batched rows fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.
+
+The verify gather runs a block's fused gate+up projection, then its down projection, when both are stacked expert weights without a bias, of an N that is whole tiles of 8 outputs, each with a dot face that is exact for the block's dtype. It proves its launches as the routed decode does: a block that fails (`expert-ordered verify gather failed; composed fallback`) keeps the projections of the same faces, tensor dtypes and shapes on their composed path.

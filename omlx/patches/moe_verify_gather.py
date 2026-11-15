@@ -10,34 +10,52 @@ This kernel runs the same pairs, one threadgroup per pair and output tile,
 but in expert order: each threadgroup finds the pair at its sorted position,
 and the grid covers all pairs of one output tile before the next. Pairs that
 share an expert then run back to back and read the expert tile from cache.
-Per pair, the arithmetic is MLX's ``qmv_fast`` or ``qmv`` traversal (chosen by
-``qmv_fast_layout``, MLX's rule), in the MLX 0.32.4 ``quantized.h``
-transcription of ``omlx.formats.affine``, so each output equals the
-``gather_qmm`` output bit for bit.
+Per pair, the rows are the dot face of the weights' format in the mat-vec
+skeleton (``omlx.formats``). The affine face is MLX's ``qmv_fast`` or ``qmv``
+traversal, so each of its outputs equals the ``gather_qmm`` output bit for
+bit.
 """
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass, field
 from functools import cache
+from typing import Any, NamedTuple
 
 import mlx.core as mx
+import mlx.nn as nn
 
-from ..formats.affine import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
+from .. import formats
+from ..formats import Dot, kernels
+from .module_cache import cached_per_module
+
+logger = logging.getLogger(__name__)
 
 MAX_ROWS = 8
+
+_STORE = r"""
+// A simdgroup's rows of a pair, each rounded to T.
+template <typename T, int... R>
+METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T* y) {
+  ((y[R] = static_cast<T>(result[R])), ...);
+}
+"""
 
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
 # pair of one tile before the next tile, so pairs sharing an expert run back
-# to back and read that expert tile from cache. Per pair this follows
-# qmv_fast_impl (FAST) or the full-tile branch of qmv_impl.
+# to back and read that expert tile from cache. A tile is 8 of a pair's
+# output rows: 4 for each of the threadgroup's two simdgroups.
 _SOURCE = r"""
+    constexpr int LANES = 32;  // of a simdgroup
+    constexpr int RPS = 4;     // output rows of a simdgroup
     const int pos = int(threadgroup_position_in_grid.y);
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
     threadgroup int chosen;
-    const int first = int(simd_gid * SIMD_SIZE + simd_lid);
-    for (int p = first; p < N_PAIRS; p += 2 * SIMD_SIZE) {
+    const int first = int(simd_gid * LANES + simd_lid);
+    for (int p = first; p < N_PAIRS; p += 2 * LANES) {
       const uint e = rhs[p];
       int rank = 0;
       for (int q = 0; q < N_PAIRS; ++q) {
@@ -48,160 +66,174 @@ _SOURCE = r"""
         chosen = p;
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     const int pair = chosen;
-    const int expert = int(rhs[pair]);
 
-    const int in_vec_size_w = K_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-    const int in_vec_size_g = K_SIZE / GS;
-    const int out_row = int(threadgroup_position_in_grid.z) * BN +
-        int(simd_gid) * RESULTS_PER_SIMDGROUP;
-
-    const device uint8_t* ws = (const device uint8_t*)w +
-        expert * (N_SIZE * in_vec_size_w) + out_row * in_vec_size_w +
-        int(simd_lid) * PACKS_PER_THREAD * BYTES_PER_PACK;
-    const device T* sc = scales + expert * (N_SIZE * in_vec_size_g) +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* bs = biases + expert * (N_SIZE * in_vec_size_g) +
-        out_row * in_vec_size_g + int(simd_lid) / SCALE_STEP_PER_THREAD;
-    const device T* xp = x + (pair / LHS_DIV) * K_SIZE +
-        int(simd_lid) * VALUES_PER_THREAD;
-
-    float x_thread[VALUES_PER_THREAD];
-    float result[RESULTS_PER_SIMDGROUP] = {0};
-
-    int k = 0;
-    const int full_limit = FAST ? K_SIZE : K_SIZE - BLOCK_SIZE;
-    for (; k < full_limit; k += BLOCK_SIZE) {
-      float sum = load_vector<T>(xp, x_thread);
-      for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
-        const device uint8_t* wl = ws + row * in_vec_size_w;
-        float s = sc[row * in_vec_size_g];
-        float b = bs[row * in_vec_size_g];
-        result[row] += qdot_n(wl, x_thread, s, b, sum, VALUES_PER_THREAD);
-      }
-      ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
-      sc += BLOCK_SIZE / GS;
-      bs += BLOCK_SIZE / GS;
-      xp += BLOCK_SIZE;
-    }
-    if (!FAST) {
-      const int remaining = clamp(
-          int(K_SIZE - k - int(simd_lid) * VALUES_PER_THREAD),
-          0,
-          VALUES_PER_THREAD);
-      if (remaining > 0) {
-        float sum = load_vector_safe<T>(xp, x_thread, remaining);
-        for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
-          const device uint8_t* wl = ws + row * in_vec_size_w;
-          float s = sc[row * in_vec_size_g];
-          float b = bs[row * in_vec_size_g];
-          result[row] += qdot_n(wl, x_thread, s, b, sum, remaining);
-        }
-      }
-    }
-
-    for (int row = 0; row < RESULTS_PER_SIMDGROUP; row++) {
-      float v = simd_sum(result[row]);
-      if (simd_lid == 0) {
-        y[pair * N_SIZE + out_row + row] = static_cast<T>(v);
-      }
+    const int out_row =
+        int(threadgroup_position_in_grid.z) * (2 * RPS) + int(simd_gid) * RPS;
+    float result[RPS];
+    qmv_rows<T, K_SIZE, RPS, 0>(
+        rt, size_t(rhs[pair]) * N_SIZE + out_row, rt, 0,
+        x + (pair / LHS_DIV) * K_SIZE, simd_lid, result);
+    if (simd_lid == 0) {
+      store_rows(omlx_iota<RPS>(), result, y + pair * N_SIZE + out_row);
     }
 """
 
 
 @cache
-def _kernel(bits: int, group_size: int, fast: bool):
-    header = (
-        _HEADER.replace("__BITS__", str(bits))
-        .replace("__GS__", str(group_size))
-        .replace("__FAST__", "1" if fast else "0")
-    )
+def _kernel(face: Dot):
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", face), "rhs"]
     return mx.fast.metal_kernel(
-        name=f"omlx_moe_verify_gather_b{bits}_gs{group_size}_{int(fast)}",
-        input_names=["x", "w", "scales", "biases", "rhs"],
+        name=f"omlx_moe_verify_gather_{face.key}",
+        input_names=inputs,
         output_names=["y"],
-        header=header,
-        source=_SOURCE,
+        header=matrices.header + _STORE,
+        source=matrices.declarations + _SOURCE,
     )
 
 
-def supported(linear, dtype) -> bool:
-    """True when ``linear`` is a quantized switch linear this kernel matches."""
-    biases = linear.get("biases") if hasattr(linear, "get") else None
-    weight = linear.get("weight") if hasattr(linear, "get") else None
-    scales = linear.get("scales") if hasattr(linear, "get") else None
-    if weight is None or scales is None or biases is None or "bias" in linear:
-        return False
-    if getattr(linear, "mode", "affine") != "affine":
-        return False
-    bits, group_size = getattr(linear, "bits", None), getattr(
-        linear, "group_size", None
+@dataclass
+class _Proof:
+    """What is known of the launches that projections of the same faces,
+    tensor dtypes and shapes compile.
+
+    MLX compiles a kernel when it first evaluates it. So a block's launches
+    are evaluated the first time they are built, while the call can still
+    fall back, and a block that fails keeps these projections on their
+    composed path. The block's inputs are evaluated ahead of it: their
+    failure is the caller's."""
+
+    ran: set = field(default_factory=set)  # (rows, top-k width, x's dtype)
+    failed: bool = False
+
+
+_PROOFS: dict[tuple, _Proof] = {}
+
+
+class Projection(NamedTuple):
+    """Stacked expert weights as this kernel runs them."""
+
+    face: Dot
+    kernel: Any
+    operands: tuple  # the weight, then the face's tensors
+    n: int
+
+
+class _Plan(NamedTuple):
+    gate_up: Projection
+    down: Projection
+    proof: _Proof
+
+
+def projection(linear, k: int) -> Projection | None:
+    """``linear``'s experts (``[E, N, K]``, no bias) as this kernel runs
+    them, or None: their format has a dot face for them, and N is whole
+    tiles of 8 outputs."""
+    if not isinstance(linear, nn.Module) or "bias" in linear:
+        return None
+    weight = linear.get("weight")
+    if not isinstance(weight, mx.array) or weight.ndim != 3 or weight.shape[1] % 8:
+        return None
+    n = weight.shape[1]
+    face = formats.dot(linear, k, n)
+    if face is None:
+        return None
+    operands = tuple(linear[name] for name in ("weight", *face.tensors))
+    return Projection(face, _kernel(face), operands, n)
+
+
+def _build_plan(switch_mlp, width: int) -> _Plan | None:
+    gate_up = projection(switch_mlp.get("gate_up_proj"), width)
+    if gate_up is None:
+        return None
+    down = projection(switch_mlp.get("down_proj"), gate_up.n // 2)
+    if down is None:
+        return None
+    # What the launches are compiled from, beside a block's rows and routing.
+    proof = _PROOFS.setdefault(
+        (
+            gate_up.face,
+            down.face,
+            tuple(a.dtype for a in gate_up.operands + down.operands),
+            width,
+            gate_up.n,
+            down.n,
+        ),
+        _Proof(),
     )
-    if bits not in _BITS or group_size not in _GROUP_SIZES:
-        return False
-    n = int(weight.shape[-2])
-    k = int(scales.shape[-1]) * group_size
-    values_per_thread = (8 if bits == 5 else (4 if bits == 6 else 32 // bits)) * (
-        2 if qmv_fast_layout(k, n, bits, gathered=True) else 1
-    )
-    return (
-        weight.ndim == 3
-        and n % 8 == 0
-        and k % 8 == 0
-        and group_size % values_per_thread == 0
-        and scales.dtype == dtype
-        and biases.dtype == dtype
-        and dtype in (mx.bfloat16, mx.float16)
-    )
+    return _Plan(gate_up, down, proof)
 
 
 def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     """Fused gate/up then down routed projections for 2..MAX_ROWS rows.
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
-    the block size or weight format is outside this kernel.
+    the block size is outside this kernel, a projection has no dot face that
+    is exact for ``x``'s dtype, or a block of these faces and shapes failed.
     """
     batch, length, width = x.shape
     rows = batch * length
-    gate_up = getattr(switch_mlp, "gate_up_proj", None)
-    down = getattr(switch_mlp, "down_proj", None)
-    if not (
-        1 < rows <= MAX_ROWS
-        and gate_up is not None
-        and down is not None
-        and supported(gate_up, x.dtype)
-        and supported(down, x.dtype)
+    if not 1 < rows <= MAX_ROWS:
+        return None
+    plan = cached_per_module(
+        switch_mlp,
+        "_omlx_verify_gather_plan",
+        lambda switch: _build_plan(switch, width),
+        flags=(width,),
+    )
+    if (
+        plan is None
+        or plan.proof.failed
+        or not plan.gate_up.face.exact_for(x.dtype)
+        or not plan.down.face.exact_for(x.dtype)
     ):
         return None
-    top_k = int(indices.shape[-1])
+    top_k = indices.shape[-1]
     pairs = indices.reshape(rows * top_k)
-    gate_up_out = gather_qmv(gate_up, x.reshape(rows, width), pairs, top_k)
-    gate, up = mx.split(gate_up_out, 2, axis=-1)
-    out = gather_qmv(down, switch_mlp.activation(up, gate), pairs, 1)
+    launch = (rows, top_k, x.dtype)
+    proven = launch in plan.proof.ran
+    if not proven:
+        # What fails ahead of the block is not the launches' failure.
+        mx.eval(x, indices)
+    try:
+        gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k)
+        gate, up = mx.split(gate_up, 2, axis=-1)
+        out = gather_qmv(plan.down, switch_mlp.activation(up, gate), pairs, 1)
+        if not proven:
+            # Surface a kernel build failure while the call can still fall
+            # back.
+            mx.eval(out)
+            plan.proof.ran.add(launch)
+            logger.info("MoE expert-ordered verify gather engaged (%d rows)", rows)
+    except Exception:
+        plan.proof.failed = True
+        logger.warning(
+            "expert-ordered verify gather failed; composed fallback", exc_info=True
+        )
+        return None
     return out.reshape(batch, length, top_k, -1)
 
 
-def gather_qmv(linear, x: mx.array, rhs: mx.array, pairs_per_row: int) -> mx.array:
+def gather_qmv(
+    projection: Projection, x: mx.array, rhs: mx.array, pairs_per_row: int
+) -> mx.array:
     """``gather_qmm`` over P (row, expert) pairs, pairs grouped by expert.
 
     ``rhs`` holds the expert of each pair; pair ``p`` reads row
     ``p // pairs_per_row`` of ``x`` (``[R, K]``). Returns ``[P, N]``.
     """
-    weight, scales, biases = linear["weight"], linear["scales"], linear["biases"]
-    k = int(x.shape[-1])
-    n = int(weight.shape[-2])
-    pairs = int(rhs.shape[0])
-    fast = qmv_fast_layout(k, n, int(linear.bits), gathered=True)
-    kernel = _kernel(int(linear.bits), int(linear.group_size), fast)
-    return kernel(
-        inputs=[x, weight, scales, biases, rhs],
+    n = projection.n
+    pairs = rhs.shape[0]
+    return projection.kernel(
+        inputs=[x, *projection.operands, rhs],
         template=[
             ("T", x.dtype),
-            ("K_SIZE", k),
+            ("K_SIZE", x.shape[-1]),
             ("N_SIZE", n),
             ("N_PAIRS", pairs),
-            ("LHS_DIV", int(pairs_per_row)),
+            ("LHS_DIV", pairs_per_row),
         ],
         grid=(32, 2 * pairs, n // 8),
         threadgroup=(32, 2, 1),

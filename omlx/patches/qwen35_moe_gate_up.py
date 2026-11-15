@@ -47,6 +47,7 @@ from mlx_vlm.models.switch_layers import (
     SwitchLinear as VLMSwitchLinear,
 )
 
+from .. import formats
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
 from .m5_gather_qmm import fused_gate_up_activation
@@ -354,6 +355,14 @@ def apply_qwen35_moe_gate_up_fusion(model: Any) -> int:
     ]
     if not targets:
         return 0
+    # Read the weight formats with the model rather than in its first verify
+    # block. A registry that cannot load leaves the model unfused. The engine
+    # applies its patches under a guard that logs at debug level.
+    try:
+        formats.load()
+    except Exception:
+        logger.exception("quant formats did not load; MoE gate+up fusion not applied")
+        raise
     _ensure_call_patch()
     _ensure_vlm_verify_patch()
     for switch_mlp in targets:

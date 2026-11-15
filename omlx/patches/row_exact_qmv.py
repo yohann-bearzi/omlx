@@ -46,8 +46,7 @@ _ROW_VALUES_BUDGET = 32
 # matrices and 4/5/6-bit unpackers are faster with the existing divisor tile.
 _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 
-# Per row this is qmv_fast_impl (FAST) or qmv_impl, exactly as
-# moe_verify_gather runs them per (row, expert) pair; the row loop sits
+# Per row this is MLX's qmv_fast_impl (FAST) or qmv_impl; the row loop sits
 # inside each K block so the block's weight bytes are fetched once. Columns
 # past N (qmv's partial last tile) are skipped: each column's arithmetic does
 # not depend on which tile computes it. ``ROW_EXACT_UNROLL`` precedes every
