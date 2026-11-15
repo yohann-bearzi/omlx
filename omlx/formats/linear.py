@@ -19,6 +19,7 @@ asks the registry how to run them:
 from __future__ import annotations
 
 import logging
+import math
 from functools import cache
 from typing import Any, NamedTuple
 
@@ -116,22 +117,18 @@ def _plan(layer) -> _Plan | None:
     return _Plan(face, _kernel(face, stacked), operands, proof, k, n)
 
 
-def _runs(plan: _Plan | None, dtype) -> bool:
-    return plan is not None and not plan.proof.failed and plan.face.exact_for(dtype)
-
-
-def _rows(plan: _Plan, x, dtype, pairs: int, shape: tuple, rhs=None, per_row=1):
+def _rows(kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1):
     """One mat-vec per pair, ``pairs`` of them, as ``shape`` (which ends
-    with N). Pair ``p`` is row ``p // per_row`` of ``x``, rows of K
-    ``dtype`` in any shape, with the matrix, or with matrix ``rhs[p]`` of
-    the stack. No reshape is put in the graph for the kernel's sake."""
-    n = plan.n
-    inputs = [x, *plan.operands]
-    template = [("T", dtype), ("K_SIZE", plan.k), ("N_SIZE", n)]
+    with N). Pair ``p`` is row ``p // per_row`` of ``x``, rows of K in any
+    shape, with the matrix (``operands``), or with matrix ``rhs[p]`` of the
+    stack. No reshape is put in the graph for the kernel's sake."""
+    dtype = x.dtype
+    inputs = [x, *operands]
+    template = [("T", dtype), ("K_SIZE", k), ("N_SIZE", n)]
     if rhs is not None:
         inputs.append(rhs)
         template.append(("PAIRS_PER_ROW", per_row))
-    return plan.kernel(
+    return kernel(
         inputs=inputs,
         template=template,
         grid=(32, 2 * pairs, n // 8),
@@ -141,29 +138,92 @@ def _rows(plan: _Plan, x, dtype, pairs: int, shape: tuple, rhs=None, per_row=1):
     )[0]
 
 
-def _proven(plan: _Plan, launch, inputs: tuple, *rows):
-    """``_rows(plan, *rows)``, or None when its launch does not compile.
+def _linear(kernel, k: int, n: int, x):
+    """A matrix's launch for ``x``: what its Metal is instantiated with
+    beside the proof's key, and its graph, from ``x`` and the operands.
+    The graph holds no array: it outlives the layers it is built for."""
+    pairs, shape = x.size // k, (*x.shape[:-1], n)
 
-    The launch is evaluated here the first time it is built, once ``inputs``
-    and the layer's tensors are: what fails ahead of it is raised as it is."""
-    proof = plan.proof
-    if launch in proof.ran:
-        return _rows(plan, *rows)
-    mx.eval(*inputs, *plan.operands)
-    y = _rows(plan, *rows)
-    try:
-        # Surface a kernel build failure while the call can still fall back.
-        mx.eval(y)
-    except Exception:
-        proof.failed = True
-        logger.warning(
-            "quant format face %s: rows kernel failed; decode fallback",
-            plan.face.key,
-            exc_info=True,
-        )
+    def graph(x, *operands):
+        return _rows(kernel, k, n, x, operands, pairs, shape)
+
+    return x.dtype, graph
+
+
+def _switch(kernel, k: int, n: int, x, indices):
+    """A stack's launch for ``x`` and ``indices``, as ``_linear`` gives a
+    matrix's, with the indices ahead of the operands; None when there is no
+    pair to launch."""
+    if not indices.size * x.size:
         return None
-    proof.ran.add(launch)
-    logger.info("quant format face %s: rows kernel engaged", plan.face.key)
+    shape, batch = x.shape, indices.shape
+    lead, m = shape[:-2], shape[-2]
+    own = len(lead)  # x's leading axes ahead of its trailing ones of 1
+    while own and lead[own - 1] == 1:
+        own -= 1
+    # Each row of x meets its own run of experts: nothing is broadcast, in
+    # memory or in shape. MLX binds indices of no axis as a scalar.
+    as_they_are = m == 1 and len(batch) == len(lead) > 0 and batch[:own] == lead[:own]
+    if as_they_are:
+        pairs = indices.size
+        per_row = pairs // (x.size // k)
+    else:
+        batch = mx.broadcast_shapes(lead, batch)
+        pairs, per_row = math.prod(batch) * m, 1
+    shape = (*batch, m, n)
+
+    def graph(x, indices, *operands):
+        if not as_they_are:
+            x = mx.broadcast_to(x, (*batch, m, k))
+            indices = mx.repeat(mx.broadcast_to(indices, batch), m)
+        rhs = indices.astype(mx.uint32)
+        return _rows(kernel, k, n, x, operands, pairs, shape, rhs, per_row)
+
+    # MLX binds fewer than 8 indices as constants: other Metal.
+    return (x.dtype, per_row, pairs < 8), graph
+
+
+def _launch(plan: _Plan | None, signature: tuple, describe, *arrays):
+    """``arrays`` (x, then a stack's indices) through the rows kernel, the
+    first time for ``signature``, or None: the layer has no plan, the face
+    is not exact for x's type, there is nothing to launch, or the launch
+    does not compile.
+
+    The launch's graph (``describe``) is compiled by MLX and kept under
+    ``signature``, which is what it depends on (the arrays' shapes and x's
+    type): a layer's call asks for the kept graph first, and replays it.
+
+    The launch is evaluated here the first time its Metal is built, once
+    ``arrays`` and the layer's tensors are: what fails ahead of it is raised
+    as it is."""
+    if plan is None:
+        return None
+    proof = plan.proof
+    if proof.failed or not plan.face.exact_for(arrays[0].dtype):
+        return None
+    launch = describe(plan.kernel, plan.k, plan.n, *arrays)
+    if launch is None:
+        return None
+    metal, graph = launch
+    graph = mx.compile(graph)
+    y = graph(*arrays, *plan.operands)
+    if metal not in proof.ran:
+        mx.eval(*arrays, *plan.operands)
+        try:
+            # Surface a kernel build failure while the call can still fall
+            # back.
+            mx.eval(y)
+        except Exception:
+            proof.fail()
+            logger.warning(
+                "quant format face %s: rows kernel failed; decode fallback",
+                plan.face.key,
+                exc_info=True,
+            )
+            return None
+        proof.ran.add(metal)
+        logger.info("quant format face %s: rows kernel engaged", plan.face.key)
+    proof.keep(signature, graph)
     return y
 
 
@@ -240,17 +300,21 @@ class FormatLinear(_FormatLayer):
     ``tensors`` are its ``weight`` and the format's tensors, by name."""
 
     def __call__(self, x: mx.array) -> mx.array:
-        k, shape, dtype = self.input_dims, x.shape, x.dtype
-        if shape[-1] != k:
-            raise ValueError(f"x has {shape[-1]} features, the layer takes {k}")
-        rows = x.size // k
-        y = None
-        if 0 < rows <= MAX_ROWS:
-            plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
-            if _runs(plan, dtype):
-                y = _proven(plan, dtype, (x,), x, dtype, rows, (*shape[:-1], plan.n))
-        if y is None:
-            y = x @ self._decoded().astype(dtype).T
+        shape, dtype = x.shape, x.dtype
+        plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
+        # A decode step is this, its kept graph's replay and the bias.
+        graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
+        if graph is not None:
+            y = graph(x, *plan.operands)
+        else:
+            k = self.input_dims
+            if shape[-1] != k:
+                raise ValueError(f"x has {shape[-1]} features, the layer takes {k}")
+            y = None
+            if 0 < x.size // k <= MAX_ROWS:
+                y = _launch(plan, (shape, dtype), _linear, x)
+            if y is None:
+                y = x @ self._decoded().astype(dtype).T
         if "bias" in self:
             y = y + self["bias"]
         return y
@@ -274,49 +338,22 @@ class FormatSwitchLinear(_FormatLayer):
         # sorted_indices is mlx-vlm's hint to MLX's gathers. The rows kernel
         # runs every pair as one mat-vec, in any order; the decode passes the
         # hint on to MLX's gather_mm.
-        k, shape, dtype = self.input_dims, x.shape, x.dtype
-        if len(shape) < 2 or shape[-1] != k:
-            raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
-        y = None
+        shape, dtype = x.shape, x.dtype
+        signature = (shape, dtype, indices.shape)
         plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
-        if _runs(plan, dtype) and indices.size * x.size:
-            lead, m, batch = shape[:-2], shape[-2], indices.shape
-            own = len(lead)  # x's leading axes ahead of its trailing ones of 1
-            while own and lead[own - 1] == 1:
-                own -= 1
-            if (
-                m == 1
-                and batch  # MLX binds indices of no axis as a scalar
-                and len(batch) == len(lead)
-                and batch[:own] == lead[:own]
-            ):
-                # Each row of x meets its own run of experts: nothing is
-                # broadcast, in memory or in shape.
-                rows, rhs, pairs = x, indices, indices.size
-                per_row = pairs // (x.size // k)
-            else:
-                batch = mx.broadcast_shapes(lead, batch)
-                rows = mx.broadcast_to(x, (*batch, m, k))
-                rhs = mx.repeat(mx.broadcast_to(indices, batch), m)
-                pairs, per_row = rhs.size, 1
-            y = _proven(
-                plan,
-                # MLX binds fewer than 8 indices as constants: other Metal.
-                (dtype, per_row, pairs < 8),
-                (x, indices),
-                rows,
-                dtype,
-                pairs,
-                (*batch, m, plan.n),
-                rhs.astype(mx.uint32),
-                per_row,
-            )
-        if y is None:
-            if indices.size < self.num_experts:
+        graph = plan.proof.graphs.get(signature) if plan is not None else None
+        if graph is not None:
+            y = graph(x, indices, *plan.operands)
+        else:
+            k = self.input_dims
+            if len(shape) < 2 or shape[-1] != k:
+                raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
+            y = _launch(plan, signature, _switch, x, indices)
+            if y is None and indices.size < self.num_experts:
                 # A decode step's indices: their matrices alone are decoded.
                 weights = self._decoded(indices).astype(dtype)
                 y = x @ weights.swapaxes(-1, -2)
-            else:
+            elif y is None:
                 # A prefill's: the stack once, not a matrix for each index.
                 y = mx.gather_mm(
                     x,

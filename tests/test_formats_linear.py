@@ -144,7 +144,8 @@ def test_more_rows_are_the_decode_and_mlx_s_matmul():
         assert _same_bits(layer(x), _composed(quantized, x))
     # No row at all.
     assert layer(_x((2, k))[:0]).shape == (0, n)
-    assert not kernels._PROOFS
+    (proof,) = kernels._PROOFS.values()
+    assert not proof.ran and not proof.graphs and not proof.failed
 
 
 def test_what_a_face_does_not_cover_is_the_decode_and_mlx_s_matmul():
@@ -245,14 +246,17 @@ def test_the_indices_of_a_launch_are_uint32(monkeypatch):
     rows, seen = linear._rows, []
 
     def recorded(*launch):
-        seen.append(launch[5].dtype)
+        seen.append(launch[7].dtype)
         return rows(*launch)
 
     monkeypatch.setattr(linear, "_rows", recorded)
     want = quantized(x, indices)
     for dtype in (mx.uint32, mx.int32, mx.int64, mx.uint8):
         assert _same_bits(layer(x, indices.astype(dtype)), want)
+    # One kept graph, which MLX's compile traces for each type it is given.
     assert seen == [mx.uint32] * 4
+    (proof,) = kernels._PROOFS.values()
+    assert set(proof.graphs) == {((16, 1, 320), mx.bfloat16, (16,))}
 
 
 def test_a_launch_takes_x_and_the_indices_as_they_are(monkeypatch):
@@ -262,33 +266,81 @@ def test_a_launch_takes_x_and_the_indices_as_they_are(monkeypatch):
     _, switch = _switch_pair(320, 72)
     rows, launches = linear._rows, []
 
-    def recorded(*launch):
-        launches.append(launch[1:])
-        return rows(*launch)
+    def recorded(kernel, k, n, x, operands, *launch):
+        launches.append((x, *launch))
+        return rows(kernel, k, n, x, operands, *launch)
 
     monkeypatch.setattr(linear, "_rows", recorded)
+
+    def launched(held, describe, *arrays):
+        """The Metal and the launch that ``describe`` gives ``arrays``: its
+        graph as it is, which a layer hands to MLX's compile."""
+        plan = linear._plan(held)
+        metal, graph = describe(plan.kernel, plan.k, plan.n, *arrays)
+        del launches[:]
+        y = graph(*arrays, *plan.operands)
+        (launch,) = launches
+        assert y.shape == launch[2] and y.dtype == arrays[0].dtype
+        return metal, launch
+
     x = _x((2, 3, 320))
-    assert layer(x).shape == (2, 3, 72)
-    (launch,) = launches
-    assert launch[0] is x and launch[1:] == (mx.bfloat16, 6, (2, 3, 72))
+    metal, launch = launched(layer, linear._linear, x)
+    assert metal == mx.bfloat16
+    assert launch[0] is x and launch[1:] == (6, (2, 3, 72))
     # A decode step's tokens, each with its top-k.
-    del launches[:]
     x, indices = _x((1, 4, 1, 1, 320)), _experts((1, 4, 3))
-    assert switch(x, indices).shape == (1, 4, 3, 1, 72)
-    ((rows_of_x, dtype, pairs, shape, rhs, per_row),) = launches
+    metal, launch = launched(switch, linear._switch, x, indices)
+    rows_of_x, pairs, shape, rhs, per_row = launch
     assert rows_of_x is x and rhs.shape == (1, 4, 3) and rhs.dtype == mx.uint32
-    assert (dtype, pairs, shape, per_row) == (mx.bfloat16, 12, (1, 4, 3, 1, 72), 3)
+    assert (pairs, shape, per_row) == (12, (1, 4, 3, 1, 72), 3)
+    assert metal == (mx.bfloat16, 3, False)
     # Otherwise x and the indices are broadcast to a row and an index a pair:
     # x along an axis of the indices, and rows of x for each index.
     for lead_m, routed, pairs in (((4, 1, 1), (2, 4, 3), 24), ((5, 3), (5,), 15)):
-        del launches[:]
         x, indices = _x((*lead_m, 320)), _experts(routed)
         shape = (*routed, lead_m[-1], 72)
-        assert switch(x, indices).shape == shape
-        ((rows_of_x, _, *launch),) = launches
-        assert rows_of_x.shape == (*routed, lead_m[-1], 320)
-        assert launch[0] == pairs and launch[1] == shape and launch[3] == 1
-        assert launch[2].shape == (pairs,) and launch[2].dtype == mx.uint32
+        metal, launch = launched(switch, linear._switch, x, indices)
+        assert launch[0].shape == (*routed, lead_m[-1], 320)
+        assert launch[1] == pairs and launch[2] == shape and launch[4] == 1
+        assert launch[3].shape == (pairs,) and launch[3].dtype == mx.uint32
+        assert metal == (mx.bfloat16, 1, False)
+    # No pair, no launch.
+    plan = linear._plan(switch)
+    for x, indices in (
+        (_x((8, 0, 320)), _experts((8,))),
+        (_x((8, 1, 320))[:0], _experts((8,))[:0]),
+    ):
+        assert linear._switch(plan.kernel, plan.k, plan.n, x, indices) is None
+
+
+def _held(graph):
+    """What a launch's graph keeps from the call that described it."""
+    return [cell.cell_contents for cell in graph.__closure__]
+
+
+def test_a_launch_s_graph_holds_no_array():
+    """A kept graph outlives the layer it is built for, in a proof that
+    lasts as long as the process: it must not hold the layer's weights."""
+    _, layer = _pair(320, 72)
+    _, switch = _switch_pair(320, 72)
+    plan = linear._plan(layer)
+    _, graph = linear._linear(plan.kernel, plan.k, plan.n, _x((2, 320)))
+    stack = linear._plan(switch)
+    described = [graph]
+    # Each row with its own experts, then the indices broadcast.
+    for x, indices in (
+        (_x((4, 1, 1, 320)), _experts((4, 3))),
+        (_x((5, 3, 320)), _experts((5,))),
+    ):
+        _, graph = linear._switch(stack.kernel, stack.k, stack.n, x, indices)
+        described.append(graph)
+    kernels_ = (plan.kernel, stack.kernel)
+    for graph in described:
+        held = _held(graph)
+        assert any(value is kernel for value in held for kernel in kernels_)
+        for value in held:
+            numbers = value if isinstance(value, tuple) else (value,)
+            assert value in kernels_ or all(type(n) in (int, bool) for n in numbers)
 
 
 def test_views_of_x_and_of_the_indices_are_read_as_their_rows():
@@ -610,17 +662,17 @@ def test_a_launch_its_tiles_do_not_cover_is_refused_in_words(toy):
     """A layer plans no such launch; the kernel does not rely on it."""
     toy(_toy("linear"))
     layer, x, _ = _toy_linear(40, 320)
-    plan = linear._plan(layer)._replace(n=44)
+    plan = linear._plan(layer)
     with pytest.raises(RuntimeError, match="format linear: N must be whole tiles"):
-        mx.eval(linear._rows(plan, x, x.dtype, 1, (1, 44)))
+        mx.eval(linear._rows(plan.kernel, 320, 44, x, plan.operands, 1, (1, 44)))
     # Nor on a row of x that has a matrix.
     plan = linear._plan(_toy_switch(40, 320))
     rows, indices = _ints((16, 1, 320)), _experts((16,))
     words = "PAIRS_PER_ROW is the matrices of a row of x, 1 or more"
     for per_row in (0, -1):
-        launch = (rows, mx.float32, 16, (16, 1, 40), indices, per_row)
+        launch = (rows, plan.operands, 16, (16, 1, 40), indices, per_row)
         with pytest.raises(RuntimeError, match=words):
-            mx.eval(linear._rows(plan, *launch))
+            mx.eval(linear._rows(plan.kernel, 320, 40, *launch))
 
 
 def test_a_stack_and_a_matrix_of_one_face_are_kernels_of_their_own(toy):
@@ -770,6 +822,140 @@ def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
     # Another launch: one row for every pair.
     switch(rows[:1], indices)
     assert [len(arrays) for arrays in evaluated] == [5, 1]
+
+
+def _built(monkeypatch):
+    """The shapes of x that the rows kernel's launches are built for, as
+    they are built: once for each graph that MLX's compile traces."""
+    rows, built = linear._rows, []
+
+    def recorded(*launch):
+        built.append(launch[3].shape)
+        return rows(*launch)
+
+    monkeypatch.setattr(linear, "_rows", recorded)
+    return built
+
+
+def test_a_launch_is_built_once_and_replayed(monkeypatch):
+    """MLX writes a kernel's source out for every launch that is built. A
+    layer builds one for its arrays' shapes and types, and replays it."""
+    quantized, layer = _pair(320, 72, bias=True)
+    built = _built(monkeypatch)
+    for seed in range(3):
+        x = _x((1, 320), seed=seed)
+        assert _same_bits(layer(x), quantized(x))
+    assert built == [(1, 320)]
+    # Other rows are another graph.
+    for seed in range(2):
+        x = _x((3, 320), seed=seed)
+        alone = [quantized(x[row : row + 1]) for row in range(3)]
+        assert _same_bits(layer(x), mx.concatenate(alone))
+    assert built == [(1, 320), (3, 320)]
+    # The graphs are the proof's: another layer of the face, the tensors'
+    # types and the shape replays them over its own tensors.
+    other_quantized, other = _pair(320, 72, seed=7)
+    x = _x((1, 320), seed=9)
+    assert _same_bits(other(x), other_quantized(x))
+    assert not _same_bits(other(x), layer(x))
+    assert built == [(1, 320), (3, 320)]
+    (proof,) = kernels._PROOFS.values()
+    assert set(proof.graphs) == {((1, 320), mx.bfloat16), ((3, 320), mx.bfloat16)}
+    assert proof.ran == {mx.bfloat16}
+
+
+def test_a_stack_s_launch_is_built_once_and_replayed(monkeypatch):
+    switched, switch = _switch_pair(320, 72, bias=True)
+    built = _built(monkeypatch)
+    # A decode step's tokens with their top-k, then rows of x for each index.
+    shapes = (((1, 4, 1, 1, 320), (1, 4, 3)), ((5, 3, 320), (5,)))
+    for lead_m_k, routed in shapes:
+        for seed in range(3):
+            x, indices = _x(lead_m_k, seed=seed), _experts(routed, seed=seed)
+            assert _same_bits(switch(x, indices), switched(x, indices))
+    assert built == [(1, 4, 1, 1, 320), (5, 3, 320)]
+    # The same x with indices of another shape is another graph.
+    x, indices = _x((5, 3, 320)), _experts((2, 5))
+    assert _same_bits(switch(x, indices), switched(x, indices))
+    assert built == [(1, 4, 1, 1, 320), (5, 3, 320), (2, 5, 3, 320)]
+    (proof,) = kernels._PROOFS.values()
+    assert set(proof.graphs) == {
+        ((1, 4, 1, 1, 320), mx.bfloat16, (1, 4, 3)),
+        ((5, 3, 320), mx.bfloat16, (5,)),
+        ((5, 3, 320), mx.bfloat16, (2, 5)),
+    }
+    # Another stack of the face and the shape, of other experts.
+    others, other = _switch_pair(320, 72, seed=7)
+    x, indices = _x((5, 3, 320), seed=9), _experts((5,), seed=9)
+    assert _same_bits(other(x, indices), others(x, indices))
+    assert len(built) == 3
+
+
+def test_a_proof_keeps_so_many_graphs_then_builds_them_as_called(monkeypatch):
+    """A prefill's chunks are shapes without end."""
+    monkeypatch.setattr(kernels, "MAX_GRAPHS", 2)
+    quantized, layer = _pair(320, 72)
+    built = _built(monkeypatch)
+    for rows in (1, 2, 1, 3, 1, 3):
+        x = _x((rows, 320), seed=rows)
+        alone = [quantized(x[row : row + 1]) for row in range(rows)]
+        assert _same_bits(layer(x), mx.concatenate(alone))
+    # The third drops the two that are kept, and the first is built again.
+    assert built == [(1, 320), (2, 320), (3, 320), (1, 320)]
+    (proof,) = kernels._PROOFS.values()
+    assert set(proof.graphs) == {((3, 320), mx.bfloat16), ((1, 320), mx.bfloat16)}
+
+
+def test_a_launch_that_fails_stops_the_launches_that_ran(toy, monkeypatch, caplog):
+    """A proof's launches stop together: its kept graphs are dropped."""
+    caplog.set_level(logging.WARNING, logger=linear.__name__)
+    floats = 'static_assert(sizeof(X) == 4, "floats alone");\n      return 0;'
+    source = _TOY.replace("      return 0;", "      " + floats)
+    assert source.count("floats alone") == 1
+    toy(_toy("floats", source))
+    layer, x, want = _toy_linear(40, 320)
+    assert _equal(layer(x), want)
+    (proof,) = kernels._PROOFS.values()
+    assert proof.ran == {mx.float32} and len(proof.graphs) == 1
+    # Halves are another instance of the Metal, which does not compile.
+    half = x.astype(mx.float16)
+    decoded = half @ layer._decoded().astype(mx.float16).T
+    assert _equal(layer(half), decoded)
+    (warning,) = _logged(caplog, linear, logging.WARNING)
+    assert "floats alone" in str(warning.exc_info[1])
+    assert proof.failed and proof.ran == {mx.float32} and not proof.graphs
+    with monkeypatch.context() as patch:
+        patch.setattr(linear, "_rows", lambda *launch: pytest.fail("built"))
+        assert _equal(layer(x), want) and _equal(layer(half), decoded)
+    assert not proof.graphs
+    assert len(_logged(caplog, linear, logging.WARNING)) == 1
+
+
+def test_a_proven_launch_is_built_into_a_function_that_mlx_compiles():
+    """MLX's compile calls a layer once for the shapes it is given, over
+    arrays that cannot be evaluated: a proven launch needs none."""
+    quantized, layer = _pair(320, 72, bias=True)
+    switched, switch = _switch_pair(320, 72)
+    x, rows, indices = _x((1, 320)), _x((4, 1, 1, 320)), _experts((4, 3))
+    layer(x), switch(rows, indices)
+
+    def block(x, rows, indices):
+        return layer(x) * 2, switch(rows, indices) * 2
+
+    compiled = mx.compile(block)
+    # The kept graphs, then other shapes of the proven Metal, whose launches
+    # are built there.
+    for lead, tokens in ((1, 4), (3, 8)):
+        for seed in range(2):
+            x = _x((lead, 320), seed=seed)
+            rows = _x((tokens, 1, 1, 320), seed=seed)
+            indices = _experts((tokens, 3), seed=seed)
+            alone = [quantized(x[row : row + 1]) for row in range(lead)]
+            y, pairs = compiled(x, rows, indices)
+            assert _same_bits(y, mx.concatenate(alone) * 2)
+            assert _same_bits(pairs, switched(rows, indices) * 2)
+    for proof in kernels._PROOFS.values():
+        assert len(proof.graphs) == 2 and not proof.failed
 
 
 def test_a_layer_holds_a_registered_format_s_tensors(toy):

@@ -170,10 +170,34 @@ class Proof:
     each launch the first time it is built, while the call can still fall
     back, and a launch that fails, whatever failed in that evaluation, keeps
     what shares the proof on its composed path until the process ends. The
-    launch's inputs are evaluated ahead of it: their failure is the caller's."""
+    launch's inputs are evaluated ahead of it: their failure is the caller's.
+
+    A launch's graph is a function of its arrays' shapes and types alone, so
+    a kernel builds it once for each, through MLX's compile, and keeps it
+    here (``keep``): a call then replays the graph, where building it anew
+    has MLX write the kernel's source out again, launch after launch."""
 
     ran: set = field(default_factory=set)  # the launches that compiled
     failed: bool = False
+    graphs: dict = field(default_factory=dict)  # a launch's signature: its graph
+
+    def keep(self, signature, graph) -> None:
+        """Keep ``graph``, a function that ``mx.compile`` gave, for the
+        launches of ``signature``: what the graph depends on, beside what
+        MLX's compile tells apart itself (its arrays' shapes and types)."""
+        if len(self.graphs) >= MAX_GRAPHS:
+            self.graphs.clear()
+        self.graphs[signature] = graph
+
+    def fail(self) -> None:
+        """A launch failed: nothing that shares the proof is launched again."""
+        self.failed = True
+        self.graphs.clear()
+
+
+# The graphs of one proof: a decode step's, those of the short blocks around
+# it, a few prompts' chunks. One more drops them all, to be built as called.
+MAX_GRAPHS = 64
 
 
 _PROOFS: dict[tuple, Proof] = {}

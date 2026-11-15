@@ -105,7 +105,7 @@ def _line(source, text) -> int:
 def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key():
     face = _toy("proof")
     proof = kernels.proof("kernel", face, mx.float32, 512)
-    assert proof == kernels.Proof(ran=set(), failed=False)
+    assert proof == kernels.Proof(ran=set(), failed=False, graphs={})
     assert kernels.proof("kernel", _toy("proof"), mx.float32, 512) is proof
     others = (
         kernels.proof("other", face, mx.float32, 512),
@@ -117,6 +117,22 @@ def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key():
     proof.failed = True
     assert all(other == kernels.Proof() and other is not proof for other in others)
     assert len(kernels._PROOFS) == 5
+
+
+def test_a_proof_keeps_graphs_until_it_has_too_many_or_a_launch_fails(monkeypatch):
+    monkeypatch.setattr(kernels, "MAX_GRAPHS", 3)
+    proof = kernels.Proof()
+    for signature in "abc":
+        proof.keep(signature, signature.upper())
+    assert proof.graphs == {"a": "A", "b": "B", "c": "C"}
+    # One more drops them all.
+    proof.keep("d", "D")
+    assert proof.graphs == {"d": "D"}
+    proof.keep("e", "E")
+    proof.ran.add("launch")
+    assert not proof.failed
+    proof.fail()
+    assert proof.failed and proof.graphs == {} and proof.ran == {"launch"}
 
 
 def test_a_matrix_is_its_weight_then_its_tensors():
