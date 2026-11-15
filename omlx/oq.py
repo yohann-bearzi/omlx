@@ -6483,6 +6483,31 @@ def _imatrix_expert_coverage_sufficient(
     )
 
 
+def _imatrix_entry(
+    imatrix: OQImatrixData, base: str, config: dict | None
+) -> OQImatrixEntry | None:
+    """The entry that weighs the inputs of module ``base``'s matrix: its own,
+    or the one it shares them with."""
+    entry = imatrix.entries.get(base)
+    if entry is None and config is not None:
+        text_config = config.get("text_config")
+        text_model_type = (
+            text_config.get("model_type") if isinstance(text_config, dict) else None
+        )
+        if (
+            config.get("model_type") == "glm5_next"
+            or text_model_type == "glm5_next_text"
+        ) and base.endswith(".self_attn.indexer.weights_proj"):
+            # The GLM-5.3 indexer feeds the same hidden-state input to wk and
+            # weights_proj. Short calibration sequences bypass sparse scoring
+            # after wk, before weights_proj is called, so its wrapper cannot
+            # collect a separate entry. Reuse the mathematically identical wk
+            # input-channel statistics instead of weakening strict coverage.
+            wk_base = base[: -len("weights_proj")] + "wk"
+            entry = imatrix.entries.get(wk_base)
+    return entry
+
+
 def _lookup_imatrix_importance(
     imatrix: OQImatrixData | None,
     tensor_name: str,
@@ -6507,23 +6532,7 @@ def _lookup_imatrix_importance(
         return None
 
     base = tensor_name[: -len(".weight")]
-    entry = imatrix.entries.get(base)
-    if entry is None and config is not None:
-        text_config = config.get("text_config")
-        text_model_type = (
-            text_config.get("model_type") if isinstance(text_config, dict) else None
-        )
-        if (
-            config.get("model_type") == "glm5_next"
-            or text_model_type == "glm5_next_text"
-        ) and base.endswith(".self_attn.indexer.weights_proj"):
-            # The GLM-5.3 indexer feeds the same hidden-state input to wk and
-            # weights_proj. Short calibration sequences bypass sparse scoring
-            # after wk, before weights_proj is called, so its wrapper cannot
-            # collect a separate entry. Reuse the mathematically identical wk
-            # input-channel statistics instead of weakening strict coverage.
-            wk_base = base[: -len("weights_proj")] + "wk"
-            entry = imatrix.entries.get(wk_base)
+    entry = _imatrix_entry(imatrix, base, config)
     if entry is None:
         if report is not None:
             report["missing"].append(base)
@@ -6914,6 +6923,13 @@ _QUANT_FORMAT_MISREAD = {
         "it reads rows of its output head by hand, as MLX's quantized "
         "layers or as floats"
     ),
+    # Inkling2MarkovHead.fold dequantizes an nn.QuantizedLinear head
+    # and reads any other head's weight as floats (patches/inkling2/dspark.py);
+    # the head is an nn.Linear (patches/inkling2/model.py).
+    "inkling2": (
+        "its DSpark draft folds the output head into its own projection by "
+        "hand, as MLX's quantized layer or as floats"
+    ),
 }
 
 
@@ -7275,7 +7291,8 @@ def quantize_oq_streaming(
             if family in _QUANT_FORMAT_MISREAD:
                 raise ValueError(
                     f"oQ writes no {family} checkpoint in quant format "
-                    f"{quant_format!r}: {_QUANT_FORMAT_MISREAD[family]}"
+                    f"{quant_format!r}: {_QUANT_FORMAT_MISREAD[family]}; write it "
+                    "without a quant format"
                 )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
@@ -8003,7 +8020,7 @@ def quantize_oq_streaming(
                     # matrix that loads as its layer.
                     encoded = None
                     if quant_fmt is not None and importance is not None:
-                        held = imatrix_data.entries[base].module_class
+                        held = _imatrix_entry(imatrix_data, base, config).module_class
                         if loads_in_format(held):
                             encoded = _encode_in_format(
                                 quant_fmt, tensor_name, w_mx, importance, bits, gs

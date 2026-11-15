@@ -675,8 +675,14 @@ _GLM5_NEXT = (
             "it reads rows of its output head by hand, as MLX's quantized "
             "layers or as floats",
         ),
+        (
+            "inkling2",
+            {"model_type": "inkling2"},
+            "its DSpark draft folds the output head into its own projection by "
+            "hand, as MLX's quantized layer or as floats",
+        ),
     ],
-    ids=["model type", "text model type", "decision family"],
+    ids=["model type", "text model type", "decision family", "inkling2"],
 )
 def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
     toy, tmp_path, family, config, why
@@ -693,7 +699,8 @@ def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
             str(source), str(output), 4, enhanced=True, quant_format="toy"
         )
     assert str(refusal.value) == (
-        f"oQ writes no {family} checkpoint in quant format 'toy': {why}"
+        f"oQ writes no {family} checkpoint in quant format 'toy': {why}; write it "
+        "without a quant format"
     )
     assert _quoted(str(refusal.value).replace("glm5_next_text", "glm5_next"))
     assert not output.exists() and toy.offered == []
@@ -745,3 +752,24 @@ def test_a_record_that_json_does_not_keep_is_refused(
     if record == {"levels": (1, 2)}:
         assert _quoted(str(refusal.value))
     assert not output.exists() and toy.offered == []
+
+
+def test_the_offer_reads_the_class_of_the_entry_the_importance_came_from():
+    # GLM-5.3's indexer weighs weights_proj by wk's inputs: the same entry.
+    wk, other = (oq.OQImatrixEntry(np.ones(4), np.ones(1), cls) for cls in ("a", "b"))
+    indexer = "l.self_attn.indexer."
+    entries = {f"{indexer}wk": wk, "l.mlp": other}
+    imatrix = oq.OQImatrixData(entries, {}, "cache")
+    config = {"model_type": "glm5_next"}
+    assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", config) is wk
+    assert oq._imatrix_entry(imatrix, "l.mlp", config) is other
+    assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", {}) is None
+    importance = oq._lookup_imatrix_importance(
+        imatrix,
+        f"{indexer}weights_proj.weight",
+        (8, 4),
+        config=config,
+        strict=True,
+        report=None,
+    )
+    assert np.array_equal(np.array(importance), np.ones(4))
