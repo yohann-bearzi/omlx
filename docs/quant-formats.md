@@ -62,7 +62,7 @@ A face is a frozen dataclass. A kernel builder is cached on the faces it is inst
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` was defective in it (an exception of the block's body is raised in its place):
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`, of 8 elements or more each), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` was defective in it (an exception of the block's body is raised in its place):
 
 ```python
 import pytest
@@ -244,7 +244,9 @@ y = kernel(
 
 `qmv_rows<T, K, NA, NB>(ma, row_a, mb, row_b, x, lane, result)` is one simdgroup's work: the K inputs at `x` against rows `row_a` to `row_a + NA - 1` of `ma` (`result[0]` to `result[NA - 1]`) and rows `row_b` to `row_b + NB - 1` of `mb` (the next `NB` results). Every lane of the simdgroup calls it; after the call every lane holds the rows' results. `ma` and `mb` have the same face. Adjacent rows of one matrix go in one pack, as above. The second pack is for rows elsewhere: another matrix's (a gate and an up projection), or a run of the same matrix that does not follow the first. It is empty (`NB = 0`) when there are none. A kernel that reads two formats calls it once per format.
 
-What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores.
+What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores. For the plain store, a kernel adds `kernels.STORE_ROWS` to its header: `store_rows(omlx_iota<N>(), result, y + row)` rounds a simdgroup's `N` results to the output's type, in the one lane that calls it.
+
+MLX compiles a kernel when it first evaluates it, which in a model is wherever the graph is evaluated: too late to fall back. So a kernel in a model's forward evaluates a launch inside the call that builds it first, and keeps what it learns in a `kernels.Proof`: the launches that compiled (`ran`) and whether one failed (`failed`). `kernels.proof(...)` gives the one proof of a key, which names the kernel, its faces and what else its source is instantiated with (the tensors' dtypes, the shapes), so that layers of the same layout share it. Once a launch has failed, what shares the proof keeps its composed path.
 
 ## Compile-time rules
 

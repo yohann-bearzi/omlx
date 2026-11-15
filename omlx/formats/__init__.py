@@ -210,9 +210,9 @@ def dot(layer, k: int, n: int) -> Dot | None:
     A kernel asks for a face inside a model's forward, and keeps the answer
     with what it builds for the layer. So a format whose ``dot`` raises, or
     returns anything but None or a ``Dot`` of arrays the layer has (the
-    weight and the face's tensors), has no face for the layer either, and
-    the model keeps its composed path there. Each defect of a format is
-    logged once."""
+    weight and the face's tensors, each of 8 elements or more), has no face
+    for the layer either, and the model keeps its composed path there. Each
+    defect of a format is logged once."""
     mode = getattr(layer, "mode", None)
     fmt = get(mode)
     if fmt is None:
@@ -231,6 +231,12 @@ def dot(layer, k: int, n: int) -> Dot | None:
         if lacking:
             raise ValueError(
                 f"face {face.key}: the layer has no array {', '.join(lacking)}"
+            )
+        small = [name for name in ("weight", *face.tensors) if layer[name].size < 8]
+        if small:
+            raise ValueError(
+                f"face {face.key}: {', '.join(small)} of fewer than 8 elements, "
+                "which MLX binds as constants, not as the buffer a face reads"
             )
     except Exception as error:
         defect = (mode, repr(error))

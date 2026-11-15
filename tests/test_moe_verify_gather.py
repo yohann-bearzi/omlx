@@ -17,7 +17,7 @@ from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 
 import omlx.patches.qwen35_moe_gate_up as gate_up_fusion
 from omlx import formats
-from omlx.formats import affine
+from omlx.formats import affine, kernels
 from omlx.patches import moe_verify_gather as gather
 from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
@@ -29,7 +29,7 @@ EXPERTS, TOP_K, HIDDEN, INTER = 8, 6, 512, 64
 
 @pytest.fixture(autouse=True)
 def _no_proofs(monkeypatch):
-    monkeypatch.setattr(gather, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_PROOFS", {})
 
 
 def _experts(k, n, bits=4, bias=False, dtype=mx.bfloat16):
@@ -113,8 +113,9 @@ def test_a_block_has_the_composed_route_s_bits(monkeypatch, caplog, bits, dtype)
         got = gather.fused_switch(switch, x, indices)
         assert got.shape == (batch, length, TOP_K, HIDDEN) and got.dtype == dtype
         assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
-    (proof,) = gather._PROOFS.values()
-    assert proof.ran == {(rows, TOP_K, dtype) for rows in (2, 3, 4, 8)}
+    (((kernel, *_), proof),) = kernels._PROOFS.items()
+    assert kernel == "verify_gather"
+    assert proof.ran == {(rows, TOP_K, dtype, mx.uint32) for rows in (2, 3, 4, 8)}
     assert not proof.failed
     # Once per launch that the blocks build.
     assert [r.getMessage() for r in _logged(caplog, gather)] == [
@@ -123,18 +124,48 @@ def test_a_block_has_the_composed_route_s_bits(monkeypatch, caplog, bits, dtype)
     ]
 
 
+def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
+    """The routing is a kernel input: its dtype is compiled into the launch."""
+    switch = _switch()
+    x, indices = _block(1, 3)
+    want = gather.fused_switch(switch, x, indices)
+    evaluate, evaluated = mx.eval, []
+    monkeypatch.setattr(mx, "eval", lambda *a: (evaluated.append(a), evaluate(*a)))
+    assert _same_bits(gather.fused_switch(switch, x, indices), want)
+    assert not evaluated  # proven
+    signed = indices.astype(mx.int32)
+    assert _same_bits(gather.fused_switch(switch, x, signed), want)
+    assert [len(arrays) for arrays in evaluated] == [2, 1]
+    (proof,) = kernels._PROOFS.values()
+    assert proof.ran == {(3, TOP_K, x.dtype, dtype) for dtype in (mx.uint32, mx.int32)}
+
+
+def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
+    """What ``projection`` and ``fused_switch`` rule out, for a caller of the
+    launch itself: outputs no tile writes, pairs that are not whole rows."""
+    k, n = 320, 64
+    projection = gather.projection(_experts(k, n), k)
+    x = mx.random.normal((2, k)).astype(mx.bfloat16)
+    rhs = mx.arange(8).astype(mx.uint32) % EXPERTS
+    mx.eval(gather.gather_qmv(projection, x, rhs, 4))
+    with pytest.raises(RuntimeError, match="N must be whole tiles of 8 outputs"):
+        mx.eval(gather.gather_qmv(projection._replace(n=60), x, rhs, 4))
+    with pytest.raises(RuntimeError, match="pairs are whole rows of LHS_DIV experts"):
+        mx.eval(gather.gather_qmv(projection, x, rhs[:6], 4))
+
+
 def test_a_block_outside_the_kernel_is_left_to_the_composed_route():
     switch = _switch()
     for batch, length in ((1, 1), (1, 9), (3, 3), (16, 2)):
         assert gather.fused_switch(switch, *_block(batch, length)) is None
     # Nothing is read of the switch for them.
-    assert not gather._PROOFS and "_omlx_verify_gather_plan" not in vars(switch)
+    assert not kernels._PROOFS and "_omlx_verify_gather_plan" not in vars(switch)
 
     x, indices = _block(1, 3)
     # The affine faces are exact for their scales' dtype.
     for dtype in (mx.float16, mx.float32):
         assert gather.fused_switch(switch, x.astype(dtype), indices) is None
-    (proof,) = gather._PROOFS.values()
+    (proof,) = kernels._PROOFS.values()
     assert not proof.ran and not proof.failed
     assert gather.fused_switch(switch, x, indices) is not None
 
@@ -168,7 +199,7 @@ def test_the_plan_follows_the_switch_s_layers_and_the_block_s_width(
     got = gather.fused_switch(switch, half, indices)
     assert _same_bits(got, _composed(monkeypatch, switch, half, indices))
     # A block that one of its two faces is not exact for was not built.
-    assert not any(proof.failed for proof in gather._PROOFS.values())
+    assert not any(proof.failed for proof in kernels._PROOFS.values())
     assert not _logged(caplog, gather)
 
 
@@ -244,7 +275,7 @@ def test_a_format_oMLX_does_not_know_runs_the_route(toy):  # noqa: N802
         want = switch.down_proj.rows(experts, switch.activation(up, gate))
         assert got.shape == (1, rows, 3, 40) and got.dtype == mx.float32
         assert np.array_equal(np.array(got).reshape(rows * 3, 40), want)
-    (proof,) = gather._PROOFS.values()
+    (proof,) = kernels._PROOFS.values()
     assert len(proof.ran) == gather.MAX_ROWS - 1 and not proof.failed
 
 
@@ -262,7 +293,7 @@ def test_a_face_that_does_not_compile_keeps_its_blocks_composed(
     message = "expert-ordered verify gather failed; composed fallback"
     assert warning.getMessage() == message and f"(`{message}`)" in _PAGE
     assert "does not compile" in str(warning.exc_info[1])
-    (proof,) = gather._PROOFS.values()
+    (proof,) = kernels._PROOFS.values()
     assert proof.failed and not proof.ran
 
     # Not built again: for these blocks, or for others of the same faces,
@@ -279,7 +310,7 @@ def test_a_face_that_does_not_compile_keeps_its_blocks_composed(
     compiles = _ToySwitch(k=320, inter=72, n=40)
     assert gather.fused_switch(compiles, *_toy_block(compiles, 3)) is not None
     assert gather.fused_switch(_switch(), *_block(1, 3)) is not None
-    assert [proof.failed for proof in gather._PROOFS.values()] == [True, False, False]
+    assert [proof.failed for proof in kernels._PROOFS.values()] == [True, False, False]
     assert len(_logged(caplog, gather)) == 1
 
 
@@ -298,7 +329,7 @@ def test_a_failed_block_keeps_only_its_tensor_dtypes_and_shapes_composed(toy, ca
     assert not runs(halves) and not runs(ragged)
     assert len(_logged(caplog, gather, logging.WARNING)) == 2
     assert runs(_ToySwitch(k=320, inter=72, n=40))
-    assert [proof.failed for proof in gather._PROOFS.values()] == [True, True, False]
+    assert [proof.failed for proof in kernels._PROOFS.values()] == [True, True, False]
 
 
 def test_a_failure_ahead_of_the_block_is_raised_and_is_not_its_launches(caplog):
@@ -309,7 +340,7 @@ def test_a_failure_ahead_of_the_block_is_raised_and_is_not_its_launches(caplog):
         gather.fused_switch(switch, _does_not_compile(x), indices)
     with pytest.raises(RuntimeError, match="Unable to build metal library"):
         gather.fused_switch(switch, x, _does_not_compile(indices))
-    (proof,) = gather._PROOFS.values()
+    (proof,) = kernels._PROOFS.values()
     assert not proof.failed and not proof.ran
     assert not _logged(caplog, gather)
     assert gather.fused_switch(switch, x, indices) is not None

@@ -198,8 +198,11 @@ def test_fusion_loads_the_formats_or_leaves_the_model_unfused(monkeypatch, caplo
     monkeypatch.setattr(formats, "load", lambda: loads.append(1))
     assert apply_qwen35_moe_gate_up_fusion(_make_model(model_cls=_FakeOtherModel)) == 0
     assert not loads  # nothing to fuse
-    assert apply_qwen35_moe_gate_up_fusion(_make_model(n_blocks=1)) == 1
+    model = _make_model(n_blocks=1)
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
     assert loads == [1]  # with the model, ahead of its first verify block
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert loads == [1]  # a supported model with nothing left to fuse
 
     def broken():
         raise ImportError("a built-in format does not import")

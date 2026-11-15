@@ -16,6 +16,8 @@ faster.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from .. import formats
 from . import Dot
 
@@ -147,6 +149,41 @@ METAL_FUNC void qmv_rows(
   }
 }
 """
+
+# What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
+# kernel that stores rows adds this to its header.
+STORE_ROWS = r"""
+// A simdgroup's rows, each rounded to T.
+template <typename T, int... R>
+METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T* y) {
+  ((y[R] = static_cast<T>(result[R])), ...);
+}
+"""
+
+
+@dataclass
+class Proof:
+    """What is known of the launches that one kernel compiles from the same
+    faces, tensor dtypes and shapes.
+
+    MLX compiles a kernel when it first evaluates it. So a kernel evaluates
+    each launch the first time it is built, while the call can still fall
+    back, and a launch that fails keeps what shares the proof on its composed
+    path. The launch's inputs are evaluated ahead of it: their failure is the
+    caller's."""
+
+    ran: set = field(default_factory=set)  # the launches that compiled
+    failed: bool = False
+
+
+_PROOFS: dict[tuple, Proof] = {}
+
+
+def proof(*key) -> Proof:
+    """The proof of the launches compiled from ``key``: the kernel, then its
+    faces and what else its source is instantiated with, beside what the
+    kernel keeps in ``Proof.ran``."""
+    return _PROOFS.setdefault(key, Proof())
 
 
 class Matrices:

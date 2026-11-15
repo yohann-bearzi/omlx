@@ -14,13 +14,6 @@ import mlx.core as mx
 from .. import formats
 from . import Dot, kernels
 
-_STORE = r"""
-template <typename T, int... R>
-METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T* y) {
-  ((y[R] = static_cast<T>(result[R])), ...);
-}
-"""
-
 # One threadgroup of one simdgroup per NA + NB rows.
 _ROWS = r"""
     const uint simd_lid = thread_index_in_simdgroup;
@@ -62,7 +55,7 @@ def _dot_rows_kernel(face: Dot):
         name=f"omlx_format_dot_rows_{face.key}",
         input_names=inputs,
         output_names=["y"],
-        header=matrices.header + _STORE,
+        header=matrices.header + kernels.STORE_ROWS,
         source=matrices.declarations + _ROWS,
     )
 

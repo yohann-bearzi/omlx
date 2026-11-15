@@ -417,7 +417,8 @@ def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
 
 
 def _layer(mode="toy", tensors=("weight", "scales")):
-    """A quantized linear: its mode, and its parameters by name."""
+    """A quantized linear: its mode, and its parameters by name, each of the
+    fewest elements that MLX binds as a buffer."""
     layer = nn.Module()
     layer.mode = mode
     for name in tensors:
@@ -463,6 +464,13 @@ class _TwoTensors(_Format):
         return replace(_FACE, tensors=("scales", "biases"))
 
 
+def _layer_with_small(*names):
+    layer = _layer()
+    for name in names:
+        layer[name] = mx.zeros((7,))
+    return layer
+
+
 def _layer_with_a_child_named_scales():
     layer = _layer(tensors=("weight",))
     layer.scales = nn.Module()
@@ -498,6 +506,25 @@ def _layer_with_a_child_named_scales():
             _Format(),
             _layer_with_a_child_named_scales(),
             "ValueError('face toy_b4: the layer has no array scales')",
+        ),
+        # MLX binds an input of fewer than 8 elements as constants.
+        (
+            _Format(),
+            _layer_with_small("scales"),
+            "ValueError('face toy_b4: scales of fewer than 8 elements, which MLX "
+            "binds as constants, not as the buffer a face reads')",
+        ),
+        (
+            _Format(),
+            _layer_with_small("weight"),
+            "ValueError('face toy_b4: weight of fewer than 8 elements, which MLX "
+            "binds as constants, not as the buffer a face reads')",
+        ),
+        (
+            _Format(),
+            _layer_with_small("scales", "weight"),
+            "ValueError('face toy_b4: weight, scales of fewer than 8 elements, which "
+            "MLX binds as constants, not as the buffer a face reads')",
         ),
         (
             _TwoTensors(),

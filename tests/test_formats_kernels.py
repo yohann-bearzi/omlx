@@ -102,6 +102,24 @@ def _line(source, text) -> int:
     return source[: source.index(text)].count("\n") + 1
 
 
+def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key(monkeypatch):
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    face = _toy("proof")
+    proof = kernels.proof("kernel", face, mx.float32, 512)
+    assert proof == kernels.Proof(ran=set(), failed=False)
+    assert kernels.proof("kernel", _toy("proof"), mx.float32, 512) is proof
+    others = (
+        kernels.proof("other", face, mx.float32, 512),
+        kernels.proof("kernel", _toy("other"), mx.float32, 512),
+        kernels.proof("kernel", face, mx.float16, 512),
+        kernels.proof("kernel", face, mx.float32, 384),
+    )
+    proof.ran.add("launch")
+    proof.failed = True
+    assert all(other == kernels.Proof() and other is not proof for other in others)
+    assert len(kernels._PROOFS) == 5
+
+
 def test_a_matrix_is_its_weight_then_its_tensors():
     matrices = kernels.Matrices()
     assert matrices.add("sg", _toy("a")) == ["sg_weight", "sg_scales"]

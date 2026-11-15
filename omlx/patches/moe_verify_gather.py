@@ -19,7 +19,6 @@ bit.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from functools import cache
 from typing import Any, NamedTuple
 
@@ -34,14 +33,6 @@ logger = logging.getLogger(__name__)
 
 MAX_ROWS = 8
 
-_STORE = r"""
-// A simdgroup's rows of a pair, each rounded to T.
-template <typename T, int... R>
-METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T* y) {
-  ((y[R] = static_cast<T>(result[R])), ...);
-}
-"""
-
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
 # pair of one tile before the next tile, so pairs sharing an expert run back
@@ -50,6 +41,12 @@ METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T
 _SOURCE = r"""
     constexpr int LANES = 32;  // of a simdgroup
     constexpr int RPS = 4;     // output rows of a simdgroup
+    static_assert(
+        N_SIZE % (2 * RPS) == 0,
+        "verify gather: N must be whole tiles of 8 outputs");
+    static_assert(
+        N_PAIRS % LHS_DIV == 0,
+        "verify gather: pairs are whole rows of LHS_DIV experts");
     const int pos = int(threadgroup_position_in_grid.y);
     const uint simd_gid = simdgroup_index_in_threadgroup;
     const uint simd_lid = thread_index_in_simdgroup;
@@ -89,27 +86,9 @@ def _kernel(face: Dot):
         name=f"omlx_moe_verify_gather_{face.key}",
         input_names=inputs,
         output_names=["y"],
-        header=matrices.header + _STORE,
+        header=matrices.header + kernels.STORE_ROWS,
         source=matrices.declarations + _SOURCE,
     )
-
-
-@dataclass
-class _Proof:
-    """What is known of the launches that projections of the same faces,
-    tensor dtypes and shapes compile.
-
-    MLX compiles a kernel when it first evaluates it. So a block's launches
-    are evaluated the first time they are built, while the call can still
-    fall back, and a block that fails keeps these projections on their
-    composed path. The block's inputs are evaluated ahead of it: their
-    failure is the caller's."""
-
-    ran: set = field(default_factory=set)  # (rows, top-k width, x's dtype)
-    failed: bool = False
-
-
-_PROOFS: dict[tuple, _Proof] = {}
 
 
 class Projection(NamedTuple):
@@ -124,7 +103,7 @@ class Projection(NamedTuple):
 class _Plan(NamedTuple):
     gate_up: Projection
     down: Projection
-    proof: _Proof
+    proof: kernels.Proof  # of a block's two launches
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -152,16 +131,14 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
     if down is None:
         return None
     # What the launches are compiled from, beside a block's rows and routing.
-    proof = _PROOFS.setdefault(
-        (
-            gate_up.face,
-            down.face,
-            tuple(a.dtype for a in gate_up.operands + down.operands),
-            width,
-            gate_up.n,
-            down.n,
-        ),
-        _Proof(),
+    proof = kernels.proof(
+        "verify_gather",
+        gate_up.face,
+        down.face,
+        tuple(a.dtype for a in gate_up.operands + down.operands),
+        width,
+        gate_up.n,
+        down.n,
     )
     return _Plan(gate_up, down, proof)
 
@@ -192,7 +169,7 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         return None
     top_k = indices.shape[-1]
     pairs = indices.reshape(rows * top_k)
-    launch = (rows, top_k, x.dtype)
+    launch = (rows, top_k, x.dtype, indices.dtype)
     proven = launch in plan.proof.ran
     if not proven:
         # What fails ahead of the block is not the launches' failure.
