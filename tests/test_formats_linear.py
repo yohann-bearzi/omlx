@@ -131,6 +131,10 @@ def test_a_row_has_the_bits_of_mlx_s_quantized_linear(caplog, k, n, bits, dtype,
     ]
 
 
+def test_the_page_names_the_rows_a_linear_launches():
+    assert f"| `FormatLinear`, 1 to {MAX_ROWS} rows of `x` (`linear.MAX_ROWS`:" in _PAGE
+
+
 def test_more_rows_are_the_decode_and_mlx_s_matmul():
     k, n = 320, 72
     quantized, layer = _pair(k, n, bias=True)
@@ -225,11 +229,12 @@ def test_each_row_of_a_pair_has_the_bits_it_has_alone():
 def test_fewer_than_8_pairs_are_a_launch_of_their_own():
     """MLX binds fewer than 8 indices as constants: other Metal."""
     quantized, layer = _switch_pair(320, 72)
-    for pairs in (1, 7, 8):
+    few, more = (mx.bfloat16, 1, True), (mx.bfloat16, 1, False)
+    for pairs, ran in ((1, {few}), (7, {few}), (8, {few, more})):
         x, indices = _x((pairs, 1, 320), seed=pairs), _experts((pairs,), seed=pairs)
         assert _same_bits(layer(x, indices), quantized(x, indices))
-    (proof,) = kernels._PROOFS.values()
-    assert proof.ran == {(mx.bfloat16, 1, True), (mx.bfloat16, 1, False)}
+        (proof,) = kernels._PROOFS.values()
+        assert proof.ran == ran
 
 
 def test_the_indices_of_a_launch_are_uint32(monkeypatch):
@@ -272,15 +277,55 @@ def test_mlx_vlm_s_switch_glu_runs_over_the_layers():
         assert kernel == "format_switch_linear" and proof.ran and not proof.failed
 
 
-def test_a_switch_s_pairs_outside_the_kernel_are_the_decode_and_mlx_s_matmul():
+def test_a_switch_s_pairs_outside_the_kernel_are_the_decode_and_mlx_s_matmul(
+    monkeypatch,
+):
+    """Fewer pairs than the stack has matrices decode theirs alone. From as
+    many, the stack is decoded once: a prefill's pairs would not fit in
+    memory a matrix each."""
     quantized, layer = _switch_pair(320, 72, bias=True)
-    x, indices = _x((2, 4, 1, 1, 320), mx.float32), _experts((2, 4, 3))
-    weight = mx.dequantize(
-        *(quantized[name][indices] for name in _NAMES), group_size=32, bits=4
-    )
-    want = x @ weight.astype(mx.float32).swapaxes(-1, -2)
-    want = want + mx.expand_dims(quantized["bias"][indices], -2)
-    assert want.shape == (2, 4, 3, 1, 72) and _equal(layer(x, indices), want)
+    decode, whole = affine.AffineFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        whole.append(tensors["weight"] is layer["weight"])
+        return decode(self, tensors, bits, group_size)
+
+    gather, hints = mx.gather_mm, []
+
+    def gathered(*operands, **named):
+        hints.append(named["sorted_indices"])
+        return gather(*operands, **named)
+
+    monkeypatch.setattr(affine.AffineFormat, "decode", recorded)
+    monkeypatch.setattr(mx, "gather_mm", gathered)
+    stack = mx.dequantize(*_tensors(quantized).values(), group_size=32, bits=4)
+    stack = stack.astype(mx.float32)
+
+    def want(x, indices, **hint):
+        if hint:
+            y = gather(x, stack.swapaxes(-1, -2), rhs_indices=indices, **hint)
+        else:
+            y = x @ stack[indices].swapaxes(-1, -2)
+        return y + mx.expand_dims(quantized["bias"][indices], -2)
+
+    # One pair fewer than matrices: (1, 5) of them, with x's (2, 1).
+    x, indices = _x((2, 1, 1, 320), mx.float32), _experts((1, EXPERTS - 1))
+    got = layer(x, indices)
+    assert got.shape == (2, 5, 1, 72) and _equal(got, want(x, indices))
+    assert whole == [False] and not hints
+    # As many pairs as matrices, then a prefill's, in any integer type.
+    for routed, dtype in (((EXPERTS,), mx.uint32), ((2, 4, 3), mx.int64)):
+        x = _x((*routed[:-1], 1, 1, 320), mx.float32)
+        indices = _experts(routed).astype(dtype)
+        got = layer(x, indices)
+        assert got.shape == (*routed, 1, 72)
+        assert _equal(got, want(x, indices, sorted_indices=False))
+    assert whole == [False, True, True] and hints == [False, False]
+    # mlx-vlm's hint goes to MLX's gather, which the pairs then are sorted for.
+    x, indices = _x((24, 1, 320), mx.float32), mx.sort(_experts((24,)))
+    got = layer(x, indices, sorted_indices=True)
+    assert _equal(got, want(x, indices, sorted_indices=True))
+    assert hints == [False, False, True]
     (proof,) = kernels._PROOFS.values()
     assert not proof.ran and not proof.failed
 
@@ -399,7 +444,10 @@ def test_rows_of_a_pair_and_no_pair_in_a_switch(toy, monkeypatch):
     # No pair, or no row of x: nothing to launch.
     monkeypatch.setattr(linear, "_rows", lambda *launch: pytest.fail("launched"))
     assert layer(x[:, :0], indices[:0]).shape == (2, 0, 3, 40)
+    assert layer(x[:1, :1], indices[:0]).shape == (1, 0, 3, 40)
     assert layer(x[:, :, :0], indices).shape == (2, 5, 0, 40)
+    # Nor from as many pairs as the stack has matrices.
+    assert layer(_ints((8, 0, 320)), _experts((8,))).shape == (8, 0, 40)
     assert proof.ran == {(mx.float32, 1, False)} and not proof.failed
 
 
@@ -410,17 +458,20 @@ def test_a_format_without_a_face_runs_through_its_decode(toy):
     switch = _toy_switch(40, 320)
     rows, indices = _ints((2, 4, 1, 1, 320)), _experts((2, 4, 3))
     assert np.array_equal(np.array(switch(rows, indices)), _want(switch, rows, indices))
-    # In x's dtype, as MLX's quantized layers, whatever the decode's.
+    few = indices[:1, :1]  # fewer pairs than the stack has matrices
+    assert np.array_equal(np.array(switch(rows, few)), _want(switch, rows, few))
+    # In x's dtype, whatever the decode's: a layer casts the decoded weights.
     assert layer(x.astype(mx.float16)).dtype == mx.float16
     assert switch(rows.astype(mx.float16), indices).dtype == mx.float16
+    assert switch(rows.astype(mx.float16), few).dtype == mx.float16
     assert not kernels._PROOFS
 
 
 def test_a_matrix_no_launch_takes_runs_through_its_decode(toy):
     toy(_toy("linear"))
-    # Four activations: MLX binds fewer than 8 as constants, which no face
-    # reads. Four lanes are not the toy face's 8 either.
-    layer, x, want = _toy_linear(8, 4)
+    # Seven activations: MLX binds fewer than 8 as constants, which no face
+    # reads. Seven are not a lane of the toy face's 8 either.
+    layer, x, want = _toy_linear(8, 7)
     assert _equal(layer(x), want)
     # N that is not whole tiles of 8 outputs.
     layer, x, want = _toy_linear(12, 320)
@@ -429,6 +480,15 @@ def test_a_matrix_no_launch_takes_runs_through_its_decode(toy):
     rows, indices = _ints((16, 1, 320)), _experts((16,))
     assert np.array_equal(np.array(switch(rows, indices)), _want(switch, rows, indices))
     assert not kernels._PROOFS
+
+
+def test_a_matrix_of_8_activations_is_the_narrowest_launch(toy):
+    """MLX binds a tensor of 8 elements as a buffer, which a face reads."""
+    toy(_toy("linear"))
+    layer, x, want = _toy_linear(40, 8)
+    assert _equal(layer(x), want)
+    (proof,) = kernels._PROOFS.values()
+    assert proof.ran == {mx.float32} and not proof.failed
 
 
 def test_a_launch_its_tiles_do_not_cover_is_refused_in_words(toy):
@@ -456,17 +516,30 @@ def test_a_stack_and_a_matrix_of_one_face_are_kernels_of_their_own(toy):
     }
 
 
-def test_the_plan_follows_the_layer_s_tensors(toy):
+def test_the_plan_follows_the_layer_s_tensors(toy, monkeypatch):
+    """A layer asks for its face once for the tensors it holds."""
     toy(_toy("linear"))
+    dot, asked = formats.dot, []
+
+    def recorded(layer, k, n):
+        asked.append(id(layer))
+        return dot(layer, k, n)
+
+    monkeypatch.setattr(formats, "dot", recorded)
     layer, x, want = _toy_linear(40, 320)
-    assert _equal(layer(x), want)
+    assert _equal(layer(x), want) and _equal(layer(x), want)
+    assert asked == [id(layer)]
     layer["scales"] = layer["scales"] * 2
-    assert _equal(layer(x), 2 * want)
+    assert _equal(layer(x), 2 * want) and _equal(layer(x), 2 * want)
+    assert asked == [id(layer)] * 2
     switch = _toy_switch(40, 320)
     rows, indices = _ints((16, 1, 320)), _experts((16,))
     before = np.array(switch(rows, indices))
+    assert np.array_equal(np.array(switch(rows, indices)), before)
+    assert asked == [id(layer)] * 2 + [id(switch)]
     switch["scales"] = switch["scales"] * 2
     assert np.array_equal(np.array(switch(rows, indices)), 2 * before)
+    assert asked == [id(layer)] * 2 + [id(switch)] * 2
 
 
 def test_a_face_that_does_not_compile_leaves_the_layers_to_the_decode(
@@ -527,6 +600,13 @@ def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(caplog)
         switch(_does_not_compile(rows), indices)
     with pytest.raises(RuntimeError, match="Unable to build metal library"):
         switch(rows, _does_not_compile(indices))
+    # Nor is a tensor of the layer's that cannot be evaluated.
+    for held, call in ((layer, (x,)), (switch, (rows, indices))):
+        scales = held["scales"]
+        held["scales"] = _does_not_compile(scales)
+        with pytest.raises(RuntimeError, match="Unable to build metal library"):
+            held(*call)
+        held["scales"] = scales
     assert len(kernels._PROOFS) == 2
     for proof in kernels._PROOFS.values():
         assert not proof.failed and not proof.ran
@@ -548,22 +628,25 @@ def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
 
     monkeypatch.setattr(mx, "eval", recorded)
     layer(x)
-    # The inputs first, outside the launch's guard, then the rows.
-    assert [len(arrays) for arrays in evaluated] == [1, 1]
+    # The inputs and the layer's tensors first, outside the launch's guard,
+    # then the rows.
+    assert [len(arrays) for arrays in evaluated] == [4, 1]
     assert evaluated[0][0] is x and evaluated[1][0].shape == (3, 72)
+    assert all(a is layer[name] for a, name in zip(evaluated[0][1:], _NAMES))
     del evaluated[:]
     layer(x), layer(more)
     assert not evaluated
     switch(rows, indices)
-    assert [len(arrays) for arrays in evaluated] == [2, 1]
+    assert [len(arrays) for arrays in evaluated] == [5, 1]
     assert evaluated[0][0] is rows and evaluated[0][1] is indices
+    assert all(a is switch[name] for a, name in zip(evaluated[0][2:], _NAMES))
     assert evaluated[1][0].shape == (16, 72)
     del evaluated[:]
     switch(rows, indices), switch(rows[4:12] + 0, indices[4:12] + 0)
     assert not evaluated
     # Another launch: one row for every pair.
     switch(rows[:1], indices)
-    assert [len(arrays) for arrays in evaluated] == [2, 1]
+    assert [len(arrays) for arrays in evaluated] == [5, 1]
 
 
 def test_a_layer_holds_a_registered_format_s_tensors(toy):

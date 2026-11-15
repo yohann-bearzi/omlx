@@ -10,8 +10,9 @@ asks the registry how to run them:
   the format's dot face in the mat-vec skeleton, one launch for all of them,
   each row with the bits it has alone;
 - everything else (more rows of one matrix, a layout the face does not
-  cover, a format without the face, a face that did not compile) is the
-  format's ``decode``, then MLX's matmul.
+  cover, activations of a type it is not exact for, a format without the
+  face, a face that did not compile) is the format's ``decode``, cast to the
+  activations' type, then MLX's matmul.
 """
 
 from __future__ import annotations
@@ -135,11 +136,11 @@ def _proven(plan: _Plan, launch, inputs: tuple, run):
     """``run()``'s rows, or None when its launch does not compile.
 
     The launch is evaluated here the first time it is built, once ``inputs``
-    are: what fails ahead of it is raised as it is."""
+    and the layer's tensors are: what fails ahead of it is raised as it is."""
     proof = plan.proof
     if launch in proof.ran:
         return run()
-    mx.eval(*inputs)
+    mx.eval(*inputs, *plan.operands)
     y = run()
     try:
         # Surface a kernel build failure while the call can still fall back.
@@ -265,8 +266,8 @@ class FormatSwitchLinear(_FormatLayer):
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ) -> mx.array:
-        # sorted_indices is mlx-vlm's hint to gather_qmm: every pair is one
-        # mat-vec here, in any order.
+        # sorted_indices is mlx-vlm's hint to MLX's gathers: the rows kernel
+        # runs every pair as one mat-vec, in any order.
         k, n = self.input_dims, self.output_dims
         if x.ndim < 2 or x.shape[-1] != k:
             raise ValueError(f"x is (..., M, {k}), not of shape {x.shape}")
@@ -301,7 +302,18 @@ class FormatSwitchLinear(_FormatLayer):
                 lambda: _rows(plan, rows, n, rhs, per_row),
             )
         if y is None:
-            y = x @ self._decoded(indices).astype(x.dtype).swapaxes(-1, -2)
+            if indices.size < self.num_experts:
+                # A decode step's pairs: their matrices alone are decoded.
+                weights = self._decoded(indices).astype(x.dtype)
+                y = x @ weights.swapaxes(-1, -2)
+            else:
+                # A prefill's: the stack once, not a matrix for each pair.
+                y = mx.gather_mm(
+                    x,
+                    self._decoded().astype(x.dtype).swapaxes(-1, -2),
+                    rhs_indices=indices,
+                    sorted_indices=sorted_indices,
+                )
         else:
             y = y.reshape(*batch, m, n)
         if "bias" in self:
