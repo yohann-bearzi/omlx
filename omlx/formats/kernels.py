@@ -215,9 +215,13 @@ class Proof:
     def keep(self, signature, graph) -> None:
         """Keep ``graph``, a function that ``mx.compile`` gave and that the
         calling thread built, for the thread's launches of ``signature``:
-        what the graph depends on, beside what MLX's compile tells apart
-        itself (its arrays' shapes and types). A proof that failed, on any
-        thread, keeps nothing."""
+        everything that is computed outside the function and built into it
+        (the pairs, the grid, the output's shape), or the arrays' shapes
+        and types that all of it comes from. MLX's compile tells apart only
+        what the function reads from its arguments, and traces it again for
+        others with the rest as the first call left it: under a signature
+        that leaves a shape out, a call replays the launch of another's
+        rows. A proof that failed, on any thread, keeps nothing."""
         with _KEEPING:
             if self.failed:
                 return

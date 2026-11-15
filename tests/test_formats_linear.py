@@ -50,15 +50,15 @@ def _pair(k, n, bits=4, dtype=mx.bfloat16, bias=False, seed=0):
     return quantized, layer
 
 
-def _switch_pair(k, n, bits=4, dtype=mx.bfloat16, bias=False, seed=0):
+def _switch_pair(k, n, bits=4, dtype=mx.bfloat16, bias=False, seed=0, experts=EXPERTS):
     """mlx-vlm's quantized switch layer, and a ``FormatSwitchLinear`` of its
     tensors."""
     mx.random.seed(seed)
-    dense = SwitchLinear(k, n, EXPERTS, bias=bias)
+    dense = SwitchLinear(k, n, experts, bias=bias)
     dense.set_dtype(dtype)
     quantized = dense.to_quantized(group_size=32, bits=bits)
     if bias:
-        quantized["bias"] = mx.random.normal((EXPERTS, n)).astype(dtype)
+        quantized["bias"] = mx.random.normal((experts, n)).astype(dtype)
     layer = FormatSwitchLinear(
         "affine", bits, 32, k, _tensors(quantized), bias=quantized.get("bias")
     )
@@ -766,6 +766,42 @@ def test_a_face_that_does_not_compile_leaves_the_layers_to_the_decode(
     assert len(_logged(caplog, linear)) == 2
 
 
+class _OwnError(Exception):
+    """An error of a type that is no other's."""
+
+
+def test_whatever_a_launch_s_first_evaluation_raises_is_the_launch_s_failure(
+    toy, monkeypatch, caplog
+):
+    """MLX reports what it cannot build or run in errors of several types.
+    Whichever is raised as a launch is first evaluated, the call is the
+    decode's and the proof has failed."""
+    caplog.set_level(logging.WARNING, logger=linear.__name__)
+    toy(_toy("linear"))
+    layer, x, want = _toy_linear(40, 320)
+    switch = _toy_switch(40, 320)
+    rows, indices = _ints((16, 1, 320)), _experts((16,))
+    tensors = [held[name] for held in (layer, switch) for name in ("weight", "scales")]
+    evaluate, error = mx.eval, _OwnError("not evaluated")
+
+    def refused(*arrays):
+        """Evaluates the layers' tensors, and nothing else."""
+        if not all(any(a is tensor for tensor in tensors) for a in arrays):
+            raise error
+        evaluate(*arrays)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "eval", refused)
+        y, pairs = layer(x), switch(rows, indices)
+    assert _equal(y, want)
+    assert np.array_equal(np.array(pairs), _want(switch, rows, indices))
+    warnings = _logged(caplog, linear, logging.WARNING)
+    assert [warning.exc_info[1] for warning in warnings] == [error, error]
+    assert len(kernels._PROOFS) == 2
+    for proof in kernels._PROOFS.values():
+        assert proof.failed and not proof.ran and not proof.graphs
+
+
 def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(
     monkeypatch, caplog
 ):
@@ -954,6 +990,60 @@ def test_a_stack_s_launch_is_built_once_and_replayed(monkeypatch):
     x, indices = _x((5, 3, 320), seed=9), _experts((5,), seed=9)
     assert _same_bits(other(x, indices), others(x, indices))
     assert len(built) == 3
+
+
+def test_stacks_of_6_and_of_8_matrices_share_a_proof_and_a_graph(monkeypatch):
+    """How many matrices a stack has is no part of what a launch is compiled
+    from, nor of its graph's signature: a stack of 8 replays the graph that
+    a stack of 6 kept, over its own tensors. MLX's compile traces the graph
+    once more, for their shapes."""
+    k, n = 320, 72
+    six, small = _switch_pair(k, n)
+    eight, large = _switch_pair(k, n, seed=7, experts=8)
+    assert (small.num_experts, large.num_experts) == (6, 8)
+    built = _built(monkeypatch)
+    shape = (1, 4, 1, 1, k)
+    x, indices = _x(shape), _experts((1, 4, 3))
+    assert _same_bits(small(x, indices), six(x, indices))
+    ((key, proof),) = kernels._PROOFS.items()
+    ((signature, graph),) = proof.graphs.items()
+    del built[:]
+    # Among them, the matrices that a stack of 6 does not have.
+    later = _x(shape, seed=3)
+    last = mx.array([[[7, 0, 6], [6, 7, 5], [1, 7, 6], [7, 6, 2]]], dtype=mx.uint32)
+    for _ in range(2):
+        assert _same_bits(large(later, last), eight(later, last))
+    assert built == [shape]
+    # The stack of 6 still replays what was traced for it.
+    assert _same_bits(small(later, indices), six(later, indices))
+    assert built == [shape]
+    assert list(kernels._PROOFS) == [key] and kernels._PROOFS[key] is proof
+    assert list(proof.graphs) == [signature] and proof.graphs[signature] is graph
+    assert proof.ran == {(mx.bfloat16, 3, False)} and not proof.failed
+
+
+def test_a_stack_s_graph_is_not_replayed_for_x_of_another_dtype():
+    """x's dtype is part of a stack's signature, as the shapes are. The
+    affine face is not exact for float32: a call in it, of the shapes of a
+    kept graph, is the decode and MLX's gather, and keeps nothing."""
+    quantized, switch = _switch_pair(320, 72, bias=True)
+    x, indices = _x((4, 1, 1, 320)), _experts((4, 3))
+    assert _same_bits(switch(x, indices), quantized(x, indices))
+    (proof,) = kernels._PROOFS.values()
+    kept = dict(proof.graphs)
+    assert len(kept) == 1
+    wide = x.astype(mx.float32)
+    stack = mx.dequantize(*_tensors(quantized).values(), group_size=32, bits=4)
+    stack = stack.astype(mx.float32).swapaxes(-1, -2)
+    want = mx.gather_mm(wide, stack, rhs_indices=indices, sorted_indices=False)
+    want = want + mx.expand_dims(quantized["bias"][indices], -2)
+    got = switch(wide, indices)
+    assert got.dtype == mx.float32 and _equal(got, want)
+    assert proof.graphs == kept and proof.ran == {(mx.bfloat16, 3, False)}
+    assert not proof.failed
+    # The kept graph is still the one of x's first dtype.
+    assert _same_bits(switch(x, indices), quantized(x, indices))
+    assert proof.graphs == kept
 
 
 def test_a_proof_keeps_so_many_graphs_then_builds_them_as_called(monkeypatch):

@@ -193,6 +193,23 @@ def test_a_proof_s_graphs_are_those_of_the_thread_that_asks(monkeypatch):
     assert "`proof.graphs` is the calling thread's own" in " ".join(_PAGE.split())
 
 
+def test_a_thread_keeps_64_graphs_of_a_proof_and_one_more_drops_them():
+    """``MAX_GRAPHS`` as it ships, which each thread counts for itself."""
+    proof = kernels.Proof()
+
+    def keep(first, count):
+        for signature in range(first, first + count):
+            proof.keep(signature, _Graph())
+        return sorted(proof.graphs)
+
+    assert keep(0, 64) == list(range(64))
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        assert pool.submit(keep, 100, 64).result() == list(range(100, 164))
+        assert sorted(proof.graphs) == list(range(64))
+        assert keep(64, 1) == [64]
+        assert pool.submit(keep, 164, 0).result() == list(range(100, 164))
+
+
 def test_no_graph_is_kept_while_a_failure_is_recorded(monkeypatch):
     """A launch can fail on one thread while another builds one: keeping a
     graph (the look at the failure, then the graph) and recording a failure
