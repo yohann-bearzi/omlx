@@ -337,6 +337,19 @@ class QuantFormat:
         matrices has its own."""
         return None
 
+    def record(self) -> dict:
+        """What a checkpoint written in the format keeps of it beside its
+        layers (the revision of its layout, what it needs to read its own
+        checkpoints): a dict that JSON keeps as it is. oQ stores it in the
+        checkpoint's config."""
+        return {}
+
+    def accept(self, record: dict) -> None:
+        """Raise a ValueError, in the format's words, for a checkpoint it
+        cannot read. A checkpoint's load calls it before any of the format's
+        layers is built, with the ``record`` it was written with: an empty
+        one for a checkpoint written before formats had records."""
+
 
 _FORMATS: dict[str, QuantFormat] = {}
 # The plugin that registered each mode: its distribution's name and version.

@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 from functools import cache, wraps
+from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -113,6 +115,22 @@ def loads_in_format(module_class: str) -> bool:
         for wrapped, _, built in _wrapped()
         for cls in (wrapped, built)
     )
+
+
+def accept_checkpoint(model_path) -> None:
+    """Hand each installed format that the checkpoint at ``model_path`` is
+    written in the record oQ stored for it (``omlx_quant_formats`` in its
+    config), before any layer is built: the format refuses a checkpoint it
+    cannot read. A checkpoint written before formats had records hands an
+    empty one."""
+    try:
+        config = json.loads((Path(model_path) / "config.json").read_text())
+    except (OSError, ValueError):
+        return
+    for mode, written in config.get("omlx_quant_formats", {}).items():
+        fmt = formats.get(mode)
+        if fmt is not None:
+            fmt.accept(written.get("record", {}))
 
 
 def apply_format_load_patch() -> None:

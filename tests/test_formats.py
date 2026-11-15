@@ -218,6 +218,13 @@ def test_a_plugin_of_another_revision_is_logged_and_skipped(plugins, caplog):
     assert "update oMLX" in str(record.exc_info[1])
 
 
+def test_a_format_s_record_is_empty_and_any_record_is_read_unless_it_says():
+    fmt = _Format()
+    assert fmt.record() == {}
+    for record in ({}, {"layout": 2, "levels": [0.5, 1.5]}):
+        assert fmt.accept(record) is None
+
+
 def test_the_contract_page_lists_every_revision():
     versions = _PAGE.split("\n## Versions\n")[1].split("\n## ")[0]
     revisions = [int(n) for n in re.findall(r"^\| (\d+) \|", versions, re.M)]

@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import re
+import textwrap
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -24,7 +25,7 @@ from omlx import formats
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
-from tests.test_formats_kernels import _matrix
+from tests.test_formats_kernels import _BLOCKS, _matrix
 from tests.test_formats_linear import EXPERTS, _ints, _ToyFormat, _want
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -40,6 +41,13 @@ class _Loadable(_ToyFormat):
     def __init__(self, mode="toy"):
         super().__init__()
         self.mode, self.asked = mode, []
+        self.accepted, self.refusal = [], None
+
+    def accept(self, record):
+        # What it was handed, and whether a layer had been built before.
+        self.accepted.append((record, len(self.asked)))
+        if self.refusal is not None:
+            raise ValueError(self.refusal)
 
     def layout(self, k, n, bits, group_size):
         self.asked.append((k, n, bits, group_size))
@@ -291,7 +299,10 @@ def test_the_patch_loads_the_plugins(unpatched, monkeypatch):
     assert loads == [True]
 
 
-def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
+def _llama(path, **written):
+    """A tiny llama checkpoint at ``path`` whose gate_proj of its one layer is
+    the toy format's, with ``written`` as its config's record of formats;
+    the reference model, and the layer's codes and scales."""
     config = {
         "model_type": "llama",
         "hidden_size": 64,
@@ -308,12 +319,18 @@ def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
     scales = scales * 2.0**-10
     weights = dict(tree_flatten(reference.parameters()))
     weights[f"{name}.weight"], weights[f"{name}.scales"] = codes, scales
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
     # A checkpoint names each layer of the format; the top-level mode is
     # MLX's, for the layers it finds by their scales.
     config["quantization"] = {"group_size": 64, "bits": 4, "mode": "affine", name: _TOY}
-    (tmp_path / "config.json").write_text(json.dumps(config))
+    if written:
+        config["omlx_quant_formats"] = written
+    (path / "config.json").write_text(json.dumps(config))
+    return reference, codes, scales
 
+
+def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
+    reference, codes, scales = _llama(tmp_path)
     model, _ = load_model(tmp_path)
     mlp = model.model.layers[0].mlp
     assert type(mlp.gate_proj) is FormatLinear and mlp.gate_proj.mode == "toy"
@@ -329,3 +346,60 @@ def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
     tokens = mx.array([[1, 5, 9, 2, 30]])
     logits = model(tokens)
     assert logits.shape == (1, 5, 32) and mx.array_equal(logits, reference(tokens))
+
+
+def test_a_load_hands_a_format_its_record_before_a_layer_is_built(toy, tmp_path):
+    record = {"layout": 2, "levels": [0.5, 1.5]}
+    _llama(tmp_path, toy={"plugin": "omlx-toy 0.3.1", "contract": 1, "record": record})
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert toy.accepted == [(record, 0)]
+    model, _ = load_model(tmp_path)
+    assert type(model.model.layers[0].mlp.gate_proj) is FormatLinear
+    assert toy.asked and len(toy.accepted) == 1
+
+
+def test_a_format_refuses_a_checkpoint_in_its_own_words(toy, tmp_path):
+    _llama(tmp_path, toy={"plugin": None, "contract": 1, "record": {"layout": 2}})
+    toy.refusal = "written in layout 2; this plugin reads layout 1"
+    with pytest.raises(ValueError) as refusal:
+        maybe_apply_pre_load_patches(str(tmp_path))
+    assert str(refusal.value) == toy.refusal
+    assert toy.asked == []
+
+
+def test_a_checkpoint_written_before_records_hands_an_empty_one(toy, tmp_path):
+    _llama(tmp_path, toy={"plugin": "omlx-toy 0.3.0", "contract": 1})
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert toy.accepted == [({}, 0)]
+    # A checkpoint of no format hands none.
+    _llama(tmp_path)
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert len(toy.accepted) == 1
+
+
+def test_a_format_that_is_not_installed_is_left_to_the_layers_load(toy, tmp_path):
+    _llama(tmp_path, oqel={"plugin": "omlx-oqel 0.2.0", "contract": 1})
+    maybe_apply_pre_load_patches(str(tmp_path))
+    assert toy.accepted == []
+
+
+def test_a_checkpoint_without_a_config_it_can_read_hands_no_record(toy, tmp_path):
+    format_load.accept_checkpoint(str(tmp_path))
+    (tmp_path / "config.json").write_text("{")
+    format_load.accept_checkpoint(str(tmp_path))
+    assert toy.accepted == []
+
+
+def test_the_contract_page_s_accept_refuses_another_layout():
+    (text,) = (
+        text
+        for language, text in _BLOCKS
+        if language == "python" and "def accept" in text
+    )
+    scope = {}
+    exec(textwrap.dedent(text), scope)
+    for record in ({}, {"layout": 1}):
+        assert scope["accept"](None, record) is None
+    with pytest.raises(ValueError) as refusal:
+        scope["accept"](None, {"layout": 2})
+    assert str(refusal.value) == "written in layout 2; this plugin reads layout 1"

@@ -139,6 +139,16 @@ A checkpoint names each layer of the format in its quantization config:
 - A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
 - A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three. Until then oQ writes their matrices in its affine (see [Quantize a checkpoint](#quantize-a-checkpoint)).
 
+Before any layer is built, the load hands each installed format a checkpoint is written in the record oQ stored for it (`omlx_quant_formats` in `config.json`, see [Quantize a checkpoint](#quantize-a-checkpoint)), and the format refuses a checkpoint it cannot read:
+
+```python
+    def accept(self, record):
+        if record.get("layout", 1) != 1:
+            raise ValueError(f"written in layout {record['layout']}; this plugin reads layout 1")
+```
+
+`accept(record)` raises a ValueError in the format's own words, which the load raises as it is. A checkpoint written before formats had records hands an empty one. The default `accept` reads every record.
+
 ## Quantize a checkpoint
 
 oQ writes a checkpoint's matrices in a format that encodes them:
@@ -177,11 +187,13 @@ What oQ writes:
 
 - The tensors, as `<layer>.<name>`, and the layer's entry in the quantization config: its `bits`, its `group_size` and the format's `mode`. That is what [loads](#load-a-checkpoint).
 - For a matrix the format returns None for, what it writes without the format: its own affine tensors at the same bits.
-- In `config.json`, each format the checkpoint has layers of, with the plugin that wrote them (`omlx.formats.origin(mode)`: the distribution's name and version, or null for a format registered by hand) and the revision the format states:
+- In `config.json`, each format the checkpoint has layers of, with the plugin that wrote them (`omlx.formats.origin(mode)`: the distribution's name and version, or null for a format registered by hand), the revision the format states and the format's record:
 
   ```json
-  "omlx_quant_formats": {"myformat": {"plugin": "my-package 0.1.0", "contract": 1}}
+  "omlx_quant_formats": {"myformat": {"plugin": "my-package 0.1.0", "contract": 1, "record": {"layout": 1}}}
   ```
+
+  `record()` gives what a checkpoint keeps of the format beside its layers: the revision of its layout, what the format needs to read its own checkpoints. It is a dict that JSON keeps as it is (string keys; strings, numbers, lists, dicts; no tuple, array or NaN), asked once for the whole checkpoint, and empty by default. oQ refuses another before it reads a weight: `quant format 'myformat' gives the record {'levels': (1, 2)}, not a dict that JSON keeps as it is: report it to the plugin`. The load hands it back to [`accept`](#load-a-checkpoint).
 
 - A line in the log, `oQ4: 23 layers in quant format myformat`, or a warning when the format took none: `oQ4: quant format myformat took no layer: the output is as without it`.
 

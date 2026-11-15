@@ -49,6 +49,7 @@ class _Codec(_ToyFormat):
         super().__init__()
         self.offered, self.encoded, self.lays_out = [], [], True
         self.answer = lambda tensors, w: tensors
+        self.accepted = []
 
     def layout(self, k, n, bits, group_size):
         self.offered.append((k, n, bits, group_size))
@@ -62,6 +63,9 @@ class _Codec(_ToyFormat):
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
         codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
         return self.answer({"weight": codes.astype(mx.uint8), "scales": scales}, w)
+
+    def accept(self, record):
+        self.accepted.append(record)
 
 
 @pytest.fixture
@@ -401,7 +405,9 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
         for name, entry in entries.items()
     )
     # The checkpoint names what reads it, and everything else is as without.
-    assert config[_RECORD] == {"toy": {"plugin": "omlx-toy 0.3.1", "contract": 1}}
+    assert config[_RECORD] == {
+        "toy": {"plugin": "omlx-toy 0.3.1", "contract": 1, "record": {}}
+    }
     said = f"oQ4: {len(entries)} layers in quant format toy"
     assert said in caplog.messages and _quoted(said)
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
@@ -437,7 +443,7 @@ def test_what_a_format_declines_is_written_as_without_it(source, plain, toy, tmp
     entries = _in_format(config)
     assert len(entries) == 6 and len(toy.encoded) == len(applied) > 6
     assert all(tensors[f"{name}.weight"].dtype == mx.uint8 for name in entries)
-    assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1}}
+    assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": {}}}
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
 
 
@@ -690,4 +696,52 @@ def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
         f"oQ writes no {family} checkpoint in quant format 'toy': {why}"
     )
     assert _quoted(str(refusal.value).replace("glm5_next_text", "glm5_next"))
+    assert not output.exists() and toy.offered == []
+
+
+def test_a_checkpoint_keeps_the_record_its_format_gives(
+    source, toy, tmp_path, monkeypatch
+):
+    record = {"layout": 2, "levels": [-1.5, 0.25, 3], "name": "lloyd"}
+    monkeypatch.setattr(toy, "record", lambda: dict(record))
+    output = tmp_path / "oqe-toy"
+    _, config, _ = _quantize(source, output, quant_format="toy")
+    assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": record}}
+    # The load hands it back to the format, once.
+    assert toy.accepted == []
+    maybe_apply_pre_load_patches(str(output))
+    assert toy.accepted == [record]
+
+
+_CYCLE: dict = {}
+_CYCLE["self"] = _CYCLE
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        ["layout", 2],
+        {"levels": (1, 2)},
+        {2: "layout"},
+        {"levels": mx.ones((2,))},
+        {"scale": float("nan")},
+        _CYCLE,
+    ],
+    ids=["no dict", "a tuple", "a key not a string", "an array", "a nan", "a cycle"],
+)
+def test_a_record_that_json_does_not_keep_is_refused(
+    source, toy, tmp_path, monkeypatch, record
+):
+    monkeypatch.setattr(toy, "record", lambda: record)
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format="toy"
+        )
+    assert str(refusal.value) == (
+        f"quant format 'toy' gives the record {record!r}, not a dict that JSON "
+        "keeps as it is: report it to the plugin"
+    )
+    if record == {"levels": (1, 2)}:
+        assert _quoted(str(refusal.value))
     assert not output.exists() and toy.offered == []

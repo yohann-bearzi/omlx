@@ -7206,6 +7206,16 @@ def quantize_oq_streaming(
                 f"no quant format is registered for mode {quant_format!r}: "
                 "install its plugin"
             )
+        quant_record = quant_fmt.record()
+        try:
+            kept = json.loads(json.dumps(quant_record))
+        except (TypeError, ValueError):
+            kept = None
+        if not isinstance(quant_record, dict) or kept != quant_record:
+            raise ValueError(
+                f"quant format {quant_format!r} gives the record {quant_record!r}, "
+                "not a dict that JSON keeps as it is: report it to the plugin"
+            )
 
     source = Path(model_path)
     output = Path(output_path)
@@ -8241,6 +8251,7 @@ def quantize_oq_streaming(
             quant_format: {
                 "plugin": formats.origin(quant_format),
                 "contract": quant_fmt.contract,
+                "record": quant_record,
             }
         }
     elif quant_fmt is not None:
