@@ -18,6 +18,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/linear.py` | the layers that hold a format's tensors |
 | `omlx/patches/format_load.py` | what loads a format's checkpoint into them |
+| `omlx/oq.py` | oQ, which writes a checkpoint in a format |
 | `omlx/formats/testing.py` | checks for a format's own tests |
 | `omlx/formats/affine.py` | affine, the built-in format |
 
@@ -38,6 +39,9 @@ class MyFormat(QuantFormat):
 
     def layout(self, k, n, bits, group_size):
         ...                # what a checkpoint keeps of one matrix
+
+    def encode(self, w, importance, bits, group_size):
+        ...                # the tensors oQ writes of one matrix
 
     def dot(self, layer, k, n) -> Dot | None:
         ...                # the face that oMLX's kernels run them through
@@ -127,6 +131,67 @@ A checkpoint names each layer of the format in its quantization config:
 - A checkpoint of a format that is not installed fails to load: `no quant format is registered for mode 'myformat': install the plugin the checkpoint was written with`.
 - A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
 - A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three.
+
+## Quantize a checkpoint
+
+oQ writes a checkpoint's matrices in a format that encodes them:
+
+```python
+    def encode(self, w, importance, bits, group_size):
+        if bits != 8:
+            return None
+        rows = w.astype(mx.float32)
+        scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
+        codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
+        return {"weight": codes.astype(mx.uint8), "scales": scales}
+```
+
+```python
+from omlx.oq import quantize_oq_streaming
+
+quantize_oq_streaming(source, output, 4, enhanced=True, quant_format="myformat")
+```
+
+`encode` returns the tensors that keep `w`, by name, in the shapes and dtypes that `layout(k, n, bits, group_size)` gives, or None for a matrix it leaves to oQ.
+
+- `w` is a matrix `(n, k)`, or some of a stack's matrices, `(e, n, k)`, in the floats of the source checkpoint. The tensors of a stack's matrices have its axis first.
+- `importance` weighs the squared error of each of the K inputs, as oQe measured them over its calibration samples. It is `(k,)`, or `(e, k)` when each matrix of a stack has its own, in fp32.
+- `bits` and `group_size` are what oQ gives the layer at the level it writes. The layer's quantization entry carries them, so `layout`, `decode` and `dot` get the same values when the checkpoint loads. A format with groups of its own ignores `group_size`.
+
+What oQ offers a format:
+
+- The matrices that oQe has an importance for: the linears and the switch layers its calibration ran through. A format is therefore written with oQe only (`enhanced=True`), and a tensor oQe has no importance for (a table of embeddings, for one) is written as without the format.
+- A matrix, or a stack of matrices, that `layout` returns a layout for at the layer's bits and group size. `layout` is asked first, and `encode` is not called for a matrix it returns None for.
+- A matrix that fits one launch: up to 2^30 weights, fewer on a Mac whose largest Metal buffer is small. A stack that does not fit one is offered in runs of whole matrices, in several calls, and oQ joins their tensors along the stack's axis. A format therefore encodes each matrix by itself: its tensors do not depend on the matrices beside it in a call. A format that encodes a stack's first runs and returns None for a later one is refused.
+- Nothing that oQ does not quantize itself: a tensor the source already keeps at the level's bits or fewer (experts their lab ships in 4 bits, at a level of 4 bits or more) is written as the source has it, and so is a table kept with `preserve_ngram_table`.
+
+What oQ writes:
+
+- The tensors, as `<layer>.<name>`, and the layer's entry in the quantization config: its `bits`, its `group_size` and the format's `mode`. That is what [loads](#load-a-checkpoint).
+- For a matrix the format returns None for, what it writes without the format: its own affine tensors at the same bits.
+- In `config.json`, each format the checkpoint has layers of, with the plugin that wrote them (`omlx.formats.origin(mode)`: the distribution's name and version, or null for a format registered by hand) and the revision the format states:
+
+  ```json
+  "omlx_quant_formats": {"myformat": {"plugin": "my-package 0.1.0", "contract": 1}}
+  ```
+
+- A line in the log, `oQ4: 23 layers in quant format myformat`, or a warning when the format took none: `oQ4: quant format myformat took no layer: the output is as without it`.
+
+oQ checks each answer against the layout, which is what the checkpoint loads by. Tensors of other names, shapes or dtypes stop the run:
+
+```
+quant format 'myformat' encoded model.layers.0.mlp.gate_proj.weight as {'weight': ((16, 64),
+mlx.core.uint8)}, and lays it out as {'weight': ((16, 64), mlx.core.uint8), 'scales': ((16,),
+mlx.core.float32)}: the checkpoint would not load
+```
+
+oQ gives each layer its bits within a budget of bits per weight, which it counts in what affine costs at `(bits, group_size)`. A format that costs about as much keeps the level's size. One that costs more writes a larger checkpoint than the level states.
+
+oQ refuses a format before it reads a weight:
+
+- without `enhanced=True`: `quant format 'myformat' encodes with oQe's importance: pass enhanced=True`,
+- for a mode that is not registered: `no quant format is registered for mode 'myformat': install its plugin`,
+- for a DeepSeek V4.1 or a Muse Spark checkpoint: `oQ writes a deepseek_v41 checkpoint through a writer of its own, which takes no quant format`.
 
 ## Faces
 
@@ -420,7 +485,7 @@ Worth testing for every layout a format gives a face for:
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `register`, `load`, `get`, `dot`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `register`, `load`, `get`, `origin`, `dot`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints` and `omlx_iota`.
 
@@ -428,7 +493,7 @@ The contract has a revision, a whole number that goes up by one with each change
 
 | Revision | In oMLX since | What it adds |
 |---|---|---|
-| 1 | not released yet | The registry, the dot face, `omlx.formats.testing`. |
+| 1 | not released yet | The registry, the dot face, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
 
 A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 

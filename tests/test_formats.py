@@ -62,6 +62,7 @@ def plugins(monkeypatch):
     plugins' entry points."""
     installed = []
     monkeypatch.setattr(formats, "_FORMATS", {})
+    monkeypatch.setattr(formats, "_ORIGINS", {})
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
@@ -299,6 +300,33 @@ def test_a_loaded_plugin_is_logged_with_its_distribution(plugins, monkeypatch, c
         "quant format plugin two (two:FORMAT) registered also, second",
     ]
     assert sorted(formats._FORMATS) == ["also", "builtin", "second", "toy"]
+
+
+def test_a_mode_s_origin_is_the_plugin_that_registered_it(plugins, monkeypatch):
+    def two():
+        formats.register(_Format("also"))
+        return _Format("second")
+
+    def failing():
+        formats.register(_Format("early"))  # its module, by itself
+        raise ImportError("and then the import failed")
+
+    installed = _Entry("toy", _Format())
+    installed.dist = SimpleNamespace(name="omlx-toy", version="0.3.1")
+    plugins += [_Entry("two", two), installed, _Entry("bad", failing)]
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTIN",))
+    # Asking loads, as every lookup does.
+    assert formats.origin("toy") == "omlx-toy 0.3.1"
+    assert installed.loaded == 1
+    # Each mode a plugin registered has it, as the entry point's value when
+    # no distribution installed the plugin.
+    assert formats.origin("also") == formats.origin("second") == "two:FORMAT"
+    # A built-in format has none. Nor has a format registered by hand, a
+    # format of a plugin that failed, or a mode without a format.
+    formats.register(_Format("by_hand"))
+    assert formats.get("by_hand") and formats.get("builtin") is _BUILTIN
+    for mode in ("builtin", "by_hand", "early", "unknown"):
+        assert formats.origin(mode) is None
 
 
 def test_a_plugin_that_fails_to_load_is_logged_and_skipped(plugins, caplog):
@@ -727,9 +755,16 @@ def test_a_face_is_exact_for_its_dtypes_or_for_any():
     assert halves.exact_for(mx.bfloat16) and not halves.exact_for(mx.float32)
 
 
-def test_a_format_without_a_decode_says_so():
-    class Bare(formats.QuantFormat):
-        mode, tensors, contract = "bare", (), formats.CONTRACT
+class _Bare(formats.QuantFormat):
+    mode, tensors, contract = "bare", (), formats.CONTRACT
 
+
+def test_a_format_without_a_decode_says_so():
     with pytest.raises(NotImplementedError, match="quant format 'bare' has no decode"):
-        Bare().decode({"weight": mx.zeros((8, 8))}, 4, 32)
+        _Bare().decode({"weight": mx.zeros((8, 8))}, 4, 32)
+
+
+def test_a_format_without_a_layout_or_a_codec_keeps_no_matrix():
+    # No layer of a checkpoint is then its to build, and oQ writes none in it.
+    assert _Bare().layout(64, 8, 4, 64) is None
+    assert _Bare().encode(mx.zeros((8, 64)), mx.ones((64,)), 4, 64) is None

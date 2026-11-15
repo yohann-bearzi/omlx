@@ -6885,6 +6885,57 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
+def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
+    """``w``'s tensors in the quant format ``fmt``, by name, or None when the
+    tensor stays oQ's affine: the format lays out or encodes no such matrix,
+    or ``w`` is neither a matrix nor a stack of matrices that fit a launch.
+    A stack is encoded in runs of its matrices. The tensors are checked
+    against the format's layout, which is what a checkpoint loads by."""
+    *stack, n, k = w.shape
+    max_elems = min(_QUANTIZE_CHUNK_BYTES // 2, 1 << 30)
+    layout = fmt.layout(k, n, bits, group_size)
+    if layout is None or len(stack) > 1 or n * k > max_elems:
+        return None
+    runs = _row_chunks_with_bounds(w, max_elems) if stack else ((0, n, w),)
+    own = stack and importance.ndim > 1  # each matrix has its importance
+    parts = []
+    for r0, r1, run in runs:
+        tensors = fmt.encode(
+            run, importance[r0:r1] if own else importance, bits, group_size
+        )
+        if tensors is None:
+            if parts:
+                raise ValueError(
+                    f"quant format {fmt.mode!r} encoded the first {r0} matrices "
+                    f"of {tensor_name} and none of the next: a stack is one layer"
+                )
+            return None
+        if not isinstance(tensors, dict) or not all(
+            isinstance(tensor, mx.array) for tensor in tensors.values()
+        ):
+            raise TypeError(
+                f"quant format {fmt.mode!r}: encode gives the tensors of "
+                f"{tensor_name} as a dict of arrays by name, or None"
+            )
+        lead = (r1 - r0,) if stack else ()
+        want = {
+            name: ((*lead, *shape), dtype) for name, (shape, dtype) in layout.items()
+        }
+        kept = {name: (tuple(t.shape), t.dtype) for name, t in tensors.items()}
+        if kept != want:
+            raise ValueError(
+                f"quant format {fmt.mode!r} encoded {tensor_name} as {kept}, and "
+                f"lays it out as {want}: the checkpoint would not load"
+            )
+        mx.eval(*tensors.values())
+        parts.append(tensors)
+        mx.synchronize()
+        mx.clear_cache()
+    if len(parts) == 1:
+        return parts[0]
+    return {name: mx.concatenate([part[name] for part in parts]) for name in layout}
+
+
 def _quantize_chunked(w, group_size, bits, mode, importance=None):
     _MLX_MAX_ELEMS = 1 << 30
     max_elems = max(group_size, min(_QUANTIZE_CHUNK_BYTES // 2, _MLX_MAX_ELEMS))
@@ -7017,6 +7068,7 @@ def quantize_oq_streaming(
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
+    quant_format: str | None = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7092,6 +7144,12 @@ def quantize_oq_streaming(
             plain weights. DeepSeek V4.1 keeps its Engram tables in the
             official FP8 storage instead of 4-bit affine. No effect on other
             model types.
+        quant_format: The mode of a registered quant format
+            (docs/quant-formats.md). Each matrix that oQe has an importance
+            for is offered to the format, at the bits and group size oQ
+            gives it, and is written as the format's tensors under the
+            format's mode. What the format leaves, and every other tensor,
+            is written as without it. Requires enhanced.
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7100,6 +7158,21 @@ def quantize_oq_streaming(
     if dtype not in OQ_DTYPES:
         raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
     target_dtype = mx.bfloat16 if dtype == "bfloat16" else mx.float16
+    quant_fmt = None
+    if quant_format is not None:
+        from . import formats
+
+        if not enhanced:
+            raise ValueError(
+                f"quant format {quant_format!r} encodes with oQe's importance: "
+                "pass enhanced=True"
+            )
+        quant_fmt = formats.get(quant_format)
+        if quant_fmt is None:
+            raise ValueError(
+                f"no quant format is registered for mode {quant_format!r}: "
+                "install its plugin"
+            )
 
     source = Path(model_path)
     output = Path(output_path)
@@ -7141,6 +7214,13 @@ def quantize_oq_streaming(
         and _has_vision_subconfig(config)
         and not text_only
     )
+    if quant_fmt is not None and (
+        normalized_model_type == "deepseek_v41" or _is_muse_spark(config)
+    ):
+        raise ValueError(
+            f"oQ writes a {config.get('model_type')} checkpoint through a writer "
+            "of its own, which takes no quant format"
+        )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -7735,6 +7815,7 @@ def quantize_oq_streaming(
     base_gs = _gs_for_mode(base_bits, group_size)
     quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
     per_layer_config = {}
+    format_layers = 0
     start_time = _time.monotonic()
     last_quant_display_pct = -1
     last_quant_emit_time = 0.0
@@ -7846,14 +7927,6 @@ def quantize_oq_streaming(
                 )
 
                 if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
-                    # Cast to target dtype before quantize: scales/biases inherit
-                    # the input dtype, which drives inference speed on Apple
-                    # Silicon (M1/M2 prefer float16, M3/M4 handle both).
-                    if (
-                        mx.issubdtype(w_mx.dtype, mx.floating)
-                        and w_mx.dtype != target_dtype
-                    ):
-                        w_mx = w_mx.astype(target_dtype)
                     importance = None
                     if imatrix_data is not None and qmode == "affine":
                         importance = _lookup_imatrix_importance(
@@ -7864,29 +7937,58 @@ def quantize_oq_streaming(
                             strict=imatrix_strict,
                             report=imatrix_report,
                         )
-                    qw, scales, biases = _quantize_chunked(
-                        w_mx,
-                        gs,
-                        bits,
-                        qmode,
-                        importance=importance,
-                    )
-
                     base = tensor_name
                     if base.endswith(".weight"):
                         base = base[:-7]
 
-                    out_shard_data[f"{base}.weight"] = qw
-                    out_shard_data[f"{base}.scales"] = scales
-                    if biases is not None:
-                        out_shard_data[f"{base}.biases"] = biases
+                    # The format is offered the source's own floats.
+                    encoded = None
+                    if quant_fmt is not None and importance is not None:
+                        encoded = _encode_in_format(
+                            quant_fmt, tensor_name, w_mx, importance, bits, gs
+                        )
+                    if encoded is not None:
+                        for name, tensor in encoded.items():
+                            out_shard_data[f"{base}.{name}"] = tensor
+                        per_layer_config[base] = {
+                            "bits": bits,
+                            "group_size": gs,
+                            "mode": quant_fmt.mode,
+                        }
+                        format_layers += 1
+                    else:
+                        # Cast to target dtype before quantize: scales/biases
+                        # inherit the input dtype, which drives inference
+                        # speed on Apple Silicon (M1/M2 prefer float16, M3/M4
+                        # handle both).
+                        if (
+                            mx.issubdtype(w_mx.dtype, mx.floating)
+                            and w_mx.dtype != target_dtype
+                        ):
+                            w_mx = w_mx.astype(target_dtype)
+                        qw, scales, biases = _quantize_chunked(
+                            w_mx,
+                            gs,
+                            bits,
+                            qmode,
+                            importance=importance,
+                        )
 
-                    base_qmode = _mode_for_bits(base_bits)
-                    base_gs_check = _gs_for_mode(base_bits, group_size)
-                    if bits != base_bits or gs != base_gs_check or qmode != base_qmode:
-                        layer_cfg = {"bits": bits, "group_size": gs}
-                        layer_cfg["mode"] = qmode
-                        per_layer_config[base] = layer_cfg
+                        out_shard_data[f"{base}.weight"] = qw
+                        out_shard_data[f"{base}.scales"] = scales
+                        if biases is not None:
+                            out_shard_data[f"{base}.biases"] = biases
+
+                        base_qmode = _mode_for_bits(base_bits)
+                        base_gs_check = _gs_for_mode(base_bits, group_size)
+                        if (
+                            bits != base_bits
+                            or gs != base_gs_check
+                            or qmode != base_qmode
+                        ):
+                            layer_cfg = {"bits": bits, "group_size": gs}
+                            layer_cfg["mode"] = qmode
+                            per_layer_config[base] = layer_cfg
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
                         w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
@@ -8074,6 +8176,26 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    if format_layers:
+        logger.info(
+            "oQ%s: %d layers in quant format %s",
+            f"{oq_level:g}",
+            format_layers,
+            quant_format,
+        )
+        # What a loader needs installed to read them.
+        output_config["omlx_quant_formats"] = {
+            quant_format: {
+                "plugin": formats.origin(quant_format),
+                "contract": quant_fmt.contract,
+            }
+        }
+    elif quant_fmt is not None:
+        logger.warning(
+            "oQ%s: quant format %s took no layer: the output is as without it",
+            f"{oq_level:g}",
+            quant_format,
+        )
     if minimax_nvfp4_experts:
         output_config["text_config"] = {
             **output_config["text_config"],

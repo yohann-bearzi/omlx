@@ -95,8 +95,8 @@ class Dot:
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
     ``contract``, and overrides ``decode``, ``layout`` (what loads its
-    checkpoints) and the faces it has; a kernel whose face a format lacks
-    keeps its composed path."""
+    checkpoints), ``encode`` (what writes them) and the faces it has; a
+    kernel whose face a format lacks keeps its composed path."""
 
     mode: str  # a linear's "mode" in the quantization config
     tensors: tuple[str, ...]  # its parameters beside "weight" (and "bias")
@@ -123,8 +123,21 @@ class QuantFormat:
         to build (affine)."""
         return None
 
+    def encode(
+        self, w: mx.array, importance: mx.array, bits: int, group_size: int
+    ) -> dict[str, mx.array] | None:
+        """The tensors that keep ``w``, by name and as ``layout`` gives them,
+        or None to leave it to oQ's affine. ``w`` is a matrix ``(n, k)``, or
+        ``(e, n, k)`` for some of a stack's, that oQ gives ``bits`` bits in
+        groups of ``group_size``. ``importance`` weighs the squared error of
+        each of the ``k`` inputs: ``(k,)``, or ``(e, k)`` when each of the
+        matrices has its own."""
+        return None
+
 
 _FORMATS: dict[str, QuantFormat] = {}
+# The plugin that registered each mode: its distribution's name and version.
+_ORIGINS: dict[str, str] = {}
 # Held for the whole load. Reentrant: the load registers through register(),
 # which loads first.
 _LOCK = threading.RLock()
@@ -209,11 +222,14 @@ def load() -> None:
                     )
                 else:
                     dist = getattr(entry, "dist", None)
+                    plugin = f"{dist.name} {dist.version}" if dist else entry.value
+                    modes = sorted(_FORMATS.keys() - before)
+                    _ORIGINS.update(dict.fromkeys(modes, plugin))
                     logger.info(
                         "quant format plugin %s (%s) registered %s",
                         entry.name,
-                        f"{dist.name} {dist.version}" if dist else entry.value,
-                        ", ".join(sorted(_FORMATS.keys() - before)),
+                        plugin,
+                        ", ".join(modes),
                     )
             _loaded = True
         finally:
@@ -224,6 +240,14 @@ def get(mode: str | None) -> QuantFormat | None:
     """The format registered for ``mode``, or None."""
     load()
     return _FORMATS.get(mode)
+
+
+def origin(mode: str) -> str | None:
+    """The plugin whose format ``mode`` is, as the name and version of its
+    distribution; None for a built-in format, and for one registered by
+    hand."""
+    load()
+    return _ORIGINS.get(mode)
 
 
 # The dot() defects that are logged: a format's mode and the error's repr.
