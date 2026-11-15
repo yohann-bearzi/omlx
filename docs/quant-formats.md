@@ -340,8 +340,9 @@ Worth testing for every layout a format gives a face for:
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- the names of `omlx.formats` and `omlx.formats.testing` that this page describes, and the `omlx.quant_formats` entry-point group,
-- the members of a face, the order a kernel runs them in and the rules a face follows.
+- `QuantFormat`, `Dot`, `register`, `load`, `get`, `dot`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- the members of a face, the order a kernel runs them in and the rules a face follows,
+- the Metal names a format's source may use: `omlx_ints` and `omlx_iota`.
 
 The contract has a revision, a whole number that goes up by one with each change. `omlx.formats.CONTRACT` is the revision this oMLX implements. `omlx.formats.OLDEST_CONTRACT` is the oldest revision whose formats it still runs.
 
@@ -349,7 +350,7 @@ The contract has a revision, a whole number that goes up by one with each change
 |---|---|---|
 | 1 | not released yet | The registry, the dot face, `omlx.formats.testing`. |
 
-A format states the revision it is written for in two places, with the same number: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face.
+A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 
 ```python
 class MyFormat(QuantFormat):
@@ -365,7 +366,7 @@ oMLX runs the formats of revisions `OLDEST_CONTRACT` to `CONTRACT`. A format of 
 
 ```
 quant format 'myformat' is written for revision 2 of the format contract; this oMLX runs
-revisions 1 to 1: update oMLX
+revision 1: update oMLX
 ```
 
 A face of another revision does not compile:
@@ -378,13 +379,17 @@ runs"
 'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
 ```
 
+A registered format meets this only with a face that does not state the format's revision. The kernel's launch then fails as it does for any face that does not compile: the routed decode logs the message and the layer keeps its composed path (see [Kernels built on faces](#kernels-built-on-faces)).
+
 What a revision can change:
 
-- **An addition** is a new revision: a member of a face, a kind of face, a name in `omlx.formats`. Formats of earlier revisions run as before, to the bit. A kernel calls a member added in revision N only on a face that states N or later, so a format moves to a later revision when it wants what that revision adds, and not before.
+- **An addition** is a new revision: a member of a face, a kind of face, a name in `omlx.formats`. Formats of earlier revisions run as before, to the bit. A kernel calls a member added in revision N only on a face that states N or later, so a format moves to a later revision when it wants what that revision adds, and not before. Revisions add up: a face that states N has every member that the revisions up to N give its kind of face.
 - **A change to something formats rely on** (a member's signature, the run order, a rule) is a new revision that also raises `OLDEST_CONTRACT`: every format of an earlier revision is refused until it is updated. Where an addition can do the job, it is done as one: a new member beside the old one.
-- **oMLX's own side** is not in the contract and changes without a revision: which kernels are built on a face, their launch shapes, `omlx.formats.kernels` (see [Kernels over faces](#kernels-over-faces)), speed.
+- **oMLX's own side** is not in the contract and changes without a revision: which kernels are built on a face, their launch shapes, `Matrices`, `qmv_rows` and the rest of `omlx.formats.kernels` (see [Kernels over faces](#kernels-over-faces)), speed.
 
-A format states the oldest revision that has everything it uses: it then runs on every oMLX from that revision's first release until `OLDEST_CONTRACT` passes it. A format that can use a later revision's additions and still run without them reads `omlx.formats.CONTRACT` and states the newest revision it knows that this oMLX runs.
+A format states the oldest revision that has everything it uses: it then runs on every oMLX from that revision's first release until `OLDEST_CONTRACT` passes it. A format that can use a later revision's additions and still run without them reads `omlx.formats.CONTRACT` and states the newest revision it knows that this oMLX runs. It never states `omlx.formats.CONTRACT` itself: a later oMLX would then call members the format does not have.
+
+A format imports a name that a later revision added where it uses the name, not at the top of its module. At the top, an oMLX without the name fails the plugin's load with an `ImportError`, in place of the refusal above and its advice.
 
 A revision that no release of oMLX has shipped can still change. Revision 1 is one.
 
@@ -396,11 +401,13 @@ The contract holds what a format uses, and grows when a format needs more. To ad
 
    ```cpp
    if constexpr (D::CONTRACT >= 2) {
-     ...  // the call
+     ...  // the call, and everything that uses its result
    }
    ```
 
-2. Raise `CONTRACT` in `omlx/formats/__init__.py`, add a row to the table above, and document the member on this page with its revision.
+   The gate discards the call where the face `D` is a template parameter: in a skeleton, never in a kernel body. `omlx_qmv_block`, which calls `load`, `row` and `madd`, has the lanes' type and not the face's: `D` becomes a template argument of it with the first member gated there.
+
+2. Raise `CONTRACT` in `omlx/formats/__init__.py`, add a row to the table above, update the two messages quoted under [Versions](#versions), and document the member on this page with its revision.
 3. Test it with a face of the new revision that uses the member, with one that states the new revision and lacks the member (it must fail to compile, with a message that names the member), and with faces of earlier revisions: their rows must not change by a bit. Affine's rows stay MLX's.
 4. Measure the kernels built on the face against the commit before, in pairs, on the formats that do not have the member. It must cost them nothing.
 

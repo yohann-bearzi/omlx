@@ -16,17 +16,11 @@ faster.
 
 from __future__ import annotations
 
-from . import CONTRACT, OLDEST_CONTRACT, Dot
+from .. import formats
+from . import Dot
 
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
-
-# The contract revisions the skeletons run a face of. A kernel has them ahead
-# of its first cited line.
-_REVISIONS = (
-    f"#define OMLX_CONTRACT {CONTRACT}\n"
-    f"#define OMLX_OLDEST_CONTRACT {OLDEST_CONTRACT}\n"
-)
 
 # Compile-time index packs, for folds over a fixed count (a kernel's rows, a
 # lane's values): omlx_iota<N>() is omlx_ints<0, ..., N - 1>. Formats' sources
@@ -164,16 +158,16 @@ class Matrices:
 
     @property
     def header(self) -> str:
-        """The Metal the kernel includes: the contract revisions, the index
-        packs, each distinct format source once (cited under the key of the
-        first face that has it), then the skeletons."""
+        """The Metal the kernel includes: the index packs, each distinct
+        format source once (cited under the key of the first face that has
+        it), then the contract revisions and the skeletons."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
         return (
-            _REVISIONS
-            + _named(_SKELETONS, _INDEX_PACKS)
+            _named(_SKELETONS, _INDEX_PACKS)
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
+            + _revisions()
             + _named(_SKELETONS, _QMV_ROWS, line=_INDEX_PACKS.count("\n") + 1)
             + _named("<kernel header>", "")
         )
@@ -186,6 +180,17 @@ class Matrices:
             f"    const auto {name} = {face.type}{{{_members(name, face)}}};\n"
             for name, face in self._faces.items()
         ) + _named("<kernel>", "")
+
+
+def _revisions() -> str:
+    """The contract revisions the skeletons run a face of, as the kernel is
+    built. Macros, so that a failed assert prints the number. They follow the
+    formats' sources, which do not read them: a format picks its revision in
+    Python. The first opens a line of its own, whatever a source ends with."""
+    return (
+        f"\n#define OMLX_CONTRACT {formats.CONTRACT}\n"
+        f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}"
+    )
 
 
 def _named(name: str, source: str, line: int = 1) -> str:

@@ -132,14 +132,20 @@ def register(fmt: QuantFormat) -> None:
     contract = getattr(fmt, "contract", None)
     if type(contract) is not int:
         raise ValueError(
-            f"quant format {mode!r} does not state the revision of the format "
-            "contract it is written for (contract)"
+            f"quant format {mode!r}: contract is the revision of the format "
+            f"contract it is written for, an int, not {contract!r} "
+            f"({type(contract).__name__})"
         )
     if not OLDEST_CONTRACT <= contract <= CONTRACT:
+        runs = (
+            f"revision {CONTRACT}"
+            if OLDEST_CONTRACT == CONTRACT
+            else f"revisions {OLDEST_CONTRACT} to {CONTRACT}"
+        )
         raise ValueError(
             f"quant format {mode!r} is written for revision {contract} of the "
-            f"format contract; this oMLX runs revisions {OLDEST_CONTRACT} to "
-            f"{CONTRACT}: update {'oMLX' if contract > CONTRACT else 'the format'}"
+            f"format contract; this oMLX runs {runs}: update "
+            f"{'oMLX' if contract > CONTRACT else 'the format'}"
         )
     load()
     if _FORMATS.setdefault(mode, fmt) is not fmt:

@@ -5,6 +5,7 @@ and computes every row with MLX's bits.
 
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 
 import mlx.core as mx
@@ -67,6 +68,12 @@ def test_affine_ships_as_a_builtin_plugin():
     assert "omlx.formats.affine:FORMAT" in formats.BUILTIN
     assert formats.get("affine") is affine.FORMAT
     assert affine.FORMAT.tensors == ("scales", "biases")
+
+
+def test_affine_states_one_revision_in_its_format_and_its_faces():
+    face = affine.FORMAT.dot(_linear(512, 8, 4, 64), 512, 8)
+    stated = re.findall(r"\bCONTRACT = (\d+);", face.source)
+    assert stated == [str(affine.FORMAT.contract)]
 
 
 @pytest.mark.parametrize(

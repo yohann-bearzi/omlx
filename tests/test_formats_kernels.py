@@ -133,18 +133,30 @@ def test_a_kernel_includes_each_format_source_once():
     for name, face in (("sg", a), ("su", a), ("rt", b)):
         matrices.add(name, face)
     header = matrices.header
-    # The revisions come ahead of the first cited line.
-    assert header.startswith(
-        f"#define OMLX_CONTRACT {formats.CONTRACT}\n"
-        f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}\n"
-        '\n#line 1 "<omlx skeletons, docs/quant-formats.md>"\n'
-    )
+    assert header.startswith('\n#line 1 "<omlx skeletons, docs/quant-formats.md>"\n')
     assert header.count(a.source) == header.count(b.source) == 1
     # Formats may use the index packs; the skeletons use the formats.
     assert (
         header.index("struct omlx_ints")
         < header.index(a.source)
         < header.index(b.source)
+        < header.index("void qmv_rows(")
+    )
+
+
+def test_a_kernel_has_the_revisions_omlx_runs_when_it_is_built(monkeypatch):
+    monkeypatch.setattr(formats, "CONTRACT", 3)
+    monkeypatch.setattr(formats, "OLDEST_CONTRACT", 2)
+    face = _toy("a")
+    matrices = kernels.Matrices()
+    matrices.add("m", face)
+    header = matrices.header
+    revisions = "\n#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
+    assert header.count("#define") == 2
+    # They follow the formats' sources, which do not read them.
+    assert (
+        header.index(face.source)
+        < header.index(revisions)
         < header.index("void qmv_rows(")
     )
 
@@ -163,8 +175,9 @@ def test_a_source_need_not_end_with_a_newline():
     face = _toy("a")
     matrices = kernels.Matrices()
     matrices.add("m", replace(face, source=face.source.rstrip("\n") + "  // the end"))
-    marked = [line for line in matrices.header.splitlines() if "#line" in line]
-    assert len(marked) == 4 and all(line.startswith("#line ") for line in marked)
+    marked = [line for line in matrices.header.splitlines() if "#" in line]
+    # Four #line and the two revisions, each on a line of its own.
+    assert len(marked) == 6 and all(line.startswith("#") for line in marked)
 
 
 # K as whole blocks of 256 inputs (512, 768), whole blocks then a last one
@@ -326,8 +339,8 @@ def _revision(contract) -> Dot:
 @metal
 def test_a_kernel_runs_the_faces_of_the_revisions_omlx_runs(monkeypatch):
     # As an oMLX of revision 3 that still runs the formats of revision 2.
-    revisions = "#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
-    monkeypatch.setattr(kernels, "_REVISIONS", revisions)
+    monkeypatch.setattr(formats, "CONTRACT", 3)
+    monkeypatch.setattr(formats, "OLDEST_CONTRACT", 2)
     operands, x, want = _matrix(8, 512)
     for contract in (2, 3):
         got = testing.dot_rows(_revision(contract), operands, x, 8)

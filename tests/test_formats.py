@@ -130,7 +130,7 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
     class NoRevision(ModeOnly):
         tensors = ("scales",)
 
-    with pytest.raises(ValueError, match="'toy' does not state the revision"):
+    with pytest.raises(ValueError, match="'toy': contract is the revision"):
         formats.register(NoRevision())
     assert formats.get("toy") is None
 
@@ -144,11 +144,19 @@ def test_a_malformed_format_is_refused_before_anything_loads(plugins):
     assert plugins[0].loaded == 0
 
 
-# The revision is an int: True, which isinstance takes for one, is refused.
-@pytest.mark.parametrize("contract", [None, "1", 1.0, True])
-def test_register_refuses_a_format_that_states_no_revision(plugins, contract):
-    with pytest.raises(ValueError, match="'toy' does not state the revision"):
+class _Revision(int):
+    """An int of another type than int."""
+
+
+# The revision is an int, and nothing isinstance takes for one.
+@pytest.mark.parametrize("contract", [None, "1", 1.0, True, _Revision(1)])
+def test_register_refuses_a_revision_that_is_not_an_int(plugins, contract):
+    with pytest.raises(ValueError) as refusal:
         formats.register(_Format(contract=contract))
+    assert str(refusal.value) == (
+        "quant format 'toy': contract is the revision of the format contract "
+        f"it is written for, an int, not {contract!r} ({type(contract).__name__})"
+    )
     assert formats.get("toy") is None
 
 
@@ -166,6 +174,9 @@ def test_a_format_registers_under_the_revisions_omlx_runs(plugins, monkeypatch):
             f"quant format 'other' is written for revision {contract} of the "
             f"format contract; this oMLX runs revisions 2 to 4: update {update}"
         )
+    monkeypatch.setattr(formats, "OLDEST_CONTRACT", 4)
+    with pytest.raises(ValueError, match="oMLX runs revision 4: update the format"):
+        formats.register(_Format("other", contract=3))
     assert formats.get("other") is None
 
 
