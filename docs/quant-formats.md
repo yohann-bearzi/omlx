@@ -61,9 +61,9 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 
 `QuantFormat.decode(tensors, bits, group_size)` returns a matrix's weights as floats, of shape `(..., n, k)`. It is the format's reference: what a layer runs where no kernel takes its rows, and what a format's tests compare a face with.
 
-- `tensors` holds `weight` and the format's `tensors`, by name. They are one matrix's, or those of several: a switch layer passes the experts a call asks for, gathered tensor by tensor (`tensor[indices]`). Each tensor then has the same axes ahead of its own, and so do the weights returned.
+- `tensors` holds `weight` and the format's `tensors`, by name. They are one matrix's, or those of several: a switch layer passes the experts a call asks for, gathered tensor by tensor (`tensor[indices]`), or its whole stack. Each tensor then has the same axes ahead of its own, and so do the weights returned.
 - `bits` and `group_size` are the layer's, from the checkpoint's quantization config.
-- The floats are of any float type. A layer casts them to the activations' type ahead of MLX's matmul, so what it returns has `x`'s dtype.
+- The floats are of any float type. A layer casts them to the activations' type ahead of MLX's matmul, so the product has `x`'s dtype.
 
 ## Layers
 
@@ -79,7 +79,7 @@ experts = FormatSwitchLinear("myformat", bits, group_size, k, stacked, bias=bias
 y = experts(x, indices)  # as mlx-vlm calls a switch layer
 ```
 
-A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), which is what `QuantFormat.dot` reads of a layer. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
+A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`): the registry finds a layer's format by its `mode`, and the format's `dot` reads the rest. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
 
 - the weight of a matrix has two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
 - in a stack every tensor has the stack's axis first, and the weight then two more. What follows the stack's axis in another tensor is the format's own.
@@ -89,9 +89,9 @@ A layer keeps the tensors under their names, frozen, with the attributes of MLX'
 | `FormatLinear`, 1 to 16 rows of `x` (`linear.MAX_ROWS`: a decode step and the short blocks around one) | the dot face in the mat-vec skeleton, in one launch. Each row has the bits it has alone. |
 | `FormatLinear`, more rows | `decode`, then MLX's matmul |
 | `FormatSwitchLinear` | each pair (a row of `x` and its expert) through the dot face, in one launch, as MLX's `gather_qmm` runs a decode step's pairs. Each pair has the bits it has alone. |
-| either, with no dot face that is exact for `x`'s dtype, an N that is not a multiple of 8, or a K under 8 | `decode`, then MLX's matmul. A switch layer decodes the matrices its pairs name or, from as many pairs as its stack has matrices, the stack once (then MLX's `gather_mm`). |
+| either, with no dot face that is exact for `x`'s dtype, an N that is not a multiple of 8, or a K under 8 | `decode`, then MLX's matmul. A switch layer decodes the matrices its indices name or, from as many indices as its stack has matrices, the stack once (then MLX's `gather_mm`). The bits are those of the MLX kernel the call lands on, not a pair's own. |
 
-A format without a dot face is correct and slow: every call decodes, a switch layer its stack at most. A switch layer's kernel takes any number of pairs, one mat-vec each: at a decode step's pairs it runs as MLX's `gather_qmm` does over affine weights, and at a prefill's (1024 to 8192 pairs, an M5 Max) MLX's sorted `gather_qmm` is 1.6 to 6.2 times faster. The rows kernel is proved as every kernel in a model's forward (see [Kernels over faces](#kernels-over-faces)): a face that does not compile is logged with the compiler's messages (`quant format face <key>: rows kernel failed; decode fallback`), and the layers of the same face, tensor dtypes and shape run through `decode`.
+A format without a dot face is correct and slow: every call decodes, a switch layer its stack at most. A switch layer's kernel takes any number of pairs, one mat-vec each. Over affine weights on an M5 Max, up to 256 pairs it takes 0.75 to 1.05 of the time of MLX's `gather_qmm`, and at a prefill's 1024 to 8192 pairs MLX's sorted `gather_qmm` is 1.6 to 6.2 times faster. The rows kernel is proved as every kernel in a model's forward (see [Kernels over faces](#kernels-over-faces)): a face that does not compile is logged with the compiler's messages (`quant format face <key>: rows kernel failed; decode fallback`), and the layers of the same face, tensor dtypes and shape run through `decode`.
 
 ## Faces
 

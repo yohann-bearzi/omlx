@@ -3,7 +3,8 @@
 
 The affine format through them has the bits of MLX's quantized layers, row by
 row. A format oMLX does not know runs through them. What the rows kernel does
-not take is the format's ``decode``, then MLX's matmul.
+not take is the format's ``decode``, then MLX's matmul or, over a switch
+layer's whole stack, its ``gather_mm``.
 """
 
 from __future__ import annotations
@@ -243,15 +244,99 @@ def test_the_indices_of_a_launch_are_uint32(monkeypatch):
     x, indices = _x((16, 1, 320)), _experts((16,))
     rows, seen = linear._rows, []
 
-    def recorded(plan, x, n, rhs, pairs_per_row):
-        seen.append(rhs.dtype)
-        return rows(plan, x, n, rhs, pairs_per_row)
+    def recorded(*launch):
+        seen.append(launch[5].dtype)
+        return rows(*launch)
 
     monkeypatch.setattr(linear, "_rows", recorded)
     want = quantized(x, indices)
     for dtype in (mx.uint32, mx.int32, mx.int64, mx.uint8):
         assert _same_bits(layer(x, indices.astype(dtype)), want)
     assert seen == [mx.uint32] * 4
+
+
+def test_a_launch_takes_x_and_the_indices_as_they_are(monkeypatch):
+    """Nothing is put in the graph for the kernel's sake where each row of x
+    has its own run of experts, as in mlx-vlm's calls."""
+    _, layer = _pair(320, 72)
+    _, switch = _switch_pair(320, 72)
+    rows, launches = linear._rows, []
+
+    def recorded(*launch):
+        launches.append(launch[1:])
+        return rows(*launch)
+
+    monkeypatch.setattr(linear, "_rows", recorded)
+    x = _x((2, 3, 320))
+    assert layer(x).shape == (2, 3, 72)
+    (launch,) = launches
+    assert launch[0] is x and launch[1:] == (mx.bfloat16, 6, (2, 3, 72))
+    # A decode step's tokens, each with its top-k.
+    del launches[:]
+    x, indices = _x((1, 4, 1, 1, 320)), _experts((1, 4, 3))
+    assert switch(x, indices).shape == (1, 4, 3, 1, 72)
+    ((rows_of_x, dtype, pairs, shape, rhs, per_row),) = launches
+    assert rows_of_x is x and rhs.shape == (1, 4, 3) and rhs.dtype == mx.uint32
+    assert (dtype, pairs, shape, per_row) == (mx.bfloat16, 12, (1, 4, 3, 1, 72), 3)
+    # Otherwise x and the indices are broadcast to a row and an index a pair:
+    # x along an axis of the indices, and rows of x for each index.
+    for lead_m, routed, pairs in (((4, 1, 1), (2, 4, 3), 24), ((5, 3), (5,), 15)):
+        del launches[:]
+        x, indices = _x((*lead_m, 320)), _experts(routed)
+        shape = (*routed, lead_m[-1], 72)
+        assert switch(x, indices).shape == shape
+        ((rows_of_x, _, *launch),) = launches
+        assert rows_of_x.shape == (*routed, lead_m[-1], 320)
+        assert launch[0] == pairs and launch[1] == shape and launch[3] == 1
+        assert launch[2].shape == (pairs,) and launch[2].dtype == mx.uint32
+
+
+def test_views_of_x_and_of_the_indices_are_read_as_their_rows():
+    """MLX hands a kernel a contiguous copy of an input that is a view."""
+    quantized, layer = _pair(320, 72)
+    switched, switch = _switch_pair(320, 72)
+    wide, tall = _x((4, 2, 640)), _x((320, 4), seed=5)
+    # Unproven, then proven: the first is evaluated ahead of the launch.
+    for x in (wide[:, 1, ::2], tall.T, wide[1:3, 0, 320:]):
+        alone = [quantized(x[row : row + 1]) for row in range(x.shape[0])]
+        assert _same_bits(layer(x), mx.concatenate(alone))
+    columns, pairs = _x((16, 320, 1), seed=6), _experts((16, 2))
+    for x, indices in (
+        (columns.swapaxes(1, 2), pairs[:, 1]),
+        (wide[:, :1, 1::2], pairs.T[0, 3:7]),
+    ):
+        assert _same_bits(switch(x, indices), switched(x, indices))
+    for proof in kernels._PROOFS.values():
+        assert proof.ran and not proof.failed
+
+
+def test_an_index_of_no_axis_is_a_launch_s_one_index():
+    """MLX binds a kernel input of no axis as a scalar, which a kernel
+    cannot subscript."""
+    switched, switch = _switch_pair(320, 72)
+    index = mx.array(4, dtype=mx.uint32)
+    for rows in (1, 3):
+        x = _x((rows, 320), seed=rows)
+        got = switch(x, index)
+        assert got.shape == (rows, 72)
+        for row in range(rows):
+            alone = switched(x[row : row + 1], index.reshape(1))
+            assert _same_bits(got[row : row + 1], alone[0])
+    (proof,) = kernels._PROOFS.values()
+    assert proof.ran == {(mx.bfloat16, 1, True)} and not proof.failed
+
+
+def test_shapes_that_do_not_broadcast_are_refused_by_mlx():
+    _, switch = _switch_pair(320, 72)
+    # Through the rows kernel, then through the decode: under the stack's
+    # matrices, and over.
+    for dtype in (mx.bfloat16, mx.float32):
+        for count in (EXPERTS - 1, EXPERTS + 1):
+            x, indices = _x((2, 3, 1, 320), dtype), _experts((count,))
+            with pytest.raises(ValueError, match="cannot be broadcast"):
+                switch(x, indices)
+    (proof,) = kernels._PROOFS.values()
+    assert not proof.ran and not proof.failed
 
 
 def test_mlx_vlm_s_switch_glu_runs_over_the_layers():
@@ -277,11 +362,11 @@ def test_mlx_vlm_s_switch_glu_runs_over_the_layers():
         assert kernel == "format_switch_linear" and proof.ran and not proof.failed
 
 
-def test_a_switch_s_pairs_outside_the_kernel_are_the_decode_and_mlx_s_matmul(
+def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
     monkeypatch,
 ):
-    """Fewer pairs than the stack has matrices decode theirs alone. From as
-    many, the stack is decoded once: a prefill's pairs would not fit in
+    """Fewer indices than the stack has matrices decode theirs alone. From as
+    many, the stack is decoded once: a prefill's indices would not fit in
     memory a matrix each."""
     quantized, layer = _switch_pair(320, 72, bias=True)
     decode, whole = affine.AffineFormat.decode, []
@@ -308,24 +393,43 @@ def test_a_switch_s_pairs_outside_the_kernel_are_the_decode_and_mlx_s_matmul(
             y = x @ stack[indices].swapaxes(-1, -2)
         return y + mx.expand_dims(quantized["bias"][indices], -2)
 
-    # One pair fewer than matrices: (1, 5) of them, with x's (2, 1).
+    # One index fewer than matrices: (1, 5) of them, with x's (2, 1). The
+    # hint has no gather to go to.
     x, indices = _x((2, 1, 1, 320), mx.float32), _experts((1, EXPERTS - 1))
     got = layer(x, indices)
     assert got.shape == (2, 5, 1, 72) and _equal(got, want(x, indices))
-    assert whole == [False] and not hints
-    # As many pairs as matrices, then a prefill's, in any integer type.
+    assert _equal(layer(x, indices, sorted_indices=True), got)
+    # No index decodes no matrix.
+    assert layer(x, indices[:, :0]).shape == (2, 0, 1, 72)
+    assert whole == [False, False, False] and not hints
+    # As many indices as matrices, then a prefill's, in any integer type.
     for routed, dtype in (((EXPERTS,), mx.uint32), ((2, 4, 3), mx.int64)):
         x = _x((*routed[:-1], 1, 1, 320), mx.float32)
         indices = _experts(routed).astype(dtype)
         got = layer(x, indices)
         assert got.shape == (*routed, 1, 72)
         assert _equal(got, want(x, indices, sorted_indices=False))
-    assert whole == [False, True, True] and hints == [False, False]
-    # mlx-vlm's hint goes to MLX's gather, which the pairs then are sorted for.
+    assert whole == [False, False, False, True, True] and hints == [False, False]
+    # Rows of x for each index count for nothing: 15 pairs of 5 indices
+    # decode 5 matrices, 24 of 8 the stack.
+    del whole[:], hints[:]
+    x, indices = _x((5, 3, 320), mx.float32), _experts((5,))
+    got = layer(x, indices)
+    assert got.shape == (5, 3, 72) and _equal(got, want(x, indices))
+    x, indices = _x((8, 3, 320), mx.float32), _experts((8,))
+    got = layer(x, indices)
+    assert got.shape == (8, 3, 72)
+    assert _equal(got, want(x, indices, sorted_indices=False))
+    assert whole == [False, True] and hints == [False]
+    # mlx-vlm's hint goes to MLX's gather, which the pairs then are sorted for:
+    # each with its row of x, or all with the one row.
     x, indices = _x((24, 1, 320), mx.float32), mx.sort(_experts((24,)))
     got = layer(x, indices, sorted_indices=True)
     assert _equal(got, want(x, indices, sorted_indices=True))
-    assert hints == [False, False, True]
+    got = layer(x[:1], indices, sorted_indices=True)
+    assert got.shape == (24, 1, 72)
+    assert mx.allclose(got, want(x[:1], indices), rtol=1e-5, atol=1e-5).item()
+    assert hints == [False, True, True]
     (proof,) = kernels._PROOFS.values()
     assert not proof.ran and not proof.failed
 
@@ -443,11 +547,17 @@ def test_rows_of_a_pair_and_no_pair_in_a_switch(toy, monkeypatch):
     assert proof.ran == {(mx.float32, 1, False)}
     # No pair, or no row of x: nothing to launch.
     monkeypatch.setattr(linear, "_rows", lambda *launch: pytest.fail("launched"))
-    assert layer(x[:, :0], indices[:0]).shape == (2, 0, 3, 40)
-    assert layer(x[:1, :1], indices[:0]).shape == (1, 0, 3, 40)
-    assert layer(x[:, :, :0], indices).shape == (2, 5, 0, 40)
-    # Nor from as many pairs as the stack has matrices.
-    assert layer(_ints((8, 0, 320)), _experts((8,))).shape == (8, 0, 40)
+
+    def nothing(x, indices):
+        y = layer(x, indices)
+        mx.eval(y)
+        return y.shape
+
+    assert nothing(x[:, :0], indices[:0]) == (2, 0, 3, 40)
+    assert nothing(x[:1, :1], indices[:0]) == (1, 0, 3, 40)
+    assert nothing(x[:, :, :0], indices) == (2, 5, 0, 40)
+    # Nor from as many indices as the stack has matrices.
+    assert nothing(_ints((8, 0, 320)), _experts((8,))) == (8, 0, 40)
     assert proof.ran == {(mx.float32, 1, False)} and not proof.failed
 
 
@@ -458,8 +568,13 @@ def test_a_format_without_a_face_runs_through_its_decode(toy):
     switch = _toy_switch(40, 320)
     rows, indices = _ints((2, 4, 1, 1, 320)), _experts((2, 4, 3))
     assert np.array_equal(np.array(switch(rows, indices)), _want(switch, rows, indices))
-    few = indices[:1, :1]  # fewer pairs than the stack has matrices
+    few = indices[:1, :1]  # fewer indices than the stack has matrices
     assert np.array_equal(np.array(switch(rows, few)), _want(switch, rows, few))
+    # Rows of x for each index, under the stack's matrices and over.
+    for count in (EXPERTS - 1, EXPERTS + 2):
+        several, each = _ints((count, 3, 320)), _experts((count,))
+        got = switch(several, each)
+        assert np.array_equal(np.array(got), _want(switch, several, each))
     # In x's dtype, whatever the decode's: a layer casts the decoded weights.
     assert layer(x.astype(mx.float16)).dtype == mx.float16
     assert switch(rows.astype(mx.float16), indices).dtype == mx.float16
@@ -495,9 +610,17 @@ def test_a_launch_its_tiles_do_not_cover_is_refused_in_words(toy):
     """A layer plans no such launch; the kernel does not rely on it."""
     toy(_toy("linear"))
     layer, x, _ = _toy_linear(40, 320)
-    plan = linear._plan(layer)
+    plan = linear._plan(layer)._replace(n=44)
     with pytest.raises(RuntimeError, match="format linear: N must be whole tiles"):
-        mx.eval(linear._rows(plan, x.reshape(1, 320), 44))
+        mx.eval(linear._rows(plan, x, x.dtype, 1, (1, 44)))
+    # Nor on a row of x that has a matrix.
+    plan = linear._plan(_toy_switch(40, 320))
+    rows, indices = _ints((16, 1, 320)), _experts((16,))
+    words = "PAIRS_PER_ROW is the matrices of a row of x, 1 or more"
+    for per_row in (0, -1):
+        launch = (rows, mx.float32, 16, (16, 1, 40), indices, per_row)
+        with pytest.raises(RuntimeError, match=words):
+            mx.eval(linear._rows(plan, *launch))
 
 
 def test_a_stack_and_a_matrix_of_one_face_are_kernels_of_their_own(toy):
@@ -640,7 +763,7 @@ def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
     assert [len(arrays) for arrays in evaluated] == [5, 1]
     assert evaluated[0][0] is rows and evaluated[0][1] is indices
     assert all(a is switch[name] for a, name in zip(evaluated[0][2:], _NAMES))
-    assert evaluated[1][0].shape == (16, 72)
+    assert evaluated[1][0].shape == (16, 1, 72)
     del evaluated[:]
     switch(rows, indices), switch(rows[4:12] + 0, indices[4:12] + 0)
     assert not evaluated
