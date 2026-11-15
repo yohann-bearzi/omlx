@@ -161,18 +161,37 @@ def test_a_kernel_includes_each_format_source_once():
 def test_a_kernel_has_the_revisions_omlx_runs_when_it_is_built(monkeypatch):
     monkeypatch.setattr(formats, "CONTRACT", 3)
     monkeypatch.setattr(formats, "OLDEST_CONTRACT", 2)
-    face = _toy("a")
+    a, b = _toy("a"), _toy("b")
     matrices = kernels.Matrices()
-    matrices.add("m", face)
+    matrices.add("m", a)
+    matrices.add("n", b)
     header = matrices.header
     revisions = "\n#define OMLX_CONTRACT 3\n#define OMLX_OLDEST_CONTRACT 2\n"
     assert header.count("#define") == 2
-    # They follow the formats' sources, which do not read them.
+    # They follow the formats' sources, none of which reads them, and end
+    # with the skeletons: nor does a face's type, or the kernel.
     assert (
-        header.index(face.source)
+        max(header.index(a.source), header.index(b.source))
         < header.index(revisions)
         < header.index("void qmv_rows(")
     )
+    assert header.endswith(
+        "}\n#undef OMLX_CONTRACT\n#undef OMLX_OLDEST_CONTRACT\n"
+        '\n#line 1 "<kernel header>"\n'
+    )
+
+
+@metal
+def test_a_faces_type_does_not_read_the_revisions():
+    operands, x, want = _matrix(8, 512)
+    typed = replace(_toy("typed"), type="decltype(1, omlx_toy_typed::Dot{})")
+    assert mx.array_equal(testing.dot_rows(typed, operands, x, 8), want).item()
+    reads = replace(
+        typed,
+        key="toy_reads",
+        type="decltype(OMLX_CONTRACT, omlx_toy_typed::Dot{})",
+    )
+    assert "use of undeclared identifier 'OMLX_CONTRACT'" in _error(reads)
 
 
 def test_a_source_two_faces_share_is_cited_under_the_first():
@@ -190,8 +209,9 @@ def test_a_source_need_not_end_with_a_newline():
     matrices = kernels.Matrices()
     matrices.add("m", replace(face, source=face.source.rstrip("\n") + "  // the end"))
     marked = [line for line in matrices.header.splitlines() if "#" in line]
-    # Four #line and the two revisions, each on a line of its own.
-    assert len(marked) == 6 and all(line.startswith("#") for line in marked)
+    # Four #line, the two revisions and their two ends, each on a line of
+    # its own.
+    assert len(marked) == 8 and all(line.startswith("#") for line in marked)
 
 
 # K as whole blocks of 256 inputs (512, 768), whole blocks then a last one
@@ -345,6 +365,8 @@ def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
     assert "dot face: K must be a whole number of a lane's VPT inputs" in message
 
 
+# A face's kernel is built once, under the revisions oMLX runs then: these
+# keys are for the test that patches them.
 def _revision(contract) -> Dot:
     source = _TOY.replace("CONTRACT = 1;", f"CONTRACT = {contract};")
     return _toy(f"revision_{contract}", source=source)
@@ -366,8 +388,10 @@ def test_a_kernel_runs_the_faces_of_the_revisions_omlx_runs(monkeypatch):
         message = _error(_revision(contract))
         assert f"dot face: written for {rule}" in message
         assert "<omlx skeletons, docs/quant-formats.md>:" in message
-        # The other rule holds, and is not cited.
+        # The other rule holds, and is not cited. Nor is the format's source,
+        # under whose name the macros' lines are.
         assert message.count("dot face: ") == 1
+        assert "<quant format" not in message
 
 
 @metal

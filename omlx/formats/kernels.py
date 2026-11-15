@@ -162,7 +162,7 @@ class Matrices:
     def header(self) -> str:
         """The Metal the kernel includes: the index packs, each distinct
         format source once (cited under the key of the first face that has
-        it), then the contract revisions and the skeletons."""
+        it), then the skeletons between the contract revisions' macros."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
@@ -171,6 +171,7 @@ class Matrices:
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
             + _revisions()
             + _named(_SKELETONS, _QMV_ROWS, line=_INDEX_PACKS.count("\n") + 1)
+            + _REVISIONS_END
             + _named("<kernel header>", "")
         )
 
@@ -186,19 +187,26 @@ class Matrices:
 
 def _revisions() -> str:
     """The contract revisions the skeletons run a face of, as the kernel is
-    built. Macros, so that a failed assert prints the number. They follow the
-    formats' sources, which do not read them: a format picks its revision in
-    Python. The first opens a line of its own, whatever a source ends with."""
+    built. Macros, so that a failed assert prints the number, and the
+    skeletons' alone: they follow the formats' sources and end with the
+    skeletons (``_REVISIONS_END``), so nothing a format gives reads them. A
+    format picks its revision in Python. The first opens a line of its own,
+    whether or not a source ends with a newline."""
     return (
         f"\n#define OMLX_CONTRACT {formats.CONTRACT}\n"
         f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}"
     )
 
 
+# The skeletons' asserts hold the numbers by now. What follows (a face's
+# type, a kernel's header and body) does not read the macros.
+_REVISIONS_END = "#undef OMLX_CONTRACT\n#undef OMLX_OLDEST_CONTRACT\n"
+
+
 def _named(name: str, source: str, line: int = 1) -> str:
     """``source`` as the Metal compiler will cite it: under ``name``, its
     first line numbered ``line``. The directive opens a line of its own,
-    whatever the text before it ends with."""
+    whether or not the text before it ends with a newline."""
     return f'\n#line {line} "{name}"\n{source}'
 
 

@@ -182,8 +182,13 @@ def test_a_format_registers_under_the_revisions_omlx_runs(plugins, monkeypatch):
             f"format contract; this oMLX runs revisions 2 to 4: update {update}"
         )
     monkeypatch.setattr(formats, "OLDEST_CONTRACT", 4)
-    with pytest.raises(ValueError, match="oMLX runs revision 4: update the format"):
-        formats.register(_Format("other", contract=3))
+    for contract, update in ((6, "oMLX"), (2, "the format")):
+        with pytest.raises(ValueError) as refusal:
+            formats.register(_Format("other", contract=contract))
+        assert str(refusal.value) == (
+            f"quant format 'other' is written for revision {contract} of the "
+            f"format contract; this oMLX runs revision 4: update {update}"
+        )
     assert formats.get("other") is None
 
 
