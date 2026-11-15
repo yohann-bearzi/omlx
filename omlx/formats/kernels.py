@@ -158,8 +158,11 @@ class Matrices:
 
     def add(self, name: str, face: Dot) -> list[str]:
         """Add matrix ``name``. Returns its kernel inputs: the weight, then
-        the face's tensors in order. The matrix and its inputs are names of
-        the kernel, each its own."""
+        the face's tensors in order. Refuses a name that is not an identifier,
+        and a matrix whose name or inputs repeat those of a matrix added
+        before: the kernel's other names are the kernel's to keep apart."""
+        if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
+            raise ValueError(f"matrix {name!r}: its name is not an identifier")
         inputs = _inputs(name, face)
         repeated = [n for n in (name, *inputs) if n in self._names]
         if repeated:
@@ -207,7 +210,8 @@ def _revisions() -> str:
     built: the skeletons' first two lines. Macros, so that a failed assert
     prints the number, and the skeletons' alone: they follow the formats'
     sources and end with the skeletons (``_REVISIONS_END``), so nothing a
-    format gives reads them. A format picks its revision in Python."""
+    source reads them unless it leaves a macro of its own defined, which the
+    page rules out. A format picks its revision in Python."""
     return (
         f"#define OMLX_CONTRACT {formats.CONTRACT}\n"
         f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}"

@@ -206,7 +206,7 @@ Dot(
 
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. The matrix and its inputs are names of the kernel: `add` refuses a matrix that would repeat one.
+A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
 
 ```python
 import mlx.core as mx
@@ -273,8 +273,10 @@ MLX compiles a kernel at the first `mx.eval` of its output. A failure is a `Runt
 |---|---|
 | `<quant format KEY>` | The `source` of the face with that key, with its own line numbers. |
 | `<omlx skeletons, docs/quant-formats.md>` | The skeletons in `omlx/formats/kernels.py`. The line that fails is a use of the face: read the message, then this page. |
-| `<kernel header>` | What a kernel adds to its header, MLX's generated signature and the matrix declarations. |
+| `<kernel header>` | What a kernel adds to its header after `Matrices.header`, MLX's generated signature and the matrix declarations. |
 | `<kernel>` | The kernel body, with its own line numbers. |
+
+The messages quoted below are the compiler's for the example above with one mistake each, in the kernel of `dot_rows` ([Test a format](#test-a-format)) with `packs=(1, 1)`: hence `qmv_rows<float, 512, 1, 1, ...>`.
 
 A face that breaks a rule the compiler cannot see fails with the rule:
 
@@ -328,7 +330,7 @@ def test_rows_are_the_dequantized_products():
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
 
-`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants.
+`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. A kernel puts such adjacent rows in one pack; `dot_rows` splits them to run both. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants.
 
 Worth testing for every layout a format gives a face for:
 

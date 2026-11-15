@@ -11,6 +11,7 @@ from dataclasses import replace
 from functools import cache
 from itertools import takewhile
 from pathlib import Path
+from textwrap import indent
 
 import mlx.core as mx
 import pytest
@@ -139,6 +140,16 @@ def test_a_kernel_has_each_name_once():
     assert "omlx_toy_b" not in matrices.declarations + other.declarations
     assert other.declarations.count("const auto") == 1
     assert other.add("sg_d_weight", _toy("b"))[0] == "sg_d_weight_weight"
+
+
+@pytest.mark.parametrize("name", ["", "2m", "m w", "m-w", "m\u00e9", "m;", 3, None])
+def test_a_matrix_is_named_by_an_identifier(name):
+    # The name is spliced into the kernel's Metal.
+    matrices = kernels.Matrices()
+    with pytest.raises(ValueError) as refusal:
+        matrices.add(name, _toy("a"))
+    assert str(refusal.value) == f"matrix {name!r}: its name is not an identifier"
+    assert matrices.add("m", _toy("a")) == ["m_weight", "m_scales"]
 
 
 def test_a_kernel_includes_each_format_source_once():
@@ -542,12 +553,17 @@ def _fenced(page) -> list[tuple[str, str]]:
 
 
 _BLOCKS = _fenced(_PAGE)
-# What the page quotes of the Metal compiler, on one line each.
+# What the page quotes of the Metal compiler, on one line each: the blocks
+# that cite a line and its column, whatever they are fenced as.
 _SAMPLES = [
-    " ".join(text.split())
-    for language, text in _BLOCKS
-    if not language and text.startswith("<")
+    " ".join(text.split()) for _, text in _BLOCKS if re.search(r">:\d+:\d+: ", text)
 ]
+# What pins a sample: the lines it cites with the kind of each message, the
+# rules oMLX words and the revisions of a failed requirement. The rest is the
+# Metal compiler's wording.
+_LINE = r"<[^<>]*>:\d+:\d+: \w+"
+_RULE = r'"dot face: [^"]*"'
+_REVISIONS = r"requirement '\d+ [<>]= \d+'"
 # A phrase of each quoted message, and what brings the message out of the
 # page's example: K, and an edit of the example's source.
 _BREAKS = {
@@ -617,29 +633,49 @@ def test_the_pages_kernel_computes_its_examples_rows():
     scope = dict(face=_example(), weight=weight, scales=scales, x=x, k=512, n=8)
     exec(kernel, scope)
     assert f"# {scope['inputs']!r}".replace("'", '"') in kernel
-    assert mx.array_equal(scope["y"], want)
+    assert mx.array_equal(scope["y"], want).item()
+
+
+def test_the_pages_fold_is_its_examples():
+    (fold,) = (
+        text
+        for language, text in _BLOCKS
+        if language == "cpp" and "// dot(omlx_iota<VPT>(), w, xt)" in text
+    )
+    function = fold[: fold.rindex("\n") + 1]
+    assert indent(function, "    ") in _example().source
+
+
+def test_the_page_names_the_entry_point_group():
+    # In the plugin's pyproject, under it, and in what the contract holds.
+    assert _PAGE.count(formats.ENTRY_POINT_GROUP) == 3
 
 
 def test_each_compiler_message_of_the_page_has_its_break():
-    broken = [
-        index
-        for phrase in _BREAKS
-        for index, sample in enumerate(_SAMPLES)
-        if phrase in sample
-    ]
-    assert sorted(broken) == list(range(len(_SAMPLES)))
-    assert len(broken) == len(_BREAKS)
+    # One sample for each break and one break for each sample.
+    assert [sum(p in s for s in _SAMPLES) for p in _BREAKS] == [1] * len(_BREAKS)
+    assert [sum(p in s for p in _BREAKS) for s in _SAMPLES] == [1] * len(_SAMPLES)
 
 
-# Pinned: the lines oMLX's own Metal is cited at, the kind of each message
-# and the rules oMLX words. The rest is the Metal compiler's wording.
+@pytest.mark.parametrize("sample", _SAMPLES)
+def test_each_citation_of_a_sample_is_one_the_tests_read(sample):
+    # One that lost its column, or a rule that lost a quote, would not be.
+    assert len(re.findall(_LINE, sample)) == len(re.findall(r">:\d", sample))
+    assert len(re.findall(_RULE, sample)) == sample.count("dot face:")
+
+
+def test_the_pages_revisions_are_a_face_one_revision_ahead_of_omlx():
+    (sample,) = (sample for sample in _SAMPLES if "a later revision" in sample)
+    face, runs = formats.CONTRACT + 1, formats.CONTRACT
+    assert re.findall(_REVISIONS, sample) == [f"requirement '{face} <= {runs}'"]
+    assert f"'omlx_revision<{face}>'" in sample
+    assert f"a face of revision {face} on an oMLX of revision {runs}" in _PAGE
+
+
 @metal
 @pytest.mark.parametrize("phrase", _BREAKS)
 def test_the_page_cites_the_lines_the_compiler_cites(phrase):
     (sample,) = (sample for sample in _SAMPLES if phrase in sample)
-    cited = re.findall(
-        r"""<[^<>]*>:\d+:\d+: \w+|"dot face: [^"]*"|requirement '\d+ <= \d+'""",
-        sample,
-    )
+    cited = re.findall(f"{_LINE}|{_RULE}|{_REVISIONS}", sample)
     message = " ".join(_page_error(**_BREAKS[phrase]).split())
     assert cited and [c for c in cited if c not in message] == []
