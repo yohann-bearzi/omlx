@@ -223,7 +223,7 @@ class Proof:
         ``metal`` names one Metal of the proof's kernel: what its source is
         instantiated with beside the proof's key (x's type, a template
         value, an input that MLX binds another way). ``build`` gives a
-        launch of that Metal, not evaluated. Its caller answers for two
+        launch of that Metal, not evaluated. Its caller answers for three
         things:
 
         - the launch reads stand-ins alone, arrays that the kernel makes
@@ -231,11 +231,17 @@ class Proof:
           may belong to a function that MLX is tracing, which refuses to
           evaluate them; what fails in them is their owner's failure, not
           the Metal's; and they have the call's size, where a proof needs
-          the smallest.
+          the smallest. ``build`` evaluates the stand-ins before it gives
+          the launch: what fails in making them (an allocation, an error
+          that an earlier evaluation left pending on the GPU) is raised as
+          its own, not taken for the Metal's.
         - MLX generates the source of the call's launch for it: the same
           kernel, template values and output dtypes and, input by input,
           the same dtype, fewer than 8 elements or not, an axis or none.
           Shapes, the grid and the output's shape are no part of the source.
+        - the launch has the call's threadgroup: MLX checks a threadgroup
+          against the pipeline's limit at every evaluation, and the grid
+          not at all.
 
         What ``build`` raises is raised: a launch that cannot be built is
         the kernel's defect, or its caller's. What the evaluation raises,

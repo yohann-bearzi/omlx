@@ -155,13 +155,30 @@ def _linear(kernel, k: int, n: int, x):
     return x.dtype, graph
 
 
+def _zeros(*specs) -> list[mx.array]:
+    """Zeros of each ``(shape, dtype)`` of ``specs``, a stand-in's inputs,
+    evaluated here, ahead of the proof and outside its guard: what fails in
+    making them (an allocation, an error that an earlier evaluation left
+    pending on the GPU) is not the face's. They are views of one buffer of
+    as many bytes as the largest: one fill and, where MLX's buffer cache is
+    empty (oMLX clears it after each prefill chunk), one new buffer."""
+    sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
+    buffer = mx.zeros((max(sizes),), mx.uint8)
+    zeros = [
+        mx.view(buffer[:size], dtype).reshape(shape)
+        for (shape, dtype), size in zip(specs, sizes, strict=True)
+    ]
+    mx.eval(*zeros)
+    return zeros
+
+
 def _linear_stand_in(plan: _Plan, metal) -> mx.array:
     """The smallest launch of a matrix that MLX generates the Metal of
     ``metal`` for (x's type), over zeros: one vector, and the whole of each
     tensor. What follows the rows in a matrix's tensors is the format's
     own, so no part of a tensor is known to be all that a row reads."""
-    tensors = [mx.zeros(a.shape, a.dtype) for a in plan.operands]
-    x = mx.zeros((plan.k,), metal)
+    operands = ((a.shape, a.dtype) for a in plan.operands)
+    x, *tensors = _zeros(((plan.k,), metal), *operands)
     return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,))
 
 
@@ -208,19 +225,20 @@ def _switch_stand_in(plan: _Plan, metal) -> mx.array:
     dtype, per_row, few = metal
     rows = 1 if few else -(-8 // per_row)
     pairs = rows * per_row
+    # Never more matrices than the stack has: formats.dot refuses a layer
+    # with a tensor of fewer than 8 elements.
     matrices = max(-(-8 * a.shape[0] // a.size) for a in plan.operands)
-    tensors = [mx.zeros((matrices, *a.shape[1:]), a.dtype) for a in plan.operands]
-    x = mx.zeros((rows, plan.k), dtype)
-    rhs = mx.zeros((pairs,), mx.uint32)
+    operands = (((matrices, *a.shape[1:]), a.dtype) for a in plan.operands)
+    x, *tensors, rhs = _zeros(((rows, plan.k), dtype), *operands, ((pairs,), mx.uint32))
     shape = (pairs, plan.n)
     return _rows(plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row)
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     """``arrays`` (x, then a stack's indices) through the rows kernel, the
-    first time for ``signature``, or None: the layer has no plan, the face
-    is not exact for x's type, there is nothing to launch, or the launch
-    does not compile.
+    first time for ``signature``, or None: the layer has no plan, its proof
+    has failed, the face is not exact for x's type, there is nothing to
+    launch, or the launch does not compile.
 
     The launch's graph (``describe``) is compiled by MLX and kept under
     ``signature``, which is what it depends on (the arrays' shapes and x's
@@ -235,7 +253,7 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     functions that MLX compiles, over its state too), where it cannot be
     evaluated, and what fails in one is raised where the caller evaluates
     the result."""
-    if plan is None or not plan.face.exact_for(arrays[0].dtype):
+    if plan is None or plan.proof.failed or not plan.face.exact_for(arrays[0].dtype):
         return None
     launch = describe(plan.kernel, plan.k, plan.n, *arrays)
     if launch is None:
