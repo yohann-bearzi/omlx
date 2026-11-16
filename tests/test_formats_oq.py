@@ -13,12 +13,12 @@ import textwrap
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx_lm.utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import llama, qwen3_5_moe, qwen3_next
 from mlx_lm.models import switch_layers as lm_switch
-from mlx_lm.utils import load_model
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
@@ -94,6 +94,13 @@ def toy(monkeypatch):
     fmt = _Codec()
     monkeypatch.setitem(formats._FORMATS, "toy", fmt)
     return fmt
+
+
+def load_model(path, **kwargs):
+    """mlx-lm's loader as the load patch leaves it: the function a module
+    bound at its import is the library's own, which builds no layer of a
+    format."""
+    return mlx_lm.utils.load_model(path, **kwargs)
 
 
 def _weights(*shape):
@@ -975,7 +982,10 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     # The load hands it back to the format, once.
     assert toy.accepted == []
     maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
     assert toy.accepted == [record]
+    layers = [m for _, m in model.named_modules() if isinstance(m, FormatLinear)]
+    assert layers and all(layer.fmt is toy for layer in layers)
 
 
 _CYCLE: dict = {}

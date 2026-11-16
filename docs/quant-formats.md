@@ -49,6 +49,12 @@ class MyFormat(QuantFormat):
     def tile(self, layer, k, n) -> Tile | None:
         ...                # the face that oMLX's tile kernels decode them through
 
+    def record(self):
+        ...                # what a checkpoint keeps of the format ({})
+
+    def accept(self, record):
+        ...                # the format that reads a checkpoint (itself)
+
 
 FORMAT = MyFormat()
 ```
@@ -91,7 +97,7 @@ experts = FormatSwitchLinear("myformat", bits, group_size, k, stacked, bias=bias
 y = experts(x, indices)  # as mlx-vlm calls a switch layer
 ```
 
-A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`): the registry finds a layer's format by its `mode`, and the format's `dot` reads the rest. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
+A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), and the format that reads them (`fmt`: what the checkpoint's [`accept`](#load-a-checkpoint) returned, or the registered format of a mode the layer is built with by hand), whose `dot` reads the rest. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
 
 - the weight of a matrix has two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
 - in a stack every tensor has the stack's axis first, and the weight then two more. What follows the stack's axis in another tensor is the format's own.
@@ -139,15 +145,26 @@ A checkpoint names each layer of the format in its quantization config:
 - A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
 - A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three. Until then oQ writes their matrices in its affine (see [Quantize a checkpoint](#quantize-a-checkpoint)).
 
-Before any layer is built, the load hands each installed format a checkpoint is written in the record oQ stored for it (`omlx_quant_formats` in `config.json`, see [Quantize a checkpoint](#quantize-a-checkpoint)), and the format refuses a checkpoint it cannot read:
+A checkpoint's layers of a format are read with the record oQ stored for it (`omlx_quant_formats` in `config.json`, see [Quantize a checkpoint](#quantize-a-checkpoint)). When the registered format lays out the first of them, the load hands the record to the format's `accept`, which returns the format that reads the checkpoint, or refuses it:
 
 ```python
     def accept(self, record):
         if record.get("layout", 1) != 1:
             raise ValueError(f"written in layout {record['layout']}; this plugin reads layout 1")
+        return self
 ```
 
-`accept(record)` raises a ValueError in the format's own words, which the load raises as it is. A checkpoint written before formats had records hands an empty one. The default `accept` reads every record.
+- Every layer of the checkpoint is built with the object `accept` returns, and keeps it (`layer.fmt`): its `layout` gives the layer's tensors, and its `decode` and `dot` run them. `accept` returns the format itself by default; None means the format itself too.
+- A format whose checkpoints differ by what their record holds (a table of levels, say) returns an object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors` and `contract`; anything else is refused: `quant format 'myformat' accepted the checkpoint at /models/my-model with 'myformat', not a format of its mode, tensors and contract: report it to my-package 0.1.0`. Make it immutable, with no unevaluated arrays: the layers of several threads read it.
+- oMLX keeps nothing on the registered format, so checkpoints of several records run side by side, each layer with its own checkpoint's object. A format that changes its registered object to accept a checkpoint is refused: `quant format 'myformat' changed its registered format (levels) to accept the checkpoint at /models/my-model: accept returns a format configured from the record instead; report it to my-package 0.1.0`.
+- `accept` raises a ValueError in the format's own words to refuse a checkpoint, which the load raises as it is.
+- A checkpoint written before formats had records, or one that names the format in its quantization config alone, hands an empty record.
+
+The record is that of the checkpoint the load reads. oMLX wraps the libraries' functions that build a model from a checkpoint's directory (mlx-lm's, mlx-vlm's and mlx-embeddings' `load_model`, and the encoder loader of mlx-vlm's embedding models), each the first time it finds it, imported or as it is imported:
+
+- The format layers built on a thread while one runs belong to its checkpoint, and a load nested in another reads its own.
+- A format's layer built anywhere else is refused: `a layer of quant format 'myformat' is built outside a checkpoint's load, which gives it the record to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model`. So is a load that returns a model without a format layer built under it (another checkpoint's, built inside this one's load).
+- A family's loader that replaces one of them afterwards runs around it: DeepSeek V4's builds its own checkpoints' layers outside any load, so a DeepSeek V4 checkpoint of a format is refused.
 
 ## Quantize a checkpoint
 
@@ -791,7 +808,7 @@ The contract has a revision, a whole number that goes up by one with each change
 
 | Revision | In oMLX since | What it adds |
 |---|---|---|
-| 1 | not released yet | The registry, the dot face and the tile face, a face's tables, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
+| 1 | not released yet | The registry, the dot face and the tile face, a face's tables, what loads and what writes a checkpoint (`layout`, `encode`, and its record: `record`, `accept`), `omlx.formats.testing`. |
 
 A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 

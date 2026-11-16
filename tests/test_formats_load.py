@@ -6,26 +6,29 @@ load, as mlx-lm and mlx-vlm load a checkpoint.
 
 from __future__ import annotations
 
+import contextlib
+import importlib
 import inspect
 import json
 import re
 import textwrap
+import threading
 
 import mlx.core as mx
 import mlx.nn as nn
+import mlx_lm.utils
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
 from mlx_lm.models import llama
 from mlx_lm.models import switch_layers as lm_switch
-from mlx_lm.utils import load_model
 from mlx_vlm.models import switch_layers as vlm_switch
 
 from omlx import formats
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
-from tests.test_formats_kernels import _BLOCKS, _matrix
+from tests.test_formats_kernels import _BLOCKS, _PAGE, _matrix
 from tests.test_formats_linear import EXPERTS, _ints, _ToyFormat, _want
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -36,18 +39,22 @@ _TOY = {"bits": 8, "group_size": 1, "mode": "toy"}
 
 class _Loadable(_ToyFormat):
     """The toy format, with what its checkpoints keep of a matrix: a byte for
-    each weight and a scale for each row."""
+    each weight and a scale for each row. ``reads`` gives the object that
+    reads a checkpoint of a record (the format itself, unless a test says
+    otherwise)."""
 
     def __init__(self, mode="toy"):
         super().__init__()
         self.mode, self.asked = mode, []
         self.accepted, self.refusal = [], None
+        self.reads = lambda record: self
 
     def accept(self, record):
         # What it was handed, and whether a layer had been built before.
         self.accepted.append((record, len(self.asked)))
         if self.refusal is not None:
             raise ValueError(self.refusal)
+        return self.reads(record)
 
     def layout(self, k, n, bits, group_size):
         self.asked.append((k, n, bits, group_size))
@@ -58,13 +65,33 @@ class _Loadable(_ToyFormat):
 
 @pytest.fixture
 def unpatched(monkeypatch):
-    """MLX's own ``to_quantized`` on the classes the patch wraps, whatever an
-    earlier test applied; the test's own wrappers are undone after it."""
+    """MLX's own ``to_quantized`` on the classes the patch wraps, and the
+    libraries' own loaders, whatever an earlier test applied; the test's own
+    wrappers are undone after it."""
     for cls in _PATCHED:
         original = cls.to_quantized
         monkeypatch.setattr(
             cls, "to_quantized", getattr(original, "__wrapped__", original)
         )
+    for module, name in _loaders():
+        loader = getattr(module, name)
+        if getattr(loader, "_omlx_format_load", False):
+            monkeypatch.setattr(module, name, loader.__wrapped__)
+    # The patch wraps each module once, the first time it finds it: what it
+    # wraps then, as a process starts.
+    pending = {name for name, _ in format_load._LOADERS}
+    monkeypatch.setattr(
+        format_load, "_PENDING", pending | set(format_load._SWITCH_MODULES)
+    )
+
+
+def _loaders():
+    """The loaders the patch wraps, of the libraries installed here."""
+    found = []
+    for module_name, name in format_load._LOADERS:
+        with contextlib.suppress(ImportError):
+            found.append((importlib.import_module(module_name), name))
+    return found
 
 
 @pytest.fixture
@@ -77,11 +104,27 @@ def toy(unpatched, monkeypatch):
     return fmt
 
 
+@pytest.fixture
+def by_hand(toy, tmp_path_factory):
+    """The test builds layers by hand as the load of a checkpoint with no
+    record would."""
+    bare = tmp_path_factory.mktemp("bare")
+    (bare / "config.json").write_text("{}")
+    with format_load.loading(bare):
+        yield toy
+
+
 class _Model(nn.Module):
     def __init__(self, k, n):
         super().__init__()
         self.toy = nn.Linear(k, n, bias=True)
         self.dense = nn.Linear(k, n, bias=False)
+
+
+def load_model(path, **kwargs):
+    """mlx-lm's loader as the patch leaves it: the function a module bound
+    at its import is the library's own, which builds no layer of a format."""
+    return mlx_lm.utils.load_model(path, **kwargs)
 
 
 def _named(config):
@@ -93,7 +136,7 @@ def _kept(layer):
     return {name: (value.shape, value.dtype) for name, value in layer.items()}
 
 
-def test_a_named_linear_loads_as_the_formats_layer(toy):
+def test_a_named_linear_loads_as_the_formats_layer(by_hand, toy):
     n, k = 16, 64
     (codes, scales), x, want = _matrix(n, k)
     bias = mx.arange(n).astype(mx.float32)
@@ -127,7 +170,7 @@ def test_a_named_linear_loads_as_the_formats_layer(toy):
 
 
 @pytest.mark.parametrize("switch", [lm_switch, vlm_switch], ids=["mlx-lm", "mlx-vlm"])
-def test_a_named_switch_layer_loads_as_the_formats_stack(toy, switch):
+def test_a_named_switch_layer_loads_as_the_formats_stack(by_hand, toy, switch):
     n, k = 16, 64
     (codes, scales), _, _ = _matrix(EXPERTS * n, k)
     codes, scales = codes.reshape(EXPERTS, n, k), scales.reshape(EXPERTS, n)
@@ -205,7 +248,7 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy):
     assert not format_load._mlx_runs("oqel") and format_load._mlx_runs("affine")
 
 
-def test_a_matrix_the_format_does_not_lay_out_is_refused_in_words(toy):
+def test_a_matrix_the_format_does_not_lay_out_is_refused_in_words(by_hand, toy):
     with pytest.raises(
         ValueError,
         match=re.escape(
@@ -222,7 +265,7 @@ def test_a_matrix_the_format_does_not_lay_out_is_refused_in_words(toy):
     assert len(toy.asked) == 1
 
 
-def test_a_formats_layer_is_built_from_its_bits_and_group_size_alone(toy):
+def test_a_formats_layer_is_built_from_its_bits_and_group_size_alone(by_hand, toy):
     with pytest.raises(
         ValueError,
         match=re.escape(
@@ -241,7 +284,7 @@ def test_a_formats_layer_is_built_from_its_bits_and_group_size_alone(toy):
 
 
 def test_a_format_of_one_of_mlx_s_modes_takes_the_matrices_it_lays_out(
-    toy, monkeypatch
+    by_hand, monkeypatch
 ):
     monkeypatch.setitem(formats._FORMATS, "mxfp4", _Loadable("mxfp4"))
     dense = nn.Linear(64, 16)
@@ -281,16 +324,34 @@ def test_the_classes_whose_matrices_load_in_a_format(unpatched):
 
 def test_the_patch_is_applied_once(toy):
     wrappers = [cls.to_quantized for cls in _PATCHED]
+    wrappers += [getattr(module, name) for module, name in _loaders()]
+    assert len(wrappers) == len(_PATCHED) + len(format_load._LOADERS)
     assert all(wrapper._omlx_format_load for wrapper in wrappers)
     format_load.apply_format_load_patch()
-    assert [cls.to_quantized for cls in _PATCHED] == wrappers
-    assert not any(hasattr(wrapper.__wrapped__, "__wrapped__") for wrapper in wrappers)
+    again = [cls.to_quantized for cls in _PATCHED]
+    assert again + [getattr(module, name) for module, name in _loaders()] == wrappers
+    assert not any(
+        getattr(wrapper.__wrapped__, "_omlx_format_load", False) for wrapper in wrappers
+    )
+    # A module found again once wrapped (its import ending on one thread as
+    # the patch is applied on another) is left as it is.
+    for module, name in _loaders():
+        format_load._wrap(module)
+        assert getattr(module, name) in wrappers
+    # What a loader's callers read of it.
+    for module, name in _loaders():
+        loader = getattr(module, name)
+        assert inspect.signature(loader) == inspect.signature(loader.__wrapped__)
 
 
 def test_a_model_load_applies_the_patch(unpatched, tmp_path):
+    loaders = [getattr(module, name) for module, name in _loaders()]
     assert not any(hasattr(cls.to_quantized, "__wrapped__") for cls in _PATCHED)
+    assert not any(getattr(loader, "_omlx_format_load", False) for loader in loaders)
     maybe_apply_pre_load_patches(str(tmp_path))
     assert all(cls.to_quantized._omlx_format_load for cls in _PATCHED)
+    for (module, name), loader in zip(_loaders(), loaders, strict=True):
+        assert getattr(module, name).__wrapped__ is loader
 
 
 def test_the_patch_loads_the_plugins(unpatched, monkeypatch):
@@ -349,58 +410,531 @@ def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
     assert logits.shape == (1, 5, 32) and mx.array_equal(logits, reference(tokens))
 
 
-def test_a_load_hands_a_format_its_record_before_a_layer_is_built(toy, tmp_path):
-    record = {"layout": 2, "levels": [0.5, 1.5]}
-    _llama(tmp_path, toy={"plugin": "omlx-toy 0.3.1", "contract": 1, "record": record})
-    maybe_apply_pre_load_patches(str(tmp_path))
-    assert toy.accepted == [(record, 0)]
+class _Levels(_Loadable):
+    """The toy format as a checkpoint's record configures it: its levels,
+    the first of which scales what it decodes."""
+
+    def __init__(self, levels):
+        super().__init__()
+        self.levels = tuple(levels)
+
+    def decode(self, tensors, bits, group_size):
+        return super().decode(tensors, bits, group_size) * self.levels[0]
+
+
+def _written(record=None, plugin="omlx-toy 0.3.1"):
+    """What oQ stores of the toy format in a checkpoint's config."""
+    entry = {"plugin": plugin, "contract": 1}
+    if record is not None:
+        entry["record"] = record
+    return {"toy": entry}
+
+
+def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_path):
+    record = {"layout": 1, "levels": [0.5, 1.5]}
+    toy.reads = lambda record: _Levels(record["levels"])
+    _llama(tmp_path, **_written(record))
     model, _ = load_model(tmp_path)
-    assert type(model.model.layers[0].mlp.gate_proj) is FormatLinear
-    assert toy.asked and len(toy.accepted) == 1
+    layer = model.model.layers[0].mlp.gate_proj
+    assert type(layer) is FormatLinear and layer.mode == "toy"
+    # The record was handed over once, when the registered format had said it
+    # lays the matrix out.
+    assert toy.accepted == [(record, 1)]
+    assert type(layer.fmt) is _Levels and layer.fmt.levels == (0.5, 1.5)
+    # The object reads the layer: it lays the matrix out, its decode and its
+    # face are the layer's; nothing is kept on the registered format.
+    assert layer.fmt.asked == toy.asked == [(64, 128, 8, 1)]
+    assert formats.get("toy") is toy and not hasattr(toy, "levels")
+    tensors = {name: layer[name] for name in ("weight", "scales")}
+    assert mx.array_equal(layer._decoded(), toy.decode(tensors, 8, 1) * 0.5)
+    asked = []
+    layer.fmt.dot = lambda layer, k, n: asked.append((k, n))
+    assert formats.dot(layer, 64, 128) is None and asked == [(64, 128)]
+    # Two checkpoints of the format, two records: each keeps its own.
+    other = tmp_path / "other"
+    other.mkdir()
+    _llama(other, **_written({"layout": 1, "levels": [2.0]}))
+    second, _ = load_model(other)
+    kept = second.model.layers[0].mlp.gate_proj.fmt
+    assert kept.levels == (2.0,) and layer.fmt.levels == (0.5, 1.5)
+
+
+def test_a_checkpoint_written_without_a_record_hands_an_empty_one(toy, tmp_path):
+    for written in (_written(), {}):
+        # Written before formats had records, or naming the format in its
+        # quantization alone.
+        _llama(tmp_path, **written)
+        model, _ = load_model(tmp_path)
+        assert model.model.layers[0].mlp.gate_proj.fmt is toy
+    assert toy.accepted == [({}, 1), ({}, 2)]
 
 
 def test_a_format_refuses_a_checkpoint_in_its_own_words(toy, tmp_path):
-    _llama(tmp_path, toy={"plugin": None, "contract": 1, "record": {"layout": 2}})
+    _llama(tmp_path, **_written({"layout": 2}, plugin=None))
     toy.refusal = "written in layout 2; this plugin reads layout 1"
     with pytest.raises(ValueError) as refusal:
-        maybe_apply_pre_load_patches(str(tmp_path))
+        load_model(tmp_path)
     assert str(refusal.value) == toy.refusal
-    assert toy.asked == []
+    assert len(toy.asked) == 1
 
 
-def test_a_checkpoint_written_before_records_hands_an_empty_one(toy, tmp_path):
-    _llama(tmp_path, toy={"plugin": "omlx-toy 0.3.0", "contract": 1})
-    maybe_apply_pre_load_patches(str(tmp_path))
-    assert toy.accepted == [({}, 0)]
-    # A checkpoint of no format hands none.
-    _llama(tmp_path)
-    maybe_apply_pre_load_patches(str(tmp_path))
+class _Other(_Loadable):
+    tensors = ("scales", "levels")
+
+
+@pytest.mark.parametrize(
+    "returned",
+    ["a string", "another mode", "other tensors", "another contract"],
+)
+def test_what_accept_returns_is_a_format_of_the_same_kind(
+    toy, tmp_path, monkeypatch, returned
+):
+    returned = {
+        "a string": "toy",
+        "another mode": _Loadable("other"),
+        "other tensors": _Other(),
+        "another contract": _Loadable(),
+    }[returned]
+    if isinstance(returned, _Loadable) and type(returned) is _Loadable:
+        returned.contract = 2 if returned.mode == "toy" else returned.contract
+    _llama(tmp_path, **_written({"layout": 1}))
+    toy.reads = lambda record: returned
+    with pytest.raises(ValueError) as refusal:
+        load_model(tmp_path)
+    said = (
+        f"quant format 'toy' accepted the checkpoint at {tmp_path} with "
+        f"{returned!r}, not a format of its mode, tensors and contract: report it "
+        "to "
+    )
+    assert str(refusal.value) == said + "the plugin"
+    # Named by its distribution when a plugin's.
+    monkeypatch.setitem(formats._ORIGINS, "toy", "my-package 0.1.0")
+    with pytest.raises(ValueError) as refusal:
+        load_model(tmp_path)
+    assert str(refusal.value) == said + "my-package 0.1.0"
+    if returned == "toy":
+        quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+        assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+
+
+def test_accept_returning_none_reads_with_the_registered_format(toy, tmp_path):
+    # As the guide's example of revision 1 wrote accept.
+    toy.reads = lambda record: None
+    _llama(tmp_path, **_written({"layout": 1}))
+    model, _ = load_model(tmp_path)
+    assert model.model.layers[0].mlp.gate_proj.fmt is toy
+
+
+def test_a_format_that_configures_itself_to_accept_is_refused(toy, tmp_path):
+    def configure(record):
+        toy.levels = tuple(record["levels"])
+        return toy
+
+    toy.reads = configure
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+    with pytest.raises(ValueError) as refusal:
+        load_model(tmp_path)
+    assert str(refusal.value) == (
+        f"quant format 'toy' changed its registered format (levels) to accept the "
+        f"checkpoint at {tmp_path}: accept returns a format configured from the "
+        "record instead; report it to the plugin"
+    )
+    quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+    quoted = quoted.replace("the plugin", "my-package 0.1.0")
+    assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+
+
+class _Wide(_Loadable):
+    """A layout of the record's: two scales a row."""
+
+    def layout(self, k, n, bits, group_size):
+        self.asked.append((k, n, bits, group_size))
+        return {"weight": ((n, k), mx.uint8), "scales": ((n, 2), mx.float32)}
+
+
+def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
+    wide = _Wide()
+    toy.reads = lambda record: wide if record.get("wide") else toy
+    _llama(tmp_path, **_written({"wide": True}))
+    with format_load.loading(tmp_path):
+        layer = nn.Linear(64, 128).to_quantized(**_TOY)
+    # The registered format said it lays such a matrix out; the checkpoint's
+    # laid it out.
+    assert toy.asked == [(64, 128, 8, 1)] and wide.asked == [(64, 128, 8, 1)]
+    assert layer.fmt is wide and _kept(layer)["scales"] == ((128, 2), mx.float32)
+    # One the registered format lays out none of is refused before the record
+    # is read.
+    with (
+        format_load.loading(tmp_path),
+        pytest.raises(ValueError, match="lays out no"),
+    ):
+        nn.Linear(64, 128).to_quantized(group_size=1, bits=4, mode="toy")
     assert len(toy.accepted) == 1
 
 
-def test_a_format_that_is_not_installed_is_left_to_the_layers_load(toy, tmp_path):
-    _llama(tmp_path, oqel={"plugin": "omlx-oqel 0.2.0", "contract": 1})
-    maybe_apply_pre_load_patches(str(tmp_path))
-    assert toy.accepted == []
+def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(toy, tmp_path):
+    import types
+
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+    toy.reads = lambda record: _Levels(record["levels"])
+    load = mlx_lm.utils.load_model
+
+    def with_a_stranger(path, **kwargs):
+        # Another checkpoint's layer, quantized by hand inside this one's load
+        # (as a loader bound before the patch would): it reads this one's
+        # record.
+        stranger = nn.Linear(64, 128).to_quantized(**_TOY)
+        assert stranger.fmt.levels == (1.0,)
+        return load(path, **kwargs)
+
+    module = types.ModuleType("stranger")
+    module.load_model = with_a_stranger
+    format_load._wrap_loader(module, "load_model")
+    with pytest.raises(ValueError) as refusal:
+        module.load_model(tmp_path)
+    assert str(refusal.value) == (
+        f"1 layers of a quant format were built while the checkpoint at {tmp_path} "
+        "loaded, and are not in its model: they were another checkpoint's, read "
+        "with this one's record; load each checkpoint with the libraries' "
+        "load_model"
+    )
 
 
-def test_a_checkpoint_without_a_config_it_can_read_hands_no_record(toy, tmp_path):
-    format_load.accept_checkpoint(str(tmp_path))
-    (tmp_path / "config.json").write_text("{")
-    format_load.accept_checkpoint(str(tmp_path))
-    assert toy.accepted == []
+def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkeypatch):
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
+    format_load.apply_format_load_patch()
+    with pytest.raises(ValueError) as refusal:
+        nn.Linear(64, 16).to_quantized(**_TOY)
+    assert str(refusal.value) == (
+        "a layer of quant format 'toy' is built outside a checkpoint's load, which "
+        "gives it the record to be read with: load the checkpoint with mlx-lm's, "
+        "mlx-vlm's or mlx-embeddings' load_model"
+    )
+    # MLX's layers need none.
+    assert type(nn.Linear(64, 16).to_quantized(32, 4)) is nn.QuantizedLinear
+
+
+def test_a_checkpoint_is_accepted_once_for_all_its_layers(toy, tmp_path):
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+    toy.reads = lambda record: _Levels(record["levels"])
+    with format_load.loading(tmp_path):
+        first = nn.Linear(64, 128).to_quantized(**_TOY)
+        second = lm_switch.SwitchLinear(64, 128, EXPERTS).to_quantized(**_TOY)
+    assert first.fmt is second.fmt and first.fmt.levels == (1.0,)
+    assert toy.accepted == [({"levels": [1.0]}, 1)]
+
+
+def test_a_load_reads_its_own_checkpoint_on_its_own_thread(toy, tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    for path, levels in ((first, [1.0]), (second, [2.0])):
+        path.mkdir()
+        _llama(path, **_written({"levels": levels}))
+    toy.reads = lambda record: _Levels(record["levels"])
+    built, loaded = threading.Event(), threading.Event()
+    seen = {}
+
+    def other_thread():
+        # A thread loading the first checkpoint, while the second loads here.
+        with format_load.loading(first):
+            built.set()
+            loaded.wait(60)
+            seen["late"] = nn.Linear(64, 128).to_quantized(**_TOY).fmt.levels
+
+    worker = threading.Thread(target=other_thread)
+    worker.start()
+    assert built.wait(60)
+    # A load is active on that thread only.
+    assert formats._LOADING.get() is None
+    model, _ = load_model(second)
+    loaded.set()
+    worker.join(60)
+    assert model.model.layers[0].mlp.gate_proj.fmt.levels == (2.0,)
+    assert seen == {"late": (1.0,)}
+    # A load nested in another reads its own, and the outer one its own after.
+    with format_load.loading(first):
+        model, _ = load_model(second)
+        after = nn.Linear(64, 128).to_quantized(**_TOY)
+    assert model.model.layers[0].mlp.gate_proj.fmt.levels == (2.0,)
+    assert after.fmt.levels == (1.0,)
 
 
 def test_the_contract_page_s_accept_refuses_another_layout():
     (text,) = (
         text
         for language, text in _BLOCKS
-        if language == "python" and "def accept" in text
+        if language == "python" and "def accept" in text and "raise" in text
     )
     scope = {}
     exec(textwrap.dedent(text), scope)
+    fmt = object()
     for record in ({}, {"layout": 1}):
-        assert scope["accept"](None, record) is None
+        assert scope["accept"](fmt, record) is fmt
     with pytest.raises(ValueError) as refusal:
-        scope["accept"](None, {"layout": 2})
+        scope["accept"](fmt, {"layout": 2})
     assert str(refusal.value) == "written in layout 2; this plugin reads layout 1"
+
+
+# Each way oMLX loads a checkpoint, through the libraries' real loaders: a
+# tiny Llama checkpoint with a layer of the toy format, whose record names
+# the levels its layers are read with. mlx-vlm serves Llama too.
+
+
+def _tiny(path, levels):
+    """A tiny llama checkpoint at ``path`` with the toy format's layer, as
+    ``_llama`` writes it, the record ``{"levels": levels}``, and a tokenizer
+    with a chat template."""
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    path.mkdir(parents=True, exist_ok=True)
+    _llama(path, **_written({"levels": levels}))
+    vocab = {f"t{i}": i for i in range(32)}
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="t0")), unk_token="t0"
+    )
+    tokenizer.chat_template = "{% for m in messages %}{{ m['content'] }}{% endfor %}"
+    tokenizer.save_pretrained(path)
+    return path
+
+
+@pytest.fixture
+def levels(toy):
+    """The toy format read as each checkpoint's record configures it: the
+    levels each load handed over, in order."""
+    toy.reads = lambda record: _Levels(record["levels"])
+    return lambda: [tuple(record["levels"]) for record, _ in toy.accepted]
+
+
+def _gate_proj(model):
+    """The toy layer of a tiny Llama, as mlx-lm or mlx-vlm built it."""
+    lm = getattr(model, "language_model", model)
+    layer = lm.model.layers[0].mlp.gate_proj
+    assert type(layer) is FormatLinear
+    return layer
+
+
+def test_the_llm_engine_and_a_specprefill_draft_read_their_records(levels, tmp_path):
+    from omlx.utils.model_loading import lm_load_compat, load_text_model
+
+    model, _ = load_text_model(str(_tiny(tmp_path / "target", [1.0])))
+    # SpecPrefill's draft (engine/batched.py, engine/vlm.py).
+    draft, _ = lm_load_compat(str(_tiny(tmp_path / "draft", [2.0])))
+    assert _gate_proj(model).fmt.levels == (1.0,)
+    assert _gate_proj(draft).fmt.levels == (2.0,)
+    assert levels() == [(1.0,), (2.0,)]
+
+
+def test_a_hub_id_reads_the_record_of_the_files_it_resolves_to(
+    levels, tmp_path, monkeypatch
+):
+    import mlx_lm.utils
+
+    from omlx.utils.model_loading import lm_load_compat
+
+    path = _tiny(tmp_path / "snapshot", [4.0])
+    monkeypatch.setattr(mlx_lm.utils, "snapshot_download", lambda *a, **k: str(path))
+    model, _ = lm_load_compat("someone/tiny-toy")
+    assert _gate_proj(model).fmt.levels == (4.0,)
+
+
+def test_a_model_directory_under_home_loads_with_its_record(
+    levels, tmp_path, monkeypatch
+):
+    from omlx.model_discovery import discover_models_from_dirs
+    from omlx.settings import ModelSettings
+    from omlx.utils.model_loading import load_text_model
+
+    _tiny(tmp_path / "home" / "models" / "tiny", [5.0])
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # The server's model directories, as its settings give them, and what
+    # the pool discovers there.
+    dirs = ModelSettings(model_dirs=["~/models"]).get_model_dirs(tmp_path)
+    (found,) = discover_models_from_dirs(dirs).values()
+    model, _ = load_text_model(found.model_path)
+    assert _gate_proj(model).fmt.levels == (5.0,)
+
+
+def test_the_vlm_engine_reads_its_record(levels, tmp_path):
+    from mlx_vlm.utils import load_model as vlm_load_model
+
+    from omlx.engine.vlm import _load_cohere2_moe_text_model
+
+    model = vlm_load_model(_tiny(tmp_path / "vlm", [6.0]), lazy=True)
+    assert _gate_proj(model).fmt.levels == (6.0,)
+    # The engine's text-only load of Cohere2 MoE goes through it too.
+    model, _ = _load_cohere2_moe_text_model(str(_tiny(tmp_path / "cohere", [7.0])))
+    assert _gate_proj(model).fmt.levels == (7.0,)
+
+
+@pytest.mark.parametrize("drafter", ["DFlash", "VLM-MTP"])
+def test_a_drafter_reads_its_record(levels, tmp_path, drafter):
+    path = str(_tiny(tmp_path / "drafter", [8.0]))
+    if drafter == "DFlash":
+        from omlx.speculative.dflash import load_dflash_drafter
+
+        # The tiny checkpoint is no DFlash drafter: it fails once loaded,
+        # where the drafter meets its target (None here).
+        with pytest.raises(TypeError):
+            load_dflash_drafter(path, target_model=None)
+    else:
+        from omlx.speculative.vlm_mtp import load_vlm_mtp_drafter
+
+        # Nor an MTP one: it is logged and dropped once loaded.
+        assert load_vlm_mtp_drafter(path) is None
+    assert levels() == [(8.0,)]
+
+
+def _registered(monkeypatch):
+    """The toy format, registered with no patch applied yet, reading each
+    checkpoint with its record's levels."""
+    formats.load()
+    toy = _Loadable()
+    toy.reads = lambda record: _Levels(record["levels"])
+    monkeypatch.setitem(formats._FORMATS, "toy", toy)
+    return toy
+
+
+def test_a_causal_lm_reranker_installs_the_patch_and_reads_its_record(
+    unpatched, tmp_path, monkeypatch
+):
+    from omlx.models.reranker import MLXRerankerModel
+
+    _registered(monkeypatch)
+    path = _tiny(tmp_path / "tiny-reranker", [9.0])
+    config = json.loads((path / "config.json").read_text())
+    config["architectures"] = ["Qwen3ForCausalLM"]
+    (path / "config.json").write_text(json.dumps(config))
+    reranker = MLXRerankerModel(str(path))
+    reranker.load()
+    assert _gate_proj(reranker.model).fmt.levels == (9.0,)
+
+
+def test_an_embedding_model_installs_the_patch_and_reads_its_record(
+    unpatched, tmp_path, monkeypatch
+):
+    from omlx.models import embedding
+
+    toy = _registered(monkeypatch)
+    # Through mlx-vlm's encoder loader, as its embedding models load.
+    monkeypatch.setitem(embedding._MLX_VLM_EMBEDDING_CONTEXT, "llama", 512)
+    path = _tiny(tmp_path / "embedding", [10.0])
+    try:
+        embedding.MLXEmbeddingModel(str(path)).load()
+    except Exception as error:  # a Llama is no embedding model: what follows
+        failed = error  # its load fails
+    else:
+        failed = None
+    accepted = [tuple(record["levels"]) for record, _ in toy.accepted]
+    assert accepted == [(10.0,)], failed
+
+
+def test_the_cluster_s_loads_read_their_records(levels, tmp_path):
+    from omlx.cluster.progressive_loading import progressive_sharded_load
+    from omlx.patches.mlx_lm_sharded_load import _local_sharded_load
+
+    model, _ = _local_sharded_load(str(_tiny(tmp_path / "rank", [11.0])))
+    assert _gate_proj(model).fmt.levels == (11.0,)
+    # Whether a tiny Llama shards or not: its layers were read.
+    with contextlib.suppress(ValueError):
+        progressive_sharded_load(str(_tiny(tmp_path / "progressive", [12.0])))
+    assert levels()[1] == (12.0,)
+
+
+@pytest.mark.parametrize("adapter", ["qwen3_5", "minimax_m3", "glm5_next", "qwen4_exp"])
+def test_a_prefill_helper_reads_its_record(levels, tmp_path, adapter, monkeypatch):
+    module = importlib.import_module(f"omlx.prefill_helper.adapters.{adapter}")
+    # The kernel patches a helper applies after its load are process-wide:
+    # the tests after this one run without them.
+    for name in [name for name in vars(module) if name.startswith("apply_")]:
+        monkeypatch.setattr(module, name, lambda *args, **kwargs: False)
+    (cls,) = (
+        value
+        for name, value in vars(module).items()
+        if name.endswith("Adapter")
+        and getattr(value, "__module__", "") == module.__name__
+    )
+    # A Llama is not the family's: what follows its load fails.
+    with contextlib.suppress(Exception):
+        cls().load_first(str(_tiny(tmp_path / "helper", [13.0])), 1)
+    assert levels() == [(13.0,)]
+
+
+def test_oq_s_calibration_reads_the_record_of_its_source(levels, tmp_path):
+    from omlx import oq
+
+    path = _tiny(tmp_path / "source", [14.0])
+    config = json.loads((path / "config.json").read_text())
+    model, _ = oq._calibration_model(str(path), config)
+    assert _gate_proj(model).fmt.levels == (14.0,)
+
+
+def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkeypatch):
+    import mlx_lm.utils
+
+    from omlx.patches.deepseek_v4 import utils_patch
+    from omlx.patches.k2_horizon import checkpoint
+
+    # DeepSeek V4's loader goes over the wrapped one, as the pre-load
+    # patches apply it after this patch.
+    monkeypatch.setattr(mlx_lm.utils, "load_model", mlx_lm.utils.load_model)
+    wrapped = mlx_lm.utils.load_model
+    mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
+    model, _ = mlx_lm.utils.load_model(_tiny(tmp_path / "llama", [15.0]))
+    assert _gate_proj(model).fmt.levels == (15.0,)
+    # It builds a DeepSeek V4 checkpoint's layers itself, outside any load:
+    # one of a format is refused, on every load (the patch never wraps the
+    # loader again).
+    v4 = _tiny(tmp_path / "v4", [16.0])
+    config = json.loads((v4 / "config.json").read_text())
+    (v4 / "config.json").write_text(json.dumps({**config, "model_type": "deepseek_v4"}))
+    for _ in range(2):
+        format_load.apply_format_load_patch()
+        assert not getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
+        with pytest.raises(ValueError, match="built outside a checkpoint's load"):
+            mlx_lm.utils.load_model(
+                v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
+            )
+    # K2 Horizon's loads a directory of links to the checkpoint's files.
+    mlx_lm.utils.load_model = wrapped
+    checkpoint.apply_checkpoint_patch()
+    k2 = _tiny(tmp_path / "k2", [17.0])
+    config = json.loads((k2 / "config.json").read_text())
+    (k2 / "config.json").write_text(json.dumps({**config, "model_type": "k2_horizon"}))
+    model, _ = mlx_lm.utils.load_model(
+        k2, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
+    )
+    assert _gate_proj(model).fmt.levels == (17.0,)
+
+
+def test_the_patch_imports_none_of_the_libraries_and_wraps_them_on_import():
+    import subprocess
+    import sys
+
+    code = textwrap.dedent("""
+        import json, sys
+        from omlx.patches import format_load
+        libraries = ("mlx_lm", "mlx_vlm", "mlx_embeddings")
+        before = [name for name in libraries if name in sys.modules]
+        format_load.apply_format_load_patch()
+        after = [name for name in libraries if name in sys.modules]
+        import mlx_lm.utils, mlx_vlm.utils, mlx_vlm.embedding_loader
+        import mlx_embeddings.utils, mlx_lm.models.switch_layers
+        import mlx_vlm.models.switch_layers
+        marked = lambda f: getattr(f, "_omlx_format_load", False)
+        wrapped = [
+            marked(getattr(sys.modules[module], name))
+            for module, name in format_load._LOADERS
+        ] + [
+            marked(sys.modules[module].SwitchLinear.to_quantized)
+            for module in format_load._SWITCH_MODULES
+        ]
+        print(json.dumps({"before": before, "after": after, "wrapped": wrapped}))
+        """)
+    run = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    seen = json.loads(run.stdout.splitlines()[-1])
+    assert seen["after"] == seen["before"]
+    assert seen["wrapped"] == [True] * 6

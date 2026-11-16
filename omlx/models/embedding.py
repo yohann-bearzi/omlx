@@ -22,6 +22,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
+from ..patches.format_load import apply_format_load_patch
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import _decode_input_audio_data, load_image, validate_image_data_uri
 from .base_model import (
@@ -507,6 +508,9 @@ class MLXEmbeddingModel:
         """Load the model and processor/tokenizer."""
         if self._loaded:
             return
+
+        # A checkpoint's layers of a quant format load as the format's layers.
+        apply_format_load_patch()
 
         # mlx-vlm embedding models pool inside their forward and return
         # float32 text_embeds, so the declared pooling mode is not applied.

@@ -29,6 +29,7 @@ import math
 import numbers
 import struct
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from importlib.metadata import EntryPoint, entry_points
 
@@ -344,14 +345,28 @@ class QuantFormat:
         checkpoint's config."""
         return {}
 
-    def accept(self, record: dict) -> None:
-        """Raise a ValueError, in the format's words, for a checkpoint it
-        cannot read. A checkpoint's load calls it before any of the format's
-        layers is built, with the ``record`` it was written with: an empty
-        one for a checkpoint written before formats had records."""
+    def accept(self, record: dict) -> QuantFormat | None:
+        """The format object that reads a checkpoint written with ``record``,
+        or a ValueError, in the format's words, for one it cannot read.
+
+        A checkpoint's load calls it once for each of its modes, when the
+        format lays out the first of its layers, with the ``record`` it was
+        written with: an empty one for a checkpoint written before formats
+        had records. Every layer of that checkpoint is built with, and
+        keeps, the object returned: the format itself by default (or for
+        None), or one configured from the record, of the same mode,
+        tensors and contract, immutable and holding no unevaluated arrays
+        (the layers of several checkpoints and threads may run at once).
+        The registered format is left as it is."""
+        return self
 
 
 _FORMATS: dict[str, QuantFormat] = {}
+# The checkpoint whose layers the calling thread is loading, if any: set by
+# omlx.patches.format_load around the libraries' loads, read by the layers.
+# Not None exactly while a load is active on the calling thread: a thread
+# starts with none, whatever another thread loads.
+_LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
 # The plugin that registered each mode: its distribution's name and version.
 _ORIGINS: dict[str, str] = {}
 # Held for the whole load. Reentrant: the load registers through register(),
@@ -507,7 +522,10 @@ def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
     notes it again in a block of ``testing.no_dot_defects``. A kernel that
     asks at every call costs a lookup."""
     mode = getattr(layer, "mode", None)
-    fmt = get(mode)
+    # A format's layer keeps the object that reads it; MLX's have a mode.
+    fmt = getattr(layer, "fmt", None)
+    if fmt is None:
+        fmt = get(mode)
     if fmt is None:
         return None
     if not isinstance(layer, nn.Module):

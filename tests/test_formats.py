@@ -218,11 +218,12 @@ def test_a_plugin_of_another_revision_is_logged_and_skipped(plugins, caplog):
     assert "update oMLX" in str(record.exc_info[1])
 
 
-def test_a_format_s_record_is_empty_and_any_record_is_read_unless_it_says():
+def test_a_format_s_record_is_empty_and_it_reads_any_record_unless_it_says():
     fmt = _Format()
     assert fmt.record() == {}
+    # By default the format itself reads every checkpoint.
     for record in ({}, {"layout": 2, "levels": [0.5, 1.5]}):
-        assert fmt.accept(record) is None
+        assert fmt.accept(record) is fmt
 
 
 def test_the_contract_page_lists_every_revision():

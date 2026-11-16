@@ -432,7 +432,8 @@ _KEPT = "_omlx_format_call"
 
 class _FormatLayer(nn.Module):
     """What the two layers share: a format's tensors as frozen parameters,
-    and the attributes of MLX's quantized layers.
+    the attributes of MLX's quantized layers, and the format object that
+    reads them (``fmt``).
 
     A layer works out its plan and finds its bias at its first call, and
     keeps them in its ``__dict__`` with the weight they were found with,
@@ -451,7 +452,7 @@ class _FormatLayer(nn.Module):
 
     def __init__(
         self,
-        mode: str,
+        fmt: formats.QuantFormat | str,
         bits: int,
         group_size: int,
         input_dims: int,
@@ -459,9 +460,12 @@ class _FormatLayer(nn.Module):
         bias: mx.array | None = None,
     ) -> None:
         super().__init__()
-        fmt = formats.get(mode)
-        if fmt is None:
-            raise ValueError(f"no quant format is registered for mode {mode!r}")
+        if isinstance(fmt, str):
+            # A layer built by hand, of a registered mode: its format.
+            mode, fmt = fmt, formats.get(fmt)
+            if fmt is None:
+                raise ValueError(f"no quant format is registered for mode {mode!r}")
+        mode = fmt.mode
         names = ("weight", *fmt.tensors)
         if set(tensors) != set(names):
             raise ValueError(
@@ -482,6 +486,10 @@ class _FormatLayer(nn.Module):
                 f"{type(self).__name__}: {', '.join(ragged)} does not open with "
                 f"the weight's stack of {stack}"
             )
+        # The object, not a lookup of its mode: a checkpoint's own (what its
+        # format's accept returned for its record) reads its layers. Kept out
+        # of the module's items whatever its class.
+        object.__setattr__(self, "fmt", fmt)
         self.mode, self.bits, self.group_size = mode, bits, group_size
         self.input_dims = input_dims
         for name in names:
@@ -539,7 +547,7 @@ class _FormatLayer(nn.Module):
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
         """The layer's weights as floats: all of them, or the matrices at
         ``indices`` of the stack."""
-        fmt = formats.get(self.mode)
+        fmt = self.fmt
         tensors = {name: self[name] for name in ("weight", *fmt.tensors)}
         if indices is not None:
             tensors = {name: tensor[indices] for name, tensor in tensors.items()}
