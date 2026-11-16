@@ -111,7 +111,7 @@ A format whose tensors are all row-major keeps a matrix's rows apart: where ever
 
 A switch layer's indices are integers of any integer dtype (mlx-vlm's are `uint32`); others are refused. A negative index counts from the end of the stack, as MLX's indexing does, on every route. A call of 2^30 pairs or more runs through `decode`: MLX's grid is int32.
 
-A layer keeps the format's tensors in the dtypes it is built with, which the face reads: an array of another dtype assigned to one of them is not taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 activations recast a format layer's bias alone.
+A layer keeps the format's tensors in the shapes and dtypes it is built with, which the face reads: an array of another shape or dtype assigned to one of them is not taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 activations recast a format layer's bias alone.
 
 | Call | What runs |
 |---|---|
@@ -135,7 +135,7 @@ mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a
         return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
 ```
 
-`layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there (by MLX in a strict load, by oMLX when the load returns, whatever its `strict`, and a layer the load filled none of at the end of oMLX's own load: see [Load a checkpoint](#load-a-checkpoint)). MLX's load does not check a tensor's dtype: one of another dtype than the layout's is not taken, and leaves the placeholder. A layer that still holds a placeholder when it is first called (that tensor's, or one a load that is not strict lacked) refuses to compute, naming itself, the tensor and the dtype it was offered or `never loaded`: it never computes on a placeholder.
+`layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there (by MLX in a strict load, by oMLX when the load returns, whatever its `strict`, and a layer the load filled none of at the end of oMLX's own load: see [Load a checkpoint](#load-a-checkpoint)). MLX's load does not check a tensor's dtype, nor its shape when it is not strict: one of another shape or dtype than the layout's is not taken, and leaves the placeholder. A layer that still holds a placeholder when it is first called (that tensor's, or one a load that is not strict lacked) refuses to compute, naming itself, the tensor and the shape and dtype it was offered or `never loaded`: it never computes on a placeholder, and neither its decode nor `formats.dot` reads one.
 
 `layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): it lays out no (16, 64) matrix of 4 bits in groups of 2`. A built-in format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
 
@@ -409,7 +409,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 
 ## The dot face
 
-The struct named by `type` holds the matrix. Its aggregate members are the weight as bytes, one device pointer per name in `tensors`, then one `omlx_table<T, N>` per entry in `tables`. Both tuples set the order of their members. Each tensor pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
+The struct named by `type` holds the matrix. Its aggregate members are the weight as bytes, one device pointer per name in `tensors`, then one `omlx_table<T, N>` per entry in `tables`. Both tuples set the order of their members. Each tensor pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). A layer's tensors keep their dtypes when the activations are recast (see [Layers](#layers)), so a pointer typed `T` reads its tensor right only for the activation dtypes the face lists in `dtypes`: a face whose pointers are `T` lists its tensors' dtype there, or names their type, `bfloat16_t` for one. Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
 
 ```cpp
 struct Dot {

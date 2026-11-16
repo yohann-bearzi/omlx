@@ -334,7 +334,11 @@ def test_a_checkpoint_s_tensor_of_another_dtype_is_refused_at_the_first_call(
     half = weights["scales"].astype(mx.float16)
     layer.load_weights(list({**weights, "scales": half}.items()), strict=True)
     assert layer["scales"].dtype == mx.float32 and not mx.any(layer["scales"]).item()
-    offered = "scales (offered mlx.core.float16, not the layout's mlx.core.float32)"
+    shape = weights["scales"].shape
+    offered = (
+        f"scales (offered {shape} mlx.core.float16, not the layout's {shape} "
+        "mlx.core.float32)"
+    )
     with pytest.raises(ValueError, match=_refused(layer, offered)):
         layer(*args)
     # An array of the layout's dtype loads it.
@@ -352,6 +356,36 @@ def test_a_tensor_a_load_lacks_is_refused_at_the_first_call(toy, by_hand, switch
     layer.load_weights(list(weights.items()), strict=False)
     assert mx.array_equal(layer["weight"], weights["weight"])
     with pytest.raises(ValueError, match=_refused(layer, "scales (never loaded)")):
+        layer(*args)
+
+
+@_LAYERS
+def test_a_tensor_of_another_shape_is_refused_at_the_first_call(toy, by_hand, switch):
+    """MLX's load checks shapes only when it is strict: a tensor of another
+    shape than the layout's is not taken either, and the layer refuses to
+    compute rather than read past it."""
+    layer, weights, args = _for_load(switch)
+    shape = weights["scales"].shape
+    short = weights["scales"][..., :8]
+    layer.load_weights(list({**weights, "scales": short}.items()), strict=False)
+    offered = (
+        f"scales (offered {short.shape} mlx.core.float32, not the layout's "
+        f"{shape} mlx.core.float32)"
+    )
+    with pytest.raises(ValueError, match=_refused(layer, offered)):
+        layer(*args)
+
+
+@_LAYERS
+def test_codes_a_recast_hands_back_are_no_load(toy, by_hand, switch):
+    """MLX's set_dtype hands the codes, which it does not cast, back to the
+    layer as they are: the very array the layer holds is no load, and a load
+    that lacks the codes leaves them refused."""
+    layer, weights, args = _for_load(switch)
+    layer.set_dtype(mx.float16)
+    del weights["weight"]
+    layer.load_weights(list(weights.items()), strict=False)
+    with pytest.raises(ValueError, match=_refused(layer, "weight (never loaded)")):
         layer(*args)
 
 
@@ -415,6 +449,10 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
     assert _equal(model.linear(x), linear(x))
     switch = FormatSwitchLinear("toy", 8, 1, k, stack, bias=bias)
     assert _equal(model.switch(rows, indices), switch(rows, indices))
+    if when == "after":
+        # Float16 activations meet the recast float16 bias: float16 out.
+        assert model.linear(x.astype(mx.float16)).dtype == mx.float16
+        assert model.switch(rows.astype(mx.float16), indices).dtype == mx.float16
     # Through the face: one launch each, none failed.
     assert len(kernels._PROOFS) == 2
     assert all(p.ran and not p.failed for p in kernels._PROOFS.values())

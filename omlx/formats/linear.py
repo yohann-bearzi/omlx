@@ -168,7 +168,7 @@ def _plan(layer) -> _Plan | None:
     format has no face for the matrix, or a launch could not take it. A
     layer that still holds a load's placeholder is refused here, ahead of
     every route, once per plan and not per call."""
-    layer._refuse_placeholders()
+    layer.refuse_placeholders()
     k, n = layer.input_dims, layer.output_dims
     # MLX binds x as a buffer from 8 elements.
     if k < 8:
@@ -441,6 +441,17 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
 # bias.
 _KEPT = "_omlx_format_call"
 
+def _unloaded(name: str, held, offered) -> str:
+    """A placeholder ``held`` of tensor ``name``, as a refusal names it: with
+    the shape and dtype last offered in its place, or as never loaded."""
+    if offered is None:
+        return f"{name} (never loaded)"
+    shape, dtype = offered
+    return (
+        f"{name} (offered {shape} {dtype}, not the layout's {held.shape} "
+        f"{held.dtype})"
+    )
+
 
 class _FormatLayer(nn.Module):
     """What the two layers share: a format's tensors as frozen parameters,
@@ -460,14 +471,14 @@ class _FormatLayer(nn.Module):
     two threads that make a layer's first call at once each work out the
     same plan, and either keeps it.
 
-    The format's tensors keep the dtypes the layer is built with, which its
-    face reads. MLX writes a module's arrays back one by one through
-    ``__setitem__``, for a load (``load_weights``, ``update``) as for a
-    recast (``set_dtype``, ``apply``, oMLX's float16 activations), and the
-    two cannot be told apart there: an array of another dtype is not taken,
-    and raises nothing. A layer built for a load (``placeholders``) holds
-    stand-ins that arrays of their dtypes replace, and refuses to compute
-    while one is left."""
+    The format's tensors keep the shapes and dtypes the layer is built
+    with, which its face reads. MLX writes a module's arrays back one by one
+    through ``__setitem__``, for a load (``load_weights``, ``update``) as for
+    a recast (``set_dtype``, ``apply``, oMLX's float16 activations), and the
+    two cannot be told apart there: an array of another shape or dtype is
+    not taken, and raises nothing. A layer built for a load
+    (``placeholders``) holds stand-ins that arrays of their shapes and
+    dtypes replace, and refuses to compute while one is left."""
 
     _STACK = 0  # the axes ahead of one matrix's, in each of its tensors
 
@@ -517,8 +528,8 @@ class _FormatLayer(nn.Module):
         self.mode, self.bits, self.group_size = mode, bits, group_size
         self.input_dims = input_dims
         # The format's tensors, and those that still hold a load's
-        # placeholders, each with the dtype last offered in its place (None:
-        # none was). Kept beside the parameters, not among them.
+        # placeholders, each with the shape and dtype last offered in its
+        # place (None: none was). Kept beside the parameters, not among them.
         self.__dict__.update(
             _tensors=names, _placeholders=dict.fromkeys(names if placeholders else ())
         )
@@ -529,30 +540,30 @@ class _FormatLayer(nn.Module):
         self.freeze()
 
     def __setitem__(self, key: str, value: Any) -> None:
-        # Over a tensor of the format the layer holds: an array of its dtype
-        # replaces it (a placeholder is then loaded), any other is not taken.
+        # Over a tensor of the format the layer holds: an array of its shape
+        # and dtype replaces it (a placeholder is then loaded), any other is
+        # not taken, and the very array it holds changes nothing.
         held = self.get(key)
         if held is not None and key in self._tensors:
-            if value.dtype != held.dtype:
+            if value is held:
+                return
+            if value.shape != held.shape or value.dtype != held.dtype:
                 if key in self._placeholders:
-                    self._placeholders[key] = value.dtype
+                    self._placeholders[key] = (value.shape, value.dtype)
                 return
             self._placeholders.pop(key, None)
         self.__dict__.pop(_KEPT, None)
         super().__setitem__(key, value)
 
-    def _refuse_placeholders(self) -> None:
+    def refuse_placeholders(self) -> None:
         """Raise while a tensor of the format still holds the load's
         placeholder: the layer never computes on one."""
-        if not self._placeholders:
+        # A copy: a load on another thread may be emptying the set.
+        pending = tuple(self._placeholders.items())
+        if not pending:
             return
         held = ", ".join(
-            (
-                f"{name} (never loaded)"
-                if offered is None
-                else f"{name} (offered {offered}, not the layout's {self[name].dtype})"
-            )
-            for name, offered in self._placeholders.items()
+            _unloaded(name, self[name], offered) for name, offered in pending
         )
         raise ValueError(
             f"{self!r} computes on its checkpoint's tensors alone; it still "
@@ -604,6 +615,7 @@ class _FormatLayer(nn.Module):
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
         """The layer's weights as floats: all of them, or the matrices at
         ``indices`` of the stack."""
+        self.refuse_placeholders()
         fmt = self.fmt
         tensors = {name: self[name] for name in ("weight", *fmt.tensors)}
         if indices is not None:

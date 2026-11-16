@@ -641,6 +641,9 @@ def dot(layer, k: int, n: int) -> Dot | None:
     """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None when
     its format (``layer.mode``) is unknown or has none for it.
 
+    A format layer that still holds a load's placeholder is refused, as
+    its call refuses it (``linear``).
+
     A kernel asks for a face inside a model's forward, and keeps the answer
     with what it builds for the layer. So a format whose ``dot`` raises, or
     returns anything but None or a ``Dot`` of arrays the layer has (the
@@ -680,6 +683,11 @@ def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
         fmt = get(mode)
     if fmt is None:
         return None
+    # A format layer that still holds a load's placeholder has nothing to
+    # read: refused here, ahead of the format.
+    refuse = getattr(layer, "refuse_placeholders", None)
+    if refuse is not None:
+        refuse()
     if not isinstance(layer, nn.Module):
         return _asked(fmt, layer, k, n, kind, name, keeps)[0]
     slot = f"_omlx_{name}_face_{k}_{n}"

@@ -2580,6 +2580,9 @@ def test_a_recast_of_the_model_casts_a_format_layer_s_bias_alone(
     assert model["_private"] is private
     assert _equal(model.linear(x), before[0])
     assert _equal(model.switch(rows, indices), before[1])
+    # Float16 activations meet a float16 bias: float16 out, through the face.
+    assert model.linear(x.astype(mx.float16)).dtype == mx.float16
+    assert model.switch(rows.astype(mx.float16), indices).dtype == mx.float16
     # The launches of before: no other proof, none failed.
     assert set(kernels._PROOFS) == proofs and len(proofs) == 2
     assert all(p.ran and not p.failed for p in kernels._PROOFS.values())
@@ -2588,8 +2591,17 @@ def test_a_recast_of_the_model_casts_a_format_layer_s_bias_alone(
 def test_the_page_says_a_recast_casts_a_format_layer_s_bias_alone():
     page = " ".join(_PAGE.split())
     assert (
-        "MLX's `set_dtype` and oMLX's float16 activations recast a format "
-        "layer's bias alone" in page
+        "an array of another shape or dtype assigned to one of them is not "
+        "taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 "
+        "activations recast a format layer's bias alone" in page
+    )
+
+
+def test_the_page_says_a_face_s_pointers_typed_t_name_their_dtypes():
+    page = " ".join(_PAGE.split())
+    assert (
+        "a pointer typed `T` reads its tensor right only for the activation "
+        "dtypes the face lists in `dtypes`" in page
     )
 
 
@@ -2603,32 +2615,102 @@ def test_the_page_says_a_layer_over_placeholders_refuses_to_compute():
 
 def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
     """A layer built for a load holds placeholders: an array of another
-    dtype does not replace one, and until each is replaced the layer
-    refuses to compute, whatever route its call would take (here N is not
-    whole tiles, and the format has no face), naming what it lacks."""
+    shape or dtype does not replace one, nor does the very array it holds,
+    and until each is replaced the layer refuses to compute, whatever route
+    its call would take (here N is not whole tiles, and the format has no
+    face), naming what it lacks; so do its decode and formats.dot."""
     toy()
     (codes, scales), x, want = _matrix(36, 320)
-    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
-    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+    # Given in another order than the format's: named in the format's.
+    stand_ins = {"scales": mx.zeros_like(scales), "weight": mx.zeros_like(codes)}
+    bias = mx.zeros((36,))
+    layer = FormatLinear("toy", 8, 1, 320, stand_ins, bias=bias, placeholders=True)
     refusal = (
         f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
         "the load's placeholder of "
     )
-    lacking = refusal + "weight (never loaded), scales (never loaded)"
-    with pytest.raises(ValueError, match=f"^{re.escape(lacking)}$"):
+
+    def refused(placeholders):
+        return f"^{re.escape(refusal + placeholders)}$"
+
+    lacking = refused("weight (never loaded), scales (never loaded)")
+    for compute in (
+        lambda: layer(x),
+        layer._decoded,
+        lambda: formats.dot(layer, 320, 36),
+    ):
+        with pytest.raises(ValueError, match=lacking):
+            compute()
+    # The array it holds, assigned again, is no load.
+    layer["weight"] = layer["weight"]
+    with pytest.raises(ValueError, match=lacking):
         layer(x)
+    # The last array offered in another dtype or shape is named.
     layer["scales"] = scales.astype(mx.float16)
+    layer["scales"] = scales.astype(mx.bfloat16)
     assert layer["scales"] is stand_ins["scales"]
     layer["weight"] = codes
-    offered = "scales (offered mlx.core.float16, not the layout's mlx.core.float32)"
-    with pytest.raises(ValueError, match=f"^{re.escape(refusal + offered)}$"):
+    offered = (
+        "scales (offered (36,) mlx.core.bfloat16, not the layout's (36,) "
+        "mlx.core.float32)"
+    )
+    with pytest.raises(ValueError, match=refused(offered)):
+        layer(x)
+    layer["scales"] = scales[:8]
+    offered = (
+        "scales (offered (8,) mlx.core.float32, not the layout's (36,) "
+        "mlx.core.float32)"
+    )
+    with pytest.raises(ValueError, match=refused(offered)):
         layer(x)
     layer["scales"] = scales
     assert _equal(layer(x), want)
-    # Loaded, it takes an array of its dtype, and no other.
+    # Loaded, it takes an array of its shape and dtype, and no other; it
+    # knows its format's tensors by their names, not by the dict it was
+    # built from.
     layer["scales"] = 2 * scales
     layer["scales"] = scales.astype(mx.bfloat16)
+    layer["scales"] = mx.concatenate([scales, scales])
+    stand_ins["bias"] = bias
+    layer.set_dtype(mx.float16)
+    assert layer["bias"].dtype == mx.float16
     assert _equal(layer(x), 2 * want)
+
+
+def test_a_layer_s_placeholders_are_checked_where_its_plan_is_built(toy, monkeypatch):
+    """The check costs a call nothing: it runs while a layer's plan is built
+    (and in formats.dot, which the plan asks), not at each call."""
+    toy(_toy("checked"))
+    layer, x, want = _toy_linear(40, 320)
+    refuse, checked = FormatLinear.refuse_placeholders, []
+
+    def counted(self):
+        checked.append(self)
+        return refuse(self)
+
+    monkeypatch.setattr(FormatLinear, "refuse_placeholders", counted)
+    for _ in range(3):
+        assert _equal(layer(x), want)
+    assert checked == [layer, layer]
+
+
+def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy):
+    """A load on another thread may take a placeholder while a refusal
+    names them: the refusal names those it read, and raises nothing else."""
+    toy()
+    (codes, scales), x, _ = _matrix(36, 320)
+    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+
+    class Loading:
+        def __repr__(self):
+            # The other thread's load lands while the refusal is written.
+            layer["scales"] = scales
+            return "36"
+
+    layer._placeholders["weight"] = ((Loading(),), mx.float16)
+    with pytest.raises(ValueError, match=re.escape("scales (never loaded)")):
+        layer(x)
 
 
 def test_a_layer_reads_as_mlx_s_quantized_layers():

@@ -433,13 +433,13 @@ class _Checkpoint:
                 key = (held, layer.mode)
                 bound[key] = bound.get(key, 0) + 1
             placeholders = layer._load_origin[0]
-            # A tensor of another dtype is not taken (the layer keeps its
-            # placeholder) and recorded as offered: named as it was.
+            # A tensor of another shape or dtype is not taken (the layer keeps
+            # its placeholder) and recorded as offered: named as it was.
             for name, offered in getattr(layer, "_placeholders", {}).items():
                 if offered is not None:
                     held = placeholders[name]
                     raise _refused(
-                        f"{path}.{name} is {tuple(held.shape)} {offered}, where the "
+                        f"{path}.{name} is {offered[0]} {offered[1]}, where the "
                         f"format lays out {tuple(held.shape)} {held.dtype}",
                         layer.mode,
                         self,
