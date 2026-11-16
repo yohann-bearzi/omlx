@@ -324,7 +324,7 @@ What oQ offers a format:
   it loads as holds at their shape: model.layers.0.mlp.experts.0.gate_proj`, the first
   twenty and then how many more.
 - A matrix, or a stack of matrices, that `layout` returns a layout for at the layer's bits and group size. `layout` is asked first, and `encode` is not called for a matrix it returns None for. That includes a matrix whose K the group size does not divide, which oQ's affine keeps in floats.
-- A matrix that fits one launch: up to 2^30 weights, fewer on a Mac whose largest Metal buffer is small. A stack that does not fit one is offered in runs of whole matrices, in several calls, and oQ joins their tensors along the stack's axis. A format therefore encodes each matrix by itself: its tensors do not depend on the matrices beside it in a call. A format that encodes a stack's first runs and returns None for a later one is refused.
+- A matrix that fits one launch: up to 2^30 weights, fewer on a Mac whose largest Metal buffer is small, and a stack whose tensors, joined, each fit a Metal buffer. A stack that does not fit one launch is offered in runs of whole matrices, in several calls, and oQ joins their tensors along the stack's axis. A format therefore encodes each matrix by itself: its tensors do not depend on the matrices beside it in a call. A format that encodes a stack's first runs and returns None for a later one is refused.
 - Nothing that oQ does not quantize itself: a tensor the source already keeps at the level's bits or fewer (experts their lab ships in 4 bits, at a level of 4 bits or more) is written as the source has it, and so is a table kept with `preserve_ngram_table`.
 
 What oQ writes:

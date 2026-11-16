@@ -260,7 +260,65 @@ def test_a_stack_s_runs_are_let_go_one_by_one(toy, monkeypatch):
         monkeypatch.setattr(mx, name, recorded(name, getattr(mx, name)))
     w = _weights(5, 8, 64)
     oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
-    assert events == ["encode", "eval", "synchronize", "clear_cache"] * 3
+    # Then the join hands its runs' cache back.
+    assert events == ["encode", "eval", "synchronize", "clear_cache"] * 3 + [
+        "clear_cache"
+    ]
+
+
+def test_a_run_holds_at_most_a_launch_s_weights(toy, monkeypatch):
+    """Whatever the chunk, a run is at most _LAUNCH_WEIGHTS weights (MLX
+    indexes with 32-bit integers), and a matrix of more is not offered."""
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 40)
+    monkeypatch.setattr(oq, "_LAUNCH_WEIGHTS", 2 * 8 * 64)
+    importance = mx.ones((64,))
+    w = _weights(5, 8, 64)
+    kept = oq._encode_in_format(toy, "experts.weight", w, importance, 4, 64)
+    assert [given.shape[0] for given, *_ in toy.encoded] == [2, 2, 1]
+    assert _same(kept, _Codec().encode(w, importance, 4, 64))
+    toy.encoded.clear()
+
+    def offer(*shape):
+        return oq._encode_in_format(
+            toy, "a.weight", _weights(*shape), importance, 4, 64
+        )
+
+    # A matrix of a launch's weights is offered, one of more is not.
+    assert offer(16, 64) and offer(17, 64) is None
+    assert [given.shape for given, *_ in toy.encoded] == [(16, 64)]
+
+
+def test_runs_are_counted_in_matrices_of_any_shape(toy, monkeypatch):
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(16, 32))
+    w = _weights(5, 16, 32)
+    oq._encode_in_format(toy, "experts.weight", w, mx.ones((32,)), 4, 32)
+    assert [given.shape[0] for given, *_ in toy.encoded] == [2, 2, 1]
+
+
+@pytest.mark.parametrize("shape", [(0, 8, 64), (0, 64), (3, 0, 64), (8, 0)])
+def test_an_empty_matrix_or_stack_is_not_offered(toy, shape):
+    w = mx.zeros(shape)
+    assert oq._encode_in_format(toy, "a.weight", w, mx.ones((64,)), 4, 64) is None
+    assert toy.encoded == []
+
+
+def test_a_name_s_runs_are_let_go_once_it_is_joined(toy, monkeypatch):
+    """Joining a stack's runs name by name, a name's run tensors are let go
+    once that name is joined: the next join does not hold them too."""
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", _matrix_bytes(64, 512))
+    concatenate, active = mx.concatenate, []
+
+    def measured(arrays, *args, **kwargs):
+        mx.synchronize()
+        active.append(mx.get_active_memory())
+        return concatenate(arrays, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "concatenate", measured)
+    w = _weights(4, 64, 512)
+    oq._encode_in_format(toy, "experts.weight", w, mx.ones((512,)), 4, 64)
+    # The codes, a byte a weight, joined and their runs let go: as much held
+    # when the scales are joined as when the codes were.
+    assert len(active) == 2 and active[1] - active[0] < 4 * 64 * 512 // 2
 
 
 def test_a_stack_in_one_run_is_kept_as_it_was_encoded(toy):

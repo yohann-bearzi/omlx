@@ -5466,6 +5466,9 @@ def _metal_max_buffer_bytes() -> int:
 
 _METAL_MAX_BUFFER = _metal_max_buffer_bytes()
 _QUANTIZE_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 4)
+# The most weights a format's encode is given in one call: MLX indexes an
+# array's elements with 32-bit integers.
+_LAUNCH_WEIGHTS = 1 << 30
 _LOAD_CHUNK_BYTES = max(1 << 20, _METAL_MAX_BUFFER // 2)
 
 
@@ -7103,28 +7106,37 @@ def _loads_as_laid_out(fmt, reader, tensor_name, shape, bits, group_size):
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
-    ``w`` is neither a matrix nor a stack of matrices that fit a launch (2^30
-    weights; a matrix's input and tensors within ``_QUANTIZE_CHUNK_BYTES``),
-    or a tensor of the stack would not fit a Metal buffer. A stack is
-    encoded in runs of whole matrices, each run's input and tensors within
+    ``w`` is empty, neither a matrix nor a stack of matrices that fit a
+    launch (_LAUNCH_WEIGHTS; a matrix's input and tensors within
+    ``_QUANTIZE_CHUNK_BYTES``), or a tensor of the stack would not fit a
+    Metal buffer. A stack is encoded in runs of whole matrices, each run
+    within _LAUNCH_WEIGHTS and its input and tensors within
     ``_QUANTIZE_CHUNK_BYTES`` in their own dtypes, and the runs' tensors are
     joined here and evaluated. The tensors are checked
     against the format's layout, which is what a checkpoint loads by."""
     from . import formats
 
     *stack, n, k = w.shape
+    count = stack[0] if stack else 1
     layout = fmt.layout(k, n, bits, group_size)
-    if layout is None or len(stack) > 1 or n * k > 1 << 30:
+    if (
+        layout is None
+        or len(stack) > 1
+        or n * k > _LAUNCH_WEIGHTS
+        or count * n * k == 0
+    ):
         return None
     formats.check_layout(fmt, n, k, layout)
     # What one matrix holds while it is encoded: its input, and its tensors.
-    count = stack[0] if stack else 1
     sizes = [math.prod(shape) * dtype.size for shape, dtype in layout.values()]
     matrix = w.nbytes // count + sum(sizes)
     if matrix > _QUANTIZE_CHUNK_BYTES or max(sizes) * count > _METAL_MAX_BUFFER:
         return None
-    run = (_QUANTIZE_CHUNK_BYTES // matrix) * n * k
-    runs = _row_chunks_with_bounds(w, run) if stack else ((0, n, w),)
+    if stack:
+        run = min(_QUANTIZE_CHUNK_BYTES // matrix * n * k, _LAUNCH_WEIGHTS)
+        runs = _row_chunks_with_bounds(w, run)
+    else:
+        runs = ((0, n, w),)
     own = stack and importance.ndim > 1  # each matrix has its importance
     parts = []
     for r0, r1, run in runs:
@@ -7161,10 +7173,13 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
         mx.clear_cache()
     if len(parts) == 1:
         return parts[0]
-    joined = {name: mx.concatenate([part[name] for part in parts]) for name in layout}
     # The writer keeps a layer's tensors until its shard is saved: evaluated,
-    # they hold no run.
-    mx.eval(*joined.values())
+    # they hold no run; each name's run tensors are let go once it is joined.
+    joined = {}
+    for name in layout:
+        joined[name] = mx.concatenate([part.pop(name) for part in parts])
+        mx.eval(joined[name])
+    mx.clear_cache()
     return joined
 
 
