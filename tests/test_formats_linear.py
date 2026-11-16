@@ -29,6 +29,7 @@ from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 from omlx import formats
 from omlx.formats import affine, kernels, linear, testing
 from omlx.formats.linear import MAX_ROWS, FormatLinear, FormatSwitchLinear
+from omlx.utils import model_loading
 from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
 
@@ -2510,6 +2511,124 @@ def test_a_layer_holds_a_registered_format_s_tensors(toy):
         FormatSwitchLinear("toy", 8, 1, 64, {**stack, "scales": scales.reshape(4, 2)})
     # A matrix's tensors are the format's own beyond that.
     assert FormatLinear("toy", 8, 1, 64, {**matrix, "scales": scales.reshape(2, 4)})
+
+
+# The toy face over row scales kept as bfloat16.
+_TOY_BF16 = (
+    _TOY.replace("const device float* scales;", "const device bfloat16_t* scales;")
+    .replace("const device float* s;", "const device bfloat16_t* s;")
+    .replace("return sum * s[r];", "return sum * float(s[r]);")
+)
+
+
+def _recast_model(dtype):
+    """A toy linear and a toy switch layer, with row scales and biases of
+    ``dtype``: powers of two and small integers, and a scale of 2**17
+    (beyond float16's range); and an array of ``dtype`` under a private
+    name, which MLX does not count among the parameters."""
+    (codes, scales), _, _ = _matrix(EXPERTS * 40, 320)
+    scales = mx.concatenate([mx.array([2.0**17]), scales[1:]]).astype(dtype)
+    mx.random.seed(7)
+    bias = mx.random.randint(-64, 64, (EXPERTS, 40)).astype(dtype)
+    model = nn.Module()
+    matrix = {"weight": codes[:40], "scales": scales[:40]}
+    model.linear = FormatLinear("toy", 8, 1, 320, matrix, bias=bias[0])
+    stack = {
+        "weight": codes.reshape(EXPERTS, 40, 320),
+        "scales": scales.reshape(EXPERTS, 40),
+    }
+    model.switch = FormatSwitchLinear("toy", 8, 1, 320, stack, bias=bias)
+    model["_private"] = mx.ones((8,), dtype)
+    mx.eval(model.parameters())
+    return model
+
+
+@pytest.mark.parametrize(
+    "recast,dtype",
+    [
+        ("set_dtype", mx.float32),
+        ("set_dtype", mx.bfloat16),
+        ("float16 activations", mx.bfloat16),
+    ],
+)
+def test_a_recast_of_the_model_casts_a_format_layer_s_bias_alone(
+    toy, monkeypatch, recast, dtype
+):
+    """A format's tensors are in the dtypes its face reads: the layer keeps
+    them, its outputs and its launches through MLX's set_dtype and oMLX's
+    float16 activations."""
+    key = "recast_f32" if dtype == mx.float32 else "recast_bf16"
+    toy(_toy(key, _TOY if dtype == mx.float32 else _TOY_BF16))
+    monkeypatch.setattr(_ToyFormat, "decode", lambda *matrix: pytest.fail("decoded"))
+    model = _recast_model(dtype)
+    x, rows, indices = _ints((1, 320)), _ints((3, 1, 320)), _experts((3,))
+    before = (model.linear(x), model.switch(rows, indices))
+    mx.eval(before)
+    proofs = set(kernels._PROOFS)
+    held = dict(tree_flatten(model.parameters()))
+    private = model["_private"]
+    if recast == "set_dtype":
+        model.set_dtype(mx.float16)
+    else:
+        # The two biases.
+        assert model_loading.cast_bf16_params_to_fp16(model) == 2
+    for name, value in tree_flatten(model.parameters()):
+        if name.endswith("bias"):
+            assert value.dtype == mx.float16
+        else:
+            assert value is held[name]
+    assert model["_private"] is private
+    assert _equal(model.linear(x), before[0])
+    assert _equal(model.switch(rows, indices), before[1])
+    # The launches of before: no other proof, none failed.
+    assert set(kernels._PROOFS) == proofs and len(proofs) == 2
+    assert all(p.ran and not p.failed for p in kernels._PROOFS.values())
+
+
+def test_the_page_says_a_recast_casts_a_format_layer_s_bias_alone():
+    page = " ".join(_PAGE.split())
+    assert (
+        "MLX's `set_dtype` and oMLX's float16 activations recast a format "
+        "layer's bias alone" in page
+    )
+
+
+def test_the_page_says_a_layer_over_placeholders_refuses_to_compute():
+    page = " ".join(_PAGE.split())
+    assert (
+        "A layer that still holds a placeholder when it is first called (that "
+        "tensor's, or one a load that is not strict lacked) refuses to compute" in page
+    )
+
+
+def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
+    """A layer built for a load holds placeholders: an array of another
+    dtype does not replace one, and until each is replaced the layer
+    refuses to compute, whatever route its call would take (here N is not
+    whole tiles, and the format has no face), naming what it lacks."""
+    toy()
+    (codes, scales), x, want = _matrix(36, 320)
+    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+    refusal = (
+        f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
+        "the load's placeholder of "
+    )
+    lacking = refusal + "weight (never loaded), scales (never loaded)"
+    with pytest.raises(ValueError, match=f"^{re.escape(lacking)}$"):
+        layer(x)
+    layer["scales"] = scales.astype(mx.float16)
+    assert layer["scales"] is stand_ins["scales"]
+    layer["weight"] = codes
+    offered = "scales (offered mlx.core.float16, not the layout's mlx.core.float32)"
+    with pytest.raises(ValueError, match=f"^{re.escape(refusal + offered)}$"):
+        layer(x)
+    layer["scales"] = scales
+    assert _equal(layer(x), want)
+    # Loaded, it takes an array of its dtype, and no other.
+    layer["scales"] = 2 * scales
+    layer["scales"] = scales.astype(mx.bfloat16)
+    assert _equal(layer(x), 2 * want)
 
 
 def test_a_layer_reads_as_mlx_s_quantized_layers():

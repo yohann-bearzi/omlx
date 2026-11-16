@@ -432,7 +432,18 @@ class _Checkpoint:
             for held in paths[id(layer)]:
                 key = (held, layer.mode)
                 bound[key] = bound.get(key, 0) + 1
-            placeholders = layer._placeholders[0]
+            placeholders = layer._load_origin[0]
+            # A tensor of another dtype is not taken (the layer keeps its
+            # placeholder) and recorded as offered: named as it was.
+            for name, offered in getattr(layer, "_placeholders", {}).items():
+                if offered is not None:
+                    held = placeholders[name]
+                    raise _refused(
+                        f"{path}.{name} is {tuple(held.shape)} {offered}, where the "
+                        f"format lays out {tuple(held.shape)} {held.dtype}",
+                        layer.mode,
+                        self,
+                    )
             left = [name for name, held in placeholders.items() if layer[name] is held]
             if left and len(left) < len(placeholders):
                 raise _refused(
@@ -551,7 +562,7 @@ def check_loaded(model) -> None:
         # No process that built no format layer walks a model.
         return
     for name, module in model.named_modules():
-        held = module.__dict__.get("_placeholders")
+        held = module.__dict__.get("_load_origin")
         if held is None:
             continue
         tensors, checkpoint = held
@@ -568,7 +579,7 @@ def check_loaded(model) -> None:
             # Filled, and its load has ended and been checked (a load still
             # running, a library's loader around oMLX's, checks it when it
             # returns).
-            module.__dict__.pop("_placeholders", None)
+            module.__dict__.pop("_load_origin", None)
 
 
 @contextmanager
@@ -998,11 +1009,13 @@ def _format_layer(layer, layer_cls, signature, arguments):
         name: mx.zeros((*stack, *shape), dtype)
         for name, (shape, dtype) in layout.items()
     }
-    built = layer_cls(fmt, bits, group_size, k, tensors, layer.get("bias"))
+    built = layer_cls(
+        fmt, bits, group_size, k, tensors, layer.get("bias"), placeholders=True
+    )
     checkpoint.built.append(built)
     # Its placeholders and its checkpoint, until oMLX's own load has checked
     # them (check_loaded).
-    object.__setattr__(built, "_placeholders", (tensors, checkpoint))
+    object.__setattr__(built, "_load_origin", (tensors, checkpoint))
     global _BUILT_ANY
     _BUILT_ANY = True
     return built

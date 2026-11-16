@@ -156,7 +156,10 @@ class _Plan(NamedTuple):
 
 def _plan(layer) -> _Plan | None:
     """How ``layer``'s rows run through its format's dot face, or None: the
-    format has no face for the matrix, or a launch could not take it."""
+    format has no face for the matrix, or a launch could not take it. A
+    layer that still holds a load's placeholder is refused here, ahead of
+    every route, once per plan and not per call."""
+    layer._refuse_placeholders()
     k, n = layer.input_dims, layer.output_dims
     # MLX binds x as a buffer from 8 elements.
     if k < 8:
@@ -446,7 +449,16 @@ class _FormatLayer(nn.Module):
     back, behind those methods. A call then reads one dict entry and the
     weight. Threads: a layer that is being loaded is not called meanwhile;
     two threads that make a layer's first call at once each work out the
-    same plan, and either keeps it."""
+    same plan, and either keeps it.
+
+    The format's tensors keep the dtypes the layer is built with, which its
+    face reads. MLX writes a module's arrays back one by one through
+    ``__setitem__``, for a load (``load_weights``, ``update``) as for a
+    recast (``set_dtype``, ``apply``, oMLX's float16 activations), and the
+    two cannot be told apart there: an array of another dtype is not taken,
+    and raises nothing. A layer built for a load (``placeholders``) holds
+    stand-ins that arrays of their dtypes replace, and refuses to compute
+    while one is left."""
 
     _STACK = 0  # the axes ahead of one matrix's, in each of its tensors
 
@@ -458,6 +470,8 @@ class _FormatLayer(nn.Module):
         input_dims: int,
         tensors: dict[str, mx.array],
         bias: mx.array | None = None,
+        *,
+        placeholders: bool = False,
     ) -> None:
         formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
         super().__init__()
@@ -493,11 +507,48 @@ class _FormatLayer(nn.Module):
         object.__setattr__(self, "fmt", fmt)
         self.mode, self.bits, self.group_size = mode, bits, group_size
         self.input_dims = input_dims
+        # The format's tensors, and those that still hold a load's
+        # placeholders, each with the dtype last offered in its place (None:
+        # none was). Kept beside the parameters, not among them.
+        self.__dict__.update(
+            _tensors=names, _placeholders=dict.fromkeys(names if placeholders else ())
+        )
         for name in names:
             self[name] = tensors[name]
         if bias is not None:
             self["bias"] = bias
         self.freeze()
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        # Over a tensor of the format the layer holds: an array of its dtype
+        # replaces it (a placeholder is then loaded), any other is not taken.
+        held = self.get(key)
+        if held is not None and key in self._tensors:
+            if value.dtype != held.dtype:
+                if key in self._placeholders:
+                    self._placeholders[key] = value.dtype
+                return
+            self._placeholders.pop(key, None)
+        self.__dict__.pop(_KEPT, None)
+        super().__setitem__(key, value)
+
+    def _refuse_placeholders(self) -> None:
+        """Raise while a tensor of the format still holds the load's
+        placeholder: the layer never computes on one."""
+        if not self._placeholders:
+            return
+        held = ", ".join(
+            (
+                f"{name} (never loaded)"
+                if offered is None
+                else f"{name} (offered {offered}, not the layout's {self[name].dtype})"
+            )
+            for name, offered in self._placeholders.items()
+        )
+        raise ValueError(
+            f"{self!r} computes on its checkpoint's tensors alone; it still "
+            f"holds the load's placeholder of {held}"
+        )
 
     @property
     def output_dims(self) -> int:
@@ -511,10 +562,6 @@ class _FormatLayer(nn.Module):
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
         kept = self.__dict__[_KEPT] = (_plan(self), bias, self["weight"])
         return kept
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        self.__dict__.pop(_KEPT, None)
-        super().__setitem__(key, value)
 
     def __delitem__(self, key: str) -> None:
         self.__dict__.pop(_KEPT, None)
@@ -560,6 +607,13 @@ class _FormatLayer(nn.Module):
             f"bias={'bias' in self}, group_size={self.group_size}, "
             f"bits={self.bits}, mode={self.mode}"
         )
+
+
+def keeps_dtype(module, key: str) -> bool:
+    """Whether ``module``'s array ``key`` keeps its dtype through a recast
+    of the model: a format layer's tensors (not its bias) are in the dtypes
+    of the format's layout, which its face reads."""
+    return isinstance(module, _FormatLayer) and key in module._tensors
 
 
 class FormatLinear(_FormatLayer):

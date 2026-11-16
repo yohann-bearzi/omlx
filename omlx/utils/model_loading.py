@@ -1627,11 +1627,21 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
     changes. Leaves are then swapped one chunk at a time, so peak memory grows
     by one chunk instead of a second copy of every bfloat16 leaf.
 
+    A format layer's tensors keep the dtypes of its format, which its face
+    reads: of such a layer only the bias is recast.
+
     Returns the number of tensors recast.
     """
+    from ..formats.linear import keeps_dtype
+
+    def recast(module, key, value):
+        return nn.Module.valid_parameter_filter(module, key, value) and not (
+            keeps_dtype(module, key)
+        )
+
     pending = [
         (key, value)
-        for key, value in tree_flatten(model.parameters())
+        for key, value in tree_flatten(model.filter_and_map(recast))
         if isinstance(value, mx.array) and value.dtype == mx.bfloat16
     ]
     count = len(pending)

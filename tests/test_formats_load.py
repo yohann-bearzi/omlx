@@ -28,12 +28,23 @@ from mlx_lm.models import switch_layers as lm_switch
 from mlx_vlm.models import switch_layers as vlm_switch
 
 from omlx import formats, oq
-from omlx.formats import testing
+from omlx.formats import kernels, testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
-from omlx.utils.model_loading import maybe_apply_pre_load_patches
-from tests.test_formats_kernels import _BLOCKS, _PAGE, _matrix
-from tests.test_formats_linear import EXPERTS, _ints, _ToyFormat, _want
+from omlx.utils.model_loading import (
+    cast_bf16_params_to_fp16,
+    maybe_apply_pre_load_patches,
+)
+from tests.test_formats_kernels import _BLOCKS, _PAGE, _matrix, _toy
+from tests.test_formats_linear import (
+    _TOY_BF16,
+    EXPERTS,
+    _equal,
+    _experts,
+    _ints,
+    _ToyFormat,
+    _want,
+)
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -276,6 +287,137 @@ def test_a_named_switch_layer_loads_as_the_formats_stack(by_hand, toy, switch):
     # Without a bias.
     layer = switch.SwitchLinear(k, n, EXPERTS, bias=False).to_quantized(**_TOY)
     assert sorted(layer.keys()) == ["scales", "weight"]
+
+
+def _for_load(switch, n=16, k=64):
+    """A toy format's layer as a load builds it, over placeholders, with a
+    bias: a linear, or the stack of mlx-lm's or mlx-vlm's SwitchLinear
+    (``switch``, its module); the checkpoint's tensors for it, and the
+    arrays of a call."""
+    if switch is None:
+        (codes, scales), _, _ = _matrix(n, k)
+        layer = nn.Linear(k, n).to_quantized(**_TOY)
+        weights = {"weight": codes, "scales": scales}
+        weights["bias"] = mx.arange(n).astype(mx.float32)
+        return layer, weights, (_ints((3, k)),)
+    (codes, scales), _, _ = _matrix(EXPERTS * n, k)
+    layer = switch.SwitchLinear(k, n, EXPERTS, bias=True).to_quantized(**_TOY)
+    weights = {
+        "weight": codes.reshape(EXPERTS, n, k),
+        "scales": scales.reshape(EXPERTS, n),
+        "bias": mx.arange(EXPERTS * n).reshape(EXPERTS, n).astype(mx.float32),
+    }
+    indices = mx.array([4, 0, 5, 5, 2], dtype=mx.uint32)
+    return layer, weights, (_ints((5, 1, k)), indices)
+
+
+_LAYERS = pytest.mark.parametrize(
+    "switch", [None, lm_switch, vlm_switch], ids=["linear", "mlx-lm", "mlx-vlm"]
+)
+
+
+def _refused(layer, placeholders):
+    return re.escape(
+        f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
+        f"the load's placeholder of {placeholders}"
+    )
+
+
+@_LAYERS
+def test_a_checkpoint_s_tensor_of_another_dtype_is_refused_at_the_first_call(
+    toy, by_hand, switch
+):
+    """MLX's load checks a tensor's name and shape, not its dtype: one of
+    another dtype than the layout's is not loaded, and the layer refuses to
+    compute on the placeholder it leaves, never on zeros."""
+    layer, weights, args = _for_load(switch)
+    half = weights["scales"].astype(mx.float16)
+    layer.load_weights(list({**weights, "scales": half}.items()), strict=True)
+    assert layer["scales"].dtype == mx.float32 and not mx.any(layer["scales"]).item()
+    offered = "scales (offered mlx.core.float16, not the layout's mlx.core.float32)"
+    with pytest.raises(ValueError, match=_refused(layer, offered)):
+        layer(*args)
+    # An array of the layout's dtype loads it.
+    layer.load_weights(list(weights.items()), strict=True)
+    assert np.array_equal(np.array(layer(*args)), _want(layer, *args))
+
+
+@_LAYERS
+def test_a_tensor_a_load_lacks_is_refused_at_the_first_call(toy, by_hand, switch):
+    """A load that is not strict drops what the model has no parameter for
+    (here a tensor a sanitize named wrong) and leaves the layer's
+    placeholder: the layer refuses to compute on it."""
+    layer, weights, args = _for_load(switch)
+    weights["scale"] = weights.pop("scales")
+    layer.load_weights(list(weights.items()), strict=False)
+    assert mx.array_equal(layer["weight"], weights["weight"])
+    with pytest.raises(ValueError, match=_refused(layer, "scales (never loaded)")):
+        layer(*args)
+
+
+class _HalfScales(_Loadable):
+    """The toy format keeping a row's scale as bfloat16, with a face that
+    reads it."""
+
+    def __init__(self):
+        super().__init__()
+        self.face = _toy("load_bf16", _TOY_BF16)
+
+    def layout(self, k, n, bits, group_size):
+        layout = super().layout(k, n, bits, group_size)
+        return {**layout, "scales": ((n,), mx.bfloat16)}
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+@pytest.mark.parametrize("recast", ["set_dtype", "float16 activations"])
+def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
+    toy, by_hand, monkeypatch, recast, when
+):
+    """MLX's set_dtype and oMLX's float16 activations, before the load or
+    after it, leave a format layer the checkpoint's tensors, the outputs of
+    a layer built from them, and the face's route."""
+    monkeypatch.setitem(formats._FORMATS, "toy", _HalfScales())
+    n, k = 40, 320
+    (codes, scales), _, _ = _matrix(EXPERTS * n, k)
+    scales = scales.astype(mx.bfloat16)
+    mx.random.seed(7)
+    bias = mx.random.randint(-64, 64, (EXPERTS, n)).astype(mx.bfloat16)
+    matrix = {"weight": codes[:n], "scales": scales[:n]}
+    stack = {
+        "weight": codes.reshape(EXPERTS, n, k),
+        "scales": scales.reshape(EXPERTS, n),
+    }
+    weights = {f"linear.{name}": value for name, value in matrix.items()}
+    weights.update({f"switch.{name}": value for name, value in stack.items()})
+    weights.update({"linear.bias": bias[0], "switch.bias": bias})
+    model = nn.Module()
+    model.linear = nn.Linear(k, n)
+    model.switch = lm_switch.SwitchLinear(k, n, EXPERTS, bias=True)
+    nn.quantize(model, class_predicate=_named({"linear": _TOY, "switch": _TOY}))
+
+    def run():
+        if recast == "set_dtype":
+            model.set_dtype(mx.float16)
+        else:
+            # The biases, once the load has made them bfloat16.
+            assert cast_bf16_params_to_fp16(model) == (2 if when == "after" else 0)
+
+    if when == "before":
+        run()
+    model.load_weights(list(weights.items()), strict=True)
+    if when == "after":
+        run()
+    for name, value in tree_flatten(model.parameters()):
+        assert name.endswith("bias") or value is weights[name], name
+    monkeypatch.setattr(_HalfScales, "decode", lambda *matrix: pytest.fail("decoded"))
+    x, rows, indices = _ints((1, k)), _ints((3, 1, k)), _experts((3,))
+    linear = FormatLinear("toy", 8, 1, k, matrix, bias=bias[0])
+    assert _equal(model.linear(x), linear(x))
+    switch = FormatSwitchLinear("toy", 8, 1, k, stack, bias=bias)
+    assert _equal(model.switch(rows, indices), switch(rows, indices))
+    # Through the face: one launch each, none failed.
+    assert len(kernels._PROOFS) == 2
+    assert all(p.ran and not p.failed for p in kernels._PROOFS.values())
 
 
 def test_mlx_s_modes_load_as_mlx_s_layers(toy):
@@ -1824,10 +1966,10 @@ def test_a_load_joined_to_an_outer_one_leaves_it_the_check(toy, tmp_path):
         format_load.check_loaded(model)
     format_load.check_loaded(model)
     outer.check(model)
-    assert "_placeholders" in _gate_proj(model).__dict__
+    assert "_load_origin" in _gate_proj(model).__dict__
     # Checked: the next exit check lets them go.
     format_load.check_loaded(model)
-    assert "_placeholders" not in _gate_proj(model).__dict__
+    assert "_load_origin" not in _gate_proj(model).__dict__
 
 
 def test_a_load_joins_only_a_running_loader_s_load_on_its_thread(toy, tmp_path):
@@ -2045,9 +2187,9 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     _llama(full, **_written({}))
     model, _ = load_model(full)
     layer = model.model.layers[0].mlp.gate_proj
-    assert set(layer._placeholders[0]) == {"weight", "scales"}
+    assert set(layer._load_origin[0]) == {"weight", "scales"}
     format_load.check_loaded(model)
-    assert not hasattr(layer, "_placeholders")
+    assert not hasattr(layer, "_load_origin")
     format_load.check_loaded(model)
 
 
@@ -2088,10 +2230,10 @@ def test_omlx_s_own_check_inside_a_library_load_leaves_it_the_layers(toy, tmp_pa
         model, _ = load_model(tmp_path)
         # oMLX's helper inside a library's loader: the load still runs.
         format_load.check_loaded(model)
-        assert hasattr(_gate_proj(model), "_placeholders")
+        assert hasattr(_gate_proj(model), "_load_origin")
     outer.check(model)
     format_load.check_loaded(model)
-    assert not hasattr(_gate_proj(model), "_placeholders") and outer.built == []
+    assert not hasattr(_gate_proj(model), "_load_origin") and outer.built == []
 
 
 def test_a_drafter_or_draft_refused_is_never_skipped():
