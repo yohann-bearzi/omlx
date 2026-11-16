@@ -95,13 +95,13 @@ from .. import formats
 from ..formats import Dot, kernels
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
-    TOPK_HEADER,
     fused_router_topk,
     router_eligible,
     router_gemv,
     softmax_topk_eligible,
     softmax_topk_row,
     softmax_topk_rows,
+    topk_header,
 )
 from .qwen35_verify_qmm import is_row_exact_armed
 
@@ -478,7 +478,9 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("rt", routed), "logits"]
     source = _GATE_UP_TOPK_HEAD
-    name = f"omlx_qwen35_moe_gate_up_topk_{routed.key}"
+    # The selection is compiled for the activation dtype alone (topk_header).
+    selection = "bf16" if routed.dtypes[0] == mx.bfloat16 else "scan"
+    name = f"omlx_qwen35_moe_gate_up_topk_{selection}_{routed.key}"
     if shared is None:
         source += _GATE_UP_TOPK_UNSHARED
     else:
@@ -489,7 +491,7 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
         name=name,
         input_names=inputs,
         output_names=["y", "indices", "scores"],
-        header=_COMMON + _SWIGLU + TOPK_HEADER + matrices.header,
+        header=_COMMON + _SWIGLU + topk_header(routed.dtypes[0]) + matrices.header,
         source=matrices.declarations + source + _GATE_UP_TOPK_ROUTED + "    }\n",
     )
 

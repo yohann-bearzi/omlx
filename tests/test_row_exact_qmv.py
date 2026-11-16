@@ -71,12 +71,15 @@ SHAPES = [
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_a_tile_s_source_holds_its_own_bit_width_alone(bits, fast):
     """MLX hashes a kernel's whole source at every launch: a tile holds the
-    branch of MLX's code for its width and the functions it calls. Only a
-    qmv tile has qmv_impl's last block (qmv_fast's K is whole blocks)."""
+    branch of MLX's code for its width and the functions it calls. A lane
+    has all of its inputs in qmv_impl's last block or none: the tile reads
+    it with load_vector and qdot's terms, as a whole block."""
     metal = row_exact_qmv._header(bits, 64, fast) + row_exact_qmv._SOURCE
     assert mlx_branches(metal) == (MLX_MASKS[bits], MLX_SCALES[bits])
     assert uncalled(metal) == []
-    assert ("load_vector_safe" in metal) == ("qdot_n" in metal) == (not fast)
+    assert "_safe" not in metal and "qdot" not in metal
+    # The last block's lanes: in a qmv tile alone.
+    assert metal.count("< K_SIZE - k) {") == (not fast)
 
 
 @pytest.mark.parametrize("shape", SHAPES)

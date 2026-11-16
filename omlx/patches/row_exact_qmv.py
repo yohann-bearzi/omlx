@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import logging
 from functools import cache
+from textwrap import indent
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..formats.affine import _GROUP_SIZES, _LOAD, _QDOT, header, qmv_fast_layout
+from ..formats.affine import _GROUP_SIZES, header, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
@@ -54,9 +55,7 @@ _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 # past N (qmv's partial last tile) are skipped: each column's arithmetic does
 # not depend on which tile computes it. ``ROW_EXACT_UNROLL`` precedes every
 # row and column loop: empty, or a full unroll in the ``unrolled`` kernels
-# (unrolling repeats each accumulator's steps in the same order). qmv_impl's
-# last block (``_LAST_BLOCK``) is in a qmv tile alone: qmv_fast's K is whole
-# blocks.
+# (unrolling repeats each accumulator's steps in the same order).
 _TILE = r"""
 // Tiny scale/bias arrays (N < 8) arrive in the constant address space, so
 // their pointer type is a template parameter.
@@ -98,27 +97,7 @@ METAL_FUNC void row_exact_tile(
   int k = 0;
   const int full_limit = FAST ? K_SIZE : K_SIZE - BLOCK_SIZE;
   for (; k < full_limit; k += BLOCK_SIZE) {
-    float xs[ROWS][VALUES_PER_THREAD];
-    float sums[ROWS];
-    ROW_EXACT_UNROLL
-    for (int i = 0; i < ROWS; i++) {
-      sums[i] = load_vector<T>(xp + i * K_SIZE, xs[i]);
-    }
-    ROW_EXACT_UNROLL
-    for (int r = 0; r < RPS; r++) {
-      if (PARTIAL && r >= valid) {
-        break;
-      }
-      float wq[W_TERMS];
-      decode_w(ws + r * in_vec_size_w, wq);
-      float s = sc[r * in_vec_size_g];
-      float b = bs[r * in_vec_size_g];
-      ROW_EXACT_UNROLL
-      for (int i = 0; i < ROWS; i++) {
-        result[i][r] += s * wdot(wq, xs[i]) + sums[i] * b;
-      }
-    }
-    ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
+__BLOCK__    ws += BLOCK_SIZE * BYTES_PER_PACK / PACK_FACTOR;
     sc += BLOCK_SIZE / GS;
     bs += BLOCK_SIZE / GS;
     xp += BLOCK_SIZE;
@@ -140,54 +119,39 @@ __LAST_BLOCK__
 }
 """
 
-_LAST_BLOCK = r"""
-  const int remaining = clamp(
-      int(K_SIZE - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
-  if (remaining > 0) {
+# One K block of a lane: its inputs of every row, then each column's weights
+# decoded once against them.
+_BLOCK = r"""
+    float xs[ROWS][VALUES_PER_THREAD];
+    float sums[ROWS];
     ROW_EXACT_UNROLL
     for (int i = 0; i < ROWS; i++) {
-      float x_thread[VALUES_PER_THREAD];
-      float sum = load_vector_safe<T>(xp + i * K_SIZE, x_thread, remaining);
+      sums[i] = load_vector<T>(xp + i * K_SIZE, xs[i]);
+    }
+    ROW_EXACT_UNROLL
+    for (int r = 0; r < RPS; r++) {
+      if (PARTIAL && r >= valid) {
+        break;
+      }
+      float wq[W_TERMS];
+      decode_w(ws + r * in_vec_size_w, wq);
+      float s = sc[r * in_vec_size_g];
+      float b = bs[r * in_vec_size_g];
       ROW_EXACT_UNROLL
-      for (int r = 0; r < RPS; r++) {
-        if (PARTIAL && r >= valid) {
-          break;
-        }
-        const device uint8_t* wl = ws + r * in_vec_size_w;
-        float s = sc[r * in_vec_size_g];
-        float b = bs[r * in_vec_size_g];
-        result[i][r] += qdot_n(wl, x_thread, s, b, sum, remaining);
+      for (int i = 0; i < ROWS; i++) {
+        result[i][r] += s * wdot(wq, xs[i]) + sums[i] * b;
       }
     }
-  }
 """
 
-# MLX's load_vector_safe and qdot_safe (qdot_n here), which qmv_impl's last
-# block reads: the branch of the tile's width in load_vector and qdot, over
-# the first N of a lane's values.
-_LOAD_SAFE = r"""
-template <typename T>
-inline float load_vector_safe(const device T* x, thread float* x_thread, int N) {
-  float sum = 0;
-__LOAD__
-  for (int i = N; i < VALUES_PER_THREAD; i++) {
-    x_thread[i] = 0;
-  }
-  return sum;
-}
-
-inline float qdot_n(
-    const device uint8_t* w,
-    const thread float* x_thread,
-    float scale,
-    float bias,
-    float sum,
-    int N) {
-  float accum = 0;
-__QDOT__
-  return scale * accum + sum * bias;
-}
-"""
+# qmv_impl's last block, in a qmv tile alone (qmv_fast's K is whole blocks):
+# a lane has all of its inputs there or none (K is whole groups), and for
+# all of them load_vector_safe and qdot_safe are the full block's code.
+_LAST_BLOCK = (
+    "  if (int(simd_lid) * VALUES_PER_THREAD < K_SIZE - k) {\n"
+    + indent(_BLOCK[1:], "  ")
+    + "  }\n"
+)
 
 _SOURCE = r"""
     row_exact_tile<T, K_SIZE, N_SIZE, ROWS, RPS>(
@@ -388,14 +352,14 @@ def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> s
         raise ValueError(f"row-exact tile: no decode of {bits}-bit weights")
     start = header(bits, group_size, fast)  # refuses a group size MLX lacks
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
-    last = "" if fast else _LOAD_SAFE.replace("__LOAD__", _LOAD[bits])
     decoded = _DECODED_DOT.replace("__DECODE__", _DECODE[bits])
     return (
         f"#define ROW_EXACT_UNROLL {unroll}\n"
         + start
-        + last.replace("__QDOT__", _QDOT[bits]).replace("__N__", "N")
         + decoded.replace("__WDOT__", _WDOT[bits])
-        + _TILE.replace("__LAST_BLOCK__", "" if fast else _LAST_BLOCK)
+        + _TILE.replace("__BLOCK__", _BLOCK[1:]).replace(
+            "__LAST_BLOCK__", "" if fast else _LAST_BLOCK
+        )
     )
 
 

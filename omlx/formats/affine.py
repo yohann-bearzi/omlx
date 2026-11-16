@@ -55,19 +55,18 @@ _PACKING = {
     ),
 }
 
-# The branch of each bit width in MLX's load_vector and qdot, over the first
-# __N__ of a lane's values: all VALUES_PER_THREAD of them, or N in qmv_impl's
-# last block (load_vector_safe, qdot_safe). A kernel's source holds its own
-# width's branch alone: MLX hashes the whole source at every launch.
+# The branch of each bit width in MLX's load_vector and qdot, over a lane's
+# VALUES_PER_THREAD values. A kernel's source holds its own width's branch
+# alone: MLX hashes the whole source at every launch.
 _LOAD = {
-    2: r"""  for (int i = 0; i < __N__; i += 4) {
+    2: r"""  for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 4.0f;
     x_thread[i + 2] = x[i + 2] / 16.0f;
     x_thread[i + 3] = x[i + 3] / 64.0f;
   }""",
-    3: r"""  for (int i = 0; i < __N__; i += 8) {
+    3: r"""  for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
         float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
     x_thread[i] = x[i];
@@ -79,14 +78,14 @@ _LOAD = {
     x_thread[i + 6] = x[i + 6] / 4.0f;
     x_thread[i + 7] = x[i + 7] / 32.0f;
   }""",
-    4: r"""  for (int i = 0; i < __N__; i += 4) {
+    4: r"""  for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 16.0f;
     x_thread[i + 2] = x[i + 2] / 256.0f;
     x_thread[i + 3] = x[i + 3] / 4096.0f;
   }""",
-    5: r"""  for (int i = 0; i < __N__; i += 8) {
+    5: r"""  for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
         float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
     x_thread[i] = x[i];
@@ -98,28 +97,28 @@ _LOAD = {
     x_thread[i + 6] = x[i + 6] / 64.0f;
     x_thread[i + 7] = x[i + 7] / 8.0f;
   }""",
-    6: r"""  for (int i = 0; i < __N__; i += 4) {
+    6: r"""  for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     x_thread[i] = x[i];
     x_thread[i + 1] = x[i + 1] / 64.0f;
     x_thread[i + 2] = x[i + 2] / 16.0f;
     x_thread[i + 3] = x[i + 3] / 4.0f;
   }""",
-    8: r"""  for (int i = 0; i < __N__; i++) {
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
     sum += x[i];
     x_thread[i] = x[i];
   }""",
 }
 
 _QDOT = {
-    2: r"""  for (int i = 0; i < (__N__ / 4); i++) {
+    2: r"""  for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
     accum +=
         (x_thread[4 * i] * (w[i] & 0x03) +
          x_thread[4 * i + 1] * (w[i] & 0x0c) +
          x_thread[4 * i + 2] * (w[i] & 0x30) +
          x_thread[4 * i + 3] * (w[i] & 0xc0));
   }""",
-    3: r"""  for (int i = 0; i < (__N__ / 8); i++) {
+    3: r"""  for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
     x_thread += 8 * i;
     w += 3 * i;
 
@@ -137,14 +136,14 @@ _QDOT = {
     accum += (w[2] & 0xe0) * x_thread[7];
   }""",
     4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
-  for (int i = 0; i < (__N__ / 4); i++) {
+  for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
     accum +=
         (x_thread[4 * i] * (ws[i] & 0x000f) +
          x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
          x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
          x_thread[4 * i + 3] * (ws[i] & 0xf000));
   }""",
-    5: r"""  for (int i = 0; i < (__N__ / 8); i++) {
+    5: r"""  for (int i = 0; i < (VALUES_PER_THREAD / 8); i++) {
     x_thread += 8 * i;
     w += 5 * i;
 
@@ -161,7 +160,7 @@ _QDOT = {
     accum += (w[4] & 0x7) * (x_thread[6] * 256.0f);
     accum += (w[4] & 0xf8) * x_thread[7];
   }""",
-    6: r"""  for (int i = 0; i < (__N__ / 4); i++) {
+    6: r"""  for (int i = 0; i < (VALUES_PER_THREAD / 4); i++) {
     x_thread += 4 * i;
     w += 3 * i;
 
@@ -175,7 +174,7 @@ _QDOT = {
 
     accum += (w[2] & 0xfc) * x_thread[3];
   }""",
-    8: r"""  for (int i = 0; i < __N__; i++) {
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
     accum += x_thread[i] * w[i];
   }""",
 }
@@ -218,7 +217,6 @@ def header(bits: int, group_size: int, fast: bool) -> str:
         (_CONSTANTS + _LOAD_FUNCTION.replace("__LOAD__", _LOAD[bits]))
         .replace("__PACK_FACTOR__", pack_factor)
         .replace("__PACKS__", packs)
-        .replace("__N__", "VALUES_PER_THREAD")
         .replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__FAST__", "1" if fast else "0")
@@ -306,7 +304,7 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     source = header(bits, group_size, fast)
     key = f"affine_b{bits}g{group_size}{'f' if fast else 's'}"
     qdot = _QDOT_FUNCTION.replace("__QDOT__", _QDOT[bits])
-    source += qdot.replace("__N__", "VALUES_PER_THREAD")
+    source += qdot
     return Dot(
         key=key,
         source=(

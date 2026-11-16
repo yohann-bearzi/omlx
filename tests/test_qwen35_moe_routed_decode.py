@@ -284,6 +284,25 @@ def test_a_launch_holds_the_swiglu_only_where_it_applies_it(monkeypatch):
         assert uncalled(metal) == [], name
 
 
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+def test_the_folded_top_k_launch_holds_its_dtype_s_selection_alone(monkeypatch, dtype):
+    """MLX hashes a launch's whole source at every launch: the bf16 kernel
+    holds the packed-key selection, the others the scan, each under a name
+    of its own."""
+    built = {}
+
+    def build(**kernel):
+        built[kernel["name"]] = kernel["header"]
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", build)
+    routed._gate_up_topk_kernel.__wrapped__(affine.face(4, 64, True, dtype), None, None)
+    ((name, header),) = built.items()
+    bf16 = dtype == mx.bfloat16
+    assert ("struct omlx_router_topk<bfloat16_t, NE> {" in header) == bf16
+    assert ("struct omlx_router_topk {" in header) == (not bf16)
+    assert ("_topk_bf16_" in name) == bf16
+
+
 @pytest.mark.parametrize("hidden", [2560, 2432])
 @pytest.mark.parametrize("bits", [2, 3, 4, 5])
 def test_fp32_kernels_match_mlx_mat_vecs(bits, hidden):

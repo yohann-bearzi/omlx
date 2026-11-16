@@ -125,7 +125,7 @@ METAL_FUNC void omlx_router_softmax_row(
 # largest; the selected lane moves on and rescans its keys once its three
 # are used. Key 0 stands for the per-row launch's -inf / NE when nothing is
 # left.
-_TOPK_SELECT_HEADER = _SOFTMAX_ROW_HEADER + """
+_TOPK_GENERIC = """
 template <typename T, int NE>
 struct omlx_router_topk {
   enum : uint { PER = uint(NE) / 32 };
@@ -184,7 +184,9 @@ struct omlx_router_topk {
     omlx_router_topk_store<T, K>(sel_p, sel_i, lane, indices, scores);
   }
 };
+"""
 
+_TOPK_BF16 = """
 template <int NE>
 struct omlx_router_topk<bfloat16_t, NE> {
   enum : uint { PER = uint(NE) / 32 };
@@ -287,8 +289,18 @@ METAL_FUNC void omlx_router_topk_store(
 }
 """
 
-# Headers for kernels selecting experts (qwen35_moe_routed_decode reuses it).
-TOPK_HEADER = _TOPK_STORE_HEADER + _TOPK_SELECT_HEADER
+# Headers for kernels selecting experts, for every dtype.
+TOPK_HEADER = _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + _TOPK_GENERIC + _TOPK_BF16
+
+
+def topk_header(dtype: mx.Dtype) -> str:
+    """TOPK_HEADER for a kernel of one activation dtype, as
+    qwen35_moe_routed_decode folds it in: only the selection that dtype
+    compiles (MLX hashes a kernel's whole source at every launch)."""
+    if dtype == mx.bfloat16:
+        declared = "\ntemplate <typename T, int NE>\nstruct omlx_router_topk;\n"
+        return _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + declared + _TOPK_BF16
+    return _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + _TOPK_GENERIC
 
 _SOFTMAX_TOPK_SOURCE = """
     const uint lane = thread_position_in_threadgroup.x;
