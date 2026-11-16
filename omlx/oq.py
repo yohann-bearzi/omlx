@@ -7044,18 +7044,28 @@ def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
-    or ``w`` is neither a matrix nor a stack of matrices that fit a launch.
-    A stack is encoded in runs of its matrices. The tensors are checked
+    ``w`` is neither a matrix nor a stack of matrices that fit a launch (2^30
+    weights; a matrix's input and tensors within ``_QUANTIZE_CHUNK_BYTES``),
+    or a tensor of the stack would not fit a Metal buffer. A stack is
+    encoded in runs of whole matrices, each run's input and tensors within
+    ``_QUANTIZE_CHUNK_BYTES`` in their own dtypes, and the runs' tensors are
+    joined here and evaluated. The tensors are checked
     against the format's layout, which is what a checkpoint loads by."""
     from . import formats
 
     *stack, n, k = w.shape
-    max_elems = min(_QUANTIZE_CHUNK_BYTES // 2, 1 << 30)
     layout = fmt.layout(k, n, bits, group_size)
-    if layout is None or len(stack) > 1 or n * k > max_elems:
+    if layout is None or len(stack) > 1 or n * k > 1 << 30:
         return None
     formats.check_layout(fmt, n, k, layout)
-    runs = _row_chunks_with_bounds(w, max_elems) if stack else ((0, n, w),)
+    # What one matrix holds while it is encoded: its input, and its tensors.
+    count = stack[0] if stack else 1
+    sizes = [math.prod(shape) * dtype.size for shape, dtype in layout.values()]
+    matrix = w.nbytes // count + sum(sizes)
+    if matrix > _QUANTIZE_CHUNK_BYTES or max(sizes) * count > _METAL_MAX_BUFFER:
+        return None
+    run = (_QUANTIZE_CHUNK_BYTES // matrix) * n * k
+    runs = _row_chunks_with_bounds(w, run) if stack else ((0, n, w),)
     own = stack and importance.ndim > 1  # each matrix has its importance
     parts = []
     for r0, r1, run in runs:
@@ -7092,7 +7102,11 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
         mx.clear_cache()
     if len(parts) == 1:
         return parts[0]
-    return {name: mx.concatenate([part[name] for part in parts]) for name in layout}
+    joined = {name: mx.concatenate([part[name] for part in parts]) for name in layout}
+    # The writer keeps a layer's tensors until its shard is saved: evaluated,
+    # they hold no run.
+    mx.eval(*joined.values())
+    return joined
 
 
 def _quantize_chunked(w, group_size, bits, mode, importance=None):

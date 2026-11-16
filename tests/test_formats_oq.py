@@ -121,6 +121,12 @@ def _weights(*shape):
     return mx.random.normal(shape)
 
 
+def _matrix_bytes(n, k, dtype=mx.float32):
+    """What one (n, k) matrix holds while the toy encodes it: its input in
+    ``dtype``, a byte for each weight and a float32 scale for each row."""
+    return n * k * dtype.size + n * k + n * 4
+
+
 def _same(a, b):
     return a.keys() == b.keys() and all(
         (a[name].shape, a[name].dtype) == (b[name].shape, b[name].dtype)
@@ -152,8 +158,8 @@ def test_a_stack_is_offered_in_runs_of_its_matrices(toy, monkeypatch, own):
     e, n, k = 5, 8, 64
     w = _weights(e, n, k)
     importance = mx.random.uniform(0.5, 2.0, (e, k) if own else (k,))
-    # Two of its matrices fit a launch.
-    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * 2 * n * k)
+    # Two of its matrices fit a launch: their float32 input and their tensors.
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(n, k))
     kept = oq._encode_in_format(toy, "experts.weight", w, importance, 3, 64)
     assert toy.offered == [(k, n, 3, 64)]
     runs = [(0, 2), (2, 4), (4, 5)]
@@ -179,11 +185,11 @@ def test_what_is_no_matrix_or_fits_no_launch_is_not_offered(toy, monkeypatch):
         )
 
     assert offer(2, 2, 8, 64) is None
-    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * 8 * 64 - 2)
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", _matrix_bytes(8, 64) - 1)
     assert offer(8, 64) is None and offer(3, 8, 64) is None
     assert toy.encoded == []
     # A matrix of a launch's size is, and a stack of them one at a time.
-    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * 8 * 64)
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", _matrix_bytes(8, 64))
     assert offer(8, 64).keys() == {"weight", "scales"}
     assert offer(3, 8, 64)["weight"].shape == (3, 8, 64)
     assert [given.shape[0] for given, *_ in toy.encoded] == [8, 1, 1, 1]
@@ -191,6 +197,49 @@ def test_what_is_no_matrix_or_fits_no_launch_is_not_offered(toy, monkeypatch):
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 40)
     huge = SimpleNamespace(shape=((1 << 15) + 1, 1 << 15))
     assert oq._encode_in_format(toy, "a.weight", huge, importance, 4, 64) is None
+
+
+@pytest.mark.parametrize(
+    "dtype,runs", [(mx.bfloat16, [4, 4, 2]), (mx.float32, [2, 2, 2, 2, 2])]
+)
+def test_a_run_counts_its_input_in_its_own_dtype(toy, monkeypatch, dtype, runs):
+    """A run holds four matrices of a bfloat16 stack, two of a float32
+    one: its input in the stack's dtype and its tensors in the layout's."""
+    monkeypatch.setattr(
+        oq, "_QUANTIZE_CHUNK_BYTES", 4 * _matrix_bytes(8, 64, mx.bfloat16)
+    )
+    w = _weights(10, 8, 64).astype(dtype)
+    kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
+    assert [given.shape[0] for given, *_ in toy.encoded] == runs
+    assert _same(kept, _Codec().encode(w, mx.ones((64,)), 4, 64))
+
+
+def test_a_stack_whose_tensor_would_not_fit_a_metal_buffer_is_not_offered(
+    toy, monkeypatch
+):
+    """A stack's tensor is one array: its joined codes, 3 x 8 x 64 bytes,
+    must fit a Metal buffer."""
+    w, importance = _weights(3, 8, 64), mx.ones((64,))
+    monkeypatch.setattr(oq, "_METAL_MAX_BUFFER", 3 * 8 * 64 - 1)
+    assert oq._encode_in_format(toy, "experts.weight", w, importance, 4, 64) is None
+    assert toy.encoded == []
+    monkeypatch.setattr(oq, "_METAL_MAX_BUFFER", 3 * 8 * 64)
+    kept = oq._encode_in_format(toy, "experts.weight", w, importance, 4, 64)
+    assert kept["weight"].shape == (3, 8, 64)
+
+
+def test_a_stack_s_runs_are_joined_evaluated(toy, monkeypatch):
+    """The writer keeps a layer's tensors until its shard is saved: they are
+    joined here, evaluated, not left a graph over every run's tensors."""
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(8, 64))
+    w = _weights(5, 8, 64)
+    kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
+    assert len(toy.encoded) == 3
+    mx.synchronize()
+    mx.reset_peak_memory()
+    mx.eval(*kept.values())
+    # Nothing is left to compute, so nothing is allocated.
+    assert mx.get_peak_memory() < sum(tensor.nbytes for tensor in kept.values())
 
 
 def test_a_matrix_the_format_lays_out_none_of_is_not_offered(toy):
@@ -202,7 +251,7 @@ def test_a_matrix_the_format_lays_out_none_of_is_not_offered(toy):
 
 def test_a_format_declines_a_matrix_or_a_whole_stack(toy, monkeypatch):
     importance = mx.ones((64,))
-    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * 2 * 8 * 64)
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(8, 64))
     toy.answer = lambda tensors, w: None
     for shape in ((8, 64), (5, 8, 64)):
         w = _weights(*shape)
