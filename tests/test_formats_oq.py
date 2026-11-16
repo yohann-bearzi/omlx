@@ -9,10 +9,14 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import sys
 import textwrap
+import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import mlx_lm.utils
 import numpy as np
 import pytest
@@ -1270,6 +1274,252 @@ def test_the_walk_keeps_the_process_s_load_state(source, monkeypatch):
     assert after == before and qwen35_yarn._context_windows is windows
 
 
+class _Walked(nn.Module):
+    """What a stubbed loader builds: one linear, and whether it was closed."""
+
+    def __init__(self):
+        super().__init__()
+        self.proj = nn.Linear(64, 16)
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _stub_loaders(monkeypatch):
+    """mlx-lm's and mlx-vlm's load_model stubbed: each call's library, thread
+    and arguments, and the model each returns."""
+    from mlx_vlm import utils as vlm_utils
+
+    calls, model = [], _Walked()
+
+    def loader(library):
+        def load(path, **kwargs):
+            view = Path(path)
+            config = json.loads((view / "config.json").read_text())
+            index = json.loads((view / "model.safetensors.index.json").read_text())
+            thread = threading.current_thread().name
+            calls.append((library, thread, kwargs, config, index))
+            return model if library == "mlx-vlm" else (model, None)
+
+        return load
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", loader("mlx-lm"))
+    monkeypatch.setattr(vlm_utils, "load_model", loader("mlx-vlm"))
+    return calls, model
+
+
+def _checkpoint(path, config, tensors=("model.embed_tokens.weight",)):
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config))
+    weights = {name: mx.zeros((2, 64)) for name in tensors}
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    return path
+
+
+@pytest.mark.parametrize(
+    "config, library",
+    [
+        ({"model_type": "llama"}, "mlx-lm"),
+        # mlx-vlm serves these without a vision config, as a text-only run
+        # of them writes it.
+        ({"model_type": "gemma4_unified"}, "mlx-vlm"),
+        ({"model_type": "lfm3_audio"}, "mlx-vlm"),
+        ({"model_type": "qwen3_vl", "vision_config": {"depth": 1}}, "mlx-vlm"),
+    ],
+    ids=["llama", "gemma4_unified", "lfm3_audio", "qwen3_vl"],
+)
+def test_the_walk_builds_the_model_with_the_library_that_serves_it(
+    tmp_path, monkeypatch, config, library
+):
+    from omlx.model_discovery import detect_model_type
+
+    calls, model = _stub_loaders(monkeypatch)
+    source = _checkpoint(tmp_path / "source", config)
+    walked = oq._module_classes(str(source), config)
+    ((loaded, thread, kwargs, given, index),) = calls
+    assert loaded == library
+    assert (detect_model_type(source) == "vlm") == (library == "mlx-vlm")
+    # Lazily, unchecked, on the thread the engines load models on; the
+    # model is let go of.
+    assert kwargs["lazy"] is True and kwargs["strict"] is False
+    assert thread.startswith("mlx-global") and model.closed
+    assert given == config and walked["proj"][2] == (16, 64)
+    # The view: the source's files but its weights and config, and an index
+    # declaring the source's tensors.
+    assert index == {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
+
+
+def test_the_walk_reads_no_sidecar_and_keeps_the_calibration_override(
+    tmp_path, monkeypatch
+):
+    calls, _ = _stub_loaders(monkeypatch)
+    # MiMo's MTP sidecar would be read by its sanitize: the walk names none.
+    mimo = {"model_type": "mimo_v2"}
+    source = _checkpoint(tmp_path / "mimo", mimo)
+    (source / "mtp").mkdir()
+    (source / "mtp" / "model_mtp.safetensors").write_bytes(b"")
+    oq._module_classes(str(source), mimo)
+    assert calls[-1][0] == "mlx-lm" and calls[-1][2]["model_config"] is None
+    # A QAT config's quantization is not the walk's.
+    qat = {"model_type": "llama", "quantization_config": {"quant_method": "qat"}}
+    monkeypatch.setattr(oq, "_is_qat_unquantized_config", lambda qc: bool(qc))
+    source = _checkpoint(tmp_path / "qat", qat)
+    oq._module_classes(str(source), qat)
+    assert calls[-1][2]["model_config"] == {"quantization_config": None}
+
+
+def test_the_walk_leaves_the_source_as_it_is(tmp_path, monkeypatch):
+    from omlx.utils import model_loading
+
+    calls, _ = _stub_loaders(monkeypatch)
+    patches, dispatched = model_loading.maybe_apply_pre_load_patches, []
+
+    def dispatching(model_name, *args, **kwargs):
+        dispatched.append(json.loads((Path(model_name) / "config.json").read_text()))
+        return patches(model_name, *args, **kwargs)
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", dispatching)
+    config = {"model_type": "llama"}
+    source = _checkpoint(tmp_path / "source", config)
+    before = (source / "config.json").read_bytes()
+    # Links that resolve to nothing, or to themselves, as a source may hold.
+    (source / "dangling").symlink_to(tmp_path / "nowhere")
+    (source / "loop").symlink_to(source / "loop")
+    written = {**config, "torch_dtype": "float16"}
+    oq._module_classes(str(source), written)
+    assert (source / "config.json").read_bytes() == before
+    # The loader and the pre-load dispatch read the config the run writes.
+    assert calls[0][3] == written and dispatched == [written]
+
+
+def test_the_walk_runs_on_the_engines_load_thread_too(tmp_path, monkeypatch):
+    from omlx.engine_core import get_mlx_executor
+
+    calls, _ = _stub_loaders(monkeypatch)
+    config = {"model_type": "llama"}
+    source = _checkpoint(tmp_path / "source", config)
+    walk = get_mlx_executor().submit(oq._module_classes, str(source), config)
+    assert walk.result(timeout=60)["proj"][2] == (16, 64)
+    assert calls[0][1].startswith("mlx-global")
+
+
+def test_the_walk_restores_what_a_module_it_imports_holds(tmp_path, monkeypatch):
+    imported = []
+    real = oq.importlib.import_module
+
+    def importing(name):
+        imported.append(name)
+        return real(name)
+
+    monkeypatch.setattr(oq.importlib, "import_module", importing)
+    _stub_loaders(monkeypatch)
+    # Qwen4-Exp's runtime, as the pre-load patches set it for the model.
+    language = SimpleNamespace(
+        _MTP_RUNTIME="served", _PLE_RUNTIME_MODEL_PATH=None, _PLE_RUNTIME_MODE="r"
+    )
+    monkeypatch.setitem(sys.modules, "mlx_vlm.models.qwen4_exp.language", language)
+    from omlx.utils import model_loading
+
+    patches = model_loading.maybe_apply_pre_load_patches
+
+    def setting(*args, **kwargs):
+        patches(*args, **kwargs)
+        language._MTP_RUNTIME, language._PLE_RUNTIME_MODE = "walked", "ssd"
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", setting)
+    config = {"model_type": "llama"}
+    oq._module_classes(str(_checkpoint(tmp_path / "source", config)), config)
+    assert (language._MTP_RUNTIME, language._PLE_RUNTIME_MODE) == ("served", "r")
+    # oMLX's modules of that state are imported before the walk starts.
+    assert {name for name, _ in oq._LOAD_GLOBALS if name.startswith("omlx.")} <= set(
+        imported
+    )
+
+
+def test_the_walk_restores_qwen4_exp_s_runtime_it_registers(tmp_path, monkeypatch):
+    from omlx.patches import mlx_vlm_qwen4_exp_compat
+    from omlx.utils import model_loading
+
+    _stub_loaders(monkeypatch)
+    name = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.delitem(sys.modules, name, raising=False)
+    language = SimpleNamespace(
+        _MTP_RUNTIME="default", _PLE_RUNTIME_MODEL_PATH=None, _PLE_RUNTIME_MODE="r"
+    )
+
+    def registering():
+        sys.modules[name] = language
+
+    offloaded = []
+
+    def setting(*args, **kwargs):
+        # The dispatch registers Qwen4-Exp, then sets its runtime.
+        registering()
+        language._MTP_RUNTIME, language._PLE_RUNTIME_MODE = "walked", "ssd"
+        offloaded.append(kwargs["model_settings"].qwen4_ple_ssd_offload)
+
+    monkeypatch.setattr(
+        mlx_vlm_qwen4_exp_compat, "apply_mlx_vlm_qwen4_exp_compat_patch", registering
+    )
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", setting)
+    monkeypatch.setattr(oq, "_is_qwen4_exp_config", lambda config: True)
+    try:
+        config = {"model_type": "llama"}
+        oq._module_classes(str(_checkpoint(tmp_path / "source", config)), config)
+        assert (language._MTP_RUNTIME, language._PLE_RUNTIME_MODE) == ("default", "r")
+        # Its tables are resident for the walk: no file is opened for them.
+        assert offloaded == [False]
+    finally:
+        sys.modules.pop(name, None)
+
+
+def test_the_walk_patches_the_mtp_runtime_of_its_model_type(tmp_path, monkeypatch):
+    from omlx.patches import mlx_vlm_mtp
+
+    calls, _ = _stub_loaders(monkeypatch)
+    asked = []
+    monkeypatch.setattr(
+        mlx_vlm_mtp, "apply_mlx_vlm_mtp_runtime_patch", lambda t=None: asked.append(t)
+    )
+    monkeypatch.setattr(mlx_vlm_mtp, "apply_mlx_vlm_mtp_patch", lambda: True)
+    config = {
+        "model_type": "qwen3_vl",
+        "vision_config": {"depth": 1},
+        "mtp_num_hidden_layers": 1,
+    }
+    source = _checkpoint(tmp_path / "source", config, tensors=("mtp.fc.weight",))
+    oq._module_classes(str(source), config)
+    assert calls[0][0] == "mlx-vlm" and asked == ["qwen3_vl"]
+
+
+def test_the_walk_is_of_the_mtp_the_run_keeps(source, toy, tmp_path, monkeypatch):
+    layout = oq._written_layout
+    kept = []
+
+    def written(*args, **kwargs):
+        kept.append(kwargs["preserve_mtp"])
+        return layout(*args, **kwargs)
+
+    monkeypatch.setattr(oq, "_written_layout", written)
+    # A source the run keeps an MTP head of.
+    monkeypatch.setattr(oq, "_source_has_nextn_tensors", lambda keys, config: True)
+    _quantize(source, tmp_path / "oqe-toy", quant_format="toy", preserve_mtp=True)
+    assert kept == [True]
+    config = {"model_type": "qwen3_5_moe", "mtp_num_hidden_layers": 1}
+    run = {"bits": 4, "group_size": 64}
+    for preserve in (True, False):
+        written = layout(
+            config,
+            tmp_path,
+            text_only=False,
+            preserve_mtp=preserve,
+            dtype="bfloat16",
+            quantization=run,
+        )
+        assert written["mtp_num_hidden_layers"] == (1 if preserve else 0)
+
+
 def test_the_walk_loads_as_the_run_trusts_remote_code(
     source, toy, tmp_path, monkeypatch
 ):
@@ -1533,10 +1783,13 @@ def test_the_walk_keeps_the_modules_the_source_s_index_declares(tmp_path):
             if name.startswith("vision_tower.") and loads and shape is not None
         ]
 
-    assert tower(oq._module_classes(str(source), config)) == []
+    # One file of weights, no index: its tensors are declared from its header.
+    assert not (source / "model.safetensors.index.json").exists()
+    single = tower(oq._module_classes(str(source), config))
+    assert single
     index = {"metadata": {}, "weight_map": dict.fromkeys(weights, "model.safetensors")}
     (source / "model.safetensors.index.json").write_text(json.dumps(index))
-    assert tower(oq._module_classes(str(source), config))
+    assert tower(oq._module_classes(str(source), config)) == single
 
 
 def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(

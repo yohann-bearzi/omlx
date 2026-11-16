@@ -13,6 +13,7 @@ import contextlib
 import copy
 import functools
 import hashlib
+import importlib
 import inspect
 import json
 import logging
@@ -23,6 +24,7 @@ import shutil
 import struct as _struct
 import sys
 import tempfile
+import threading
 import time as _time
 from dataclasses import dataclass
 from pathlib import Path
@@ -11481,9 +11483,21 @@ _LOAD_GLOBALS = (
 
 
 @contextlib.contextmanager
-def _load_globals_kept():
+def _load_globals_kept(config: dict):
     """After the block, the process-wide state of ``_LOAD_GLOBALS`` as it was
-    before it, in the modules imported then (a dict in place)."""
+    before it (a dict in place). The modules are imported first, Qwen4-Exp's
+    for a checkpoint of it (oMLX registers it), so that one the block would
+    import is restored to what it had then."""
+    for module_name, _ in _LOAD_GLOBALS:
+        if module_name.startswith("omlx."):
+            importlib.import_module(module_name)
+    if _is_qwen4_exp_config(config):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+        importlib.import_module("mlx_vlm.models.qwen4_exp.language")
     kept = [
         (module, name, getattr(module, name))
         for module_name, names in _LOAD_GLOBALS
@@ -11554,11 +11568,7 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
     from .patches.format_load import loads_in_format
 
     source = Path(model_path)
-    with (
-        tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory,
-        _load_globals_kept(),
-        _calibration_patches(model_path, config) as is_vlm,
-    ):
+    with tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory:
         view = Path(directory)
         for item in source.iterdir():
             if item.name != "config.json" and not item.name.endswith(
@@ -11566,24 +11576,15 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
             ):
                 (view / item.name).symlink_to(item.resolve())
         (view / "config.json").write_text(json.dumps(config))
-        # The loaders want a file of weights: one with none, which the
-        # source's index, when it has one, declares each of its tensors in.
+        # The loaders want a file of weights: one with none, and an index
+        # that declares each tensor of the source in it.
         mx.save_safetensors(str(view / "model.safetensors"), {})
-        index = source / "model.safetensors.index.json"
-        if index.is_file():
-            declared = json.loads(index.read_text())["weight_map"]
-            weight_map = dict.fromkeys(declared, "model.safetensors")
-            (view / index.name).write_text(json.dumps({"weight_map": weight_map}))
-        built = {"lazy": True, "strict": False, "trust_remote_code": trust_remote_code}
-        if is_vlm:
-            from mlx_vlm import utils as vlm_utils
-
-            model = vlm_utils.load_model(view, **built)
-        else:
-            import mlx_lm.utils as lm_utils
-
-            override = _sensitivity_lm_config_override(config, model_path)
-            model, _ = lm_utils.load_model(view, model_config=override, **built)
+        weight_map = dict.fromkeys(_source_tensors(source), "model.safetensors")
+        index = view / "model.safetensors.index.json"
+        index.write_text(json.dumps({"weight_map": weight_map}))
+        model = _on_mlx_thread(
+            lambda: _walk_model(source, view, config, trust_remote_code)
+        )
     loads = {}
     walked = {}
     for name, module in model.named_modules():
@@ -11593,21 +11594,86 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
         weight = module.get("weight")
         shape = tuple(weight.shape) if isinstance(weight, mx.array) else None
         walked[name] = (cls, loads[cls], shape)
+    # A model that holds files or threads open (Qwen4-Exp's tables on the
+    # SSD) lets them go.
+    close = getattr(model, "close", None)
+    if callable(close):
+        close()
     return walked
 
 
+def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool):
+    """The model built over ``view`` by the library that serves it, with the
+    pre-load patches of the source's calibration, the process-wide state they
+    set kept as it was."""
+    with (
+        _load_globals_kept(config),
+        _calibration_patches(source, config, walk=view) as is_vlm,
+    ):
+        built = {"lazy": True, "strict": False, "trust_remote_code": trust_remote_code}
+        if is_vlm:
+            from mlx_vlm import utils as vlm_utils
+
+            return vlm_utils.load_model(view, **built)
+        import mlx_lm.utils as lm_utils
+
+        # Without MiMo's MTP sidecar, which the model's sanitize would read.
+        override = _sensitivity_lm_config_override(config)
+        return lm_utils.load_model(view, model_config=override, **built)[0]
+
+
+def _on_mlx_thread(load):
+    """``load()`` on the thread the engines load models on, so that the
+    process-wide state a load sets is not another load's meanwhile."""
+    if threading.current_thread().name.startswith("mlx-global"):
+        return load()
+    from .engine_core import get_mlx_executor
+
+    return get_mlx_executor().submit(load).result()
+
+
+def _source_tensors(source: Path) -> list[str]:
+    """The names of the tensors the checkpoint at ``source`` holds: its
+    index's, or its files' headers'."""
+    index = source / "model.safetensors.index.json"
+    if index.is_file():
+        return list(json.loads(index.read_text())["weight_map"])
+    from safetensors import SafetensorError, safe_open
+
+    names = []
+    for shard in sorted(source.glob("*.safetensors")):
+        try:
+            with safe_open(str(shard), framework="numpy") as tensors:
+                names += tensors.keys()
+        except (OSError, SafetensorError):
+            # Its tensors are declared nowhere: mlx-vlm drops a module beside
+            # the language model that holds only them, which stays affine.
+            continue
+    return names
+
+
 @contextlib.contextmanager
-def _calibration_patches(model_path, config):
+def _calibration_patches(model_path, config, *, walk: Path | None = None):
     """For the block, the pre-load patches oQe's resident calibration loads
     the checkpoint at ``model_path`` with, and its MTP head attached when it
-    has one; yields whether mlx-vlm loads it."""
+    has one; yields whether mlx-vlm loads it.
+
+    For the walk over the checkpoint a run writes (``walk``, its directory):
+    the library is the one oMLX serves that checkpoint with, the dispatch
+    reads its config, the runtime MTP patch is the model type's, and
+    Qwen4-Exp's tables are resident."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
         maybe_apply_pre_load_patches,
     )
 
-    is_vlm = _is_vlm_load(config)
+    if walk is None:
+        is_vlm = _is_vlm_load(config)
+    else:
+        from omlx.model_discovery import detect_model_type
+
+        is_vlm = detect_model_type(walk) == "vlm"
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
     calibration_settings = _calibration_model_settings(
@@ -11615,10 +11681,14 @@ def _calibration_patches(model_path, config):
         has_mtp_heads=has_mtp_heads,
         has_mtp_weights=has_mtp_weights,
     )
+    if walk is not None and calibration_settings is not None:
+        # The walk reads no weight: Qwen4-Exp's tables stay resident (none
+        # is read), and no file of the source is opened for them.
+        calibration_settings.qwen4_ple_ssd_offload = False
     patch_kwargs: dict[str, Any] = {"for_vlm": is_vlm}
     if calibration_settings is not None:
         patch_kwargs["model_settings"] = calibration_settings
-    maybe_apply_pre_load_patches(model_path, **patch_kwargs)
+    maybe_apply_pre_load_patches(walk or model_path, **patch_kwargs)
 
     restore_mtp_active = None
     if has_mtp_heads and has_mtp_weights:
@@ -11635,7 +11705,10 @@ def _calibration_patches(model_path, config):
                 )
 
                 apply_mlx_vlm_mtp_patch()
-                apply_mlx_vlm_mtp_runtime_patch()
+                if walk is None:
+                    apply_mlx_vlm_mtp_runtime_patch()
+                else:
+                    apply_mlx_vlm_mtp_runtime_patch(config.get("model_type"))
             prev_active = is_mtp_active()
             set_mtp_active(True)
 
