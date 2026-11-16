@@ -10,6 +10,11 @@ for one row through ``gather_qmm`` (stacked weights) when N is a multiple of
 8 as well. One row of a 2-D matrix of K 64 or 128 at 2, 4 or 8 bits is a
 third MLX kernel, ``qmv_quad``, which sums in another order: such a matrix
 has no face.
+
+The tile face gives each weight as ``scale * q + bias`` in float32, which a
+kernel rounds once to the activations' dtype: MLX's ``dequantize`` of the
+same weight (``scale * q`` is exact in float32), and what MLX's sorted
+``gather_qmm`` loads into its tiles. It reads runs of 4 and 8 bits only.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from functools import cache
 
 import mlx.core as mx
 
-from . import Dot, QuantFormat
+from . import Dot, QuantFormat, Tile
 
 _BITS = (2, 3, 4, 5, 6, 8)
 _GROUP_SIZES = (32, 64, 128)
@@ -317,6 +322,99 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     )
 
 
+_TILE_BITS = (4, 8)
+
+# A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8. The
+# code at position i comes from an overload on the run's type: BITS is not a
+# template parameter of Tile, so an `if constexpr` on it would not discard
+# the branch of the other width, which does not compile for this one.
+_TILE = r"""
+using namespace metal;
+
+constant constexpr int BITS = __BITS__;
+constant constexpr int GS = __GS__;
+static_assert(
+    BITS == 4 || BITS == 8,
+    "affine tile face: runs of 4 and 8 bits only; 2- and 3-bit runs need a "
+    "fetch of their own");
+
+template <typename S>
+struct Tile {
+  static constant constexpr int CONTRACT = 1;
+  const device uint8_t* codes;
+  const device S* scales;
+  const device S* biases;
+
+  struct Runs {
+    static constant constexpr int RUN = 8;
+    static constant constexpr int GROUP = GS;
+    struct P {
+      float s;
+      float b;
+    };
+    using Codes = metal::conditional_t<BITS == 8, uint2, uint>;
+
+    const device Codes* c;
+    const device S* s;
+    const device S* b;
+
+    Runs(Tile m, size_t row, int k)
+        : c((const device Codes*)(m.codes + row * size_t(k / 8 * BITS))),
+          s(m.scales + row * size_t((k + GS - 1) / GS)),
+          b(m.biases + row * size_t((k + GS - 1) / GS)) {}
+
+    P params(int g) const {
+      return {float(s[g]), float(b[g])};
+    }
+    Codes fetch(int run) const {
+      return c[run];
+    }
+    static uint code_at(uint q, int i) {
+      return (q >> (BITS * i)) & ((1u << BITS) - 1u);
+    }
+    static uint code_at(uint2 q, int i) {
+      return ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
+    }
+    static float weight(thread const P& p, Codes q, int i) {
+      return p.s * float(code_at(q, i)) + p.b;
+    }
+  };
+};
+"""
+
+# Metal's names of the scales' types.
+_METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "float16_t"}
+
+
+def _tile_source(bits: int, group_size: int) -> str:
+    """The Metal of the affine tile face of ``bits``-bit codes in groups of
+    ``group_size``: ``omlx_affine_tile_b{bits}g{group_size}::Tile<S>``, S the
+    scales' type. One source serves both types of scales."""
+    namespace = f"omlx_affine_tile_b{bits}g{group_size}"
+    tile = _TILE.replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
+    return f"namespace {namespace} {{\n{tile}\n}}  // namespace {namespace}\n"
+
+
+@cache
+def tile_face(bits: int, group_size: int, dtype: mx.Dtype) -> Tile:
+    """The tile face of ``bits``-bit weights with ``group_size`` groups and
+    scales and biases of ``dtype``, exact for activations of that dtype."""
+    if bits not in _TILE_BITS or group_size not in _GROUP_SIZES:
+        raise ValueError(
+            f"affine tile face: no runs of {bits} bits in groups of {group_size}"
+        )
+    if dtype not in _METAL_TYPES:
+        raise ValueError(f"affine tile face: no scales of {dtype}")
+    suffix = "bf16" if dtype == mx.bfloat16 else "fp16"
+    return Tile(
+        key=f"affine_tile_b{bits}g{group_size}_{suffix}",
+        source=_tile_source(bits, group_size),
+        type=f"omlx_affine_tile_b{bits}g{group_size}::Tile<{_METAL_TYPES[dtype]}>",
+        tensors=AffineFormat.tensors,
+        dtypes=(dtype,),
+    )
+
+
 class AffineFormat(QuantFormat):
     mode = "affine"
     tensors = ("scales", "biases")
@@ -347,6 +445,33 @@ class AffineFormat(QuantFormat):
         # Stacked (3-D) weights are the ones MLX runs through gather_qmm.
         fast = qmv_fast_layout(k, n, layer.bits, gathered=layer["weight"].ndim == 3)
         return face(layer.bits, layer.group_size, fast, layer["scales"].dtype)
+
+    def tile(self, layer, k: int, n: int) -> Tile | None:
+        if (
+            layer.bits not in _TILE_BITS
+            or layer.group_size not in _GROUP_SIZES
+            or "scales" not in layer
+            or "biases" not in layer
+        ):
+            return None
+        weight, scales, biases = layer["weight"], layer["scales"], layer["biases"]
+        # A matrix, or a stack of them; codes in 32-bit words; one scale and
+        # one bias per group of each row.
+        groups = (*weight.shape[:-1], k // layer.group_size)
+        if (
+            weight.dtype != mx.uint32
+            or weight.ndim not in (2, 3)
+            or k % layer.group_size
+            or weight.shape[-2:] != (n, k * layer.bits // 32)
+            or scales.dtype not in _METAL_TYPES
+            or biases.dtype != scales.dtype
+            or scales.shape != groups
+            or biases.shape != groups
+            # MLX binds an input of fewer than 8 elements as constants.
+            or scales.size < 8
+        ):
+            return None
+        return tile_face(layer.bits, layer.group_size, scales.dtype)
 
     def decode(self, tensors, bits: int, group_size: int) -> mx.array:
         return mx.dequantize(

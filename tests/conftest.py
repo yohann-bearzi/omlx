@@ -508,9 +508,10 @@ def _hermetic_discovery_links(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def dot_defects():
-    """A quant format's defective dot() costs a model its fused kernels, not
-    its forward (omlx.formats.dot). A test that meets one fails at its
-    teardown, unless it removes the defect from this set."""
+    """A quant format's defective dot() or tile() costs a model its fused
+    kernels, not its forward (omlx.formats.dot, omlx.formats.tile). A test
+    that meets one fails at its teardown, unless it removes the defect from
+    this set."""
     from omlx.formats import testing
 
     with testing.no_dot_defects() as defects:

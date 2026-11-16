@@ -14,7 +14,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 
 | File | What it holds |
 |---|---|
-| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot` |
+| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot`, `Tile` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/linear.py` | the layers that hold a format's tensors |
 | `omlx/patches/format_load.py` | what loads a format's checkpoint into them |
@@ -26,7 +26,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 
 ```python
 # my_package/__init__.py
-from omlx.formats import Dot, QuantFormat
+from omlx.formats import Dot, QuantFormat, Tile
 
 
 class MyFormat(QuantFormat):
@@ -46,6 +46,9 @@ class MyFormat(QuantFormat):
     def dot(self, layer, k, n) -> Dot | None:
         ...                # the face that oMLX's kernels run them through
 
+    def tile(self, layer, k, n) -> Tile | None:
+        ...                # the face that oMLX's tile kernels decode them through
+
 
 FORMAT = MyFormat()
 ```
@@ -56,7 +59,7 @@ FORMAT = MyFormat()
 myformat = "my_package:FORMAT"
 ```
 
-Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
+Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot`, `tile` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
 - A mode has one format. A second format for a registered mode is refused.
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
@@ -199,14 +202,14 @@ oQ refuses a format before it reads a weight:
 
 ## Faces
 
-A face is a frozen dataclass. A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
+A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the kernels that decode tiles of weights (see [The tile face](#the-tile-face)). A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
 
 `QuantFormat.dot(layer, k, n)` returns the mat-vec face of `layer`'s `(..., n, k)` matrix, a `Dot`, or `None`. With `None` the kernel is not used for that layer and the model keeps its composed path. Return `None` for:
 
 - a layout the face does not cover,
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`, of 8 elements or more each), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` was defective in it (an exception of the block's body is raised in its place):
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`, of 8 elements or more each), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` or a `tile()` was defective in it (an exception of the block's body is raised in its place):
 
 ```python
 import pytest
@@ -221,11 +224,13 @@ def dot_defects():
 
 The block's value is the set of the defects met so far, each as `(mode, repr(error))`; a test that expects one removes it. A kernel keeps the answer with what it builds for the layer, so only the first forward that asks for a layer's face meets its defect: a model that a module or session fixture runs in its setup (or a function fixture set up ahead of this one) meets it outside this block.
 
-| `Dot` field | Meaning |
+`QuantFormat.tile(layer, k, n)` returns the tile face of the same matrix, a `Tile`, or `None`, and kernels ask through `omlx.formats.tile(layer, k, n)` with the same answers to the same defects (`quant format MODE gave no usable tile face ...`). A defect is a format's mode and the error: the same error from its `dot()` and its `tile()` is one defect, logged once.
+
+| `Dot` and `Tile` field | Meaning |
 |---|---|
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`). A kernel includes each distinct source once. |
-| `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. |
+| `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. A `Tile`'s struct is in a namespace of its own, apart from its format's `Dot`: a kernel includes the source of the faces it reads, and no other. |
 | `tensors` | The layer's parameters beside `weight` that the face reads, as a tuple. They become kernel inputs in this order. Identifiers, each named once. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype`; empty (the default) for any. Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
 
@@ -349,9 +354,143 @@ Dot(
 )
 ```
 
+## The tile face
+
+A kernel that multiplies many rows of activations by a matrix (a prompt's prefill, a switch layer's experts over a prompt) decodes a tile of the weights, some rows by some inputs, into threadgroup memory once, and every row of activations it computes reads them there. The tile face is how it decodes them: the matrix of the dot face, read in runs of 8 codes and given weight by weight. A format gives it with `QuantFormat.tile(layer, k, n)` (see [Faces](#faces)).
+
+The struct named by `type` is the matrix, an aggregate as a dot face's: `CONTRACT`, the weight as bytes, then one device pointer per name in `tensors`, in order. Its member struct `Runs` is the cursor of one row:
+
+```cpp
+struct Tile {
+  static constant constexpr int CONTRACT = 1;
+  const device uint8_t* codes;
+  const device float* group_scales;
+  const device float* row_scales;
+
+  struct Runs { ... };
+};
+```
+
+A kernel builds a cursor for each row a thread decodes, and reads the row through it in runs of 8 codes, and in groups of codes that share their parameters.
+
+| Member of `Runs` | Role |
+|---|---|
+| `static constant constexpr int RUN` | 8, the codes of a run. A run of 8 codes of b bits is b whole bytes. |
+| `static constant constexpr int GROUP` | The codes that share one `params()`: 8 times a power of two (8, 16, 32, ...). A row has `(K + GROUP - 1) / GROUP` groups, the last of which may be partial. |
+| `struct P` | A group's parameters, as a kernel holds them in registers. |
+| `Codes` | A run's codes, as a kernel holds them in registers: a `uint`, a `uint2`, ... |
+| `Runs(Tile m, size_t row, int k)` | The cursor of row `row` of `m`, of K = `k` inputs. In a stack of matrices of N rows each, row `n` of matrix `e` is row `e * N + n`. |
+| `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (k + GROUP - 1) / GROUP)`. |
+| `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, k / 8)`. |
+| `static float weight(thread const P& p, Codes c, int i)` | Weight `i` (0 to 7) of a run of codes `c` in a group of parameters `p`, as a float32. |
+
+`P` and `Codes` are default-constructible: a kernel holds arrays of them. K is a whole number of runs. A kernel runs a face in this order, in each thread that decodes values of a row, for each block of K that it decodes, with `T` the activations' type:
+
+```
+runs = Runs(m, row, k)                            once for the row
+c[r] = fetch(first_run + r)                       for each run r of the thread's values
+p[g] = params(first_group + g)                    for each group g they lie in
+w[8 r + i] = T(weight(p[group of run r], c[r], i))  for each run r, i from 0 to 7
+```
+
+The values a thread decodes are whole groups or lie in one group: hence a `GROUP` of 8 times a power of two.
+
+### The weight
+
+`weight` gives the weight that the format's `decode` gives, computed in float32, bit for bit; the kernel rounds it once to `T` where it stores it. The weights a tile kernel multiplies are therefore the decoded weights rounded to `T`, whatever the kernel, and a format's tests check the face weight by weight (see [Test a format](#test-a-format)).
+
+Where a weight has several scales, a group's and a row's, `params` multiplies them, once for the group, `P` holds the product, and `weight` multiplies the code's level by it: `level * (group_scale * row_scale)`. The format's `decode` computes the same products in the same order. Multiplication of floats is not associative: `(level * group_scale) * row_scale` can differ from it in the last bit. MLX compiles kernels with fast math off, so the operations run as written.
+
+### Rules
+
+1. **Every address a member forms lies inside the arrays of its aggregate**, for tensors of any value: an index read from a tensor is masked to its table's size.
+2. **A face is safe on zeros**: tensors of zeros give finite weights. A kernel proves its Metal on zeros.
+3. **No loop bound or exit comes from a value read**: a face has no loop over data.
+4. **The constructor reads nothing.** A kernel builds a cursor in each thread of its tile, also for rows past the matrix, and calls `params` and `fetch` only for the rows, groups and runs it computes. A constant of the row (a row scale) is read again at each `params()`: that is the price of this rule.
+5. **No threadgroup memory, barrier or simdgroup operation**: not every thread of a kernel decodes.
+6. **A face never writes.**
+7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data, and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
+8. **The members keep no state but the cursor's**, and `params` and `fetch` are `const`: kernels run on several threads, and a format returns equal `Tile`s for the layers of one layout.
+9. **The source is C++17 Metal without derived classes.** See [Compile-time rules](#compile-time-rules).
+10. **`if constexpr` discards a branch only in a template, on a condition that depends on its parameters.** A face's source is one instance, its bit width and group size namespace constants, so an `if constexpr` on one of them compiles both branches, and each must be well-formed for the instance's types. Choose by an overload on a type (`code_at(uint, i)` and `code_at(uint2, i)` in the affine face) or by a template parameter.
+
+Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). The compiler checks the rest of what it can see when a kernel is compiled, the face's revision first. A face that breaks one of those rules fails with the rule, cited in `<omlx skeletons, docs/quant-formats.md>`: one error for each rule it breaks and none after them. A face of another revision is told that and nothing else, as a dot face is (see [Versions](#versions)).
+
+- `tile face: written for a later revision of the contract than this oMLX runs`
+- `tile face: written for a revision of the contract this oMLX no longer runs`
+- `tile face: Runs::RUN must be 8: every tile kernel reads runs of 8 codes`
+- `tile face: Runs::GROUP must be 8 times a power of two (8, 16, 32, ...): the values a kernel's thread decodes are then whole groups or in one`
+- `tile face: Runs::P and Runs::Codes must be default-constructible: a kernel holds arrays of them`
+- `tile face: Runs must be constructible from the face, a size_t row and an int K`
+- `tile face: Runs needs a const member params(int g) that returns a Runs::P`
+- `tile face: Runs needs a const member fetch(int run) that returns a Runs::Codes`
+- `tile face: Runs needs a static member weight(P, Codes, int i) that returns a float`
+
+### An example of a tile face
+
+A format of 8-bit codes around 128, with a float32 scale for each group of 32 codes of a row and one for the row: `w = (code - 128) * (group_scale * row_scale)`.
+
+```cpp
+namespace omlx_myformat_b8g32 {
+struct Tile {
+  static constant constexpr int CONTRACT = 1;
+  const device uint8_t* codes;
+  const device float* group_scales;
+  const device float* row_scales;
+
+  struct Runs {
+    static constant constexpr int RUN = 8;
+    static constant constexpr int GROUP = 32;
+    struct P {
+      float s;  // the group's scale times the row's
+    };
+    using Codes = uint2;  // 8 codes of 8 bits
+
+    const device uint2* c;
+    const device float* g;
+    const device float* r;
+
+    Runs(Tile m, size_t row, int k)
+        : c((const device uint2*)(m.codes + row * size_t(k))),
+          g(m.group_scales + row * size_t((k + GROUP - 1) / GROUP)),
+          r(m.row_scales + row) {}
+
+    P params(int group) const {
+      return {g[group] * r[0]};
+    }
+    Codes fetch(int run) const {
+      return c[run];
+    }
+    static float weight(thread const P& p, Codes q, int i) {
+      const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
+      return (float(code) - 128.0f) * p.s;
+    }
+  };
+};
+}  // namespace omlx_myformat_b8g32
+```
+
+```python
+Tile(
+    key="myformat_b8g32",
+    source=METAL,
+    type="omlx_myformat_b8g32::Tile",
+    tensors=("group_scales", "row_scales"),
+)
+```
+
+Its `decode`, the same products in the same order:
+
+```python
+    def decode(self, tensors, bits, group_size):
+        levels = tensors["weight"].astype(mx.float32) - 128.0
+        scales = tensors["group_scales"] * tensors["row_scales"][..., None]
+        return levels * mx.repeat(scales, 32, axis=-1)[..., : levels.shape[-1]]
+```
+
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`. That gives the matrix's kernel inputs, the Metal to include and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
+A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot` or a `Tile`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons of the kinds of faces the kernel reads, and no other) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
 
 ```python
 import mlx.core as mx
@@ -469,7 +608,7 @@ The last one is a `madd` declared without its `aux` parameter.
 
 ## Test a format
 
-`omlx.formats.testing.dot_rows` runs a face in the row skeleton, outside any model:
+`omlx.formats.testing.dot_rows` runs a dot face in the row skeleton, outside any model:
 
 ```python
 import mlx.core as mx
@@ -492,11 +631,29 @@ Worth testing for every layout a format gives a face for:
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
 - the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. `dot_rows` compiles the skeleton for `x.dtype` and refuses a dtype the face is not exact for. For a face whose tensors are typed `T`, `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32, on fp32 activations and fp32 copies of those tensors.
 
+`omlx.formats.testing.tile_rows` reads every weight of some rows through a tile face, as a tile kernel reads it (`weight(params(g), fetch(run), i)`, with `i` not known when the kernel is compiled), and gives them twice: as `weight` gives them, in float32, and rounded once to a dtype the face is exact for, as a kernel stores them for activations of that dtype:
+
+```python
+def test_the_tile_face_is_the_decode_in_float32():
+    face = FORMAT.tile(layer, k, n)
+    operands = [layer[name] for name in ("weight", *face.tensors)]
+    exact, rounded = testing.tile_rows(face, operands, k, range(n), mx.bfloat16)
+    want = decode_in_float32(layer)  # (n, k)
+    assert mx.array_equal(exact, want).item()
+    assert mx.array_equal(rounded, want.astype(mx.bfloat16)).item()
+```
+
+`rows` are the rows' indices (in a stack, row `n` of matrix `e` is `e * N + n`), none past the matrix's, which is not checked; K is a whole number of runs of 8; the operands have 8 elements or more. The reference is the format's decode computed in float32: for a format whose `decode` returns another type (affine returns the scales' type), compute it in float32 for the test. Worth testing for every layout a format gives a tile face for:
+
+- every weight of rows of each matrix of a stack, its last rows included, against the reference, in float32 and rounded to each dtype the face is exact for,
+- the codes and the scales at their largest values and at random ones, with float fields finite, and at zero: rules 1, 2 and 7 of [The tile face](#the-tile-face). A NaN the decode gives compares as a NaN, not by its bits,
+- a K whose last group is partial, if the face takes one.
+
 ## Versions
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `register`, `load`, `get`, `origin`, `dot`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints` and `omlx_iota`.
 
@@ -504,7 +661,7 @@ The contract has a revision, a whole number that goes up by one with each change
 
 | Revision | In oMLX since | What it adds |
 |---|---|---|
-| 1 | not released yet | The registry, the dot face, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
+| 1 | not released yet | The registry, the dot face and the tile face, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
 
 A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 
@@ -593,6 +750,16 @@ Any other affine layer has no face and runs MLX's ops:
 - a 2-D matrix of K 64 or 128 at 2, 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
 
 The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFormat.dot` is what gives a matrix its traversal.
+
+Its tile face gives each weight as `scale * q + bias` computed in float32, which a kernel rounds once to the activations' dtype: MLX's `dequantize` of the weight (`scale * q` is exact in float32), and what MLX's sorted `gather_qmm` loads into its tiles.
+
+| | Covered |
+|---|---|
+| Bits | 4, 8: a run of 8 codes is one 32-bit word, or two. 2- and 3-bit runs are 2 and 3 bytes, which the face's `fetch` does not read: its source asserts the width. |
+| Group size | 32, 64, 128 |
+| Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
+| Weights | 32-bit words, a matrix or a stack of them, K whole groups, scales of 8 elements or more |
+| Face key | `affine_tile_b{bits}g{group_size}_bf16`, or `_fp16`, by the scales' dtype |
 
 ## Kernels built on faces
 

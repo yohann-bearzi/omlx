@@ -9,6 +9,7 @@ import logging
 import re
 import threading
 from dataclasses import replace
+from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -634,7 +635,9 @@ def test_a_defect_fails_a_block_that_admits_none(plugins, dot_defects):
     defect = ("toy", "_DefectError('no biases')")
     with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
         assert formats.dot(_layer(), 64, 8) is None
-    assert str(failure.value) == f"a quant format's dot() is defective: {[defect]}"
+    assert str(failure.value) == (
+        f"a quant format's dot() or tile() is defective: {[defect]}"
+    )
     # The defect is the block's: nothing outside collected it.
     assert formats._DOT_DEFECTS is dot_defects and not dot_defects
     with testing.no_dot_defects() as defects:
@@ -691,6 +694,159 @@ def test_a_format_without_a_face_for_a_layer_is_no_defect(plugins, caplog):
 
 def test_a_format_has_no_face_until_it_gives_one():
     assert formats.QuantFormat().dot(SimpleNamespace(), 64, 8) is None
+
+
+@cache
+def _tile():
+    return formats.Tile(
+        key="toy_tile_b4",
+        source="namespace omlx_toy_tile_b4 { struct Tile {}; }\n",
+        type="omlx_toy_tile_b4::Tile",
+        tensors=("scales",),
+    )
+
+
+class _Tiled(_Format):
+    def tile(self, layer, k, n):
+        self.tiled = (layer, k, n)
+        return _tile()
+
+
+def test_tile_asks_the_format_of_the_layers_mode(plugins, caplog):
+    fmt, layer = _Tiled(), _layer()
+    formats.register(fmt)
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.tile(layer, 64, 8) is _tile()
+        assert fmt.tiled == (layer, 64, 8)
+        # Its dot face is asked for apart.
+        assert not hasattr(fmt, "asked") and formats.dot(layer, 64, 8) is _FACE
+        assert formats.tile(_layer("other"), 64, 8) is None
+        assert formats.tile(nn.Module(), 64, 8) is None  # not quantized
+    assert not caplog.records
+
+
+def test_a_format_without_a_tile_face_keeps_its_dot_face(plugins, caplog):
+    formats.register(_Format())
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.tile(_layer(), 64, 8) is None
+        assert formats.dot(_layer(), 64, 8) is _FACE
+    assert not caplog.records
+
+
+class _TileRaises(_Format):
+    def tile(self, layer, k, n):
+        raise _DefectError("no biases")
+
+
+class _TileIsADot(_Format):
+    def tile(self, layer, k, n):
+        return _FACE
+
+
+class _TileOfTwoTensors(_Format):
+    def tile(self, layer, k, n):
+        return replace(_tile(), tensors=("scales", "biases"))
+
+
+@pytest.mark.parametrize(
+    "fmt, layer, defect",
+    [
+        (_TileRaises(), _layer(), "_DefectError('no biases')"),
+        (
+            _TileIsADot(),
+            _layer(),
+            f'TypeError("tile() returned a {formats.Dot!r}, not a Tile")',
+        ),
+        (
+            _Tiled(),
+            _layer(tensors=("weight",)),
+            "ValueError('face toy_tile_b4: the layer has no array scales')",
+        ),
+        (
+            _Tiled(),
+            _layer_with_small("scales"),
+            "ValueError('face toy_tile_b4: scales of fewer than 8 elements, which "
+            "MLX binds as constants, not as the buffer a face reads')",
+        ),
+        (
+            _TileOfTwoTensors(),
+            _layer(),
+            "ValueError('face toy_tile_b4: the layer has no array biases')",
+        ),
+    ],
+)
+def test_a_defective_tile_is_no_face(plugins, caplog, dot_defects, fmt, layer, defect):
+    formats.register(fmt)
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.tile(layer, 64, 8) is None
+    (record,) = caplog.records
+    assert record.getMessage() == (
+        "quant format toy gave no usable tile face for a Module (n=8, k=64); "
+        "the layer keeps its other kernels"
+    )
+    assert repr(record.exc_info[1]) == defect
+    assert dot_defects == {("toy", defect)}
+    dot_defects.clear()  # expected
+
+
+def test_a_dot_that_gives_a_tile_is_defective(plugins, caplog, dot_defects):
+    class DotIsATile(_Format):
+        def dot(self, layer, k, n):
+            return _tile()
+
+    formats.register(DotIsATile())
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.dot(_layer(), 64, 8) is None
+    defect = f'TypeError("dot() returned a {formats.Tile!r}, not a Dot")'
+    assert dot_defects == {("toy", defect)}
+    dot_defects.clear()  # expected
+
+
+def test_one_error_of_a_formats_dot_and_tile_is_one_defect(
+    plugins, caplog, dot_defects
+):
+    class BothRaise(_TileRaises):
+        def dot(self, layer, k, n):
+            raise _DefectError("no biases")
+
+    formats.register(BothRaise())
+    formats.register(_TileRaises("other"))
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for _ in range(2):
+            assert formats.dot(_layer(), 64, 8) is None
+            assert formats.tile(_layer(), 64, 8) is None
+            assert formats.tile(_layer("other"), 64, 8) is None
+    logged = [(r.args[0], r.args[1], repr(r.exc_info[1])) for r in caplog.records]
+    assert logged == [
+        ("toy", "dot", "_DefectError('no biases')"),
+        ("other", "tile", "_DefectError('no biases')"),
+    ]
+    assert dot_defects == {
+        ("toy", "_DefectError('no biases')"),
+        ("other", "_DefectError('no biases')"),
+    }
+    dot_defects.clear()  # expected
+
+
+def test_a_tile_defect_fails_a_block_that_admits_none(plugins, dot_defects):
+    formats.register(_TileRaises())
+    with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
+        assert formats.tile(_layer(), 64, 8) is None
+    assert str(failure.value) == (
+        "a quant format's dot() or tile() is defective: "
+        "[('toy', \"_DefectError('no biases')\")]"
+    )
+    assert not dot_defects
+
+
+def test_an_interrupt_inside_tile_is_not_a_defect(plugins):
+    class Interrupted(_Format):
+        def tile(self, layer, k, n):
+            raise KeyboardInterrupt
+
+    formats.register(Interrupted())
+    with pytest.raises(KeyboardInterrupt):
+        formats.tile(_layer(), 64, 8)
 
 
 def test_equal_faces_are_one_cache_key():

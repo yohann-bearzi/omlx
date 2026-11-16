@@ -5,7 +5,8 @@ matrices into a ``mx.fast.metal_kernel``.
 A kernel names each matrix it reads (``rt``, ``sg``, ...) in a ``Matrices``,
 which gives the matrix's kernel inputs, the statements that declare the
 matrices in the kernel body, and the Metal the kernel includes: the index
-packs, the formats' sources and the skeletons below.
+packs, the formats' sources and the skeletons below of the kinds of faces
+it reads.
 
 The Metal here is C++17 (Metal 4.1 takes no later standard), without derived
 classes. What is known when a kernel is compiled is a template parameter or
@@ -22,7 +23,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 
 from .. import formats
-from . import Dot
+from . import Dot, Tile
 
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
@@ -158,6 +159,116 @@ METAL_FUNC void qmv_rows(
     }
   }
 }
+"""
+
+# What a kernel asks of a tile face F (docs/quant-formats.md, The tile face),
+# stated where the compiler can check it, so that a face that breaks a rule
+# fails with that sentence and nothing after it. A kernel compiles its use of
+# F under `if constexpr (omlx_tile_face<F>::value)`, in a function template
+# of F. For a face of another revision the revision is the only error, as
+# for a dot face; for one of a revision oMLX runs, each rule it breaks is one.
+# The members are detected, not called, so that one that is missing or of
+# another signature is that rule's error too.
+_TILE_FACE = r"""
+// Whether R::params, R::fetch and R::weight are there, with the signatures
+// the contract gives them.
+template <typename...>
+using omlx_void = void;
+template <typename R, typename = void>
+struct omlx_tile_params {
+  static constant constexpr bool value = false;
+};
+template <typename R>
+struct omlx_tile_params<R, omlx_void<decltype(metal::declval<const R>().params(0))>> {
+  static constant constexpr bool value = metal::
+      is_same_v<decltype(metal::declval<const R>().params(0)), typename R::P>;
+};
+template <typename R, typename = void>
+struct omlx_tile_fetch {
+  static constant constexpr bool value = false;
+};
+template <typename R>
+struct omlx_tile_fetch<R, omlx_void<decltype(metal::declval<const R>().fetch(0))>> {
+  static constant constexpr bool value = metal::
+      is_same_v<decltype(metal::declval<const R>().fetch(0)), typename R::Codes>;
+};
+template <typename R, typename = void>
+struct omlx_tile_weight {
+  static constant constexpr bool value = false;
+};
+template <typename R>
+struct omlx_tile_weight<
+    R,
+    omlx_void<decltype(R::weight(
+        metal::declval<thread const typename R::P&>(),
+        metal::declval<typename R::Codes>(),
+        0))>> {
+  static constant constexpr bool value = metal::is_same_v<
+      decltype(R::weight(
+          metal::declval<thread const typename R::P&>(),
+          metal::declval<typename R::Codes>(),
+          0)),
+      float>;
+};
+
+// Tile face F, of the revision FACE: value is whether a kernel runs it. A
+// face of a revision oMLX does not run is told that, and nothing else. FACE
+// is a template parameter so that a failed assert prints both numbers.
+template <
+    typename F,
+    int FACE = F::CONTRACT,
+    bool RUNS = FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT>
+struct omlx_tile_face {
+  static_assert(
+      FACE <= OMLX_CONTRACT,
+      "tile face: written for a later revision of the contract than this oMLX runs");
+  static_assert(
+      FACE >= OMLX_OLDEST_CONTRACT,
+      "tile face: written for a revision of the contract this oMLX no longer runs");
+  static constant constexpr bool value = false;
+};
+
+template <typename F, int FACE>
+struct omlx_tile_face<F, FACE, true> {
+  using R = typename F::Runs;
+  static constant constexpr bool RUN = R::RUN == 8;
+  static constant constexpr bool GROUP =
+      R::GROUP >= 8 && (R::GROUP & (R::GROUP - 1)) == 0;
+  static constant constexpr bool HELD =
+      metal::is_default_constructible_v<typename R::P> &&
+      metal::is_default_constructible_v<typename R::Codes>;
+  static constant constexpr bool CURSOR =
+      metal::is_constructible_v<R, F, size_t, int>;
+  static_assert(
+      RUN,
+      "tile face: Runs::RUN must be 8: every tile kernel reads runs of 8 codes");
+  static_assert(
+      GROUP,
+      "tile face: Runs::GROUP must be 8 times a power of two (8, 16, 32, ...): "
+      "the values a kernel's thread decodes are then whole groups or in one");
+  static_assert(
+      HELD,
+      "tile face: Runs::P and Runs::Codes must be default-constructible: a "
+      "kernel holds arrays of them");
+  static_assert(
+      CURSOR,
+      "tile face: Runs must be constructible from the face, a size_t row and "
+      "an int K");
+  static_assert(
+      omlx_tile_params<R>::value,
+      "tile face: Runs needs a const member params(int g) that returns a Runs::P");
+  static_assert(
+      omlx_tile_fetch<R>::value,
+      "tile face: Runs needs a const member fetch(int run) that returns a "
+      "Runs::Codes");
+  static_assert(
+      omlx_tile_weight<R>::value,
+      "tile face: Runs needs a static member weight(P, Codes, int i) that "
+      "returns a float");
+  static constant constexpr bool value = RUN && GROUP && HELD && CURSOR &&
+      omlx_tile_params<R>::value && omlx_tile_fetch<R>::value &&
+      omlx_tile_weight<R>::value;
+};
 """
 
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
@@ -334,14 +445,15 @@ class Matrices:
     """The matrices a kernel reads, each under the name its body uses."""
 
     def __init__(self) -> None:
-        self._faces: dict[str, Dot] = {}
+        self._faces: dict[str, Dot | Tile] = {}
         self._names: set[str] = set()
 
-    def add(self, name: str, face: Dot) -> list[str]:
-        """Add matrix ``name``. Returns its kernel inputs: the weight, then
-        the face's tensors in order. Refuses a name that is not an identifier,
-        and a matrix whose name or inputs repeat those of a matrix added
-        before: the kernel's other names are the kernel's to keep apart."""
+    def add(self, name: str, face: Dot | Tile) -> list[str]:
+        """Add matrix ``name``, read through ``face``, a ``Dot`` or a
+        ``Tile``. Returns its kernel inputs: the weight, then the face's
+        tensors in order. Refuses a name that is not an identifier, and a
+        matrix whose name or inputs repeat those of a matrix added before:
+        the kernel's other names are the kernel's to keep apart."""
         if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
             raise ValueError(f"matrix {name!r}: its name is not an identifier")
         inputs = _inputs(name, face)
@@ -359,18 +471,31 @@ class Matrices:
     def header(self) -> str:
         """The Metal the kernel includes: the index packs, each distinct
         format source once (cited under the key of the first face that has
-        it), then the skeletons, from the contract revisions' macros to the
-        macros' end."""
+        it), then the skeletons of the kinds of faces added, from the
+        contract revisions' macros to the macros' end. Each skeleton is
+        cited at its own lines, whichever others the kernel includes."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
+        faces = self._faces.values()
+        revisions = _INDEX_PACKS.count("\n") + 1
         return (
             _named(_SKELETONS, _INDEX_PACKS)
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
             + _named(
                 _SKELETONS,
-                _revisions() + _QMV_ROWS,
-                line=_INDEX_PACKS.count("\n") + 1,
+                _revisions()
+                + (_QMV_ROWS if any(isinstance(f, Dot) for f in faces) else ""),
+                line=revisions,
+            )
+            + (
+                _named(
+                    _SKELETONS,
+                    _TILE_FACE,
+                    line=revisions + (_revisions() + _QMV_ROWS).count("\n"),
+                )
+                if any(isinstance(f, Tile) for f in faces)
+                else ""
             )
             + _REVISIONS_END
             + _named("<kernel header>", "")
@@ -411,10 +536,10 @@ def _named(name: str, source: str, line: int = 1) -> str:
     return f'\n#line {line} "{name}"\n{source}'
 
 
-def _inputs(name: str, face: Dot) -> list[str]:
+def _inputs(name: str, face: Dot | Tile) -> list[str]:
     return [f"{name}_weight", *(f"{name}_{tensor}" for tensor in face.tensors)]
 
 
-def _members(name: str, face: Dot) -> str:
+def _members(name: str, face: Dot | Tile) -> str:
     weight, *tensors = _inputs(name, face)
     return ", ".join([f"(const device uint8_t*){weight}", *tensors])

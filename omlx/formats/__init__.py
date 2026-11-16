@@ -45,17 +45,10 @@ OLDEST_CONTRACT = 1
 
 
 @dataclass(frozen=True)
-class Dot:
-    """A format's mat-vec face for one matrix shape.
-
-    ``source`` is Metal that declares ``type`` at global scope (a kernel
-    includes each distinct source once). ``type`` is a type expression for a
-    kernel body, where ``T`` names the activations' float type. The struct it
-    names is the matrix: an aggregate of the weight codes as bytes, then one
-    device pointer per name in ``tensors`` (the linear's parameters beside
-    ``weight``, which become kernel inputs in this order), with the member
-    template ``Lanes<K>`` that ``docs/quant-formats.md`` specifies.
-    """
+class _Face:
+    """What every kind of face is: Metal, the type it declares, the tensors
+    it reads and the activations it is exact for. A face of one kind never
+    equals a face of another."""
 
     key: str  # names the instance in kernel names and compiler messages
     source: str
@@ -92,6 +85,32 @@ class Dot:
         return not self.dtypes or dtype in self.dtypes
 
 
+@dataclass(frozen=True)
+class Dot(_Face):
+    """A format's mat-vec face for one matrix shape.
+
+    ``source`` is Metal that declares ``type`` at global scope (a kernel
+    includes each distinct source once). ``type`` is a type expression for a
+    kernel body, where ``T`` names the activations' float type. The struct it
+    names is the matrix: an aggregate of the weight codes as bytes, then one
+    device pointer per name in ``tensors`` (the linear's parameters beside
+    ``weight``, which become kernel inputs in this order), with the member
+    template ``Lanes<K>`` that ``docs/quant-formats.md`` specifies.
+    """
+
+
+@dataclass(frozen=True)
+class Tile(_Face):
+    """A format's tile face for one matrix shape: the same matrix as its
+    ``Dot``, read the way a kernel that decodes a tile of weights reads it.
+
+    The fields are a ``Dot``'s. The struct ``type`` names is the matrix, an
+    aggregate as a dot face's, with the member struct ``Runs`` that
+    ``docs/quant-formats.md`` specifies: a row's cursor that reads a group's
+    parameters and runs of 8 codes, and gives each weight as a float32.
+    """
+
+
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
     ``contract``, and overrides ``decode``, ``layout`` (what loads its
@@ -104,6 +123,10 @@ class QuantFormat:
 
     def dot(self, layer, k: int, n: int) -> Dot | None:
         """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None."""
+        return None
+
+    def tile(self, layer, k: int, n: int) -> Tile | None:
+        """The tile face of ``layer``'s ``(..., n, k)`` matrix, or None."""
         return None
 
     def decode(
@@ -250,7 +273,8 @@ def origin(mode: str) -> str | None:
     return _ORIGINS.get(mode)
 
 
-# The dot() defects that are logged: a format's mode and the error's repr.
+# The dot() and tile() defects that are logged: a format's mode and the
+# error's repr.
 _DOT_DEFECTS: set[tuple[str, str]] = set()
 
 
@@ -264,16 +288,35 @@ def dot(layer, k: int, n: int) -> Dot | None:
     weight and the face's tensors, each of 8 elements or more), has no face
     for the layer either, and the model keeps its composed path there. Each
     defect of a format is logged once."""
+    return _face(layer, k, n, Dot, "the layer keeps its composed path")
+
+
+def tile(layer, k: int, n: int) -> Tile | None:
+    """The tile face of ``layer``'s ``(..., n, k)`` matrix, or None, as
+    ``dot`` gives the mat-vec face: a format whose ``tile`` raises, or
+    returns anything but None or a ``Tile`` of arrays the layer has, has no
+    tile face for the layer, which keeps its other kernels. Each defect is
+    logged once, a defect being the format's mode and the error: the same
+    error from the format's ``dot`` is the same defect."""
+    return _face(layer, k, n, Tile, "the layer keeps its other kernels")
+
+
+def _face(layer, k: int, n: int, kind: type, keeps: str):
+    """The face of class ``kind`` that ``layer``'s format gives, from its
+    method of the class's name in lower case, or None."""
     mode = getattr(layer, "mode", None)
     fmt = get(mode)
     if fmt is None:
         return None
+    name = kind.__name__.lower()
     try:
-        face = fmt.dot(layer, k, n)
+        face = getattr(fmt, name)(layer, k, n)
         if face is None:
             return None
-        if not isinstance(face, Dot):
-            raise TypeError(f"dot() returned a {type(face)!r}, not a Dot")
+        if not isinstance(face, kind):
+            raise TypeError(
+                f"{name}() returned a {type(face)!r}, not a {kind.__name__}"
+            )
         lacking = [
             name
             for name in ("weight", *face.tensors)
@@ -294,12 +337,13 @@ def dot(layer, k: int, n: int) -> Dot | None:
         if defect not in _DOT_DEFECTS:
             _DOT_DEFECTS.add(defect)
             logger.exception(
-                "quant format %s gave no usable dot face for a %s (n=%s, k=%s); "
-                "the layer keeps its composed path",
+                "quant format %s gave no usable %s face for a %s (n=%s, k=%s); %s",
                 mode,
+                name,
                 type(layer).__name__,
                 n,
                 k,
+                keeps,
             )
         return None
     return face
