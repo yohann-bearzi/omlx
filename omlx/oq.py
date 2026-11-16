@@ -7277,6 +7277,40 @@ def _resolve_stream_calibration(
     return model_exceeds_ram and supported
 
 
+def calibrate_oq_streaming(
+    model_path: str,
+    imatrix_cache_path: str,
+    oq_level: float,
+    **settings: Any,
+) -> OQImatrixData:
+    """oQe's calibration of ``model_path`` into ``imatrix_cache_path``,
+    without quantizing: what ``quantize_oq_streaming(model_path, output,
+    oq_level, enhanced=True, imatrix_cache_path=imatrix_cache_path,
+    **settings)`` collects (or reuses) before it reads a weight, by the same
+    code. That call then reuses the cache. A quant format's plugin fits from
+    it before it hands oQ its configured format (docs/quant-formats.md).
+
+    ``settings`` are quantize_oq_streaming's other arguments, those of the
+    run that will reuse the cache (group_size, text_only, dtype,
+    preserve_mtp, trust_remote_code, the imatrix_* settings,
+    stream_calibration, sensitivity_map_override, progress_callback, ...).
+    Returns the cache's entries and metadata."""
+    cache = Path(imatrix_cache_path)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    # The run's output folder and a calibration proxy (a model above the
+    # calibration budget) are made here and removed with it.
+    with tempfile.TemporaryDirectory(dir=cache.parent) as scratch:
+        return quantize_oq_streaming(
+            model_path,
+            str(Path(scratch) / "output"),
+            oq_level,
+            enhanced=True,
+            imatrix_cache_path=str(cache),
+            _calibrate_only=True,
+            **settings,
+        )
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
@@ -7301,6 +7335,7 @@ def quantize_oq_streaming(
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
     quant_format: Any = None,
+    _calibrate_only: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7383,6 +7418,9 @@ def quantize_oq_streaming(
             gives it, and is written as the format's tensors under the
             format's mode. What the format leaves, and every other tensor,
             is written as without it. Requires enhanced.
+
+    calibrate_oq_streaming runs this up to oQe's calibration
+    (``_calibrate_only``).
     """
     if oq_level not in OQ_LEVELS:
         raise ValueError(
@@ -7527,6 +7565,11 @@ def quantize_oq_streaming(
     if inkling2_layout.is_inkling2(config):
         # The model class is needed before any calibration load registers it.
         apply_inkling2_patch()
+    if normalized_model_type == "deepseek_v41" and _calibrate_only:
+        raise ValueError(
+            "oQ calibrates a deepseek_v41 checkpoint inside a writer of its own, "
+            "which takes no quant format"
+        )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
@@ -7823,6 +7866,8 @@ def quantize_oq_streaming(
                 or None
             )
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
+        if _calibrate_only:
+            return imatrix_data
         imatrix_report = {
             "enabled": True,
             "cache_path": imatrix_data.path,

@@ -282,6 +282,20 @@ quantize_oq_streaming(source, output, 4, enhanced=True, quant_format="myformat")
 
 `quant_format` is the format's mode, or an object of the class registered for its mode: a plugin's command that fits its format to the model first (a table of levels, say) hands oQ the object it configured. oQ encodes with that object and stores its record; the load reads the record back through the registered format's `accept`. An object of another class, a subclass included, is refused: `quant format 'myformat' is registered as MyFormat, not OtherFormat: pass an object of the registered class`.
 
+A format fitted to the model reads oQe's importance before oQ asks for its record. `calibrate_oq_streaming` runs oQe's calibration alone, into the imatrix cache, by the code of the run that will reuse it, and returns the cache's entries and metadata; that run then reads the cache instead of calibrating again:
+
+```python
+from omlx.oq import calibrate_oq_streaming, quantize_oq_streaming
+
+calibrate_oq_streaming(source, cache, 4)
+fitted = fit(source, cache)  # the plugin's own: a configured MyFormat
+quantize_oq_streaming(
+    source, output, 4, enhanced=True, quant_format=fitted, imatrix_cache_path=cache
+)
+```
+
+Its keyword arguments are that run's own (`group_size`, `text_only`, `dtype`, `preserve_mtp`, the `imatrix_*` settings, `stream_calibration`, ...): a run with other settings does not match the cache and calibrates again. It writes nothing but the cache (`<cache>` and `<cache>.json`); a calibration proxy that a model above the calibration budget needs is built beside the cache and removed. DeepSeek V4.1 calibrates inside its own writer and is refused.
+
 `encode` returns the tensors that keep `w`, by name, in the shapes and dtypes that `layout(k, n, bits, group_size)` gives, or None for a matrix it leaves to oQ.
 
 - `w` is a matrix `(n, k)`, or some of a stack's matrices, `(e, n, k)`, in the floats of the source checkpoint. The tensors of a stack's matrices have its axis first.

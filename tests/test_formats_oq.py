@@ -456,21 +456,35 @@ def _save_tokenizer(path, size):
     )
 
 
-def _quantize(source, output, **kwargs):
+# oQe's settings of the tiny runs: four samples of 16 tokens, a sensitivity
+# map given.
+_SETTINGS = {
+    "imatrix_num_samples": 4,
+    "imatrix_seq_length": 16,
+    "sensitivity_map_override": {0: 0.1, 1: 0.2},
+}
+
+
+def _calibration(patch, sampled=None):
+    """oQe's calibration tokens for the tiny runs; ``sampled`` counts the
+    times they are read."""
+    tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
+
+    def load(*args, **kwargs):
+        if sampled is not None:
+            sampled.append(1)
+        return tokens
+
+    patch.setattr(oq, "_load_calibration_data", load)
+
+
+def _quantize(source, output, sampled=None, **kwargs):
     """oQ4e of ``source``: the output's tensors, its config, and the layers
     that oQe had an importance for."""
-    tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(oq, "_load_calibration_data", lambda *args, **kwargs: tokens)
+        _calibration(patch, sampled)
         oq.quantize_oq_streaming(
-            str(source),
-            str(output),
-            4,
-            enhanced=True,
-            imatrix_num_samples=4,
-            imatrix_seq_length=16,
-            sensitivity_map_override={0: 0.1, 1: 0.2},
-            **kwargs,
+            str(source), str(output), 4, enhanced=True, **_SETTINGS, **kwargs
         )
     tensors = {}
     for shard in sorted(output.glob("*.safetensors")):
@@ -1472,6 +1486,68 @@ def test_a_record_a_source_carries_is_not_kept_without_its_layers(
     toy.lays_out = False
     _, written, _ = _quantize(carried, tmp_path / "oqe-none", quant_format="toy")
     assert _RECORD not in written
+
+
+def _cache(path):
+    """An imatrix cache's arrays and its metadata, without the batch plan:
+    its readings of the memory free at the time change between two
+    collections of the same cache."""
+    with np.load(path) as arrays:
+        kept = {name: arrays[name] for name in arrays.files}
+    metadata = json.loads(path.with_name(path.name + ".json").read_text())
+    del metadata["collection"]["batch_plan"]
+    return kept, metadata
+
+
+def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_path):
+    """calibrate_oq_streaming writes the imatrix cache that a run with the
+    same settings writes, and nothing else; that run then reuses it."""
+    alone, sampled = tmp_path / "alone" / "imatrix.npz", []
+    with pytest.MonkeyPatch.context() as patch:
+        _calibration(patch, sampled)
+        data = oq.calibrate_oq_streaming(str(source), str(alone), 4, **_SETTINGS)
+    assert sampled and not data.reused
+    assert sorted(path.name for path in alone.parent.iterdir()) == [
+        "imatrix.npz",
+        "imatrix.npz.json",
+    ]
+    assert sorted(data.entries) == sorted(oq._load_oqe_imatrix(alone).entries)
+    # A plain run collects the same cache.
+    plain = tmp_path / "plain" / "imatrix.npz"
+    _quantize(source, tmp_path / "plain" / "oqe", imatrix_cache_path=str(plain))
+    (arrays, metadata), (their_arrays, their_metadata) = _cache(alone), _cache(plain)
+    assert sorted(arrays) == sorted(their_arrays)
+    assert all(np.array_equal(arrays[name], their_arrays[name]) for name in arrays)
+    assert metadata == their_metadata
+    # A run with a format reads the calibration, and samples nothing.
+    sampled.clear()
+    _, _, applied = _quantize(
+        source,
+        tmp_path / "oqe-toy",
+        sampled,
+        quant_format="toy",
+        imatrix_cache_path=str(alone),
+    )
+    assert sampled == [] and len(toy.encoded) == len(applied) > 0
+    report = json.loads((tmp_path / "oqe-toy" / "oq_imatrix_report.json").read_text())
+    assert report["cache_reused"] is True
+
+
+def test_a_calibration_alone_refuses_a_writer_of_its_own(tmp_path):
+    source = tmp_path / "v41"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "deepseek_v41"}))
+    with pytest.raises(ValueError) as refusal:
+        oq.calibrate_oq_streaming(str(source), str(tmp_path / "imatrix.npz"), 4)
+    assert str(refusal.value) == (
+        "oQ calibrates a deepseek_v41 checkpoint inside a writer of its own, "
+        "which takes no quant format"
+    )
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["v41"]
+
+
+def test_the_contract_page_shows_a_calibration_alone():
+    assert "calibrate_oq_streaming(source, cache, 4)" in _QUOTED
 
 
 def test_an_importance_may_be_the_entry_of_another_layer():
