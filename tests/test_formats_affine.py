@@ -184,6 +184,15 @@ def test_a_face_built_by_hand_is_one_the_transcription_has(bits, group_size):
         affine.face(bits, group_size, False, mx.bfloat16)
 
 
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("bits, group_size", [(7, 64), (4, 8), (4, 256)])
+def test_a_header_is_one_the_transcription_has(bits, group_size, fast):
+    """A kernel built over the header alone (the row-exact tiles) is refused
+    as a face is: not with a KeyError, nor with a group of no lanes."""
+    with pytest.raises(ValueError, match="no MLX transcription"):
+        affine.header(bits, group_size, fast)
+
+
 def test_no_face_for_a_group_size_mlx_does_not_quantize_to():
     linear = _linear(512, 16, 4, 64)
     linear.group_size = 16

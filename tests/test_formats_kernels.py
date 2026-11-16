@@ -700,15 +700,28 @@ def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
 
 
 @metal
-def test_a_lane_of_no_inputs_is_refused_in_words_and_nothing_else():
-    message = _error(_toy("no_inputs", source=_TOY.replace("VPT = 8;", "VPT = 0;")))
+@pytest.mark.parametrize("block", ["32 * VPT", "256"])
+def test_a_lane_of_no_inputs_is_refused_in_words_and_nothing_else(block):
+    source = _TOY.replace("VPT = 8;", "VPT = 0;").replace("32 * VPT", block)
+    message = _error(_toy(f"no_inputs_{block[:2]}", source=source))
     assert (
         "due to requirement 'Lanes<512>::VPT >= 1' "
         '"dot face: Lanes<K>::VPT must be one input or more"'
     ) in " ".join(message.split())
     assert "<omlx skeletons, docs/quant-formats.md>:" in message
-    # Nothing that divides by VPT or walks a lane's inputs is compiled.
+    # Nothing that multiplies or divides by VPT or walks a lane's inputs is
+    # compiled.
     assert message.count("error:") == 1
+
+
+@metal
+@pytest.mark.parametrize("k", [32, 20])
+def test_a_lane_of_one_input_computes_its_rows(k):
+    """The fewest inputs a lane may read: whole blocks, and a last block of
+    20 lanes."""
+    face = _toy("one_input", source=_TOY.replace("VPT = 8;", "VPT = 1;"))
+    operands, x, want = _matrix(8, k)
+    assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want).item()
 
 
 # A face's kernel is built once, under the revisions oMLX runs then: these

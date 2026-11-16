@@ -434,7 +434,7 @@ The messages quoted below are the compiler's for the example above with one mist
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:96:5: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:100:7: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
 <kernel>:5:5: note: in instantiation of function template specialization

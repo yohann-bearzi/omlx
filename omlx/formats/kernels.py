@@ -59,7 +59,8 @@ using omlx_iota = typename omlx_iota_<N>::type;
 # that sentence instead of computing garbage. The face's revision comes
 # first: the rest is compiled only for a face of a revision oMLX runs, so a
 # face of another one fails with that and nothing else. So for a lane of no
-# inputs (VPT): nothing that divides by VPT or walks a lane's inputs follows.
+# inputs (VPT): nothing that multiplies or divides by VPT or walks a lane's
+# inputs follows.
 _QMV_ROWS = r"""
 // One block of a lane: its VPT inputs against each row's weights.
 template <typename L, typename T, int... RA, int... RB>
@@ -142,13 +143,13 @@ METAL_FUNC void qmv_rows(
   if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
     using L = typename D::template Lanes<K>;
     static_assert(
-        L::BLOCK == 32 * L::VPT,
-        "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
-        "lanes");
-    static_assert(
         L::VPT >= 1,
         "dot face: Lanes<K>::VPT must be one input or more");
     if constexpr (L::VPT >= 1) {
+      static_assert(
+          L::BLOCK == 32 * L::VPT,
+          "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
+          "lanes");
       static_assert(
           K % L::VPT == 0,
           "dot face: K must be a whole number of a lane's VPT inputs");

@@ -151,6 +151,12 @@ def header(bits: int, group_size: int, fast: bool) -> str:
     """MLX's constants and ``load_vector`` for ``bits``-bit weights in groups
     of ``group_size`` on the ``qmv_fast`` (``fast``) or ``qmv`` traversal:
     the start of a kernel's source over MLX's affine layout."""
+    if bits not in _BITS or group_size not in _GROUP_SIZES:
+        # MLX does not quantize to another group size, and the transcription
+        # has no other bit width.
+        raise ValueError(
+            f"affine: no MLX transcription of {bits} bits in groups of {group_size}"
+        )
     return (
         (_CONSTANTS + _LOAD_FUNCTION.replace("__LOAD__", _LOAD[bits]))
         .replace("__N__", "VALUES_PER_THREAD")
@@ -238,16 +244,10 @@ struct Dot {
 def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     """The dot face of ``bits``-bit weights with ``group_size`` groups, as
     MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal."""
-    if bits not in _BITS or group_size not in _GROUP_SIZES:
-        # MLX does not quantize to another group size, and the transcription
-        # has no other bit width.
-        raise ValueError(
-            f"affine face: no MLX transcription of {bits} bits in groups of "
-            f"{group_size}"
-        )
+    source = header(bits, group_size, fast)
     key = f"affine_b{bits}g{group_size}{'f' if fast else 's'}"
     qdot = _QDOT_FUNCTION.replace("__QDOT__", _QDOT[bits])
-    source = header(bits, group_size, fast) + qdot.replace("__N__", "VALUES_PER_THREAD")
+    source += qdot.replace("__N__", "VALUES_PER_THREAD")
     return Dot(
         key=key,
         source=(

@@ -223,6 +223,16 @@ def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
     )
 
 
+@pytest.mark.parametrize("bits, group_size", [(7, 64), (4, 8)])
+def test_a_tile_is_built_only_for_a_width_mlx_has_code_for(bits, group_size):
+    weight = mx.zeros((8, 512 * bits // 32), mx.uint32)
+    scales = mx.zeros((8, 512 // group_size), mx.bfloat16)
+    with pytest.raises(ValueError, match="no MLX transcription"):
+        row_exact_qmv.OneRowQmv(
+            weight, scales, scales, bits, group_size, mx.bfloat16, 4
+        )
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
 @pytest.mark.parametrize("rps", [1, 2])
 def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):

@@ -381,12 +381,13 @@ def unrolled_tile_verified(shape: tuple, run, weights: list, bits: int, group_si
 def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> str:
     """The tile's source for one bit width: MLX's code for that width, and
     qmv_impl's last block in a qmv tile alone."""
+    start = header(bits, group_size, fast)  # refuses a width MLX has no code for
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
     last = "" if fast else _LOAD_SAFE.replace("__LOAD__", _LOAD[bits])
     decoded = _DECODED_DOT.replace("__DECODE__", _DECODE[bits])
     return (
         f"#define ROW_EXACT_UNROLL {unroll}\n"
-        + header(bits, group_size, fast)
+        + start
         + last.replace("__QDOT__", _QDOT[bits]).replace("__N__", "N")
         + decoded.replace("__WDOT__", _WDOT[bits])
         + _TILE.replace("__LAST_BLOCK__", "" if fast else _LAST_BLOCK)
