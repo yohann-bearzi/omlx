@@ -8387,6 +8387,17 @@ class TestQwen35TextCheckpoint:
         loaded, _ = load_model(output, strict=True)
         assert mx.isfinite(loaded(tokens[:1])).all().item()
 
+    def test_the_proxy_keeps_no_record_of_a_format_run(self, checkpoint, tmp_path):
+        source, _, _ = checkpoint
+        config = json.loads((source / "config.json").read_text())
+        config["omlx_quant_formats"] = {"toy": {"plugin": None, "contract": 1}}
+        config["omlx_verification"] = {"verified": False, "mode": "toy"}
+        (source / "config.json").write_text(json.dumps(config))
+        output = tmp_path / "proxy"
+        _build_streaming_proxy_for_sensitivity(str(source), output, dtype="bfloat16")
+        written = json.loads((output / "config.json").read_text())
+        assert not {"omlx_quant_formats", "omlx_verification"} & set(written)
+
     def test_proxy_output_reloads(self, checkpoint, tmp_path):
         from mlx_lm.utils import load_model
 

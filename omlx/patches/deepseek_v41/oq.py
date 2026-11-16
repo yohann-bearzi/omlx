@@ -22,6 +22,7 @@ from pathlib import Path
 import mlx.core as mx
 import numpy as np
 
+from ...model_discovery import SOURCE_RECORDS
 from .convert import iter_source_weights, source_engram_tables, strip_draft_config
 from .sharding import ShardWriter
 from .storage import TensorFile, decode_array
@@ -623,6 +624,8 @@ def quantize(
     if written_bytes != budget["remaining_weights"]["tensor_bytes"]:
         raise ValueError("Exported non-Engram bytes differ from the independent budget")
     config.pop("quantization_config", None)
+    for key in SOURCE_RECORDS:
+        config.pop(key, None)
     if not preserve_mtp:
         strip_draft_config(config)
     if text_only:

@@ -280,6 +280,8 @@ from omlx.oq import quantize_oq_streaming
 quantize_oq_streaming(source, output, 4, enhanced=True, quant_format="myformat")
 ```
 
+`quant_format` is the format's mode, or an object of the class registered for its mode: a plugin's command that fits its format to the model first (a table of levels, say) hands oQ the object it configured. oQ encodes with that object and stores its record; the load reads the record back through the registered format's `accept`. An object of another class, a subclass included, is refused: `quant format 'myformat' is registered as MyFormat, not OtherFormat: pass an object of the registered class`.
+
 `encode` returns the tensors that keep `w`, by name, in the shapes and dtypes that `layout(k, n, bits, group_size)` gives, or None for a matrix it leaves to oQ.
 
 - `w` is a matrix `(n, k)`, or some of a stack's matrices, `(e, n, k)`, in the floats of the source checkpoint. The tensors of a stack's matrices have its axis first.
@@ -321,7 +323,7 @@ What oQ writes:
   "omlx_quant_formats": {"myformat": {"plugin": "my-package 0.1.0", "contract": 1, "record": {"layout": 1}}}
   ```
 
-  `record()` gives what a checkpoint keeps of the format beside its layers: the revision of its layout, what the format needs to read its own checkpoints. It is a dict that JSON keeps as it is (string keys; strings, numbers, lists, dicts; no tuple, array or NaN), asked once for the whole checkpoint, and empty by default. oQ refuses another before it reads a weight: `quant format 'myformat' gives the record {'levels': (1, 2)}, not a dict that JSON keeps as it is: report it to the plugin`. The load hands it back to [`accept`](#load-a-checkpoint).
+  `record()` gives what a checkpoint keeps of the format beside its layers: the revision of its layout, what the format needs to read its own checkpoints. It is a dict that JSON keeps as it is (string keys; strings of UTF-8, finite numbers, lists, dicts; no tuple, array, NaN or infinity), asked once for the whole checkpoint, and empty by default. oQ stores it as it checked it: a record the format changes afterwards (while it encodes) is not what the checkpoint keeps. A source written in a format carries its own record in its config; oQ leaves it out of an output with no layer in a format. oQ refuses another before it reads a weight: `quant format 'myformat' gives the record {'levels': (1, 2)}, not a dict that JSON keeps as it is: report it to the plugin`. The load hands it back to [`accept`](#load-a-checkpoint).
 
 - A line in the log, `oQ4: 23 layers in quant format myformat`, or a warning when the format took none: `oQ4: quant format myformat took no layer: the output is as without it`.
 

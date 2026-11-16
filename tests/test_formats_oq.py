@@ -1228,11 +1228,12 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     output = tmp_path / "oqe-toy"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": record}}
-    # The load hands it back to the format, once.
-    assert toy.accepted == []
+    # The run hands it back to the format as the load does, before it
+    # reads a weight; the load, once.
+    assert toy.accepted == [record]
     maybe_apply_pre_load_patches(str(output))
     model, _ = load_model(output, strict=True)
-    assert toy.accepted == [record]
+    assert toy.accepted == [record, record]
     layers = [m for _, m in model.named_modules() if isinstance(m, FormatLinear)]
     # Read with the load's copy of the format, one for all of them.
     (read,) = {id(layer.fmt): layer.fmt for layer in layers}.values()
@@ -1251,9 +1252,20 @@ _CYCLE["self"] = _CYCLE
         {2: "layout"},
         {"levels": mx.ones((2,))},
         {"scale": float("nan")},
+        {"scale": float("inf")},
+        {"name": "\ud800"},
         _CYCLE,
     ],
-    ids=["no dict", "a tuple", "a key not a string", "an array", "a nan", "a cycle"],
+    ids=[
+        "no dict",
+        "a tuple",
+        "a key not a string",
+        "an array",
+        "a nan",
+        "an infinity",
+        "no utf-8",
+        "a cycle",
+    ],
 )
 def test_a_record_that_json_does_not_keep_is_refused(
     source, toy, tmp_path, monkeypatch, record
@@ -1271,6 +1283,195 @@ def test_a_record_that_json_does_not_keep_is_refused(
     if record == {"levels": (1, 2)}:
         assert _quoted(str(refusal.value))
     assert not output.exists() and toy.offered == []
+
+
+def test_a_checkpoint_keeps_the_record_as_it_was_checked(
+    source, toy, tmp_path, monkeypatch
+):
+    """A record the format changes after oQ asked for it (here, as it
+    encodes) is stored as it was when oQ checked it."""
+    record = {"layout": 2, "encoded": 0}
+    monkeypatch.setattr(toy, "record", lambda: record)
+
+    def answer(tensors, w):
+        record["encoded"] += 1
+        return tensors
+
+    toy.answer = answer
+    _, config, _ = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
+    assert record["encoded"] > 0
+    assert config[_RECORD]["toy"]["record"] == {"layout": 2, "encoded": 0}
+
+
+def test_oq_writes_with_a_format_object_of_the_registered_class(
+    source, toy, tmp_path, monkeypatch
+):
+    """A plugin's command hands oQ its configured object (a fitted table):
+    oQ encodes with that object and stores its record, under its mode and
+    with its plugin."""
+    monkeypatch.setitem(formats._ORIGINS, "toy", "toy-plugin 0.1")
+    fitted = _Codec()
+    fitted.record = lambda: {"levels": [-2, 1]}
+    tensors, config, applied = _quantize(
+        source, tmp_path / "oqe-fitted", quant_format=fitted
+    )
+    assert len(fitted.encoded) == len(applied) and toy.encoded == []
+    assert config[_RECORD] == {
+        "toy": {
+            "plugin": "toy-plugin 0.1",
+            "contract": 1,
+            "record": {"levels": [-2, 1]},
+        }
+    }
+    assert sorted(_in_format(config)) == applied
+
+
+class _Fitted(_Codec):
+    """A subclass of the registered class: another accept() at load."""
+
+
+def test_a_format_object_of_another_class_is_refused(source, toy, tmp_path):
+    output = tmp_path / "refused"
+    for given, name in ((_ToyFormat(), "_ToyFormat"), (_Fitted(), "_Fitted")):
+        with pytest.raises(ValueError) as refusal:
+            oq.quantize_oq_streaming(
+                str(source), str(output), 4, enhanced=True, quant_format=given
+            )
+        assert str(refusal.value) == (
+            f"quant format 'toy' is registered as _Codec, not {name}: pass an "
+            "object of the registered class"
+        )
+    unregistered = _Codec()
+    unregistered.mode = "lloyd"
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format=unregistered
+        )
+    assert str(refusal.value) == (
+        "no quant format is registered for mode 'lloyd': install its plugin"
+    )
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(str(source), str(output), 4, quant_format=toy)
+    assert str(refusal.value) == (
+        "quant format 'toy' encodes with oQe's importance: pass enhanced=True"
+    )
+    assert not output.exists() and toy.offered == []
+
+
+@pytest.mark.parametrize(
+    "configured,words",
+    [
+        (
+            {"tensors": ("scales", "extra")},
+            "quant format 'toy' is configured with tensors ('scales', 'extra') at "
+            "contract 1, registered with ('scales',) at 1: the checkpoint would not "
+            "load; report it to the plugin",
+        ),
+        (
+            {"contract": 2},
+            "quant format 'toy' is configured with tensors ('scales',) at contract 2, "
+            "registered with ('scales',) at 1: the checkpoint would not load; report "
+            "it to the plugin",
+        ),
+    ],
+)
+def test_a_configured_object_that_would_not_load_is_refused(
+    source, toy, tmp_path, configured, words
+):
+    fitted = _Codec()
+    for name, value in configured.items():
+        setattr(fitted, name, value)
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format=fitted
+        )
+    assert str(refusal.value) == words
+    assert not output.exists() and fitted.offered == toy.offered == []
+
+
+@pytest.mark.parametrize("kind", ["raises", "configures", "returns"])
+def test_a_record_the_registered_format_does_not_read_is_refused(
+    source, toy, tmp_path, monkeypatch, kind
+):
+    """Before a weight is read: as the load would refuse it."""
+
+    def accept(record):
+        if kind == "raises":
+            raise ValueError("no layout 2")
+        if kind == "configures":
+            toy.levels = (1, 2)
+            return None
+        return "levels"
+
+    monkeypatch.setattr(toy, "accept", accept)
+    words = {
+        "raises": "quant format 'toy' refuses the record it gives (no layout 2): "
+        "the checkpoint would not load; report it to the plugin",
+        "configures": "quant format 'toy''s accept changes the registered format to "
+        "read the record: the checkpoint would not load; report it to the plugin",
+        "returns": "quant format 'toy''s accept returns 'levels' for the record it "
+        "gives: the checkpoint would not load; report it to the plugin",
+    }[kind]
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format="toy"
+        )
+    assert str(refusal.value) == words
+    assert not output.exists() and toy.offered == []
+
+
+@pytest.mark.parametrize("loads", ["none", "other"])
+def test_a_configured_object_laid_out_otherwise_than_it_loads_stops_the_run(
+    source, toy, tmp_path, loads
+):
+    """The registered format lays out none of a matrix the configured object
+    lays out, or the object its accept returns another layout."""
+    fitted = _Codec()
+    if loads == "none":
+        # Though the object its accept returns would lay it out.
+        toy.lays_out = False
+        toy.accept = lambda record: _Codec()
+    else:
+        reader = _Codec()
+        reader.layout = lambda k, n, bits, gs: {
+            "weight": ((n, k), mx.uint8),
+            "scales": ((n,), mx.float16),
+        }
+        toy.accept = lambda record: reader
+    with pytest.raises(ValueError) as refusal:
+        _quantize(source, tmp_path / "stopped", quant_format=fitted)
+    said = str(refusal.value)
+    assert said.startswith("quant format 'toy' lays out ") and said.endswith(
+        "the checkpoint would not load; report it to the plugin"
+    )
+    assert fitted.encoded == []
+
+
+def test_the_contract_page_says_a_format_object_is_taken():
+    assert "an object of the class registered for its mode" in _QUOTED
+    assert "pass an object of the registered class" in _QUOTED
+
+
+def test_a_record_a_source_carries_is_not_kept_without_its_layers(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    """A source written in a format carries its record; an output with no
+    layer in a format does not."""
+    carried = tmp_path / "carried"
+    carried.mkdir()
+    for path in source.iterdir():
+        (carried / path.name).symlink_to(path)
+    config = json.loads((source / "config.json").read_text())
+    config[_RECORD] = {"toy": {"plugin": None, "contract": 1, "record": {}}}
+    (carried / "config.json").unlink()
+    (carried / "config.json").write_text(json.dumps(config))
+    _, written, _ = _quantize(carried, tmp_path / "oqe")
+    assert _RECORD not in written
+    toy.lays_out = False
+    _, written, _ = _quantize(carried, tmp_path / "oqe-none", quant_format="toy")
+    assert _RECORD not in written
 
 
 def test_an_importance_may_be_the_entry_of_another_layer():
@@ -1900,8 +2101,13 @@ def test_the_walk_is_of_the_config_the_run_writes(source, toy, tmp_path, monkeyp
         (changed / item.name).write_bytes(item.read_bytes())
     config = json.loads((source / "config.json").read_text())
     extra = {"torch_dtype": "bfloat16", "n_mtp_layers": 1}
+    # And the records of the run that wrote it, which the walk does not read.
+    carried = {
+        _RECORD: {"lloyd": {"plugin": None, "contract": 1, "record": {}}},
+        _VERIFICATION: {"verified": True, "mode": "lloyd", "verify_version": 0},
+    }
     (changed / "config.json").write_text(
-        json.dumps({**config, **extra, "image_token_id": 5})
+        json.dumps({**config, **extra, **carried, "image_token_id": 5})
     )
     walk = oq._module_classes
     given = []

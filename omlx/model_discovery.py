@@ -1456,6 +1456,13 @@ def model_directory_write_error(path: Path, *, create: bool = False) -> str | No
     return None
 
 
+VERIFICATION = "omlx_verification"
+# A checkpoint's records of the run in a quant format that wrote it: what
+# reads its layers, and its verification. A checkpoint written from it
+# keeps neither.
+SOURCE_RECORDS = ("omlx_quant_formats", VERIFICATION)
+
+
 def _iter_readable_entries(path: Path, context: str) -> list[Path]:
     """Return sorted directory entries, or an empty list when scanning fails."""
     try:

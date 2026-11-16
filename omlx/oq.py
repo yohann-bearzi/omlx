@@ -64,6 +64,7 @@ from omlx.model_discovery import (
     DECISION_SIDECAR_FILES,
     DECISION_SIDECAR_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
+    SOURCE_RECORDS,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
@@ -7041,6 +7042,64 @@ def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
     return said
 
 
+def _format_reader(registered, record):
+    """The object a load reads a checkpoint of ``registered``'s mode with:
+    what its accept returns for ``record`` (None: itself), checked as the
+    load checks it, before a weight is read."""
+    from . import formats
+
+    mode = registered.mode
+    kept = dict(getattr(registered, "__dict__", {}))
+    try:
+        read = registered.accept(record)
+    except ValueError as error:
+        raise ValueError(
+            f"quant format {mode!r} refuses the record it gives ({error}): the "
+            "checkpoint would not load; report it to the plugin"
+        ) from error
+    now = getattr(registered, "__dict__", {})
+    if any(kept.get(name, kept) is not now.get(name, kept) for name in kept | now):
+        raise ValueError(
+            f"quant format {mode!r}'s accept changes the registered format to "
+            "read the record: the checkpoint would not load; report it to the plugin"
+        )
+    read = registered if read is None else read
+    if not (
+        isinstance(read, formats.QuantFormat)
+        and (read.mode, read.tensors, read.contract)
+        == (mode, registered.tensors, registered.contract)
+    ):
+        raise ValueError(
+            f"quant format {mode!r}'s accept returns {read!r} for the record it "
+            "gives: the checkpoint would not load; report it to the plugin"
+        )
+    return read
+
+
+def _loads_as_laid_out(fmt, reader, tensor_name, shape, bits, group_size):
+    """Stop the run when ``fmt`` lays out the matrix ``tensor_name`` of
+    ``shape`` otherwise than its checkpoint loads it: the registered format
+    lays out none, or ``reader`` (the object its accept returns for the
+    record) another layout."""
+    from . import formats
+
+    registered = formats.get(fmt.mode)
+    if fmt is reader is registered:
+        # The registered format reads what it lays out.
+        return
+    n, k = shape[-2:]
+    laid_out = fmt.layout(k, n, bits, group_size)
+    loads = None
+    if registered.layout(k, n, bits, group_size) is not None:
+        loads = reader.layout(k, n, bits, group_size)
+    if loads != laid_out:
+        raise ValueError(
+            f"quant format {fmt.mode!r} lays out {tensor_name} ({n}, {k}) as "
+            f"{laid_out}, and its checkpoint loads it as {loads}: the checkpoint "
+            "would not load; report it to the plugin"
+        )
+
+
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
@@ -7241,7 +7300,7 @@ def quantize_oq_streaming(
     sensitivity_map_override: dict[int | str, float] | None = None,
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
-    quant_format: str | None = None,
+    quant_format: Any = None,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -7317,7 +7376,8 @@ def quantize_oq_streaming(
             plain weights. DeepSeek V4.1 keeps its Engram tables in the
             official FP8 storage instead of 4-bit affine. No effect on other
             model types.
-        quant_format: The mode of a registered quant format
+        quant_format: The mode of a registered quant format, or an object
+            of the class registered for its mode, configured by a plugin
             (docs/quant-formats.md). Each matrix that oQe has an importance
             for is offered to the format, at the bits and group size oQ
             gives it, and is written as the format's tensors under the
@@ -7335,34 +7395,66 @@ def quantize_oq_streaming(
     if quant_format is not None:
         from . import formats
 
+        given = isinstance(quant_format, formats.QuantFormat)
+        mode = quant_format.mode if given else quant_format
         if not enhanced:
             raise ValueError(
-                f"quant format {quant_format!r} encodes with oQe's importance: "
+                f"quant format {mode!r} encodes with oQe's importance: "
                 "pass enhanced=True"
             )
-        if formats._mlx_runs(quant_format):
+        if formats._mlx_runs(mode):
             # Its checkpoint would record a format of a mode MLX's layers
             # take, which a load refuses: MLX's modes are written as MLX's.
             raise ValueError(
-                f"quant format {quant_format!r} is one of MLX's own modes: oQ "
+                f"quant format {mode!r} is one of MLX's own modes: oQ "
                 "writes it without a quant format"
             )
-        quant_fmt = formats.get(quant_format)
+        quant_fmt = formats.get(mode)
         if quant_fmt is None:
             raise ValueError(
-                f"no quant format is registered for mode {quant_format!r}: "
+                f"no quant format is registered for mode {mode!r}: "
                 "install its plugin"
             )
+        if given:
+            # A plugin's object, configured (a fitted table): of the class
+            # whose accept() reads the record back at load.
+            if type(quant_format) is not type(quant_fmt):
+                raise ValueError(
+                    f"quant format {mode!r} is registered as "
+                    f"{type(quant_fmt).__name__}, not {type(quant_format).__name__}: "
+                    "pass an object of the registered class"
+                )
+            if (quant_format.tensors, quant_format.contract) != (
+                quant_fmt.tensors,
+                quant_fmt.contract,
+            ):
+                raise ValueError(
+                    f"quant format {mode!r} is configured with tensors "
+                    f"{quant_format.tensors} at contract {quant_format.contract}, "
+                    f"registered with {quant_fmt.tensors} at {quant_fmt.contract}: "
+                    "the checkpoint would not load; report it to the plugin"
+                )
+            registered, quant_fmt = quant_fmt, quant_format
+        else:
+            registered = quant_fmt
         quant_record = quant_fmt.record()
         try:
-            kept = json.loads(json.dumps(quant_record))
+            # What config.json stores: strict JSON, in UTF-8.
+            text = json.dumps(quant_record, allow_nan=False, ensure_ascii=False)
+            kept = json.loads(text.encode("utf-8"))
         except (TypeError, ValueError):
             kept = None
         if not isinstance(quant_record, dict) or kept != quant_record:
             raise ValueError(
-                f"quant format {quant_format!r} gives the record {quant_record!r}, "
+                f"quant format {mode!r} gives the record {quant_record!r}, "
                 "not a dict that JSON keeps as it is: report it to the plugin"
             )
+        # The checked copy: a record the format changes later is not stored.
+        quant_record = kept
+        # What lays the checkpoint's matrices out when it loads: the
+        # registered format says whether it lays one out, the object its
+        # accept() returns for this record lays it out.
+        reader = _format_reader(registered, copy.deepcopy(quant_record))
 
     source = Path(model_path)
     output = Path(output_path)
@@ -7419,7 +7511,7 @@ def quantize_oq_streaming(
             raise FormatRefusedError(
                 f"oQ writes no {refused[0]} checkpoint in it: {refused[1]}; write "
                 f"it without a quant format, or {fix}",
-                mode=quant_format,
+                mode=quant_fmt.mode,
             )
         # Some checkpoints declare the native reader as their model type;
         # others declare its ordinary backbone and ship the decision head.
@@ -7430,7 +7522,7 @@ def quantize_oq_streaming(
             raise FormatRefusedError(
                 f"oQ writes no {native} checkpoint in a quant format: its native "
                 "reader cannot load format layers; write it without a quant format",
-                mode=quant_format,
+                mode=quant_fmt.mode,
             )
     if inkling2_layout.is_inkling2(config):
         # The model class is needed before any calibration load registers it.
@@ -8194,6 +8286,9 @@ def quantize_oq_streaming(
                             if grouped:
                                 unwalked.append(base)
                         elif held[1]:
+                            _loads_as_laid_out(
+                                quant_fmt, reader, tensor_name, shape, bits, gs
+                            )
                             encoded = _encode_in_format(
                                 quant_fmt, tensor_name, w_mx, importance, bits, gs
                             )
@@ -8422,17 +8517,21 @@ def quantize_oq_streaming(
         quant_info[key] = val
     output_config["quantization"] = quant_info
     output_config["quantization_config"] = quant_info
+    # A source's own records (a checkpoint written in a format) read layers
+    # this output does not have, and tell of another run's verification.
+    for key in SOURCE_RECORDS:
+        output_config.pop(key, None)
     if format_layers:
         logger.info(
             "oQ%s: %d layers in quant format %s",
             f"{oq_level:g}",
             format_layers,
-            quant_format,
+            quant_fmt.mode,
         )
         # What a loader needs installed to read them.
         output_config["omlx_quant_formats"] = {
-            quant_format: {
-                "plugin": formats.origin(quant_format),
+            quant_fmt.mode: {
+                "plugin": formats.origin(quant_fmt.mode),
                 "contract": quant_fmt.contract,
                 "record": quant_record,
             }
@@ -8441,7 +8540,7 @@ def quantize_oq_streaming(
         logger.warning(
             "oQ%s: quant format %s took no layer: the output is as without it",
             f"{oq_level:g}",
-            quant_format,
+            quant_fmt.mode,
         )
     if unloaded or unwalked:
         logger.warning(_left_affine(f"{oq_level:g}", unloaded, unwalked))
@@ -11572,7 +11671,7 @@ def _written_layout(
     token from the tokenizer): the writer's own steps on a copy of
     ``config``, with ``quantization``, the run's own, as its quantization."""
     written = copy.deepcopy(config)
-    for key in _OQ_RUN_KEYS:
+    for key in (*_OQ_RUN_KEYS, *SOURCE_RECORDS):
         written.pop(key, None)
     if text_only:
         _normalize_text_only_in_config(written)
@@ -12607,6 +12706,7 @@ def _build_streaming_proxy_for_sensitivity(
         "_oq_use_budget_plan",
         "_oq_non_quantizable",
         "_oq_imatrix_capture_skip",
+        *SOURCE_RECORDS,
     ):
         output_config.pop(temp_key, None)
     if not preserve_mtp:

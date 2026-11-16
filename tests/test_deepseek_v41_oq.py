@@ -577,6 +577,11 @@ def test_official_oq3_streams_affine_weights_and_unified_engram(
             engram_head_dim=32,
             engram_compressed_vocab_size=64,
         )
+        # The records of a run in a format, which the output does not keep.
+        carried = json.loads((source / "config.json").read_text())
+        carried["omlx_quant_formats"] = {"toy": {"plugin": None, "contract": 1}}
+        carried["omlx_verification"] = {"verified": True, "mode": "toy"}
+        (source / "config.json").write_text(json.dumps(carried))
         name = "language_model.layers.0.attn.wq_a"
         weight = original.language_model.layers[0].attn.wq_a.weight
         received = {}
@@ -632,6 +637,7 @@ def test_official_oq3_streams_affine_weights_and_unified_engram(
         assert received["imatrix_cache_path"] == "selected-cache"
         assert received["sensitivity_model_path"] == "selected-proxy"
         config = json.loads((output / "config.json").read_text())
+        assert not {"omlx_quant_formats", "omlx_verification"} & set(config)
         spec = config["omlx_deepseek_v41"]
         assert spec["quantized_modules"][name]["bits"] == 3
         assert spec["quantized_modules"][name]["quantize_input"] is False
