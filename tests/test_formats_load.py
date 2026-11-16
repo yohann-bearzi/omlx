@@ -2842,8 +2842,9 @@ def test_the_cluster_s_loads_read_their_records(levels, tmp_path):
 
     model, _ = _local_sharded_load(str(_tiny(tmp_path / "rank", [11.0])))
     assert _gate_proj(model).fmt.levels == (11.0,)
-    # Whether a tiny Llama shards or not: its layers were read.
-    with contextlib.suppress(ValueError):
+    # Whether a tiny Llama shards or not (tensor parallelism refuses a
+    # model with a format layer): its layers were read.
+    with contextlib.suppress(ValueError, RuntimeError):
         progressive_sharded_load(str(_tiny(tmp_path / "progressive", [12.0])))
     assert levels()[1] == (12.0,)
 

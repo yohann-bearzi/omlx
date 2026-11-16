@@ -883,6 +883,24 @@ def _shard_muse_spark(
     _shard_layers(list(model.layers), shard_layer, mx, progress, MUSE_SPARK)
 
 
+def _refuse_format_layers(model: Any) -> None:
+    """Refuse a model that holds a quant format's layer, naming the first:
+    no strategy splits a format's tensors. A model is walked through its
+    ``named_modules`` (an ``nn.Module``'s)."""
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+    from ..formats.linear import FormatLinear, FormatSwitchLinear
+
+    for name, module in named_modules():
+        if isinstance(module, (FormatLinear, FormatSwitchLinear)):
+            raise RuntimeError(
+                f"tensor parallelism cannot shard {name}: a layer of quant "
+                f"format {module.mode!r}, which no strategy splits; serve this "
+                "model on one machine"
+            )
+
+
 def apply_tensor_strategy(
     model: Any,
     group: Any,
@@ -890,8 +908,12 @@ def apply_tensor_strategy(
     mx_module: Any,
     progress: ProgressCallback | None = None,
 ) -> str:
-    """Shard ``model`` with the registered adapter or its native implementation."""
+    """Shard ``model`` with the registered adapter or its native implementation.
 
+    A model that holds a quant format's layer is refused: no strategy splits
+    a format's tensors."""
+
+    _refuse_format_layers(model)
     model_type = _model_type(model)
     adapter = _ADAPTERS.get(model_type)
     if adapter is not None:

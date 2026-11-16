@@ -11,15 +11,21 @@ forward.
 from __future__ import annotations
 
 import copy
+import re
+from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from mlx_lm.models.switch_layers import SwitchLinear
 
+from omlx import formats
 from omlx.cluster.tensor_strategies import (
     _shard_switch_mlp_uneven,
     _uneven_group_ranges,
+    apply_tensor_strategy,
 )
+from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 
 
 @pytest.mark.parametrize(
@@ -118,3 +124,48 @@ def test_uneven_switch_mlp_shard_shapes():
     assert rank1.fc2.weight.shape[-1] == 112
     # No dropped groups.
     assert rank0.fc2.scales.shape[-1] + rank1.fc2.scales.shape[-1] == 29
+
+
+class _ToyFormat(formats.QuantFormat):
+    mode, tensors, contract = "toy", ("scales",), formats.CONTRACT
+
+
+@pytest.mark.parametrize(
+    "model_type,stacked",
+    [("qwen3_5", True), ("native_test", False)],
+)
+def test_a_model_with_a_format_layer_is_refused_with_the_layer_and_its_mode(
+    monkeypatch, model_type, stacked
+):
+    """No strategy splits a format's tensors: the model is not sharded."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat())
+    shards = []
+    if stacked:
+        tensors = {"weight": mx.zeros((4, 8, 64), mx.uint8), "scales": mx.zeros((4, 8))}
+        layer = FormatSwitchLinear("toy", 8, 1, 64, tensors)
+    else:
+        tensors = {"weight": mx.zeros((8, 64), mx.uint8), "scales": mx.zeros((8,))}
+        layer = FormatLinear("toy", 8, 1, 64, tensors)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model_type = model_type
+            block = nn.Module()
+            block.dense = nn.Linear(64, 8)
+            block.experts = layer
+            self.layers = [block]
+
+        def shard(self, group):
+            for block in self.layers:
+                shards.append(block)
+
+    model = Model()
+    words = (
+        "tensor parallelism cannot shard layers.0.experts: a layer of quant "
+        "format 'toy'"
+    )
+    with pytest.raises(RuntimeError, match=re.escape(words)):
+        apply_tensor_strategy(model, SimpleNamespace(), mx_module=mx)
+    assert not shards and model.layers[0].experts is layer
