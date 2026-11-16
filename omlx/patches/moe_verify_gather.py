@@ -198,8 +198,9 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
     the block is outside this kernel (its rows, indices that are not integers
-    or not top_k of them for each row of x, fewer than 8 values of x, 2- or
-    3-bit affine experts outside MANY_EXPERTS and FEW_PAIRS), a
+    or not top_k >= 1 of them for each row of x, x that is not float16,
+    bfloat16 or float32 or has fewer than 8 values, 2- or 3-bit affine
+    experts outside MANY_EXPERTS and FEW_PAIRS), a
     projection has no dot face that is exact for ``x``'s dtype, the
     activation gives another dtype than ``x``'s or another shape than the
     up's, or a block of these faces and shapes failed.
@@ -207,7 +208,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     The first block of each Metal proves it on a stand-in (``_stand_in``):
     nothing of the call is evaluated here. Any of its arrays may belong to a
     function that MLX traces, and what fails in x, the indices, a tensor or
-    the activation is raised where the caller evaluates the result.
+    the activation's arrays is raised where the caller evaluates the result.
+    The activation itself runs in the call: what it raises, the call raises.
     """
     if x.ndim != 3 or indices.ndim != 3:
         return None
@@ -236,9 +238,10 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     metal = (rows, top_k, x.dtype, indices.dtype)
     if metal not in plan.proof.ran and (
         # MLX binds an input of fewer than 8 values as constants, and the
-        # kernel reads x from device memory; like gather_qmm, it reads
-        # integer indices only.
+        # kernel reads x from device memory; like gather_qmm, it takes float
+        # activations of the GPU and integer indices only.
         top_k < 1
+        or x.dtype not in (mx.float16, mx.bfloat16, mx.float32)
         or (plan.pairs is not None and rows * top_k > plan.pairs)
         or rows * width < 8
         or not mx.issubdtype(indices.dtype, mx.integer)

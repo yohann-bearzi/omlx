@@ -269,8 +269,11 @@ def test_a_block_outside_the_kernel_is_left_to_the_composed_route():
         (x[None], indices),
         (x, indices[0]),
         (x, indices[..., 0]),
+        (x, indices[None]),
         (x, indices[:, :2]),  # not one row of experts for each row of x
+        (x, _block(1, 4)[1]),
         (x, mx.concatenate([indices, indices], axis=0)),
+        (_block(2, 3)[0], indices),
     )
     for block in others:
         assert gather.fused_switch(switch, *block) is None
@@ -404,6 +407,34 @@ def test_a_format_oMLX_does_not_know_runs_the_route(toy):  # noqa: N802
         assert np.array_equal(np.array(got).reshape(rows * 3, 40), want)
     (proof,) = _proofs()
     assert len(proof.ran) == gather.MAX_ROWS - 1 and not proof.failed
+
+
+def test_a_row_of_one_expert_runs_the_route(toy):
+    toy(_toy("one_expert"))
+    switch = _ToySwitch(k=320, inter=72, n=40)
+    x, indices = _toy_block(switch, 3, top_k=1)
+    got = gather.fused_switch(switch, x, indices)
+    experts = np.array(indices).reshape(-1)
+    gate, up = np.split(switch.gate_up_proj.rows(experts, np.array(x[0])), 2, axis=-1)
+    want = switch.down_proj.rows(experts, switch.activation(up, gate))
+    assert np.array_equal(np.array(got).reshape(3, 40), want)
+
+
+def test_x_that_is_not_a_float_of_the_gpu_is_left_to_the_composed_route(toy):
+    """Like gather_qmm, the block takes float16, bfloat16 or float32
+    activations. A face of no stated dtypes is exact for any: the others are
+    the caller's, refused before the proof (a stand-in of float64 zeros
+    cannot even be made on the GPU)."""
+    toy(_toy("any_dtype"))
+    switch = _ToySwitch(k=320, inter=72, n=40)
+    x, indices = _toy_block(switch, 3)
+    for dtype in (mx.int32, mx.bool_, mx.complex64):
+        assert gather.fused_switch(switch, x.astype(dtype), indices) is None
+    with mx.stream(mx.cpu):
+        assert gather.fused_switch(switch, x.astype(mx.float64), indices) is None
+    (proof,) = _proofs()
+    assert not proof.ran and not proof.failed
+    assert gather.fused_switch(switch, x, indices) is not None
 
 
 def test_an_activation_of_another_dtype_or_shape_leaves_the_block_composed(
