@@ -16,7 +16,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 from mlx.utils import tree_flatten
-from mlx_lm.models import qwen3_5_moe, qwen3_next
+from mlx_lm.models import llama, qwen3_5_moe, qwen3_next
 from mlx_lm.models import switch_layers as lm_switch
 from mlx_lm.utils import load_model
 from tokenizers import Tokenizer
@@ -24,6 +24,7 @@ from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from omlx import formats, oq
+from omlx.cluster import autoconfigure
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches.format_load import loads_in_format
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
@@ -39,6 +40,23 @@ _QUOTED = " ".join(_PAGE.split())
 
 def _quoted(message, name="toy"):
     return message.replace(name, "myformat") in _QUOTED
+
+
+# The families verified with quant formats, as this oMLX ships them.
+_VERIFIED = getattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset())
+
+
+@pytest.fixture(autouse=True)
+def verified(monkeypatch):
+    """The toy checkpoint's family taken as verified: oMLX patches Qwen3.5
+    MoE on an mlx-vlm load, and oQ writes a family it patches in a format
+    only once the family is verified."""
+    monkeypatch.setattr(
+        oq,
+        "_QUANT_FORMAT_VERIFIED",
+        frozenset({"qwen3_5_moe_text"}),
+        raising=False,
+    )
 
 
 class _Codec(_ToyFormat):
@@ -568,7 +586,7 @@ def test_a_model_with_a_writer_of_its_own_takes_no_format(toy, tmp_path, model_t
         )
     assert str(refusal.value) == (
         f"oQ writes a {model_type} checkpoint through a writer of its own, "
-        "which takes no quant format"
+        "which takes no quant format; write it without a quant format"
     )
     # The page quotes it of one of the two.
     assert str(refusal.value).replace(model_type, "deepseek_v41") in _QUOTED
@@ -714,14 +732,66 @@ _GLM5_NEXT = (
 )
 
 
+_DEEPSEEK_V4 = "its DSpark draft reads the output head's weight by hand, as floats"
+# What the page quotes in place of a family's name, and of what oMLX runs
+# for it.
+_PAGE_FAMILY = {
+    "omlx.patches.mlx_vlm_unlimited_ocr_compat": "omlx.patches.step3p7",
+    "omlx.patches.llama4_attention": "omlx.patches.step3p7",
+    "(omlx.models)": "(omlx.patches.step3p7)",
+    "glm5_next_text": "glm5_next",
+    "deepseek_v4_mtp": "deepseek_v4",
+    "no unlimited_ocr": "no step3p7",
+    "no llama4": "no step3p7",
+    "no d1": "no step3p7",
+}
+_OWN_CODE = (
+    "oMLX serves it with code of its own ({}), not verified with quant formats yet"
+)
+
+
 @pytest.mark.parametrize(
     "family, config, why",
     [
         ("glm5_next", {"model_type": "glm5_next"}, _GLM5_NEXT),
         (
             "glm5_next_text",
-            {"model_type": "glm5", "text_config": {"model_type": "glm5_next_text"}},
+            {"model_type": "glm5", "text_config": {"model_type": "GLM5-Next-Text"}},
             _GLM5_NEXT,
+        ),
+        (
+            "raon1_mini",
+            {"model_type": "raon1_mini"},
+            "its merged gate and up projection is sliced by hand on a prefill, as "
+            "MLX's quantized layer or as floats",
+        ),
+        ("deepseek_v4", {"model_type": "deepseek_v4"}, _DEEPSEEK_V4),
+        ("deepseek_v4_mtp", {"model_type": "deepseek_v4_mtp"}, _DEEPSEEK_V4),
+        (
+            "glm_moe_dsa",
+            {"model_type": "glm_moe_dsa"},
+            "its indexer fuses its projections' 8-bit affine layers by hand, and "
+            "refuses a load where one of them is a format's",
+        ),
+        (
+            "step3p7",
+            {"model_type": "step3p7"},
+            _OWN_CODE.format("omlx.patches.step3p7"),
+        ),
+        (
+            "unlimited_ocr",
+            {"model_type": "unlimited-ocr"},
+            _OWN_CODE.format("omlx.patches.mlx_vlm_unlimited_ocr_compat"),
+        ),
+        (
+            "llama4",
+            {"model_type": "llama4_vl", "text_config": {"model_type": "llama4"}},
+            _OWN_CODE.format("omlx.patches.llama4_attention"),
+        ),
+        (
+            "d1",
+            {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
+            _OWN_CODE.format("omlx.models"),
         ),
         (
             "clef",
@@ -737,9 +807,22 @@ _GLM5_NEXT = (
             "hand, as MLX's quantized layer or as floats",
         ),
     ],
-    ids=["model type", "text model type", "decision family", "inkling2"],
+    ids=[
+        "model type",
+        "text model type",
+        "raon1_mini",
+        "deepseek_v4",
+        "deepseek_v4_mtp",
+        "glm_moe_dsa",
+        "patched",
+        "patched, spelled with a hyphen",
+        "patched for its text model",
+        "decision model",
+        "decision family",
+        "inkling2",
+    ],
 )
-def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
+def test_a_family_omlx_patches_and_formats_are_not_verified_with_is_refused(
     toy, tmp_path, family, config, why
 ):
     source = tmp_path / "source"
@@ -757,8 +840,128 @@ def test_a_family_that_reads_a_format_s_layer_wrongly_is_refused(
         f"oQ writes no {family} checkpoint in quant format 'toy': {why}; write it "
         "without a quant format"
     )
-    assert _quoted(str(refusal.value).replace("glm5_next_text", "glm5_next"))
+    # The page quotes it, of the same family or one of its kind.
+    said = str(refusal.value)
+    for spelled, quoted in _PAGE_FAMILY.items():
+        said = said.replace(spelled, quoted)
+    assert _quoted(said)
     assert not output.exists() and toy.offered == []
+
+
+def test_no_family_omlx_patches_is_verified_with_formats_yet(
+    source, toy, tmp_path, monkeypatch
+):
+    assert not _VERIFIED
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", _VERIFIED, raising=False)
+    # Qwen3.8 Flash-Next enters with the run that verifies it.
+    flash = tmp_path / "flash-next"
+    flash.mkdir()
+    (flash / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    for checkpoint, family in ((flash, "qwen4_exp"), (source, "qwen3_5_moe_text")):
+        with pytest.raises(ValueError) as refusal:
+            oq.quantize_oq_streaming(
+                str(checkpoint),
+                str(tmp_path / family),
+                4,
+                enhanced=True,
+                quant_format="toy",
+            )
+        patches = ", ".join(autoconfigure.family_patches({family}))
+        assert str(refusal.value) == (
+            f"oQ writes no {family} checkpoint in quant format 'toy': "
+            f"{_OWN_CODE.format(patches)}; write it without a quant format"
+        )
+        assert patches and not (tmp_path / family).exists()
+    assert toy.offered == []
+
+
+def test_which_families_omlx_patches_is_read_from_its_pre_load_dispatch(
+    tmp_path, monkeypatch
+):
+    family_patches = autoconfigure.family_patches
+    assert family_patches({"step3p7"}) == ("omlx.patches.step3p7",)
+    # On either library's load, a test of the type or of its prefix.
+    assert "omlx.patches.mlx_vlm_qwen4_exp_compat" in family_patches({"qwen4_exp"})
+    assert family_patches({"qwen3_5_moe_text"}) == (
+        "omlx.patches.mlx_vlm_mtp",
+        "omlx.patches.qwen3_6_nested_visual",
+    )
+    assert family_patches({"llama", "qwen3", "gemma3"}) == ()
+    # A branch added to the dispatcher is a family oMLX patches.
+    dispatcher = tmp_path / "model_loading.py"
+    dispatcher.write_text(textwrap.dedent("""
+            def maybe_apply_pre_load_patches(model_name):
+                from ..patches.format_load import apply_format_load_patch
+                if model_type == "llama":
+                    from ..patches.llama_fix import apply_llama_fix_patch
+            """))
+    monkeypatch.setattr(autoconfigure, "_DISPATCHER", dispatcher)
+    autoconfigure._dispatch_rules.cache_clear()
+    try:
+        assert family_patches({"llama"}) == ("omlx.patches.llama_fix",)
+        # One it cannot read tells no model from one oMLX patches.
+        dispatcher.unlink()
+        autoconfigure._dispatch_rules.cache_clear()
+        with pytest.raises(RuntimeError, match="cannot read the pre-load patch"):
+            family_patches({"llama"})
+    finally:
+        monkeypatch.undo()
+        autoconfigure._dispatch_rules.cache_clear()
+
+
+@pytest.fixture(scope="module")
+def llama_source(tmp_path_factory):
+    """A tiny Llama checkpoint in bfloat16: a model oMLX serves with mlx-lm's
+    own code."""
+    config = {
+        "model_type": "llama",
+        "hidden_size": 64,
+        "num_hidden_layers": 2,
+        "intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 64,
+        "tie_word_embeddings": False,
+    }
+    mx.random.seed(3)
+    model = llama.Model(llama.ModelArgs.from_dict(config))
+    model.set_dtype(mx.bfloat16)
+    path = tmp_path_factory.mktemp("llama")
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+    (path / "config.json").write_text(json.dumps(config))
+    _save_tokenizer(path, config["vocab_size"])
+    return path
+
+
+def test_a_model_omlx_does_not_patch_is_written_in_a_format(
+    llama_source, toy, tmp_path, monkeypatch
+):
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", _VERIFIED, raising=False)
+    output = tmp_path / "oqe-toy"
+    _, config, applied = _quantize(llama_source, output, quant_format="toy")
+    # Each layer's seven linears.
+    assert applied == sorted(
+        f"model.layers.{i}.{name}"
+        for i in range(2)
+        for name in (
+            "mlp.down_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "self_attn.k_proj",
+            "self_attn.o_proj",
+            "self_attn.q_proj",
+            "self_attn.v_proj",
+        )
+    )
+    assert sorted(_in_format(config)) == applied
+    maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
+    layers = dict(model.named_modules())
+    assert {type(layers[name]) for name in applied} == {FormatLinear}
+    logits = model(mx.array([[1, 2, 3, 4]]))
+    assert logits.shape == (1, 4, 64) and mx.isfinite(logits).all()
 
 
 def test_a_checkpoint_keeps_the_record_its_format_gives(
@@ -1276,6 +1479,10 @@ def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(
     output = tmp_path / "oqe8-toy"
     tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
     monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **k: tokens)
+    # oMLX patches MiniMax M3: taken as verified, so that the run writes it.
+    monkeypatch.setattr(
+        oq, "_QUANT_FORMAT_VERIFIED", frozenset({"minimax_m3_vl"}), raising=False
+    )
     oq.quantize_oq_streaming(
         str(source),
         str(output),

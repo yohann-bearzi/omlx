@@ -1117,6 +1117,31 @@ def _declared_model_types(config: Mapping[str, Any]) -> frozenset[str]:
     return frozenset(value for value in candidates if isinstance(value, str))
 
 
+def family_patches(model_types: Collection[str]) -> tuple[str, ...]:
+    """The patches the pre-load dispatch applies for the family of a model
+    of ``model_types`` (its ``model_type`` and its ``text_config``'s), on an
+    mlx-lm load or an mlx-vlm one: the patch imports behind a test of the
+    model type. Empty for a model served by mlx-lm's and mlx-vlm's own code.
+
+    Raises when the dispatcher cannot be read: no model can then be told
+    apart from one oMLX patches.
+    """
+
+    rules = _dispatch_rules()
+    if not rules:
+        raise RuntimeError(f"cannot read the pre-load patch dispatch in {_DISPATCHER}")
+    return tuple(
+        sorted(
+            {
+                module
+                for guard, module in rules
+                if guard.model_types
+                and any(guard.matches(model_types, vlm) for vlm in (False, True))
+            }
+        )
+    )
+
+
 def required_imports(
     model_path: str | Path,
     *,

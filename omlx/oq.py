@@ -6894,11 +6894,19 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
-# Families whose own code reads a layer's quantized tensors by hand and takes
-# a format's layer for MLX's or for floats, instead of calling it. oQ writes
-# them in no quant format until a commit whose tests show each such reader
-# declining a format's layer takes the family off. Keyed by model type (of
-# the checkpoint or of its text_config), or by the decision family
+# Families that oMLX serves with code of its own (a branch of its pre-load
+# patches taken for their model type, or a decision model's own code) and
+# that quant formats have been verified with end to end. oQ writes a family
+# oMLX does not patch in a format by default, and one it patches only once
+# it is here: a family enters with the run that verifies it.
+_QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
+
+# What the audits found a family's own code to read wrongly of a format's
+# layer: a layer's quantized tensors read by hand, taken for MLX's layer or
+# for floats instead of called. oQ says it when it refuses the family; the
+# family leaves the table when a commit whose tests show each such reader
+# declining a format's layer verifies it. Keyed by model type (of the
+# checkpoint or of its text_config), or by the decision family
 # (model_discovery.decision_kind) of a decision model.
 _GLM5_NEXT_MISREAD = (
     # Glm5NextLinearAttention._fused_in_proj concatenates q, k, v, f_a, g_a
@@ -6906,6 +6914,9 @@ _GLM5_NEXT_MISREAD = (
     # (mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py).
     "its linear attention fuses its input projections by hand, as MLX's "
     "affine layers or as floats"
+)
+_DEEPSEEK_V4_MISREAD = (
+    "its DSpark draft reads the output head's weight by hand, as floats"
 )
 _QUANT_FORMAT_MISREAD = {
     "glm5_next": _GLM5_NEXT_MISREAD,
@@ -6924,6 +6935,26 @@ _QUANT_FORMAT_MISREAD = {
         "its DSpark draft folds the output head into its own projection by "
         "hand, as MLX's quantized layer or as floats"
     ),
+    # MergedSwitchGLU._half slices gate_up's weight into mx.gather_mm on a
+    # prefill above 8 tokens when it is not MLX's QuantizedSwitchLinear
+    # (patches/raon1_mini/raon1_mini_model.py); its sanitize merges gate
+    # and up by their weight, scales and biases.
+    "raon1_mini": (
+        "its merged gate and up projection is sliced by hand on a prefill, as "
+        "MLX's quantized layer or as floats"
+    ),
+    # dspark_head_gemv binds lm_head's weight to a float kernel when its dtype
+    # is the activations' (patches/deepseek_v4/verify_qmv.py), with no test of
+    # the layer's class.
+    "deepseek_v4": _DEEPSEEK_V4_MISREAD,
+    "deepseek_v4_mtp": _DEEPSEEK_V4_MISREAD,
+    # The indexer's fused 8-bit projections (patches/glm_moe_dsa/
+    # deepseek_v32.py) read their quantization entries by hand and refuse a
+    # load where one of them is not MLX's affine.
+    "glm_moe_dsa": (
+        "its indexer fuses its projections' 8-bit affine layers by hand, and "
+        "refuses a load where one of them is a format's"
+    ),
 }
 
 
@@ -6941,6 +6972,43 @@ _OQ_RUN_KEYS = (
 def _no_lookups() -> dict:
     """An imatrix report of no lookup yet, as a run's starts."""
     return {"applied": [], "missing": [], "mismatched": [], "zero_count_experts": 0}
+
+
+def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
+    """(family, why) when oQ writes the checkpoint at ``source`` in no quant
+    format: a family whose own code the audits found reading a format's
+    layer wrongly, or one oMLX serves with code of its own that formats are
+    not verified with yet."""
+    from .cluster.autoconfigure import family_patches
+
+    text_config = config.get("text_config")
+    declared = [
+        name
+        for name in (
+            config.get("model_type"),
+            text_config.get("model_type") if isinstance(text_config, dict) else None,
+        )
+        if isinstance(name, str)
+    ]
+    kind = decision_kind(source, config)
+    families = [name.lower().replace("-", "_") for name in declared]
+    for family in (*families, kind):
+        if family in _QUANT_FORMAT_MISREAD:
+            return family, _QUANT_FORMAT_MISREAD[family]
+    for name, family in zip(declared, families, strict=True):
+        # The dispatcher compares the model type as the config spells it.
+        patches = family_patches({name, family})
+        if patches and family not in _QUANT_FORMAT_VERIFIED:
+            return family, (
+                f"oMLX serves it with code of its own ({', '.join(patches)}), "
+                "not verified with quant formats yet"
+            )
+    if kind is not None and kind not in _QUANT_FORMAT_VERIFIED:
+        return kind, (
+            "oMLX serves it with code of its own (omlx.models), not verified "
+            "with quant formats yet"
+        )
+    return None
 
 
 def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
@@ -7310,22 +7378,16 @@ def quantize_oq_streaming(
     ):
         raise ValueError(
             f"oQ writes a {config.get('model_type')} checkpoint through a writer "
-            "of its own, which takes no quant format"
+            "of its own, which takes no quant format; write it without a quant "
+            "format"
         )
     if quant_fmt is not None:
-        text_config = config.get("text_config")
-        families = (
-            normalized_model_type,
-            text_config.get("model_type") if isinstance(text_config, dict) else None,
-            decision_kind(source, config),
-        )
-        for family in families:
-            if family in _QUANT_FORMAT_MISREAD:
-                raise ValueError(
-                    f"oQ writes no {family} checkpoint in quant format "
-                    f"{quant_format!r}: {_QUANT_FORMAT_MISREAD[family]}; write it "
-                    "without a quant format"
-                )
+        refused = _unverified_family(source, config)
+        if refused is not None:
+            raise ValueError(
+                f"oQ writes no {refused[0]} checkpoint in quant format "
+                f"{quant_format!r}: {refused[1]}; write it without a quant format"
+            )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
