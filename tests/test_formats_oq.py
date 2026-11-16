@@ -228,6 +228,60 @@ def test_a_stack_whose_tensor_would_not_fit_a_metal_buffer_is_not_offered(
     assert kept["weight"].shape == (3, 8, 64)
 
 
+def test_a_stack_s_runs_are_let_go_one_by_one(toy, monkeypatch):
+    """Each run's tensors are evaluated, the GPU waited for and MLX's cache
+    given back before the next run is read: a stack read from its
+    checkpoint a run at a time holds one run, not the stack."""
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(8, 64))
+    answers, events = [], []
+
+    def answer(tensors, w):
+        answers.append(tensors)
+        events.append("encode")
+        return tensors
+
+    toy.answer = answer
+    evaluate = mx.eval
+
+    def evaluated(*arrays):
+        if answers and any(a is t for a in arrays for t in answers[-1].values()):
+            events.append("eval")
+        return evaluate(*arrays)
+
+    def recorded(name, call):
+        def record():
+            events.append(name)
+            return call()
+
+        return record
+
+    monkeypatch.setattr(mx, "eval", evaluated)
+    for name in ("synchronize", "clear_cache"):
+        monkeypatch.setattr(mx, name, recorded(name, getattr(mx, name)))
+    w = _weights(5, 8, 64)
+    oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
+    assert events == ["encode", "eval", "synchronize", "clear_cache"] * 3
+
+
+def test_a_stack_in_one_run_is_kept_as_it_was_encoded(toy):
+    """A stack that one run holds is not joined: oQ keeps the tensors the
+    format gave, no copy."""
+    answers = []
+    toy.answer = lambda tensors, w: answers.append(tensors) or tensors
+    w = _weights(3, 8, 64)
+    kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
+    assert len(answers) == 1
+    assert all(kept[name] is tensor for name, tensor in answers[0].items())
+
+
+def test_rows_are_cut_from_a_tensor_of_no_rows_or_of_empty_rows():
+    """oQ's row chunks (its affine writer's and a format's runs): none of a
+    tensor without rows, one of a tensor whose rows are empty."""
+    assert list(oq._row_chunks_with_bounds(mx.zeros((0, 4)), 8)) == []
+    chunks = oq._row_chunks_with_bounds(mx.zeros((3, 0)), 8)
+    assert [(r0, r1, chunk.shape) for r0, r1, chunk in chunks] == [(0, 3, (3, 0))]
+
+
 def test_a_stack_s_runs_are_joined_evaluated(toy, monkeypatch):
     """The writer keeps a layer's tensors until its shard is saved: they are
     joined here, evaluated, not left a graph over every run's tensors."""
@@ -1252,6 +1306,16 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     # Read with the load's copy of the format, one for all of them.
     (read,) = {id(layer.fmt): layer.fmt for layer in layers}.values()
     assert read is not toy and type(read) is _Codec and read.log is toy.log
+
+
+def test_the_record_names_the_contract_the_format_states(
+    source, toy, tmp_path, monkeypatch
+):
+    """A checkpoint keeps the revision of the contract its format states,
+    not the newest this oMLX knows."""
+    monkeypatch.setattr(formats, "CONTRACT", formats.CONTRACT + 1)
+    _, config, _ = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
+    assert config[_RECORD]["toy"]["contract"] == toy.contract
 
 
 _CYCLE: dict = {}
