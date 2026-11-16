@@ -2916,3 +2916,125 @@ def test_a_face_with_a_table_runs_the_rows_kernels_to_the_bit(monkeypatch):
     faces = {face for _, face, *_ in kernels._PROOFS}
     assert faces and all(face.key.endswith("_lut") for face in faces)
     assert all(proof.ran and not proof.failed for proof in kernels._PROOFS.values())
+
+def _toy_stack(experts, n, k, exact=True, seed=0):
+    """A stack of the toy format's matrices: with power-of-two scales (every
+    product exact), or with scales of any float (``exact=False``)."""
+    (codes, scales), _, _ = _matrix(experts * n, k, seed)
+    if not exact:
+        mx.random.seed(seed)
+        scales = mx.random.uniform(0.001, 0.01, scales.shape)
+    tensors = {
+        "weight": codes.reshape(experts, n, k),
+        "scales": scales.reshape(experts, n),
+    }
+    layer = FormatSwitchLinear("toy", 8, 1, k, tensors)
+    mx.eval(layer.parameters())
+    return layer
+
+
+def _pieces_of(monkeypatch, matrices, n, k, dtype):
+    """A decode outside the rows kernel holds ``matrices`` of an (n, k)
+    stack at once, decoded as float32 and cast to ``dtype``."""
+    budget = matrices * n * k * (4 + dtype.size)
+    # raising=False: the tests of the bits also run over a layer that decodes
+    # at once, which has no budget (the parent commit's: they guard it).
+    monkeypatch.setattr(linear, "_DECODE_BYTES", budget, raising=False)
+
+
+def _at_once(layer, x, indices, sorted_indices=False):
+    """The decode as it was: the matrices of the indices at once or, from
+    as many indices as the stack has matrices, the stack, then gather_mm."""
+    if indices.size < layer.num_experts:
+        return x @ layer._decoded(indices).astype(x.dtype).swapaxes(-1, -2)
+    weights = layer._decoded().astype(x.dtype).swapaxes(-1, -2)
+    return mx.gather_mm(x, weights, rhs_indices=indices, sorted_indices=sorted_indices)
+
+
+# Calls of a switch layer outside the rows kernel: x, its indices, the hint.
+_DECODED_CALLS = [
+    # As many indices as the stack has matrices, or more: the stack.
+    ((24, 1, 320), (24,), True),
+    ((8, 3, 320), (8,), False),
+    ((2, 4, 1, 1, 320), (2, 4, 3), False),
+    ((1, 320), (EXPERTS,), False),
+    # Fewer: the matrices of the indices.
+    ((5, 1, 320), (5,), False),
+    ((5, 3, 320), (5,), False),
+    ((1, 2, 1, 1, 320), (1, 2, 2), False),
+    ((3, 320), (1,), False),
+]
+
+
+@pytest.mark.parametrize("exact", [True, False], ids=["exact", "any floats"])
+@pytest.mark.parametrize("matrices", [1, 4, EXPERTS])
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
+def test_a_decode_in_pieces_has_the_bits_of_a_decode_at_once(
+    toy, monkeypatch, exact, matrices, dtype
+):
+    toy()
+    layer = _toy_stack(EXPERTS, 40, 320, exact)
+    _pieces_of(monkeypatch, matrices, 40, 320, dtype)
+    for seed, (shape, batch, hint) in enumerate(_DECODED_CALLS):
+        if exact:
+            x = _ints(shape, seed).astype(dtype)
+        elif shape[-2] > 1 and math.prod(batch) < EXPERTS:
+            # The matrices of the indices, with more rows of x than one: a
+            # piece's matmul may run another kernel than the whole batch's.
+            continue
+        else:
+            x = _x(shape, dtype, seed)
+        indices = _experts(batch, seed)
+        if hint:
+            indices = mx.sort(indices)
+        got = layer(x, indices, sorted_indices=hint)
+        assert _equal(got, _at_once(layer, x, indices, hint)), (shape, batch)
+
+
+def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
+    """Outside the rows kernel a switch layer decodes the stack, or the
+    matrices of its indices, a piece at a time."""
+    toy()
+    layer = _toy_stack(EXPERTS, 40, 320)
+    _pieces_of(monkeypatch, 4, 40, 320, mx.float32)
+    decode, decoded = _ToyFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        decoded.append(tensors["weight"].shape[:-2])
+        return decode(self, tensors, bits, group_size)
+
+    monkeypatch.setattr(_ToyFormat, "decode", recorded)
+    gather, hints = mx.gather_mm, []
+
+    def gathered(*operands, **named):
+        hints.append(named["sorted_indices"])
+        return gather(*operands, **named)
+
+    monkeypatch.setattr(mx, "gather_mm", gathered)
+    calls = [
+        ((_ints((24, 1, 320)), mx.sort(_experts((24,))), True), [(4,), (2,)]),
+        ((_ints((2, 4, 1, 1, 320)), _experts((2, 4, 3)), False), [(4,), (2,)]),
+        ((_ints((5, 1, 320)), _experts((5,)), False), [(4,), (1,)]),
+        # As many as a piece holds: at once, as the indices are.
+        ((_ints((1, 2, 1, 1, 320)), _experts((1, 2, 2)), False), [(1, 2, 2)]),
+    ]
+    for (x, indices, hint), pieces in calls:
+        decoded.clear()
+        mx.eval(layer(x, indices, sorted_indices=hint))
+        assert decoded == pieces
+    # mlx-vlm's hint goes to each piece's gather.
+    assert hints == [True, True, False, False]
+    # Less than a matrix: one at a time.
+    monkeypatch.setattr(linear, "_DECODE_BYTES", 1)
+    for (x, indices, hint), _ in calls[:3]:
+        decoded.clear()
+        mx.eval(layer(x, indices, sorted_indices=hint))
+        assert decoded == [(1,)] * min(indices.size, EXPERTS)
+
+
+def test_the_page_says_a_decode_holds_a_piece_at_once():
+    page = " ".join(_PAGE.split())
+    assert (
+        "A switch layer's decode holds at most `linear._DECODE_BYTES` "
+        f"({linear._DECODE_BYTES >> 20} MiB) of decoded matrices at once" in page
+    )

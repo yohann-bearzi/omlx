@@ -36,6 +36,15 @@ logger = logging.getLogger(__name__)
 # bits of its one-row call, whatever rows it is launched with.
 MAX_ROWS = 16
 
+# What a switch layer's decode holds of its matrices at once, outside the
+# rows kernel: a piece of them, decoded as float32 (a decode's widest floats)
+# and cast to x's dtype. A call over more decodes them a piece at a time.
+_DECODE_BYTES = 1 << 28
+
+# What opens the ValueError of MLX's eval for an array of a function that it
+# is tracing (compile, vmap).
+_TRACED = "[eval] Attempting to eval"
+
 # One threadgroup per pair (a row of x and the matrix it meets) and tile of 8
 # of the pair's outputs: 4 for each of the threadgroup's two simdgroups.
 # __MATRIX__ is the pair's matrix in the stack, __X_ROW__ its row of x.
@@ -654,6 +663,62 @@ class FormatSwitchLinear(_FormatLayer):
     def num_experts(self) -> int:
         return self["weight"].shape[0]
 
+    def _through_decode(self, x, indices, sorted_indices):
+        """``x`` times the matrices at ``indices``, decoded: what the rows
+        kernel does not take, a piece of the matrices at a time."""
+        dtype = x.dtype
+        matrix = self.output_dims * self.input_dims * (4 + dtype.size)
+        piece = max(1, _DECODE_BYTES // matrix)
+        if indices.size < self.num_experts:
+            # A decode step's indices: their matrices alone are decoded.
+            if indices.size > piece:
+                return self._selected(x, indices, piece)
+            return x @ self._decoded(indices).astype(dtype).swapaxes(-1, -2)
+        indices = _wrapped(indices, self.num_experts)
+        # A prefill's: the stack once, not a matrix for each index.
+        if self.num_experts > piece:
+            return self._stacked(x, indices, sorted_indices, piece)
+        return mx.gather_mm(
+            x,
+            self._decoded().astype(dtype).swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+
+    def _selected(self, x, indices, piece):
+        """``x`` times the matrices at ``indices``, ``piece`` pairs at a
+        time, each piece one matmul. With one row of x a pair (a model's
+        call) each pair has the bits of the matmul of all of them at once;
+        with more rows, MLX may choose another kernel for a smaller batch."""
+        dtype, (m, k) = x.dtype, x.shape[-2:]
+        batch = mx.broadcast_shapes(x.shape[:-2], indices.shape)
+        rows = mx.broadcast_to(x, (*batch, m, k)).reshape(-1, m, k)
+        each = mx.broadcast_to(indices, batch).flatten()
+        parts = [
+            rows[p : p + piece]
+            @ self._decoded(each[p : p + piece]).astype(dtype).swapaxes(-1, -2)
+            for p in range(0, each.size, piece)
+        ]
+        return mx.concatenate(parts).reshape(*batch, m, self.output_dims)
+
+    def _stacked(self, x, indices, sorted_indices, piece):
+        """MLX's gather_mm of ``x`` with the stack, ``piece`` matrices at a
+        time: each pair takes the product of the piece that holds its
+        matrix, a gather_mm of the same shapes as over the whole stack."""
+        y = None
+        for first in range(0, self.num_experts, piece):
+            last = min(first + piece, self.num_experts)
+            weights = self._decoded(slice(first, last)).astype(x.dtype)
+            part = mx.gather_mm(
+                x,
+                weights.swapaxes(-1, -2),
+                rhs_indices=mx.clip(indices, first, last - 1) - first,
+                sorted_indices=sorted_indices,
+            )
+            inside = mx.expand_dims(indices >= first, (-2, -1))
+            y = part if y is None else mx.where(inside, part, y)
+        return y
+
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ) -> mx.array:
@@ -676,18 +741,8 @@ class FormatSwitchLinear(_FormatLayer):
             if not mx.issubdtype(indices.dtype, mx.integer):
                 raise ValueError(f"indices are integers, not {indices.dtype}")
             y = _launch(plan, signature, _switch, _switch_stand_in, x, indices)
-            if y is None and indices.size < self.num_experts:
-                # A decode step's indices: their matrices alone are decoded.
-                weights = self._decoded(indices).astype(dtype)
-                y = x @ weights.swapaxes(-1, -2)
-            elif y is None:
-                # A prefill's: the stack once, not a matrix for each index.
-                y = mx.gather_mm(
-                    x,
-                    self._decoded().astype(dtype).swapaxes(-1, -2),
-                    rhs_indices=_wrapped(indices, self.num_experts),
-                    sorted_indices=sorted_indices,
-                )
+            if y is None:
+                y = self._through_decode(x, indices, sorted_indices)
         if bias is not None:
             y = y + mx.expand_dims(bias[indices], -2)
         return y
