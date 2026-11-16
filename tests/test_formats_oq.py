@@ -581,7 +581,7 @@ def test_a_quant_format_needs_oqe_and_a_registered_mode(source, toy, tmp_path):
     assert not output.exists() and toy.offered == []
 
 
-@pytest.mark.parametrize("model_type", ["deepseek_v41", "muse_spark"])
+@pytest.mark.parametrize("model_type", ["deepseek_v41", "muse_spark", "Muse-Spark"])
 def test_a_model_with_a_writer_of_its_own_takes_no_format(toy, tmp_path, model_type):
     source = tmp_path / "source"
     source.mkdir()
@@ -740,17 +740,12 @@ _GLM5_NEXT = (
 
 
 _DEEPSEEK_V4 = "its DSpark draft reads the output head's weight by hand, as floats"
-# What the page quotes in place of a family's name, and of what oMLX runs
-# for it.
-_PAGE_FAMILY = {
-    "omlx.patches.mlx_vlm_unlimited_ocr_compat": "omlx.patches.step3p7",
-    "omlx.patches.llama4_attention": "omlx.patches.step3p7",
-    "(omlx.models)": "(omlx.patches.step3p7)",
-    "glm5_next_text": "glm5_next",
-    "deepseek_v4_mtp": "deepseek_v4",
-    "no unlimited_ocr": "no step3p7",
-    "no llama4": "no step3p7",
-    "no d1": "no step3p7",
+# The page quotes these of the same family, or of one of their kind.
+_PAGE_FAMILY = {"glm5_next_text": "glm5_next", "deepseek_v4_mtp": "deepseek_v4"}
+# The pages quote the refusals of these families.
+_QUOTED_FAMILIES = {
+    "glm5_next", "glm5_next_text", "raon1_mini", "deepseek_v4", "deepseek_v4_mtp",
+    "glm_moe_dsa", "llama4", "clef", "inkling2",
 }
 _OWN_CODE = (
     "oMLX serves it with code of its own ({}), not verified with quant formats yet"
@@ -783,20 +778,39 @@ _OWN_CODE = (
         (
             "step3p7",
             {"model_type": "step3p7"},
-            _OWN_CODE.format("omlx.patches.step3p7"),
+            {"step3p7"},
         ),
+        ("step3p7", {"model_type": "STEP3P7"}, {"STEP3P7", "step3p7"}),
         (
             "unlimited_ocr",
             {"model_type": "unlimited-ocr"},
-            _OWN_CODE.format("omlx.patches.mlx_vlm_unlimited_ocr_compat"),
+            {"unlimited-ocr", "unlimited_ocr"},
         ),
         (
             "llama4",
             {"model_type": "llama4_vl", "text_config": {"model_type": "llama4"}},
-            _OWN_CODE.format("omlx.patches.llama4_attention"),
+            {"llama4"},
         ),
+        # Renamed by the dispatcher before its tests.
+        (
+            "qwen3_5_text",
+            {"model_type": "qwen3_5_text"},
+            {"qwen3_5_text", "qwen3_5"},
+        ),
+        # Through a helper of the dispatcher (_is_mtp_compatible).
+        ("gemma4", {"model_type": "gemma4"}, {"gemma4"}),
+        ("nemotron_h", {"model_type": "nemotron_h"}, {"nemotron_h"}),
+        ("qwen3_6", {"model_type": "qwen3_6"}, {"qwen3_6"}),
+        # Patched by an engine, or by a patch the dispatcher does not apply.
+        ("flint", {"model_type": "flint"}, {"flint"}),
+        ("lfm3_vl", {"model_type": "lfm3_vl"}, {"lfm3_vl"}),
+        ("cohere2_moe", {"model_type": "cohere2_moe"}, {"cohere2_moe"}),
+        ("qwen3_next", {"model_type": "qwen3_next"}, {"qwen3_next"}),
+        ("qwen3_moe", {"model_type": "qwen3_moe"}, {"qwen3_moe"}),
+        ("qwen3", {"model_type": "qwen3"}, {"qwen3"}),
         (
             "d1",
+            # Its backbone is patched; it is refused as its decision family.
             {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
             _OWN_CODE.format("omlx.models"),
         ),
@@ -822,9 +836,20 @@ _OWN_CODE = (
         "deepseek_v4_mtp",
         "glm_moe_dsa",
         "patched",
+        "patched, spelled in capitals",
         "patched, spelled with a hyphen",
         "patched for its text model",
-        "decision model",
+        "renamed",
+        "helper gemma4",
+        "helper nemotron_h",
+        "helper qwen3_6",
+        "engine flint",
+        "engine lfm3_vl",
+        "engine cohere2_moe",
+        "patch qwen3_next",
+        "patch qwen3_moe",
+        "patch qwen3",
+        "decision model, on a backbone oMLX patches",
         "decision family",
         "inkling2",
     ],
@@ -843,16 +868,27 @@ def test_a_family_omlx_patches_and_formats_are_not_verified_with_is_refused(
         oq.quantize_oq_streaming(
             str(source), str(output), 4, enhanced=True, quant_format="toy"
         )
+    if isinstance(why, set):
+        # The code oMLX has for the model types the config spells.
+        why = _OWN_CODE.format(_shown(autoconfigure.family_patches(why)))
     assert str(refusal.value) == (
         f"oQ writes no {family} checkpoint in quant format 'toy': {why}; write it "
         "without a quant format"
     )
+    assert "()" not in str(refusal.value)
     # The page quotes it, of the same family or one of its kind.
     said = str(refusal.value)
     for spelled, quoted in _PAGE_FAMILY.items():
         said = said.replace(spelled, quoted)
-    assert _quoted(said)
+    if family in _QUOTED_FAMILIES:
+        assert _quoted(said)
     assert not output.exists() and toy.offered == []
+
+
+def _shown(patches):
+    """The first three of ``patches``, and how many more, as oQ names them."""
+    more = f" and {len(patches) - 3} more" if len(patches) > 3 else ""
+    return ", ".join(patches[:3]) + more
 
 
 def test_no_family_omlx_patches_is_verified_with_formats_yet(
@@ -864,7 +900,10 @@ def test_no_family_omlx_patches_is_verified_with_formats_yet(
     flash = tmp_path / "flash-next"
     flash.mkdir()
     (flash / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
-    for checkpoint, family in ((flash, "qwen4_exp"), (source, "qwen3_5_moe_text")):
+    for checkpoint, family, types in (
+        (flash, "qwen4_exp", {"qwen4_exp"}),
+        (source, "qwen3_5_moe_text", {"qwen3_5_moe_text", "qwen3_5_moe"}),
+    ):
         with pytest.raises(ValueError) as refusal:
             oq.quantize_oq_streaming(
                 str(checkpoint),
@@ -873,7 +912,7 @@ def test_no_family_omlx_patches_is_verified_with_formats_yet(
                 enhanced=True,
                 quant_format="toy",
             )
-        patches = ", ".join(autoconfigure.family_patches({family}))
+        patches = _shown(autoconfigure.family_patches(types))
         assert str(refusal.value) == (
             f"oQ writes no {family} checkpoint in quant format 'toy': "
             f"{_OWN_CODE.format(patches)}; write it without a quant format"
@@ -882,38 +921,64 @@ def test_no_family_omlx_patches_is_verified_with_formats_yet(
     assert toy.offered == []
 
 
-def test_which_families_omlx_patches_is_read_from_its_pre_load_dispatch(
-    tmp_path, monkeypatch
-):
+def test_which_families_omlx_patches_is_read_from_its_code(tmp_path, monkeypatch):
     family_patches = autoconfigure.family_patches
-    assert family_patches({"step3p7"}) == ("omlx.patches.step3p7",)
+    assert "omlx.patches.step3p7" in family_patches({"step3p7"})
     # On either library's load, a test of the type or of its prefix.
     assert "omlx.patches.mlx_vlm_qwen4_exp_compat" in family_patches({"qwen4_exp"})
-    assert family_patches({"qwen3_5_moe_text"}) == (
-        "omlx.patches.mlx_vlm_mtp",
-        "omlx.patches.qwen3_6_nested_visual",
-    )
-    assert family_patches({"llama", "qwen3", "gemma3"}) == ()
-    # A branch added to the dispatcher is a family oMLX patches.
+    assert "omlx.patches.qwen3_6_nested_visual" in family_patches({"qwen3_5_moe"})
+    # A test through str(...), and one in a helper of the dispatcher.
+    assert "omlx.patches.qwen35_gdn_prework" in family_patches({"qwen3_5"})
+    assert "omlx.patches.mlx_lm_mtp" in family_patches({"gemma4"})
+    # An engine's test of the type, and a patch of the family's model module.
+    assert "omlx.engine.vlm" in family_patches({"flint"})
+    assert family_patches({"qwen3_next"}) == ("omlx.patches.qwen35_moe_router",)
+    assert family_patches({"llama", "gemma3", "mistral"}) == ()
+    # A branch added to the dispatcher is a family oMLX patches, on the
+    # library's load it is taken on.
     dispatcher = tmp_path / "model_loading.py"
     dispatcher.write_text(textwrap.dedent("""
             def maybe_apply_pre_load_patches(model_name):
                 from ..patches.format_load import apply_format_load_patch
-                if model_type == "llama":
+                if not for_vlm and model_type == "llama":
                     from ..patches.llama_fix import apply_llama_fix_patch
+                if for_vlm and _is_gemma(model_type):
+                    from ..patches.gemma_fix import apply_gemma_fix_patch
+
+            def _is_gemma(model_type):
+                if not model_type:
+                    return False
+                return str(model_type or "").startswith(("gemma3", "gemma2"))
             """))
     monkeypatch.setattr(autoconfigure, "_DISPATCHER", dispatcher)
-    autoconfigure._dispatch_rules.cache_clear()
+    autoconfigure._family_rules.cache_clear()
     try:
         assert family_patches({"llama"}) == ("omlx.patches.llama_fix",)
+        assert family_patches({"gemma3"}) == ("omlx.patches.gemma_fix",)
         # One it cannot read tells no model from one oMLX patches.
         dispatcher.unlink()
-        autoconfigure._dispatch_rules.cache_clear()
+        autoconfigure._family_rules.cache_clear()
         with pytest.raises(RuntimeError, match="cannot read the pre-load patch"):
             family_patches({"llama"})
     finally:
         monkeypatch.undo()
-        autoconfigure._dispatch_rules.cache_clear()
+        autoconfigure._family_rules.cache_clear()
+    # The cluster's import check reads the dispatcher as before.
+    assert autoconfigure._dispatch_rules() == autoconfigure._read_dispatch(
+        with_helpers=False
+    )
+
+
+def test_a_verified_decision_family_is_written_whatever_its_backbone(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "d1"
+    source.mkdir()
+    config = {"model_type": "lfm3_vl", "architectures": ["D1Model"]}
+    (source / "config.json").write_text(json.dumps(config))
+    assert oq._unverified_family(source, config)[0] == "d1"
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"d1"}))
+    assert oq._unverified_family(source, config) is None
 
 
 @pytest.fixture(scope="module")

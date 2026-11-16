@@ -6978,8 +6978,9 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
     """(family, why) when oQ writes the checkpoint at ``source`` in no quant
     format: a family whose own code the audits found reading a format's
     layer wrongly, or one oMLX serves with code of its own that formats are
-    not verified with yet."""
+    not verified with yet. A decision model is its decision family."""
     from .cluster.autoconfigure import family_patches
+    from .utils.model_loading import normalize_qwen35_text_config
 
     text_config = config.get("text_config")
     declared = [
@@ -6992,24 +6993,31 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
     ]
     kind = decision_kind(source, config)
     families = [name.lower().replace("-", "_") for name in declared]
-    for family in (*families, kind):
+    for family in (kind, *families):
         if family in _QUANT_FORMAT_MISREAD:
             return family, _QUANT_FORMAT_MISREAD[family]
+    if kind is not None:
+        if kind in _QUANT_FORMAT_VERIFIED:
+            return None
+        return kind, _own_code("omlx.models")
     for name, family in zip(declared, families, strict=True):
-        # The dispatcher compares the model type as the config spells it.
-        patches = family_patches({name, family})
+        # The dispatcher compares the model type as the config spells it,
+        # after its own renames.
+        spelled = normalize_qwen35_text_config({"model_type": name})["model_type"]
+        patches = family_patches({name, spelled, family})
         if patches and family not in _QUANT_FORMAT_VERIFIED:
-            return family, (
-                f"oMLX serves it with code of its own ({', '.join(patches)}), "
-                "not verified with quant formats yet"
-            )
-    if kind is not None and kind not in _QUANT_FORMAT_VERIFIED:
-        return kind, (
-            "oMLX serves it with code of its own (omlx.models), not verified "
-            "with quant formats yet"
-        )
+            shown = ", ".join(patches[:3])
+            if len(patches) > 3:
+                shown += f" and {len(patches) - 3} more"
+            return family, _own_code(shown)
     return None
 
+
+def _own_code(where: str) -> str:
+    return (
+        f"oMLX serves it with code of its own ({where}), not verified with "
+        "quant formats yet"
+    )
 
 def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
     """What a run with a quant format says of the matrices it offered none:
@@ -7373,9 +7381,8 @@ def quantize_oq_streaming(
         and _has_vision_subconfig(config)
         and not text_only
     )
-    if quant_fmt is not None and (
-        normalized_model_type == "deepseek_v41" or _is_muse_spark(config)
-    ):
+    own_writer = normalized_model_type in ("deepseek_v41", "muse_spark")
+    if quant_fmt is not None and own_writer:
         raise ValueError(
             f"oQ writes a {config.get('model_type')} checkpoint through a writer "
             "of its own, which takes no quant format; write it without a quant "
