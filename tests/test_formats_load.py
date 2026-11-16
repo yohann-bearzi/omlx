@@ -458,6 +458,25 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
     assert all(p.ran and not p.failed for p in kernels._PROOFS.values())
 
 
+@_LAYERS
+def test_a_layout_packed_along_n_is_refused_where_the_layer_is_built(
+    toy, by_hand, monkeypatch, switch
+):
+    """The load builds a layer over the layout's placeholders: one packed
+    along N would hold half the rows its matrix has, and is refused."""
+
+    def packed(k, n, bits, group_size):
+        return {"weight": ((n // 2, 2 * k), mx.uint8), "scales": ((n,), mx.float32)}
+
+    monkeypatch.setattr(toy, "layout", packed)
+    if switch is None:
+        dense = nn.Linear(64, 16)
+    else:
+        dense = switch.SwitchLinear(64, 16, EXPERTS)
+    with pytest.raises(ValueError, match=re.escape("its first axis is N (8)")):
+        dense.to_quantized(**_TOY)
+
+
 def test_mlx_s_modes_load_as_mlx_s_layers(toy):
     # Affine is a registered format that lays out no matrix: its layers are
     # MLX's to build.
@@ -1425,7 +1444,9 @@ def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_pat
     assert type(layer.fmt) is _Levels and layer.fmt.levels == (0.5, 1.5)
     # The object reads the layer: it lays the matrix out, its decode and its
     # face are the layer's; nothing is kept on the registered format.
-    assert layer.fmt.asked == toy.asked == [(64, 128, 8, 1)]
+    # The hook asks both; the layer asks its own once more.
+    assert toy.asked == [(64, 128, 8, 1)]
+    assert layer.fmt.asked == [(64, 128, 8, 1)] * 2
     assert formats.get("toy") is toy and not hasattr(toy, "levels")
     tensors = {name: layer[name] for name in ("weight", "scales")}
     assert mx.array_equal(layer._decoded(), toy.decode(tensors, 8, 1) * 0.5)
@@ -1758,7 +1779,8 @@ def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
         layer = nn.Linear(64, 128).to_quantized(**_TOY)
     # The registered format said it lays such a matrix out; the checkpoint's
     # laid it out.
-    assert toy.asked == [(64, 128, 8, 1)] and wide.asked == [(64, 128, 8, 1)]
+    assert toy.asked == [(64, 128, 8, 1)]
+    assert wide.asked == [(64, 128, 8, 1)] * 2  # and the layer's own
     assert layer.fmt is wide and _kept(layer)["scales"] == ((128, 2), mx.float32)
     # One the registered format lays out none of is refused before the record
     # is read.

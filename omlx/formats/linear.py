@@ -513,6 +513,12 @@ class _FormatLayer(nn.Module):
                 f"{type(self).__name__}: the weight has {self._STACK + 2} axes, "
                 f"not the shape {weight.shape}"
             )
+        # What the format lays out for the matrix the layer holds: a layer's
+        # N is its weight's first axis.
+        n = weight.shape[-2]
+        layout = fmt.layout(input_dims, n, bits, group_size)
+        if layout is not None:
+            formats.check_layout(fmt, n, input_dims, layout)
         # What lets a stack's matrices be gathered, tensor by tensor.
         stack = weight.shape[: self._STACK]
         ragged = [name for name in names if tensors[name].shape[: self._STACK] != stack]
@@ -526,7 +532,7 @@ class _FormatLayer(nn.Module):
         # of the module's items whatever its class.
         object.__setattr__(self, "fmt", fmt)
         self.mode, self.bits, self.group_size = mode, bits, group_size
-        self.input_dims = input_dims
+        self.input_dims, self.output_dims = input_dims, n
         # The format's tensors, and those that still hold a load's
         # placeholders, each with the shape and dtype last offered in its
         # place (None: none was). Kept beside the parameters, not among them.
@@ -569,10 +575,6 @@ class _FormatLayer(nn.Module):
             f"{self!r} computes on its checkpoint's tensors alone; it still "
             f"holds the load's placeholder of {held}"
         )
-
-    @property
-    def output_dims(self) -> int:
-        return self["weight"].shape[-2]
 
     def _keep(self) -> tuple:
         """The layer's plan and bias, worked out and kept."""

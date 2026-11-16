@@ -7047,11 +7047,14 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     or ``w`` is neither a matrix nor a stack of matrices that fit a launch.
     A stack is encoded in runs of its matrices. The tensors are checked
     against the format's layout, which is what a checkpoint loads by."""
+    from . import formats
+
     *stack, n, k = w.shape
     max_elems = min(_QUANTIZE_CHUNK_BYTES // 2, 1 << 30)
     layout = fmt.layout(k, n, bits, group_size)
     if layout is None or len(stack) > 1 or n * k > max_elems:
         return None
+    formats.check_layout(fmt, n, k, layout)
     runs = _row_chunks_with_bounds(w, max_elems) if stack else ((0, n, w),)
     own = stack and importance.ndim > 1  # each matrix has its importance
     parts = []

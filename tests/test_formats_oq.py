@@ -9,6 +9,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import re
 import sys
 import textwrap
 import threading
@@ -259,6 +260,75 @@ def test_tensors_that_are_not_the_layout_s_are_refused(toy, answer, shape):
         "checkpoint would not load",
     ):
         oq._encode_in_format(toy, "a.weight", _weights(*shape), mx.ones((64,)), 4, 64)
+
+
+# Layouts that the toy's encode is made to agree with, and that no layer
+# holds, with what oQ says of each for an (8, 64) matrix.
+_UNHELD = {
+    "a tensor more": (
+        lambda n, k: {
+            "weight": ((n, k), mx.uint8),
+            "scales": ((n,), mx.float32),
+            "biases": ((n,), mx.float32),
+        },
+        "quant format 'toy' lays out a (8, 64) matrix as biases, scales, weight: "
+        "a layer holds weight, scales",
+    ),
+    "one axis": (
+        lambda n, k: {"weight": ((n * k,), mx.uint8), "scales": ((n,), mx.float32)},
+        "quant format 'toy' lays out the weight of a (8, 64) matrix as (512,): a "
+        "weight has two axes, N and the format's own",
+    ),
+    "packed along N": (
+        lambda n, k: {
+            "weight": ((n // 2, 2 * k), mx.uint8),
+            "scales": ((n,), mx.float32),
+        },
+        "quant format 'toy' lays out the weight of a (8, 64) matrix as (4, 128): "
+        "its first axis is N (8); a format packs along K, never along N",
+    ),
+}
+
+
+def _lays_out(toy, monkeypatch, layout):
+    """The toy lays matrices out as ``layout``, and encodes them so."""
+    monkeypatch.setattr(toy, "layout", lambda k, n, bits, group_size: layout(n, k))
+
+    def agreeing(tensors, w):
+        *lead, n, k = w.shape
+        return {
+            name: mx.zeros((*lead, *shape), dtype)
+            for name, (shape, dtype) in layout(n, k).items()
+        }
+
+    toy.answer = agreeing
+
+
+@pytest.mark.parametrize("shape", [(8, 64), (3, 8, 64)], ids=["matrix", "stack"])
+@pytest.mark.parametrize("case", list(_UNHELD))
+def test_a_layout_no_layer_holds_is_refused_before_a_matrix_is_encoded(
+    toy, monkeypatch, case, shape
+):
+    layout, words = _UNHELD[case]
+    _lays_out(toy, monkeypatch, layout)
+    with pytest.raises(ValueError, match=f"^{re.escape(words)}$"):
+        oq._encode_in_format(toy, "a.weight", _weights(*shape), mx.ones((64,)), 4, 64)
+    assert toy.encoded == []
+
+
+def test_the_contract_page_quotes_the_refusal_of_a_layout(toy, monkeypatch):
+    monkeypatch.setattr(toy, "mode", "myformat")
+    _lays_out(toy, monkeypatch, _UNHELD["packed along N"][0])
+    with pytest.raises(ValueError) as refusal:
+        oq._encode_in_format(toy, "a.weight", _weights(16, 64), mx.ones((64,)), 8, 1)
+    assert str(refusal.value) in _QUOTED
+
+
+def test_the_contract_page_says_who_refuses_a_layout():
+    assert (
+        "A layout that breaks these rules for a matrix is refused, by oQ before "
+        "it encodes the matrix and by a layer when it is built" in _QUOTED
+    )
 
 
 def test_the_contract_page_quotes_the_refusal_of_other_tensors(toy, monkeypatch):

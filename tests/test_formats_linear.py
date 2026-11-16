@@ -2713,6 +2713,43 @@ def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy):
         layer(x)
 
 
+class _PackedAlongN(_ToyFormat):
+    """The toy, with a layout that packs two rows of a matrix into one."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n // 2, 2 * k), mx.uint8), "scales": ((n,), mx.float32)}
+
+
+def test_a_layer_whose_format_lays_out_no_such_layer_is_refused(monkeypatch):
+    """A layer holds the layout of the matrix it is built for, which the
+    format gives for the layer's N (its weight's first axis): a format that
+    packs along N lays out another weight for it."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _PackedAlongN())
+    (codes, scales), _, _ = _matrix(8, 64)
+    packed = {"weight": codes.reshape(4, 128), "scales": scales}
+    refusal = re.escape(
+        "quant format 'toy' lays out the weight of a (4, 128) matrix as (2, 256): "
+        "its first axis is N (4); a format packs along K, never along N"
+    )
+    with pytest.raises(ValueError, match=refusal):
+        FormatLinear("toy", 8, 1, 128, packed)
+    stack = {name: mx.stack([t, t]) for name, t in packed.items()}
+    with pytest.raises(ValueError, match=refusal):
+        FormatSwitchLinear("toy", 8, 1, 128, stack)
+    # A layout of the layer's N: the layer is built, and its N is that.
+    monkeypatch.setattr(
+        _PackedAlongN,
+        "layout",
+        lambda self, k, n, bits, group_size: {
+            "weight": ((n, k), mx.uint8),
+            "scales": ((n,), mx.float32),
+        },
+    )
+    layer = FormatLinear("toy", 8, 1, 64, {"weight": codes, "scales": scales})
+    assert layer.output_dims == 8
+
+
 def test_a_layer_reads_as_mlx_s_quantized_layers():
     quantized, layer = _pair(320, 72, bits=5, bias=True)
     assert (layer.mode, layer.bits, layer.group_size) == ("affine", 5, 32)

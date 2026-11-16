@@ -399,6 +399,34 @@ class FormatRefusedError(ValueError):
         super().__init__(f"{said}: {reason}")
 
 
+def check_layout(fmt: QuantFormat, n: int, k: int, layout: dict) -> None:
+    """Refuse, in words, a ``layout`` that ``fmt`` gives for an ``(n, k)``
+    matrix and that no layer holds: tensors of other names than the weight
+    and the format's ``tensors``, a weight of other than two axes, or a
+    weight whose first axis is not N (a layer's N is its weight's first
+    axis: a format packs along K, never along N). oQ checks a layout before
+    it encodes a matrix in it, and a layer the layout of the matrix it
+    holds."""
+    names = ("weight", *fmt.tensors)
+    if set(layout) != set(names):
+        raise ValueError(
+            f"quant format {fmt.mode!r} lays out a ({n}, {k}) matrix as "
+            f"{', '.join(sorted(layout))}: a layer holds {', '.join(names)}"
+        )
+    shape = tuple(layout["weight"][0])
+    if len(shape) != 2:
+        raise ValueError(
+            f"quant format {fmt.mode!r} lays out the weight of a ({n}, {k}) "
+            f"matrix as {shape}: a weight has two axes, N and the format's own"
+        )
+    if shape[0] != n:
+        raise ValueError(
+            f"quant format {fmt.mode!r} lays out the weight of a ({n}, {k}) "
+            f"matrix as {shape}: its first axis is N ({n}); a format packs "
+            "along K, never along N"
+        )
+
+
 _FORMATS: dict[str, QuantFormat] = {}
 
 
