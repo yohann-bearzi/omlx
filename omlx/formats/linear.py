@@ -27,7 +27,6 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
-from ..patches.module_cache import cached_per_module
 from . import Dot, kernels
 
 logger = logging.getLogger(__name__)
@@ -298,9 +297,26 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     return y
 
 
+# Where a layer keeps what its calls work out of it once: its plan and its
+# bias.
+_KEPT = "_omlx_format_call"
+
+
 class _FormatLayer(nn.Module):
     """What the two layers share: a format's tensors as frozen parameters,
-    and the attributes of MLX's quantized layers."""
+    and the attributes of MLX's quantized layers.
+
+    A layer works out its plan and finds its bias at its first call, and
+    keeps them in its ``__dict__`` with the weight they were found with,
+    until one of its arrays or attributes is assigned or removed
+    (``__setitem__``, ``__delitem__``, ``pop``: what MLX's loads,
+    ``update``, ``set_dtype`` and attribute writes go through) or its
+    weight is another array: a function that ``mx.compile`` traces over the
+    layer's state (``inputs=``) swaps every array of it for a trace's, and
+    back, behind those methods. A call then reads one dict entry and the
+    weight. Threads: a layer that is being loaded is not called meanwhile;
+    two threads that make a layer's first call at once each work out the
+    same plan, and either keeps it."""
 
     _STACK = 0  # the axes ahead of one matrix's, in each of its tensors
 
@@ -349,6 +365,23 @@ class _FormatLayer(nn.Module):
     def output_dims(self) -> int:
         return self["weight"].shape[-2]
 
+    def _keep(self) -> tuple:
+        """The layer's plan and bias, worked out and kept."""
+        kept = self.__dict__[_KEPT] = (_plan(self), self.get("bias"), self["weight"])
+        return kept
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        self.__dict__.pop(_KEPT, None)
+        super().__setitem__(key, value)
+
+    def __delitem__(self, key: str) -> None:
+        self.__dict__.pop(_KEPT, None)
+        super().__delitem__(key)
+
+    def pop(self, *key_and_default):
+        self.__dict__.pop(_KEPT, None)
+        return super().pop(*key_and_default)
+
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
         """The layer's weights as floats: all of them, or the matrices at
         ``indices`` of the stack."""
@@ -372,7 +405,10 @@ class FormatLinear(_FormatLayer):
 
     def __call__(self, x: mx.array) -> mx.array:
         shape, dtype = x.shape, x.dtype
-        plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept[2] is not self["weight"]:
+            kept = self._keep()
+        plan, bias, _ = kept
         # A decode step is this, its kept graph's replay and the bias.
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
@@ -386,9 +422,7 @@ class FormatLinear(_FormatLayer):
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
-        if "bias" in self:
-            y = y + self["bias"]
-        return y
+        return y if bias is None else y + bias
 
 
 class FormatSwitchLinear(_FormatLayer):
@@ -411,7 +445,10 @@ class FormatSwitchLinear(_FormatLayer):
         # hint on to MLX's gather_mm.
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
-        plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept[2] is not self["weight"]:
+            kept = self._keep()
+        plan, bias, _ = kept
         graph = plan.proof.graphs.get(signature) if plan is not None else None
         if graph is not None:
             y = graph(x, indices, *plan.operands)
@@ -434,6 +471,6 @@ class FormatSwitchLinear(_FormatLayer):
                     rhs_indices=_wrapped(indices, self.num_experts),
                     sorted_indices=sorted_indices,
                 )
-        if "bias" in self:
-            y = y + mx.expand_dims(self["bias"][indices], -2)
+        if bias is not None:
+            y = y + mx.expand_dims(bias[indices], -2)
         return y

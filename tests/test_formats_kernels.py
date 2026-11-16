@@ -106,6 +106,34 @@ def _line(source, text) -> int:
     return source[: source.index(text)].count("\n") + 1
 
 
+def test_a_proof_asked_for_again_is_the_one_kept_and_makes_none(monkeypatch):
+    """kernels.proof gives the one proof of a key; asked again it makes no
+    Proof to drop."""
+    kernels._PROOFS.pop(("probe", 1), None)
+    first = kernels.proof("probe", 1)
+    monkeypatch.setattr(kernels, "Proof", lambda: pytest.fail("made"))
+    assert kernels.proof("probe", 1) is first
+    kernels._PROOFS.pop(("probe", 1))
+
+
+class _Missed(dict):
+    """A registry whose first two lookups miss, as two threads' that ask
+    for a new key at once."""
+
+    misses = 2
+
+    def get(self, key, default=None):
+        if self.misses:
+            self.misses -= 1
+            return default
+        return super().get(key, default)
+
+
+def test_two_threads_that_miss_a_key_at_once_get_one_proof(monkeypatch):
+    monkeypatch.setattr(kernels, "_PROOFS", _Missed())
+    assert kernels.proof("probe", 2) is kernels.proof("probe", 2)
+
+
 def test_a_proof_is_shared_by_what_is_compiled_from_the_same_key():
     face = _toy("proof")
     proof = kernels.proof("kernel", face, mx.float32, 512)

@@ -533,7 +533,12 @@ def proof(kernel: str, *key) -> Proof:
     """The proof of the launches that ``kernel`` compiles from ``key``: its
     faces and what else its source is instantiated with, beside what the
     kernel keeps in ``Proof.ran``."""
-    return _PROOFS.setdefault((kernel, *key), Proof())
+    key = (kernel, *key)
+    proof = _PROOFS.get(key)
+    if proof is None:
+        # One step: of two threads that miss at once, both get one Proof.
+        proof = _PROOFS.setdefault(key, Proof())
+    return proof
 
 
 class Matrices:

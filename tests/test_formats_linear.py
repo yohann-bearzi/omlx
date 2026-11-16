@@ -730,6 +730,51 @@ def test_the_plan_follows_the_layer_s_tensors(toy, monkeypatch):
     assert asked == [id(layer)] * 2 + [id(switch)] * 2
 
 
+def test_a_call_finds_its_plan_and_bias_kept_on_the_layer(toy, monkeypatch):
+    """A layer works out its plan and finds its bias at its first call; its
+    calls after read them off the layer, with no walk of its arrays, until
+    an array or an attribute of the layer is assigned or removed."""
+    toy(_toy("linear"))
+    planned, plan = [], linear._plan
+
+    def recorded(layer):
+        planned.append(layer)
+        return plan(layer)
+
+    monkeypatch.setattr(linear, "_plan", recorded)
+    bias = mx.arange(40).astype(mx.float32)
+    layer, x, want = _toy_linear(40, 320, bias=bias)
+    assert _equal(layer(x), want + bias)
+    with monkeypatch.context() as patch:
+        walked = lambda *a, **k: pytest.fail("walked")  # noqa: E731
+        patch.setattr(linear, "cached_per_module", walked, raising=False)
+        assert _equal(layer(x), want + bias)
+    assert planned == [layer]
+    # Each way MLX changes a layer: an assignment, a removal, an update, an
+    # attribute's write.
+    layer["scales"] = layer["scales"] * 2
+    assert _equal(layer(x), 2 * want + bias) and len(planned) == 2
+    layer.pop("bias")
+    assert _equal(layer(x), 2 * want) and len(planned) == 3
+    layer.bias = bias
+    assert _equal(layer(x), 2 * want + bias) and len(planned) == 4
+    layer.update({"scales": layer["scales"] / 2})
+    assert _equal(layer(x), want + bias) and len(planned) == 5
+    del layer["bias"]
+    assert _equal(layer(x), want) and len(planned) == 6
+    layer.group_size = 2
+    assert _equal(layer(x), want) and len(planned) == 7
+    # A stack's bias as well.
+    switch = _toy_switch(40, 320)
+    rows, indices = _ints((16, 1, 320)), _experts((16,))
+    alone = np.array(switch(rows, indices))
+    stacked = mx.arange(EXPERTS * 40).astype(mx.float32).reshape(EXPERTS, 40)
+    switch["bias"] = stacked
+    assert np.array_equal(np.array(switch(rows, indices)), _want(switch, rows, indices))
+    switch.pop("bias")
+    assert np.array_equal(np.array(switch(rows, indices)), alone)
+
+
 def test_a_face_that_does_not_compile_leaves_the_layers_to_the_decode(
     toy, monkeypatch, caplog
 ):
