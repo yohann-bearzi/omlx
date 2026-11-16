@@ -38,7 +38,7 @@ import sys
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import cache, wraps
+from functools import wraps
 from pathlib import Path
 
 import mlx.core as mx
@@ -235,6 +235,20 @@ def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
     )
 
 
+def _not_installed(mode) -> str:
+    """Why no format of ``mode`` reads a checkpoint's layers: its plugin
+    did not load, or is not installed (the one the checkpoint being loaded
+    records, when it records one)."""
+    skipped = formats._SKIPPED.get(mode)
+    if skipped is not None:
+        return skipped
+    checkpoint = formats._LOADING.get()
+    written = checkpoint.writer(mode) if checkpoint is not None else None
+    if written in (None, "an unknown writer", "a format registered by hand"):
+        written = "the plugin the checkpoint was written with"
+    return f"no format of this mode is installed: install {written}"
+
+
 def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
     """The checkpoint a layer of ``fmt`` built now belongs to."""
     checkpoint = formats._LOADING.get()
@@ -246,16 +260,6 @@ def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
             mode=fmt.mode,
         )
     return checkpoint
-
-
-@cache
-def _mlx_runs(mode) -> bool:
-    """Whether ``mode`` is one of MLX's own."""
-    try:
-        mx.quantize(mx.zeros((1, 64)), mode=mode)
-    except ValueError:
-        return False
-    return True
 
 
 def _format_layer(layer, layer_cls, signature, arguments):
@@ -275,14 +279,10 @@ def _format_layer(layer, layer_cls, signature, arguments):
             layout = read.layout(k, n, bits, group_size)
         fmt = read
     if layout is None:
-        if _mlx_runs(mode):
+        if formats._mlx_runs(mode):
             return None
         if fmt is None:
-            raise _refused(
-                "no format of this mode is installed: install the plugin the "
-                "checkpoint was written with",
-                mode,
-            )
+            raise _refused(_not_installed(mode), mode)
         raise _refused(
             f"it lays out no ({n}, {k}) matrix of {bits} bits in groups of "
             f"{group_size}",

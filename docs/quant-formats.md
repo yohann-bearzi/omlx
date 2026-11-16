@@ -70,9 +70,10 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - A mode has one format. A second format for a registered mode is refused.
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
+- MLX's own modes (`affine`, `mxfp4`, `mxfp8`, `nvfp4`, any mode `mx.quantize` takes) are oMLX's built-in formats' only: a checkpoint of one of them loads as MLX's layers wherever no built-in format lays its matrix out. Another format under one is refused: `quant format 'mxfp4': 'mxfp4' is one of MLX's own modes, which only oMLX's built-in formats take: register the format under a mode of its own`.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
 - A plugin is logged when it is loaded, with the distribution that installed it and the modes it registered: `quant format plugin myformat (my-package 0.1.0) registered myformat`.
-- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts.
+- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts. A checkpoint of the mode it would have registered is then refused with what failed: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: none): my-package 0.2.0 is installed but did not load: quant format 'myformat' is written for revision 2 of the format contract; this oMLX runs revision 1: update oMLX`.
 - A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read can fail to load (it is then skipped), and an import in one thread can deadlock with the first lookup in another.
 
 ## Decode
@@ -128,7 +129,7 @@ mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a
 
 `layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there, by MLX.
 
-`layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): it lays out no (16, 64) matrix of 4 bits in groups of 2`. A format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
+`layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): it lays out no (16, 64) matrix of 4 bits in groups of 2`. A built-in format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
 
 A checkpoint names each layer of the format in its quantization config:
 
@@ -141,7 +142,7 @@ A checkpoint names each layer of the format in its quantization config:
 
 - A layer's entry holds `group_size`, `bits` and `mode`, and nothing else: the loader calls the layer's `to_quantized` with it.
 - The top-level `mode` stays one of MLX's. A layer the config does not name takes the top-level values, and the loaders find such a layer by its `scales` tensor.
-- A checkpoint of a format that is not installed fails to load: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: none): no format of this mode is installed: install the plugin the checkpoint was written with`.
+- A checkpoint of a format that is not installed fails to load, naming the plugin its record says wrote it: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: none): no format of this mode is installed: install my-package 0.1.0`.
 - A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
 - A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three. Until then oQ writes their matrices in its affine (see [Quantize a checkpoint](#quantize-a-checkpoint)).
 

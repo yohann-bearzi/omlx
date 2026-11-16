@@ -65,6 +65,7 @@ def plugins(monkeypatch):
     installed = []
     monkeypatch.setattr(formats, "_FORMATS", {})
     monkeypatch.setattr(formats, "_ORIGINS", {})
+    monkeypatch.setattr(formats, "_SKIPPED", {}, raising=False)
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
@@ -216,6 +217,9 @@ def test_a_plugin_of_another_revision_is_logged_and_skipped(plugins, caplog):
         "quant format plugin later (later:FORMAT) failed to load"
     )
     assert "update oMLX" in str(record.exc_info[1])
+    # What a checkpoint of its mode is told.
+    said = f"later:FORMAT is installed but did not load: {record.exc_info[1]}"
+    assert dict(formats._SKIPPED) == {"later": said}
 
 
 def test_a_format_s_record_is_empty_and_it_reads_any_record_unless_it_says():
@@ -397,6 +401,37 @@ def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
     assert [r.getMessage() for r in caplog.records] == [
         "quant format plugin toy (toy:FORMAT) failed to load"
     ]
+
+
+@pytest.mark.parametrize("mode", ["affine", "mxfp4", "mxfp8", "nvfp4"])
+def test_mlx_s_own_modes_are_the_builtin_formats(plugins, monkeypatch, caplog, mode):
+    refused = (
+        f"quant format {mode!r}: {mode!r} is one of MLX's own modes, which only "
+        "oMLX's built-in formats take: register the format under a mode of its own"
+    )
+    with pytest.raises(ValueError) as by_hand:
+        formats.register(_Format(mode))
+    assert str(by_hand.value) == refused
+    # A plugin's is logged and skipped; checkpoints of the mode stay MLX's.
+    plugins.append(_Entry("shadow", _Format(mode)))
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        assert formats.get(mode) is None
+    (record,) = caplog.records
+    assert str(record.exc_info[1]) == refused
+    said = f"shadow:FORMAT is installed but did not load: {refused}"
+    assert dict(formats._SKIPPED) == {mode: said}
+    # A built-in takes one.
+    monkeypatch.setattr(formats, "_loaded", False)
+    builtin = _Format(mode)
+    monkeypatch.setattr(formats, "BUILTIN", (f"{__name__}:_BUILTINS.{mode}",))
+    monkeypatch.setattr(_BUILTINS, mode, builtin, raising=False)
+    monkeypatch.setattr(formats, "_FORMATS", {})
+    plugins.clear()
+    assert formats.get(mode) is builtin
+    assert formats._mlx_runs(mode) and not formats._mlx_runs("toy")
+
+
+_BUILTINS = SimpleNamespace()
 
 
 def test_a_plugin_cannot_take_a_builtins_mode(plugins, monkeypatch, caplog):

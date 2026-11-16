@@ -258,20 +258,64 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
     # As a load meets it.
     with pytest.raises(formats.FormatRefusedError, match=refusal):
         nn.quantize(_Model(64, 16), class_predicate=_named({"toy": lost}))
-    # A checkpoint's load names it, with the plugin that wrote it.
+    assert not formats._mlx_runs("oqel") and formats._mlx_runs("affine")
+    # A checkpoint's load names the plugin that wrote it, to install.
     (tmp_path / "config.json").write_text(
         json.dumps({"omlx_quant_formats": {"oqel": {"plugin": "omlx-oqel 1.0.0"}}})
     )
-    with format_load.loading(tmp_path), pytest.raises(formats.FormatRefusedError) as no:
+    with (
+        format_load.loading(tmp_path),
+        pytest.raises(formats.FormatRefusedError) as no,
+    ):
         nn.Linear(64, 16).to_quantized(**lost)
     assert str(no.value) == (
         f"quant format 'oqel' of the checkpoint at {tmp_path} (written by "
         "omlx-oqel 1.0.0; installed: none): no format of this mode is installed: "
-        "install the plugin the checkpoint was written with"
+        "install omlx-oqel 1.0.0"
     )
     assert (no.value.mode, no.value.path) == ("oqel", tmp_path)
     assert (no.value.written, no.value.installed) == ("omlx-oqel 1.0.0", "none")
-    assert not format_load._mlx_runs("oqel") and format_load._mlx_runs("affine")
+    quoted = str(no.value).replace(str(tmp_path), "/models/my-model")
+    quoted = quoted.replace("omlx-oqel 1.0.0", "my-package 0.1.0")
+    assert quoted.replace("'oqel'", "'myformat'") in " ".join(_PAGE.split())
+    # A checkpoint that records no plugin, or a format registered by hand.
+    for kept in ({}, {"omlx_quant_formats": {"oqel": {"plugin": None}}}):
+        (tmp_path / "config.json").write_text(json.dumps(kept))
+        with (
+            format_load.loading(tmp_path),
+            pytest.raises(formats.FormatRefusedError) as no,
+        ):
+            nn.Linear(64, 16).to_quantized(**lost)
+        assert no.value.reason == (
+            "no format of this mode is installed: install the plugin the "
+            "checkpoint was written with"
+        )
+
+
+def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(toy, tmp_path):
+    # Installed, and skipped when the registry loaded (here for the revision
+    # of the contract it is written for).
+    skipped = (
+        "omlx-oqel 2.0.0 is installed but did not load: quant format 'oqel' is "
+        "written for revision 2 of the format contract; this oMLX runs revision "
+        "1: update oMLX"
+    )
+    (tmp_path / "config.json").write_text(
+        json.dumps({"omlx_quant_formats": {"oqel": {"plugin": "omlx-oqel 2.0.0"}}})
+    )
+    formats._SKIPPED["oqel"] = skipped
+    try:
+        with (
+            format_load.loading(tmp_path),
+            pytest.raises(formats.FormatRefusedError) as no,
+        ):
+            nn.Linear(64, 16).to_quantized(bits=3, group_size=64, mode="oqel")
+    finally:
+        del formats._SKIPPED["oqel"]
+    assert no.value.reason == skipped and no.value.installed == "none"
+    quoted = str(no.value).replace(str(tmp_path), "/models/my-model")
+    quoted = quoted.replace("omlx-oqel 2.0.0", "my-package 0.2.0")
+    assert quoted.replace("'oqel'", "'myformat'") in " ".join(_PAGE.split())
 
 
 def test_a_matrix_the_format_does_not_lay_out_is_refused_in_words(by_hand, toy):

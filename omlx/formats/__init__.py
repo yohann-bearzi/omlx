@@ -31,6 +31,7 @@ import struct
 import threading
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from functools import cache
 from importlib.metadata import EntryPoint, entry_points
 
 import mlx.core as mx
@@ -397,6 +398,10 @@ _FORMATS: dict[str, QuantFormat] = {}
 _LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
 # The plugin that registered each mode: its distribution's name and version.
 _ORIGINS: dict[str, str] = {}
+# Each mode of an installed plugin that did not load: what is said of it.
+_SKIPPED: dict[str, str] = {}
+# Set on the thread that registers the built-in formats, while it does.
+_REGISTERING_BUILTINS = threading.local()
 # Held for the whole load. Reentrant: the load registers through register(),
 # which loads first.
 _LOCK = threading.RLock()
@@ -421,6 +426,12 @@ def register(fmt: QuantFormat) -> None:
             f"quant format {mode!r}: contract is the revision of the format "
             f"contract it is written for, an int, not {contract!r} "
             f"({type(contract).__name__})"
+        )
+    if _mlx_runs(mode) and not getattr(_REGISTERING_BUILTINS, "registering", False):
+        raise ValueError(
+            f"quant format {mode!r}: {mode!r} is one of MLX's own modes, which "
+            "only oMLX's built-in formats take: register the format under a "
+            "mode of its own"
         )
     if not OLDEST_CONTRACT <= contract <= CONTRACT:
         runs = (
@@ -460,24 +471,35 @@ def load() -> None:
             return
         _loading = True
         try:
-            for value in BUILTIN:
-                register(EntryPoint("builtin", value, ENTRY_POINT_GROUP).load())
+            _REGISTERING_BUILTINS.registering = True
+            try:
+                for value in BUILTIN:
+                    register(EntryPoint("builtin", value, ENTRY_POINT_GROUP).load())
+            finally:
+                _REGISTERING_BUILTINS.registering = False
             plugins = entry_points(group=ENTRY_POINT_GROUP)
             for entry in sorted(plugins, key=lambda entry: (entry.name, entry.value)):
                 before = set(_FORMATS)
+                dist = getattr(entry, "dist", None)
+                plugin = f"{dist.name} {dist.version}" if dist else entry.value
+                fmt = None
                 try:
-                    register(entry.load())
-                except Exception:
+                    fmt = entry.load()
+                    register(fmt)
+                except Exception as error:
                     for mode in _FORMATS.keys() - before:
                         del _FORMATS[mode]
+                    mode = getattr(fmt, "mode", None)
+                    if isinstance(mode, str):
+                        _SKIPPED[mode] = (
+                            f"{plugin} is installed but did not load: {error}"
+                        )
                     logger.exception(
                         "quant format plugin %s (%s) failed to load",
                         entry.name,
                         entry.value,
                     )
                 else:
-                    dist = getattr(entry, "dist", None)
-                    plugin = f"{dist.name} {dist.version}" if dist else entry.value
                     modes = sorted(_FORMATS.keys() - before)
                     _ORIGINS.update(dict.fromkeys(modes, plugin))
                     logger.info(
@@ -489,6 +511,16 @@ def load() -> None:
             _loaded = True
         finally:
             _loading = False
+
+
+@cache
+def _mlx_runs(mode) -> bool:
+    """Whether ``mode`` is one of MLX's own."""
+    try:
+        mx.quantize(mx.zeros((1, 64)), mode=mode)
+    except ValueError:
+        return False
+    return True
 
 
 def get(mode: str | None) -> QuantFormat | None:
