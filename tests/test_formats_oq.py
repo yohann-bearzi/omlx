@@ -864,8 +864,8 @@ def test_a_matrix_of_no_module_of_its_path_stays_affine_and_is_named(
     ]
     said = (
         "oQ4: 1 matrices stay oQ's affine: a quant format's layer is not built for "
-        "their class (no module has their path)\npaths that no module of the model "
-        f"built over the source has: {lost}"
+        "their class (no module holds them)\npaths that no module of the model it "
+        f"loads as holds at their shape: {lost}"
     )
     assert warnings == [said]
     # The page quotes the line that names them.
@@ -879,8 +879,8 @@ def test_the_warning_names_twenty_paths_and_counts_the_others():
     said = oq._left_affine("3", [cls, cls], paths[::-1])
     head = (
         "oQ3: 25 matrices stay oQ's affine: a quant format's layer is not built for "
-        f"their class (no module has their path, {cls})\npaths that no module of the "
-        "model built over the source has: "
+        f"their class (no module holds them, {cls})\npaths that no module of the "
+        "model it loads as holds at their shape: "
     )
     assert said == head + ", ".join(paths[:20]) + " and 3 more"
     assert oq._left_affine("3", [], paths[:20]) == (
@@ -892,30 +892,325 @@ def test_the_warning_names_twenty_paths_and_counts_the_others():
     )
 
 
-def test_an_unpacked_minimax_shared_expert_is_offered_to_no_format(tmp_path):
-    # A MiniMax M3 whose config leaves the shared expert's layout to the
-    # model (pack_shared_expert unset, one shared expert as wide as a routed
-    # one) is built packed: the shared expert is the last matrix of the
-    # routed stacks. A checkpoint stored unpacked keeps the names below, oQ
-    # at 8 bits writes them so, and the loader's sanitize packs them.
-    moe = "language_model.model.layers.0.block_sparse_moe"
+def test_a_matrix_of_another_shape_than_its_module_s_stays_affine(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    walk = oq._module_classes
+    other = "language_model.model.layers.1.mlp.switch_mlp.down_proj"
+
+    def reshaped(*args, **kwargs):
+        walked = walk(*args, **kwargs)
+        cls, loads, shape = walked[other]
+        return {**walked, other: (cls, loads, (shape[0] + 1, *shape[1:]))}
+
+    monkeypatch.setattr(oq, "_module_classes", reshaped)
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    _, config, applied = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
+    assert other in applied and other not in _in_format(config)
+    assert sorted(_in_format(config)) == sorted(set(applied) - {other})
+    assert f"at their shape: {other}" in caplog.text
+
+
+def test_the_walk_builds_the_written_model_from_its_config_alone(
+    source, tmp_path, monkeypatch
+):
+    from omlx.patches import format_load
+
+    asked = []
+
+    def loads(cls):
+        asked.append(cls)
+        return loads_in_format(cls)
+
+    monkeypatch.setattr(format_load, "loads_in_format", loads)
+    config = json.loads((source / "config.json").read_text())
+    walked = oq._module_classes(str(source), config)
+    # Whether a format's layer is built for a class is asked once.
+    assert sorted(asked) == sorted({cls for cls, _, _ in walked.values()})
+    # Each module of the model, its class, whether a format's layer is built
+    # for it, and its weight's shape.
+    gate = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
+    lm_switch_linear = "mlx_lm.models.switch_layers.SwitchLinear"
+    assert walked[gate] == (lm_switch_linear, True, (4, 128, 64))
+    linear = walked["language_model.model.layers.0.mlp.shared_expert.up_proj"]
+    assert linear == ("mlx.nn.layers.linear.Linear", True, (128, 64))
+    norm = walked["language_model.model.norm"]
+    assert norm[1] is False and norm[2] == (64,)
+    # From the config it is given, unquantized, reading neither a weight nor
+    # the tokenizer: a copy of the source with its weights and tokenizer
+    # broken walks the same.
+    broken = tmp_path / "broken"
+    broken.mkdir()
+    for item in source.iterdir():
+        if item.suffix == ".json" and "token" not in item.name:
+            (broken / item.name).write_bytes(item.read_bytes())
+    (broken / "model.safetensors").write_bytes(b"not safetensors")
+    (broken / "tokenizer.json").write_text("{")
+    assert oq._module_classes(str(broken), config) == walked
+    assert (broken / "model.safetensors").read_bytes() == b"not safetensors"
+    # A run's quantization names no layer: none is quantized.
+    quantized = {**config, "quantization": {"group_size": 64, "bits": 4}}
+    assert oq._module_classes(str(broken), quantized) == walked
+    one = oq._module_classes(str(broken), {**config, "num_hidden_layers": 1})
+    assert not any(".layers.1." in name for name in one)
+
+
+def test_the_walk_keeps_the_process_s_load_state(source, monkeypatch):
+    from omlx.patches import mlx_lm_mtp, mlx_vlm_mtp, qwen35_yarn
+    from omlx.utils import model_loading
+
+    # Whatever the pre-load patches set for the model the walk builds.
+    patches = model_loading.maybe_apply_pre_load_patches
+
+    def setting(*args, **kwargs):
+        patches(*args, **kwargs)
+        mlx_lm_mtp._MTP_ACTIVE = not mlx_lm_mtp._MTP_ACTIVE
+        mlx_lm_mtp._MTP_DEPTH, mlx_lm_mtp._MTP_DEPTH_FIXED = 3, True
+        mlx_vlm_mtp._MTP_ATTACH_ENABLED = False
+        qwen35_yarn._context_windows[str(source)] = 1024
+        qwen35_yarn._context_windows.pop("served", None)
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", setting)
+    monkeypatch.setitem(qwen35_yarn._context_windows, "served", 65536)
+    windows = qwen35_yarn._context_windows
+    before = (
+        mlx_lm_mtp._MTP_ACTIVE,
+        mlx_lm_mtp._MTP_DEPTH,
+        mlx_lm_mtp._MTP_DEPTH_FIXED,
+        mlx_vlm_mtp._MTP_ATTACH_ENABLED,
+        dict(windows),
+    )
+    config = json.loads((source / "config.json").read_text())
+    assert oq._module_classes(str(source), config)
+    after = (
+        mlx_lm_mtp._MTP_ACTIVE,
+        mlx_lm_mtp._MTP_DEPTH,
+        mlx_lm_mtp._MTP_DEPTH_FIXED,
+        mlx_vlm_mtp._MTP_ATTACH_ENABLED,
+        dict(qwen35_yarn._context_windows),
+    )
+    assert after == before and qwen35_yarn._context_windows is windows
+
+
+def test_the_walk_loads_as_the_run_trusts_remote_code(
+    source, toy, tmp_path, monkeypatch
+):
+    import mlx_lm.utils
+
+    walk, loader = oq._module_classes, mlx_lm.utils.load_model
+    asked, loaded = [], []
+
+    def loading(*args, **kwargs):
+        loaded.append(kwargs["trust_remote_code"])
+        return loader(*args, **kwargs)
+
+    def walking(*args, **kwargs):
+        asked.append(kwargs["trust_remote_code"])
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(mlx_lm.utils, "load_model", loading)
+            return walk(*args, **kwargs)
+
+    monkeypatch.setattr(oq, "_module_classes", walking)
+    _quantize(source, tmp_path / "oqe-toy", quant_format="toy", trust_remote_code=True)
+    assert asked == [True] and loaded == [True]
+
+
+def test_the_walk_is_of_the_config_the_run_writes(source, toy, tmp_path, monkeypatch):
+    # A source whose config the run changes: text-only, without MTP layers
+    # (the key Qwen3.5 does not read), in float16.
+    changed = tmp_path / "changed"
+    changed.mkdir()
+    for item in source.iterdir():
+        (changed / item.name).write_bytes(item.read_bytes())
+    config = json.loads((source / "config.json").read_text())
+    extra = {"torch_dtype": "bfloat16", "n_mtp_layers": 1}
+    (changed / "config.json").write_text(
+        json.dumps({**config, **extra, "image_token_id": 5})
+    )
+    walk = oq._module_classes
+    given = []
+
+    def walking(model_path, config, **kwargs):
+        given.append(config)
+        return walk(model_path, config, **kwargs)
+
+    monkeypatch.setattr(oq, "_module_classes", walking)
+    output = tmp_path / "oqe-toy"
+    _, written, _ = _quantize(
+        changed, output, quant_format="toy", dtype="float16", text_only=True
+    )
+    assert written["torch_dtype"] == "float16" and "image_token_id" not in written
+    assert "n_mtp_layers" not in written
+    # It is the config written, but what the run learns as it writes: its
+    # layers' quantization entries, the formats' record, the tokenizer's end
+    # of sequence.
+    run = {k: v for k, v in written["quantization"].items() if not isinstance(v, dict)}
+    learned = {"quantization": run, "quantization_config": run}
+    unlearned = {k: v for k, v in written.items() if k not in (_RECORD, "eos_token_id")}
+    assert given == [{**unlearned, **learned}]
+
+
+def test_the_walk_of_minimax_nvfp4_experts_has_their_scales(tmp_path):
     config = {
         "model_type": "minimax_m3_vl",
-        "text_config": {
-            "hidden_size": 64,
-            "intermediate_size": 32,
-            "shared_intermediate_size": 32,
-            "dense_intermediate_size": 128,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 1,
-            "head_dim": 16,
-            "num_hidden_layers": 1,
-            "num_local_experts": 2,
-            "num_experts_per_tok": 1,
-            "n_shared_experts": 1,
-            "moe_layer_freq": [1],
-            "vocab_size": 64,
-        },
+        "text_config": {"n_shared_experts": 1, "pack_shared_expert": False},
+        "quantization_config": {"quant_method": "mxfp8", "moe_quant_algo": "NVFP4"},
+    }
+    base = {"group_size": 64, "bits": 4, "mode": "affine"}
+    written = oq._written_layout(
+        config,
+        tmp_path,
+        text_only=False,
+        preserve_mtp=False,
+        dtype="bfloat16",
+        quantization=base,
+    )
+    assert written["text_config"] == {
+        "n_shared_experts": 1,
+        "pack_shared_expert": False,
+        "routed_expert_scales": True,
+    }
+    assert written["quantization"] == written["quantization_config"] == base
+    assert config["text_config"] == {"n_shared_experts": 1, "pack_shared_expert": False}
+
+
+def test_a_matrix_the_format_declines_outside_oq_s_groups_is_written_as_without(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    # In groups of 128, the format takes the matrices oQ's groups divide and
+    # declines those of K = 64, which are written in floats, as without it;
+    # so are two of them that the format is not asked of: one that no module
+    # holds, and one whose module's class no format's layer is built for.
+    theirs = _quantize(source, tmp_path / "oqe", group_size=128)
+    floats = sorted(
+        name[: -len(".weight")]
+        for name, tensor in theirs[0].items()
+        if name.endswith("_proj.weight")
+        and tensor.shape[-1] == 64
+        and name.replace(".weight", ".scales") not in theirs[0]
+    )
+    unheld, unloaded, missing = floats[:3]
+    walk = oq._module_classes
+
+    def walking(*args, **kwargs):
+        walked = walk(*args, **kwargs)
+        del walked[unheld]
+        cls, _, shape = walked[unloaded]
+        return {**walked, unloaded: (cls, False, shape)}
+
+    monkeypatch.setattr(oq, "_module_classes", walking)
+    toy.answer = lambda tensors, w: None if w.shape[-1] % 128 else tensors
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    output = tmp_path / "oqe-toy"
+    tensors, config, applied = _quantize(
+        source, output, group_size=128, quant_format="toy"
+    )
+    entries = _in_format(config)
+    assert entries and all(
+        tensors[f"{name}.weight"].shape[-1] == 128 for name in entries
+    )
+    for name in (unheld, unloaded):
+        assert tensors[f"{name}.weight"].shape[-1] == 64
+    _assert_same_output(
+        _beside(tensors, config, entries), _beside(*theirs[:2], entries)
+    )
+    # Neither the report nor the warning counts them.
+    ours = json.loads((output / "oq_imatrix_report.json").read_text())
+    plain = json.loads((tmp_path / "oqe" / "oq_imatrix_report.json").read_text())
+    for key in ("applied", "missing", "mismatched", "zero_count_experts"):
+        assert ours[key] == plain[key], key
+    assert not any("stay oQ's affine" in message for message in caplog.messages)
+    # Nor does a strict run stop at one of them that has no importance: a
+    # format is only asked of it. (The calibration measures no lm_head here:
+    # the cache is given an entry for each matrix it missed.)
+    cache = tmp_path / "imatrix.npz"
+    _quantize(source, tmp_path / "first", group_size=128, imatrix_cache_path=str(cache))
+    with np.load(cache) as data:
+        kept = {name: data[name] for name in data.files}
+    assert f"{missing}.in_sum2" in kept
+    kept = {k: v for k, v in kept.items() if not k.startswith(f"{missing}.")}
+    wide = next(
+        k[: -len(".in_sum2")]
+        for k, v in kept.items()
+        if k.endswith(".in_sum2") and v.shape == (64,)
+    )
+    first = json.loads((tmp_path / "first" / "oq_imatrix_report.json").read_text())
+    for name in first["missing"]:
+        for part in ("in_sum2", "counts"):
+            kept[f"{name}.{part}"] = kept[f"{wide}.{part}"]
+    np.savez_compressed(cache, **kept)
+    monkeypatch.setattr(oq, "_collect_imatrix", lambda *a, **k: pytest.fail("ran"))
+    _, config, _ = _quantize(
+        source,
+        tmp_path / "strict",
+        group_size=128,
+        quant_format="toy",
+        imatrix_cache_path=str(cache),
+        imatrix_strict=True,
+    )
+    assert missing not in _in_format(config)
+
+
+def test_a_stack_outside_oq_s_groups_that_the_format_takes_is_in_the_report(
+    source, toy, tmp_path, monkeypatch
+):
+    # An expert of a stack of K = 64 that no calibration token reached: in
+    # groups of 128 the format alone writes the stack, and the report counts
+    # it as it counts the format's other matrices.
+    cache = tmp_path / "imatrix.npz"
+    _quantize(source, tmp_path / "first", group_size=128, imatrix_cache_path=str(cache))
+    gate = "language_model.model.layers.0.mlp.switch_mlp.gate_proj"
+    with np.load(cache) as data:
+        kept = {name: data[name] for name in data.files}
+    counts = kept[f"{gate}.counts"].copy()
+    counts[0] = 0
+    np.savez_compressed(cache, **{**kept, f"{gate}.counts": counts})
+    monkeypatch.setattr(oq, "_collect_imatrix", lambda *a, **k: pytest.fail("ran"))
+    output = tmp_path / "oqe-toy"
+    tensors, config, applied = _quantize(
+        source,
+        output,
+        group_size=128,
+        quant_format="toy",
+        imatrix_cache_path=str(cache),
+    )
+    assert tensors[f"{gate}.weight"].shape == (4, 128, 64)
+    assert gate in _in_format(config) and gate in applied
+    report = json.loads((output / "oq_imatrix_report.json").read_text())
+    assert report["zero_count_experts"] == 1
+
+
+def _minimax_m3_vl(path, layers=2):
+    """A tiny MiniMax M3 checkpoint in bfloat16 at ``path``, every weight
+    real, its experts stored unpacked (mlx-vlm's names, a shared expert
+    beside the routed stacks), and a config that leaves the layout to the
+    model: one shared expert as wide as a routed one, so the model packs
+    it with them when it loads."""
+    from mlx_vlm.utils import get_model_and_args, update_module_configs
+
+    from omlx.patches.mlx_vlm_minimax_m3_compat import (
+        apply_mlx_vlm_minimax_m3_compat_patch,
+    )
+
+    apply_mlx_vlm_minimax_m3_compat_patch()
+    text = {
+        "hidden_size": 64,
+        "intermediate_size": 32,
+        "shared_intermediate_size": 32,
+        "dense_intermediate_size": 128,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 1,
+        "head_dim": 16,
+        "num_hidden_layers": layers,
+        "num_local_experts": 2,
+        "num_experts_per_tok": 1,
+        "n_shared_experts": 1,
+        "moe_layer_freq": [1] * layers,
+        "vocab_size": 64,
+    }
+    config = {
+        "model_type": "minimax_m3_vl",
+        "text_config": text,
         "vision_config": {
             "hidden_size": 32,
             "intermediate_size": 64,
@@ -926,42 +1221,78 @@ def test_an_unpacked_minimax_shared_expert_is_offered_to_no_format(tmp_path):
         "projector_hidden_size": 64,
         "vocab_size": 64,
     }
-    path = tmp_path / "minimax"
+    unpacked = {**config, "text_config": {**text, "pack_shared_expert": False}}
+    module, _ = get_model_and_args(config=unpacked)
+    model_config = update_module_configs(
+        module.ModelConfig.from_dict(json.loads(json.dumps(unpacked))),
+        module,
+        unpacked,
+        ["text", "vision", "perceiver", "projector", "audio"],
+    )
+    mx.random.seed(11)
+    model = module.Model(model_config)
+    model.set_dtype(mx.bfloat16)
     path.mkdir()
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(path / "model.safetensors"), weights, {"format": "mlx"})
     (path / "config.json").write_text(json.dumps(config))
     _save_tokenizer(path, 64)
-    norm = "language_model.model.norm.weight"
-    mx.save_safetensors(str(path / "model.safetensors"), {norm: mx.ones((64,))})
-    classes = oq._module_classes(str(path), config)
-    # The shared expert's matrices, and the routed gate and up projections,
-    # are no module of the model built over the source: oQ's affine keeps
-    # them, and the run names them.
-    unpacked = [
-        *(
-            f"{moe}.shared_experts.{name}"
-            for name in ("gate_proj", "up_proj", "down_proj")
-        ),
-        f"{moe}.switch_mlp.gate_proj",
-        f"{moe}.switch_mlp.up_proj",
-    ]
-    assert [classes.get(name) for name in unpacked] == [None] * 5
-    assert loads_in_format(classes[f"{moe}.switch_mlp.gate_up_proj"])
-    # The routed down projection has the path of the packed stack, which
-    # holds the shared expert too: oQe measures three matrices' inputs, and
-    # the checkpoint's stack of two takes no importance, so no format is
-    # offered it (nor oQe's weighing, as in a run without one).
-    down = f"{moe}.switch_mlp.down_proj"
-    assert loads_in_format(classes[down])
-    model, _ = oq._calibration_model(str(path), config)
-    measured = dict(model.named_modules())[down].weight.shape
-    assert measured == (3, 64, 32)
-    entry = oq.OQImatrixEntry(np.ones((3, 32)), np.ones(3))
-    report = {"applied": [], "missing": [], "mismatched": []}
-    importance = oq._lookup_imatrix_importance(
-        oq.OQImatrixData({down: entry}, {}, "cache"),
-        f"{down}.weight",
-        (2, 64, 32),
-        strict=False,
-        report=report,
+    return weights
+
+
+def test_the_walk_keeps_the_modules_the_source_s_index_declares(tmp_path):
+    # mlx-vlm drops a module beside the language model that no weight is
+    # given for, unless the checkpoint's index declares it (an MTP head, a
+    # vision tower): the walk declares what the source's index does.
+    source = tmp_path / "minimax"
+    weights = _minimax_m3_vl(source)
+    config = json.loads((source / "config.json").read_text())
+
+    def tower(walked):
+        return [
+            name
+            for name, (_, loads, shape) in walked.items()
+            if name.startswith("vision_tower.") and loads and shape is not None
+        ]
+
+    assert tower(oq._module_classes(str(source), config)) == []
+    index = {"metadata": {}, "weight_map": dict.fromkeys(weights, "model.safetensors")}
+    (source / "model.safetensors.index.json").write_text(json.dumps(index))
+    assert tower(oq._module_classes(str(source), config))
+
+
+def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(
+    toy, tmp_path, monkeypatch
+):
+    from mlx_vlm import utils as vlm_utils
+
+    from omlx.engine.vlm import _force_minimax_m3_moe_sanitize_on_load
+
+    source = tmp_path / "minimax"
+    weights = _minimax_m3_vl(source)
+    moe = "language_model.model.layers.0.block_sparse_moe"
+    assert f"{moe}.shared_experts.down_proj.weight" in weights
+    assert weights[f"{moe}.switch_mlp.down_proj.weight"].shape == (2, 64, 32)
+    output = tmp_path / "oqe8-toy"
+    tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
+    monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **k: tokens)
+    oq.quantize_oq_streaming(
+        str(source),
+        str(output),
+        8,
+        enhanced=True,
+        imatrix_num_samples=4,
+        imatrix_seq_length=16,
+        sensitivity_map_override={0: 0.1, 1: 0.2},
+        quant_format="toy",
     )
-    assert importance is None and [m["tensor"] for m in report["mismatched"]] == [down]
+    config = json.loads((output / "config.json").read_text())
+    # The loader packs the shared expert with the routed stacks: none of the
+    # experts' matrices is the format's.
+    assert not any(".block_sparse_moe." in name for name in _in_format(config))
+    with _force_minimax_m3_moe_sanitize_on_load(output):
+        maybe_apply_pre_load_patches(str(output), for_vlm=True)
+        model = vlm_utils.load_model(output)
+    logits = model.language_model(mx.array([[1, 2, 3, 4]]))
+    logits = getattr(logits, "logits", logits)
+    assert mx.isfinite(logits).all()

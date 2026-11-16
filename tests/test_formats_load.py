@@ -256,16 +256,17 @@ def _class_name(cls):
 
 
 def test_the_classes_whose_matrices_load_in_a_format(unpatched):
-    # The classes whose to_quantized the patch wraps, and the layers MLX
-    # builds of them: a calibration over a quantized checkpoint meets those.
+    # The classes whose to_quantized the patch wraps; not the layers MLX
+    # builds of them (oQ's walk gives no weight, so it builds none).
     for cls in _PATCHED:
+        assert format_load.loads_in_format(_class_name(cls)), cls
         built = cls(64, 16, EXPERTS) if cls is not nn.Linear else cls(64, 16)
-        for loaded in (cls, type(built.to_quantized(32, 4))):
-            assert format_load.loads_in_format(_class_name(loaded)), loaded
-    assert format_load.loads_in_format("mlx.nn.layers.quantized.QuantizedLinear")
+        quantized = _class_name(type(built.to_quantized(32, 4)))
+        assert not format_load.loads_in_format(quantized), quantized
     # Not a family's own switch layer, nor MLA's, nor a class by its name
     # alone.
     for name in (
+        "mlx.nn.layers.quantized.QuantizedLinear",
         "omlx.patches.deepseek_v4.switch_layers.SwitchLinear",
         "omlx.patches.glm_moe_dsa.switch_layers.QuantizedSwitchLinear",
         "mlx_lm.models.mla.MultiLinear",

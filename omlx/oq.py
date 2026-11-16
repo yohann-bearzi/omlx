@@ -6927,13 +6927,30 @@ _QUANT_FORMAT_MISREAD = {
 }
 
 
+# What a run keeps in its config for itself and does not write.
+_OQ_RUN_KEYS = (
+    "_oq_sensitivity_map",
+    "_oq_boost_map",
+    "_oq_use_budget_plan",
+    "_oq_non_quantizable",
+    "_oq_noncausal_attention",
+    "_oq_imatrix_capture_skip",
+)
+
+
+def _no_lookups() -> dict:
+    """An imatrix report of no lookup yet, as a run's starts."""
+    return {"applied": [], "missing": [], "mismatched": [], "zero_count_experts": 0}
+
+
 def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
     """What a run with a quant format says of the matrices it offered none:
     ``unloaded`` has the class of each one's module, which no format's layer
-    is built for, ``unwalked`` the path of each one that is no module of the
-    model built over the source (a family's loader renames or joins it, so
-    what it would load as is not known): those are named."""
-    classes = set(unloaded) | ({"no module has their path"} if unwalked else set())
+    is built for, ``unwalked`` the path of each one that no module of the
+    model the checkpoint loads as holds at its shape (a family's loader
+    renames, joins or splits it, so what it would load as is not known):
+    those are named."""
+    classes = set(unloaded) | ({"no module holds them"} if unwalked else set())
     said = (
         f"oQ{level}: {len(unloaded) + len(unwalked)} matrices stay oQ's affine: "
         "a quant format's layer is not built for their class "
@@ -6943,7 +6960,7 @@ def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
         paths = sorted(unwalked)
         more = f" and {len(paths) - 20} more" if len(paths) > 20 else ""
         said += (
-            "\npaths that no module of the model built over the source has: "
+            "\npaths that no module of the model it loads as holds at their shape: "
             f"{', '.join(paths[:20])}{more}"
         )
     return said
@@ -7225,7 +7242,6 @@ def quantize_oq_streaming(
     quant_fmt = None
     if quant_format is not None:
         from . import formats
-        from .patches.format_load import loads_in_format
 
         if not enhanced:
             raise ValueError(
@@ -7569,13 +7585,6 @@ def quantize_oq_streaming(
             )
             return str(_ensure_ram_safe_proxy())
 
-        if quant_fmt is not None:
-            # The class of the module that holds each matrix, which decides
-            # what it loads as, read from the model built lazily over the
-            # source: the imatrix cache keeps none, so it serves every run.
-            module_classes = _module_classes(
-                model_path, config, trust_remote_code=trust_remote_code
-            )
         try:
             imatrix_data = _load_or_collect_imatrix(
                 model_path,
@@ -7913,7 +7922,23 @@ def quantize_oq_streaming(
     per_layer_config = {}
     format_layers = 0
     unloaded = []  # the classes of matrices no format's layer loads for
-    unwalked = []  # matrices of no module of the model built over the source
+    unwalked = []  # matrices no module of the model it loads as holds
+    if quant_fmt is not None:
+        # The module that holds each matrix in the model the checkpoint loads
+        # as, built from the config the run writes, with each of this run's
+        # changes to the source's: the imatrix cache keeps none, so it serves
+        # every run.
+        written = _written_layout(
+            config,
+            source,
+            text_only=text_only,
+            preserve_mtp=preserve_mtp,
+            dtype=dtype,
+            quantization=quantization_config,
+        )
+        module_classes = _module_classes(
+            model_path, written, trust_remote_code=trust_remote_code
+        )
     start_time = _time.monotonic()
     last_quant_display_pct = -1
     last_quant_emit_time = 0.0
@@ -8024,21 +8049,25 @@ def quantize_oq_streaming(
                     tensor_name, config, oq_level, group_size
                 )
 
-                matrix = bits is not None and len(shape) >= 2
                 # oQ's affine keeps a matrix whose K is whole groups. A
-                # format is asked of any matrix: its groups may be its own.
-                grouped = matrix and shape[-1] % gs == 0
+                # format is asked of any matrix that oQe weighs: its groups
+                # may be its own.
+                grouped = bits is not None and shape[-1] % gs == 0
                 encoded = None
-                if grouped or (matrix and quant_fmt is not None):
+                if grouped or quant_fmt is not None:
                     importance = None
+                    # Outside oQ's groups a matrix is written in floats unless
+                    # the format takes it: its importance is looked up for the
+                    # format alone, and counted only if the format takes it.
+                    looked_up = imatrix_report if grouped else _no_lookups()
                     if imatrix_data is not None and qmode == "affine":
                         importance = _lookup_imatrix_importance(
                             imatrix_data,
                             tensor_name,
                             tuple(shape),
                             config=config,
-                            strict=imatrix_strict,
-                            report=imatrix_report,
+                            strict=imatrix_strict and grouped,
+                            report=looked_up,
                         )
                     base = tensor_name
                     if base.endswith(".weight"):
@@ -8048,15 +8077,21 @@ def quantize_oq_streaming(
                     # matrix that loads as its layer.
                     if quant_fmt is not None and importance is not None:
                         held = module_classes.get(base)
-                        if held is None:
-                            unwalked.append(base)
-                        elif loads_in_format(held):
+                        if held is None or held[2] != tuple(shape):
+                            if grouped:
+                                unwalked.append(base)
+                        elif held[1]:
                             encoded = _encode_in_format(
                                 quant_fmt, tensor_name, w_mx, importance, bits, gs
                             )
-                        else:
-                            unloaded.append(held)
+                        elif grouped:
+                            unloaded.append(held[0])
                 if encoded is not None:
+                    if not grouped:
+                        imatrix_report["applied"] += looked_up["applied"]
+                        imatrix_report["zero_count_experts"] += looked_up[
+                            "zero_count_experts"
+                        ]
                     for name, tensor in encoded.items():
                         out_shard_data[f"{base}.{name}"] = tensor
                     per_layer_config[base] = {
@@ -8223,14 +8258,7 @@ def quantize_oq_streaming(
             json.dump(index, f, indent=2)
 
     output_config = dict(config)
-    for temp_key in (
-        "_oq_sensitivity_map",
-        "_oq_boost_map",
-        "_oq_use_budget_plan",
-        "_oq_non_quantizable",
-        "_oq_noncausal_attention",
-        "_oq_imatrix_capture_skip",
-    ):
+    for temp_key in _OQ_RUN_KEYS:
         output_config.pop(temp_key, None)
     if text_only:
         _normalize_text_only_in_config(output_config)
@@ -11369,28 +11397,141 @@ def _collect_imatrix(
         mx.clear_cache()
 
 
-def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
-    """The class (module and qualified name) of each module of the model
-    that oQe's calibration loads over ``model_path``, by its path, which is
-    the name a checkpoint keeps its matrix under. The model is built lazily:
-    no weight is read."""
-    model, tokenizer = _calibration_model(
-        model_path, config, trust_remote_code=trust_remote_code
-    )
+# Process-wide state that the pre-load patches set for the model they load:
+# the Lightning MTP flags, mlx-vlm's MTP attach, Qwen4-Exp's MTP and PLE
+# runtime, the context windows. The walk of a format run keeps it as it was.
+_LOAD_GLOBALS = (
+    ("omlx.patches.mlx_lm_mtp", ("_MTP_ACTIVE", "_MTP_DEPTH", "_MTP_DEPTH_FIXED")),
+    ("omlx.patches.mlx_vlm_mtp", ("_MTP_ATTACH_ENABLED",)),
+    (
+        "mlx_vlm.models.qwen4_exp.language",
+        ("_MTP_RUNTIME", "_PLE_RUNTIME_MODEL_PATH", "_PLE_RUNTIME_MODE"),
+    ),
+    ("omlx.patches.qwen35_yarn", ("_context_windows",)),
+)
+
+
+@contextlib.contextmanager
+def _load_globals_kept():
+    """After the block, the process-wide state of ``_LOAD_GLOBALS`` as it was
+    before it, in the modules imported then (a dict in place)."""
+    kept = [
+        (module, name, getattr(module, name))
+        for module_name, names in _LOAD_GLOBALS
+        if (module := sys.modules.get(module_name)) is not None
+        for name in names
+    ]
+    contents = [dict(value) for _, _, value in kept if isinstance(value, dict)]
     try:
-        return {
-            name: f"{type(module).__module__}.{type(module).__qualname__}"
-            for name, module in model.named_modules()
-        }
+        yield
     finally:
-        del model, tokenizer
-        mx.synchronize()
-        mx.clear_cache()
+        for module, name, value in kept:
+            setattr(module, name, value)
+            if isinstance(value, dict):
+                value.clear()
+                value.update(contents.pop(0))
 
 
-def _calibration_model(model_path, config, *, trust_remote_code=False):
-    """(model, tokenizer) as oQe's resident calibration loads them, lazily,
-    with the MTP head attached when the checkpoint has one."""
+def _written_layout(
+    config: dict,
+    source: Path,
+    *,
+    text_only: bool,
+    preserve_mtp: bool,
+    dtype: str,
+    quantization: dict,
+) -> dict:
+    """The config the run writes, but what it learns as it writes (its
+    layers' quantization entries, the formats' record, an end-of-sequence
+    token from the tokenizer): the writer's own steps on a copy of
+    ``config``, with ``quantization``, the run's own, as its quantization."""
+    written = copy.deepcopy(config)
+    for key in _OQ_RUN_KEYS:
+        written.pop(key, None)
+    if text_only:
+        _normalize_text_only_in_config(written)
+    bundled_draft = inkling2_layout.is_inkling2(config) and (
+        inkling2_layout.has_bundled_draft(source)
+    )
+    if not preserve_mtp and not bundled_draft:
+        _normalize_mtp_in_config(written)
+    written["quantization"] = written["quantization_config"] = dict(quantization)
+    if _is_minimax_m3_config(config) and (
+        minimax_nvfp4.has_nvfp4_routed_experts(config)
+    ):
+        text_config = written["text_config"]
+        written["text_config"] = {**text_config, "routed_expert_scales": True}
+    _apply_output_dtype(written, dtype)
+    return written
+
+
+def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
+    """``(class, loads, shape)`` of each module of the model that a checkpoint
+    written with ``config`` loads as, by its path, which is the name the
+    checkpoint keeps its matrix under: the module's class (its module and
+    qualified name), whether a format's layer is built for it, and its
+    weight's shape (None for a module without one).
+
+    The model is built from ``config`` by the loader oQe's calibration uses,
+    over a directory with the source's files but its weights and its config:
+    no weight is read, no tokenizer loaded, and the process-wide state the
+    pre-load patches set is kept as it was. With no weight given, the loader
+    quantizes only the layers ``config``'s quantization names (a run's has
+    none yet): the others are the modules whose ``to_quantized`` builds the
+    checkpoint's layers. mlx-vlm drops a module beside the language model
+    that no weight is given for unless the checkpoint's index declares it:
+    the source's index is the view's, so a module the source holds (an MTP
+    head) is kept, and one it does not is no module of the walk."""
+    from .patches.format_load import loads_in_format
+
+    source = Path(model_path)
+    with (
+        tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory,
+        _load_globals_kept(),
+        _calibration_patches(model_path, config) as is_vlm,
+    ):
+        view = Path(directory)
+        for item in source.iterdir():
+            if item.name != "config.json" and not item.name.endswith(
+                (".safetensors", ".safetensors.index.json")
+            ):
+                (view / item.name).symlink_to(item.resolve())
+        (view / "config.json").write_text(json.dumps(config))
+        # The loaders want a file of weights: one with none, which the
+        # source's index, when it has one, declares each of its tensors in.
+        mx.save_safetensors(str(view / "model.safetensors"), {})
+        index = source / "model.safetensors.index.json"
+        if index.is_file():
+            declared = json.loads(index.read_text())["weight_map"]
+            weight_map = dict.fromkeys(declared, "model.safetensors")
+            (view / index.name).write_text(json.dumps({"weight_map": weight_map}))
+        built = {"lazy": True, "strict": False, "trust_remote_code": trust_remote_code}
+        if is_vlm:
+            from mlx_vlm import utils as vlm_utils
+
+            model = vlm_utils.load_model(view, **built)
+        else:
+            import mlx_lm.utils as lm_utils
+
+            override = _sensitivity_lm_config_override(config, model_path)
+            model, _ = lm_utils.load_model(view, model_config=override, **built)
+    loads = {}
+    walked = {}
+    for name, module in model.named_modules():
+        cls = f"{type(module).__module__}.{type(module).__qualname__}"
+        if cls not in loads:
+            loads[cls] = loads_in_format(cls)
+        weight = module.get("weight")
+        shape = tuple(weight.shape) if isinstance(weight, mx.array) else None
+        walked[name] = (cls, loads[cls], shape)
+    return walked
+
+
+@contextlib.contextmanager
+def _calibration_patches(model_path, config):
+    """For the block, the pre-load patches oQe's resident calibration loads
+    the checkpoint at ``model_path`` with, and its MTP head attached when it
+    has one; yields whether mlx-vlm loads it."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
@@ -11437,40 +11578,48 @@ def _calibration_model(model_path, config, *, trust_remote_code=False):
             logger.debug("MTP runtime patch skipped for oQe imatrix: %s", e)
 
     try:
-        if _is_muse_spark(config):
-            model, tokenizer = _load_muse_spark_calibration_model(model_path)
-        elif is_vlm:
-            from mlx_vlm.utils import load_model as vlm_load_model
-
-            # Calibration proxies deliberately retain SSD-mapped tensors that
-            # are consumed by model-specific mmap modules rather than owned as
-            # normal MLX parameters (Qwen4 PLE shards are the primary case).
-            # mlx-vlm exposes ``strict`` specifically for this final weight
-            # load; pass it directly instead of monkeypatching Module globally.
-            model = vlm_load_model(
-                Path(model_path),
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-                strict=False,
-            )
-            from mlx_lm.tokenizer_utils import load as load_tokenizer
-
-            tokenizer = load_tokenizer(Path(model_path))
-        else:
-            from omlx.utils.model_loading import lm_load_compat as lm_load
-
-            model, tokenizer = lm_load(
-                model_path,
-                lazy=True,
-                trust_remote_code=trust_remote_code,
-                model_config=_sensitivity_lm_config_override(config, model_path),
-            )
-    except Exception as e:
-        logger.error("oQe imatrix: model load failed (%s)", e)
-        raise RuntimeError(f"oQe imatrix model load failed: {e}") from e
+        yield is_vlm
     finally:
         if restore_mtp_active is not None:
             restore_mtp_active()
+
+
+def _calibration_model(model_path, config, *, trust_remote_code=False):
+    """(model, tokenizer) as oQe's resident calibration loads them, lazily,
+    with the MTP head attached when the checkpoint has one."""
+    with _calibration_patches(model_path, config) as is_vlm:
+        try:
+            if _is_muse_spark(config):
+                model, tokenizer = _load_muse_spark_calibration_model(model_path)
+            elif is_vlm:
+                from mlx_vlm.utils import load_model as vlm_load_model
+
+                # Calibration proxies deliberately retain SSD-mapped tensors that
+                # are consumed by model-specific mmap modules rather than owned as
+                # normal MLX parameters (Qwen4 PLE shards are the primary case).
+                # mlx-vlm exposes ``strict`` specifically for this final weight
+                # load; pass it directly instead of monkeypatching Module globally.
+                model = vlm_load_model(
+                    Path(model_path),
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                    strict=False,
+                )
+                from mlx_lm.tokenizer_utils import load as load_tokenizer
+
+                tokenizer = load_tokenizer(Path(model_path))
+            else:
+                from omlx.utils.model_loading import lm_load_compat as lm_load
+
+                model, tokenizer = lm_load(
+                    model_path,
+                    lazy=True,
+                    trust_remote_code=trust_remote_code,
+                    model_config=_sensitivity_lm_config_override(config, model_path),
+                )
+        except Exception as e:
+            logger.error("oQe imatrix: model load failed (%s)", e)
+            raise RuntimeError(f"oQe imatrix model load failed: {e}") from e
     return model, tokenizer
 
 
