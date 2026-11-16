@@ -45,6 +45,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
+from ..formats import FormatRefusedError
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 
 # The modules whose SwitchLinear holds a stack of matrices, (E, N, K).
@@ -60,6 +61,16 @@ _LOADERS = (
     ("mlx_vlm.embedding_loader", "load_encoder_model"),
     ("mlx_embeddings.utils", "load_model"),
 )
+
+# A value of config.json by its JSON type.
+_JSON_TYPES = {
+    list: "an array",
+    str: "a string",
+    int: "a number",
+    float: "a number",
+    bool: "a boolean",
+    type(None): "null",
+}
 
 # What a format's layer is built from, of to_quantized's parameters.
 _TAKEN = ("self", "mode", "bits", "group_size")
@@ -93,7 +104,13 @@ class _Checkpoint:
         if read is None:
             plugin = formats.origin(fmt.mode) or "the plugin"
             kept = dict(getattr(fmt, "__dict__", {}))
-            read = fmt.accept(self._record(fmt.mode))
+            try:
+                read = fmt.accept(self._record(fmt.mode))
+            except FormatRefusedError:
+                raise
+            except ValueError as error:
+                # The format's own words.
+                raise _refused(str(error), fmt.mode, self) from error
             now = getattr(fmt, "__dict__", {})
             changed = sorted(
                 name
@@ -101,11 +118,12 @@ class _Checkpoint:
                 if kept.get(name, kept) is not now.get(name, kept)
             )
             if changed:
-                raise ValueError(
-                    f"quant format {fmt.mode!r} changed its registered format "
-                    f"({', '.join(changed)}) to accept the checkpoint at "
-                    f"{self.path}: accept returns a format configured from the "
-                    f"record instead; report it to {plugin}"
+                raise _refused(
+                    f"accept changed the registered format ({', '.join(changed)})"
+                    " to accept the checkpoint: accept returns a format "
+                    f"configured from the record instead; report it to {plugin}",
+                    fmt.mode,
+                    self,
                 )
             read = fmt if read is None else read
             if not (
@@ -113,21 +131,54 @@ class _Checkpoint:
                 and (read.mode, read.tensors, read.contract)
                 == (fmt.mode, fmt.tensors, fmt.contract)
             ):
-                raise ValueError(
-                    f"quant format {fmt.mode!r} accepted the checkpoint at "
-                    f"{self.path} with {read!r}, not a format of its mode, "
-                    f"tensors and contract: report it to {plugin}"
+                raise _refused(
+                    f"accept returned {read!r}, not a format of its mode, "
+                    f"tensors and contract: report it to {plugin}",
+                    fmt.mode,
+                    self,
                 )
             self._read[fmt.mode] = read
         return read
 
+    def _written(self, mode: str):
+        """What the checkpoint's config keeps of ``mode``'s format, as it is
+        (None for nothing), and the JSON path to it."""
+        if self._config is None:
+            self._config = json.loads((self.path / "config.json").read_text())
+        kept, where = self._config, "config.json"
+        for key in ("omlx_quant_formats", mode):
+            if not isinstance(kept, dict):
+                return kept, where
+            kept, where = kept.get(key), f"{where}[{key!r}]"
+        return kept, where
+
     def _record(self, mode: str) -> dict:
         """The record oQ stored for ``mode``; an empty one for a checkpoint
         written before formats had records, or by another writer."""
-        if self._config is None:
-            self._config = json.loads((self.path / "config.json").read_text())
-        written = self._config.get("omlx_quant_formats", {}).get(mode, {})
-        return written.get("record", {})
+        written, where = self._written(mode)
+        if written is None:
+            return {}
+        if isinstance(written, dict):
+            written, where = written.get("record", {}), f"{where}['record']"
+        if not isinstance(written, dict):
+            raise _refused(
+                f"{where} is {_JSON_TYPES[type(written)]}, where oQ writes "
+                "an object: the checkpoint's config is damaged",
+                mode,
+                self,
+            )
+        return written
+
+    def writer(self, mode: str) -> str:
+        """The plugin the checkpoint's record says wrote ``mode``'s layers."""
+        try:
+            written, _ = self._written(mode)
+        except (OSError, ValueError):
+            written = None
+        if not isinstance(written, dict) or "plugin" not in written:
+            return "an unknown writer"
+        plugin = written["plugin"]
+        return plugin if isinstance(plugin, str) else "a format registered by hand"
 
     def check(self, loaded) -> None:
         """Refuse a load that returns ``loaded`` without each format layer
@@ -141,13 +192,15 @@ class _Checkpoint:
             if isinstance(model, nn.Module)
             for _, module in model.named_modules()
         }
-        stray = sum(id(layer) not in held for layer in self.built)
+        stray = [layer for layer in self.built if id(layer) not in held]
         if stray:
-            raise ValueError(
-                f"{stray} layers of a quant format were built while the checkpoint "
-                f"at {self.path} loaded, and are not in its model: they were "
-                "another checkpoint's, read with this one's record; load each "
-                "checkpoint with the libraries' load_model"
+            raise _refused(
+                f"{len(stray)} layers were built while the checkpoint loaded, "
+                "and are not in its model: they were another checkpoint's, read "
+                "with this one's record; load each checkpoint with the "
+                "libraries' load_model",
+                stray[0].mode,
+                self,
             )
 
 
@@ -163,14 +216,34 @@ def loading(path) -> Iterator[_Checkpoint]:
         formats._LOADING.reset(token)
 
 
+def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
+    """The refusal of ``mode``'s layers of ``checkpoint`` (the one loading
+    on this thread when not given) for ``reason``."""
+    if checkpoint is None:
+        checkpoint = formats._LOADING.get()
+    if checkpoint is None:
+        return FormatRefusedError(reason, mode=mode)
+    installed = formats.origin(mode) or (
+        "a format registered by hand" if formats.get(mode) is not None else "none"
+    )
+    return FormatRefusedError(
+        reason,
+        mode=mode,
+        path=checkpoint.path,
+        written=checkpoint.writer(mode),
+        installed=installed,
+    )
+
+
 def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
     """The checkpoint a layer of ``fmt`` built now belongs to."""
     checkpoint = formats._LOADING.get()
     if checkpoint is None:
-        raise ValueError(
-            f"a layer of quant format {fmt.mode!r} is built outside a checkpoint's "
-            "load, which gives it the record to be read with: load the checkpoint "
-            "with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model"
+        raise FormatRefusedError(
+            "a layer is built outside a checkpoint's load, which gives it the "
+            "record to be read with: load the checkpoint with mlx-lm's, "
+            "mlx-vlm's or mlx-embeddings' load_model",
+            mode=fmt.mode,
         )
     return checkpoint
 
@@ -205,19 +278,22 @@ def _format_layer(layer, layer_cls, signature, arguments):
         if _mlx_runs(mode):
             return None
         if fmt is None:
-            raise ValueError(
-                f"no quant format is registered for mode {mode!r}: install the "
-                "plugin the checkpoint was written with"
+            raise _refused(
+                "no format of this mode is installed: install the plugin the "
+                "checkpoint was written with",
+                mode,
             )
-        raise ValueError(
-            f"quant format {mode!r} lays out no ({n}, {k}) matrix of {bits} "
-            f"bits in groups of {group_size}"
+        raise _refused(
+            f"it lays out no ({n}, {k}) matrix of {bits} bits in groups of "
+            f"{group_size}",
+            mode,
         )
     for name, value in arguments.items():
         if name not in _TAKEN and value != signature.parameters[name].default:
-            raise ValueError(
-                f"a layer of quant format {mode!r} is built from its bits and "
-                f"group_size, not with {name}={value!r}"
+            raise _refused(
+                "a layer is built from its bits and group_size, not with "
+                f"{name}={value!r}",
+                mode,
             )
     tensors = {
         name: mx.zeros((*stack, *shape), dtype)

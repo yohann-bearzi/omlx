@@ -1534,6 +1534,48 @@ class TestVLMFallback:
         assert isinstance(excinfo.value.__cause__, RuntimeError)
         assert isinstance(excinfo.value.__cause__.__cause__, TypeError)
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("force_lm", [False, True], ids=["vlm", "force_lm"])
+    async def test_a_quant_format_refusal_is_loaded_with_no_other_library(
+        self, small_mock_model_dir, force_lm
+    ):
+        """A checkpoint whose quant format refuses it is not loaded again
+        with the other library, which would build the same layers: the
+        refusal surfaces as it was raised."""
+        from omlx.formats import FormatRefusedError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        refusal = FormatRefusedError(
+            "written in layout 2; this plugin reads layout 1",
+            mode="myformat",
+            path=small_mock_model_dir,
+            written="my-package 0.2.0",
+            installed="my-package 0.1.0",
+        )
+        first = MagicMock()
+        first.start = AsyncMock(side_effect=refusal)
+        first.stop = AsyncMock()
+        engines = {"BatchedEngine": MagicMock(), "VLMBatchedEngine": MagicMock()}
+        engines["BatchedEngine" if force_lm else "VLMBatchedEngine"].return_value = (
+            first
+        )
+        with (
+            patch("omlx.engine_pool.BatchedEngine", engines["BatchedEngine"]),
+            patch("omlx.engine_pool.VLMBatchedEngine", engines["VLMBatchedEngine"]),
+            pytest.raises(ModelUnavailableError) as excinfo,
+        ):
+            await pool._load_engine("model-a", force_lm=force_lm)
+
+        other = engines["VLMBatchedEngine" if force_lm else "BatchedEngine"]
+        other.assert_not_called()
+        assert excinfo.value.__cause__ is refusal
+        assert str(refusal) in str(excinfo.value)
+        assert "fallback" not in str(excinfo.value)
+
 
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""

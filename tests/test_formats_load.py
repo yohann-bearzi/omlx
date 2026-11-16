@@ -127,6 +127,19 @@ def load_model(path, **kwargs):
     return mlx_lm.utils.load_model(path, **kwargs)
 
 
+def _refusal(reason, path=None, written="omlx-toy 0.3.1", installed=None):
+    """What a refusal of the toy format's layers says: of the checkpoint at
+    ``path``, when it is known, written by ``written`` and with ``installed``
+    (a format registered by hand, as the tests register it)."""
+    if path is None:
+        return f"quant format 'toy': {reason}"
+    installed = installed or "a format registered by hand"
+    return (
+        f"quant format 'toy' of the checkpoint at {path} (written by {written}; "
+        f"installed: {installed}): {reason}"
+    )
+
+
 def _named(config):
     """The loaders' predicate for the layers a quantization config names."""
     return lambda path, module: config.get(path, False)
@@ -229,10 +242,10 @@ def test_mlx_s_modes_load_as_mlx_s_layers(toy):
     assert "global_scale" in inspect.signature(stack.to_quantized).parameters
 
 
-def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy):
+def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
     refusal = re.escape(
-        "no quant format is registered for mode 'oqel': install the plugin "
-        "the checkpoint was written with"
+        "quant format 'oqel': no format of this mode is installed: install the "
+        "plugin the checkpoint was written with"
     )
     lost = {"bits": 3, "group_size": 64, "mode": "oqel"}
     for dense in (
@@ -240,41 +253,54 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy):
         lm_switch.SwitchLinear(64, 16, EXPERTS),
         vlm_switch.SwitchLinear(64, 16, EXPERTS),
     ):
-        with pytest.raises(ValueError, match=refusal):
+        with pytest.raises(formats.FormatRefusedError, match=refusal):
             dense.to_quantized(**lost)
     # As a load meets it.
-    with pytest.raises(ValueError, match=refusal):
+    with pytest.raises(formats.FormatRefusedError, match=refusal):
         nn.quantize(_Model(64, 16), class_predicate=_named({"toy": lost}))
+    # A checkpoint's load names it, with the plugin that wrote it.
+    (tmp_path / "config.json").write_text(
+        json.dumps({"omlx_quant_formats": {"oqel": {"plugin": "omlx-oqel 1.0.0"}}})
+    )
+    with format_load.loading(tmp_path), pytest.raises(formats.FormatRefusedError) as no:
+        nn.Linear(64, 16).to_quantized(**lost)
+    assert str(no.value) == (
+        f"quant format 'oqel' of the checkpoint at {tmp_path} (written by "
+        "omlx-oqel 1.0.0; installed: none): no format of this mode is installed: "
+        "install the plugin the checkpoint was written with"
+    )
+    assert (no.value.mode, no.value.path) == ("oqel", tmp_path)
+    assert (no.value.written, no.value.installed) == ("omlx-oqel 1.0.0", "none")
     assert not format_load._mlx_runs("oqel") and format_load._mlx_runs("affine")
 
 
 def test_a_matrix_the_format_does_not_lay_out_is_refused_in_words(by_hand, toy):
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            "quant format 'toy' lays out no (16, 64) matrix of 4 bits in groups of 2"
-        ),
-    ):
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         nn.Linear(64, 16).to_quantized(group_size=2, bits=4, mode="toy")
+    assert str(refusal.value) == _refusal(
+        "it lays out no (16, 64) matrix of 4 bits in groups of 2",
+        refusal.value.path,
+        written="an unknown writer",
+    )
     assert toy.asked == [(64, 16, 4, 2)]
     # A layout is asked for with bits and a group size, as a checkpoint's
     # config gives them.
     for arguments in ({"group_size": 1}, {"bits": 8}):
-        with pytest.raises(ValueError, match="quant format 'toy' lays out no"):
+        with pytest.raises(formats.FormatRefusedError, match="it lays out no"):
             nn.Linear(64, 16).to_quantized(mode="toy", **arguments)
     assert len(toy.asked) == 1
 
 
 def test_a_formats_layer_is_built_from_its_bits_and_group_size_alone(by_hand, toy):
     with pytest.raises(
-        ValueError,
+        formats.FormatRefusedError,
         match=re.escape(
-            "a layer of quant format 'toy' is built from its bits and "
-            "group_size, not with quantize_input=True"
+            "a layer is built from its bits and group_size, not with "
+            "quantize_input=True"
         ),
     ):
         nn.Linear(64, 16).to_quantized(**_TOY, quantize_input=True)
-    with pytest.raises(ValueError, match="not with global_scale=True"):
+    with pytest.raises(formats.FormatRefusedError, match="not with global_scale=True"):
         lm_switch.SwitchLinear(64, 16, EXPERTS).to_quantized(**_TOY, global_scale=True)
     # An argument stated as its default is none.
     assert type(nn.Linear(64, 16).to_quantized(1, 8, "toy", False)) is FormatLinear
@@ -472,10 +498,68 @@ def test_a_checkpoint_written_without_a_record_hands_an_empty_one(toy, tmp_path)
 def test_a_format_refuses_a_checkpoint_in_its_own_words(toy, tmp_path):
     _llama(tmp_path, **_written({"layout": 2}, plugin=None))
     toy.refusal = "written in layout 2; this plugin reads layout 1"
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
-    assert str(refusal.value) == toy.refusal
+    # The format's words, with what oMLX knows of the checkpoint.
+    assert str(refusal.value) == _refusal(
+        toy.refusal, tmp_path, written="a format registered by hand"
+    )
+    assert type(refusal.value.__cause__) is ValueError
+    assert str(refusal.value.__cause__) == refusal.value.reason == toy.refusal
     assert len(toy.asked) == 1
+    # Named by their distributions when plugins'.
+    _llama(tmp_path, **_written({"layout": 2}, plugin="my-package 0.2.0"))
+    formats._ORIGINS["toy"] = "my-package 0.1.0"
+    try:
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            load_model(tmp_path)
+    finally:
+        del formats._ORIGINS["toy"]
+    said = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+    assert said.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    # A record that names no writer.
+    _llama(tmp_path, toy={"record": {"layout": 2}})
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path)
+    assert refusal.value.written == "an unknown writer"
+
+
+_ENTRY = "['omlx_quant_formats']['toy']"
+
+
+def _kept_record(record):
+    entry = {"plugin": "omlx-toy 0.3.1", "record": record}
+    return {"omlx_quant_formats": {"toy": entry}}
+
+
+@pytest.mark.parametrize(
+    "config, where, kind",
+    [
+        ([], "", "an array"),
+        ({"omlx_quant_formats": []}, "['omlx_quant_formats']", "an array"),
+        ({"omlx_quant_formats": {"toy": "v1"}}, _ENTRY, "a string"),
+        (_kept_record(None), f"{_ENTRY}['record']", "null"),
+        (_kept_record([1]), f"{_ENTRY}['record']", "an array"),
+        (_kept_record(2.5), f"{_ENTRY}['record']", "a number"),
+    ],
+    ids=["config", "formats", "entry", "null", "array", "number"],
+)
+def test_a_record_that_is_not_an_object_is_refused(toy, tmp_path, config, where, kind):
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with format_load.loading(tmp_path), pytest.raises(formats.FormatRefusedError) as no:
+        nn.Linear(64, 128).to_quantized(**_TOY)
+    assert str(no.value) == _refusal(
+        f"config.json{where} is {kind}, where oQ writes an object: the "
+        "checkpoint's config is damaged",
+        tmp_path,
+        written="omlx-toy 0.3.1" if "record" in where else "an unknown writer",
+    )
+    assert toy.accepted == []
+    if kind == "null":
+        quoted = str(no.value).replace(str(tmp_path), "/models/my-model")
+        quoted = quoted.replace("omlx-toy 0.3.1", "my-package 0.1.0")
+        quoted = quoted.replace("a format registered by hand", "my-package 0.1.0")
+        assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
 
 
 class _Other(_Loadable):
@@ -499,21 +583,23 @@ def test_what_accept_returns_is_a_format_of_the_same_kind(
         returned.contract = 2 if returned.mode == "toy" else returned.contract
     _llama(tmp_path, **_written({"layout": 1}))
     toy.reads = lambda record: returned
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
     said = (
-        f"quant format 'toy' accepted the checkpoint at {tmp_path} with "
-        f"{returned!r}, not a format of its mode, tensors and contract: report it "
-        "to "
+        f"accept returned {returned!r}, not a format of its mode, tensors and "
+        "contract: report it to "
     )
-    assert str(refusal.value) == said + "the plugin"
+    assert str(refusal.value) == _refusal(said + "the plugin", tmp_path)
     # Named by its distribution when a plugin's.
     monkeypatch.setitem(formats._ORIGINS, "toy", "my-package 0.1.0")
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
-    assert str(refusal.value) == said + "my-package 0.1.0"
+    assert str(refusal.value) == _refusal(
+        said + "my-package 0.1.0", tmp_path, installed="my-package 0.1.0"
+    )
     if returned == "toy":
         quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+        quoted = quoted.replace("omlx-toy 0.3.1", "my-package 0.1.0")
         assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
 
 
@@ -532,15 +618,17 @@ def test_a_format_that_configures_itself_to_accept_is_refused(toy, tmp_path):
 
     toy.reads = configure
     _llama(tmp_path, **_written({"levels": [1.0]}))
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
-    assert str(refusal.value) == (
-        f"quant format 'toy' changed its registered format (levels) to accept the "
-        f"checkpoint at {tmp_path}: accept returns a format configured from the "
-        "record instead; report it to the plugin"
+    assert str(refusal.value) == _refusal(
+        "accept changed the registered format (levels) to accept the checkpoint: "
+        "accept returns a format configured from the record instead; report it "
+        "to the plugin",
+        tmp_path,
     )
     quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
-    quoted = quoted.replace("the plugin", "my-package 0.1.0")
+    for said in ("the plugin", "omlx-toy 0.3.1", "a format registered by hand"):
+        quoted = quoted.replace(said, "my-package 0.1.0")
     assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
 
 
@@ -590,13 +678,13 @@ def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(toy, tmp_path):
     module = types.ModuleType("stranger")
     module.load_model = with_a_stranger
     format_load._wrap_loader(module, "load_model")
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         module.load_model(tmp_path)
-    assert str(refusal.value) == (
-        f"1 layers of a quant format were built while the checkpoint at {tmp_path} "
-        "loaded, and are not in its model: they were another checkpoint's, read "
-        "with this one's record; load each checkpoint with the libraries' "
-        "load_model"
+    assert str(refusal.value) == _refusal(
+        "1 layers were built while the checkpoint loaded, and are not in its "
+        "model: they were another checkpoint's, read with this one's record; load "
+        "each checkpoint with the libraries' load_model",
+        tmp_path,
     )
 
 
@@ -604,13 +692,14 @@ def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkey
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
     format_load.apply_format_load_patch()
-    with pytest.raises(ValueError) as refusal:
+    with pytest.raises(formats.FormatRefusedError) as refusal:
         nn.Linear(64, 16).to_quantized(**_TOY)
-    assert str(refusal.value) == (
-        "a layer of quant format 'toy' is built outside a checkpoint's load, which "
-        "gives it the record to be read with: load the checkpoint with mlx-lm's, "
-        "mlx-vlm's or mlx-embeddings' load_model"
+    assert str(refusal.value) == _refusal(
+        "a layer is built outside a checkpoint's load, which gives it the record "
+        "to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or "
+        "mlx-embeddings' load_model"
     )
+    assert refusal.value.path is None
     # MLX's layers need none.
     assert type(nn.Linear(64, 16).to_quantized(32, 4)) is nn.QuantizedLinear
 

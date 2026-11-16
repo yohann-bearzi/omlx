@@ -67,6 +67,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_metal_out_of_memory,
 )
+from .formats import FormatRefusedError
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -4351,6 +4352,10 @@ class EnginePool:
                 if isinstance(engine, SplashEngine):
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
+                    raise
+                if isinstance(start_error, FormatRefusedError):
+                    # A checkpoint's quant format refused: the other library
+                    # would load the same layers and meet the same refusal.
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't

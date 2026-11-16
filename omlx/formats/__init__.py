@@ -361,6 +361,34 @@ class QuantFormat:
         return self
 
 
+class FormatRefusedError(ValueError):
+    """oMLX refuses to load a checkpoint's layers of a quant format, for
+    ``reason``, and says what it knows of them: the ``mode``, the checkpoint
+    at ``path`` (None for a layer built outside a checkpoint's load), the
+    plugin its record says ``written`` it, and the one ``installed``.
+
+    Every refusal of a format's checkpoint at load is one of these, and
+    oMLX's loaders let it through as it is: no fallback load runs after it.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        mode: str,
+        path=None,
+        written: str | None = None,
+        installed: str | None = None,
+    ) -> None:
+        self.reason, self.mode, self.path = reason, mode, path
+        self.written, self.installed = written, installed
+        said = f"quant format {mode!r}"
+        if path is not None:
+            said += f" of the checkpoint at {path} (written by {written}; "
+            said += f"installed: {installed})"
+        super().__init__(f"{said}: {reason}")
+
+
 _FORMATS: dict[str, QuantFormat] = {}
 # The checkpoint whose layers the calling thread is loading, if any: set by
 # omlx.patches.format_load around the libraries' loads, read by the layers.

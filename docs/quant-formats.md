@@ -128,7 +128,7 @@ mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a
 
 `layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there, by MLX.
 
-`layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' lays out no (16, 64) matrix of 4 bits in groups of 2`. A format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
+`layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): it lays out no (16, 64) matrix of 4 bits in groups of 2`. A format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
 
 A checkpoint names each layer of the format in its quantization config:
 
@@ -141,7 +141,7 @@ A checkpoint names each layer of the format in its quantization config:
 
 - A layer's entry holds `group_size`, `bits` and `mode`, and nothing else: the loader calls the layer's `to_quantized` with it.
 - The top-level `mode` stays one of MLX's. A layer the config does not name takes the top-level values, and the loaders find such a layer by its `scales` tensor.
-- A checkpoint of a format that is not installed fails to load: `no quant format is registered for mode 'myformat': install the plugin the checkpoint was written with`.
+- A checkpoint of a format that is not installed fails to load: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: none): no format of this mode is installed: install the plugin the checkpoint was written with`.
 - A layer of a format is built from its bits and group size. MLX's other arguments (`quantize_input`, mlx-lm's `global_scale`) are refused with a format's mode.
 - A model whose layers have a `to_quantized` of their own loads a format once `omlx.patches.format_load` wraps it as it wraps those three. Until then oQ writes their matrices in its affine (see [Quantize a checkpoint](#quantize-a-checkpoint)).
 
@@ -155,16 +155,18 @@ A checkpoint's layers of a format are read with the record oQ stored for it (`om
 ```
 
 - Every layer of the checkpoint is built with the object `accept` returns, and keeps it (`layer.fmt`): its `layout` gives the layer's tensors, and its `decode` and `dot` run them. `accept` returns the format itself by default; None means the format itself too.
-- A format whose checkpoints differ by what their record holds (a table of levels, say) returns an object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors` and `contract`; anything else is refused: `quant format 'myformat' accepted the checkpoint at /models/my-model with 'myformat', not a format of its mode, tensors and contract: report it to my-package 0.1.0`. Make it immutable, with no unevaluated arrays: the layers of several threads read it.
-- oMLX keeps nothing on the registered format, so checkpoints of several records run side by side, each layer with its own checkpoint's object. A format that changes its registered object to accept a checkpoint is refused: `quant format 'myformat' changed its registered format (levels) to accept the checkpoint at /models/my-model: accept returns a format configured from the record instead; report it to my-package 0.1.0`.
-- `accept` raises a ValueError in the format's own words to refuse a checkpoint, which the load raises as it is.
-- A checkpoint written before formats had records, or one that names the format in its quantization config alone, hands an empty record.
+- A format whose checkpoints differ by what their record holds (a table of levels, say) returns an object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors` and `contract`; anything else is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): accept returned 'myformat', not a format of its mode, tensors and contract: report it to my-package 0.1.0`. Make it immutable, with no unevaluated arrays: the layers of several threads read it.
+- oMLX keeps nothing on the registered format, so checkpoints of several records run side by side, each layer with its own checkpoint's object. A format that changes its registered object to accept a checkpoint is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): accept changed the registered format (levels) to accept the checkpoint: accept returns a format configured from the record instead; report it to my-package 0.1.0`.
+- `accept` raises a ValueError in the format's own words to refuse a checkpoint. The load raises them as its reason: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: my-package 0.1.0): written in layout 2; this plugin reads layout 1`.
+- A checkpoint written before formats had records, or one that names the format in its quantization config alone, hands an empty record. A record that is not a JSON object is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): config.json['omlx_quant_formats']['myformat']['record'] is null, where oQ writes an object: the checkpoint's config is damaged`.
 
 The record is that of the checkpoint the load reads. oMLX wraps the libraries' functions that build a model from a checkpoint's directory (mlx-lm's, mlx-vlm's and mlx-embeddings' `load_model`, and the encoder loader of mlx-vlm's embedding models), each the first time it finds it, imported or as it is imported:
 
 - The format layers built on a thread while one runs belong to its checkpoint, and a load nested in another reads its own.
-- A format's layer built anywhere else is refused: `a layer of quant format 'myformat' is built outside a checkpoint's load, which gives it the record to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model`. So is a load that returns a model without a format layer built under it (another checkpoint's, built inside this one's load).
+- A format's layer built anywhere else is refused: `quant format 'myformat': a layer is built outside a checkpoint's load, which gives it the record to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model`. So is a load that returns a model without a format layer built under it (another checkpoint's, built inside this one's load).
 - A family's loader that replaces one of them afterwards runs around it: DeepSeek V4's builds its own checkpoints' layers outside any load, so a DeepSeek V4 checkpoint of a format is refused.
+
+Every refusal of a format's checkpoint at load is one exception, `omlx.formats.FormatRefusedError` (a ValueError), which names the mode, the checkpoint, the plugin its record says wrote it and the one installed (`mode`, `path`, `written`, `installed`, and the `reason`). oMLX lets it through as it is: a model that mlx-vlm refuses is not loaded again with mlx-lm, nor the other way, since either would build the same layers.
 
 ## Quantize a checkpoint
 
