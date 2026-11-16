@@ -586,9 +586,6 @@ class OQImatrixEntry:
 
     in_sum2: np.ndarray
     counts: np.ndarray
-    # The class of the module whose inputs were measured, as its module and
-    # qualified name; empty in a cache written before it was kept.
-    module_class: str = ""
 
 
 @dataclass
@@ -6287,7 +6284,6 @@ def _save_oqe_imatrix(
     for name, entry in sorted(entries.items()):
         arrays[f"{name}.in_sum2"] = np.asarray(entry.in_sum2, dtype=np.float32)
         arrays[f"{name}.counts"] = np.asarray(entry.counts, dtype=np.int64)
-        arrays[f"{name}.module_class"] = np.asarray(entry.module_class)
     np.savez_compressed(path, **arrays)
     _imatrix_metadata_path(path).write_text(
         json.dumps(metadata, indent=2, ensure_ascii=False),
@@ -6309,11 +6305,9 @@ def _load_oqe_imatrix(path: Path) -> OQImatrixData:
             counts_key = f"{name}.counts"
             if counts_key not in data.files:
                 continue
-            class_key = f"{name}.module_class"
             entries[name] = OQImatrixEntry(
                 in_sum2=np.asarray(data[f"{name}.in_sum2"], dtype=np.float32),
                 counts=np.asarray(data[counts_key], dtype=np.int64),
-                module_class=(str(data[class_key]) if class_key in data.files else ""),
             )
     return OQImatrixData(entries=entries, metadata=metadata, path=str(path))
 
@@ -6931,6 +6925,28 @@ _QUANT_FORMAT_MISREAD = {
         "hand, as MLX's quantized layer or as floats"
     ),
 }
+
+
+def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
+    """What a run with a quant format says of the matrices it offered none:
+    ``unloaded`` has the class of each one's module, which no format's layer
+    is built for, ``unwalked`` the path of each one that is no module of the
+    model built over the source (a family's loader renames or joins it, so
+    what it would load as is not known): those are named."""
+    classes = set(unloaded) | ({"no module has their path"} if unwalked else set())
+    said = (
+        f"oQ{level}: {len(unloaded) + len(unwalked)} matrices stay oQ's affine: "
+        "a quant format's layer is not built for their class "
+        f"({', '.join(sorted(classes))})"
+    )
+    if unwalked:
+        paths = sorted(unwalked)
+        more = f" and {len(paths) - 20} more" if len(paths) > 20 else ""
+        said += (
+            "\npaths that no module of the model built over the source has: "
+            f"{', '.join(paths[:20])}{more}"
+        )
+    return said
 
 
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
@@ -7553,6 +7569,13 @@ def quantize_oq_streaming(
             )
             return str(_ensure_ram_safe_proxy())
 
+        if quant_fmt is not None:
+            # The class of the module that holds each matrix, which decides
+            # what it loads as, read from the model built lazily over the
+            # source: the imatrix cache keeps none, so it serves every run.
+            module_classes = _module_classes(
+                model_path, config, trust_remote_code=trust_remote_code
+            )
         try:
             imatrix_data = _load_or_collect_imatrix(
                 model_path,
@@ -7577,7 +7600,6 @@ def quantize_oq_streaming(
                 sensitivity_num_samples=_SENS_NUM_SAMPLES,
                 sensitivity_seq_length=_SENS_SEQ_LENGTH,
                 require_mtp_entries=preserve_mtp,
-                require_module_classes=quant_fmt is not None,
             )
         except BaseException:
             _cleanup_ram_safe_proxy()
@@ -7891,6 +7913,7 @@ def quantize_oq_streaming(
     per_layer_config = {}
     format_layers = 0
     unloaded = []  # the classes of matrices no format's layer loads for
+    unwalked = []  # matrices of no module of the model built over the source
     start_time = _time.monotonic()
     last_quant_display_pct = -1
     last_quant_emit_time = 0.0
@@ -8001,7 +8024,12 @@ def quantize_oq_streaming(
                     tensor_name, config, oq_level, group_size
                 )
 
-                if bits is not None and len(shape) >= 2 and shape[-1] % gs == 0:
+                matrix = bits is not None and len(shape) >= 2
+                # oQ's affine keeps a matrix whose K is whole groups. A
+                # format is asked of any matrix: its groups may be its own.
+                grouped = matrix and shape[-1] % gs == 0
+                encoded = None
+                if grouped or (matrix and quant_fmt is not None):
                     importance = None
                     if imatrix_data is not None and qmode == "affine":
                         importance = _lookup_imatrix_importance(
@@ -8018,57 +8046,54 @@ def quantize_oq_streaming(
 
                     # The format is offered the source's own floats, of a
                     # matrix that loads as its layer.
-                    encoded = None
                     if quant_fmt is not None and importance is not None:
-                        held = _imatrix_entry(imatrix_data, base, config).module_class
-                        if loads_in_format(held):
+                        held = module_classes.get(base)
+                        if held is None:
+                            unwalked.append(base)
+                        elif loads_in_format(held):
                             encoded = _encode_in_format(
                                 quant_fmt, tensor_name, w_mx, importance, bits, gs
                             )
                         else:
                             unloaded.append(held)
-                    if encoded is not None:
-                        for name, tensor in encoded.items():
-                            out_shard_data[f"{base}.{name}"] = tensor
-                        per_layer_config[base] = {
-                            "bits": bits,
-                            "group_size": gs,
-                            "mode": quant_fmt.mode,
-                        }
-                        format_layers += 1
-                    else:
-                        # Cast to target dtype before quantize: scales/biases
-                        # inherit the input dtype, which drives inference
-                        # speed on Apple Silicon (M1/M2 prefer float16, M3/M4
-                        # handle both).
-                        if (
-                            mx.issubdtype(w_mx.dtype, mx.floating)
-                            and w_mx.dtype != target_dtype
-                        ):
-                            w_mx = w_mx.astype(target_dtype)
-                        qw, scales, biases = _quantize_chunked(
-                            w_mx,
-                            gs,
-                            bits,
-                            qmode,
-                            importance=importance,
-                        )
+                if encoded is not None:
+                    for name, tensor in encoded.items():
+                        out_shard_data[f"{base}.{name}"] = tensor
+                    per_layer_config[base] = {
+                        "bits": bits,
+                        "group_size": gs,
+                        "mode": quant_fmt.mode,
+                    }
+                    format_layers += 1
+                elif grouped:
+                    # Cast to target dtype before quantize: scales/biases
+                    # inherit the input dtype, which drives inference
+                    # speed on Apple Silicon (M1/M2 prefer float16, M3/M4
+                    # handle both).
+                    if (
+                        mx.issubdtype(w_mx.dtype, mx.floating)
+                        and w_mx.dtype != target_dtype
+                    ):
+                        w_mx = w_mx.astype(target_dtype)
+                    qw, scales, biases = _quantize_chunked(
+                        w_mx,
+                        gs,
+                        bits,
+                        qmode,
+                        importance=importance,
+                    )
 
-                        out_shard_data[f"{base}.weight"] = qw
-                        out_shard_data[f"{base}.scales"] = scales
-                        if biases is not None:
-                            out_shard_data[f"{base}.biases"] = biases
+                    out_shard_data[f"{base}.weight"] = qw
+                    out_shard_data[f"{base}.scales"] = scales
+                    if biases is not None:
+                        out_shard_data[f"{base}.biases"] = biases
 
-                        base_qmode = _mode_for_bits(base_bits)
-                        base_gs_check = _gs_for_mode(base_bits, group_size)
-                        if (
-                            bits != base_bits
-                            or gs != base_gs_check
-                            or qmode != base_qmode
-                        ):
-                            layer_cfg = {"bits": bits, "group_size": gs}
-                            layer_cfg["mode"] = qmode
-                            per_layer_config[base] = layer_cfg
+                    base_qmode = _mode_for_bits(base_bits)
+                    base_gs_check = _gs_for_mode(base_bits, group_size)
+                    if bits != base_bits or gs != base_gs_check or qmode != base_qmode:
+                        layer_cfg = {"bits": bits, "group_size": gs}
+                        layer_cfg["mode"] = qmode
+                        per_layer_config[base] = layer_cfg
                 else:
                     if cast_predicate is None or cast_predicate(tensor_name):
                         w_mx = _cast_passthrough_tensor(tensor_name, w_mx, target_dtype)
@@ -8277,14 +8302,8 @@ def quantize_oq_streaming(
             f"{oq_level:g}",
             quant_format,
         )
-    if unloaded:
-        logger.warning(
-            "oQ%s: %d matrices stay oQ's affine: a quant format's layer is not "
-            "built for their class (%s)",
-            f"{oq_level:g}",
-            len(unloaded),
-            ", ".join(sorted(set(unloaded))),
-        )
+    if unloaded or unwalked:
+        logger.warning(_left_affine(f"{oq_level:g}", unloaded, unwalked))
     if minimax_nvfp4_experts:
         output_config["text_config"] = {
             **output_config["text_config"],
@@ -9601,16 +9620,12 @@ class OQImatrixCollector:
             setattr(module, attribute, value)
         self._saved_attributes.clear()
 
-    def _ensure_entry(
-        self, name: str, module, sums_shape, counts_shape
-    ) -> OQImatrixEntry:
+    def _ensure_entry(self, name: str, sums_shape, counts_shape) -> OQImatrixEntry:
         entry = self.entries.get(name)
         if entry is None:
-            cls = type(module)
             entry = OQImatrixEntry(
                 in_sum2=np.zeros(sums_shape, dtype=np.float32),
                 counts=np.zeros(counts_shape, dtype=np.int64),
-                module_class=f"{cls.__module__}.{cls.__qualname__}",
             )
             self.entries[name] = entry
         return entry
@@ -9624,7 +9639,7 @@ class OQImatrixCollector:
             x_np = np.asarray(x.astype(mx.float32)).reshape(-1, in_dim)
             if x_np.shape[0] == 0:
                 return
-            entry = self._ensure_entry(name, module, (in_dim,), (1,))
+            entry = self._ensure_entry(name, (in_dim,), (1,))
             entry.in_sum2 += np.square(x_np, dtype=np.float32).sum(axis=0)
             entry.counts[0] += x_np.shape[0]
         except Exception as e:
@@ -9657,7 +9672,7 @@ class OQImatrixCollector:
             else:
                 shared = x_np.reshape(-1, in_dim)
                 per_head = np.repeat(shared[None], n_heads, axis=0)
-            entry = self._ensure_entry(name, module, (n_heads, in_dim), (n_heads,))
+            entry = self._ensure_entry(name, (n_heads, in_dim), (n_heads,))
             entry.in_sum2 += np.square(per_head, dtype=np.float32).sum(axis=1)
             entry.counts += per_head.shape[1]
         except Exception as e:
@@ -9762,7 +9777,7 @@ class OQImatrixCollector:
                 x_source = x_source[valid]
             else:
                 token_ids = token_ids[valid]
-            entry = self._ensure_entry(name, module, (n_experts, in_dim), (n_experts,))
+            entry = self._ensure_entry(name, (n_experts, in_dim), (n_experts,))
             self._accumulate_switch(entry, idx_flat, x_source, n_experts, token_ids)
         except Exception as e:
             logger.debug("oQe imatrix switch capture skipped for %s: %s", name, e)
@@ -11331,6 +11346,51 @@ def _collect_imatrix(
             progress_end=progress_end,
         )
 
+    model, tokenizer = _calibration_model(
+        model_path, config, trust_remote_code=trust_remote_code
+    )
+    try:
+        model_bytes = _calibration_resident_checkpoint_bytes(model_path, config)
+        return _collect_imatrix_from_model(
+            model,
+            tokenizer,
+            config,
+            calib_dataset=calib_dataset,
+            num_samples=num_samples,
+            seq_length=seq_length,
+            progress_callback=progress_callback,
+            progress_start=progress_start,
+            progress_end=progress_end,
+            model_bytes=model_bytes,
+        )
+    finally:
+        del model, tokenizer
+        mx.synchronize()
+        mx.clear_cache()
+
+
+def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
+    """The class (module and qualified name) of each module of the model
+    that oQe's calibration loads over ``model_path``, by its path, which is
+    the name a checkpoint keeps its matrix under. The model is built lazily:
+    no weight is read."""
+    model, tokenizer = _calibration_model(
+        model_path, config, trust_remote_code=trust_remote_code
+    )
+    try:
+        return {
+            name: f"{type(module).__module__}.{type(module).__qualname__}"
+            for name, module in model.named_modules()
+        }
+    finally:
+        del model, tokenizer
+        mx.synchronize()
+        mx.clear_cache()
+
+
+def _calibration_model(model_path, config, *, trust_remote_code=False):
+    """(model, tokenizer) as oQe's resident calibration loads them, lazily,
+    with the MTP head attached when the checkpoint has one."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
@@ -11411,25 +11471,7 @@ def _collect_imatrix(
     finally:
         if restore_mtp_active is not None:
             restore_mtp_active()
-
-    try:
-        model_bytes = _calibration_resident_checkpoint_bytes(model_path, config)
-        return _collect_imatrix_from_model(
-            model,
-            tokenizer,
-            config,
-            calib_dataset=calib_dataset,
-            num_samples=num_samples,
-            seq_length=seq_length,
-            progress_callback=progress_callback,
-            progress_start=progress_start,
-            progress_end=progress_end,
-            model_bytes=model_bytes,
-        )
-    finally:
-        del model, tokenizer
-        mx.synchronize()
-        mx.clear_cache()
+    return model, tokenizer
 
 
 def _oqe_cache_missing_mtp_entries(
@@ -11479,7 +11521,6 @@ def _load_or_collect_imatrix(
     sensitivity_num_samples: int = 32,
     sensitivity_seq_length: int = 256,
     require_mtp_entries: bool = True,
-    require_module_classes: bool = False,
 ) -> OQImatrixData:
     source = Path(model_path)
     path = Path(cache_path)
@@ -11513,14 +11554,6 @@ def _load_or_collect_imatrix(
                 logger.info(
                     "oQe imatrix: cache predates MTP-head collection "
                     "(no mtp.* entries), recollecting %s",
-                    path,
-                )
-            elif require_module_classes and not all(
-                entry.module_class for entry in cache.entries.values()
-            ):
-                logger.info(
-                    "oQe imatrix: cache predates the class of each layer, "
-                    "which a quant format is offered by, recollecting %s",
                     path,
                 )
             elif _oqe_cache_has_required_expert_coverage(cache):

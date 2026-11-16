@@ -25,6 +25,7 @@ from transformers import PreTrainedTokenizerFast
 
 from omlx import formats, oq
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+from omlx.patches.format_load import loads_in_format
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 from tests.test_formats_kernels import _BLOCKS, _PAGE
 from tests.test_formats_linear import _ToyFormat
@@ -287,12 +288,16 @@ def source(tmp_path_factory):
     }
     mx.save_safetensors(str(path / "model.safetensors"), weights)
     (path / "config.json").write_text(json.dumps(config))
-    vocab = {f"t{i}": i for i in range(config["vocab_size"])}
+    _save_tokenizer(path, config["vocab_size"])
+    return path
+
+
+def _save_tokenizer(path, size):
+    vocab = {f"t{i}": i for i in range(size)}
     tokenizer = Tokenizer(WordLevel(vocab, unk_token="t0"))
     PreTrainedTokenizerFast(tokenizer_object=tokenizer, unk_token="t0").save_pretrained(
         path
     )
-    return path
 
 
 def _quantize(source, output, **kwargs):
@@ -462,6 +467,37 @@ def test_a_layer_keeps_the_group_size_oq_gives_it(source, toy, tmp_path):
     )
 
 
+def test_a_format_is_asked_of_a_matrix_whose_k_oq_s_groups_do_not_divide(
+    source, toy, tmp_path
+):
+    # In groups of 128, oQ's affine keeps the matrices of K = 64 in floats.
+    theirs = _quantize(source, tmp_path / "oqe", group_size=128)
+    output = tmp_path / "oqe-toy"
+    tensors, config, applied = _quantize(
+        source, output, group_size=128, quant_format="toy"
+    )
+    entries = _in_format(config)
+    floats = sorted(set(applied) - set(theirs[2]))
+    assert floats and all(
+        theirs[0][f"{name}.weight"].shape[-1] == 64 for name in floats
+    )
+    assert not any(f"{name}.scales" in theirs[0] for name in floats)
+    # The format is asked of each, at the group size oQ gives it, and keeps it.
+    assert set(floats) <= set(entries)
+    assert {entries[name]["group_size"] for name in floats} == {128}
+    assert sorted(entries) == applied
+    _assert_same_output(
+        _beside(tensors, config, entries), _beside(*theirs[:2], entries)
+    )
+    maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
+    layers = dict(model.named_modules())
+    kinds = {type(layers[name]) for name in floats}
+    assert kinds == {FormatLinear, FormatSwitchLinear}
+    logits = model(mx.array([[1, 2, 3, 4]]))
+    assert logits.shape == (1, 4, 64) and mx.isfinite(logits).all()
+
+
 @pytest.mark.parametrize("declines", ["layout", "encode"])
 def test_a_format_that_takes_no_layer_is_said_so(
     source, plain, toy, tmp_path, caplog, declines
@@ -490,11 +526,15 @@ def test_a_format_that_takes_no_layer_is_said_so(
     _assert_same_output((tensors, config), plain[:2])
 
 
-def test_without_a_format_oq_says_nothing_of_one(source, tmp_path, caplog):
+def test_without_a_format_oq_says_nothing_of_one(source, tmp_path, caplog, monkeypatch):
+    walked = []
+    monkeypatch.setattr(oq, "_module_classes", lambda *a, **k: walked.append(a))
     caplog.set_level(logging.INFO, logger="omlx.oq")
     _, config, _ = _quantize(source, tmp_path / "oqe")
     assert _RECORD not in config
     assert not any("quant format" in message for message in caplog.messages)
+    # Nor builds a model to read the classes of its modules.
+    assert walked == []
 
 
 def test_a_quant_format_needs_oqe_and_a_registered_mode(source, toy, tmp_path):
@@ -549,11 +589,10 @@ def test_a_writer_of_its_own_writes_without_a_format(tmp_path, monkeypatch):
     assert wrote == [str(output)]
 
 
-@pytest.fixture
 def own_switch(monkeypatch):
     """Qwen3.5's experts in a switch layer of the family's own, as DeepSeek
     V4's and GLM's are: a ``to_quantized`` of its own, which builds MLX's
-    modes and no format's layer."""
+    modes and no format's layer. Returns the class's name."""
 
     class SwitchLinear(lm_switch.SwitchLinear):
         def to_quantized(self, group_size=64, bits=4, mode="affine"):
@@ -573,8 +612,9 @@ def own_switch(monkeypatch):
 
 
 def test_a_layer_whose_class_loads_no_format_stays_affine(
-    source, plain, toy, own_switch, tmp_path, caplog
+    source, plain, toy, tmp_path, monkeypatch, caplog
 ):
+    own = own_switch(monkeypatch)
     caplog.set_level(logging.INFO, logger="omlx.oq")
     output = tmp_path / "oqe-own"
     tensors, config, applied = _quantize(source, output, quant_format="toy")
@@ -594,11 +634,11 @@ def test_a_layer_whose_class_loads_no_format_stays_affine(
     ]
     said = (
         "oQ4: 6 matrices stay oQ's affine: a quant format's layer is not "
-        f"built for their class ({own_switch})"
+        f"built for their class ({own})"
     )
     assert warnings == [said]
     v4 = "omlx.patches.deepseek_v4.switch_layers.SwitchLinear"
-    assert _quoted(said.replace(own_switch, v4))
+    assert _quoted(said.replace(own, v4))
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
     # So the checkpoint loads, through the family's own to_quantized.
     maybe_apply_pre_load_patches(str(output))
@@ -614,8 +654,8 @@ _MEASURED = (".in_sum2", ".counts")  # what an imatrix cache kept of an entry
 
 
 def _without_classes(path):
-    """The imatrix cache at ``path`` as one written before each entry kept
-    the class of its layer."""
+    """The imatrix cache at ``path`` as upstream writes one: each entry's
+    sums and counts, nothing else."""
     with np.load(path) as data:
         kept = {name: data[name] for name in data.files}
     np.savez_compressed(
@@ -623,34 +663,49 @@ def _without_classes(path):
     )
 
 
-def test_a_cache_without_the_layers_classes_is_collected_again_for_a_format(
-    source, toy, tmp_path
+def _cached(source, tmp_path, cache, name, **kwargs):
+    """A run of ``_quantize`` over the imatrix cache at ``cache``: its
+    output's layers in the toy format, and whether it reused the cache."""
+    output = tmp_path / name
+    _, config, _ = _quantize(source, output, imatrix_cache_path=str(cache), **kwargs)
+    report = json.loads((output / "oq_imatrix_report.json").read_text())
+    return sorted(_in_format(config)), report["cache_reused"]
+
+
+def test_a_cache_written_without_classes_serves_a_run_with_a_format(
+    source, toy, tmp_path, monkeypatch
 ):
+    fresh, reused = _cached(
+        source, tmp_path, tmp_path / "fresh.npz", "fresh", quant_format="toy"
+    )
+    assert fresh and not reused
     cache = tmp_path / "imatrix.npz"
-
-    def reused(name, **kwargs):
-        output = tmp_path / name
-        _quantize(source, output, imatrix_cache_path=str(cache), **kwargs)
-        report = json.loads((output / "oq_imatrix_report.json").read_text())
-        return report["cache_reused"]
-
-    assert not reused("first")
+    assert _cached(source, tmp_path, cache, "plain") == ([], False)
     _without_classes(cache)
-    # A run without a format reuses it; a run with one collects again, and
-    # keeps the class of each entry's layer.
-    assert reused("plain")
-    assert not reused("toy", quant_format="toy")
-    entries = oq._load_oqe_imatrix(cache).entries
-    assert all(type(entry.module_class) is str for entry in entries.values())
-    assert {name: entry.module_class for name, entry in entries.items()} == {
-        name: (
-            "mlx_lm.models.switch_layers.SwitchLinear"
-            if ".switch_mlp." in name
-            else "mlx.nn.layers.linear.Linear"
-        )
-        for name in entries
+    # No calibration pass, and the matrices of a fresh collection.
+    calibrated = []
+    monkeypatch.setattr(oq, "_collect_imatrix", lambda *a, **k: calibrated.append(a))
+    assert _cached(source, tmp_path, cache, "toy", quant_format="toy") == (fresh, True)
+    assert calibrated == []
+
+
+def test_each_run_reads_the_classes_of_the_model_it_writes(
+    source, toy, tmp_path, monkeypatch
+):
+    # A cache collected while the experts were mlx-lm's switch layers serves
+    # a run where they are a switch layer of the family's own: they stay
+    # affine, and the checkpoint loads.
+    cache = tmp_path / "imatrix.npz"
+    stock, reused = _cached(source, tmp_path, cache, "stock", quant_format="toy")
+    assert any(".switch_mlp." in name for name in stock) and not reused
+    own_switch(monkeypatch)
+    own, reused = _cached(source, tmp_path, cache, "own", quant_format="toy")
+    assert reused and own == [name for name in stock if ".switch_mlp." not in name]
+    maybe_apply_pre_load_patches(str(tmp_path / "own"))
+    model, _ = load_model(tmp_path / "own", strict=True)
+    assert "FormatSwitchLinear" not in {
+        type(m).__name__ for _, m in model.named_modules()
     }
-    assert reused("toy again", quant_format="toy")
 
 
 _GLM5_NEXT = (
@@ -754,9 +809,9 @@ def test_a_record_that_json_does_not_keep_is_refused(
     assert not output.exists() and toy.offered == []
 
 
-def test_the_offer_reads_the_class_of_the_entry_the_importance_came_from():
+def test_an_importance_may_be_the_entry_of_another_layer():
     # GLM-5.3's indexer weighs weights_proj by wk's inputs: the same entry.
-    wk, other = (oq.OQImatrixEntry(np.ones(4), np.ones(1), cls) for cls in ("a", "b"))
+    wk, other = (oq.OQImatrixEntry(np.ones(4), np.ones(1)) for _ in range(2))
     indexer = "l.self_attn.indexer."
     entries = {f"{indexer}wk": wk, "l.mlp": other}
     imatrix = oq.OQImatrixData(entries, {}, "cache")
@@ -764,6 +819,16 @@ def test_the_offer_reads_the_class_of_the_entry_the_importance_came_from():
     assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", config) is wk
     assert oq._imatrix_entry(imatrix, "l.mlp", config) is other
     assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", {}) is None
+    # The text model's type says so too; a weights_proj of its own, or of
+    # no indexer, keeps its own entry or none.
+    text = {"model_type": "glm5", "text_config": {"model_type": "glm5_next_text"}}
+    assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", text) is wk
+    own = oq.OQImatrixEntry(np.ones(4), np.ones(1))
+    imatrix.entries[f"{indexer}weights_proj"] = own
+    assert oq._imatrix_entry(imatrix, f"{indexer}weights_proj", config) is own
+    imatrix.entries["l.mlp.wk"] = other
+    assert oq._imatrix_entry(imatrix, "l.mlp.weights_proj", config) is None
+    del imatrix.entries[f"{indexer}weights_proj"]
     importance = oq._lookup_imatrix_importance(
         imatrix,
         f"{indexer}weights_proj.weight",
@@ -773,3 +838,130 @@ def test_the_offer_reads_the_class_of_the_entry_the_importance_came_from():
         report=None,
     )
     assert np.array_equal(np.array(importance), np.ones(4))
+
+
+def test_a_matrix_of_no_module_of_its_path_stays_affine_and_is_named(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    walk = oq._module_classes
+    lost = "language_model.model.layers.1.mlp.shared_expert.down_proj"
+
+    def without(*args, **kwargs):
+        return {
+            name: cls for name, cls in walk(*args, **kwargs).items() if name != lost
+        }
+
+    monkeypatch.setattr(oq, "_module_classes", without)
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    _, config, applied = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
+    assert lost in applied and sorted(_in_format(config)) == sorted(
+        set(applied) - {lost}
+    )
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    said = (
+        "oQ4: 1 matrices stay oQ's affine: a quant format's layer is not built for "
+        "their class (no module has their path)\npaths that no module of the model "
+        f"built over the source has: {lost}"
+    )
+    assert warnings == [said]
+    # The page quotes the line that names them.
+    named = said.splitlines()[1].replace(lost, "model.layers.0.mlp.experts.0.gate_proj")
+    assert _quoted(named)
+
+
+def test_the_warning_names_twenty_paths_and_counts_the_others():
+    cls = "omlx.patches.deepseek_v4.switch_layers.SwitchLinear"
+    paths = [f"m.layers.{i:02d}.mlp.gate_proj" for i in range(23)]
+    said = oq._left_affine("3", [cls, cls], paths[::-1])
+    head = (
+        "oQ3: 25 matrices stay oQ's affine: a quant format's layer is not built for "
+        f"their class (no module has their path, {cls})\npaths that no module of the "
+        "model built over the source has: "
+    )
+    assert said == head + ", ".join(paths[:20]) + " and 3 more"
+    assert oq._left_affine("3", [], paths[:20]) == (
+        head.replace("25", "20").replace(f", {cls}", "") + ", ".join(paths[:20])
+    )
+    assert oq._left_affine("4", [cls], []) == (
+        "oQ4: 1 matrices stay oQ's affine: a quant format's layer is not built for "
+        f"their class ({cls})"
+    )
+
+
+def test_an_unpacked_minimax_shared_expert_is_offered_to_no_format(tmp_path):
+    # A MiniMax M3 whose config leaves the shared expert's layout to the
+    # model (pack_shared_expert unset, one shared expert as wide as a routed
+    # one) is built packed: the shared expert is the last matrix of the
+    # routed stacks. A checkpoint stored unpacked keeps the names below, oQ
+    # at 8 bits writes them so, and the loader's sanitize packs them.
+    moe = "language_model.model.layers.0.block_sparse_moe"
+    config = {
+        "model_type": "minimax_m3_vl",
+        "text_config": {
+            "hidden_size": 64,
+            "intermediate_size": 32,
+            "shared_intermediate_size": 32,
+            "dense_intermediate_size": 128,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "num_hidden_layers": 1,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "n_shared_experts": 1,
+            "moe_layer_freq": [1],
+            "vocab_size": 64,
+        },
+        "vision_config": {
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_hidden_layers": 1,
+            "projection_dim": 64,
+        },
+        "projector_hidden_size": 64,
+        "vocab_size": 64,
+    }
+    path = tmp_path / "minimax"
+    path.mkdir()
+    (path / "config.json").write_text(json.dumps(config))
+    _save_tokenizer(path, 64)
+    norm = "language_model.model.norm.weight"
+    mx.save_safetensors(str(path / "model.safetensors"), {norm: mx.ones((64,))})
+    classes = oq._module_classes(str(path), config)
+    # The shared expert's matrices, and the routed gate and up projections,
+    # are no module of the model built over the source: oQ's affine keeps
+    # them, and the run names them.
+    unpacked = [
+        *(
+            f"{moe}.shared_experts.{name}"
+            for name in ("gate_proj", "up_proj", "down_proj")
+        ),
+        f"{moe}.switch_mlp.gate_proj",
+        f"{moe}.switch_mlp.up_proj",
+    ]
+    assert [classes.get(name) for name in unpacked] == [None] * 5
+    assert loads_in_format(classes[f"{moe}.switch_mlp.gate_up_proj"])
+    # The routed down projection has the path of the packed stack, which
+    # holds the shared expert too: oQe measures three matrices' inputs, and
+    # the checkpoint's stack of two takes no importance, so no format is
+    # offered it (nor oQe's weighing, as in a run without one).
+    down = f"{moe}.switch_mlp.down_proj"
+    assert loads_in_format(classes[down])
+    model, _ = oq._calibration_model(str(path), config)
+    measured = dict(model.named_modules())[down].weight.shape
+    assert measured == (3, 64, 32)
+    entry = oq.OQImatrixEntry(np.ones((3, 32)), np.ones(3))
+    report = {"applied": [], "missing": [], "mismatched": []}
+    importance = oq._lookup_imatrix_importance(
+        oq.OQImatrixData({down: entry}, {}, "cache"),
+        f"{down}.weight",
+        (2, 64, 32),
+        strict=False,
+        report=report,
+    )
+    assert importance is None and [m["tensor"] for m in report["mismatched"]] == [down]
