@@ -36,9 +36,13 @@ logger = logging.getLogger(__name__)
 # bits of its one-row call, whatever rows it is launched with.
 MAX_ROWS = 16
 
-# What a switch layer's decode holds of its matrices at once, outside the
-# rows kernel: a piece of them, decoded as float32 (a decode's widest floats)
-# and cast to x's dtype. A call over more decodes them a piece at a time.
+# Outside the rows kernel a switch layer decodes the matrices a call needs at
+# once when they are within _DECODE_AT_ONCE_BYTES (in the decode's dtype, and
+# in x's when it differs), else a piece at a time, _DECODE_BYTES of them
+# counted as float32 and in x's dtype. MLX keeps every piece of one evaluation
+# in flight and frees a buffer when its command buffer completes: only many
+# small pieces, which split its command buffers, hold less than at once.
+_DECODE_AT_ONCE_BYTES = 1 << 31
 _DECODE_BYTES = 1 << 28
 
 # What opens the ValueError of MLX's eval for an array of a function that it
@@ -632,6 +636,12 @@ class _FormatLayer(nn.Module):
         )
 
 
+def _decode_dtype(layer: FormatSwitchLinear) -> mx.Dtype:
+    """The dtype of the layer's decode: read from the graph of one matrix's
+    decode, never evaluated."""
+    return layer._decoded(slice(0, 1)).dtype
+
+
 def keeps_dtype(module, key: str) -> bool:
     """Whether ``module``'s array ``key`` keeps its dtype through a recast
     of the model: a format layer's tensors (not its bias) are in the dtypes
@@ -681,16 +691,20 @@ class FormatSwitchLinear(_FormatLayer):
         """``x`` times the matrices at ``indices``, decoded: what the rows
         kernel does not take, a piece of the matrices at a time."""
         dtype = x.dtype
-        matrix = self.output_dims * self.input_dims * (4 + dtype.size)
-        piece = max(1, _DECODE_BYTES // matrix)
+        decoded = cached_per_module(self, "_omlx_decode_dtype", _decode_dtype, depth=0)
+        size = decoded.size + (dtype.size if dtype != decoded else 0)
+        matrix = self.output_dims * self.input_dims
+        piece = max(1, _DECODE_BYTES // (matrix * (4 + dtype.size)))
         if indices.size < self.num_experts:
-            # A decode step's indices: their matrices alone are decoded.
-            if indices.size > piece:
+            # A decode step's indices: their matrices alone are decoded, one
+            # for each pair of x and the indices broadcast together.
+            pairs = math.prod(mx.broadcast_shapes(x.shape[:-2], indices.shape))
+            if pairs * matrix * size > _DECODE_AT_ONCE_BYTES:
                 return self._selected(x, indices, piece)
             return x @ self._decoded(indices).astype(dtype).swapaxes(-1, -2)
         indices = _wrapped(indices, self.num_experts)
         # A prefill's: the stack once, not a matrix for each index.
-        if self.num_experts > piece:
+        if self.num_experts * matrix * size > _DECODE_AT_ONCE_BYTES:
             return self._stacked(x, indices, sorted_indices, piece)
         return mx.gather_mm(
             x,
@@ -702,8 +716,9 @@ class FormatSwitchLinear(_FormatLayer):
     def _selected(self, x, indices, piece):
         """``x`` times the matrices at ``indices``, ``piece`` pairs at a
         time, each piece one matmul. With one row of x a pair (a model's
-        call) each pair has the bits of the matmul of all of them at once;
-        with more rows, MLX may choose another kernel for a smaller batch."""
+        call) and a decode that works element by element, each pair has the
+        bits of the matmul of all of them at once; with more rows, MLX may
+        choose another kernel for a smaller batch."""
         dtype, (m, k) = x.dtype, x.shape[-2:]
         batch = mx.broadcast_shapes(x.shape[:-2], indices.shape)
         rows = mx.broadcast_to(x, (*batch, m, k)).reshape(-1, m, k)
@@ -717,8 +732,10 @@ class FormatSwitchLinear(_FormatLayer):
 
     def _stacked(self, x, indices, sorted_indices, piece):
         """MLX's gather_mm of ``x`` with the stack, ``piece`` matrices at a
-        time: each pair takes the product of the piece that holds its
-        matrix, a gather_mm of the same shapes as over the whole stack."""
+        time: each piece's gather_mm takes every pair (pieces x the
+        gather's work), and each pair keeps the product of the piece that
+        holds its matrix. With a decode that works element by element, that
+        product has the bits of the gather over the whole stack."""
         y = None
         for first in range(0, self.num_experts, piece):
             last = min(first + piece, self.num_experts)
