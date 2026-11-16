@@ -29,11 +29,14 @@ from functools import cache
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..formats.affine import _BITS, _GROUP_SIZES, _LOAD, _QDOT, header, qmv_fast_layout
+from ..formats.affine import _GROUP_SIZES, _LOAD, _QDOT, header, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
+# The affine widths whose weights the tile decodes (``_DECODE``, ``_WDOT``):
+# not 2 and 3 bits, which affine.py's faces take.
+_BITS = (4, 5, 6, 8)
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
 _RPS = 4
 # Verify projections run in a dependent chain, so latency wins: below this
@@ -381,7 +384,9 @@ def unrolled_tile_verified(shape: tuple, run, weights: list, bits: int, group_si
 def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> str:
     """The tile's source for one bit width: MLX's code for that width, and
     qmv_impl's last block in a qmv tile alone."""
-    start = header(bits, group_size, fast)  # refuses a width MLX has no code for
+    if bits not in _BITS:
+        raise ValueError(f"row-exact tile: no decode of {bits}-bit weights")
+    start = header(bits, group_size, fast)  # refuses a group size MLX lacks
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
     last = "" if fast else _LOAD_SAFE.replace("__LOAD__", _LOAD[bits])
     decoded = _DECODED_DOT.replace("__DECODE__", _DECODE[bits])

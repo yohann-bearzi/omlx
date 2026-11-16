@@ -242,6 +242,16 @@ def test_window_rows_equal_one_token_decode(topk_fold, engaged):
     assert not plan.proof.failed and not plan.window.failed
 
 
+@pytest.mark.parametrize("bits", [2, 3])
+def test_2_and_3_bit_window_rows_equal_one_token_decode(bits, engaged):
+    """MLX's 2- and 3-bit experts take the window launches as the other
+    widths do, gate+up through qmv_fast and down through qmv."""
+    block = _block(0, bits=bits)
+    for rows in (1, 2, 3, 4, 8, 16):
+        for step in range(2):
+            _check(block, _inputs(rows, step), engaged)
+
+
 @pytest.mark.parametrize("rows", [2, 5, 8])
 def test_batched_decode_rows_equal_one_token_decode(rows, engaged):
     """Several requests' one-token decode ([B, 1, hidden], not a verify
@@ -400,7 +410,7 @@ def _quantized(shape, group_size, bits):
 
 
 @pytest.mark.parametrize("window_rps,token_rps", [(4, 4), (4, 2)])
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5])
 def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps):
     """BF16 outputs hide one-ulp FP32 differences: run the window launches
     and the one-token launches in FP32 (the one-token ones equal MLX's FP32

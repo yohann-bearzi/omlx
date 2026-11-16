@@ -580,17 +580,17 @@ An affine checkpoint's linears stay MLX's layers (`nn.QuantizedLinear`, `Quantiz
 
 | | Covered |
 |---|---|
-| Bits | 4, 5, 6, 8 |
+| Bits | 2, 3, 4, 5, 6, 8 |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16. The face is exact for activations of that dtype (its `dtypes`); no kernel is built on it for another. |
-| Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 4 and 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
+| Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 2 to 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
 Any other affine layer has no face and runs MLX's ops:
 
 - another bit width or group size, fp32 scales, biases of another dtype than the scales, no scales or no biases, a K that is not whole groups, weights that are neither 2-D nor 3-D or that are not the N by K asked for,
 - a matrix of fewer than 8 groups, counted in one expert for stacked weights (MLX binds an input of fewer than 8 elements as constants, not as a buffer),
-- a 2-D matrix of K 64 or 128 at 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
+- a 2-D matrix of K 64 or 128 at 2, 4 or 8 bits: MLX runs one row of it through `qmv_quad`, which sums in another order than `qmv`.
 
 The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFormat.dot` is what gives a matrix its traversal.
 
@@ -606,4 +606,4 @@ The routed decode runs a block in the one dtype its gate+up face is exact for. W
 
 A face that does not compile does not fail the model. The decode evaluates a launch inside the call the first time blocks of the same faces, tensor dtypes and shapes build it, once the block's input is evaluated (a failure ahead of the block is raised as it is). If a one-token launch fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path. If the launch of a verify window or of batched rows fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.
 
-The verify gather runs a block's fused gate+up projection, then its down projection, when both are stacked expert weights without a bias, of an N that is whole tiles of 8 outputs, each with a dot face that is exact for the block's dtype, and the block's activation returns that dtype in the shape of the up's rows. The block's indices are integers, top-k of them for each row of `x`, and `x` has 8 values or more (MLX binds fewer as constants). The gather proves each Metal of a block's two launches as a format layer does, on a stand-in: zeros of the block's rows and pairs, every pair with expert 0 of stacks of the fewest experts that leave each tensor 8 elements. It evaluates nothing of the call, so a block may be built inside a function that `mx.compile` traces, and what fails in `x`, in the indices, in a tensor or in the activation is raised where the caller evaluates the result. A block whose stand-in fails (`expert-ordered verify gather failed; composed fallback`) keeps the projections of the same faces, tensor dtypes and shapes on their composed path, on every thread.
+The verify gather runs a block's fused gate+up projection, then its down projection, when both are stacked expert weights without a bias, of an N that is whole tiles of 8 outputs, each with a dot face that is exact for the block's dtype, and the block's activation returns that dtype in the shape of the up's rows. MLX's 2- and 3-bit experts run it only in blocks of 64 experts or more and of 32 pairs (rows times top-k) or fewer: above 32 pairs, its search of each pair's place costs more than it saves against the composed path, and a block of 8 experts lost at 8 to 16 pairs. The block's indices are integers, top-k of them for each row of `x`, and `x` has 8 values or more (MLX binds fewer as constants). The gather proves each Metal of a block's two launches as a format layer does, on a stand-in: zeros of the block's rows and pairs, every pair with expert 0 of stacks of the fewest experts that leave each tensor 8 elements. It evaluates nothing of the call, so a block may be built inside a function that `mx.compile` traces, and what fails in `x`, in the indices, in a tensor or in the activation is raised where the caller evaluates the result. A block whose stand-in fails (`expert-ordered verify gather failed; composed fallback`) keeps the projections of the same faces, tensor dtypes and shapes on their composed path, on every thread.

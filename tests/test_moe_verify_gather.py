@@ -33,14 +33,17 @@ def _experts(k, n, bits=4, bias=False, dtype=mx.bfloat16):
     return linear.to_quantized(group_size=32, bits=bits)
 
 
-def _switch(bits=4, dtype=mx.bfloat16, seed=3, group=32, inter=INTER):
+def _switch(
+    bits=4, dtype=mx.bfloat16, seed=3, group=32, inter=INTER, down_bits=None, experts=8
+):
     """A fused switch: gate+up of K 512 (``qmv_fast`` at these bits), down of
-    K ``inter`` (``qmv``, one last block at 64)."""
+    K ``inter`` (``qmv``, one last block at 64), at ``down_bits`` if given."""
     mx.random.seed(seed)
-    glu = SwitchGLU(HIDDEN, inter, EXPERTS)
+    glu = SwitchGLU(HIDDEN, inter, experts)
     glu.set_dtype(dtype)
-    for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(glu, name, getattr(glu, name).to_quantized(group, bits))
+    widths = {"gate_proj": bits, "up_proj": bits, "down_proj": down_bits or bits}
+    for name, width in widths.items():
+        setattr(glu, name, getattr(glu, name).to_quantized(group, width))
     glu.eval()
     gate_up_fusion._fuse_one(glu)
     return glu
@@ -146,6 +149,52 @@ def test_float32_affine_experts_keep_the_composed_route():
     x, indices = _block(1, 3, mx.float32)
     assert gather.fused_switch(switch, x, indices) is None
     assert not _proofs()
+
+
+def _routed(rows, top_k, experts, seed=7):
+    mx.random.seed(seed + rows * top_k)
+    x = mx.random.normal((1, rows, HIDDEN)).astype(mx.bfloat16)
+    indices = mx.random.randint(0, experts, (1, rows, top_k)).astype(mx.uint32)
+    mx.eval(x, indices)
+    return x, indices
+
+
+@pytest.mark.parametrize("bits, down_bits", [(2, None), (3, None), (3, 4), (4, 2)])
+def test_2_and_3_bit_experts_take_the_gather_up_to_32_pairs(
+    monkeypatch, bits, down_bits
+):
+    """In a block of 64 experts or more; either projection at 2 or 3 bits is
+    enough."""
+    switch = _switch(bits, down_bits=down_bits, experts=64)
+    few = ((2, 6), (5, 6), (4, 8), (8, 4), (2, 16))  # 32 pairs or fewer
+    many = ((6, 6), (5, 8), (8, 5), (3, 11), (3, 16))
+    for rows, top_k in few + many:
+        x, indices = _routed(rows, top_k, 64)
+        got = gather.fused_switch(switch, x, indices)
+        assert (got is not None) == ((rows, top_k) in few), (rows, top_k)
+        if got is not None:
+            assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+    (proof,) = _proofs()
+    assert len(proof.ran) == 5 and not proof.failed
+
+
+@pytest.mark.parametrize("bits, down_bits", [(2, None), (3, None), (4, 3)])
+def test_2_and_3_bit_experts_of_fewer_than_64_leave_every_block_composed(
+    bits, down_bits
+):
+    """A block of 8 experts lost to the composed path at 8 to 16 pairs."""
+    switch = _switch(bits, down_bits=down_bits, experts=63)
+    for rows, top_k in ((2, 4), (2, 6), (4, 8)):
+        assert gather.fused_switch(switch, *_routed(rows, top_k, 63)) is None
+    assert not _proofs()
+
+
+def test_4_bit_experts_take_the_gather_past_32_pairs(monkeypatch):
+    switch = _switch(4)
+    for rows, top_k in ((6, 6), (8, 6), (5, 8), (8, 16)):
+        x, indices = _routed(rows, top_k, EXPERTS)
+        got = gather.fused_switch(switch, x, indices)
+        assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
 
 
 def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):

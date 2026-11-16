@@ -32,6 +32,15 @@ from .module_cache import cached_per_module
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 8
+# MLX's 2- and 3-bit experts run the gather only in blocks of at least
+# MANY_EXPERTS experts and of at most FEW_PAIRS pairs (rows x top-k): there
+# it was measured faster than the composed path on both Macs, at Flash-Next's
+# and the 35B-A3B's blocks (BLOCK-P.md, Item 5). Above FEW_PAIRS, each
+# threadgroup's search of its pair's rank costs more than the gather saves;
+# a block of 8 experts lost at 8 to 16 pairs as well. Other widths and
+# formats engage as they did before those faces.
+FEW_PAIRS = 32
+MANY_EXPERTS = 64
 
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
@@ -108,6 +117,7 @@ class _Plan(NamedTuple):
     down: Projection
     proof: kernels.Proof  # of a block's two launches
     width: int  # the K of gate_up: a row of x
+    pairs: int | None  # the most pairs of a block it takes, if a limit
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -128,12 +138,18 @@ def projection(linear, k: int) -> Projection | None:
 
 
 def _build_plan(switch_mlp, width: int) -> _Plan | None:
-    gate_up = projection(switch_mlp.get("gate_up_proj"), width)
+    layers = switch_mlp.get("gate_up_proj"), switch_mlp.get("down_proj")
+    gate_up = projection(layers[0], width)
     if gate_up is None:
         return None
-    down = projection(switch_mlp.get("down_proj"), gate_up.n // 2)
+    down = projection(layers[1], gate_up.n // 2)
     if down is None:
         return None
+    pairs = None
+    if any(layer.mode == "affine" and layer.bits in (2, 3) for layer in layers):
+        if gate_up.operands[0].shape[0] < MANY_EXPERTS:
+            return None
+        pairs = FEW_PAIRS
     # What the launches are compiled from, beside a block's rows and routing.
     proof = kernels.proof(
         "verify_gather",
@@ -144,7 +160,7 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
         gate_up.n,
         down.n,
     )
-    return _Plan(gate_up, down, proof, width)
+    return _Plan(gate_up, down, proof, width, pairs)
 
 
 _FAILED = "expert-ordered verify gather failed; composed fallback"
@@ -182,7 +198,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
     the block is outside this kernel (its rows, indices that are not integers
-    or not top_k of them for each row of x, fewer than 8 values of x), a
+    or not top_k of them for each row of x, fewer than 8 values of x, 2- or
+    3-bit affine experts outside MANY_EXPERTS and FEW_PAIRS), a
     projection has no dot face that is exact for ``x``'s dtype, the
     activation gives another dtype than ``x``'s or another shape than the
     up's, or a block of these faces and shapes failed.
@@ -222,6 +239,7 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         # kernel reads x from device memory; like gather_qmm, it reads
         # integer indices only.
         top_k < 1
+        or (plan.pairs is not None and rows * top_k > plan.pairs)
         or rows * width < 8
         or not mx.issubdtype(indices.dtype, mx.integer)
         or not plan.proof.prove(

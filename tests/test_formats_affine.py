@@ -67,6 +67,8 @@ def _mlx_rows(layer, x, expert=None):
 # MLX 0.32.4 quantized.h, by bit width: the masks of qdot's branch and the
 # powers of two that the branches of load_vector and qdot scale by.
 MLX_MASKS = {
+    2: {"0x03", "0x0c", "0x30", "0xc0"},
+    3: {"0x01", "0x03", "0x07", "0x0e", "0x1c", "0x38", "0x70", "0x80", "0xc0", "0xe0"},
     4: {"0x000f", "0x00f0", "0x0f00", "0xf000"},
     5: {"0x1", "0x3", "0x7", "0xf", "0x1f", "0x3e", "0x7c", "0x80", "0xc0", "0xe0"}
     | {"0xf0", "0xf8"},
@@ -74,6 +76,8 @@ MLX_MASKS = {
     8: set(),
 }
 MLX_SCALES = {
+    2: {"4.0f", "16.0f", "64.0f"},
+    3: {"2.0f", "4.0f", "8.0f", "16.0f", "32.0f", "64.0f", "128.0f", "256.0f"},
     4: {"16.0f", "256.0f", "4096.0f"},
     5: {"2.0f", "4.0f", "8.0f", "16.0f", "32.0f", "64.0f", "128.0f", "256.0f"},
     6: {"4.0f", "16.0f", "64.0f", "256.0f"},
@@ -111,11 +115,15 @@ def test_affine_states_one_revision_in_its_format_and_its_faces():
 @pytest.mark.parametrize(
     "k, bits, fast",
     [
+        (512, 2, True),
+        (512, 3, True),
         (512, 4, True),
         (512, 5, True),
         (256, 6, True),
         (256, 8, True),
-        (256, 4, False),  # MLX's qmv_fast block is 512 wide at 4 and 5 bits
+        (256, 2, False),  # MLX's qmv_fast block is 512 wide at 2 to 5 bits
+        (256, 3, False),
+        (256, 4, False),
         (256, 5, False),
         (384, 6, False),
         (384, 8, False),
@@ -144,15 +152,15 @@ def test_each_layout_is_one_face():
     assert a != formats.dot(_linear(512, 16, 4, 64, mx.float16), 512, 16)
     keys = {
         affine.face(bits, group_size, fast, mx.bfloat16).key
-        for bits in (4, 5, 6, 8)
+        for bits in (2, 3, 4, 5, 6, 8)
         for group_size in (32, 64, 128)
         for fast in (True, False)
     }
-    assert len(keys) == 24
+    assert len(keys) == 36
 
 
 @pytest.mark.parametrize("fast", [True, False])
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_a_face_s_source_holds_its_own_bit_width_alone(bits, fast):
     """MLX hashes a kernel's whole source at every launch: a face holds the
     branch of MLX's code for its width and the functions its kernels call."""
@@ -166,7 +174,7 @@ def test_a_face_s_source_holds_its_own_bit_width_alone(bits, fast):
 @pytest.mark.parametrize(
     "bits, dtype, k, n",
     [
-        (3, mx.bfloat16, 512, 16),  # bits the transcription lacks
+        (1, mx.bfloat16, 512, 16),  # bits the transcription lacks
         (4, mx.float32, 512, 16),
         (4, mx.bfloat16, 256, 16),  # not the matrix asked for
         (4, mx.bfloat16, 512, 8),
@@ -178,7 +186,7 @@ def test_no_face_outside_what_the_transcription_covers(bits, dtype, k, n):
     assert affine.FORMAT.dot(_linear(512, 16, bits, 64, dtype), k, n) is None
 
 
-@pytest.mark.parametrize("bits, group_size", [(3, 64), (4, 16), (4, 256)])
+@pytest.mark.parametrize("bits, group_size", [(1, 64), (7, 64), (4, 16), (4, 256)])
 def test_a_face_built_by_hand_is_one_the_transcription_has(bits, group_size):
     with pytest.raises(ValueError, match="no MLX transcription"):
         affine.face(bits, group_size, False, mx.bfloat16)
@@ -229,7 +237,7 @@ def test_a_matrix_of_8_groups_is_bound_as_buffers():
     assert _bit_equal(got, _mlx_rows(linear, x))
 
 
-_QUAD = [(k, bits) for k in (64, 128) for bits in (4, 8)]
+_QUAD = [(k, bits) for k in (64, 128) for bits in (2, 4, 8)]
 
 
 def test_no_face_where_mlx_runs_qmv_quad():
@@ -237,8 +245,9 @@ def test_no_face_where_mlx_runs_qmv_quad():
         assert affine.FORMAT.dot(_linear(k, 16, bits, 32), k, 16) is None
         # gather_qmm has no such kernel.
         assert formats.dot(_stacked(2, k, 16, bits, 32), k, 16) is not None
-    # Only K 64 and 128, only 4 and 8 bits.
-    for k, bits in [(32, 4), (96, 8), (64, 5), (128, 6), (192, 4), (256, 8)]:
+    # Only K 64 and 128, only 2, 4 and 8 bits.
+    others = [(32, 4), (96, 8), (64, 5), (128, 6), (192, 4), (256, 8)]
+    for k, bits in [*others, (64, 3), (128, 3), (192, 2)]:
         assert formats.dot(_linear(k, 16, bits, 32), k, 16) is not None
 
 
@@ -250,8 +259,11 @@ def test_no_face_for_weights_that_are_not_a_matrix_or_a_stack_of_them():
     assert affine.FORMAT.dot(stacked, 512, 16) is None
 
 
+# At 2 bits and K 64 a lane of qmv holds 16 inputs, as a lane of qmv_quad
+# does, and the four partial sums meet in one simd_sum or quad_sum: the bits
+# came out equal here. No face either: what equals MLX is its dispatch.
 @metal
-@pytest.mark.parametrize("k, bits", _QUAD)
+@pytest.mark.parametrize("k, bits", [quad for quad in _QUAD if quad != (64, 2)])
 def test_qmv_quad_is_not_the_qmv_sum(k, bits):
     # Why such a matrix has no face: built by hand, the qmv face gives it the
     # right products, summed in another order than MLX's.
@@ -273,7 +285,7 @@ def test_qmv_quad_is_not_the_qmv_sum(k, bits):
         for n in (16, 12)  # whole output tiles of 8 rows, or not
         # Around qmv_quad's K (64, 128), then as in test_rows_have_mlx_bits.
         for k in (32, 64, 96, 128, 256, 288, 384, 448, 512, 1024, 1280)
-        for bits in (4, 5, 6, 8)
+        for bits in (2, 3, 4, 5, 6, 8)
         if stacked or (k, bits) not in _QUAD
     ],
 )
@@ -305,12 +317,13 @@ def test_the_traversal_sums_in_mlx_order(bits, k, n, stacked):
     "bits, group_size, k",
     [
         (bits, group_size, k)
-        for bits in (4, 5, 6, 8)
+        for bits in (2, 3, 4, 5, 6, 8)
         for group_size in (32, 64, 128)
-        # qmv_fast where K is whole blocks of 512 (4 and 5 bits) or of 256 (6
+        # qmv_fast where K is whole blocks of 512 (2 to 5 bits) or of 256 (6
         # and 8 bits): one block and more. Elsewhere qmv, in blocks of half
-        # that: a partial block alone (from 96), whole blocks alone, whole
-        # blocks and a partial one (640 at 4 and 5 bits: two and a half).
+        # that (2 bits: of 512 as well): a partial block alone (from 96),
+        # whole blocks alone, whole blocks and a partial one (640 at 3 to 5
+        # bits: two and a half).
         for k in (96, 128, 192, 256, 288, 384, 448, 512, 640, 1024, 1280)
         if k % group_size == 0 and (k, bits) not in _QUAD
     ],
@@ -327,7 +340,7 @@ def test_rows_have_mlx_bits(bits, group_size, k, dtype):
 @metal
 @pytest.mark.parametrize("n", [16, 24, 12])  # whole output tiles of 8 rows, or not
 @pytest.mark.parametrize("k", [512, 384, 128])
-@pytest.mark.parametrize("bits", [4, 6])
+@pytest.mark.parametrize("bits", [2, 3, 4, 6])
 def test_stacked_rows_have_gather_qmm_bits(bits, k, n):
     stacked = _stacked(3, k, n, bits, 64)
     x = mx.random.normal((k,)).astype(mx.bfloat16)

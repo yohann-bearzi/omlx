@@ -174,6 +174,10 @@ class _CastGate(nn.Module):
     [
         (2560, 640, 5, 64),  # Qwen3.8-Flash-Next oQ5e
         (2560, 640, 4, 64),
+        (2560, 640, 3, 64),  # Qwen3.8-Flash-Next oQ3e
+        (2560, 640, 2, 64),
+        (1024, 320, 3, 32),
+        (1024, 384, 2, 128),
         (1024, 320, 5, 32),
         (1024, 384, 6, 128),
         (1024, 320, 8, 64),
@@ -281,7 +285,7 @@ def test_a_launch_holds_the_swiglu_only_where_it_applies_it(monkeypatch):
 
 
 @pytest.mark.parametrize("hidden", [2560, 2432])
-@pytest.mark.parametrize("bits", [4, 5])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5])
 def test_fp32_kernels_match_mlx_mat_vecs(bits, hidden):
     """BF16 outputs hide one-ulp FP32 differences, so run both launches in
     FP32 against MLX's FP32 mat-vecs: the gate+up rows after SwiGLU of the
@@ -580,7 +584,6 @@ def test_plan_follows_replaced_weights(owner, names):
     "kwargs",
     [
         {"hidden": 1024, "inter": 320, "top_k": 6},
-        {"hidden": 1024, "inter": 320, "bits": 3},
     ],
 )
 def test_ineligible_shapes_keep_the_composed_body(kwargs):

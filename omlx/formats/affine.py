@@ -7,9 +7,9 @@ kernel instantiated with it computes each row as MLX's ``qmv_fast`` or ``qmv``
 does, bit for bit, for bf16 or fp16 activations with scales in the same
 dtype. MLX runs ``qmv_fast`` when K is a multiple of the kernel block, and
 for one row through ``gather_qmm`` (stacked weights) when N is a multiple of
-8 as well. One row of a 2-D matrix of K 64 or 128 at 4 or 8 bits is a third
-MLX kernel, ``qmv_quad``, which sums in another order: such a matrix has no
-face.
+8 as well. One row of a 2-D matrix of K 64 or 128 at 2, 4 or 8 bits is a
+third MLX kernel, ``qmv_quad``, which sums in another order: such a matrix
+has no face.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import mlx.core as mx
 
 from . import Dot, QuantFormat
 
-_BITS = (4, 5, 6, 8)
+_BITS = (2, 3, 4, 5, 6, 8)
 _GROUP_SIZES = (32, 64, 128)
 
 # MLX 0.32.4 quantized.h's constants for a bit width, group size and
@@ -33,20 +33,52 @@ constant constexpr int BITS = __BITS__;
 constant constexpr int GS = __GS__;
 constant constexpr int FAST = __FAST__;
 constant constexpr int PACK_FACTOR =
-    (BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
+    __PACK_FACTOR__;
 constant constexpr int BYTES_PER_PACK =
     ((BITS & (BITS - 1)) == 0) ? 4 : (BITS == 5 ? 5 : 3);
-constant constexpr int PACKS_PER_THREAD = FAST ? 2 : 1;
+constant constexpr int PACKS_PER_THREAD = __PACKS__;
 constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
 constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
 constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
 """
+
+# MLX's pack factor (get_pack_factor) and the packs a lane reads per block
+# (qmv_fast_impl's packs_per_thread: one at 2 bits; qmv_impl: one), as each
+# width's source states them. The 4- to 8-bit text is the one their kernels
+# have always been compiled from: a kernel of an existing checkpoint keeps
+# its source byte for byte.
+_PACKING = {
+    2: ("32 / BITS", "1"),
+    3: ("8", "FAST ? 2 : 1"),
+    **dict.fromkeys(
+        (4, 5, 6, 8), ("(BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS)", "FAST ? 2 : 1")
+    ),
+}
 
 # The branch of each bit width in MLX's load_vector and qdot, over the first
 # __N__ of a lane's values: all VALUES_PER_THREAD of them, or N in qmv_impl's
 # last block (load_vector_safe, qdot_safe). A kernel's source holds its own
 # width's branch alone: MLX hashes the whole source at every launch.
 _LOAD = {
+    2: r"""  for (int i = 0; i < __N__; i += 4) {
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 4.0f;
+    x_thread[i + 2] = x[i + 2] / 16.0f;
+    x_thread[i + 3] = x[i + 3] / 64.0f;
+  }""",
+    3: r"""  for (int i = 0; i < __N__; i += 8) {
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+        float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 8.0f;
+    x_thread[i + 2] = x[i + 2] / 64.0f;
+    x_thread[i + 3] = x[i + 3] / 2.0f;
+    x_thread[i + 4] = x[i + 4] / 16.0f;
+    x_thread[i + 5] = x[i + 5] / 128.0f;
+    x_thread[i + 6] = x[i + 6] / 4.0f;
+    x_thread[i + 7] = x[i + 7] / 32.0f;
+  }""",
     4: r"""  for (int i = 0; i < __N__; i += 4) {
     sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
     x_thread[i] = x[i];
@@ -80,6 +112,30 @@ _LOAD = {
 }
 
 _QDOT = {
+    2: r"""  for (int i = 0; i < (__N__ / 4); i++) {
+    accum +=
+        (x_thread[4 * i] * (w[i] & 0x03) +
+         x_thread[4 * i + 1] * (w[i] & 0x0c) +
+         x_thread[4 * i + 2] * (w[i] & 0x30) +
+         x_thread[4 * i + 3] * (w[i] & 0xc0));
+  }""",
+    3: r"""  for (int i = 0; i < (__N__ / 8); i++) {
+    x_thread += 8 * i;
+    w += 3 * i;
+
+    accum += (w[0] & 0x07) * x_thread[0];
+    accum += (w[0] & 0x38) * x_thread[1];
+    accum += (w[0] & 0xc0) * x_thread[2];
+    accum += (w[1] & 0x01) * (x_thread[2] * 256.0f);
+
+    accum += (w[1] & 0x0e) * x_thread[3];
+    accum += (w[1] & 0x70) * x_thread[4];
+    accum += (w[1] & 0x80) * x_thread[5];
+    accum += (w[2] & 0x03) * (x_thread[5] * 256.0f);
+
+    accum += (w[2] & 0x1c) * x_thread[6];
+    accum += (w[2] & 0xe0) * x_thread[7];
+  }""",
     4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
   for (int i = 0; i < (__N__ / 4); i++) {
     accum +=
@@ -157,8 +213,11 @@ def header(bits: int, group_size: int, fast: bool) -> str:
         raise ValueError(
             f"affine: no MLX transcription of {bits} bits in groups of {group_size}"
         )
+    pack_factor, packs = _PACKING[bits]
     return (
         (_CONSTANTS + _LOAD_FUNCTION.replace("__LOAD__", _LOAD[bits]))
+        .replace("__PACK_FACTOR__", pack_factor)
+        .replace("__PACKS__", packs)
         .replace("__N__", "VALUES_PER_THREAD")
         .replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
@@ -168,7 +227,7 @@ def header(bits: int, group_size: int, fast: bool) -> str:
 
 def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> bool:
     """MLX 0.32.4's one-row affine dispatch: K must align to the kernel block
-    (512 for 4/5-bit, 256 for 6/8-bit). Only gathered QMV still requires N
+    (512 for 2- to 5-bit, 256 for 6/8-bit). Only gathered QMV still requires N
     to be a multiple of 8; ordinary QMV supports partial output tiles."""
     pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
     return (not gathered or n % 8 == 0) and k % (
@@ -282,7 +341,9 @@ class AffineFormat(QuantFormat):
             or n * k // layer.group_size < 8
             # qmv_quad: MLX's kernel for one row of a 2-D matrix of K 64 or
             # 128 at a power-of-two bit width.
-            or (layer["weight"].ndim == 2 and k in (64, 128) and layer.bits in (4, 8))
+            or (
+                layer["weight"].ndim == 2 and k in (64, 128) and layer.bits in (2, 4, 8)
+            )
         ):
             return None
         # Stacked (3-D) weights are the ones MLX runs through gather_qmm.

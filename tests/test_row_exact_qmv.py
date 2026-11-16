@@ -223,14 +223,30 @@ def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
     )
 
 
-@pytest.mark.parametrize("bits, group_size", [(7, 64), (4, 8)])
-def test_a_tile_is_built_only_for_a_width_mlx_has_code_for(bits, group_size):
+@pytest.mark.parametrize(
+    "bits, group_size, words",
+    [(7, 64, "no decode of 7-bit weights"), (4, 8, "no MLX transcription")],
+)
+def test_a_tile_is_built_only_for_a_width_mlx_has_code_for(bits, group_size, words):
     weight = mx.zeros((8, 512 * bits // 32), mx.uint32)
     scales = mx.zeros((8, 512 // group_size), mx.bfloat16)
-    with pytest.raises(ValueError, match="no MLX transcription"):
+    with pytest.raises(ValueError, match=words):
         row_exact_qmv.OneRowQmv(
             weight, scales, scales, bits, group_size, mx.bfloat16, 4
         )
+
+
+@pytest.mark.parametrize("bits", [2, 3])
+def test_the_tile_declines_the_widths_it_does_not_decode(bits):
+    """The tile decodes 4, 5, 6 and 8 bits (decode_w, wdot): affine.py's 2-
+    and 3-bit faces are not the tile's."""
+    weight, scales, biases = _quantized(2560, 64, bits, 64, mx.bfloat16, 1)
+    one_row = row_exact_qmv.one_row_qmv
+    assert one_row(weight, scales, biases, bits, 64, "affine", mx.bfloat16, 1) is None
+    x = mx.zeros((1, 2560), mx.bfloat16)
+    assert not row_exact_qmv._kernel_supported(_linear(2560, 64, bits, 64, 1), x)
+    with pytest.raises(ValueError, match=f"no decode of {bits}-bit weights"):
+        row_exact_qmv.OneRowQmv(weight, scales, biases, bits, 64, mx.bfloat16, 1)
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
