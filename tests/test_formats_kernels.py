@@ -699,6 +699,18 @@ def test_a_k_that_is_not_whole_lanes_is_refused_in_words():
     assert "dot face: K must be a whole number of a lane's VPT inputs" in message
 
 
+@metal
+def test_a_lane_of_no_inputs_is_refused_in_words_and_nothing_else():
+    message = _error(_toy("no_inputs", source=_TOY.replace("VPT = 8;", "VPT = 0;")))
+    assert (
+        "due to requirement 'Lanes<512>::VPT >= 1' "
+        '"dot face: Lanes<K>::VPT must be one input or more"'
+    ) in " ".join(message.split())
+    assert "<omlx skeletons, docs/quant-formats.md>:" in message
+    # Nothing that divides by VPT or walks a lane's inputs is compiled.
+    assert message.count("error:") == 1
+
+
 # A face's kernel is built once, under the revisions oMLX runs then: these
 # keys are for the test that patches them.
 def _revision(contract) -> Dot:

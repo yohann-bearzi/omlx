@@ -15,6 +15,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx.patches import qwen35_verify_qmm, row_exact_qmv
+from tests.test_formats_affine import MLX_MASKS, MLX_SCALES, mlx_branches, uncalled
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -61,7 +62,21 @@ SHAPES = [
     (2560, 1024, 5, 32),
     (768, 1024, 8, 64),
     (1280, 1024, 6, 64),
+    (640, 1024, 4, 64),  # qmv's last block at 4 and 5 bits
+    (640, 1024, 5, 32),
 ]
+
+
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_a_tile_s_source_holds_its_own_bit_width_alone(bits, fast):
+    """MLX hashes a kernel's whole source at every launch: a tile holds the
+    branch of MLX's code for its width and the functions it calls. Only a
+    qmv tile has qmv_impl's last block (qmv_fast's K is whole blocks)."""
+    metal = row_exact_qmv._header(bits, 64, fast) + row_exact_qmv._SOURCE
+    assert mlx_branches(metal) == (MLX_MASKS[bits], MLX_SCALES[bits])
+    assert uncalled(metal) == []
+    assert ("load_vector_safe" in metal) == ("qdot_n" in metal) == (not fast)
 
 
 @pytest.mark.parametrize("shape", SHAPES)

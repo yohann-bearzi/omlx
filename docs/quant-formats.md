@@ -246,7 +246,7 @@ struct Dot {
 
 | Member of `Lanes<K>` | Role |
 |---|---|
-| `static constant constexpr int VPT` | Inputs a lane reads per block. K is a multiple of it. |
+| `static constant constexpr int VPT` | Inputs a lane reads per block: one or more. K is a multiple of it. |
 | `static constant constexpr int BLOCK` | Inputs the simdgroup covers per block: `32 * VPT`. |
 | `Lanes(Dot m, size_t row, uint lane)` | Lane `lane` at the first block of row `row`. |
 | `struct Row` and `Row row(int r) const` | What `madd` needs of the current block of row `row + r`: pointers, the group's scale. |
@@ -275,7 +275,7 @@ K need not be a multiple of `BLOCK`. Where it is not, the last block is partial:
 
 Rules:
 
-- `BLOCK == 32 * VPT`, and K is a multiple of `VPT`. A kernel asserts both when it is compiled, so a format's `dot()` returns `None` for a K that is not.
+- `VPT` is one or more, `BLOCK == 32 * VPT`, and K is a multiple of `VPT`. A kernel asserts the three when it is compiled, so a format's `dot()` returns `None` for a K that is not.
 - A row's result is a function of the row and the input only: not of the kernel, of the rows computed with it or of its place in a launch. MLX compiles kernels with fast math off, so the float operations run as written; keep `madd` and `finish` pure and every kernel computes the same bits for a row. oMLX relies on it wherever a fused kernel and another path must agree on a token.
 - A face never writes the matrix: its members store to nothing but the cursor's own state and `xt`.
 - A face is safe over tensors and activations of any value, zeros included, on which a kernel proves its Metal: every address a member forms stays inside the arrays it was given (an index read from a tensor, such as a code that picks an entry of a level table, is masked to the size of what it indexes), and no loop bound or exit depends on a value that it reads.
@@ -440,7 +440,7 @@ each of a simdgroup's 32 lanes"
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:100:5: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:104:7: error: static_assert failed due to requirement
 '60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 

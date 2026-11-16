@@ -15,6 +15,7 @@ import pytest
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
 from omlx.formats import affine, kernels
+from tests.test_formats_affine import uncalled
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -243,6 +244,40 @@ def test_qmv_gate_up_is_bit_identical(
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert _engaged()
+
+
+def test_a_launch_holds_the_swiglu_only_where_it_applies_it(monkeypatch):
+    """MLX hashes a kernel's whole source at every launch: the down launches,
+    which apply no SwiGLU, do not carry its function, and no launch carries
+    a function it does not call."""
+    built = {}
+
+    def build(**kernel):
+        built[kernel["name"]] = kernel["header"] + kernel["source"]
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", build)
+    face = partial(affine.face, dtype=mx.bfloat16)
+    gate_up, down, shared, gate = (
+        face(4, 64, True),
+        face(4, 64, False),
+        face(8, 128, True),
+        face(8, 64, True),
+    )
+    for kernel, faces in (
+        (routed._gate_up_kernel, (gate_up, None, None)),
+        (routed._gate_up_kernel, (gate_up, shared, gate)),
+        (routed._gate_up_window_kernel, (gate_up, shared, gate)),
+        (routed._gate_up_topk_kernel, (gate_up, None, None)),
+        (routed._gate_up_topk_kernel, (gate_up, shared, gate)),
+        (routed._down_kernel, (down, None)),
+        (routed._down_kernel, (down, shared)),
+        (routed._down_window_kernel, (down, shared)),
+    ):
+        kernel.__wrapped__(*faces)
+    assert len(built) == 8
+    for name, metal in built.items():
+        assert ("swiglu_store" in metal) == ("_gate_up_" in name), name
+        assert uncalled(metal) == [], name
 
 
 @pytest.mark.parametrize("hidden", [2560, 2432])

@@ -139,7 +139,11 @@ inline U omlx_mlx_sigmoid(U x) {
   auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
   return (x < 0) ? y : 1 - y;
 }
+"""
 
+# The gate+up launches' epilogue. The down launches do not carry it: MLX
+# hashes a kernel's whole source at every launch.
+_SWIGLU = r"""
 // swiglu(gate, up) of the compiled mlx-vlm activation: both rounded to T,
 // silu(gate) = gate * sigmoid(gate), then times up, each op in T.
 template <typename T, int RPS>
@@ -377,7 +381,7 @@ def _gate_up_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
         name=name,
         input_names=inputs,
         output_names=["y"],
-        header=_COMMON + matrices.header,
+        header=_COMMON + _SWIGLU + matrices.header,
         source=matrices.declarations + source + _GATE_UP_ROUTED,
     )
 
@@ -428,7 +432,7 @@ def _gate_up_window_kernel(routed: Dot, shared: Dot, gate: Dot):
         ),
         input_names=inputs,
         output_names=["y"],
-        header=_COMMON + matrices.header,
+        header=_COMMON + _SWIGLU + matrices.header,
         source=(
             matrices.declarations
             + _GATE_UP_WINDOW_HEAD
@@ -485,7 +489,7 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
         name=name,
         input_names=inputs,
         output_names=["y", "indices", "scores"],
-        header=_COMMON + TOPK_HEADER + matrices.header,
+        header=_COMMON + _SWIGLU + TOPK_HEADER + matrices.header,
         source=matrices.declarations + source + _GATE_UP_TOPK_ROUTED + "    }\n",
     )
 

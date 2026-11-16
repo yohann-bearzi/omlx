@@ -23,7 +23,9 @@ from . import Dot, QuantFormat
 _BITS = (4, 5, 6, 8)
 _GROUP_SIZES = (32, 64, 128)
 
-_HEADER = r"""
+# MLX 0.32.4 quantized.h's constants for a bit width, group size and
+# traversal (qmv_fast's, FAST, or qmv's).
+_CONSTANTS = r"""
 using namespace metal;
 
 constant constexpr int SIMD_SIZE = 32;
@@ -38,150 +40,124 @@ constant constexpr int PACKS_PER_THREAD = FAST ? 2 : 1;
 constant constexpr int VALUES_PER_THREAD = PACK_FACTOR * PACKS_PER_THREAD;
 constant constexpr int BLOCK_SIZE = VALUES_PER_THREAD * SIMD_SIZE;
 constant constexpr int SCALE_STEP_PER_THREAD = GS / VALUES_PER_THREAD;
+"""
 
+# The branch of each bit width in MLX's load_vector and qdot, over the first
+# __N__ of a lane's values: all VALUES_PER_THREAD of them, or N in qmv_impl's
+# last block (load_vector_safe, qdot_safe). A kernel's source holds its own
+# width's branch alone: MLX hashes the whole source at every launch.
+_LOAD = {
+    4: r"""  for (int i = 0; i < __N__; i += 4) {
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 16.0f;
+    x_thread[i + 2] = x[i + 2] / 256.0f;
+    x_thread[i + 3] = x[i + 3] / 4096.0f;
+  }""",
+    5: r"""  for (int i = 0; i < __N__; i += 8) {
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
+        float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 32.0f;
+    x_thread[i + 2] = x[i + 2] / 4.0f;
+    x_thread[i + 3] = x[i + 3] / 128.0f;
+    x_thread[i + 4] = x[i + 4] / 16.0f;
+    x_thread[i + 5] = x[i + 5] / 2.0f;
+    x_thread[i + 6] = x[i + 6] / 64.0f;
+    x_thread[i + 7] = x[i + 7] / 8.0f;
+  }""",
+    6: r"""  for (int i = 0; i < __N__; i += 4) {
+    sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
+    x_thread[i] = x[i];
+    x_thread[i + 1] = x[i + 1] / 64.0f;
+    x_thread[i + 2] = x[i + 2] / 16.0f;
+    x_thread[i + 3] = x[i + 3] / 4.0f;
+  }""",
+    8: r"""  for (int i = 0; i < __N__; i++) {
+    sum += x[i];
+    x_thread[i] = x[i];
+  }""",
+}
+
+_QDOT = {
+    4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < (__N__ / 4); i++) {
+    accum +=
+        (x_thread[4 * i] * (ws[i] & 0x000f) +
+         x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
+         x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
+         x_thread[4 * i + 3] * (ws[i] & 0xf000));
+  }""",
+    5: r"""  for (int i = 0; i < (__N__ / 8); i++) {
+    x_thread += 8 * i;
+    w += 5 * i;
+
+    accum += (w[0] & 0x1f) * x_thread[0];
+    accum += (w[0] & 0xe0) * x_thread[1];
+    accum += (w[1] & 0x3) * (x_thread[1] * 256.0f);
+    accum += (w[1] & 0x7c) * x_thread[2];
+    accum += (w[1] & 0x80) * x_thread[3];
+    accum += (w[2] & 0xf) * (x_thread[3] * 256.0f);
+    accum += (w[2] & 0xf0) * x_thread[4];
+    accum += (w[3] & 0x1) * (x_thread[4] * 256.0f);
+    accum += (w[3] & 0x3e) * x_thread[5];
+    accum += (w[3] & 0xc0) * x_thread[6];
+    accum += (w[4] & 0x7) * (x_thread[6] * 256.0f);
+    accum += (w[4] & 0xf8) * x_thread[7];
+  }""",
+    6: r"""  for (int i = 0; i < (__N__ / 4); i++) {
+    x_thread += 4 * i;
+    w += 3 * i;
+
+    accum += (w[0] & 0x3f) * x_thread[0];
+
+    accum += (w[0] & 0xc0) * x_thread[1];
+    accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
+
+    accum += (w[1] & 0xf0) * x_thread[2];
+    accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
+
+    accum += (w[2] & 0xfc) * x_thread[3];
+  }""",
+    8: r"""  for (int i = 0; i < __N__; i++) {
+    accum += x_thread[i] * w[i];
+  }""",
+}
+
+_LOAD_FUNCTION = r"""
 template <typename T>
 inline float load_vector(const device T* x, thread float* x_thread) {
   float sum = 0;
-  if (BITS == 4) {
-    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
-    }
-  } else if (BITS == 5) {
-    for (int i = 0; i < VALUES_PER_THREAD; i += 8) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
-          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 32.0f;
-      x_thread[i + 2] = x[i + 2] / 4.0f;
-      x_thread[i + 3] = x[i + 3] / 128.0f;
-      x_thread[i + 4] = x[i + 4] / 16.0f;
-      x_thread[i + 5] = x[i + 5] / 2.0f;
-      x_thread[i + 6] = x[i + 6] / 64.0f;
-      x_thread[i + 7] = x[i + 7] / 8.0f;
-    }
-  } else if (BITS == 6) {
-    for (int i = 0; i < VALUES_PER_THREAD; i += 4) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 64.0f;
-      x_thread[i + 2] = x[i + 2] / 16.0f;
-      x_thread[i + 3] = x[i + 3] / 4.0f;
-    }
-  } else if (BITS == 8) {
-    for (int i = 0; i < VALUES_PER_THREAD; i++) {
-      sum += x[i];
-      x_thread[i] = x[i];
-    }
-  }
+__LOAD__
   return sum;
 }
+"""
 
-template <typename T>
-inline float load_vector_safe(const device T* x, thread float* x_thread, int N) {
-  float sum = 0;
-  if (BITS == 4) {
-    for (int i = 0; i < N; i += 4) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 16.0f;
-      x_thread[i + 2] = x[i + 2] / 256.0f;
-      x_thread[i + 3] = x[i + 3] / 4096.0f;
-    }
-  } else if (BITS == 5) {
-    for (int i = 0; i < N; i += 8) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]) +
-          float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 32.0f;
-      x_thread[i + 2] = x[i + 2] / 4.0f;
-      x_thread[i + 3] = x[i + 3] / 128.0f;
-      x_thread[i + 4] = x[i + 4] / 16.0f;
-      x_thread[i + 5] = x[i + 5] / 2.0f;
-      x_thread[i + 6] = x[i + 6] / 64.0f;
-      x_thread[i + 7] = x[i + 7] / 8.0f;
-    }
-  } else if (BITS == 6) {
-    for (int i = 0; i < N; i += 4) {
-      sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-      x_thread[i] = x[i];
-      x_thread[i + 1] = x[i + 1] / 64.0f;
-      x_thread[i + 2] = x[i + 2] / 16.0f;
-      x_thread[i + 3] = x[i + 3] / 4.0f;
-    }
-  } else if (BITS == 8) {
-    for (int i = 0; i < N; i++) {
-      sum += x[i];
-      x_thread[i] = x[i];
-    }
-  }
-  for (int i = N; i < VALUES_PER_THREAD; i++) {
-    x_thread[i] = 0;
-  }
-  return sum;
-}
-
-inline float qdot_n(
+_QDOT_FUNCTION = r"""
+inline float qdot(
     const device uint8_t* w,
     const thread float* x_thread,
     float scale,
     float bias,
-    float sum,
-    int N) {
+    float sum) {
   float accum = 0;
-  if (BITS == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < (N / 4); i++) {
-      accum +=
-          (x_thread[4 * i] * (ws[i] & 0x000f) +
-           x_thread[4 * i + 1] * (ws[i] & 0x00f0) +
-           x_thread[4 * i + 2] * (ws[i] & 0x0f00) +
-           x_thread[4 * i + 3] * (ws[i] & 0xf000));
-    }
-  } else if (BITS == 5) {
-    for (int i = 0; i < (N / 8); i++) {
-      x_thread += 8 * i;
-      w += 5 * i;
-
-      accum += (w[0] & 0x1f) * x_thread[0];
-      accum += (w[0] & 0xe0) * x_thread[1];
-      accum += (w[1] & 0x3) * (x_thread[1] * 256.0f);
-      accum += (w[1] & 0x7c) * x_thread[2];
-      accum += (w[1] & 0x80) * x_thread[3];
-      accum += (w[2] & 0xf) * (x_thread[3] * 256.0f);
-      accum += (w[2] & 0xf0) * x_thread[4];
-      accum += (w[3] & 0x1) * (x_thread[4] * 256.0f);
-      accum += (w[3] & 0x3e) * x_thread[5];
-      accum += (w[3] & 0xc0) * x_thread[6];
-      accum += (w[4] & 0x7) * (x_thread[6] * 256.0f);
-      accum += (w[4] & 0xf8) * x_thread[7];
-    }
-  } else if (BITS == 6) {
-    for (int i = 0; i < (N / 4); i++) {
-      x_thread += 4 * i;
-      w += 3 * i;
-
-      accum += (w[0] & 0x3f) * x_thread[0];
-
-      accum += (w[0] & 0xc0) * x_thread[1];
-      accum += (w[1] & 0x0f) * (x_thread[1] * 256.0f);
-
-      accum += (w[1] & 0xf0) * x_thread[2];
-      accum += (w[2] & 0x03) * (x_thread[2] * 256.0f);
-
-      accum += (w[2] & 0xfc) * x_thread[3];
-    }
-  } else if (BITS == 8) {
-    for (int i = 0; i < N; i++) {
-      accum += x_thread[i] * w[i];
-    }
-  }
+__QDOT__
   return scale * accum + sum * bias;
 }
 """
+
+
+def header(bits: int, group_size: int, fast: bool) -> str:
+    """MLX's constants and ``load_vector`` for ``bits``-bit weights in groups
+    of ``group_size`` on the ``qmv_fast`` (``fast``) or ``qmv`` traversal:
+    the start of a kernel's source over MLX's affine layout."""
+    return (
+        (_CONSTANTS + _LOAD_FUNCTION.replace("__LOAD__", _LOAD[bits]))
+        .replace("__N__", "VALUES_PER_THREAD")
+        .replace("__BITS__", str(bits))
+        .replace("__GS__", str(group_size))
+        .replace("__FAST__", "1" if fast else "0")
+    )
 
 
 def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> bool:
@@ -249,7 +225,7 @@ struct Dot {
     }
 
     static float madd(float acc, Row r, const thread float* x_thread, float sum) {
-      return acc + qdot_n(r.w, x_thread, r.s, r.b, sum, VALUES_PER_THREAD);
+      return acc + qdot(r.w, x_thread, r.s, r.b, sum);
     }
 
     float finish(int, float sum) const { return sum; }
@@ -263,21 +239,21 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
     """The dot face of ``bits``-bit weights with ``group_size`` groups, as
     MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal."""
     if bits not in _BITS or group_size not in _GROUP_SIZES:
-        # MLX does not quantize to another group size. For another bit width
-        # the transcription compiles, and computes zeros.
+        # MLX does not quantize to another group size, and the transcription
+        # has no other bit width.
         raise ValueError(
             f"affine face: no MLX transcription of {bits} bits in groups of "
             f"{group_size}"
         )
     key = f"affine_b{bits}g{group_size}{'f' if fast else 's'}"
-    header = (
-        _HEADER.replace("__BITS__", str(bits))
-        .replace("__GS__", str(group_size))
-        .replace("__FAST__", "1" if fast else "0")
-    )
+    qdot = _QDOT_FUNCTION.replace("__QDOT__", _QDOT[bits])
+    source = header(bits, group_size, fast) + qdot.replace("__N__", "VALUES_PER_THREAD")
     return Dot(
         key=key,
-        source=f"namespace omlx_{key} {{\n{header}\n{_DOT}\n}}  // namespace omlx_{key}\n",
+        source=(
+            f"namespace omlx_{key} {{\n{source}\n{_DOT}\n}}"
+            f"  // namespace omlx_{key}\n"
+        ),
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
         dtypes=(dtype,),

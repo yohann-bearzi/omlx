@@ -29,7 +29,7 @@ from functools import cache
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..formats.affine import _BITS, _GROUP_SIZES, _HEADER, qmv_fast_layout
+from ..formats.affine import _BITS, _GROUP_SIZES, _LOAD, _QDOT, header, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,9 @@ _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 # past N (qmv's partial last tile) are skipped: each column's arithmetic does
 # not depend on which tile computes it. ``ROW_EXACT_UNROLL`` precedes every
 # row and column loop: empty, or a full unroll in the ``unrolled`` kernels
-# (unrolling repeats each accumulator's steps in the same order).
+# (unrolling repeats each accumulator's steps in the same order). qmv_impl's
+# last block (``_LAST_BLOCK``) is in a qmv tile alone: qmv_fast's K is whole
+# blocks.
 _TILE = r"""
 // Tiny scale/bias arrays (N < 8) arrive in the constant address space, so
 // their pointer type is a template parameter.
@@ -118,28 +120,7 @@ METAL_FUNC void row_exact_tile(
     bs += BLOCK_SIZE / GS;
     xp += BLOCK_SIZE;
   }
-  if (!FAST) {
-    const int remaining = clamp(
-        int(K_SIZE - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
-    if (remaining > 0) {
-      ROW_EXACT_UNROLL
-      for (int i = 0; i < ROWS; i++) {
-        float x_thread[VALUES_PER_THREAD];
-        float sum = load_vector_safe<T>(xp + i * K_SIZE, x_thread, remaining);
-        ROW_EXACT_UNROLL
-        for (int r = 0; r < RPS; r++) {
-          if (PARTIAL && r >= valid) {
-            break;
-          }
-          const device uint8_t* wl = ws + r * in_vec_size_w;
-          float s = sc[r * in_vec_size_g];
-          float b = bs[r * in_vec_size_g];
-          result[i][r] += qdot_n(wl, x_thread, s, b, sum, remaining);
-        }
-      }
-    }
-  }
-
+__LAST_BLOCK__
   ROW_EXACT_UNROLL
   for (int i = 0; i < ROWS; i++) {
     ROW_EXACT_UNROLL
@@ -153,6 +134,55 @@ METAL_FUNC void row_exact_tile(
       }
     }
   }
+}
+"""
+
+_LAST_BLOCK = r"""
+  const int remaining = clamp(
+      int(K_SIZE - k - int(simd_lid) * VALUES_PER_THREAD), 0, VALUES_PER_THREAD);
+  if (remaining > 0) {
+    ROW_EXACT_UNROLL
+    for (int i = 0; i < ROWS; i++) {
+      float x_thread[VALUES_PER_THREAD];
+      float sum = load_vector_safe<T>(xp + i * K_SIZE, x_thread, remaining);
+      ROW_EXACT_UNROLL
+      for (int r = 0; r < RPS; r++) {
+        if (PARTIAL && r >= valid) {
+          break;
+        }
+        const device uint8_t* wl = ws + r * in_vec_size_w;
+        float s = sc[r * in_vec_size_g];
+        float b = bs[r * in_vec_size_g];
+        result[i][r] += qdot_n(wl, x_thread, s, b, sum, remaining);
+      }
+    }
+  }
+"""
+
+# MLX's load_vector_safe and qdot_safe (qdot_n here), which qmv_impl's last
+# block reads: the branch of the tile's width in load_vector and qdot, over
+# the first N of a lane's values.
+_LOAD_SAFE = r"""
+template <typename T>
+inline float load_vector_safe(const device T* x, thread float* x_thread, int N) {
+  float sum = 0;
+__LOAD__
+  for (int i = N; i < VALUES_PER_THREAD; i++) {
+    x_thread[i] = 0;
+  }
+  return sum;
+}
+
+inline float qdot_n(
+    const device uint8_t* w,
+    const thread float* x_thread,
+    float scale,
+    float bias,
+    float sum,
+    int N) {
+  float accum = 0;
+__QDOT__
+  return scale * accum + sum * bias;
 }
 """
 
@@ -193,99 +223,98 @@ def _group_source(count: int) -> str:
 # once per K block and output column, then every row accumulates them against
 # its own inputs. Each term and each accumulation step is qdot's, in qdot's
 # order (the 5/6-bit runs cover at most two packs, so qdot's cumulative
-# pointer steps are the 8i/5i and 4i/3i offsets used here).
+# pointer steps are the 8i/5i and 4i/3i offsets used here). A tile holds the
+# branch of its own width.
 _DECODED_DOT = r"""
 constant constexpr int W_TERMS = (BITS == 5) ? 12 * VALUES_PER_THREAD / 8
     : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD);
 
 inline void decode_w(const device uint8_t* w, thread float* wq) {
-  if (BITS == 4) {
-    const device uint16_t* ws = (const device uint16_t*)w;
-    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-      wq[4 * i] = ws[i] & 0x000f;
-      wq[4 * i + 1] = ws[i] & 0x00f0;
-      wq[4 * i + 2] = ws[i] & 0x0f00;
-      wq[4 * i + 3] = ws[i] & 0xf000;
-    }
-  } else if (BITS == 5) {
-    for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
-      const device uint8_t* wb = w + 5 * i;
-      thread float* wv = wq + 12 * i;
-      wv[0] = wb[0] & 0x1f;
-      wv[1] = wb[0] & 0xe0;
-      wv[2] = wb[1] & 0x3;
-      wv[3] = wb[1] & 0x7c;
-      wv[4] = wb[1] & 0x80;
-      wv[5] = wb[2] & 0xf;
-      wv[6] = wb[2] & 0xf0;
-      wv[7] = wb[3] & 0x1;
-      wv[8] = wb[3] & 0x3e;
-      wv[9] = wb[3] & 0xc0;
-      wv[10] = wb[4] & 0x7;
-      wv[11] = wb[4] & 0xf8;
-    }
-  } else if (BITS == 6) {
-    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-      const device uint8_t* wb = w + 3 * i;
-      thread float* wv = wq + 6 * i;
-      wv[0] = wb[0] & 0x3f;
-      wv[1] = wb[0] & 0xc0;
-      wv[2] = wb[1] & 0x0f;
-      wv[3] = wb[1] & 0xf0;
-      wv[4] = wb[2] & 0x03;
-      wv[5] = wb[2] & 0xfc;
-    }
-  } else if (BITS == 8) {
-    for (int i = 0; i < VALUES_PER_THREAD; i++) {
-      wq[i] = w[i];
-    }
-  }
+__DECODE__
 }
 
 inline float wdot(const thread float* wq, const thread float* x) {
   float accum = 0;
-  if (BITS == 4) {
-    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-      accum +=
-          (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
-           x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
-    }
-  } else if (BITS == 5) {
-    for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
-      const thread float* xv = x + 8 * i;
-      const thread float* wv = wq + 12 * i;
-      accum += wv[0] * xv[0];
-      accum += wv[1] * xv[1];
-      accum += wv[2] * (xv[1] * 256.0f);
-      accum += wv[3] * xv[2];
-      accum += wv[4] * xv[3];
-      accum += wv[5] * (xv[3] * 256.0f);
-      accum += wv[6] * xv[4];
-      accum += wv[7] * (xv[4] * 256.0f);
-      accum += wv[8] * xv[5];
-      accum += wv[9] * xv[6];
-      accum += wv[10] * (xv[6] * 256.0f);
-      accum += wv[11] * xv[7];
-    }
-  } else if (BITS == 6) {
-    for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-      const thread float* xv = x + 4 * i;
-      const thread float* wv = wq + 6 * i;
-      accum += wv[0] * xv[0];
-      accum += wv[1] * xv[1];
-      accum += wv[2] * (xv[1] * 256.0f);
-      accum += wv[3] * xv[2];
-      accum += wv[4] * (xv[2] * 256.0f);
-      accum += wv[5] * xv[3];
-    }
-  } else if (BITS == 8) {
-    for (int i = 0; i < VALUES_PER_THREAD; i++) {
-      accum += x[i] * wq[i];
-    }
-  }
+__WDOT__
   return accum;
 }
 """
+
+_DECODE = {
+    4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    wq[4 * i] = ws[i] & 0x000f;
+    wq[4 * i + 1] = ws[i] & 0x00f0;
+    wq[4 * i + 2] = ws[i] & 0x0f00;
+    wq[4 * i + 3] = ws[i] & 0xf000;
+  }""",
+    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const device uint8_t* wb = w + 5 * i;
+    thread float* wv = wq + 12 * i;
+    wv[0] = wb[0] & 0x1f;
+    wv[1] = wb[0] & 0xe0;
+    wv[2] = wb[1] & 0x3;
+    wv[3] = wb[1] & 0x7c;
+    wv[4] = wb[1] & 0x80;
+    wv[5] = wb[2] & 0xf;
+    wv[6] = wb[2] & 0xf0;
+    wv[7] = wb[3] & 0x1;
+    wv[8] = wb[3] & 0x3e;
+    wv[9] = wb[3] & 0xc0;
+    wv[10] = wb[4] & 0x7;
+    wv[11] = wb[4] & 0xf8;
+  }""",
+    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    const device uint8_t* wb = w + 3 * i;
+    thread float* wv = wq + 6 * i;
+    wv[0] = wb[0] & 0x3f;
+    wv[1] = wb[0] & 0xc0;
+    wv[2] = wb[1] & 0x0f;
+    wv[3] = wb[1] & 0xf0;
+    wv[4] = wb[2] & 0x03;
+    wv[5] = wb[2] & 0xfc;
+  }""",
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
+    wq[i] = w[i];
+  }""",
+}
+
+_WDOT = {
+    4: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    accum +=
+        (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
+         x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
+  }""",
+    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const thread float* xv = x + 8 * i;
+    const thread float* wv = wq + 12 * i;
+    accum += wv[0] * xv[0];
+    accum += wv[1] * xv[1];
+    accum += wv[2] * (xv[1] * 256.0f);
+    accum += wv[3] * xv[2];
+    accum += wv[4] * xv[3];
+    accum += wv[5] * (xv[3] * 256.0f);
+    accum += wv[6] * xv[4];
+    accum += wv[7] * (xv[4] * 256.0f);
+    accum += wv[8] * xv[5];
+    accum += wv[9] * xv[6];
+    accum += wv[10] * (xv[6] * 256.0f);
+    accum += wv[11] * xv[7];
+  }""",
+    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    const thread float* xv = x + 4 * i;
+    const thread float* wv = wq + 6 * i;
+    accum += wv[0] * xv[0];
+    accum += wv[1] * xv[1];
+    accum += wv[2] * (xv[1] * 256.0f);
+    accum += wv[3] * xv[2];
+    accum += wv[4] * (xv[2] * 256.0f);
+    accum += wv[5] * xv[3];
+  }""",
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
+    accum += x[i] * wq[i];
+  }""",
+}
 
 
 # Fully unrolled tiles hold every (row, column) accumulator and every row's
@@ -350,13 +379,17 @@ def unrolled_tile_verified(shape: tuple, run, weights: list, bits: int, group_si
 
 
 def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> str:
+    """The tile's source for one bit width: MLX's code for that width, and
+    qmv_impl's last block in a qmv tile alone."""
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
+    last = "" if fast else _LOAD_SAFE.replace("__LOAD__", _LOAD[bits])
+    decoded = _DECODED_DOT.replace("__DECODE__", _DECODE[bits])
     return (
         f"#define ROW_EXACT_UNROLL {unroll}\n"
-        + (_HEADER + _DECODED_DOT + _TILE)
-        .replace("__BITS__", str(bits))
-        .replace("__GS__", str(group_size))
-        .replace("__FAST__", "1" if fast else "0")
+        + header(bits, group_size, fast)
+        + last.replace("__QDOT__", _QDOT[bits]).replace("__N__", "N")
+        + decoded.replace("__WDOT__", _WDOT[bits])
+        + _TILE.replace("__LAST_BLOCK__", "" if fast else _LAST_BLOCK)
     )
 
 

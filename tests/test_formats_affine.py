@@ -64,6 +64,38 @@ def _mlx_rows(layer, x, expert=None):
     )[0, 0]
 
 
+# MLX 0.32.4 quantized.h, by bit width: the masks of qdot's branch and the
+# powers of two that the branches of load_vector and qdot scale by.
+MLX_MASKS = {
+    4: {"0x000f", "0x00f0", "0x0f00", "0xf000"},
+    5: {"0x1", "0x3", "0x7", "0xf", "0x1f", "0x3e", "0x7c", "0x80", "0xc0", "0xe0"}
+    | {"0xf0", "0xf8"},
+    6: {"0x03", "0x0f", "0x3f", "0xc0", "0xf0", "0xfc"},
+    8: set(),
+}
+MLX_SCALES = {
+    4: {"16.0f", "256.0f", "4096.0f"},
+    5: {"2.0f", "4.0f", "8.0f", "16.0f", "32.0f", "64.0f", "128.0f", "256.0f"},
+    6: {"4.0f", "16.0f", "64.0f", "256.0f"},
+    8: set(),
+}
+
+
+def mlx_branches(metal: str) -> tuple[set, set]:
+    """The masks and the scales of MLX's per-width branches that ``metal``
+    holds."""
+    masks = set(re.findall(r"\b0x[0-9a-f]+\b", metal))
+    return masks, set(re.findall(r"\b\d+\.0f\b", metal))
+
+
+def uncalled(metal: str) -> list[str]:
+    """The free functions ``metal`` defines and names nowhere else (a face's
+    members are the skeletons' to call)."""
+    code = re.sub(r"//[^\n]*", "", metal)
+    defined = re.findall(r"^(?:inline|METAL_FUNC) [\w:<>]+ (\w+)\(", code, re.M)
+    return [name for name in defined if len(re.findall(rf"\b{name}\b", code)) < 2]
+
+
 def test_affine_ships_as_a_builtin_plugin():
     assert "omlx.formats.affine:FORMAT" in formats.BUILTIN
     assert formats.get("affine") is affine.FORMAT
@@ -117,6 +149,18 @@ def test_each_layout_is_one_face():
         for fast in (True, False)
     }
     assert len(keys) == 24
+
+
+@pytest.mark.parametrize("fast", [True, False])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_a_face_s_source_holds_its_own_bit_width_alone(bits, fast):
+    """MLX hashes a kernel's whole source at every launch: a face holds the
+    branch of MLX's code for its width and the functions its kernels call."""
+    source = affine.face(bits, 64, fast, mx.bfloat16).source
+    assert mlx_branches(source) == (MLX_MASKS[bits], MLX_SCALES[bits])
+    # load_vector and qdot walk the lane's values once each.
+    assert source.count("for (") == 2
+    assert uncalled(source) == []
 
 
 @pytest.mark.parametrize(
