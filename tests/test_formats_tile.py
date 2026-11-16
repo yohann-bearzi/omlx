@@ -137,8 +137,12 @@ def test_a_tile_is_a_face_of_its_own_kind():
         ({"key": "toy-tile"}, "is not an identifier"),
         ({"tensors": ("row scales",)}, "is not an identifier"),
         ({"tensors": ["row_scales"]}, "tensors and dtypes are tuples"),
-        ({"tensors": ("row_scales", "row_scales")}, "beside 'weight', each named"),
-        ({"tensors": ("weight",)}, "beside 'weight', each named once"),
+        (
+            {"tensors": ("row_scales", "row_scales")},
+            "beside 'weight' and 'bias', each named",
+        ),
+        ({"tensors": ("weight",)}, "beside 'weight' and 'bias', each named once"),
+        ({"tensors": ("bias",)}, "beside 'weight' and 'bias', each named once"),
         ({"dtypes": (mx.float16, mx.float16)}, "dtypes are distinct mx.Dtype"),
     ],
 )

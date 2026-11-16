@@ -112,6 +112,13 @@ def test_a_mode_has_one_format(plugins):
         ("toy", ["scales"]),
         ("toy", ("weight", "scales")),
         ("toy", ("scales", "bias")),
+        # What a face would refuse: kernels splice them into Metal.
+        ("toy", ("scales", "scales")),
+        ("toy", ("row-scales",)),
+        ("toy", ("",)),
+        ("toy", ("scales.sub",)),
+        ("toy", (7,)),
+        ("toy", ([],)),
     ],
 )
 def test_register_refuses_a_malformed_format(plugins, mode, tensors):
@@ -129,7 +136,7 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
     class ModeOnly(formats.QuantFormat):
         mode = "toy"
 
-    with pytest.raises(ValueError, match="'toy': tensors must be a tuple"):
+    with pytest.raises(ValueError, match="'toy': tensors are a tuple, not None"):
         formats.register(ModeOnly())
 
     class NoRevision(ModeOnly):
@@ -144,7 +151,7 @@ def test_a_malformed_format_is_refused_before_anything_loads(plugins):
     plugins.append(_Entry("toy", _Format()))
     with pytest.raises(ValueError, match="has no mode"):
         formats.register(formats.QuantFormat())
-    with pytest.raises(ValueError, match="tensors must be a tuple"):
+    with pytest.raises(ValueError, match="tensors are a tuple"):
         formats.register(_Format(tensors=["scales"]))
     with pytest.raises(ValueError, match="contract is the revision"):
         formats.register(_Format(contract=None))
@@ -285,8 +292,9 @@ def test_plugins_load_once_from_their_entry_points(plugins):
 
 def test_a_loaded_plugin_is_logged_with_its_distribution(plugins, monkeypatch, caplog):
     def two():
-        formats.register(_Format("also"))
-        return _Format("second")
+        # The modes are listed by name, not as they registered.
+        formats.register(_Format("second"))
+        return _Format("also")
 
     installed = _Entry("toy", _Format())
     installed.dist = SimpleNamespace(name="omlx-toy", version="0.3.1")
@@ -578,10 +586,16 @@ def _layer_with_a_child_named_scales():
             "ValueError('face toy_b4: weight, scales of fewer than 8 elements, which "
             "MLX binds as constants, not as the buffer a face reads')",
         ),
+        # A face reads its format's tensors, which a load gives the layer.
         (
             _TwoTensors(),
             _layer(),
-            "ValueError('face toy_b4: the layer has no array biases')",
+            "ValueError('face toy_b4: biases is no tensor of quant format toy')",
+        ),
+        (
+            _TwoTensors(),
+            _layer(tensors=("weight", "scales", "biases")),
+            "ValueError('face toy_b4: biases is no tensor of quant format toy')",
         ),
     ],
 )
@@ -748,6 +762,11 @@ class _TileOfTwoTensors(_Format):
         return replace(_tile(), tensors=("scales", "biases"))
 
 
+class _TileOfTheFormatsTwoTensors(_TileOfTwoTensors):
+    def __init__(self):
+        super().__init__(tensors=("scales", "biases"))
+
+
 @pytest.mark.parametrize(
     "fmt, layer, defect",
     [
@@ -770,6 +789,11 @@ class _TileOfTwoTensors(_Format):
         ),
         (
             _TileOfTwoTensors(),
+            _layer(),
+            "ValueError('face toy_tile_b4: biases is no tensor of quant format toy')",
+        ),
+        (
+            _TileOfTheFormatsTwoTensors(),
             _layer(),
             "ValueError('face toy_tile_b4: the layer has no array biases')",
         ),
@@ -889,9 +913,15 @@ def test_a_face_names_metal_identifiers(names):
         ({"tensors": "scales"}, "tensors and dtypes are tuples"),
         ({"tensors": ["scales"]}, "tensors and dtypes are tuples"),
         ({"dtypes": mx.float16}, "tensors and dtypes are tuples"),
-        ({"tensors": ("scales", "scales")}, "beside 'weight', each named once"),
-        ({"tensors": ("weight",)}, "beside 'weight', each named once"),
-        ({"tensors": ("scales", "weight")}, "beside 'weight', each named once"),
+        ({"tensors": ("scales", "scales")}, "beside 'weight' and 'bias', each named"),
+        ({"tensors": ("weight",)}, "beside 'weight' and 'bias', each named once"),
+        ({"tensors": ("scales", "weight")}, "beside 'weight' and 'bias', each named"),
+        # A linear adds its bias itself.
+        ({"tensors": ("scales", "bias")}, "beside 'weight' and 'bias', each named"),
+        # A kernel is built for float activations alone.
+        ({"dtypes": (mx.int32,)}, "activations are float16, bfloat16 or float32"),
+        ({"dtypes": (mx.float16, mx.uint8)}, "activations are float16, bfloat16"),
+        ({"dtypes": (mx.float64,)}, "activations are float16, bfloat16 or float32"),
         ({"dtypes": (None,)}, "dtypes are distinct mx.Dtype"),
         ({"dtypes": ("float16",)}, "dtypes are distinct mx.Dtype"),
         ({"dtypes": (mx.float16, [])}, "dtypes are distinct mx.Dtype"),
@@ -903,8 +933,13 @@ def test_a_face_lists_its_tensors_and_dtypes_in_tuples(fields, message):
         replace(_FACE, **fields)
 
 
-def test_a_face_is_exact_for_its_dtypes_or_for_any():
+def test_a_face_is_exact_for_its_dtypes_or_for_the_floats():
     assert _FACE.exact_for(mx.float16) and _FACE.exact_for(mx.bfloat16)
+    assert _FACE.exact_for(mx.float32)
+    assert (mx.float16, mx.bfloat16, mx.float32) == formats.FLOATS
+    # A kernel computes in floats: integers would be truncated in its store.
+    for dtype in (mx.int32, mx.uint8, mx.bool_, mx.float64):
+        assert not _FACE.exact_for(dtype)
     half = replace(_FACE, dtypes=(mx.float16,))
     assert half.exact_for(mx.float16) and not half.exact_for(mx.bfloat16)
     halves = replace(_FACE, dtypes=(mx.float16, mx.bfloat16))

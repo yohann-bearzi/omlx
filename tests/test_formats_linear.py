@@ -264,11 +264,12 @@ def test_the_indices_of_a_launch_are_uint32(monkeypatch):
     want = quantized(x, indices)
     for dtype in (mx.uint32, mx.int32, mx.int64, mx.uint8):
         assert _same_bits(layer(x, indices.astype(dtype)), want)
-    # The stand-in's, then one kept graph, which MLX's compile traces for
-    # each type it is given.
+    # The stand-in's, then a kept graph for each type of the indices: a
+    # signed type's has their wrap.
     assert seen == [mx.uint32] * 5
     (proof,) = kernels._PROOFS.values()
-    assert set(proof.graphs) == {((16, 1, 320), mx.bfloat16, (16,))}
+    types = (mx.uint32, mx.int32, mx.int64, mx.uint8)
+    assert set(proof.graphs) == {((16, 1, 320), mx.bfloat16, (16,), t) for t in types}
 
 
 def test_a_launch_takes_x_and_the_indices_as_they_are(monkeypatch):
@@ -1425,9 +1426,9 @@ def test_a_stack_s_launch_is_built_once_and_replayed(monkeypatch):
     assert built[4:] == [(2, 5, 3, 320)]
     (proof,) = kernels._PROOFS.values()
     assert set(proof.graphs) == {
-        ((1, 4, 1, 1, 320), mx.bfloat16, (1, 4, 3)),
-        ((5, 3, 320), mx.bfloat16, (5,)),
-        ((5, 3, 320), mx.bfloat16, (2, 5)),
+        ((1, 4, 1, 1, 320), mx.bfloat16, (1, 4, 3), mx.uint32),
+        ((5, 3, 320), mx.bfloat16, (5,), mx.uint32),
+        ((5, 3, 320), mx.bfloat16, (2, 5), mx.uint32),
     }
     # Another stack of the face and the shape, of other experts.
     others, other = _switch_pair(320, 72, seed=7)
@@ -1610,7 +1611,7 @@ def test_an_unproven_stack_s_launch_is_proven_in_a_function_that_mlx_compiles(
     assert not proof.ran and not proof.graphs and not built
     assert _same_bits(compiled(rows, indices), switched(rows, indices) * 2)
     assert proof.ran == {(mx.bfloat16, 3, False)} and not proof.failed
-    assert set(proof.graphs) == {((4, 1, 1, 320), mx.bfloat16, (4, 3))}
+    assert set(proof.graphs) == {((4, 1, 1, 320), mx.bfloat16, (4, 3), mx.uint32)}
     assert built == [(3, 320), (4, 1, 1, 320)]
     assert len(_logged(caplog, linear)) == 1
     # Outside the function: one trace of the kept graph, then its replay.
@@ -2167,8 +2168,10 @@ def test_a_layer_reads_as_mlx_s_quantized_layers():
 
 def test_x_of_another_width_is_refused():
     _, layer = _pair(320, 72)
-    with pytest.raises(ValueError, match="x has 64 features, the layer takes 320"):
-        layer(_x((1, 64)))
+    for x in (_x((1, 64)), mx.array(1.0, dtype=mx.bfloat16)):  # x of no axis too
+        refused = re.escape(f"x is (..., 320), not of shape {x.shape}")
+        with pytest.raises(ValueError, match=refused):
+            layer(x)
     _, switch = _switch_pair(320, 72)
     refused = re.escape("x is (..., M, 320), not of shape (320,)")
     with pytest.raises(ValueError, match=refused):
@@ -2176,6 +2179,109 @@ def test_x_of_another_width_is_refused():
     refused = re.escape("x is (..., M, 320), not of shape (3, 1, 64)")
     with pytest.raises(ValueError, match=refused):
         switch(_x((3, 1, 64)), _experts((3,)))
+
+
+def test_a_matrix_of_no_input_is_its_decode(toy):
+    """K = 0: no launch takes it, and x of no element has rows of none."""
+    toy(_toy("linear"))
+    tensors = {"weight": mx.zeros((8, 0), mx.uint8), "scales": mx.ones((8,))}
+    layer = FormatLinear("toy", 8, 1, 0, tensors)
+    got = layer(mx.zeros((2, 0)))
+    assert got.shape == (2, 8) and not mx.any(got).item()
+    assert not kernels._PROOFS
+
+
+def test_a_face_named_with_no_dtype_is_exact_for_floats_alone(toy, monkeypatch):
+    """A face that names no dtype is exact for float16, bfloat16 and
+    float32: the rows kernel would round an integer x's rows to integers."""
+    toy(_toy("linear"))
+    layer, _, _ = _toy_linear(40, 320)
+    plan = linear._plan(layer)
+    assert plan.face.dtypes == ()
+    for dtype in (mx.int32, mx.uint8, mx.bool_):
+        x = mx.zeros((1, 320), dtype)
+        launch = (plan, (x.shape, dtype), linear._linear, linear._linear_stand_in, x)
+        assert linear._launch(*launch) is None
+    (proof,) = kernels._PROOFS.values()
+    assert not proof.ran and not proof.failed
+
+
+def _signed(indices):
+    """``indices`` with each counted from the end of a stack of EXPERTS."""
+    return (indices.astype(mx.int32) - EXPERTS).astype(mx.int32)
+
+
+@pytest.mark.parametrize("lead_m,routed,per_row", SHAPES)
+def test_a_negative_index_counts_from_the_stack_s_end(lead_m, routed, per_row):
+    """As MLX's indexing does, on every route: the rows kernel, the bias,
+    the decode of the indices' matrices and of the stack."""
+    _, layer = _switch_pair(320, 72, bias=True)
+    x, indices = _x((*lead_m, 320)), _experts(routed)
+    want = layer(x, indices)
+    got = layer(x, _signed(indices))
+    assert _same_bits(got, want)
+    (proof,) = kernels._PROOFS.values()
+    assert len(proof.graphs) == 2  # one for each dtype of the indices
+
+
+def test_a_negative_index_counts_from_the_stack_s_end_in_the_decode(toy):
+    toy()  # no face
+    mx.random.seed(7)
+    bias = mx.random.randint(-64, 64, (EXPERTS, 40)).astype(mx.float32)
+    layer = _toy_switch(40, 320, bias=bias)
+    # Fewer indices than matrices (their matrices are decoded), and as many
+    # (the stack is, for MLX's gather_mm).
+    for count in (3, 16):
+        x, indices = _ints((count, 1, 320)), _experts((count,))
+        want = _want(layer, x, indices)
+        got = layer(x, _signed(indices))
+        assert np.array_equal(np.array(got), want)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.bool_])
+def test_indices_that_are_no_integers_are_refused(dtype):
+    """MLX's gather refuses them; the rows kernel would truncate them. A
+    launch kept for integer indices is not replayed for them."""
+    _, layer = _switch_pair(320, 72)
+    x, indices = _x((16, 1, 320)), _experts((16,))
+    layer(x, indices)
+    for asked in (indices, indices.astype(mx.int32)):
+        with pytest.raises(ValueError, match=f"indices are integers, not {dtype}"):
+            layer(x, asked.astype(dtype))
+
+
+def test_a_launch_of_2_to_the_30_pairs_or_more_is_the_decode_s():  # noqa: N802
+    """MLX's grid is int32, and a launch has 2 rows of threadgroups a pair.
+    Nothing is evaluated: the arrays are never allocated."""
+    k = n = 8
+    x, indices = mx.zeros((1024, 1, 1, k)), mx.zeros((1, 2**20), mx.uint32)
+    assert linear._switch(None, k, n, x, indices) is None
+    x = mx.zeros((1, 1, k))
+    assert linear._switch(None, k, n, x, mx.zeros((2**30,), mx.uint32)) is None
+    metal, _ = linear._switch(None, k, n, x, mx.zeros((2**30 - 1,), mx.uint32))
+    assert metal == (mx.float32, 2**30 - 1, False)
+
+
+def test_a_launch_s_kernel_is_named_by_its_layer_and_face(toy, monkeypatch, capfd):
+    """MLX names a launch's Metal function by the kernel's name: a
+    compiler's message, a GPU trace and a profile show which layer and face
+    ran."""
+    toy(_toy("linear"))
+    rows = linear._rows
+
+    def printed(kernel, *launch):
+        return rows(lambda **named: kernel(**named, verbose=True), *launch)
+
+    monkeypatch.setattr(linear, "_rows", printed)
+    layer, x, _ = _toy_linear(40, 320)
+    mx.eval(layer(x[None]))
+    mx.eval(_toy_switch(40, 320)(_ints((8, 1, 320)), _experts((8,))))
+    out = capfd.readouterr().out
+    names = re.findall(r"^Generated source code for `(\w+)`", out, re.M)
+    assert set(names) == {
+        "omlx_format_linear_toy_linear",
+        "omlx_format_switch_linear_toy_linear",
+    }
 
 
 def test_the_affine_decode_is_mlx_s_dequantize():

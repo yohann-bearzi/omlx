@@ -202,7 +202,8 @@ def _linear_stand_in(plan: _Plan, metal) -> mx.array:
 def _switch(kernel, k: int, n: int, x, indices):
     """A stack's launch for ``x`` and ``indices``, as ``_linear`` gives a
     matrix's, with the indices ahead of the operands; None when there is no
-    pair to launch."""
+    pair to launch, or more than a grid takes. A negative index counts from
+    the stack's end, as MLX's indexing does."""
     if not indices.size * x.size:
         return None
     shape, batch = x.shape, indices.shape
@@ -219,17 +220,28 @@ def _switch(kernel, k: int, n: int, x, indices):
     else:
         batch = mx.broadcast_shapes(lead, batch)
         pairs, per_row = math.prod(batch) * m, 1
+    # MLX's grid is int32, of 2 rows of threadgroups a pair.
+    if pairs >= 2**30:
+        return None
     shape = (*batch, m, n)
 
     def graph(x, indices, *operands):
         if not as_they_are:
             x = mx.broadcast_to(x, (*batch, m, k))
             indices = mx.repeat(mx.broadcast_to(indices, batch), m)
-        rhs = indices.astype(mx.uint32)
+        rhs = _wrapped(indices, operands[0].shape[0]).astype(mx.uint32)
         return _rows(kernel, k, n, x, operands, pairs, shape, rhs, per_row)
 
     # MLX binds fewer than 8 indices as constants: other Metal.
     return (x.dtype, per_row, pairs < 8), graph
+
+
+def _wrapped(indices, matrices: int):
+    """``indices`` with each negative one counted from the end of a stack of
+    ``matrices``."""
+    if not mx.issubdtype(indices.dtype, mx.signedinteger):
+        return indices
+    return mx.where(indices < 0, indices + matrices, indices)
 
 
 def _switch_stand_in(plan: _Plan, metal) -> mx.array:
@@ -367,10 +379,10 @@ class FormatLinear(_FormatLayer):
             y = graph(x, *plan.operands)
         else:
             k = self.input_dims
-            if shape[-1] != k:
-                raise ValueError(f"x has {shape[-1]} features, the layer takes {k}")
+            if not shape or shape[-1] != k:
+                raise ValueError(f"x is (..., {k}), not of shape {shape}")
             y = None
-            if 0 < x.size // k <= MAX_ROWS:
+            if plan is not None and 0 < x.size // k <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
@@ -398,7 +410,7 @@ class FormatSwitchLinear(_FormatLayer):
         # runs every pair as one mat-vec, in any order; the decode passes the
         # hint on to MLX's gather_mm.
         shape, dtype = x.shape, x.dtype
-        signature = (shape, dtype, indices.shape)
+        signature = (shape, dtype, indices.shape, indices.dtype)
         plan = cached_per_module(self, "_omlx_format_plan", _plan, depth=0)
         graph = plan.proof.graphs.get(signature) if plan is not None else None
         if graph is not None:
@@ -407,6 +419,8 @@ class FormatSwitchLinear(_FormatLayer):
             k = self.input_dims
             if len(shape) < 2 or shape[-1] != k:
                 raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
+            if not mx.issubdtype(indices.dtype, mx.integer):
+                raise ValueError(f"indices are integers, not {indices.dtype}")
             y = _launch(plan, signature, _switch, _switch_stand_in, x, indices)
             if y is None and indices.size < self.num_experts:
                 # A decode step's indices: their matrices alone are decoded.
@@ -417,7 +431,7 @@ class FormatSwitchLinear(_FormatLayer):
                 y = mx.gather_mm(
                     x,
                     self._decoded().astype(dtype).swapaxes(-1, -2),
-                    rhs_indices=indices,
+                    rhs_indices=_wrapped(indices, self.num_experts),
                     sorted_indices=sorted_indices,
                 )
         if "bias" in self:

@@ -33,6 +33,10 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
+# The activation dtypes a kernel is built for: a face that names none is
+# exact for these.
+FLOATS: tuple[mx.Dtype, ...] = (mx.float16, mx.bfloat16, mx.float32)
+
 ENTRY_POINT_GROUP = "omlx.quant_formats"
 
 # Formats that ship with oMLX, as entry-point values ("module:attribute").
@@ -42,6 +46,26 @@ BUILTIN: tuple[str, ...] = ("omlx.formats.affine:FORMAT",)
 # oMLX implements, and the oldest one whose formats it still runs.
 CONTRACT = 1
 OLDEST_CONTRACT = 1
+
+
+def _identifier(name) -> bool:
+    return isinstance(name, str) and name.isascii() and name.isidentifier()
+
+
+def _check_tensors(owner: str, tensors) -> None:
+    """Refuses ``tensors`` unless they are what a format keeps beside
+    ``weight`` and ``bias``, as kernels splice them into Metal: a tuple of
+    distinct identifiers. ``register`` and ``Dot`` ask the same."""
+    if not isinstance(tensors, tuple):
+        raise ValueError(f"{owner}: tensors are a tuple, not {tensors!r}")
+    for name in tensors:
+        if not _identifier(name):
+            raise ValueError(f"{owner}: {name!r} is not an identifier")
+    if {"weight", "bias"} & set(tensors) or len(set(tensors)) != len(tensors):
+        raise ValueError(
+            f"{owner}: tensors are the parameters beside 'weight' and 'bias', "
+            f"each named once, not {tensors!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -54,35 +78,32 @@ class _Face:
     source: str
     type: str
     tensors: tuple[str, ...]
-    dtypes: tuple[mx.Dtype, ...] = ()  # the activations it is exact for; any if empty
+    # The activations it is exact for; FLOATS if empty.
+    dtypes: tuple[mx.Dtype, ...] = ()
 
     def __post_init__(self) -> None:
+        owner = f"quant format face {self.key!r}"
         if not (isinstance(self.tensors, tuple) and isinstance(self.dtypes, tuple)):
-            raise ValueError(
-                f"quant format face {self.key!r}: tensors and dtypes are tuples"
-            )
-        # Both are spliced into Metal identifiers.
-        for name in (self.key, *self.tensors):
-            if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
-                raise ValueError(
-                    f"quant format face {self.key!r}: {name!r} is not an identifier"
-                )
-        if "weight" in self.tensors or len(set(self.tensors)) != len(self.tensors):
-            raise ValueError(
-                f"quant format face {self.key!r}: tensors are the parameters "
-                f"beside 'weight', each named once, not {self.tensors!r}"
-            )
+            raise ValueError(f"{owner}: tensors and dtypes are tuples")
+        # The key and the tensors are spliced into Metal identifiers.
+        if not _identifier(self.key):
+            raise ValueError(f"{owner}: {self.key!r} is not an identifier")
+        _check_tensors(owner, self.tensors)
         dtypes = {dtype for dtype in self.dtypes if isinstance(dtype, mx.Dtype)}
         if len(dtypes) != len(self.dtypes):
             raise ValueError(
-                f"quant format face {self.key!r}: dtypes are distinct mx.Dtype, "
+                f"{owner}: dtypes are distinct mx.Dtype, not {self.dtypes!r}"
+            )
+        if dtypes - set(FLOATS):
+            raise ValueError(
+                f"{owner}: activations are float16, bfloat16 or float32, "
                 f"not {self.dtypes!r}"
             )
 
     def exact_for(self, dtype) -> bool:
         """Whether the face computes its format's rows for ``dtype``
         activations."""
-        return not self.dtypes or dtype in self.dtypes
+        return dtype in (self.dtypes or FLOATS)
 
 
 @dataclass(frozen=True)
@@ -178,11 +199,7 @@ def register(fmt: QuantFormat) -> None:
     mode, tensors = getattr(fmt, "mode", None), getattr(fmt, "tensors", None)
     if not isinstance(mode, str) or not mode:
         raise ValueError(f"quant format {fmt!r} has no mode")
-    if not isinstance(tensors, tuple) or {"weight", "bias"} & set(tensors):
-        raise ValueError(
-            f"quant format {mode!r}: tensors must be a tuple of the parameter "
-            "names beside 'weight' and 'bias'"
-        )
+    _check_tensors(f"quant format {mode!r}", tensors)
     contract = getattr(fmt, "contract", None)
     if type(contract) is not int:
         raise ValueError(
@@ -285,7 +302,8 @@ def dot(layer, k: int, n: int) -> Dot | None:
     A kernel asks for a face inside a model's forward, and keeps the answer
     with what it builds for the layer. So a format whose ``dot`` raises, or
     returns anything but None or a ``Dot`` of arrays the layer has (the
-    weight and the face's tensors, each of 8 elements or more), has no face
+    weight and the face's tensors, which are the format's, each of 8
+    elements or more), has no face
     for the layer either, and the model keeps its composed path there. Each
     defect of a format is logged once."""
     return _face(layer, k, n, Dot, "the layer keeps its composed path")
@@ -316,6 +334,12 @@ def _face(layer, k: int, n: int, kind: type, keeps: str):
         if not isinstance(face, kind):
             raise TypeError(
                 f"{name}() returned a {type(face)!r}, not a {kind.__name__}"
+            )
+        stray = [name for name in face.tensors if name not in fmt.tensors]
+        if stray:
+            raise ValueError(
+                f"face {face.key}: {', '.join(stray)} is no tensor of quant "
+                f"format {mode}"
             )
         lacking = [
             name
