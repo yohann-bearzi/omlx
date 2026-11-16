@@ -122,11 +122,15 @@ def _plan(layer) -> _Plan | None:
     return _Plan(face, _kernel(face, stacked), operands, proof, k, n, said)
 
 
-def _rows(kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1):
+def _rows(
+    kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1, tiles=None
+):
     """One mat-vec per pair, ``pairs`` of them, as ``shape`` (which ends
     with N). Pair ``p`` is row ``p // per_row`` of ``x``, rows of K in any
     shape, with the matrix (``operands``), or with matrix ``rhs[p]`` of the
-    stack. No reshape is put in the graph for the kernel's sake."""
+    stack. No reshape is put in the graph for the kernel's sake. A pair's
+    outputs are ``tiles`` tiles of 8 from the first, or all of them: the
+    grid is no part of the Metal, so a stand-in computes one."""
     dtype = x.dtype
     inputs = [x, *operands]
     template = [("T", dtype), ("K_SIZE", k), ("N_SIZE", n)]
@@ -136,7 +140,7 @@ def _rows(kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1
     return kernel(
         inputs=inputs,
         template=template,
-        grid=(32, 2 * pairs, n // 8),
+        grid=(32, 2 * pairs, n // 8 if tiles is None else tiles),
         threadgroup=(32, 2, 1),
         output_shapes=[shape],
         output_dtypes=[dtype],
@@ -155,20 +159,32 @@ def _linear(kernel, k: int, n: int, x):
     return x.dtype, graph
 
 
+# MLX's shapes are int32: a buffer of zeros as one axis of bytes is smaller.
+_ONE_BUFFER = 2**31
+
+
 def _zeros(*specs) -> list[mx.array]:
     """Zeros of each ``(shape, dtype)`` of ``specs``, a stand-in's inputs,
     evaluated here, ahead of the proof and outside its guard: what fails in
     making them (an allocation, an error that an earlier evaluation left
-    pending on the GPU) is not the face's. They are views of one buffer of
-    as many bytes as the largest: one fill and, where MLX's buffer cache is
-    empty (oMLX clears it after each prefill chunk), one new buffer."""
+    pending on the GPU) is not the face's. They are made on the GPU's
+    stream, the launch's, which is synchronized after their evaluation, so
+    such an error is raised here. They are views of one buffer of as many
+    bytes as the largest, from its first byte: one fill and, where MLX's
+    buffer cache is empty (oMLX clears it after each prefill chunk), one new
+    buffer. Where the largest has 2 GiB or more, each is zeros of its own."""
     sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
-    buffer = mx.zeros((max(sizes),), mx.uint8)
-    zeros = [
-        mx.view(buffer[:size], dtype).reshape(shape)
-        for (shape, dtype), size in zip(specs, sizes, strict=True)
-    ]
-    mx.eval(*zeros)
+    with mx.stream(mx.gpu):
+        if max(sizes) < _ONE_BUFFER:
+            buffer = mx.zeros((max(sizes),), mx.uint8)
+            zeros = [
+                mx.view(buffer[:size], dtype).reshape(shape)
+                for (shape, dtype), size in zip(specs, sizes, strict=True)
+            ]
+        else:
+            zeros = [mx.zeros(shape, dtype) for shape, dtype in specs]
+        mx.eval(*zeros)
+        mx.synchronize(mx.gpu)
     return zeros
 
 
@@ -179,7 +195,8 @@ def _linear_stand_in(plan: _Plan, metal) -> mx.array:
     own, so no part of a tensor is known to be all that a row reads."""
     operands = ((a.shape, a.dtype) for a in plan.operands)
     x, *tensors = _zeros(((plan.k,), metal), *operands)
-    return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,))
+    # Its first tile of outputs.
+    return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,), None, 1, 1)
 
 
 def _switch(kernel, k: int, n: int, x, indices):
@@ -231,7 +248,8 @@ def _switch_stand_in(plan: _Plan, metal) -> mx.array:
     operands = (((matrices, *a.shape[1:]), a.dtype) for a in plan.operands)
     x, *tensors, rhs = _zeros(((rows, plan.k), dtype), *operands, ((pairs,), mx.uint32))
     shape = (pairs, plan.n)
-    return _rows(plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row)
+    # Each pair's first tile of outputs.
+    return _rows(plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row, 1)
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):

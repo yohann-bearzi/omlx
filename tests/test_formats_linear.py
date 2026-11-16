@@ -181,6 +181,8 @@ SHAPES = [
     ((2, 4, 1, 1), (2, 4, 3), 3),
     # One token of a top-3 MoE: fewer than 8 pairs, 3 of them a row.
     ((1, 1, 1), (1, 3), 3),
+    # Of a top-4: 4 pairs, where two such rows would have 8.
+    ((1, 1, 1), (1, 4), 4),
     # Its sorted prefill: each pair with its own row.
     ((16, 1), (16,), 1),
     ((2, 4, 3, 1), (2, 4, 3), 1),
@@ -912,6 +914,14 @@ def test_what_fails_in_a_stand_in_s_zeros_is_raised_and_fails_no_proof(
     for proof in kernels._PROOFS.values():
         assert not proof.failed and not proof.ran and not proof.graphs
     assert not _logged(caplog, linear)
+    # In a function compiled over the model's state, MLX leaves the state as
+    # its trace left it when such an error escapes (UPSTREAM-BUGS M2).
+    assert (
+        "Inside a function compiled over the model's state, such an error "
+        "leaves the state's arrays as MLX's trace left them, placeholders "
+        "without a value (MLX restores a compiled function's state only when "
+        "the function returns): the model is loaded again."
+    ) in _PAGE
     # The calls after prove the launches.
     assert _same_bits(layer(x), quantized(x))
     assert _same_bits(switch(rows, indices), switched(rows, indices))
@@ -941,6 +951,107 @@ def test_a_stand_in_s_inputs_are_views_of_one_buffer_of_zeros(monkeypatch):
     assert asked == [((layer["weight"].nbytes,), mx.uint8), ((one_matrix,), mx.uint8)]
 
 
+def _address(a):
+    """Where ``a``'s first byte is in memory."""
+    data = mx.view(a.reshape(-1), mx.uint8)
+    mx.eval(data)
+    return np.frombuffer(memoryview(data), np.uint8).ctypes.data
+
+
+def test_a_stand_in_s_zeros_open_the_buffer_whatever_input_is_the_largest(
+    toy, monkeypatch
+):
+    """The buffer has the bytes of the largest input, here x's: 8 rows of
+    float32 against one matrix of 8 rows of byte codes. Each input is a view
+    of it from its first byte: a view at an offset that is no multiple of
+    its dtype's size is a copy in MLX."""
+    toy(_toy("linear"))
+    switch = _toy_switch(8, 320)
+    zeros, asked = mx.zeros, []
+
+    def recorded(shape, *dtype, **named):
+        asked.append((shape, *dtype))
+        return zeros(shape, *dtype, **named)
+
+    x, indices = _ints((16, 1, 320)), _experts((16,))
+    evaluated = _evaluations(monkeypatch)
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "zeros", recorded)
+        switch(x, indices)
+    assert asked == [((8 * 320 * 4,), mx.uint8)]
+    stand_in = evaluated[0]
+    assert [a.shape for a in stand_in] == [(8, 320), (1, 8, 320), (1, 8), (8,)]
+    assert len({_address(a) for a in stand_in}) == 1
+
+
+def test_zeros_of_2_GiB_or_more_are_each_their_own(monkeypatch):  # noqa: N802
+    """MLX's shapes are int32: a buffer of 2 GiB or more as one axis of
+    bytes cannot be made. Where a stand-in's largest input has that many
+    bytes (a vocabulary head of 262144 x 4096 two-byte codes), each input is
+    zeros of its own. Nothing is evaluated here: MLX allocates when it
+    evaluates."""
+    zeros, asked = mx.zeros, []
+
+    def recorded(shape, *dtype, **named):
+        asked.append((shape, *dtype))
+        return zeros(shape, *dtype, **named)
+
+    monkeypatch.setattr(mx, "zeros", recorded)
+    monkeypatch.setattr(mx, "eval", lambda *arrays: None)
+    x = ((4096,), mx.bfloat16)
+    for largest, buffers in (
+        (((262144, 4096), mx.bfloat16), None),
+        (((2**31 - 1,), mx.uint8), [((2**31 - 1,), mx.uint8)]),
+    ):
+        del asked[:]
+        made = linear._zeros(x, largest)
+        assert [(a.shape, a.dtype) for a in made] == [x, largest]
+        assert asked == (buffers or [x, largest])
+
+
+def test_a_stand_in_s_zeros_are_made_and_waited_for_on_the_gpu(monkeypatch):
+    """A launch runs on the GPU's stream, whatever the caller's default
+    stream. Its stand-in's zeros are made there too, and the stream is
+    synchronized after their evaluation: what an earlier evaluation left
+    pending on the GPU is raised then, ahead of the proof, not in the
+    evaluation of the launch."""
+    quantized, layer = _pair(320, 72)
+    x = _x((1, 320))
+    zeros, synchronize, evaluate, events = mx.zeros, mx.synchronize, mx.eval, []
+
+    def made(shape, *dtype, **named):
+        events.append(("zeros", mx.default_device()))
+        return zeros(shape, *dtype, **named)
+
+    def synchronized(*stream):
+        events.append(("synchronize", *stream))
+        synchronize(*stream)
+
+    def evaluated(*arrays):
+        events.append(("eval", len(arrays)))
+        evaluate(*arrays)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "zeros", made)
+        patch.setattr(mx, "synchronize", synchronized)
+        patch.setattr(mx, "eval", evaluated)
+        with mx.stream(mx.cpu):
+            y = layer(x)
+    assert events == [
+        ("zeros", mx.gpu),
+        ("eval", 4),
+        ("synchronize", mx.gpu),
+        ("eval", 1),
+    ]
+    assert _same_bits(y, quantized(x))
+    assert (
+        "The stand-in's zeros are evaluated on the GPU's stream as it is built, "
+        "ahead of the proof, and the stream is synchronized: what fails in making "
+        "them, or what an earlier evaluation left pending on the GPU, is raised by "
+        "the call and fails no proof."
+    ) in _PAGE
+
+
 def test_a_layer_whose_proof_failed_works_out_no_launch(toy, monkeypatch):
     """Once its proof has failed, a layer's call is the decode at once: it
     does not work out a launch that it would not run."""
@@ -954,6 +1065,7 @@ def test_a_layer_whose_proof_failed_works_out_no_launch(toy, monkeypatch):
         proof.fail()
     for describe in ("_linear", "_switch"):
         monkeypatch.setattr(linear, describe, lambda *call: pytest.fail("described"))
+    monkeypatch.setattr(formats.Dot, "exact_for", lambda *asked: pytest.fail("asked"))
     assert _equal(layer(x), want)
     assert np.array_equal(np.array(switch(rows, indices)), _want(switch, rows, indices))
 
@@ -978,18 +1090,28 @@ def _zeros(a):
     return mx.array_equal(a, mx.zeros(a.shape, a.dtype)).item()
 
 
-def _launched(monkeypatch):
+def _launched(monkeypatch, tiles=None):
     """What the rows kernel is launched with, launch by launch: x, the
-    matrix's tensors and the indices. A launch of more or fewer pairs than
-    its x's rows have, than its indices name or than its output holds fails
-    the test: its grid would read and write past them."""
+    matrix's tensors and the indices; and, in ``tiles``, the tiles of 8
+    outputs that its grid computes of each pair. A launch of more or fewer
+    pairs than its x's rows have, than its indices name or than its output
+    holds, or of more tiles than N has, fails the test: its grid would read
+    and write past them."""
     rows, launched = linear._rows, []
 
-    def recorded(kernel, k, n, x, operands, pairs, shape, rhs=None, per_row=1):
+    def recorded(kernel, k, n, x, operands, pairs, shape, *launch):
+        rhs, per_row = (*launch, None, 1)[:2]
         assert x.size // k * per_row == pairs == math.prod(shape) // n
         assert rhs is None or rhs.size == pairs
         launched.append((x, list(operands), rhs))
-        return rows(kernel, k, n, x, operands, pairs, shape, rhs, per_row)
+
+        def gridded(grid, **named):
+            assert grid[:2] == (32, 2 * pairs) and 0 < grid[2] <= n // 8
+            if tiles is not None:
+                tiles.append(grid[2])
+            return kernel(grid=grid, **named)
+
+        return rows(gridded, k, n, x, operands, pairs, shape, *launch)
 
     monkeypatch.setattr(linear, "_rows", recorded)
     return launched
@@ -1021,12 +1143,13 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     switched, switch = _switch_pair(320, 72)
     x, more = _x((3, 320)), _x((5, 320))
     rows, indices = _x((16, 1, 320)), _experts((16,))
-    launched = _launched(monkeypatch)
+    tiles = []
+    launched = _launched(monkeypatch, tiles)
     evaluated = _evaluations(monkeypatch)
     y = layer(x)
     zeros, (proving,) = evaluated
     assert proving is not y and proving.shape == (72,)
-    assert proving.dtype == mx.bfloat16 and _zeros(proving) and not _zeros(y)
+    assert proving.dtype == mx.bfloat16 and _zeros(proving[..., :8]) and not _zeros(y)
     # The stand-in's launch, then the call's. A matrix's stand-in is one
     # vector over the whole of each tensor: what follows the rows in a
     # tensor is the format's own.
@@ -1035,14 +1158,18 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     assert _like(tensors, [layer[name] for name in _NAMES])
     assert called.shape == (3, 320)
     assert _same([vector, *tensors], zeros)
-    del evaluated[:], launched[:]
+    # The stand-in computes the first tile of 8 outputs (the rest of its
+    # result is never written): the grid is no part of the Metal. The call,
+    # all 9 of them.
+    assert tiles == [1, 9]
+    del evaluated[:], launched[:], tiles[:]
     layer(x), layer(more)
     assert not evaluated and [x.shape for x, _, _ in launched] == [(5, 320)]
-    del launched[:]
+    del launched[:], tiles[:]
     y = switch(rows, indices)
     zeros, (proving,) = evaluated
     assert proving is not y and proving.shape == (8, 72)
-    assert proving.dtype == mx.bfloat16 and _zeros(proving) and not _zeros(y)
+    assert proving.dtype == mx.bfloat16 and _zeros(proving[..., :8]) and not _zeros(y)
     # 16 pairs, each with its row, have the Metal of 8: the fewest indices
     # that MLX binds as a buffer. One matrix of the stack keeps each of its
     # tensors one.
@@ -1051,6 +1178,7 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     assert _like(tensors, [switch[name][:1] for name in _NAMES])
     assert called.shape == (16, 1, 320)
     assert _same([pairs, *tensors, rhs], zeros)
+    assert tiles == [1, 9]
     del evaluated[:], launched[:]
     switch(rows, indices), switch(rows[4:12] + 0, indices[4:12] + 0)
     assert not evaluated and [x.shape for x, _, _ in launched] == [(8, 1, 320)]
@@ -1058,7 +1186,7 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     del launched[:]
     switch(rows[:1], indices)
     zeros, (proving,) = evaluated
-    assert proving.shape == (16, 72) and _zeros(proving)
+    assert proving.shape == (16, 72) and _zeros(proving[..., :8])
     (row, tensors, rhs), _ = launched
     assert _like([row, rhs], [rows[0], indices])
     assert _like(tensors, [switch[name][:1] for name in _NAMES])
@@ -1067,29 +1195,34 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     # masked to the table is allowed).
     contract = (
         "- A face is safe over tensors and activations of any value, zeros "
-        "included, on which a kernel proves its Metal: every address a member "
-        "forms stays inside the arrays it was given (an index read from a "
-        "tensor, such as a code that picks an entry of a level table, is "
-        "masked to the size of what it indexes), and no loop bound or exit "
-        "depends on a value that it reads.\n"
+        "included, on which a kernel proves its Metal: every address that "
+        "`row`, `load`, `madd` or `finish` reads stays inside the arrays the "
+        "face was given (an index read from a tensor, such as a code that "
+        "picks an entry of a level table, is masked to the size of what it "
+        "indexes; the constructor and `step()` form addresses and read none, "
+        "next rule), and no loop bound or exit depends on a value that it "
+        "reads.\n"
     )
     assert contract in _PAGE
 
 
-def _gain():
-    """The toy face with one more tensor, of two floats a matrix: the second
-    is a gain of all the matrix's rows (40 of them)."""
+def _gain(width=2):
+    """The toy face with one more tensor, of ``width`` floats a matrix: the
+    second is a gain of all the matrix's rows (40 of them)."""
     scales, lane = "  const device float* scales;\n", "    const device float* s;\n"
     source = _TOY
     for old, new in (
         (scales, scales + "  const device float* gains;\n"),
         (lane, lane + "    const device float* g;\n"),
-        ("s(m.scales + row) {}", "s(m.scales + row), g(m.gains + row / 40 * 2) {}"),
+        (
+            "s(m.scales + row) {}",
+            f"s(m.scales + row), g(m.gains + row / 40 * {width}) {{}}",
+        ),
         ("return sum * s[r];", "return sum * s[r] * g[1];"),
     ):
         assert source.count(old) == 1
         source = source.replace(old, new)
-    return replace(_toy("gain", source), tensors=("scales", "gains"))
+    return replace(_toy(f"gain{width}", source), tensors=("scales", "gains"))
 
 
 class _GainFormat(_ToyFormat):
@@ -1101,16 +1234,18 @@ class _GainFormat(_ToyFormat):
         pytest.fail("decoded")
 
 
-def _gain_stack(monkeypatch):
-    """A stack of the gain format, whose smallest tensor has 2 elements a
-    matrix."""
+def _gain_stack(monkeypatch, width=2):
+    """A stack of the gain format, whose smallest tensor has ``width``
+    elements a matrix."""
     formats.load()
-    monkeypatch.setitem(formats._FORMATS, "gain", _GainFormat(_gain()))
+    monkeypatch.setitem(formats._FORMATS, "gain", _GainFormat(_gain(width)))
     (codes, scales), _, _ = _matrix(EXPERTS * 40, 320)
     tensors = {
         "weight": codes.reshape(EXPERTS, 40, 320),
         "scales": scales.reshape(EXPERTS, 40),
-        "gains": mx.array([[3.0, 2.0 ** (e % 3 - 1)] for e in range(EXPERTS)]),
+        "gains": mx.array(
+            [[3.0, 2.0 ** (e % 3 - 1)] + [5.0] * (width - 2) for e in range(EXPERTS)]
+        ),
     }
     return FormatSwitchLinear("gain", 8, 1, 320, tensors)
 
@@ -1199,29 +1334,34 @@ def test_a_stand_in_has_the_metal_of_the_launch_it_proves(toy, monkeypatch, capf
     # Both ways MLX binds a stack's indices are among them.
     for binding in ("const constant uint32_t* rhs", "const device uint32_t* rhs"):
         assert any(binding in source for source in generated)
-    assert len(generated) == 12
+    assert len(generated) == 13
 
 
+@pytest.mark.parametrize("width,matrices", [(2, 4), (7, 2)])
 def test_a_stack_s_stand_in_has_the_matrices_that_keep_each_tensor_a_buffer(
-    monkeypatch, caplog
+    monkeypatch, caplog, width, matrices
 ):
     """MLX binds a tensor of fewer than 8 elements as constants: other
     Metal, which a face does not compile with. A stack's stand-in has as
     many matrices as bring its smallest tensor to 8 elements: 4, of a
-    tensor of 2 floats a matrix."""
+    tensor of 2 floats a matrix; 2, of 7."""
     caplog.set_level(logging.INFO, logger=linear.__name__)
-    layer = _gain_stack(monkeypatch)
-    assert layer["gains"].shape == (EXPERTS, 2)
+    layer = _gain_stack(monkeypatch, width)
+    assert layer["gains"].shape == (EXPERTS, width)
     launched = _launched(monkeypatch)
     x, indices = _ints((4, 1, 1, 320)), _experts((4, 3))
     got = layer(x, indices)
     assert np.array_equal(np.array(got), _gained(layer, x, indices))
     (_, tensors, _), _ = launched
-    assert [a.shape for a in tensors] == [(4, 40, 320), (4, 40), (4, 2)]
+    assert [a.shape for a in tensors] == [
+        (matrices, 40, 320),
+        (matrices, 40),
+        (matrices, width),
+    ]
     (proof,) = kernels._PROOFS.values()
     assert proof.ran == {(mx.float32, 3, False)} and not proof.failed
     assert [r.getMessage() for r in _logged(caplog, linear)] == [
-        "quant format face toy_gain: rows kernel engaged"
+        f"quant format face toy_gain{width}: rows kernel engaged"
     ]
 
 

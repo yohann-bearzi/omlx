@@ -443,10 +443,11 @@ class Proof:
           may belong to a function that MLX is tracing, which refuses to
           evaluate them; what fails in them is their owner's failure, not
           the Metal's; and they have the call's size, where a proof needs
-          the smallest. ``build`` evaluates the stand-ins before it gives
-          the launch: what fails in making them (an allocation, an error
-          that an earlier evaluation left pending on the GPU) is raised as
-          its own, not taken for the Metal's.
+          the smallest. ``build`` evaluates the stand-ins on the GPU's
+          stream before it gives the launch, then synchronizes the stream:
+          what fails in making them (an allocation, an error that an
+          earlier evaluation left pending on the GPU) is raised as its own,
+          not taken for the Metal's.
         - MLX generates the source of the call's launch for it: the same
           kernel, template values and output dtypes and, input by input,
           the same dtype, fewer than 8 elements or not, an axis or none.
