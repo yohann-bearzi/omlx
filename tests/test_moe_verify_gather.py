@@ -33,14 +33,14 @@ def _experts(k, n, bits=4, bias=False, dtype=mx.bfloat16):
     return linear.to_quantized(group_size=32, bits=bits)
 
 
-def _switch(bits=4, dtype=mx.bfloat16, seed=3):
+def _switch(bits=4, dtype=mx.bfloat16, seed=3, group=32, inter=INTER):
     """A fused switch: gate+up of K 512 (``qmv_fast`` at these bits), down of
-    K 64 (``qmv``, one last block)."""
+    K ``inter`` (``qmv``, one last block at 64)."""
     mx.random.seed(seed)
-    glu = SwitchGLU(HIDDEN, INTER, EXPERTS)
+    glu = SwitchGLU(HIDDEN, inter, EXPERTS)
     glu.set_dtype(dtype)
     for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(glu, name, getattr(glu, name).to_quantized(32, bits))
+        setattr(glu, name, getattr(glu, name).to_quantized(group, bits))
     glu.eval()
     gate_up_fusion._fuse_one(glu)
     return glu
@@ -127,6 +127,27 @@ def test_a_block_has_the_composed_route_s_bits(monkeypatch, caplog, bits, dtype)
     ]
 
 
+@pytest.mark.parametrize("group", [64, 128])
+def test_a_block_of_groups_of_64_or_128_has_the_composed_route_s_bits(
+    monkeypatch, group
+):
+    switch = _switch(group=group, inter=128)
+    for batch, length in ((1, 2), (2, 4)):
+        x, indices = _block(batch, length)
+        got = gather.fused_switch(switch, x, indices)
+        assert got is not None
+        assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+
+
+def test_float32_affine_experts_keep_the_composed_route():
+    """The affine face is MLX's for half-precision scales: experts of
+    float32 scales have none."""
+    switch = _switch(dtype=mx.float32)
+    x, indices = _block(1, 3, mx.float32)
+    assert gather.fused_switch(switch, x, indices) is None
+    assert not _proofs()
+
+
 def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
     """The routing is a kernel input, typed in the kernel's signature: a
     launch with indices of another dtype is proven on its own."""
@@ -135,13 +156,41 @@ def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
     want = gather.fused_switch(switch, x, indices)
     evaluate, evaluated = mx.eval, []
     monkeypatch.setattr(mx, "eval", lambda *a: (evaluated.append(a), evaluate(*a)))
+    launch, read = gather.gather_qmv, []
+
+    def built(projection, x, rhs, per_row):
+        read.append(rhs.dtype)
+        return launch(projection, x, rhs, per_row)
+
+    monkeypatch.setattr(gather, "gather_qmv", built)
     assert _same_bits(gather.fused_switch(switch, x, indices), want)
     assert not evaluated  # proven
     signed = indices.astype(mx.int32)
     assert _same_bits(gather.fused_switch(switch, x, signed), want)
-    assert [len(arrays) for arrays in evaluated] == [2, 1]
+    ((stand_in,),) = evaluated
+    assert [a.shape for a in stand_in] == [(3 * TOP_K, 2 * INTER), (3 * TOP_K, HIDDEN)]
+    # The proven call's two launches, the stand-in's, then the signed call's.
+    assert read == [mx.uint32] * 2 + [mx.int32] * 4
     (proof,) = _proofs()
     assert proof.ran == {(3, TOP_K, x.dtype, dtype) for dtype in (mx.uint32, mx.int32)}
+
+
+def test_a_stand_in_s_stack_has_the_fewest_experts_that_leave_each_tensor_8():
+    """MLX binds an input of fewer than 8 elements as constants: a stand-in
+    stack keeps each tensor 8 elements or more, whatever its experts hold."""
+    k, n = 320, 64
+    projection = gather.projection(_experts(k, n), k)
+    weight, scales, biases = projection.operands
+    for tensors, experts in (
+        ((weight, scales, biases), 1),
+        ((weight, scales[:, :1, :1]), 8),  # one value an expert
+        ((weight, scales[:, :1, :3]), 3),  # three
+        ((weight, scales[:, :1, :4]), 2),
+    ):
+        zeros = gather._zeros(projection._replace(operands=tensors)).operands
+        assert [a.shape for a in zeros] == [(experts, *a.shape[1:]) for a in tensors]
+        assert [a.dtype for a in zeros] == [a.dtype for a in tensors]
+        assert not any(mx.any(a).item() for a in zeros)
 
 
 def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
@@ -165,8 +214,30 @@ def test_a_block_outside_the_kernel_is_left_to_the_composed_route():
     switch = _switch()
     for batch, length in ((1, 1), (1, 9), (3, 3), (16, 2)):
         assert gather.fused_switch(switch, *_block(batch, length)) is None
+    x, indices = _block(1, 3)
+    others = (
+        (x[0], indices),  # not [B, L, K]
+        (x[None], indices),
+        (x, indices[0]),
+        (x, indices[..., 0]),
+        (x, indices[:, :2]),  # not one row of experts for each row of x
+        (x, mx.concatenate([indices, indices], axis=0)),
+    )
+    for block in others:
+        assert gather.fused_switch(switch, *block) is None
     # Nothing is read of the switch for them.
     assert not _proofs() and "_omlx_verify_gather_plan" not in vars(switch)
+    # Nor is a launch built or proven for these: they are the caller's, not
+    # the kernel's failures.
+    for block in (
+        (x, indices[..., :0]),  # no expert for a row
+        (x, indices.astype(mx.float32)),  # gather_qmm reads integers only
+        (x, indices.astype(mx.bfloat16)),
+        (x, indices > 3),
+    ):
+        assert gather.fused_switch(switch, *block) is None
+    (proof,) = _proofs()
+    assert not proof.ran and not proof.failed
 
     x, indices = _block(1, 3)
     # The affine faces are exact for their scales' dtype.
@@ -314,16 +385,38 @@ def test_an_activation_of_another_dtype_or_shape_leaves_the_block_composed(
         assert launched == [144] * len(others)
         del launched[:]
 
-    # Ahead of the block's proof: it is not the launches' failure.
-    composed()
+    # The block's Metal is proven on its stand-in, which reads no
+    # activation: both launches, then the block's gate and up.
+    with monkeypatch.context() as patch:
+        patch.setattr(switch, "activation", others[0])
+        assert gather.fused_switch(switch, x, indices) is None
     (proof,) = _proofs()
-    assert not proof.ran and not proof.failed
-    assert gather.fused_switch(switch, x, indices) is not None
-    assert launched == [144, 40] and len(proof.ran) == 1
+    assert launched == [144, 40, 144] and len(proof.ran) == 1
     del launched[:]
-    # Then with the block proven.
     composed()
-    assert len(proof.ran) == 1 and not proof.failed
+    assert gather.fused_switch(switch, x, indices) is not None
+    assert launched == [144, 40] and len(proof.ran) == 1 and not proof.failed
+
+
+def test_an_activation_that_raises_raises_in_the_call(toy):
+    """The activation is the caller's: what it raises is raised, the
+    proof stands, and the next block runs the kernel."""
+    toy(_toy("gather"))
+    switch = _ToySwitch(k=320, inter=72, n=40)
+    x, indices = _toy_block(switch, 3)
+    activation = switch.activation
+
+    def raises(up, gate):
+        raise ArithmeticError("not this block")
+
+    for _ in range(2):  # unproven, then proven
+        switch.activation = raises
+        with pytest.raises(ArithmeticError, match="not this block"):
+            gather.fused_switch(switch, x, indices)
+        (proof,) = _proofs()
+        assert len(proof.ran) == 1 and not proof.failed
+        switch.activation = activation
+        assert gather.fused_switch(switch, x, indices) is not None
 
 
 def test_a_face_that_does_not_compile_keeps_its_blocks_composed(
@@ -361,6 +454,17 @@ def test_a_face_that_does_not_compile_keeps_its_blocks_composed(
     assert len(_logged(caplog, gather)) == 1
 
 
+def test_a_proof_that_fails_after_a_block_ran_keeps_that_block_composed():
+    """Another thread's launch may fail the proof after this block's Metal
+    ran: every block of the proof keeps its composed path from then on."""
+    switch = _switch()
+    x, indices = _block(1, 3)
+    assert gather.fused_switch(switch, x, indices) is not None
+    (proof,) = _proofs()
+    proof.fail()
+    assert gather.fused_switch(switch, x, indices) is None
+
+
 def test_a_failed_block_keeps_only_its_tensor_dtypes_and_shapes_composed(toy, caplog):
     caplog.set_level(logging.WARNING, logger=gather.__name__)
     toy(_toy("gather"))
@@ -379,39 +483,91 @@ def test_a_failed_block_keeps_only_its_tensor_dtypes_and_shapes_composed(toy, ca
     assert [proof.failed for proof in _proofs()] == [True, True, False]
 
 
-def test_a_failure_ahead_of_the_block_is_raised_and_is_not_its_launches(caplog):
+def test_a_failure_in_the_block_s_arrays_is_raised_where_they_are_evaluated(caplog):
     caplog.set_level(logging.WARNING, logger=gather.__name__)
     switch = _switch()
     x, indices = _block(1, 3)
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        gather.fused_switch(switch, _does_not_compile(x), indices)
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        gather.fused_switch(switch, x, _does_not_compile(indices))
+    for block in ((_does_not_compile(x), indices), (x, _does_not_compile(indices))):
+        y = gather.fused_switch(switch, *block)
+        with pytest.raises(RuntimeError, match="Unable to build metal library"):
+            mx.eval(y)
     (proof,) = _proofs()
-    assert not proof.failed and not proof.ran
+    assert not proof.failed and proof.ran == {(3, TOP_K, x.dtype, mx.uint32)}
     assert not _logged(caplog, gather)
     assert gather.fused_switch(switch, x, indices) is not None
 
 
-def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
-    switch = _switch()
-    x, indices = _block(1, 3)
-    shorter = _block(1, 2)
+def test_a_block_of_fewer_than_8_values_of_x_is_left_to_the_composed_route(toy):
+    """MLX binds such an x as constants, and the kernel reads x from device
+    memory: a face of one value a lane takes K 1, 3 and 4."""
+    toy(_toy("one", source=_TOY.replace("VPT = 8;", "VPT = 1;")))
+    blocks = ((3, 2, False), (1, 7, False), (4, 2, True), (3, 3, True), (1, 8, True))
+    for k, rows, runs in blocks:
+        switch = _ToySwitch(k=k, inter=72, n=40)
+        got = gather.fused_switch(switch, *_toy_block(switch, rows))
+        assert (got is not None) == runs, (k, rows)
+    assert sorted(len(proof.ran) for proof in _proofs()) == [1, 1, 1]
+    assert not any(proof.failed for proof in _proofs())
+
+
+def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
+    """A Metal is proven on zeros: the block's rows and pairs, every pair
+    with expert 0 of one expert's tensors, in the block's dtype. Nothing of
+    the call is evaluated."""
+    switch = _switch(dtype=mx.float16)
+    x, indices = _block(1, 3, mx.float16)
+    shorter = _block(1, 2, mx.float16)
     evaluate, evaluated = mx.eval, []
 
     def recorded(*arrays):
         evaluated.append(arrays)
         evaluate(*arrays)
 
+    launch, launched = gather.gather_qmv, []
+
+    def built(projection, x, rhs, per_row):
+        launched.append((projection.operands, x, rhs, per_row))
+        return launch(projection, x, rhs, per_row)
+
     monkeypatch.setattr(mx, "eval", recorded)
+    monkeypatch.setattr(gather, "gather_qmv", built)
     y = gather.fused_switch(switch, x, indices)
-    # The block's inputs first, outside the launches' guard, then the block.
-    assert [len(arrays) for arrays in evaluated] == [2, 1]
-    assert evaluated[0][0] is x and evaluated[0][1] is indices
-    assert evaluated[1][0].shape == (3 * TOP_K, HIDDEN)
-    del evaluated[:]
+    ((stand_in,),) = evaluated
+    assert [a.shape for a in stand_in] == [(3 * TOP_K, 2 * INTER), (3 * TOP_K, HIDDEN)]
+    zeros = launched[:2]
+    assert [(len(z[2]), z[3]) for z in zeros] == [(3 * TOP_K, TOP_K), (3 * TOP_K, 1)]
+    for operands, x_in, rhs, _ in zeros:
+        assert [a.shape[0] for a in operands] == [1, 1, 1]
+        assert rhs.dtype == mx.uint32
+        for a in (*operands, x_in, rhs):
+            assert not mx.any(a).item()
+    assert zeros[0][1].shape == (3, HIDDEN) and zeros[1][1].shape == (3 * TOP_K, INTER)
+    assert zeros[0][1].dtype == zeros[1][1].dtype == mx.float16
+    # Then the block's own launches, built and not evaluated.
+    assert launched[2][1].shape == (3, HIDDEN) and launched[3][3] == 1
+    assert len(launched) == 4 and len(evaluated) == 1
+    del evaluated[:], launched[:]
     assert _same_bits(gather.fused_switch(switch, x, indices), y)
-    assert not evaluated
-    # Another launch: its rows are not these.
+    assert not evaluated and len(launched) == 2
+    # Another Metal: its rows are not these.
     gather.fused_switch(switch, *shorter)
-    assert [len(arrays) for arrays in evaluated] == [2, 1]
+    assert len(evaluated) == 1 and evaluated[0][0][0].shape == (2 * TOP_K, 2 * INTER)
+
+
+@pytest.mark.parametrize("state", [False, True])
+def test_a_block_is_proven_in_a_function_that_mlx_compiles(monkeypatch, state):
+    """A block may be built in a function that MLX's compile traces, over
+    an x and indices that cannot be evaluated, and, compiled over the
+    model's state (``inputs=``), over tensors that cannot be either."""
+    switch = _switch()
+    x, indices = _block(1, 3)
+    want = _composed(monkeypatch, switch, x, indices)
+    compiled = mx.compile(
+        lambda x, i: gather.fused_switch(switch, x, i) * 2,
+        inputs=switch.state if state else None,
+    )
+    assert _same_bits(compiled(x, indices), want * 2)
+    (proof,) = _proofs()
+    assert proof.ran == {(3, TOP_K, x.dtype, mx.uint32)} and not proof.failed
+    mx.eval(switch.parameters())
+    assert _same_bits(gather.fused_switch(switch, x, indices), want)

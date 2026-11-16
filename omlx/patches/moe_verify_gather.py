@@ -107,6 +107,7 @@ class _Plan(NamedTuple):
     gate_up: Projection
     down: Projection
     proof: kernels.Proof  # of a block's two launches
+    width: int  # the K of gate_up: a row of x
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -143,21 +144,61 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
         gate_up.n,
         down.n,
     )
-    return _Plan(gate_up, down, proof)
+    return _Plan(gate_up, down, proof, width)
+
+
+_FAILED = "expert-ordered verify gather failed; composed fallback"
+
+
+def _stand_in(plan: _Plan, metal) -> list[mx.array]:
+    """The smallest launches of a block that MLX generates the Metal of
+    ``metal`` for, over zeros. The pairs and a row's experts are template
+    values, so x has the block's rows and the indices its pairs, of their
+    dtypes; every pair is with expert 0 of stacks of the fewest experts that
+    leave each tensor 8 elements. The down launch reads zeros of the rows
+    that the activation gives, not the gate/up launch's output."""
+    rows, top_k, dtype, index = metal
+    pairs = rows * top_k
+    rhs = mx.zeros((pairs,), index)
+    x = mx.zeros((rows, plan.width), dtype)
+    hidden = mx.zeros((pairs, plan.gate_up.n // 2), dtype)
+    return [
+        gather_qmv(_zeros(plan.gate_up), x, rhs, top_k),
+        gather_qmv(_zeros(plan.down), hidden, rhs, 1),
+    ]
+
+
+def _zeros(projection: Projection) -> Projection:
+    experts = max(-(-8 * a.shape[0] // a.size) for a in projection.operands)
+    return projection._replace(
+        operands=tuple(
+            mx.zeros((experts, *a.shape[1:]), a.dtype) for a in projection.operands
+        )
+    )
 
 
 def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     """Fused gate/up then down routed projections for 2..MAX_ROWS rows.
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
-    the block size is outside this kernel, a projection has no dot face that
-    is exact for ``x``'s dtype, the activation gives another dtype than
-    ``x``'s or another shape than the up's, or a block of these faces and
-    shapes failed.
+    the block is outside this kernel (its rows, indices that are not integers
+    or not top_k of them for each row of x, fewer than 8 values of x), a
+    projection has no dot face that is exact for ``x``'s dtype, the
+    activation gives another dtype than ``x``'s or another shape than the
+    up's, or a block of these faces and shapes failed.
+
+    The first block of each Metal proves it on a stand-in (``_stand_in``):
+    nothing of the call is evaluated here. Any of its arrays may belong to a
+    function that MLX traces, and what fails in x, the indices, a tensor or
+    the activation is raised where the caller evaluates the result.
     """
+    if x.ndim != 3 or indices.ndim != 3:
+        return None
     batch, length, width = x.shape
+    routed_batch, routed_length, top_k = indices.shape
     rows = batch * length
-    if not 1 < rows <= MAX_ROWS:
+    # A pair is a row and one of its top_k experts.
+    if not 1 < rows <= MAX_ROWS or routed_batch != batch or routed_length != length:
         return None
     plan = cached_per_module(
         switch_mlp,
@@ -172,35 +213,35 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         or not plan.down.face.exact_for(x.dtype)
     ):
         return None
-    top_k = indices.shape[-1]
-    pairs = indices.reshape(rows * top_k)
-    launch = (rows, top_k, x.dtype, indices.dtype)
-    proven = launch in plan.proof.ran
-    if not proven:
-        # What fails ahead of the block is not the launches' failure.
-        mx.eval(x, indices)
-    try:
-        gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k)
-        gate, up = mx.split(gate_up, 2, axis=-1)
-        hidden = switch_mlp.activation(up, gate)
-        if hidden.dtype != x.dtype or hidden.shape != up.shape:
-            # Not the rows that the down launch is planned and proven for.
-            # Nothing is kept of it: the next block asks its activation again.
-            return None
-        out = gather_qmv(plan.down, hidden, pairs, 1)
-        if not proven:
-            # Surface a kernel build failure while the call can still fall
-            # back.
-            mx.eval(out)
-            plan.proof.ran.add(launch)
-            logger.info("MoE expert-ordered verify gather engaged (%d rows)", rows)
-    except Exception:
-        plan.proof.failed = True
-        logger.warning(
-            "expert-ordered verify gather failed; composed fallback", exc_info=True
+    # What a block's two launches are instantiated with beside the proof's
+    # key. A Metal in ran passed the checks below when it was proven: a call
+    # pays for neither, nor for the stand-in and the log line it would build.
+    metal = (rows, top_k, x.dtype, indices.dtype)
+    if metal not in plan.proof.ran and (
+        # MLX binds an input of fewer than 8 values as constants, and the
+        # kernel reads x from device memory; like gather_qmm, it reads
+        # integer indices only.
+        top_k < 1
+        or rows * width < 8
+        or not mx.issubdtype(indices.dtype, mx.integer)
+        or not plan.proof.prove(
+            metal,
+            lambda: _stand_in(plan, metal),
+            logger,
+            f"MoE expert-ordered verify gather engaged ({rows} rows)",
+            _FAILED,
         )
+    ):
         return None
-    return out.reshape(batch, length, top_k, -1)
+    pairs = indices.reshape(rows * top_k)
+    gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k)
+    gate, up = mx.split(gate_up, 2, axis=-1)
+    hidden = switch_mlp.activation(up, gate)
+    if hidden.dtype != x.dtype or hidden.shape != up.shape:
+        # Not the rows that the down launch is planned and proven for.
+        # Nothing is kept of it: the next block asks its activation again.
+        return None
+    return gather_qmv(plan.down, hidden, pairs, 1).reshape(batch, length, top_k, -1)
 
 
 def gather_qmv(
