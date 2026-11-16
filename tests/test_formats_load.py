@@ -405,7 +405,7 @@ class _HalfScales(_Loadable):
 @pytest.mark.parametrize("when", ["before", "after"])
 @pytest.mark.parametrize("recast", ["set_dtype", "float16 activations"])
 def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
-    toy, by_hand, monkeypatch, recast, when
+    toy, tmp_path, monkeypatch, recast, when
 ):
     """MLX's set_dtype and oMLX's float16 activations, before the load or
     after it, leave a format layer the checkpoint's tensors, the outputs of
@@ -427,7 +427,6 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
     model = nn.Module()
     model.linear = nn.Linear(k, n)
     model.switch = lm_switch.SwitchLinear(k, n, EXPERTS, bias=True)
-    nn.quantize(model, class_predicate=_named({"linear": _TOY, "switch": _TOY}))
 
     def run():
         if recast == "set_dtype":
@@ -436,9 +435,14 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
             # The biases, once the load has made them bfloat16.
             assert cast_bf16_params_to_fp16(model) == (2 if when == "after" else 0)
 
-    if when == "before":
-        run()
-    model.load_weights(list(weights.items()), strict=True)
+    # The checkpoint's load: the layers are built and filled; a recast
+    # "after" comes once the load has returned.
+    (tmp_path / "config.json").write_text("{}")
+    with format_load.loading(tmp_path):
+        nn.quantize(model, class_predicate=_named({"linear": _TOY, "switch": _TOY}))
+        if when == "before":
+            run()
+        model.load_weights(list(weights.items()), strict=True)
     if when == "after":
         run()
     for name, value in tree_flatten(model.parameters()):

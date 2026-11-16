@@ -551,22 +551,28 @@ class _FormatLayer(nn.Module):
 
     def __setitem__(self, key: str, value: Any) -> None:
         # Over a tensor of the format the layer holds: an array of its shape
-        # and dtype replaces it (a placeholder is then loaded), any other is
-        # not taken, and the very array it holds changes nothing.
+        # and dtype replaces it, any other is not taken, and the very array
+        # it holds changes nothing. Only a load (a checkpoint loading on this
+        # thread) changes what the layer holds as loaded: its array loads the
+        # tensor, and one it does not take leaves the tensor unloaded, named
+        # by what was offered. A recast (set_dtype, before or after a load)
+        # hands arrays back outside a load: it changes no tensor's status.
         self.__dict__.pop(_KEPT, None)
         held = self.get(key)
         if held is not None and key in self._tensors:
             if value is held:
                 return
+            loading = formats._LOADING.get() is not None
             if value.shape != held.shape or value.dtype != held.dtype:
-                if key in self._placeholders:
+                if loading:
                     # The dtype's name: a Dtype neither pickles nor copies.
                     self._placeholders[key] = (value.shape, str(value.dtype))
                 return
             # Stored before its placeholder is cleared: a call on another
             # thread that finds no placeholder finds the tensor.
             super().__setitem__(key, value)
-            self._placeholders.pop(key, None)
+            if loading:
+                self._placeholders.pop(key, None)
             return
         super().__setitem__(key, value)
 

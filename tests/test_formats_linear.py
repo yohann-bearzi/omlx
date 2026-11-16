@@ -9,6 +9,7 @@ layer's whole stack, its ``gather_mm``.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import math
@@ -31,6 +32,7 @@ from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 from omlx import formats
 from omlx.formats import affine, kernels, linear, testing
 from omlx.formats.linear import MAX_ROWS, FormatLinear, FormatSwitchLinear
+from omlx.patches import format_load
 from omlx.utils import model_loading
 from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
@@ -2626,7 +2628,9 @@ def test_the_page_says_a_layer_over_placeholders_refuses_to_compute():
     )
 
 
-def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy, monkeypatch):
+def test_a_layer_over_placeholders_computes_once_each_is_loaded(
+    toy, tmp_path, monkeypatch
+):
     """A layer built for a load holds placeholders: an array of another
     shape or dtype does not replace one, nor does the very array it holds,
     and until each is replaced the layer refuses to compute, whatever route
@@ -2638,6 +2642,9 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy, monkeypatch
     stand_ins = {"scales": mx.zeros_like(scales), "weight": mx.zeros_like(codes)}
     bias = mx.zeros((36,))
     layer = FormatLinear("toy", 8, 1, 320, stand_ins, bias=bias, placeholders=True)
+    # What follows is a checkpoint's load, until the layer computes.
+    load = contextlib.ExitStack()
+    load.enter_context(format_load.loading(tmp_path))
     refusal = (
         f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
         "the load's placeholder of "
@@ -2699,9 +2706,10 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy, monkeypatch
         layer(x)
     layer["scales"] = scales
     assert _equal(layer(x), want)
-    # Loaded, it takes an array of its shape and dtype, and no other; it
-    # knows its format's tensors by their names, not by the dict it was
-    # built from.
+    load.close()
+    # Loaded, it takes an array of its shape and dtype, and no other (outside
+    # a load: it stays loaded); it knows its format's tensors by their names,
+    # not by the dict it was built from.
     layer["scales"] = 2 * scales
     layer["scales"] = scales.astype(mx.bfloat16)
     layer["scales"] = mx.concatenate([scales, scales])
@@ -2709,6 +2717,91 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy, monkeypatch
     layer.set_dtype(mx.float16)
     assert layer["bias"].dtype == mx.float16
     assert _equal(layer(x), 2 * want)
+
+
+@pytest.fixture
+def a_load(tmp_path):
+    """The test runs as a checkpoint's load on its thread: what is assigned
+    to a format layer is the load's."""
+    with format_load.loading(tmp_path):
+        yield
+
+
+def _over_placeholders(toy):
+    """A layer built for a load, none of its tensors loaded, and what it
+    is built for."""
+    toy()
+    (codes, scales), x, want = _matrix(36, 320)
+    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+    return layer, (codes, scales), x, want
+
+
+def _refusal(layer, held):
+    return re.escape(
+        f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
+        f"the load's placeholder of {held}"
+    )
+
+
+def test_only_a_load_takes_a_placeholder(toy, tmp_path):
+    """Outside a load an array of a placeholder's shape and dtype (one a
+    recast hands back) is stored, and the tensor stays unloaded."""
+    layer, (codes, scales), x, want = _over_placeholders(toy)
+    # The scales are float32: set_dtype hands back a new float32 array.
+    layer.set_dtype(mx.float32)
+    layer["weight"] = mx.zeros_like(codes)
+    lacking = _refusal(layer, "weight (never loaded), scales (never loaded)")
+    with pytest.raises(ValueError, match=lacking):
+        layer(x)
+    with format_load.loading(tmp_path):
+        layer["weight"], layer["scales"] = codes, scales
+    assert _equal(layer(x), want)
+    # Loaded, a recast's array keeps it loaded.
+    layer.set_dtype(mx.float32)
+    assert _equal(layer(x), want)
+
+
+def test_a_load_s_array_not_taken_unloads_a_loaded_tensor(toy, tmp_path):
+    """A load whose array a loaded layer does not take leaves that tensor
+    unloaded: the layer refuses, naming what was offered, until a load gives
+    it one; outside a load such an array changes nothing."""
+    layer, (codes, scales), x, want = _over_placeholders(toy)
+    with format_load.loading(tmp_path):
+        layer["weight"], layer["scales"] = codes, scales
+    layer["scales"] = scales.astype(mx.float16)
+    assert _equal(layer(x), want)
+    with format_load.loading(tmp_path):
+        layer["scales"] = scales.astype(mx.float16)
+    offered = _refusal(
+        layer,
+        "scales (offered (36,) mlx.core.float16, not the layout's (36,) "
+        "mlx.core.float32)",
+    )
+    with pytest.raises(ValueError, match=offered):
+        layer(x)
+    with format_load.loading(tmp_path):
+        # A new array: the very one the layer holds is no load.
+        layer["scales"] = scales * 1
+    assert _equal(layer(x), want)
+
+
+def test_a_recast_after_a_failed_load_keeps_what_the_load_offered(toy, tmp_path):
+    layer, (codes, scales), x, _ = _over_placeholders(toy)
+    with format_load.loading(tmp_path):
+        layer["weight"], layer["scales"] = codes, scales[:8]
+    layer.set_dtype(mx.float16)
+    offered = _refusal(
+        layer,
+        "scales (offered (8,) mlx.core.float32, not the layout's (36,) "
+        "mlx.core.float32)",
+    )
+    with pytest.raises(ValueError, match=offered):
+        layer(x)
+
+
+def test_the_page_says_only_a_load_fills_a_placeholder():
+    assert "Only a load fills a placeholder" in " ".join(_PAGE.split())
 
 
 def _pending(toy):
@@ -2726,7 +2819,7 @@ def _pending(toy):
     return layer, (codes, scales), x, want, refusal
 
 
-def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, monkeypatch):
+def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, a_load, monkeypatch):
     """A call on another thread that finds no placeholder finds the tensor:
     the load stores it first."""
     layer, (codes, scales), _, _, _ = _pending(toy)
@@ -2747,7 +2840,7 @@ def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, monkeypatch):
     [copy.deepcopy, lambda layer: pickle.loads(pickle.dumps(layer))],
     ids=["deepcopy", "pickle"],
 )
-def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(toy, copied):
+def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(toy, a_load, copied):
     layer, (codes, scales), x, want, refusal = _pending(toy)
     clone = copied(layer)
     with pytest.raises(ValueError, match=refusal):
@@ -2758,7 +2851,7 @@ def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(toy, copied):
         layer(x)
 
 
-def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy):
+def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy, a_load):
     """copy.copy shares the tensors and not the record of placeholders: the
     original, never loaded, still refuses."""
     layer, (codes, scales), x, want, refusal = _pending(toy)
@@ -2787,7 +2880,7 @@ def test_a_layer_s_placeholders_are_checked_where_its_plan_is_built(toy, monkeyp
     assert checked == [layer, layer]
 
 
-def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy):
+def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy, a_load):
     """A load on another thread may take a placeholder while a refusal
     names them: the refusal names those it read, and raises nothing else."""
     toy()
