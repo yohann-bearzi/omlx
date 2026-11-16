@@ -450,9 +450,16 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
     switch = FormatSwitchLinear("toy", 8, 1, k, stack, bias=bias)
     assert _equal(model.switch(rows, indices), switch(rows, indices))
     if when == "after":
-        # Float16 activations meet the recast float16 bias: float16 out.
-        assert model.linear(x.astype(mx.float16)).dtype == mx.float16
-        assert model.switch(rows.astype(mx.float16), indices).dtype == mx.float16
+        # Float16 activations meet the recast float16 bias: float16 out, the
+        # values of layers built from the checkpoint's tensors and that bias.
+        half = bias.astype(mx.float16)
+        x16, rows16 = x.astype(mx.float16), rows.astype(mx.float16)
+        linear = FormatLinear("toy", 8, 1, k, matrix, bias=half[0])
+        assert _equal(model.linear(x16), linear(x16))
+        assert model.linear(x16).dtype == mx.float16
+        switch = FormatSwitchLinear("toy", 8, 1, k, stack, bias=half)
+        assert _equal(model.switch(rows16, indices), switch(rows16, indices))
+        assert model.switch(rows16, indices).dtype == mx.float16
     # Through the face: one launch each, none failed.
     assert len(kernels._PROOFS) == 2
     assert all(p.ran and not p.failed for p in kernels._PROOFS.values())

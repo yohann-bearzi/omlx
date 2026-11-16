@@ -9,9 +9,11 @@ layer's whole stack, its ``gather_mm``.
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 import operator
+import pickle
 import re
 import threading
 import weakref
@@ -2582,9 +2584,18 @@ def test_a_recast_of_the_model_casts_a_format_layer_s_bias_alone(
     assert model["_private"] is private
     assert _equal(model.linear(x), before[0])
     assert _equal(model.switch(rows, indices), before[1])
-    # Float16 activations meet a float16 bias: float16 out, through the face.
-    assert model.linear(x.astype(mx.float16)).dtype == mx.float16
-    assert model.switch(rows.astype(mx.float16), indices).dtype == mx.float16
+    # Float16 activations meet a float16 bias: float16 out, through the face,
+    # the values of layers built from the same tensors and bias.
+    x16, rows16 = x.astype(mx.float16), rows.astype(mx.float16)
+    for name, layer_cls, inputs in (
+        ("linear", FormatLinear, (x16,)),
+        ("switch", FormatSwitchLinear, (rows16, indices)),
+    ):
+        layer = model[name]
+        tensors = {key: layer[key] for key in ("weight", "scales")}
+        built = layer_cls("toy", 8, 1, 320, tensors, bias=layer["bias"])
+        out = layer(*inputs)
+        assert out.dtype == mx.float16 and _equal(out, built(*inputs))
     # The launches of before: no other proof, none failed.
     assert set(kernels._PROOFS) == proofs and len(proofs) == 2
     assert all(p.ran and not p.failed for p in kernels._PROOFS.values())
@@ -2615,7 +2626,7 @@ def test_the_page_says_a_layer_over_placeholders_refuses_to_compute():
     )
 
 
-def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
+def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy, monkeypatch):
     """A layer built for a load holds placeholders: an array of another
     shape or dtype does not replace one, nor does the very array it holds,
     and until each is replaced the layer refuses to compute, whatever route
@@ -2636,6 +2647,8 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
         return f"^{re.escape(refusal + placeholders)}$"
 
     lacking = refused("weight (never loaded), scales (never loaded)")
+    faces, dot = [], _ToyFormat.dot
+    monkeypatch.setattr(_ToyFormat, "dot", lambda self, *a: faces.append(a))
     for compute in (
         lambda: layer(x),
         layer._decoded,
@@ -2643,9 +2656,20 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
     ):
         with pytest.raises(ValueError, match=lacking):
             compute()
+    # Refused before its format is asked for a face.
+    assert faces == []
+    monkeypatch.setattr(_ToyFormat, "dot", dot)
     # The array it holds, assigned again, is no load.
     layer["weight"] = layer["weight"]
     with pytest.raises(ValueError, match=lacking):
+        layer(x)
+    # The tensor named is the one offered.
+    layer["weight"] = codes[:8]
+    weight = (
+        "weight (offered (8, 320) mlx.core.uint8, not the layout's (36, 320) "
+        "mlx.core.uint8), scales (never loaded)"
+    )
+    with pytest.raises(ValueError, match=refused(weight)):
         layer(x)
     # The last array offered in another dtype or shape is named.
     layer["scales"] = scales.astype(mx.float16)
@@ -2665,6 +2689,14 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
     )
     with pytest.raises(ValueError, match=refused(offered)):
         layer(x)
+    # As many elements, in another shape.
+    layer["scales"] = scales.reshape(36, 1)
+    offered = (
+        "scales (offered (36, 1) mlx.core.float32, not the layout's (36,) "
+        "mlx.core.float32)"
+    )
+    with pytest.raises(ValueError, match=refused(offered)):
+        layer(x)
     layer["scales"] = scales
     assert _equal(layer(x), want)
     # Loaded, it takes an array of its shape and dtype, and no other; it
@@ -2677,6 +2709,65 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(toy):
     layer.set_dtype(mx.float16)
     assert layer["bias"].dtype == mx.float16
     assert _equal(layer(x), 2 * want)
+
+
+def _pending(toy):
+    """A layer built for a load, its scales offered in float16 (not taken),
+    its weight never loaded; its tensors and the refusal that names them."""
+    toy()
+    (codes, scales), x, want = _matrix(36, 320)
+    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+    layer["scales"] = scales.astype(mx.float16)
+    refusal = re.escape(
+        "weight (never loaded), scales (offered (36,) mlx.core.float16, not the "
+        "layout's (36,) mlx.core.float32)"
+    )
+    return layer, (codes, scales), x, want, refusal
+
+
+def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, monkeypatch):
+    """A call on another thread that finds no placeholder finds the tensor:
+    the load stores it first."""
+    layer, (codes, scales), _, _, _ = _pending(toy)
+    store, seen = nn.Module.__setitem__, []
+
+    def stored(self, key, value):
+        if self is layer:
+            seen.append((key, key in layer._placeholders))
+        return store(self, key, value)
+
+    monkeypatch.setattr(nn.Module, "__setitem__", stored)
+    layer["scales"] = scales
+    assert seen == [("scales", True)] and "scales" not in layer._placeholders
+
+
+@pytest.mark.parametrize(
+    "copied",
+    [copy.deepcopy, lambda layer: pickle.loads(pickle.dumps(layer))],
+    ids=["deepcopy", "pickle"],
+)
+def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(toy, copied):
+    layer, (codes, scales), x, want, refusal = _pending(toy)
+    clone = copied(layer)
+    with pytest.raises(ValueError, match=refusal):
+        clone(x)
+    clone["weight"], clone["scales"] = codes, scales
+    assert _equal(clone(x), want)
+    with pytest.raises(ValueError, match=refusal):
+        layer(x)
+
+
+def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy):
+    """copy.copy shares the tensors and not the record of placeholders: the
+    original, never loaded, still refuses."""
+    layer, (codes, scales), x, want, refusal = _pending(toy)
+    clone = copy.copy(layer)
+    assert clone["weight"] is layer["weight"]
+    clone["weight"], clone["scales"] = codes, scales
+    assert _equal(clone(x), want)
+    with pytest.raises(ValueError, match=refusal):
+        layer(x)
 
 
 def test_a_layer_s_placeholders_are_checked_where_its_plan_is_built(toy, monkeypatch):

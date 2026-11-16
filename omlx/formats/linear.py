@@ -553,17 +553,30 @@ class _FormatLayer(nn.Module):
         # Over a tensor of the format the layer holds: an array of its shape
         # and dtype replaces it (a placeholder is then loaded), any other is
         # not taken, and the very array it holds changes nothing.
+        self.__dict__.pop(_KEPT, None)
         held = self.get(key)
         if held is not None and key in self._tensors:
             if value is held:
                 return
             if value.shape != held.shape or value.dtype != held.dtype:
                 if key in self._placeholders:
-                    self._placeholders[key] = (value.shape, value.dtype)
+                    # The dtype's name: a Dtype neither pickles nor copies.
+                    self._placeholders[key] = (value.shape, str(value.dtype))
                 return
+            # Stored before its placeholder is cleared: a call on another
+            # thread that finds no placeholder finds the tensor.
+            super().__setitem__(key, value)
             self._placeholders.pop(key, None)
-        self.__dict__.pop(_KEPT, None)
+            return
         super().__setitem__(key, value)
+
+    def __copy__(self) -> _FormatLayer:
+        """A copy with a record of placeholders of its own: a load into one
+        of the two loads nothing into the other."""
+        clone = type(self).__new__(type(self))
+        dict.update(clone, self)
+        clone.__dict__.update(self.__dict__, _placeholders=dict(self._placeholders))
+        return clone
 
     def refuse_placeholders(self) -> None:
         """Raise while a tensor of the format still holds the load's
