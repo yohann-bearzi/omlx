@@ -403,6 +403,66 @@ def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
     ]
 
 
+def test_what_a_checkpoint_of_a_plugin_that_did_not_load_is_told(plugins, caplog):
+    def partly():
+        # A plugin of two modes whose import fails after its first.
+        formats.register(_Format("also"))
+        raise ImportError("no module named its_codec")
+
+    first = _Entry("alpha", _Format("oqel", contract=formats.CONTRACT + 1))
+    first.dist = SimpleNamespace(name="omlx-alpha", version="2.0.0")
+    plugins += [
+        first,
+        # Another plugin of the mode that fails after it is not what is said.
+        _Entry("zeta", _Format("oqel", contract=0)),
+        _Entry("partly", partly),
+        # One that fails for a mode a later plugin registers.
+        _Entry("beta", _Format("good", contract=formats.CONTRACT + 1)),
+        _Entry("gamma", _Format("good")),
+        # One that fails because an earlier plugin has its mode.
+        _Entry("omega", _Format("good")),
+    ]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        formats.load()
+    assert set(formats._SKIPPED) == {"oqel", "also"}
+    assert formats._SKIPPED["oqel"].startswith(
+        "omlx-alpha 2.0.0 is installed but did not load: quant format 'oqel' is "
+        "written for revision"
+    )
+    assert formats._SKIPPED["also"] == (
+        "partly:FORMAT is installed but did not load: no module named its_codec"
+    )
+    assert formats.get("good") is not None and formats.get("also") is None
+
+
+def test_only_the_thread_that_loads_the_builtins_takes_an_mlx_mode(plugins):
+    import threading
+
+    formats._REGISTERING_BUILTINS.registering = True
+    refused = []
+
+    def by_hand():
+        try:
+            formats.register(_Format("mxfp4"))
+        except ValueError as error:
+            refused.append(str(error))
+
+    try:
+        worker = threading.Thread(target=by_hand)
+        worker.start()
+        worker.join(60)
+    finally:
+        formats._REGISTERING_BUILTINS.registering = False
+    assert refused and "is one of MLX's own modes" in refused[0]
+
+
+def test_what_is_one_of_mlx_s_modes():
+    for mode in ("affine", "mxfp4", "mxfp8", "nvfp4"):
+        assert formats._mlx_runs(mode)
+    for mode in ("oqel", "", None, 4):
+        assert not formats._mlx_runs(mode)
+
+
 @pytest.mark.parametrize("mode", ["affine", "mxfp4", "mxfp8", "nvfp4"])
 def test_mlx_s_own_modes_are_the_builtin_formats(plugins, monkeypatch, caplog, mode):
     refused = (

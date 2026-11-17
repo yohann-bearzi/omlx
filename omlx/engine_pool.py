@@ -4386,6 +4386,9 @@ class EnginePool:
                     try:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
+                        if isinstance(fallback_error, FormatRefusedError):
+                            # The other library's load of it was refused.
+                            raise
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
                             f"VLM fallback also failed: {fallback_error}"
@@ -4422,6 +4425,9 @@ class EnginePool:
                     try:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
+                        if isinstance(fallback_error, FormatRefusedError):
+                            # The other library's load of it was refused.
+                            raise
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
                             f"LLM fallback also failed: {fallback_error}"

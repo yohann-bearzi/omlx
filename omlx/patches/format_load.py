@@ -64,6 +64,9 @@ _LOADERS = (
     ("mlx_embeddings.utils", "load_model"),
 )
 
+# What a config holds nothing at (a key it has not), apart from a null.
+_ABSENT = object()
+
 # A value of config.json by its JSON type.
 _JSON_TYPES = {
     list: "an array",
@@ -94,7 +97,11 @@ class _Checkpoint:
 
     def __init__(self, path) -> None:
         self.path = Path(path)
-        self._config = None
+        # A view of links to a checkpoint's files (a family's loader's, a
+        # decision model's) is named by the checkpoint its config is.
+        config = self.path / "config.json"
+        self.shown = config.resolve().parent if config.is_symlink() else self.path
+        self._config = _ABSENT
         self._read: dict[str, formats.QuantFormat] = {}
         self.built: list[nn.Module] = []
 
@@ -105,15 +112,16 @@ class _Checkpoint:
         read = self._read.get(fmt.mode)
         if read is None:
             plugin = formats.origin(fmt.mode) or "the plugin"
+            record = self._record(fmt.mode)
             kept = _state(fmt)
             try:
-                read = fmt.accept(self._record(fmt.mode))
-            except FormatRefusedError:
-                raise
+                read = fmt.accept(record)
             except ValueError as error:
-                # The format's own words, on the registered format as it was.
+                # The format's own words, on the registered format as it was,
+                # with what oMLX knows of the checkpoint.
                 _restore(fmt, kept)
-                raise _refused(str(error), fmt.mode, self) from error
+                said = error.reason if isinstance(error, FormatRefusedError) else error
+                raise _refused(str(said), fmt.mode, self) from error
             except Exception:
                 _restore(fmt, kept)
                 raise
@@ -145,21 +153,25 @@ class _Checkpoint:
 
     def _written(self, mode: str):
         """What the checkpoint's config keeps of ``mode``'s format, as it is
-        (None for nothing), and the JSON path to it."""
-        if self._config is None:
+        (``_ABSENT`` for nothing), and the JSON path to it."""
+        if self._config is _ABSENT:
             self._config = json.loads((self.path / "config.json").read_text())
         kept, where = self._config, "config.json"
         for key in ("omlx_quant_formats", mode):
             if not isinstance(kept, dict):
                 return kept, where
-            kept, where = kept.get(key), f"{where}[{key!r}]"
+            kept, where = kept.get(key, _ABSENT), f"{where}[{key!r}]"
         return kept, where
+
+    def records(self, mode: str) -> bool:
+        """Whether the checkpoint's config keeps anything of ``mode``'s format."""
+        return self._written(mode)[0] is not _ABSENT
 
     def _record(self, mode: str) -> dict:
         """The record oQ stored for ``mode``; an empty one for a checkpoint
         written before formats had records, or by another writer."""
         written, where = self._written(mode)
-        if written is None:
+        if written is _ABSENT:
             return {}
         if isinstance(written, dict):
             written, where = written.get("record", {}), f"{where}['record']"
@@ -177,11 +189,14 @@ class _Checkpoint:
         try:
             written, _ = self._written(mode)
         except (OSError, ValueError):
-            written = None
-        if not isinstance(written, dict) or "plugin" not in written:
-            return "an unknown writer"
-        plugin = written["plugin"]
-        return plugin if isinstance(plugin, str) else "a format registered by hand"
+            written = _ABSENT
+        plugin = written.get("plugin", _ABSENT) if isinstance(written, dict) else _ABSENT
+        if plugin is None:
+            # oQ records a format registered by hand as null.
+            return "a format registered by hand"
+        if isinstance(plugin, str) and plugin.strip():
+            return plugin
+        return "an unknown writer"
 
     def check(self, loaded) -> None:
         """Refuse, whatever ``strict`` the load had, a load that returns
@@ -247,7 +262,7 @@ class _Checkpoint:
         """The layers the checkpoint's quantization config names in a mode
         that is not MLX's, with that mode."""
         try:
-            if self._config is None:
+            if self._config is _ABSENT:
                 self._config = json.loads((self.path / "config.json").read_text())
         except OSError:
             # A loader handed what is no checkpoint's directory: it names
@@ -393,10 +408,23 @@ def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
     return FormatRefusedError(
         reason,
         mode=mode,
-        path=checkpoint.path,
+        path=checkpoint.shown,
         written=checkpoint.writer(mode),
         installed=installed,
     )
+
+
+def _recorded(mode) -> bool:
+    """Whether the checkpoint loading on this thread records a format of
+    ``mode`` in its config."""
+    checkpoint = formats._LOADING.get()
+    if checkpoint is None:
+        return False
+    try:
+        return checkpoint.records(mode)
+    except OSError:
+        # A loader handed what is no checkpoint's directory.
+        return False
 
 
 def _not_installed(mode) -> str:
@@ -443,10 +471,16 @@ def _format_layer(layer, layer_cls, signature, arguments):
             layout = read.layout(k, n, bits, group_size)
         fmt = read
     if layout is None:
+        if not isinstance(mode, str):
+            # MLX's to refuse.
+            return None
+        if fmt is None and (_recorded(mode) or not formats._mlx_runs(mode)):
+            # No format reads it: one of MLX's modes too when the checkpoint
+            # records a format of it (written before MLX's modes were the
+            # built-ins' only, or by a newer oMLX).
+            raise _refused(_not_installed(mode), mode)
         if formats._mlx_runs(mode):
             return None
-        if fmt is None:
-            raise _refused(_not_installed(mode), mode)
         raise _refused(
             f"it lays out no ({n}, {k}) matrix of {bits} bits in groups of "
             f"{group_size}",

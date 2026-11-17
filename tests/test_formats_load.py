@@ -306,6 +306,32 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
         )
 
 
+def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path):
+    # Written before MLX's modes were the built-ins' only, or by a newer oMLX
+    # whose built-in format of the mode this one has not.
+    entry = {"plugin": "shadow 0.1.0", "contract": 1, "record": {}}
+    (tmp_path / "config.json").write_text(
+        json.dumps({"omlx_quant_formats": {"mxfp4": entry}})
+    )
+    with (
+        format_load.loading(tmp_path),
+        pytest.raises(formats.FormatRefusedError) as no,
+    ):
+        nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode="mxfp4")
+    assert no.value.reason == "no format of this mode is installed: install shadow 0.1.0"
+    # A checkpoint that records none of it is MLX's, and so is a load of
+    # what is no checkpoint's directory.
+    (tmp_path / "config.json").write_text("{}")
+    for path in (tmp_path, tmp_path / "none"):
+        with format_load.loading(path):
+            layer = nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode="mxfp4")
+        assert type(layer) is nn.QuantizedLinear
+    # So is a mode that is no string: MLX refuses it in its own words.
+    with pytest.raises(ValueError) as mlx_s:
+        nn.Linear(64, 16).to_quantized(mode=None)
+    assert type(mlx_s.value) is not formats.FormatRefusedError
+
+
 def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(toy, tmp_path):
     # Installed, and skipped when the registry loaded (here for the revision
     # of the contract it is written for).
@@ -594,13 +620,30 @@ def _kept_record(record):
     "config, where, kind",
     [
         ([], "", "an array"),
+        (None, "", "null"),
         ({"omlx_quant_formats": []}, "['omlx_quant_formats']", "an array"),
+        ({"omlx_quant_formats": None}, "['omlx_quant_formats']", "null"),
         ({"omlx_quant_formats": {"toy": "v1"}}, _ENTRY, "a string"),
+        ({"omlx_quant_formats": {"toy": None}}, _ENTRY, "null"),
         (_kept_record(None), f"{_ENTRY}['record']", "null"),
         (_kept_record([1]), f"{_ENTRY}['record']", "an array"),
         (_kept_record(2.5), f"{_ENTRY}['record']", "a number"),
+        (_kept_record(3), f"{_ENTRY}['record']", "a number"),
+        (_kept_record(True), f"{_ENTRY}['record']", "a boolean"),
     ],
-    ids=["config", "formats", "entry", "null", "array", "number"],
+    ids=[
+        "config",
+        "config null",
+        "formats",
+        "formats null",
+        "entry",
+        "entry null",
+        "null",
+        "array",
+        "number",
+        "integer",
+        "boolean",
+    ],
 )
 def test_a_record_that_is_not_an_object_is_refused(toy, tmp_path, config, where, kind):
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -613,11 +656,76 @@ def test_a_record_that_is_not_an_object_is_refused(toy, tmp_path, config, where,
         written="omlx-toy 0.3.1" if "record" in where else "an unknown writer",
     )
     assert toy.accepted == []
-    if kind == "null":
+    if kind == "null" and "record" in where:
         quoted = str(no.value).replace(str(tmp_path), "/models/my-model")
         quoted = quoted.replace("omlx-toy 0.3.1", "my-package 0.1.0")
         quoted = quoted.replace("a format registered by hand", "my-package 0.1.0")
         assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+
+
+def test_what_the_checkpoint_says_of_its_writer(toy, tmp_path):
+    # oQ records a format registered by hand as null; anything else that
+    # names no plugin is an unknown writer.
+    for plugin, said in (
+        (None, "a format registered by hand"),
+        ("omlx-toy 0.3.1", "omlx-toy 0.3.1"),
+        ("", "an unknown writer"),
+        ("  ", "an unknown writer"),
+        (123, "an unknown writer"),
+        (False, "an unknown writer"),
+    ):
+        entry = {"plugin": plugin, "record": {"layout": 2}}
+        config = {"omlx_quant_formats": {"toy": entry}}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert format_load._Checkpoint(tmp_path).writer("toy") == said
+    # A directory without a config.
+    assert format_load._Checkpoint(tmp_path / "none").writer("toy") == (
+        "an unknown writer"
+    )
+
+
+def test_a_checkpoint_reads_its_config_once(toy, tmp_path):
+    (tmp_path / "config.json").write_text(json.dumps(_kept_record({"levels": [1]})))
+    checkpoint = format_load._Checkpoint(tmp_path)
+    assert checkpoint._record("toy") == {"levels": [1]}
+    (tmp_path / "config.json").write_text(json.dumps(_kept_record({"levels": [2]})))
+    assert checkpoint._record("toy") == {"levels": [1]}
+    # Read outside any load, a refusal still names the checkpoint.
+    (tmp_path / "config.json").write_text(json.dumps(_kept_record([1])))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        format_load._Checkpoint(tmp_path).read(toy)
+    assert refusal.value.path == tmp_path
+    # A config that is not JSON is the library's error, not the format's.
+    (tmp_path / "config.json").write_text("{")
+    with pytest.raises(json.JSONDecodeError):
+        format_load._Checkpoint(tmp_path).read(toy)
+
+
+def test_a_refusal_in_a_view_of_links_names_the_checkpoint(toy, tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(_kept_record([1])))
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").symlink_to(source / "config.json")
+    with format_load.loading(view), pytest.raises(formats.FormatRefusedError) as no:
+        nn.Linear(64, 128).to_quantized(**_TOY)
+    assert no.value.path == source
+
+
+def test_a_format_s_own_refusal_names_the_checkpoint(toy, tmp_path):
+    def refusing(record):
+        raise formats.FormatRefusedError("written in layout 2", mode="toy")
+
+    toy.reads = refusing
+    _llama(tmp_path, **_written({"layout": 2}))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path)
+    assert str(refusal.value) == _refusal("written in layout 2", tmp_path)
+    assert refusal.value.path == tmp_path
+    # What it knows of nothing else.
+    bare = formats.FormatRefusedError("why", mode="toy")
+    assert (bare.path, bare.written, bare.installed) == (None, None, None)
 
 
 class _Other(_Loadable):
@@ -767,19 +875,22 @@ def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
     assert len(toy.accepted) == 1
 
 
-def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(toy, tmp_path):
+def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(
+    toy, tmp_path, monkeypatch
+):
     import types
 
     _llama(tmp_path, **_written({"levels": [1.0]}))
     toy.reads = lambda record: _Levels(record["levels"])
+    monkeypatch.setitem(formats._FORMATS, "toy2", _Loadable("toy2"))
     load = mlx_lm.utils.load_model
 
     def with_a_stranger(path, **kwargs):
         # Another checkpoint's layer, quantized by hand inside this one's load
         # (as a loader bound before the patch would): it reads this one's
-        # record.
-        stranger = nn.Linear(64, 128).to_quantized(**_TOY)
-        assert stranger.fmt.levels == (1.0,)
+        # record, here of another format than the checkpoint's own layer.
+        stranger = nn.Linear(64, 128).to_quantized(bits=8, group_size=1, mode="toy2")
+        assert type(stranger) is FormatLinear
         return load(path, **kwargs)
 
     module = types.ModuleType("stranger")
@@ -787,12 +898,14 @@ def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(toy, tmp_path):
     format_load._wrap_loader(module, "load_model")
     with pytest.raises(formats.FormatRefusedError) as refusal:
         module.load_model(tmp_path)
-    assert str(refusal.value) == _refusal(
+    said = _refusal(
         "1 layers were built while the checkpoint loaded, and are not in its "
         "model: they were another checkpoint's, read with this one's record; load "
         "each checkpoint with the libraries' load_model",
         tmp_path,
+        written="an unknown writer",
     )
+    assert str(refusal.value) == said.replace("'toy'", "'toy2'")
 
 
 def _rewritten(path, change):

@@ -1577,6 +1577,37 @@ class TestVLMFallback:
         assert "fallback" not in str(excinfo.value)
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("force_lm", [False, True], ids=["vlm", "force_lm"])
+    async def test_a_quant_format_refusal_on_the_fallback_load_surfaces_as_is(
+        self, small_mock_model_dir, force_lm
+    ):
+        """The first library fails before it reaches the layers; the other
+        one's load is refused: that refusal surfaces, not a RuntimeError."""
+        from omlx.formats import FormatRefusedError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        refusal = FormatRefusedError("written in layout 2", mode="myformat")
+        first, second = MagicMock(), MagicMock()
+        first.start = AsyncMock(side_effect=TypeError("ModelArgs mismatch"))
+        first.stop = AsyncMock()
+        second.start = AsyncMock(side_effect=refusal)
+        first_cls = "BatchedEngine" if force_lm else "VLMBatchedEngine"
+        second_cls = "VLMBatchedEngine" if force_lm else "BatchedEngine"
+        with (
+            patch(f"omlx.engine_pool.{first_cls}", return_value=first),
+            patch(f"omlx.engine_pool.{second_cls}", return_value=second),
+            pytest.raises(ModelUnavailableError) as excinfo,
+        ):
+            await pool._load_engine("model-a", force_lm=force_lm)
+
+        assert excinfo.value.__cause__ is refusal
+
+
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
 

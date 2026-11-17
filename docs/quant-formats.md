@@ -14,7 +14,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 
 | File | What it holds |
 |---|---|
-| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot`, `Tile` |
+| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot`, `Tile`, `FormatRefusedError` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/linear.py` | the layers that hold a format's tensors |
 | `omlx/patches/format_load.py` | what loads a format's checkpoint into them |
@@ -73,7 +73,7 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - MLX's own modes (`affine`, `mxfp4`, `mxfp8`, `nvfp4`, any mode `mx.quantize` takes) are oMLX's built-in formats' only: a checkpoint of one of them loads as MLX's layers wherever no built-in format lays its matrix out. Another format under one is refused: `quant format 'mxfp4': 'mxfp4' is one of MLX's own modes, which only oMLX's built-in formats take: register the format under a mode of its own`.
 - Plugins register in the order of their entry points' names, then of their values (`my_package:FORMAT`). Of two that claim one mode, the first is kept.
 - A plugin is logged when it is loaded, with the distribution that installed it and the modes it registered: `quant format plugin myformat (my-package 0.1.0) registered myformat`.
-- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts. A checkpoint of the mode it would have registered is then refused with what failed: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: none): my-package 0.2.0 is installed but did not load: quant format 'myformat' is written for revision 2 of the format contract; this oMLX runs revision 1: update oMLX`.
+- A plugin that fails to import or to register is logged (`quant format plugin NAME (VALUE) failed to load`) and skipped, with every format registered while it loaded. The server still starts. A checkpoint of a mode it registered, or built a format of, before it failed is then refused with what failed (the first such plugin's, in the order plugins register; none once a later plugin registers the mode; a plugin whose import fails before it builds a format names no mode, and its checkpoints are told to install the plugin they record): `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: none): my-package 0.2.0 is installed but did not load: quant format 'myformat' is written for revision 2 of the format contract; this oMLX runs revision 1: update oMLX`.
 - A plugin's module does not use the registry when it is imported: the entry point registers its format. A format that builds on another looks it up when it is asked for a face (`omlx.formats.get` in `dot()`). At import the registry may be loading: another plugin may not be registered yet, a module still half imported when its own entry point is read can fail to load (it is then skipped), and an import in one thread can deadlock with the first lookup in another.
 
 ## Decode
@@ -806,7 +806,7 @@ A test's `monkeypatch` is undone after the fixture's block ends, unless `monkeyp
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Table`, `FormatRefusedError`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints`, `omlx_iota` and `omlx_table`.
 

@@ -400,8 +400,10 @@ _LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
 _ORIGINS: dict[str, str] = {}
 # Each mode of an installed plugin that did not load: what is said of it.
 _SKIPPED: dict[str, str] = {}
-# Set on the thread that registers the built-in formats, while it does.
+# Set on the thread that registers the built-in formats, while it does; and,
+# on the thread that loads an installed plugin, the modes it registers.
 _REGISTERING_BUILTINS = threading.local()
+_PLUGIN_MODES = threading.local()
 # Held for the whole load. Reentrant: the load registers through register(),
 # which loads first.
 _LOCK = threading.RLock()
@@ -419,6 +421,9 @@ def register(fmt: QuantFormat) -> None:
     mode, tensors = getattr(fmt, "mode", None), getattr(fmt, "tensors", None)
     if not isinstance(mode, str) or not mode:
         raise ValueError(f"quant format {fmt!r} has no mode")
+    modes = getattr(_PLUGIN_MODES, "modes", None)
+    if modes is not None:
+        modes.add(mode)
     _check_tensors(f"quant format {mode!r}", tensors)
     contract = getattr(fmt, "contract", None)
     if type(contract) is not int:
@@ -454,8 +459,8 @@ def load() -> None:
     order of their entry points' names, then values. A plugin is logged with
     its distribution and the modes it registered. One that fails to load is
     logged and skipped, with every format registered while it loaded:
-    its checkpoints then fail to load with an unknown mode, everything else
-    is served. A built-in that fails to load is oMLX's own defect and raises,
+    a checkpoint of a mode it registered, or built a format of, is then
+    refused with its error, everything else is served. A built-in that fails to load is oMLX's own defect and raises,
     here and at every later lookup.
 
     A lookup the loading thread makes while the load runs sees the formats
@@ -482,17 +487,17 @@ def load() -> None:
                 before = set(_FORMATS)
                 dist = getattr(entry, "dist", None)
                 plugin = f"{dist.name} {dist.version}" if dist else entry.value
-                fmt = None
+                _PLUGIN_MODES.modes = tried = set()
                 try:
-                    fmt = entry.load()
-                    register(fmt)
+                    register(entry.load())
                 except Exception as error:
                     for mode in _FORMATS.keys() - before:
                         del _FORMATS[mode]
-                    mode = getattr(fmt, "mode", None)
-                    if isinstance(mode, str):
-                        _SKIPPED[mode] = (
-                            f"{plugin} is installed but did not load: {error}"
+                    # What a checkpoint of each mode it would have registered
+                    # is told, unless a plugin before it has one or said why.
+                    for mode in sorted(tried - _FORMATS.keys()):
+                        _SKIPPED.setdefault(
+                            mode, f"{plugin} is installed but did not load: {error}"
                         )
                     logger.exception(
                         "quant format plugin %s (%s) failed to load",
@@ -502,6 +507,8 @@ def load() -> None:
                 else:
                     modes = sorted(_FORMATS.keys() - before)
                     _ORIGINS.update(dict.fromkeys(modes, plugin))
+                    for mode in modes:
+                        _SKIPPED.pop(mode, None)
                     logger.info(
                         "quant format plugin %s (%s) registered %s",
                         entry.name,
@@ -515,11 +522,15 @@ def load() -> None:
 
 @cache
 def _mlx_runs(mode) -> bool:
-    """Whether ``mode`` is one of MLX's own."""
-    try:
-        mx.quantize(mx.zeros((1, 64)), mode=mode)
-    except ValueError:
+    """Whether ``mode`` is one of MLX's own: one ``mx.quantize`` does not
+    call invalid, whatever else it finds wrong with a one-weight matrix (on
+    the CPU: no GPU state is made for it)."""
+    if not isinstance(mode, str):
         return False
+    try:
+        mx.quantize(mx.zeros((1, 1)), mode=mode, stream=mx.cpu)
+    except ValueError as error:
+        return "Invalid quantization mode" not in str(error)
     return True
 
 
