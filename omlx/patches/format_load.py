@@ -71,6 +71,10 @@ _LOADERS = (
 # What a config holds nothing at (a key it has not), apart from a null.
 _ABSENT = object()
 
+# Whether this process has built a format layer: until it has, no load
+# holds one to check.
+_BUILT_ANY = False
+
 # Held while a format accepts a checkpoint's record: a load's threads (one
 # that copied its context) accept it once, and no two accepts of a format
 # run at once.
@@ -250,7 +254,7 @@ class _Checkpoint:
             )
         for layer in self.built:
             path = paths[id(layer)]
-            placeholders = layer._placeholders
+            placeholders = layer._placeholders[0]
             left = [name for name, held in placeholders.items() if layer[name] is held]
             if left and len(left) < len(placeholders):
                 raise _refused(
@@ -392,27 +396,27 @@ def _restore(fmt, kept: dict, changed: list[str]) -> None:
             value[:] = held
 
 
-def check_loaded(model, path=None) -> None:
-    """At the end of oMLX's own load of ``model`` from the checkpoint at
-    ``path``, once what this process does not hold is dropped (a pipeline
-    rank's other layers, a prefill helper's later ones): refuse a format
-    layer it still holds with a placeholder, which no tensor of the
-    checkpoint filled. The layers let their placeholders go."""
-    if not isinstance(model, nn.Module):
+def check_loaded(model) -> None:
+    """At the end of oMLX's own load of ``model``, once what this process does
+    not hold is dropped (a pipeline rank's other layers, a prefill helper's
+    later ones): refuse a format layer it still holds with a placeholder,
+    which no tensor of its checkpoint filled. The layers let their
+    placeholders go, each once (two threads checking one model)."""
+    if not _BUILT_ANY or not isinstance(model, nn.Module):
+        # No process that built no format layer walks a model.
         return
     for name, module in model.named_modules():
-        held = getattr(module, "_placeholders", None)
+        held = module.__dict__.pop("_placeholders", None)
         if held is None:
             continue
-        left = [tensor for tensor, kept in held.items() if module[tensor] is kept]
+        tensors, checkpoint = held
+        left = [tensor for tensor, kept in tensors.items() if module[tensor] is kept]
         if left:
             reason = (
                 f"the loaded model holds {name} without its {', '.join(left)}: the "
                 "checkpoint holds no such tensor, or holds it under another name"
             )
-            checkpoint = _Checkpoint(path) if path is not None else None
             raise _refused(reason, module.mode, checkpoint)
-        object.__delattr__(module, "_placeholders")
 
 
 @contextmanager
@@ -597,8 +601,11 @@ def _format_layer(layer, layer_cls, signature, arguments):
     }
     built = layer_cls(fmt, bits, group_size, k, tensors, layer.get("bias"))
     checkpoint.built.append(built)
-    # Its placeholders, until oMLX's own load has checked them (check_loaded).
-    object.__setattr__(built, "_placeholders", tensors)
+    # Its placeholders and its checkpoint, until oMLX's own load has checked
+    # them (check_loaded).
+    object.__setattr__(built, "_placeholders", (tensors, checkpoint))
+    global _BUILT_ANY
+    _BUILT_ANY = True
     return built
 
 

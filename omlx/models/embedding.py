@@ -448,7 +448,6 @@ class MLXEmbeddingModel:
             self.model = model_instance
             self.processor = tokenizer
             self._hidden_size = config.hidden_size
-            check_loaded(self.model, self.model_name)
             self._loaded = True
             self._using_native = True
             self._is_compiled = False
@@ -482,6 +481,8 @@ class MLXEmbeddingModel:
         if not self.audio_enabled:
             config["audio_config"] = None
         model = load_embedding_model(model_path, config=config)
+        # Before anything runs it: no forward computes on a placeholder.
+        check_loaded(model)
         processor = load_processor(model_path, add_detokenizer=False)
         model.max_input_length = context_length
 
@@ -497,7 +498,6 @@ class MLXEmbeddingModel:
         self._using_native = False
         self._detect_input_key_remapping()
         self._is_compiled = self._try_compile()
-        check_loaded(self.model, self.model_name)
         self._loaded = True
         logger.info(
             f"Embedding model loaded via mlx-vlm: {self.model_name} "
@@ -560,8 +560,9 @@ class MLXEmbeddingModel:
 
             self._using_native = False
             self._detect_input_key_remapping()
+            # Before the compile's warm-up runs it on a placeholder.
+            check_loaded(self.model)
             self._is_compiled = self._try_compile()
-            check_loaded(self.model, self.model_name)
             self._loaded = True
             logger.info(
                 f"Embedding model loaded successfully: {self.model_name} "

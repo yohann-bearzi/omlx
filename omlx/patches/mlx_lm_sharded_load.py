@@ -55,7 +55,7 @@ def _local_sharded_load(
     from omlx.patches.format_load import check_loaded
 
     # What this rank holds of the model, filled.
-    check_loaded(model, model_path)
+    check_loaded(model)
     # Lazy load plus a post-slice eval materialises only this rank's shard.
     mx.eval(model.parameters())
     # Synchronise processes to avoid timeout, as the original does.
@@ -69,7 +69,7 @@ def _wrap(original: Any) -> Any:
     @functools.wraps(original)
     def sharded_load_with_local_fallback(repo: Any, *args: Any, **kwargs: Any) -> Any:
         try:
-            return original(repo, *args, **kwargs)
+            loaded = original(repo, *args, **kwargs)
         except ValueError as error:
             if "MLX converted models" not in str(error) or not Path(repo).is_dir():
                 raise
@@ -79,6 +79,11 @@ def _wrap(original: Any) -> Any:
                 repo,
             )
             return _local_sharded_load(repo, *args, **kwargs)
+        from omlx.patches.format_load import check_loaded
+
+        # What this rank holds of the model, filled (mlx-lm's own load).
+        check_loaded(loaded[0])
+        return loaded
 
     sharded_load_with_local_fallback._omlx_local_fallback = True  # type: ignore[attr-defined]
     return sharded_load_with_local_fallback

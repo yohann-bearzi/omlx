@@ -853,10 +853,11 @@ class MLXRerankerModel:
                     config = self.model.config
                     self._num_labels = getattr(config, "num_labels", None)
 
+            # Before the compile's warm-up runs it on a placeholder.
+            check_loaded(self.model)
             # Try mx.compile for persistent Metal kernel caching
             self._is_compiled = self._try_compile()
 
-            check_loaded(self.model, self.model_name)
             self._loaded = True
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "

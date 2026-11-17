@@ -10090,6 +10090,7 @@ def _load_muse_spark_calibration_model(model_path):
     path = Path(model_path)
     kwargs = muse_spark_serving.load_kwargs(path, text_only=True)
     model, _ = mlx_lm.utils.load_model(path, lazy=True, strict=False, **kwargs)
+    check_loaded(model)
     return model, load_mlx_lm_tokenizer(path)
 
 
@@ -11828,7 +11829,7 @@ def _calibration_model(model_path, config, *, trust_remote_code=False):
                     trust_remote_code=trust_remote_code,
                     strict=False,
                 )
-                check_loaded(model, model_path)
+                check_loaded(model)
                 from mlx_lm.tokenizer_utils import load as load_tokenizer
 
                 tokenizer = load_tokenizer(Path(model_path))
@@ -12213,7 +12214,7 @@ def _measure_sensitivity(
                 trust_remote_code=trust_remote_code,
                 strict=False,
             )
-            check_loaded(model, model_path)
+            check_loaded(model)
             from mlx_lm.tokenizer_utils import load as load_tokenizer
 
             tokenizer = load_tokenizer(Path(model_path))
@@ -12693,7 +12694,7 @@ def _measure_sensitivity_from_quantized_model(
                 # Match the imatrix and non-proxy sensitivity load paths.
                 strict=False,
             )
-            check_loaded(model, model_path)
+            check_loaded(model)
             tokenizer = load_tokenizer(Path(model_path))
         else:
             # Mirror the main quantize path's MTP patch sequence so an

@@ -356,7 +356,7 @@ def main(argv: list[str] | None = None) -> int:
     mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
     lm = adapter.load_first(args.model, args.layers, args.a8_min_tokens)
     # The helper's first layers, filled.
-    check_loaded(lm, args.model)
+    check_loaded(lm)
 
     began = time.perf_counter()
     warm = np.arange(args.warm_tokens, dtype=np.int32) % 1000 + 3

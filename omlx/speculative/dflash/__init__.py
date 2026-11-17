@@ -181,7 +181,7 @@ def load_dflash_drafter(
     apply_format_load_patch()
     adaptive = resolve_verify_mode(verify_mode)
     model, kind = load_drafter(path, kind="dflash")
-    check_loaded(model, path)
+    check_loaded(model)
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
     cast = match_target_dtype(model, target_model)

@@ -24,6 +24,7 @@ import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
 from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
+from ..patches.format_load import check_loaded
 from ..utils.image import load_image
 from ..utils.model_loading import (
     lm_load_compat,
@@ -104,6 +105,7 @@ class DecisionBackbone:
                 model, processor = vlm_load(
                     str(files), trust_remote_code=self.trust_remote_code
                 )
+            check_loaded(model)
             tokenizer = processor.tokenizer
             self.image_processor = processor.image_processor
         else:

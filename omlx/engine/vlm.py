@@ -2122,7 +2122,7 @@ class VLMBatchedEngine(BaseEngine):
         )
         from ..patches.format_load import check_loaded
 
-        check_loaded(self._vlm_model, self._model_name)
+        check_loaded(self._vlm_model)
 
         from ..models.vlm import restore_bonsai_quantized_modules
 

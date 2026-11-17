@@ -1369,8 +1369,10 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     path = _without_gate(tmp_path / "partial")
     model, _ = load_model(path, strict=False)
     layer = model.model.layers[0].mlp.gate_proj
-    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+    with pytest.raises(formats.FormatRefusedError, match="without its weight") as no:
         format_load.check_loaded(model)
+    # Named by the checkpoint the layer was built for.
+    assert (no.value.path, no.value.written) == (path, "omlx-toy 0.3.1")
     # What this process does not hold is dropped before (a prefill helper's
     # later layers, a pipeline rank's others): no refusal.
     model.model.layers[0].mlp.gate_proj = nn.Linear(64, 128)
@@ -1381,10 +1383,34 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     _llama(full, **_written({}))
     model, _ = load_model(full)
     layer = model.model.layers[0].mlp.gate_proj
-    assert set(layer._placeholders) == {"weight", "scales"}
-    format_load.check_loaded(model, full)
+    assert set(layer._placeholders[0]) == {"weight", "scales"}
+    format_load.check_loaded(model)
     assert not hasattr(layer, "_placeholders")
-    format_load.check_loaded(model, full)
+    format_load.check_loaded(model)
+
+
+def test_a_process_that_built_no_format_layer_walks_no_model(monkeypatch):
+    monkeypatch.setattr(format_load, "_BUILT_ANY", False)
+
+    def walked(self):
+        raise AssertionError("a model walked")
+
+    monkeypatch.setattr(nn.Module, "named_modules", walked)
+    format_load.check_loaded(nn.Linear(4, 4))
+
+
+def test_a_refusal_of_a_drafter_is_no_misconfigured_toggle(monkeypatch):
+    from omlx.speculative import vlm_mtp
+
+    def refused(path, kind):
+        raise formats.FormatRefusedError("refused", mode="toy")
+
+    monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", refused)
+    with pytest.raises(formats.FormatRefusedError):
+        vlm_mtp.load_vlm_mtp_drafter("/models/drafter")
+    # Any other failure is one, logged.
+    monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", lambda path, kind: 1 / 0)
+    assert vlm_mtp.load_vlm_mtp_drafter("/models/drafter") is None
 
 
 def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
@@ -1403,32 +1429,55 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "speculative/vlm_mtp.py",
         "models/embedding.py",
         "models/reranker.py",
+        "models/d1.py",
+        "models/decision.py",
         "oq.py",
     ):
         tree = ast.parse((root / file).read_text())
-        calls[file] = sum(
-            isinstance(node, ast.Call)
+        checks = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
             and getattr(node.func, "id", getattr(node.func, "attr", None))
             == "check_loaded"
-            for node in ast.walk(tree)
-        )
-    # lm_load_compat (the LLM engine, its SpecPrefill draft, oMLX's LLM and
-    # decision wrappers, a causal reranker), the VLM engine, the cluster's
-    # loads after pipeline() (one rank's, and both progressive strategies),
-    # a prefill helper after keep_first, both drafters, the embedding
-    # model's three loads and the reranker's, oQ's three of mlx-vlm (its
-    # calibration and both sensitivity measures).
+        ]
+        # Each checks the model it loaded: a name or an item of one.
+        for call in checks:
+            (model,) = call.args
+            assert isinstance(model, ast.Name | ast.Attribute | ast.Subscript), file
+        calls[file] = len(checks)
+        # Before a compile's warm-up runs the model.
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            lines = {
+                getattr(node.func, "id", getattr(node.func, "attr", None)): node.lineno
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+            }
+            if "_try_compile" in lines and "check_loaded" in lines:
+                assert lines["check_loaded"] < lines["_try_compile"], function.name
+    # lm_load_compat (the LLM engine, its SpecPrefill draft, oMLX's LLM
+    # wrappers, a causal reranker), the VLM engine, the cluster's loads
+    # (mlx-lm's sharded load and the local fallback's, an architecture's own
+    # stage loader, both progressive strategies), a prefill helper after
+    # keep_first, both drafters, the embedding model's mlx-vlm and
+    # mlx-embeddings loads (its native one builds no quantized layer), the
+    # reranker's, the decision models' (d1, a vision backbone), and oQ's own
+    # (its calibration, both sensitivity measures, Muse Spark's calibration).
     assert calls == {
         "utils/model_loading.py": 1,
         "engine/vlm.py": 1,
-        "patches/mlx_lm_sharded_load.py": 1,
-        "cluster/progressive_loading.py": 2,
+        "patches/mlx_lm_sharded_load.py": 2,
+        "cluster/progressive_loading.py": 3,
         "prefill_helper/worker.py": 1,
         "speculative/dflash/__init__.py": 1,
         "speculative/vlm_mtp.py": 1,
-        "models/embedding.py": 3,
+        "models/embedding.py": 2,
         "models/reranker.py": 1,
-        "oq.py": 3,
+        "models/d1.py": 1,
+        "models/decision.py": 1,
+        "oq.py": 4,
     }
 
 

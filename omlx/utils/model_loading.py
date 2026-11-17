@@ -126,7 +126,7 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
     from ..patches.format_load import check_loaded
 
     loaded = load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
-    check_loaded(loaded[0], path_or_repo)
+    check_loaded(loaded[0])
     return loaded
 
 

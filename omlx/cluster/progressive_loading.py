@@ -144,6 +144,10 @@ def progressive_sharded_load(
                 pipeline_group or mx_module.distributed.init(),
                 engram_ssd_offload=engram_ssd_offload,
             )
+        from ..patches.format_load import check_loaded
+
+        # What the architecture's own loader holds of the model, filled.
+        check_loaded(model)
         if return_config:
             return model, tokenizer, metadata_config
         return model, tokenizer
@@ -222,7 +226,7 @@ def progressive_sharded_load(
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
         # What this rank holds of the model, filled.
-        check_loaded(model, model_path)
+        check_loaded(model)
         materialize_parameters_progressively(
             model.parameters(),
             mx_module=mx_module,
@@ -230,7 +234,7 @@ def progressive_sharded_load(
             progress=progress,
         )
     elif tensor_group is not None:
-        check_loaded(model, model_path)
+        check_loaded(model)
         # Fixed embeddings/head weights are replicated. Materialize them first;
         # each strategy then materializes, shards, evaluates and releases one
         # transformer layer before touching the next.

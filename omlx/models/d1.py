@@ -26,6 +26,7 @@ from mlx_vlm.models.d1_lfm3_vl.prompt import (
 )
 from mlx_vlm.utils import load as vlm_load
 
+from ..patches.format_load import check_loaded
 from ..utils.model_loading import materialize_lazy_state, maybe_apply_pre_load_patches
 from .decision import (
     ChunkSize,
@@ -77,6 +78,7 @@ class D1Model:
         model, processor = vlm_load(
             self.model_path, trust_remote_code=self.trust_remote_code
         )
+        check_loaded(model)
         materialize_lazy_state(model)
         model.attach_processor(processor)
         self.model = model
