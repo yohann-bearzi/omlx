@@ -14,6 +14,7 @@ import re
 import sys
 import textwrap
 import threading
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1103,6 +1104,31 @@ class _OneSlot(_Loadable):
     __slots__ = "level"
 
 
+class _SubSlotted(_Slotted):
+    """The slot is its parent's; one more is never set."""
+
+    __slots__ = ("unset",)
+
+
+class _WeakMixin:
+    __slots__ = ("__weakref__",)
+
+
+class _Weak(_WeakMixin, _Slotted):
+    pass
+
+
+class _Tagged(list):
+    """A list whose constructor takes something else first."""
+
+    def __init__(self, tag, items=()):
+        super().__init__(items)
+        self.tag = tag
+
+
+# Weak references to a format, held for a test.
+_REFERENCES: list = []
+
 # What accept does to the registered format, and the attributes the refusal
 # names (none: the load goes on).
 _ACCEPT_CHANGES = {
@@ -1134,8 +1160,21 @@ _ACCEPT_CHANGES = {
         "options",
         lambda fmt: fmt.options.update({"face": 1, "rows": 2}),
     ),
-    # A cache of faces gains keys from forwards on other threads.
-    "a key added": (None, lambda fmt: fmt.options.__setitem__("face", 1)),
+    # A record kept in a dict that was empty: the next checkpoint would read
+    # with it.
+    "a key added": ("options", lambda fmt: fmt.options.__setitem__("scale", 2.5)),
+    "a slot of the parent": ("level", lambda fmt: setattr(fmt, "level", 2)),
+    "an entry replaced by an equal one": (
+        "scales, table",
+        lambda fmt: (
+            fmt.table.__setitem__(0, float("0.5")),
+            fmt.scales.__setitem__("s", float("0.25")),
+        ),
+    ),
+    # What accept may do: none of it changes the format.
+    # Held while accept returns: the mixin's slot holds it.
+    "a weak reference": (None, lambda fmt: _REFERENCES.append(weakref.ref(fmt))),
+    "a list of another constructor": (None, lambda fmt: None),
 }
 
 
@@ -1144,8 +1183,15 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
     tmp_path, monkeypatch, unpatched, change
 ):
     formats.load()
-    fmt = _OneSlot() if change == "a slot named alone" else _Slotted()
+    classes = {
+        "a slot named alone": _OneSlot,
+        "a slot of the parent": _SubSlotted,
+        "a weak reference": _Weak,
+    }
+    fmt = classes.get(change, _Slotted)()
     fmt.table, fmt.options, fmt.level = [0.5, 1.5], {"rows": 1}, 1
+    fmt.tagged = _Tagged("tag", [1, 2])
+    fmt.scales = {"s": 0.25}
     fmt.tags, fmt.raw = {1}, bytearray(b"ab")
     # What no copy takes: a face's dtypes, a lock.
     fmt.faces = {"dtypes": (mx.float16,), "lock": threading.Lock()}
@@ -1169,7 +1215,7 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
     named = _ACCEPT_CHANGES.get(change, ("",))[0]
     if named is None:
         load_model(tmp_path)
-        assert fmt.options == {"rows": 1, "face": 1}
+        assert fmt.options == {"rows": 1} and fmt.tagged == [1, 2]
         return
     # A format's defect is its own error; a refusal is oMLX's.
     error = KeyError if change == "then fails" else formats.FormatRefusedError
@@ -1177,9 +1223,9 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
         load_model(tmp_path)
     if named:
         assert f"accept changed the registered format ({named})" in str(refusal.value)
-    options = {"rows": 1, "face": 1} if "key added" in change else {"rows": 1}
-    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], options, 1)
+    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], {"rows": 1}, 1)
     assert (fmt.tags, fmt.raw, fmt.faces) == ({1}, bytearray(b"ab"), faces)
+    assert fmt.scales == {"s": 0.25}
     assert not hasattr(fmt, "extra")
 
 
@@ -2267,6 +2313,7 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
 def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
     unpatched, monkeypatch
 ):
+    import time
     import types
     from importlib import _bootstrap
 
@@ -2275,30 +2322,36 @@ def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
         format_load, "_LOADERS", (*format_load._LOADERS, ("halfway", "load_model"))
     )
     module = types.ModuleType("halfway")
-    held, applied = threading.Event(), threading.Event()
+    held = threading.Event()
 
     def importing(then):
         # Another thread's import of it, begun before the patch was applied:
-        # not in sys.modules yet.
+        # not in sys.modules yet. It ends once the patch waits for it.
         with _bootstrap._ModuleLockManager("halfway"):
             held.set()
-            applied.wait(0.5)
+            lock = _bootstrap._module_locks["halfway"]()
+            deadline = time.monotonic() + 60
+            while not lock.waiters and time.monotonic() < deadline:
+                time.sleep(0.01)
             then()
+
+    def fails():
+        # A failed import leaves nothing in sys.modules.
+        sys.modules["halfway"] = types.ModuleType("halfway")
+        del sys.modules["halfway"]
 
     def ends():
         module.load_model = lambda path: None
         monkeypatch.setitem(sys.modules, "halfway", module)
 
-    for then, wrapped in ((lambda: None, False), (ends, True)):
+    for then, wrapped in ((fails, False), (ends, True)):
         format_load._PENDING.add("halfway")
         held.clear()
-        applied.clear()
         other = threading.Thread(target=importing, args=(then,))
         other.start()
         assert held.wait(60)
         # Waited for; a failed import left nothing, and is not imported here.
         format_load.apply_format_load_patch()
-        applied.set()
         other.join(60)
         assert ("halfway" in format_load._PENDING) is not wrapped
     assert _wrapped(module.load_model)
@@ -2313,6 +2366,26 @@ def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
         format_load.apply_format_load_patch()
     assert "mine" in format_load._PENDING
 
+
+def test_an_import_lock_in_a_deadlock_is_not_the_patch_s_failure(
+    unpatched, monkeypatch
+):
+    from importlib import _bootstrap
+
+    class Deadlocked:
+        def __init__(self, name):
+            pass
+
+        def __enter__(self):
+            raise _bootstrap._DeadlockError("deadlock detected by _ModuleLock")
+
+        def __exit__(self, *raised):
+            return False
+
+    monkeypatch.setattr(format_load._bootstrap, "_ModuleLockManager", Deadlocked)
+    format_load.apply_format_load_patch()
+    # The modules imported already are wrapped all the same.
+    assert all(_wrapped(getattr(module, name)) for module, name in _loaders())
 
 
 _EARLY = """

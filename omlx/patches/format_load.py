@@ -338,36 +338,44 @@ def _snapshot(value):
     face's dtypes or a lock would refuse); None for any other value."""
     if isinstance(value, dict):
         return dict(value)
-    if isinstance(value, (list, set)):
-        return type(value)(value)
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, set):
+        return set(value)
     if isinstance(value, bytearray):
         return bytes(value)
     return None
 
 
-def _state(fmt) -> dict:
-    """``fmt``'s attributes (its ``__dict__``'s and its slots'), each with
-    a ``_snapshot`` of it."""
+def _attributes(fmt) -> dict:
+    """``fmt``'s attributes: its ``__dict__``'s and its slots' (but the
+    instance dict's and the weak reference's slot a mixin may declare)."""
     names = set(getattr(fmt, "__dict__", {}))
     for cls in type(fmt).__mro__:
         slots = getattr(cls, "__slots__", ())
         names.update((slots,) if isinstance(slots, str) else slots)
-    state = {}
+    names -= {"__dict__", "__weakref__"}
+    attributes = {}
     for name in names:
         try:
-            value = object.__getattribute__(fmt, name)
+            attributes[name] = object.__getattribute__(fmt, name)
         except AttributeError:
+            # A slot never set.
             continue
-        state[name] = (value, _snapshot(value))
-    return state
+    return attributes
+
+
+def _state(fmt) -> dict:
+    """``fmt``'s attributes, each with a ``_snapshot`` of it."""
+    return {name: (value, _snapshot(value)) for name, value in _attributes(fmt).items()}
 
 
 def _differs(value, held) -> bool:
     """Whether the container ``value`` holds other than ``held``, its
-    ``_snapshot``. A key a dict gained is not counted: a format's cache of
-    faces gains them from forwards on other threads meanwhile."""
+    ``_snapshot``: an entry added, removed or replaced (a list's and a dict's
+    by identity, a set's and a bytearray's by equality)."""
     if isinstance(value, dict):
-        return any(
+        return len(value) != len(held) or any(
             key not in value or value[key] is not old for key, old in held.items()
         )
     if isinstance(value, list):
@@ -380,29 +388,27 @@ def _differs(value, held) -> bool:
 def _changed(fmt, kept: dict) -> list[str]:
     """The attributes of ``fmt`` that are not as ``kept`` (by ``_state``)
     has them: added, removed, rebound, or a container's contents."""
-    now = _state(fmt)
+    now = _attributes(fmt)
     return sorted(
         name
         for name in kept.keys() | now.keys()
         if name not in kept
         or name not in now
-        or now[name][0] is not kept[name][0]
-        or (kept[name][1] is not None and _differs(now[name][0], kept[name][1]))
+        or now[name] is not kept[name][0]
+        or (kept[name][1] is not None and _differs(now[name], kept[name][1]))
     )
 
 
 def _restore(fmt, kept: dict, changed: list[str]) -> None:
     """``fmt``'s ``changed`` attributes as ``kept`` (by ``_state``) has
-    them; a dict keeps the keys it gained."""
+    them."""
     for name in changed:
         if name not in kept:
             object.__delattr__(fmt, name)
             continue
         value, held = kept[name]
         object.__setattr__(fmt, name, value)
-        if isinstance(value, dict):
-            value.update(held)
-        elif isinstance(value, set):
+        if isinstance(value, (dict, set)):
             value.clear()
             value.update(held)
         elif held is not None:
@@ -841,7 +847,7 @@ def apply_format_load_patch() -> None:
     with _LOCK:
         if _FINDER not in sys.meta_path:
             sys.meta_path.insert(0, _FINDER)
-        pending = sorted(_PENDING)
+        pending = list(_PENDING)
     for name in pending:
         # An import of it on another thread may have begun before this patch
         # could see it, even before the module is in sys.modules: it is
@@ -850,7 +856,12 @@ def apply_format_load_patch() -> None:
         # One that failed left nothing, and is not imported again here. This
         # thread's own import of it holds the lock already: it is wrapped when
         # it ends, or by the next application of the patch.
-        with _bootstrap._ModuleLockManager(name):
+        try:
+            with _bootstrap._ModuleLockManager(name):
+                module = sys.modules.get(name)
+        except _bootstrap._DeadlockError:
+            # The thread importing it waits for one this thread imports: its
+            # import's end wraps it (or the next application of the patch).
             module = sys.modules.get(name)
         if module is not None:
             _wrap(module)
