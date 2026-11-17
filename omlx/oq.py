@@ -7315,18 +7315,31 @@ def calibrate_oq_streaming(
     # The run's output folder and a calibration proxy (a model above the
     # calibration budget) are made here and removed with it.
     with tempfile.TemporaryDirectory(dir=cache.parent) as scratch:
-        return quantize_oq_streaming(
+        run = _open_oq_run(
             model_path,
             str(Path(scratch) / "output"),
             oq_level,
             enhanced=True,
             imatrix_cache_path=str(cache),
-            _calibrate_only=True,
             **settings,
         )
+        if run["normalized_model_type"] == "deepseek_v41":
+            raise ValueError(
+                "oQ calibrates a deepseek_v41 checkpoint inside a writer of its "
+                "own, which takes no quant format"
+            )
+        _calibrate_oq_run(run)
+        return run["imatrix_data"]
 
 
-def quantize_oq_streaming(
+class _OQRun(dict):
+    """A quantization's state between its phases, by name: what one phase
+    binds and a later one reads. quantize_oq_streaming runs the phases in
+    order; calibrate_oq_streaming the first two, iter_format_offers the
+    first three."""
+
+
+def _open_oq_run(
     model_path: str,
     output_path: str,
     oq_level: int,
@@ -7350,93 +7363,10 @@ def quantize_oq_streaming(
     stream_calibration: bool | None = None,
     preserve_ngram_table: bool = False,
     quant_format: Any = None,
-    _calibrate_only: bool = False,
-) -> None:
-    """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
-
-    Reads tensors one at a time from safetensors, quantizes with the universal
-    predicate, and writes output shards. Never loads the full model.
-
-    Args:
-        model_path: Path to source model directory.
-        output_path: Path for output (must not exist).
-        oq_level: Quantization level from OQ_LEVELS.
-        group_size: Default quantization group size.
-        progress_callback: Optional fn(phase_name, progress_pct) for updates.
-        text_only: Skip vision encoder weights for VLM models.
-        dtype: Target fp dtype for non-quantized weights and quant scales/biases.
-            Must be "bfloat16" (default) or "float16". float16 yields ~20%
-            faster prefill on M1/M2 Apple Silicon (native fp16 support), but
-            is unsupported for DeepSeek V4.
-        preserve_mtp: Keep mtp.* tensors and config fields in the output so
-            supported models retain Lightning MTP after quantization, including
-            V4.1 DSpark draft stages used by server verification. Stashes mtp.*
-            keys around the model.sanitize() call (which would otherwise
-            strip them) and re-merges. When False (default), mtp.* tensors
-            are stripped *and* the output config's mtp_num_hidden_layers /
-            num_nextn_predict_layers are normalized to 0 to keep the
-            quantized model self-consistent.
-        auto_proxy_sensitivity: When True (default) and the source checkpoint
-            exceeds 75% of live system/Metal calibration capacity,
-            automatically build a temporary uniform 4-bit proxy on disk and
-            run sensitivity measurement on it,
-            preserving oQ's data-driven mixed-precision allocation. When
-            False, the quantization aborts on RAM-exceeding models with a
-            RuntimeError so callers always get a real sensitivity-driven
-            output. Ignored if sensitivity_model_path is set explicitly.
-        trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads when a
-            checkpoint requires custom model code.
-        enhanced: Enable oQe imatrix-weighted quantization. When False, the
-            existing oQ streaming path is unchanged.
-        imatrix_cache_path: oQe native imatrix cache path. Required when
-            enhanced is True; the admin manager supplies an automatic path.
-        imatrix_reuse_cache: Reuse a compatible imatrix cache if present.
-        imatrix_strict: Fail on missing or mismatched imatrix entries instead
-            of falling back to standard oQ quantization for those tensors.
-        imatrix_num_samples: Calibration sample count for imatrix collection.
-        imatrix_seq_length: Calibration sequence length for imatrix collection.
-        sensitivity_map_override: Optional explicit positive layer-priority
-            scores. When supplied, skips cached/measured sensitivity and the
-            sensitivity proxy path. Missing layers receive score zero. This
-            does not skip oQe imatrix calibration when enhanced is True.
-        stream_calibration: Collect the oQe imatrix by streaming one decoder
-            layer at a time from the source checkpoint instead of loading a
-            whole model. Calibrates the real weights with a single layer
-            resident, so it needs no RAM-safe proxy. Sensitivity measurement
-            streams too: fused into the same sweep when the imatrix is
-            freshly collected (one weight load serves both passes), or as a
-            standalone streamed pass on an imatrix cache hit. An existing
-            oq_sensitivity_map.json or an explicit sensitivity_model_path
-            still wins over both. None (default) auto-enables streaming when
-            the source exceeds the RAM budget. The streamed sourcer supports
-            the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp) layouts,
-            so the auto rule stays on the RAM-safe proxy for every other
-            model_type, and an explicit stream_calibration=True on an
-            unsupported layout raises a ValueError up front instead of
-            failing deep in the sourcer. Only consulted when enhanced is True.
-            Inkling 2 never builds a proxy: its packed source is calibrated
-            resident and needs that much live memory, and the DSpark draft
-            is copied with the config's mtp_config whatever preserve_mtp says.
-        preserve_ngram_table: Write the qwen4_exp N-gram PLE table
-            (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
-            the checkpoint dtype, instead of at the selected oQ level. The
-            table can then be quantized separately (its measured
-            sensitivity is far below the core's), and a passthrough leaves
-            no per-layer quantization entry so loaders treat the shards as
-            plain weights. DeepSeek V4.1 keeps its Engram tables in the
-            official FP8 storage instead of 4-bit affine. No effect on other
-            model types.
-        quant_format: The mode of a registered quant format, or an object
-            of the class registered for its mode, configured by a plugin
-            (docs/quant-formats.md). Each matrix that oQe has an importance
-            for is offered to the format, at the bits and group size oQ
-            gives it, and is written as the format's tensors under the
-            format's mode. What the format leaves, and every other tensor,
-            is written as without it. Requires enhanced.
-
-    calibrate_oq_streaming runs this up to oQe's calibration
-    (``_calibrate_only``).
-    """
+) -> _OQRun:
+    """quantize_oq_streaming's checks and its source's config, before a
+    weight is read: the arguments, the quant format and its record, the
+    families refused."""
     if oq_level not in OQ_LEVELS:
         raise ValueError(
             f"Invalid oQ level {oq_level}. Must be one of {sorted(OQ_LEVELS)}"
@@ -7580,35 +7510,34 @@ def quantize_oq_streaming(
     if inkling2_layout.is_inkling2(config):
         # The model class is needed before any calibration load registers it.
         apply_inkling2_patch()
-    if normalized_model_type == "deepseek_v41" and _calibrate_only:
-        raise ValueError(
-            "oQ calibrates a deepseek_v41 checkpoint inside a writer of its own, "
-            "which takes no quant format"
-        )
-    if normalized_model_type == "deepseek_v41":
-        from .patches.deepseek_v41.oq import quantize as quantize_v41
+    return _OQRun(locals())
 
-        return quantize_v41(
-            source,
-            output,
-            oq_level=oq_level,
-            enhanced=enhanced,
-            group_size=group_size,
-            sensitivity_model_path=sensitivity_model_path,
-            sensitivity_map_override=sensitivity_map_override,
-            imatrix_cache_path=imatrix_cache_path,
-            imatrix_reuse_cache=imatrix_reuse_cache,
-            imatrix_strict=imatrix_strict,
-            imatrix_num_samples=imatrix_num_samples,
-            imatrix_seq_length=imatrix_seq_length,
-            preserve_mtp=preserve_mtp,
-            target_bpw=target_bpw,
-            hard_cap_bpw=hard_cap_bpw,
-            text_only=text_only,
-            dtype=dtype,
-            progress_callback=progress_callback,
-            preserve_ngram_table=preserve_ngram_table,
-        )
+
+def _calibrate_oq_run(run: _OQRun) -> None:
+    """The source's weights indexed and oQe's calibration (the imatrix,
+    collected or read from its cache)."""
+    cb = run.get("cb")
+    config = run.get("config")
+    dtype = run.get("dtype")
+    enhanced = run.get("enhanced")
+    group_size = run.get("group_size")
+    imatrix_cache_path = run.get("imatrix_cache_path")
+    imatrix_num_samples = run.get("imatrix_num_samples")
+    imatrix_reuse_cache = run.get("imatrix_reuse_cache")
+    imatrix_seq_length = run.get("imatrix_seq_length")
+    imatrix_strict = run.get("imatrix_strict")
+    mimo_multimodal = run.get("mimo_multimodal")
+    model_path = run.get("model_path")
+    normalized_model_type = run.get("normalized_model_type")
+    oq_level = run.get("oq_level")
+    output = run.get("output")
+    preserve_mtp = run.get("preserve_mtp")
+    sensitivity_map_override = run.get("sensitivity_map_override")
+    sensitivity_model_path = run.get("sensitivity_model_path")
+    source = run.get("source")
+    stream_calibration = run.get("stream_calibration")
+    text_only = run.get("text_only")
+    trust_remote_code = run.get("trust_remote_code")
     if (
         normalized_model_type in MLX_LM_TEXT_ONLY_MODEL_TYPES
         and _has_vision_subconfig(config)
@@ -7881,8 +7810,6 @@ def quantize_oq_streaming(
                 or None
             )
         cb("imatrix", 18.0, "oQe imatrix calibration ready")
-        if _calibrate_only:
-            return imatrix_data
         imatrix_report = {
             "enabled": True,
             "cache_path": imatrix_data.path,
@@ -7898,7 +7825,39 @@ def quantize_oq_streaming(
             "mismatched": [],
             "zero_count_experts": 0,
         }
+    run.update((k, v) for k, v in locals().items() if k != "run")
 
+
+def _plan_oq_run(run: _OQRun) -> None:
+    """The sensitivity of each layer, the plan of bits, and with a quant
+    format the class of the module that holds each matrix in the model the
+    checkpoint loads as."""
+    _calibration_budget = run.get("_calibration_budget")
+    _calibration_bytes = run.get("_calibration_bytes")
+    _cleanup_ram_safe_proxy = run.get("_cleanup_ram_safe_proxy")
+    _ensure_ram_safe_proxy = run.get("_ensure_ram_safe_proxy")
+    _model_requires_proxy = run.get("_model_requires_proxy")
+    all_weights = run.get("all_weights")
+    auto_proxy_sensitivity = run.get("auto_proxy_sensitivity")
+    cb = run.get("cb")
+    config = run.get("config")
+    dtype = run.get("dtype")
+    enhanced = run.get("enhanced")
+    group_size = run.get("group_size")
+    hard_cap_bpw = run.get("hard_cap_bpw")
+    model_path = run.get("model_path")
+    oq_level = run.get("oq_level")
+    preserve_mtp = run.get("preserve_mtp")
+    quant_fmt = run.get("quant_fmt")
+    sensitivity_map_path = run.get("sensitivity_map_path")
+    sensitivity_model_path = run.get("sensitivity_model_path")
+    source = run.get("source")
+    static_sensitivity_map = run.get("static_sensitivity_map")
+    stream_imatrix = run.get("stream_imatrix")
+    streamed_sensitivity_map = run.get("streamed_sensitivity_map")
+    target_bpw = run.get("target_bpw")
+    text_only = run.get("text_only")
+    trust_remote_code = run.get("trust_remote_code")
     if static_sensitivity_map is not None:
         sensitivity_map = static_sensitivity_map
         logger.info(
@@ -8018,7 +7977,6 @@ def quantize_oq_streaming(
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-
     # Single enforcement point. Inner measurement helpers may return {} on
     # load / calibration / layer-discovery failure; treat that as a hard
     # error here so the rest of quantize_oq_streaming never runs without a
@@ -8031,18 +7989,15 @@ def quantize_oq_streaming(
             "calibration data, or layer discovery), and either fix it or "
             "pass an explicit sensitivity_model_path."
         )
-
     # Calibration passes are done — drop the RAM-safe proxy (built when the
     # source exceeds live calibration capacity; a cached sensitivity map plus
     # an imatrix cache hit means it was never built at all).
     _cleanup_ram_safe_proxy()
-
     cb(
         "loading",
         19.0 if enhanced else 15.0,
         "Preparing quantization plan",
     )
-
     # --- Sanitize-plan discovery ------------------------------------------
     if _stream_source_model_type(config) == "qwen4_exp":
         # The write path may reach here without any collection having run
@@ -8106,11 +8061,9 @@ def quantize_oq_streaming(
                 )
             except Exception as e2:
                 logger.warning(f"Sanitize failed ({e2}), using original names")
-
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
     config["_oq_sensitivity_map"] = {str(k): v for k, v in sensitivity_map.items()}
     logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
-
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
         named_shapes = {
@@ -8171,21 +8124,11 @@ def quantize_oq_streaming(
         )
     else:
         config["_oq_boost_map"] = {}
-
     cb("loading", 20.0, "Starting tensor quantization")
-
-    tensor_names = list(all_weights.keys())
-    out_shard_data = {}
-    out_shard_idx = 0
-    weight_map = {}
     base_bits = _base_bits_for_level(oq_level)
     base_mode = _mode_for_bits(base_bits)
     base_gs = _gs_for_mode(base_bits, group_size)
     quantization_config = {"group_size": base_gs, "bits": base_bits, "mode": base_mode}
-    per_layer_config = {}
-    format_layers = 0
-    unloaded = []  # the classes of matrices no format's layer loads for
-    unwalked = []  # matrices no module of the model it loads as holds
     if quant_fmt is not None:
         # The module that holds each matrix in the model the checkpoint loads
         # as, built from the config the run writes, with each of this run's
@@ -8204,6 +8147,197 @@ def quantize_oq_streaming(
             written,
             trust_remote_code=trust_remote_code,
         )
+    run.update((k, v) for k, v in locals().items() if k != "run")
+
+
+def quantize_oq_streaming(
+    model_path: str,
+    output_path: str,
+    oq_level: int,
+    group_size: int = 64,
+    progress_callback: Callable[[str, float], None] | None = None,
+    text_only: bool = False,
+    target_bpw: float | None = None,
+    hard_cap_bpw: float | None = None,
+    sensitivity_model_path: str = "",
+    dtype: str = "bfloat16",
+    preserve_mtp: bool = False,
+    auto_proxy_sensitivity: bool = True,
+    trust_remote_code: bool = False,
+    enhanced: bool = False,
+    imatrix_cache_path: str = "",
+    imatrix_reuse_cache: bool = True,
+    imatrix_strict: bool = False,
+    imatrix_num_samples: int = 128,
+    imatrix_seq_length: int = 512,
+    sensitivity_map_override: dict[int | str, float] | None = None,
+    stream_calibration: bool | None = None,
+    preserve_ngram_table: bool = False,
+    quant_format: Any = None,
+) -> None:
+    """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
+
+    Reads tensors one at a time from safetensors, quantizes with the universal
+    predicate, and writes output shards. Never loads the full model.
+
+    Args:
+        model_path: Path to source model directory.
+        output_path: Path for output (must not exist).
+        oq_level: Quantization level from OQ_LEVELS.
+        group_size: Default quantization group size.
+        progress_callback: Optional fn(phase_name, progress_pct) for updates.
+        text_only: Skip vision encoder weights for VLM models.
+        dtype: Target fp dtype for non-quantized weights and quant scales/biases.
+            Must be "bfloat16" (default) or "float16". float16 yields ~20%
+            faster prefill on M1/M2 Apple Silicon (native fp16 support), but
+            is unsupported for DeepSeek V4.
+        preserve_mtp: Keep mtp.* tensors and config fields in the output so
+            supported models retain Lightning MTP after quantization, including
+            V4.1 DSpark draft stages used by server verification. Stashes mtp.*
+            keys around the model.sanitize() call (which would otherwise
+            strip them) and re-merges. When False (default), mtp.* tensors
+            are stripped *and* the output config's mtp_num_hidden_layers /
+            num_nextn_predict_layers are normalized to 0 to keep the
+            quantized model self-consistent.
+        auto_proxy_sensitivity: When True (default) and the source checkpoint
+            exceeds 75% of live system/Metal calibration capacity,
+            automatically build a temporary uniform 4-bit proxy on disk and
+            run sensitivity measurement on it,
+            preserving oQ's data-driven mixed-precision allocation. When
+            False, the quantization aborts on RAM-exceeding models with a
+            RuntimeError so callers always get a real sensitivity-driven
+            output. Ignored if sensitivity_model_path is set explicitly.
+        trust_remote_code: Forwarded to mlx-lm/mlx-vlm model loads when a
+            checkpoint requires custom model code.
+        enhanced: Enable oQe imatrix-weighted quantization. When False, the
+            existing oQ streaming path is unchanged.
+        imatrix_cache_path: oQe native imatrix cache path. Required when
+            enhanced is True; the admin manager supplies an automatic path.
+        imatrix_reuse_cache: Reuse a compatible imatrix cache if present.
+        imatrix_strict: Fail on missing or mismatched imatrix entries instead
+            of falling back to standard oQ quantization for those tensors.
+        imatrix_num_samples: Calibration sample count for imatrix collection.
+        imatrix_seq_length: Calibration sequence length for imatrix collection.
+        sensitivity_map_override: Optional explicit positive layer-priority
+            scores. When supplied, skips cached/measured sensitivity and the
+            sensitivity proxy path. Missing layers receive score zero. This
+            does not skip oQe imatrix calibration when enhanced is True.
+        stream_calibration: Collect the oQe imatrix by streaming one decoder
+            layer at a time from the source checkpoint instead of loading a
+            whole model. Calibrates the real weights with a single layer
+            resident, so it needs no RAM-safe proxy. Sensitivity measurement
+            streams too: fused into the same sweep when the imatrix is
+            freshly collected (one weight load serves both passes), or as a
+            standalone streamed pass on an imatrix cache hit. An existing
+            oq_sensitivity_map.json or an explicit sensitivity_model_path
+            still wins over both. None (default) auto-enables streaming when
+            the source exceeds the RAM budget. The streamed sourcer supports
+            the MiniMax-M3 (minimax_m3_vl) and Qwen4-Exp (qwen4_exp) layouts,
+            so the auto rule stays on the RAM-safe proxy for every other
+            model_type, and an explicit stream_calibration=True on an
+            unsupported layout raises a ValueError up front instead of
+            failing deep in the sourcer. Only consulted when enhanced is True.
+            Inkling 2 never builds a proxy: its packed source is calibrated
+            resident and needs that much live memory, and the DSpark draft
+            is copied with the config's mtp_config whatever preserve_mtp says.
+        preserve_ngram_table: Write the qwen4_exp N-gram PLE table
+            (``ple_embedding.ngram_embedding`` shard tensors) unquantized, in
+            the checkpoint dtype, instead of at the selected oQ level. The
+            table can then be quantized separately (its measured
+            sensitivity is far below the core's), and a passthrough leaves
+            no per-layer quantization entry so loaders treat the shards as
+            plain weights. DeepSeek V4.1 keeps its Engram tables in the
+            official FP8 storage instead of 4-bit affine. No effect on other
+            model types.
+        quant_format: The mode of a registered quant format, or an object
+            of the class registered for its mode, configured by a plugin
+            (docs/quant-formats.md). Each matrix that oQe has an importance
+            for is offered to the format, at the bits and group size oQ
+            gives it, and is written as the format's tensors under the
+            format's mode. What the format leaves, and every other tensor,
+            is written as without it. Requires enhanced.
+    """
+
+    run = _open_oq_run(**locals())
+    dtype = run.get("dtype")
+    enhanced = run.get("enhanced")
+    group_size = run.get("group_size")
+    hard_cap_bpw = run.get("hard_cap_bpw")
+    imatrix_cache_path = run.get("imatrix_cache_path")
+    imatrix_num_samples = run.get("imatrix_num_samples")
+    imatrix_reuse_cache = run.get("imatrix_reuse_cache")
+    imatrix_seq_length = run.get("imatrix_seq_length")
+    imatrix_strict = run.get("imatrix_strict")
+    normalized_model_type = run.get("normalized_model_type")
+    oq_level = run.get("oq_level")
+    output = run.get("output")
+    preserve_mtp = run.get("preserve_mtp")
+    preserve_ngram_table = run.get("preserve_ngram_table")
+    progress_callback = run.get("progress_callback")
+    sensitivity_map_override = run.get("sensitivity_map_override")
+    sensitivity_model_path = run.get("sensitivity_model_path")
+    source = run.get("source")
+    target_bpw = run.get("target_bpw")
+    text_only = run.get("text_only")
+    if normalized_model_type == "deepseek_v41":
+        from .patches.deepseek_v41.oq import quantize as quantize_v41
+
+        return quantize_v41(
+            source,
+            output,
+            oq_level=oq_level,
+            enhanced=enhanced,
+            group_size=group_size,
+            sensitivity_model_path=sensitivity_model_path,
+            sensitivity_map_override=sensitivity_map_override,
+            imatrix_cache_path=imatrix_cache_path,
+            imatrix_reuse_cache=imatrix_reuse_cache,
+            imatrix_strict=imatrix_strict,
+            imatrix_num_samples=imatrix_num_samples,
+            imatrix_seq_length=imatrix_seq_length,
+            preserve_mtp=preserve_mtp,
+            target_bpw=target_bpw,
+            hard_cap_bpw=hard_cap_bpw,
+            text_only=text_only,
+            dtype=dtype,
+            progress_callback=progress_callback,
+            preserve_ngram_table=preserve_ngram_table,
+        )
+    _calibrate_oq_run(run)
+    _plan_oq_run(run)
+    all_weights = run.get("all_weights")
+    base_bits = run.get("base_bits")
+    cast_predicate = run.get("cast_predicate")
+    cb = run.get("cb")
+    config = run.get("config")
+    dtype = run.get("dtype")
+    formats = run.get("formats")
+    group_size = run.get("group_size")
+    imatrix_data = run.get("imatrix_data")
+    imatrix_report = run.get("imatrix_report")
+    imatrix_strict = run.get("imatrix_strict")
+    mimo_multimodal = run.get("mimo_multimodal")
+    module_classes = run.get("module_classes")
+    oq_level = run.get("oq_level")
+    output = run.get("output")
+    output_path = run.get("output_path")
+    preserve_mtp = run.get("preserve_mtp")
+    preserve_ngram_table = run.get("preserve_ngram_table")
+    quant_fmt = run.get("quant_fmt")
+    reader = run.get("reader")
+    quant_record = run.get("quant_record")
+    quantization_config = run.get("quantization_config")
+    source = run.get("source")
+    target_dtype = run.get("target_dtype")
+    text_only = run.get("text_only")
+    tensor_names = list(all_weights.keys())
+    out_shard_data = {}
+    out_shard_idx = 0
+    weight_map = {}
+    per_layer_config = {}
+    format_layers = 0
+    unloaded = []  # the classes of matrices no format's layer loads for
+    unwalked = []  # matrices no module of the model it loads as holds
     start_time = _time.monotonic()
     last_quant_display_pct = -1
     last_quant_emit_time = 0.0
