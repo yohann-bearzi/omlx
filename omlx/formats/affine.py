@@ -188,8 +188,8 @@ _QDOT = {
 }
 
 _LOAD_FUNCTION = r"""
-template <typename T>
-inline float load_vector(const device T* x, thread float* x_thread) {
+template <typename XP>
+inline float load_vector(XP x, thread float* x_thread) {
   float sum = 0;
 __LOAD__
   return sum;
@@ -241,12 +241,161 @@ def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> boo
     ) == 0
 
 
+# qmv's ``qdot`` split in two: the weight terms of a full pack run are decoded
+# once per K block and output column, then every row accumulates them against
+# its own inputs. Each term and each accumulation step is qdot's, in qdot's
+# order (the 5/6-bit runs cover at most two packs, so qdot's cumulative
+# pointer steps are the 8i/5i and 4i/3i offsets used here). A tile holds the
+# branch of its own width.
+_DECODED_DOT = r"""
+constant constexpr int W_TERMS = (BITS == 3) ? 10 * VALUES_PER_THREAD / 8
+    : ((BITS == 5) ? 12 * VALUES_PER_THREAD / 8
+    : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD));
+
+inline void decode_w(const device uint8_t* w, thread float* wq) {
+__DECODE__
+}
+
+inline float wdot(const thread float* wq, const thread float* x) {
+  float accum = 0;
+__WDOT__
+  return accum;
+}
+"""
+
+_DECODE = {
+    2: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    wq[4 * i] = w[i] & 0x03;
+    wq[4 * i + 1] = w[i] & 0x0c;
+    wq[4 * i + 2] = w[i] & 0x30;
+    wq[4 * i + 3] = w[i] & 0xc0;
+  }""",
+    3: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const device uint8_t* wb = w + 3 * i;
+    thread float* wv = wq + 10 * i;
+    wv[0] = wb[0] & 0x07;
+    wv[1] = wb[0] & 0x38;
+    wv[2] = wb[0] & 0xc0;
+    wv[3] = wb[1] & 0x01;
+    wv[4] = wb[1] & 0x0e;
+    wv[5] = wb[1] & 0x70;
+    wv[6] = wb[1] & 0x80;
+    wv[7] = wb[2] & 0x03;
+    wv[8] = wb[2] & 0x1c;
+    wv[9] = wb[2] & 0xe0;
+  }""",
+    4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
+  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    wq[4 * i] = ws[i] & 0x000f;
+    wq[4 * i + 1] = ws[i] & 0x00f0;
+    wq[4 * i + 2] = ws[i] & 0x0f00;
+    wq[4 * i + 3] = ws[i] & 0xf000;
+  }""",
+    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const device uint8_t* wb = w + 5 * i;
+    thread float* wv = wq + 12 * i;
+    wv[0] = wb[0] & 0x1f;
+    wv[1] = wb[0] & 0xe0;
+    wv[2] = wb[1] & 0x3;
+    wv[3] = wb[1] & 0x7c;
+    wv[4] = wb[1] & 0x80;
+    wv[5] = wb[2] & 0xf;
+    wv[6] = wb[2] & 0xf0;
+    wv[7] = wb[3] & 0x1;
+    wv[8] = wb[3] & 0x3e;
+    wv[9] = wb[3] & 0xc0;
+    wv[10] = wb[4] & 0x7;
+    wv[11] = wb[4] & 0xf8;
+  }""",
+    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    const device uint8_t* wb = w + 3 * i;
+    thread float* wv = wq + 6 * i;
+    wv[0] = wb[0] & 0x3f;
+    wv[1] = wb[0] & 0xc0;
+    wv[2] = wb[1] & 0x0f;
+    wv[3] = wb[1] & 0xf0;
+    wv[4] = wb[2] & 0x03;
+    wv[5] = wb[2] & 0xfc;
+  }""",
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
+    wq[i] = w[i];
+  }""",
+}
+
+_WDOT = {
+    2: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    accum +=
+        (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
+         x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
+  }""",
+    3: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const thread float* xv = x + 8 * i;
+    const thread float* wv = wq + 10 * i;
+    accum += wv[0] * xv[0];
+    accum += wv[1] * xv[1];
+    accum += wv[2] * xv[2];
+    accum += wv[3] * (xv[2] * 256.0f);
+    accum += wv[4] * xv[3];
+    accum += wv[5] * xv[4];
+    accum += wv[6] * xv[5];
+    accum += wv[7] * (xv[5] * 256.0f);
+    accum += wv[8] * xv[6];
+    accum += wv[9] * xv[7];
+  }""",
+    4: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    accum +=
+        (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
+         x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
+  }""",
+    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
+    const thread float* xv = x + 8 * i;
+    const thread float* wv = wq + 12 * i;
+    accum += wv[0] * xv[0];
+    accum += wv[1] * xv[1];
+    accum += wv[2] * (xv[1] * 256.0f);
+    accum += wv[3] * xv[2];
+    accum += wv[4] * xv[3];
+    accum += wv[5] * (xv[3] * 256.0f);
+    accum += wv[6] * xv[4];
+    accum += wv[7] * (xv[4] * 256.0f);
+    accum += wv[8] * xv[5];
+    accum += wv[9] * xv[6];
+    accum += wv[10] * (xv[6] * 256.0f);
+    accum += wv[11] * xv[7];
+  }""",
+    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
+    const thread float* xv = x + 4 * i;
+    const thread float* wv = wq + 6 * i;
+    accum += wv[0] * xv[0];
+    accum += wv[1] * xv[1];
+    accum += wv[2] * (xv[1] * 256.0f);
+    accum += wv[3] * xv[2];
+    accum += wv[4] * (xv[2] * 256.0f);
+    accum += wv[5] * xv[3];
+  }""",
+    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
+    accum += x[i] * wq[i];
+  }""",
+}
+
+
+def decoded(bits: int) -> str:
+    """``decode_w`` and ``wdot`` of ``bits``-bit weights: qmv's ``qdot`` split
+    in two, after ``header``."""
+    return _DECODED_DOT.replace("__DECODE__", _DECODE[bits]).replace(
+        "__WDOT__", _WDOT[bits]
+    )
+
+
 # One lane of qmv_fast_impl (FAST) or qmv_impl: its pack(s) of each row's
 # block, the group's scale and bias, and MLX's qdot on them. qmv_impl reads
 # its last block through load_vector_safe and qdot_safe; a lane has all of
 # its VALUES_PER_THREAD inputs there or none (K is a multiple of the group
 # size), and for all of them the two are load_vector and qdot, operation for
-# operation.
+# operation. Decoded, decode and apply are declared here and defined in the
+# face's shared source (_SHARED), which only the kernels that apply a block
+# to several inputs include: MLX hashes a kernel's whole source at every
+# launch.
 _DOT = r"""
 template <typename T>
 struct Dot {
@@ -290,18 +439,54 @@ struct Dot {
       b += BLOCK_SIZE / GS;
     }
 
-    template <typename X>
-    static float load(const device X* x, thread float* x_thread) {
-      return load_vector<X>(x, x_thread);
+    template <typename XP>
+    static float load(XP x, thread float* x_thread) {
+      return load_vector(x, x_thread);
     }
 
     static float madd(float acc, Row r, const thread float* x_thread, float sum) {
       return acc + qdot(r.w, x_thread, r.s, r.b, sum);
     }
 
+    struct Decoded;
+    static Decoded decode(Row r);
+    static float apply(
+        float acc, thread const Decoded& d, const thread float* x_thread, float sum);
+
     float finish(int, float sum) const { return sum; }
   };
 };
+"""
+
+
+# What the shared-rows kernels read of a face beyond the row skeleton: one
+# row's weights of a block decoded once (qdot's terms, decode_w), applied to
+# each input (wdot), as members the face's struct declares.
+_SHARED = r"""
+template <typename T>
+template <int K>
+struct Dot<T>::Lanes<K>::Decoded {
+  float wq[W_TERMS];
+  float s;
+  float b;
+};
+
+template <typename T>
+template <int K>
+typename Dot<T>::template Lanes<K>::Decoded Dot<T>::Lanes<K>::decode(Row r) {
+  Decoded d;
+  decode_w(r.w, d.wq);
+  d.s = r.s;
+  d.b = r.b;
+  return d;
+}
+
+template <typename T>
+template <int K>
+float Dot<T>::Lanes<K>::apply(
+    float acc, thread const Decoded& d, const thread float* x_thread, float sum) {
+  return acc + (d.s * wdot(d.wq, x_thread) + sum * d.b);
+}
 """
 
 
@@ -317,6 +502,10 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
         key=key,
         source=(
             f"namespace omlx_{key} {{\n{source}\n{_DOT}\n}}"
+            f"  // namespace omlx_{key}\n"
+        ),
+        shared=(
+            f"namespace omlx_{key} {{\n{decoded(bits)}{_SHARED}}}"
             f"  // namespace omlx_{key}\n"
         ),
         type=f"omlx_{key}::Dot<T>",

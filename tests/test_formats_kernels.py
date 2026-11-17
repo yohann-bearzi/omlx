@@ -50,8 +50,8 @@ struct Dot {
     Row row(int r) const { return {w + r * K}; }
     void step() { w += BLOCK; }
 
-    template <typename X, int... I>
-    static void copy(omlx_ints<I...>, const device X* x, thread float* xt) {
+    template <typename XP, int... I>
+    static void copy(omlx_ints<I...>, XP x, thread float* xt) {
       ((xt[I] = float(x[I])), ...);
     }
     template <int... I>
@@ -59,8 +59,8 @@ struct Dot {
       return (... + ((float(w[I]) - 128.0f) * xt[I]));
     }
 
-    template <typename X>
-    static float load(const device X* x, thread float* xt) {
+    template <typename XP>
+    static float load(XP x, thread float* xt) {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
@@ -69,6 +69,13 @@ struct Dot {
     }
 
     float finish(int r, float sum) const { return sum * s[r]; }
+
+    using Decoded = Row;
+    static Decoded decode(Row r) { return r; }
+    template <typename A>
+    static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux) {
+      return madd(acc, d, xt, aux);
+    }
   };
 };
 }  // namespace omlx_toy_KEY
@@ -671,11 +678,141 @@ def test_rows_are_the_dequantized_products(k, packs):
     assert mx.array_equal(got, want).item()
 
 
+@metal
+@pytest.mark.parametrize("packs", [(1, 0), (2, 2), (3, 1)])
+@pytest.mark.parametrize("k", [512, 384, 248, 8])
+def test_a_face_loads_inputs_staged_in_threadgroup_memory(k, packs):
+    """A kernel may copy its inputs into threadgroup memory and run the
+    skeleton over them there: the face's load takes either pointer."""
+    operands, x, want = _matrix(16, k, seed=k + sum(packs))
+    face = _toy("staged")
+    got = testing.dot_rows(face, operands, x, 16, packs, staged=True)
+    assert mx.array_equal(got, want).item()
+
+
+@metal
+def test_a_load_of_device_inputs_alone_fails_on_staged_ones_naming_load():
+    device_only = _TOY.replace(
+        "    template <typename XP>\n    static float load(XP x, thread float* xt) {",
+        "    template <typename X>\n"
+        "    static float load(const device X* x, thread float* xt) {",
+    )
+    assert device_only != _TOY
+    face = _toy("device_only", source=device_only)
+    operands, x, want = _matrix(8, 512)
+    assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want[:8]).item()
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(testing.dot_rows(face, operands, x, 8, staged=True))
+    assert "no matching function for call to 'load'" in str(failure.value)
+
+
+@metal
+def test_the_skeleton_s_inputs_are_of_the_type_it_is_given():
+    """qmv_rows<T, ...> takes x as T inputs, in device or threadgroup memory:
+    inputs of another type do not compile."""
+    face = _toy("typed")
+    matrices = kernels.Matrices()
+    kernel = mx.fast.metal_kernel(
+        name="omlx_test_typed_inputs",
+        input_names=["x", *matrices.add("m", face)],
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations + r"""
+    float result[1];
+    qmv_rows<half, K, 1, 0>(m, 0, m, 0, x, thread_index_in_simdgroup, result);
+    y[0] = result[0];
+""",
+    )
+    (codes, scales), x, _ = _matrix(8, 512)
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(
+            kernel(
+                inputs=[x, codes, scales],
+                template=[("K", 512)],
+                grid=(32, 1, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.float32],
+            )[0]
+        )
+    assert "no matching function for call to 'omlx_inputs'" in str(failure.value)
+
+
+@metal
+def test_staged_inputs_may_fill_a_threadgroup_s_memory():
+    operands, x, want = _matrix(8, 8192)
+    assert x.nbytes == 32768
+    got = testing.dot_rows(_toy("full"), operands, x, 8, staged=True)
+    assert mx.array_equal(got, want).item()
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 384, 248, 8])
+def test_a_face_s_decode_then_apply_is_its_madd(k):
+    operands, x, want = _matrix(16, k, seed=k)
+    face = _toy("decoded")
+    assert mx.array_equal(testing.decoded_rows(face, operands, x, 16), want).item()
+
+
+@metal
+def test_an_apply_that_is_not_madd_is_told_apart():
+    """The rule a format's tests check: decoded_rows against dot_rows."""
+    other = _TOY.replace(
+        "      return madd(acc, d, xt, aux);",
+        "      return madd(acc, d, xt, aux) + 1.0f;",
+    )
+    assert other != _TOY
+    face = _toy("other_apply", source=other)
+    operands, x, want = _matrix(16, 512)
+    assert mx.array_equal(testing.dot_rows(face, operands, x, 16), want).item()
+    assert not mx.array_equal(testing.decoded_rows(face, operands, x, 16), want).item()
+
+
+@metal
+def test_a_face_without_decode_is_told_which_member_it_lacks():
+    decode = "    static Decoded decode(Row r) { return r; }\n"
+    assert decode in _TOY
+    face = _toy("no_decode", source=_TOY.replace(decode, ""))
+    operands, x, want = _matrix(8, 512)
+    # The row skeleton needs none: madd is the row's product there.
+    assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want).item()
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(testing.decoded_rows(face, operands, x, 8))
+    assert "no member named 'decode'" in str(failure.value)
+
+
+def test_a_face_s_shared_source_is_in_the_kernels_that_share_alone():
+    face = replace(_toy("shared"), shared="// the shared source\n")
+    plain = kernels.Matrices()
+    plain.add("m", face)
+    assert "// the shared source" not in plain.header
+    both = kernels.Matrices()
+    both.add("a", face, shared=True)
+    both.add("b", face, shared=True)
+    header = both.header
+    assert header.count("// the shared source") == 1
+    # After the source whose struct it defines members of.
+    assert header.index("// the shared source") > header.index("struct Dot {")
+    assert '#line 1 "<quant format toy_shared shared>"' in header
+    tile = formats.Tile(key="t", source="", type="T", tensors=())
+    with pytest.raises(TypeError, match="a tile face has no shared source"):
+        kernels.Matrices().add("t", tile, shared=True)
+    with pytest.raises(ValueError, match="shared is Metal"):
+        replace(face, shared=3)
+
+
+def test_staged_inputs_fit_in_a_threadgroup_s_memory():
+    operands, _, _ = _matrix(8, 512)
+    x = mx.zeros((8192 + 8,), mx.float32)
+    with pytest.raises(ValueError, match="32768 bytes of a threadgroup's memory"):
+        testing.dot_rows(_toy("big"), operands, x, 8, staged=True)
+
+
 # The toy's rows with the codes as stored, re-centred in madd with the sum of
 # the lane's inputs: what load returns is a struct of the face's own.
 _LOAD = r"""
-    template <typename X>
-    static float load(const device X* x, thread float* xt) {
+    template <typename XP>
+    static float load(XP x, thread float* xt) {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
@@ -691,8 +828,8 @@ _LOAD_STRUCT = r"""
     static float sum(omlx_ints<I...>, thread const float* xt) {
       return (... + xt[I]);
     }
-    template <typename X>
-    static Inputs load(const device X* x, thread float* xt) {
+    template <typename XP>
+    static Inputs load(XP x, thread float* xt) {
       copy(omlx_iota<VPT>(), x, xt);
       return {sum(omlx_iota<VPT>(), xt)};
     }

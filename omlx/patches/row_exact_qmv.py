@@ -30,12 +30,12 @@ from textwrap import indent
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..formats.affine import _GROUP_SIZES, header, qmv_fast_layout
+from ..formats.affine import _GROUP_SIZES, decoded, header, qmv_fast_layout
 
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
-# The affine widths whose weights the tile decodes (``_DECODE``, ``_WDOT``):
+# The affine widths whose weights the tile decodes (``affine.decoded``):
 # not 2 and 3 bits, which affine.py's faces take.
 _BITS = (4, 5, 6, 8)
 # Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
@@ -126,7 +126,7 @@ _BLOCK = r"""
     float sums[ROWS];
     ROW_EXACT_UNROLL
     for (int i = 0; i < ROWS; i++) {
-      sums[i] = load_vector<T>(xp + i * K_SIZE, xs[i]);
+      sums[i] = load_vector(xp + i * K_SIZE, xs[i]);
     }
     ROW_EXACT_UNROLL
     for (int r = 0; r < RPS; r++) {
@@ -184,104 +184,6 @@ def _group_source(count: int) -> str:
             f"    start += TILES_{i};",
         ]
     return "\n".join(lines) + "\n"
-
-
-# qmv's ``qdot`` split in two: the weight terms of a full pack run are decoded
-# once per K block and output column, then every row accumulates them against
-# its own inputs. Each term and each accumulation step is qdot's, in qdot's
-# order (the 5/6-bit runs cover at most two packs, so qdot's cumulative
-# pointer steps are the 8i/5i and 4i/3i offsets used here). A tile holds the
-# branch of its own width.
-_DECODED_DOT = r"""
-constant constexpr int W_TERMS = (BITS == 5) ? 12 * VALUES_PER_THREAD / 8
-    : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD);
-
-inline void decode_w(const device uint8_t* w, thread float* wq) {
-__DECODE__
-}
-
-inline float wdot(const thread float* wq, const thread float* x) {
-  float accum = 0;
-__WDOT__
-  return accum;
-}
-"""
-
-_DECODE = {
-    4: r"""  const device uint16_t* ws = (const device uint16_t*)w;
-  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-    wq[4 * i] = ws[i] & 0x000f;
-    wq[4 * i + 1] = ws[i] & 0x00f0;
-    wq[4 * i + 2] = ws[i] & 0x0f00;
-    wq[4 * i + 3] = ws[i] & 0xf000;
-  }""",
-    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
-    const device uint8_t* wb = w + 5 * i;
-    thread float* wv = wq + 12 * i;
-    wv[0] = wb[0] & 0x1f;
-    wv[1] = wb[0] & 0xe0;
-    wv[2] = wb[1] & 0x3;
-    wv[3] = wb[1] & 0x7c;
-    wv[4] = wb[1] & 0x80;
-    wv[5] = wb[2] & 0xf;
-    wv[6] = wb[2] & 0xf0;
-    wv[7] = wb[3] & 0x1;
-    wv[8] = wb[3] & 0x3e;
-    wv[9] = wb[3] & 0xc0;
-    wv[10] = wb[4] & 0x7;
-    wv[11] = wb[4] & 0xf8;
-  }""",
-    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-    const device uint8_t* wb = w + 3 * i;
-    thread float* wv = wq + 6 * i;
-    wv[0] = wb[0] & 0x3f;
-    wv[1] = wb[0] & 0xc0;
-    wv[2] = wb[1] & 0x0f;
-    wv[3] = wb[1] & 0xf0;
-    wv[4] = wb[2] & 0x03;
-    wv[5] = wb[2] & 0xfc;
-  }""",
-    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
-    wq[i] = w[i];
-  }""",
-}
-
-_WDOT = {
-    4: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-    accum +=
-        (x[4 * i] * wq[4 * i] + x[4 * i + 1] * wq[4 * i + 1] +
-         x[4 * i + 2] * wq[4 * i + 2] + x[4 * i + 3] * wq[4 * i + 3]);
-  }""",
-    5: r"""  for (int i = 0; i < VALUES_PER_THREAD / 8; i++) {
-    const thread float* xv = x + 8 * i;
-    const thread float* wv = wq + 12 * i;
-    accum += wv[0] * xv[0];
-    accum += wv[1] * xv[1];
-    accum += wv[2] * (xv[1] * 256.0f);
-    accum += wv[3] * xv[2];
-    accum += wv[4] * xv[3];
-    accum += wv[5] * (xv[3] * 256.0f);
-    accum += wv[6] * xv[4];
-    accum += wv[7] * (xv[4] * 256.0f);
-    accum += wv[8] * xv[5];
-    accum += wv[9] * xv[6];
-    accum += wv[10] * (xv[6] * 256.0f);
-    accum += wv[11] * xv[7];
-  }""",
-    6: r"""  for (int i = 0; i < VALUES_PER_THREAD / 4; i++) {
-    const thread float* xv = x + 4 * i;
-    const thread float* wv = wq + 6 * i;
-    accum += wv[0] * xv[0];
-    accum += wv[1] * xv[1];
-    accum += wv[2] * (xv[1] * 256.0f);
-    accum += wv[3] * xv[2];
-    accum += wv[4] * (xv[2] * 256.0f);
-    accum += wv[5] * xv[3];
-  }""",
-    8: r"""  for (int i = 0; i < VALUES_PER_THREAD; i++) {
-    accum += x[i] * wq[i];
-  }""",
-}
 
 
 # Fully unrolled tiles hold every (row, column) accumulator and every row's
@@ -352,11 +254,10 @@ def _header(bits: int, group_size: int, fast: bool, unrolled: bool = False) -> s
         raise ValueError(f"row-exact tile: no decode of {bits}-bit weights")
     start = header(bits, group_size, fast)  # refuses a group size MLX lacks
     unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
-    decoded = _DECODED_DOT.replace("__DECODE__", _DECODE[bits])
     return (
         f"#define ROW_EXACT_UNROLL {unroll}\n"
         + start
-        + decoded.replace("__WDOT__", _WDOT[bits])
+        + decoded(bits)
         + _TILE.replace("__BLOCK__", _BLOCK[1:]).replace(
             "__LAST_BLOCK__", "" if fast else _LAST_BLOCK
         )

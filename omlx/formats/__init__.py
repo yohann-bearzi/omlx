@@ -257,7 +257,21 @@ class Dot(_Face):
     device pointer per name in ``tensors`` (the linear's parameters beside
     ``weight``, which become kernel inputs in this order), with the member
     template ``Lanes<K>`` that ``docs/quant-formats.md`` specifies.
+
+    ``shared`` is Metal that a kernel which applies one block's weights to
+    several inputs includes after ``source``, and no other kernel: where the
+    face defines ``decode`` and ``apply`` out of its struct. Empty for a
+    face whose struct defines them.
     """
+
+    shared: str = field(default="", kw_only=True)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not isinstance(self.shared, str):
+            raise ValueError(
+                f"quant format face {self.key!r}: shared is Metal, not {self.shared!r}"
+            )
 
 
 @dataclass(frozen=True)

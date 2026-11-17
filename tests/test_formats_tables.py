@@ -236,9 +236,11 @@ def _builder_digest(monkeypatch) -> str:
     return f"{len(recorded)} {digest.hexdigest()}"
 
 
-# The digest of the parent commit's kernels (699a215): what a face without
-# tables compiles is the same text, to the byte, so the same MLX library.
-_PARENT_DIGEST = "364 95c1d038a219f5048647899890be34d092ba7f95a46b064768dd0e1f8b30331f"
+# The digest of the served kernels over affine faces without tables, as a
+# face's load of any pointer type and its decode/apply declarations have
+# them: what a face without tables compiles is this text, to the byte, so
+# the same MLX library.
+_PARENT_DIGEST = "364 4b290fb1b9ad4c75450836c7180640be7c7d5180c88d7fa34d00846df7d24b80"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
@@ -597,6 +599,7 @@ def tabled(face: Dot) -> Dot:
         key=key,
         source=source.replace(f"omlx_{face.key}", f"omlx_{key}"),
         type=face.type.replace(f"omlx_{face.key}", f"omlx_{key}"),
+        shared=face.shared.replace(f"omlx_{face.key}", f"omlx_{key}"),
         tables=(LUT,),
     )
 

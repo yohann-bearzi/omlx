@@ -231,9 +231,10 @@ def test_a_matrix_is_read_through_a_dot_or_a_tile():
 
 
 # The sha256 of the header and the declarations of a kernel of one affine dot
-# face, as oMLX's dot kernels have them at 059e4a8: a dot kernel's source is
-# the parent's to the byte, so that every kernel a checkpoint runs is too.
-_DOT_KERNEL = "8247e35050747bd5c6b15961714316d1a1eb7aa8c2bf40fbea127643fe7079aa"
+# face, as oMLX's dot kernels have them since a face's load takes any pointer
+# type: tile faces leave a dot kernel's source as it is, to the byte, so that
+# every kernel a checkpoint runs is too.
+_DOT_KERNEL = "e30cd743d883b20aa2501e0be87b65888f0bb0571b48db1ab02ca86b4afbac02"
 
 
 def test_a_kernel_of_dot_faces_is_written_as_before_tile_faces():

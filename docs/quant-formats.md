@@ -234,6 +234,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`, or one that the faces sharing the source share: the affine tile face's bf16 and fp16 keys share `omlx_affine_tile_b{bits}g{group_size}`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. A `Tile`'s struct is in a namespace of its own, apart from its format's `Dot`: a kernel includes the source of the faces it reads, and no other. |
 | `tensors` | The layer's parameters beside `weight` and `bias` that the face reads, as a tuple, among its format's `tensors`. They become kernel inputs in this order. Identifiers, each named once, as a format's `tensors` are. |
+| `shared` | `Dot` only. Metal that a kernel which applies one block's weights to several inputs includes after `source`, and no other kernel does: where a face defines `decode` and `apply` out of its struct (its struct declares them), so that the kernels that never call them do not carry them. MLX hashes a kernel's whole source at every launch, about 0.05 µs a KB. Empty (the default) for a face whose struct defines them. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype` among `float16`, `bfloat16` and `float32`; empty (the default) for those three (`formats.FLOATS`). Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
 | `tables` | The lookup tables the face reads, as a tuple of `Table`, given by keyword; empty (the default) for none. See [Tables](#tables). |
 
@@ -261,9 +262,11 @@ struct Dot {
 | `Lanes(Dot m, size_t row, uint lane)` | Lane `lane` at the first block of row `row`. |
 | `struct Row` and `Row row(int r) const` | What `madd` needs of the current block of row `row + r`: pointers, the group's scale. |
 | `void step()` | Move to the next block. |
-| `template <typename X> static A load(const device X* x, thread float* xt)` | Read the lane's `VPT` inputs into `xt` as floats. Its result is passed to every `madd` of the block as `aux`. `A` is the face's choice: a `float` (affine returns the sum of the inputs, for the bias term) or a struct of its own. |
+| `template <typename XP> static A load(XP x, thread float* xt)` | Read the lane's `VPT` inputs into `xt` as floats. `x` points at them in device memory, or in threadgroup memory where a kernel stages its inputs: `XP` is `const device X*` or `const threadgroup X*`, for the activations' type `X`. Its result is passed to every `madd` of the block as `aux`. `A` is the face's choice: a `float` (affine returns the sum of the inputs, for the bias term) or a struct of its own. |
 | `static float madd(float acc, Row r, thread const float* xt, A aux)` | `acc` plus the lane's share of the row's product for the block. |
 | `float finish(int r, float sum) const` | Row `row + r`'s result from the sum of `acc` over the lanes (for example times a row scale). |
+| `struct Decoded` and `static Decoded decode(Row r)` | One row's weights of the current block as `apply` takes them, read once for several inputs. A face with nothing to share writes `using Decoded = Row;` and returns `r`. A face whose `decode` and `apply` are long declares them in its struct and defines them in `shared` (affine does). |
+| `static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux)` | What `madd` gives, from `decode`'s weights: `apply(acc, decode(r), xt, aux)` equals `madd(acc, r, xt, aux)` bit for bit. A kernel that applies one block's weights to several inputs decodes them once and calls `apply` for each. |
 
 A kernel runs a face in this order, in every lane, on the rows `r` it computes together:
 
@@ -293,6 +296,7 @@ Rules:
 - No member uses a threadgroup operation (a barrier) or threadgroup memory of its own: the simdgroups of a kernel need not all run the skeleton, or run it over the same K. A face reads its tables through the members it is given (see [Tables](#tables)).
 - `row`, `load` and `madd` use a simdgroup operation (`simd_sum`, `simd_shuffle`) only in a face that takes whole blocks alone (its format's `dot()` never returns it for a K that ends inside a block): in a last, partial block only some of the lanes run them.
 - `finish` runs where the walk left the cursor, which is not one place: past the last whole block, or on a last, partial one. It reads only what `step()` does not move, and nothing that depends on the lane: after it every lane holds the row's result.
+- `apply(acc, decode(r), xt, aux)` and `madd(acc, r, xt, aux)` are equal bit for bit: kernels take either. `decode` reads the block's weights and no input. `omlx.formats.testing.decoded_rows` runs a face's rows through `decode` and `apply` ([Test a format](#test-a-format)).
 - `r` is a constant at every call, an element of the kernel's pack of rows. `row` and `finish` do arithmetic on it that folds (`r * K`), not a loop over the rows.
 - The source is C++17 Metal without derived classes. See [Compile-time rules](#compile-time-rules).
 
@@ -324,8 +328,8 @@ struct Dot {
     Row row(int r) const { return {w + r * K}; }
     void step() { w += BLOCK; }
 
-    template <typename X, int... I>
-    static void copy(omlx_ints<I...>, const device X* x, thread float* xt) {
+    template <typename XP, int... I>
+    static void copy(omlx_ints<I...>, XP x, thread float* xt) {
       ((xt[I] = float(x[I])), ...);
     }
     template <int... I>
@@ -333,8 +337,8 @@ struct Dot {
       return (... + ((float(w[I]) - 128.0f) * xt[I]));
     }
 
-    template <typename X>
-    static float load(const device X* x, thread float* xt) {
+    template <typename XP>
+    static float load(XP x, thread float* xt) {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
@@ -343,6 +347,13 @@ struct Dot {
     }
 
     float finish(int r, float sum) const { return sum * s[r]; }
+
+    using Decoded = Row;
+    static Decoded decode(Row r) { return r; }
+    template <typename A>
+    static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux) {
+      return madd(acc, d, xt, aux);
+    }
   };
 };
 }  // namespace omlx_myformat_b8
@@ -643,15 +654,15 @@ The messages quoted below are the compiler's for the example above with one mist
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:100:7: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:106:7: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
 <kernel>:5:5: note: in instantiation of function template specialization
-'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
+'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot, const device float *>' requested here
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:104:7: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:110:7: error: static_assert failed due to requirement
 '60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 
@@ -692,12 +703,12 @@ def test_rows_are_the_dequantized_products():
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
 
-`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. A kernel puts such adjacent rows in one pack; `dot_rows` splits them to run both. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants.
+`operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. A kernel puts such adjacent rows in one pack; `dot_rows` splits them to run both. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants. With `staged=True` the kernel copies `x` into threadgroup memory first and the face's `load` reads it there, as in a kernel that stages its inputs; `x` then fits in a threadgroup's 32 KiB. A `load` that takes only a device pointer fails to compile there: `no matching function for call to 'load'`.
 
 Worth testing for every layout a format gives a face for:
 
 - rows against the format's reference, bit for bit when the format has an exact composed path,
-- the same rows with different `packs`: they must not change by a bit,
+- the same rows with different `packs`, with `staged=True`, and through `testing.decoded_rows(face, operands, x, n)` (each row's weights by `decode`, then `apply`): they must not change by a bit,
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
 - the face's tables, with `testing.staged_tables(face, operands, dtype)`: one launch over the face's operands, compiled for activations of `dtype`, that reads each table back through the face's member of its name, as a kernel stages it. Each array it returns has the table's dtype, length and bits (`table.bits`) when the members are declared as [Tables](#tables) says,
 - the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. `dot_rows` compiles the skeleton for `x.dtype` and refuses a dtype the face is not exact for. For a face whose tensors are typed `T`, `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32, on fp32 activations and fp32 copies of those tensors.
@@ -754,7 +765,7 @@ A test's `monkeypatch` is undone after the fixture's block ends, unless `monkeyp
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `decoded_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints`, `omlx_iota` and `omlx_table`.
 
@@ -788,10 +799,10 @@ A face of another revision does not compile. The requirement that fails is the f
 ```
 <omlx skeletons, docs/quant-formats.md>:75:3: error: static_assert failed due to requirement
 '2 <= 1' "dot face: written for a later revision of the contract than this oMLX runs"
-<omlx skeletons, docs/quant-formats.md>:93:9: note: in instantiation of template class
+<omlx skeletons, docs/quant-formats.md>:99:9: note: in instantiation of template class
 'omlx_revision<2>' requested here
 <kernel>:5:5: note: in instantiation of function template specialization
-'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot>' requested here
+'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot, const device float *>' requested here
 ```
 
 A registered format meets this only with a face that does not state the format's revision. The kernel's launch then fails as it does for any face that does not compile: the routed decode logs the message and the layer keeps its composed path (see [Kernels built on faces](#kernels-built-on-faces)).

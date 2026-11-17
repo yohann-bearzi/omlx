@@ -164,11 +164,18 @@ def test_each_layout_is_one_face():
 def test_a_face_s_source_holds_its_own_bit_width_alone(bits, fast):
     """MLX hashes a kernel's whole source at every launch: a face holds the
     branch of MLX's code for its width and the functions its kernels call."""
-    source = affine.face(bits, 64, fast, mx.bfloat16).source
+    face = affine.face(bits, 64, fast, mx.bfloat16)
+    source = face.source
     assert mlx_branches(source) == (MLX_MASKS[bits], MLX_SCALES[bits])
     # load_vector and qdot walk the lane's values once each.
     assert source.count("for (") == 2
     assert uncalled(source) == []
+    # decode_w and wdot, qdot split in two, are in the shared source alone:
+    # the kernels that apply a block to several inputs include it.
+    masks, scales = mlx_branches(face.shared)
+    assert masks == MLX_MASKS[bits] and scales <= MLX_SCALES[bits]
+    assert face.shared.count("for (") == 2 and "decode_w" not in source
+    assert uncalled(face.shared) == []
 
 
 @pytest.mark.parametrize(
@@ -274,6 +281,41 @@ def test_qmv_quad_is_not_the_qmv_sum(k, bits):
     want = _mlx_rows(layer, x)
     assert not _bit_equal(got, want)
     assert mx.allclose(got, want, rtol=1e-4, atol=1e-5).item()
+
+
+@metal
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("k", [512, 288])  # qmv_fast's whole blocks; qmv's last one
+def test_decode_then_apply_gives_madd_s_rows(k, bits, dtype):
+    """A block's weights decoded once, then applied to the lane's inputs,
+    give the rows madd gives, bit for bit: MLX's, in fp32 too."""
+    layer = _linear(k, 16, bits, 32, dtype)
+    face = replace(formats.dot(_linear(k, 16, bits, 32), k, 16), dtypes=(dtype,))
+    x = mx.random.normal((k,)).astype(dtype)
+    operands = _operands(face, layer)
+    decoded = testing.decoded_rows(face, operands, x, 16)
+    assert _bit_equal(decoded, testing.dot_rows(face, operands, x, 16, packs=(1, 0)))
+    if dtype == mx.float32:
+        assert _bit_equal(decoded, _mlx_rows(layer, x))
+
+
+@metal
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("k", [512, 288])  # qmv_fast's whole blocks; qmv's last one
+def test_inputs_staged_in_threadgroup_memory_give_the_same_rows(k, bits, dtype):
+    """A kernel may stage its inputs in threadgroup memory: the face loads
+    them from there and gives the rows it gives from device memory, MLX's."""
+    layer = _linear(k, 16, bits, 32, dtype)
+    # A float32 layer's face: the traversal's, on fp32 tensors (above).
+    face = replace(formats.dot(_linear(k, 16, bits, 32), k, 16), dtypes=(dtype,))
+    x = mx.random.normal((k,)).astype(dtype)
+    operands = _operands(face, layer)
+    staged = testing.dot_rows(face, operands, x, 16, packs=(2, 2), staged=True)
+    assert _bit_equal(staged, testing.dot_rows(face, operands, x, 16, packs=(2, 2)))
+    if dtype == mx.float32:
+        assert _bit_equal(staged, _mlx_rows(layer, x))
 
 
 @metal

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks for a format's tests. ``dot_rows`` runs a face in the skeletons
-oMLX's kernels are built from, outside any model, and ``tile_rows`` reads
+oMLX's kernels are built from, outside any model, ``decoded_rows`` runs its
+rows through ``decode`` and ``apply``, and ``tile_rows`` reads
 every weight of rows through a tile face. ``staged_tables`` reads a face's
 tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
@@ -25,16 +26,65 @@ import mlx.core as mx
 from .. import formats
 from . import Dot, Tile, kernels
 
-# One threadgroup of one simdgroup per NA + NB rows.
+# One threadgroup of one simdgroup per NA + NB rows. The rows read x where
+# the kernel has it (XS): in device memory, or staged in threadgroup memory.
 _ROWS = r"""
     const uint simd_lid = thread_index_in_simdgroup;
     const size_t row = size_t(threadgroup_position_in_grid.y) * (NA + NB);
     float result[NA + NB];
-    qmv_rows<T, K, NA, NB>(m, row, m, row + NA, x, simd_lid, result);
+    qmv_rows<T, K, NA, NB>(m, row, m, row + NA, XS, simd_lid, result);
     if (simd_lid == 0) {
       store_rows(omlx_iota<NA + NB>(), result, y + row);
     }
 """
+
+# x copied into threadgroup memory, as a kernel that stages its inputs does.
+_STAGED = r"""
+    threadgroup T xs[K];
+    for (int i = int(thread_index_in_simdgroup); i < K; i += 32) {
+      xs[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+"""
+
+# One row a simdgroup through decode and apply, the walk of qmv_rows: each
+# block's weights decoded, then applied to the lane's inputs.
+_DECODED_ROW = r"""
+template <typename T, int K, typename D>
+METAL_FUNC float omlx_decoded_row(D m, size_t row, const device T* x, uint lane) {
+  using L = typename D::template Lanes<K>;
+  constexpr int WHOLE = K - K % L::BLOCK;
+  constexpr int LAST = K % L::BLOCK / L::VPT;
+  L a(m, row, lane);
+  x += int(lane) * L::VPT;
+  float xt[L::VPT];
+  float acc = 0;
+  for (int k = 0; k < WHOLE; k += L::BLOCK) {
+    const auto aux = L::load(x, xt);
+    acc = L::apply(acc, L::decode(a.row(0)), xt, aux);
+    a.step();
+    x += L::BLOCK;
+  }
+  if constexpr (LAST > 0) {
+    if (lane < uint(LAST)) {
+      const auto aux = L::load(x, xt);
+      acc = L::apply(acc, L::decode(a.row(0)), xt, aux);
+    }
+  }
+  return a.finish(0, metal::simd_sum(acc));
+}
+"""
+
+_DECODED_ROWS = r"""
+    const size_t row = size_t(threadgroup_position_in_grid.y);
+    const float v = omlx_decoded_row<T, K>(m, row, x, thread_index_in_simdgroup);
+    if (thread_index_in_simdgroup == 0) {
+      y[row] = static_cast<T>(v);
+    }
+"""
+
+# MLX's threadgroup memory for a kernel, in bytes.
+_THREADGROUP_BYTES = 32768
 
 
 @contextmanager
@@ -64,15 +114,16 @@ def no_dot_defects():
 
 
 @cache
-def _dot_rows_kernel(face: Dot):
+def _dot_rows_kernel(face: Dot, staged: bool):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("m", face)]
+    rows = _ROWS.replace("XS", "(const threadgroup T*)xs" if staged else "x")
     return mx.fast.metal_kernel(
         name=f"omlx_format_dot_rows_{face.key}",
         input_names=inputs,
         output_names=["y"],
         header=matrices.header + kernels.STORE_ROWS,
-        source=matrices.declarations + _ROWS,
+        source=matrices.declarations + (_STAGED if staged else "") + rows,
     )
 
 
@@ -131,25 +182,10 @@ def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.a
     return {table.name: got for table, got in zip(face.tables, tables, strict=True)}
 
 
-def dot_rows(
-    face: Dot, operands, x: mx.array, n: int, packs: tuple[int, int] = (1, 1)
-) -> mx.array:
-    """The products of ``x`` (K activations) with the first ``n`` rows of a
-    matrix, through the row skeleton.
-
-    ``operands`` are the matrix's weight and the face's tensors, in order.
-    A launch takes ``packs[0]`` rows as the skeleton's first pack and the
-    next ``packs[1]`` as its second, one row or more in all; ``n`` is one
-    or more times their sum, and no more than the matrix's rows (which is
-    not checked). ``x`` is one vector of a dtype the face is exact for; it
-    and each operand have 8 elements or more. Anything else is refused with
-    a ``ValueError``. The kernel is compiled for ``face`` and K.
-    """
-    na, nb = packs
-    if min(na, nb) < 0 or na + nb == 0:
-        raise ValueError(f"packs={packs}: two counts of rows, one row or more in all")
-    if n <= 0 or n % (na + nb):
-        raise ValueError(f"n={n} is not one launch or more of {na + nb} rows")
+def _checked(face: Dot, operands, x: mx.array) -> tuple:
+    """``operands`` as a tuple, or a ``ValueError``: one vector ``x`` of a
+    dtype the face is exact for, the face's operands, each of 8 elements or
+    more."""
     if x.ndim != 1:
         raise ValueError(f"x is one vector of K activations, not of shape {x.shape}")
     operands, names = tuple(operands), ("weight", *face.tensors)
@@ -166,10 +202,77 @@ def dot_rows(
                 f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
                 "input of fewer than 8 as constants, not as a device buffer"
             )
-    return _dot_rows_kernel(face)(
+    return operands
+
+
+def dot_rows(
+    face: Dot,
+    operands,
+    x: mx.array,
+    n: int,
+    packs: tuple[int, int] = (1, 1),
+    staged: bool = False,
+) -> mx.array:
+    """The products of ``x`` (K activations) with the first ``n`` rows of a
+    matrix, through the row skeleton.
+
+    ``operands`` are the matrix's weight and the face's tensors, in order.
+    A launch takes ``packs[0]`` rows as the skeleton's first pack and the
+    next ``packs[1]`` as its second, one row or more in all; ``n`` is one
+    or more times their sum, and no more than the matrix's rows (which is
+    not checked). ``x`` is one vector of a dtype the face is exact for; it
+    and each operand have 8 elements or more. With ``staged``, the kernel
+    copies ``x`` into threadgroup memory and the face loads it from there,
+    as a kernel that stages its inputs does: the rows are the same, bit for
+    bit; ``x`` then fits in 32 KiB. Anything else is refused with a
+    ``ValueError``. The kernel is compiled for ``face`` and K.
+    """
+    na, nb = packs
+    if min(na, nb) < 0 or na + nb == 0:
+        raise ValueError(f"packs={packs}: two counts of rows, one row or more in all")
+    if n <= 0 or n % (na + nb):
+        raise ValueError(f"n={n} is not one launch or more of {na + nb} rows")
+    operands = _checked(face, operands, x)
+    if staged and x.nbytes > _THREADGROUP_BYTES:
+        raise ValueError(
+            f"x of {x.nbytes} bytes does not fit in the {_THREADGROUP_BYTES} bytes "
+            "of a threadgroup's memory"
+        )
+    return _dot_rows_kernel(face, staged)(
         inputs=[x, *operands],
         template=[("T", x.dtype), ("K", x.shape[-1]), ("NA", na), ("NB", nb)],
         grid=(32, n // (na + nb), 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(n,)],
+        output_dtypes=[x.dtype],
+    )[0]
+
+
+@cache
+def _decoded_rows_kernel(face: Dot):
+    matrices = kernels.Matrices()
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_decoded_rows_{face.key}",
+        input_names=["x", *matrices.add("m", face, shared=True)],
+        output_names=["y"],
+        header=matrices.header + _DECODED_ROW,
+        source=matrices.declarations + _DECODED_ROWS,
+    )
+
+
+def decoded_rows(face: Dot, operands, x: mx.array, n: int) -> mx.array:
+    """The products of ``x`` with the first ``n`` rows of a matrix, each
+    block's weights through the face's ``decode`` and then ``apply``: what
+    ``dot_rows`` gives through ``madd``, bit for bit, for a face that keeps
+    the rule. The arguments are ``dot_rows``'s, and refused as it refuses
+    them."""
+    operands = _checked(face, operands, x)
+    if n <= 0:
+        raise ValueError(f"n={n} is not one row or more")
+    return _decoded_rows_kernel(face)(
+        inputs=[x, *operands],
+        template=[("T", x.dtype), ("K", x.shape[-1])],
+        grid=(32, n, 1),
         threadgroup=(32, 1, 1),
         output_shapes=[(n,)],
         output_dtypes=[x.dtype],

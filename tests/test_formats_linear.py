@@ -1591,7 +1591,7 @@ def test_a_proof_keeps_so_many_graphs_then_builds_them_as_called(monkeypatch):
 def test_a_launch_that_fails_stops_the_launches_that_ran(toy, monkeypatch, caplog):
     """A proof's launches stop together: its kept graphs are dropped."""
     caplog.set_level(logging.WARNING, logger=linear.__name__)
-    floats = 'static_assert(sizeof(X) == 4, "floats alone");\n      return 0;'
+    floats = 'static_assert(sizeof(x[0]) == 4, "floats alone");\n      return 0;'
     source = _TOY.replace("      return 0;", "      " + floats)
     assert source.count("floats alone") == 1
     toy(_toy("floats", source))
@@ -1966,7 +1966,7 @@ class _TwiceFormat(_ToyFormat):
 def _half_typed():
     """The toy face with a load that compiles for float32 activations alone:
     halves are another instance of its Metal, which does not compile."""
-    floats = 'static_assert(sizeof(X) == 4, "floats alone");\n      return 0;'
+    floats = 'static_assert(sizeof(x[0]) == 4, "floats alone");\n      return 0;'
     source = _TOY.replace("      return 0;", "      " + floats)
     assert source.count("floats alone") == 1
     return _toy("floats", source)

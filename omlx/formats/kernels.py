@@ -64,16 +64,18 @@ using omlx_iota = typename omlx_iota_<N>::type;
 # first: the rest is compiled only for a face of a revision oMLX runs, so a
 # face of another one fails with that and nothing else. So for a lane of no
 # inputs (VPT): nothing that multiplies or divides by VPT or walks a lane's
-# inputs follows.
+# inputs follows. x is the T inputs in device memory, or in threadgroup
+# memory where a kernel stages them (omlx_inputs checks it). Comments stay
+# out of the Metal: MLX hashes a kernel's whole source at every launch.
 _QMV_ROWS = r"""
 // One block of a lane: its VPT inputs against each row's weights.
-template <typename L, typename T, int... RA, int... RB>
+template <typename L, typename XP, int... RA, int... RB>
 METAL_FUNC void omlx_qmv_block(
     omlx_ints<RA...>,
     omlx_ints<RB...>,
     thread const L& a,
     thread const L& b,
-    const device T* x,
+    XP x,
     thread float* x_thread,
     thread float* result) {
   constexpr int NA = sizeof...(RA);
@@ -82,7 +84,7 @@ METAL_FUNC void omlx_qmv_block(
   ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), x_thread, aux)), ...);
 }
 
-template <typename T, int K, typename D, int... RA, int... RB>
+template <int K, typename D, typename XP, int... RA, int... RB>
 METAL_FUNC void omlx_qmv_rows(
     omlx_ints<RA...> ra,
     omlx_ints<RB...> rb,
@@ -90,7 +92,7 @@ METAL_FUNC void omlx_qmv_rows(
     size_t row_a,
     D mb,
     size_t row_b,
-    const device T* x,
+    XP x,
     uint simd_lid,
     thread float* result) {
   using L = typename D::template Lanes<K>;
@@ -133,15 +135,21 @@ struct omlx_revision {
       "dot face: written for a revision of the contract this oMLX no longer runs");
 };
 
-template <typename T, int K, int NA, int NB, typename D>
+template <typename T>
+METAL_FUNC void omlx_inputs(const device T*) {}
+template <typename T>
+METAL_FUNC void omlx_inputs(const threadgroup T*) {}
+
+template <typename T, int K, int NA, int NB, typename D, typename XP>
 METAL_FUNC void qmv_rows(
     D ma,
     size_t row_a,
     D mb,
     size_t row_b,
-    const device T* x,
+    XP x,
     uint simd_lid,
     thread float* result) {
+  omlx_inputs<T>(x);
   constexpr int FACE = D::CONTRACT;
   (void)sizeof(omlx_revision<FACE>);  // instantiates it: its asserts run
   if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
@@ -157,7 +165,7 @@ METAL_FUNC void qmv_rows(
       static_assert(
           K % L::VPT == 0,
           "dot face: K must be a whole number of a lane's VPT inputs");
-      omlx_qmv_rows<T, K>(
+      omlx_qmv_rows<K>(
           omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
     }
   }
@@ -838,18 +846,23 @@ class Matrices:
         self._names: set[str] = set()
         self._tables = Tables()
         self._staged: dict[str, tuple[str, ...]] = {}
+        self._shared: set[Dot] = set()
 
-    def add(self, name: str, face: Dot | Tile) -> list[str]:
+    def add(self, name: str, face: Dot | Tile, shared: bool = False) -> list[str]:
         """Add matrix ``name``, read through ``face``, a ``Dot`` or a
         ``Tile``. Returns its kernel inputs: the weight, then the face's
-        tensors in order. Refuses a name that is not an identifier, a face
-        of another type, and a matrix whose name or inputs repeat those of a
-        matrix added before: the kernel's other names are the kernel's to
-        keep apart."""
+        tensors in order. With ``shared``, the kernel applies one block's
+        weights to several inputs (``decode`` and ``apply``) and includes
+        the dot face's shared source too. Refuses a name that is not an
+        identifier, a face of another type, a shared tile, and a matrix
+        whose name or inputs repeat those of a matrix added before: the
+        kernel's other names are the kernel's to keep apart."""
         if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
             raise ValueError(f"matrix {name!r}: its name is not an identifier")
         if not isinstance(face, (Dot, Tile)):
             raise TypeError(f"matrix {name!r}: {face!r} is not a Dot or a Tile")
+        if shared and not isinstance(face, Dot):
+            raise TypeError(f"matrix {name!r}: a tile face has no shared source")
         inputs = _inputs(name, face)
         repeated = [n for n in (name, *inputs) if n in self._names]
         if repeated:
@@ -866,6 +879,8 @@ class Matrices:
         self._staged[name] = tuple(self._tables.add(t) for t in face.tables)
         self._faces[name] = face
         self._names.update((name, *inputs))
+        if shared:
+            self._shared.add(face)
         return inputs
 
     @property
@@ -883,6 +898,10 @@ class Matrices:
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
+        # A shared source defines what its face's source declares: after it.
+        for face in self._faces.values():
+            if face in self._shared and face.shared:
+                sources.setdefault(face.shared, f"{face.key} shared")
         faces = self._faces.values()
         # The row skeleton opens with a line break, as the tile skeleton's
         # #line does; with neither, the macros' end is put on a line of its
