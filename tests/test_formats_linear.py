@@ -1032,42 +1032,53 @@ def test_a_stand_in_s_zeros_open_the_buffer_whatever_input_is_the_largest(
 
 def test_zeros_of_2_GiB_or_more_are_each_their_own(monkeypatch):  # noqa: N802
     """MLX's shapes are int32: a buffer of 2 GiB or more as one axis of
-    bytes cannot be made. Where a stand-in's largest input has that many
-    bytes (a vocabulary head of 262144 x 4096 two-byte codes), each input is
-    zeros of its own. Nothing is evaluated here: MLX allocates when it
-    evaluates."""
-    zeros, asked = mx.zeros, []
+    bytes cannot be made. An input of that many bytes (a vocabulary head of
+    262144 x 4096 two-byte codes) is zeros of its own; the others share one
+    buffer, wherever the largest stands. Nothing is evaluated here: MLX
+    allocates when it evaluates."""
+    zeros, asked, streams = mx.zeros, [], []
 
     def recorded(shape, *dtype, **named):
         asked.append((shape, *dtype))
+        streams.append(named.get("stream"))
         return zeros(shape, *dtype, **named)
 
     monkeypatch.setattr(mx, "zeros", recorded)
     monkeypatch.setattr(mx, "eval", lambda *arrays: None)
-    x = ((4096,), mx.bfloat16)
-    for largest, buffers in (
-        (((262144, 4096), mx.bfloat16), None),
-        (((2**31 - 1,), mx.uint8), [((2**31 - 1,), mx.uint8)]),
+    x, scales = ((4096,), mx.bfloat16), ((262144, 64), mx.bfloat16)
+    head = ((262144, 4096), mx.bfloat16)
+    under = ((2**31 - 1,), mx.uint8)
+    for specs, buffers in (
+        ((x, head), [((8192,), mx.uint8), head]),
+        ((head, x, scales), [((2**25,), mx.uint8), head]),
+        ((x, under, scales), [((2**31 - 1,), mx.uint8)]),
+        ((under, x), [((2**31 - 1,), mx.uint8)]),
     ):
         del asked[:]
-        made = linear._zeros(x, largest)
-        assert [(a.shape, a.dtype) for a in made] == [x, largest]
-        assert asked == (buffers or [x, largest])
+        made = linear._zeros(*specs)
+        assert [(a.shape, a.dtype) for a in made] == list(specs)
+        assert asked == buffers
+    # Each on the GPU's stream, the launch's.
+    assert set(streams) == {mx.gpu}
 
 
 def test_a_stand_in_s_zeros_are_made_and_waited_for_on_the_gpu(monkeypatch):
     """A launch runs on the GPU's stream, whatever the caller's default
-    stream. Its stand-in's zeros are made there too, and the stream is
-    synchronized after their evaluation: what an earlier evaluation left
-    pending on the GPU is raised then, ahead of the proof, not in the
-    evaluation of the launch."""
+    stream. Its stand-in's zeros are made there too, each op given the GPU's
+    stream (the process's default device, which every thread shares, is
+    left as it is), and the stream is synchronized after their evaluation:
+    what an earlier evaluation left pending on the GPU is raised then, ahead
+    of the proof, not in the evaluation of the launch."""
     quantized, layer = _pair(320, 72)
     x = _x((1, 320))
-    zeros, synchronize, evaluate, events = mx.zeros, mx.synchronize, mx.eval, []
+    synchronize, evaluate, events = mx.synchronize, mx.eval, []
 
-    def made(shape, *dtype, **named):
-        events.append(("zeros", mx.default_device()))
-        return zeros(shape, *dtype, **named)
+    def made(op, name):
+        def recorded(*args, **named):
+            events.append((name, mx.default_device(), named.get("stream")))
+            return op(*args, **named)
+
+        return recorded
 
     def synchronized(*stream):
         events.append(("synchronize", *stream))
@@ -1078,17 +1089,16 @@ def test_a_stand_in_s_zeros_are_made_and_waited_for_on_the_gpu(monkeypatch):
         evaluate(*arrays)
 
     with monkeypatch.context() as patch:
-        patch.setattr(mx, "zeros", made)
+        for name in ("zeros", "as_strided", "view", "reshape"):
+            patch.setattr(mx, name, made(getattr(mx, name), name))
         patch.setattr(mx, "synchronize", synchronized)
         patch.setattr(mx, "eval", evaluated)
         with mx.stream(mx.cpu):
             y = layer(x)
-    assert events == [
-        ("zeros", mx.gpu),
-        ("eval", 4),
-        ("synchronize", mx.gpu),
-        ("eval", 1),
-    ]
+    ops = [event for event in events if event[0] not in ("eval", "synchronize")]
+    assert ops[0][0] == "zeros" and len(ops) == 1 + 3 * 4
+    assert all(event[1:] == (mx.cpu, mx.gpu) for event in ops)
+    assert events[len(ops) :] == [("eval", 4), ("synchronize", mx.gpu), ("eval", 1)]
     assert _same_bits(y, quantized(x))
     assert (
         "The stand-in's zeros are evaluated on the GPU's stream as it is built, "

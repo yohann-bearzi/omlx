@@ -168,22 +168,26 @@ def _zeros(*specs) -> list[mx.array]:
     making them (an allocation, an error that an earlier evaluation left
     pending on the GPU) is not the face's. They are made on the GPU's
     stream, the launch's, which is synchronized after their evaluation, so
-    such an error is raised here. They are views of one buffer of as many
-    bytes as the largest, from its first byte: one fill and, where MLX's
-    buffer cache is empty (oMLX clears it after each prefill chunk), one new
-    buffer. Where the largest has 2 GiB or more, each is zeros of its own."""
+    such an error is raised here. Each op is given the stream: the default
+    device is the process's, every thread's, and is left as it is. The
+    zeros are views of one buffer of as many bytes as the largest, from its
+    first byte: one fill and, where MLX's buffer cache is empty (oMLX clears
+    it after each prefill chunk), one new buffer. One of 2 GiB or more is
+    zeros of its own: MLX's shapes are int32."""
+    gpu = mx.gpu
     sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
-    with mx.stream(mx.gpu):
-        if max(sizes) < _ONE_BUFFER:
-            buffer = mx.zeros((max(sizes),), mx.uint8)
-            zeros = [
-                mx.view(buffer[:size], dtype).reshape(shape)
-                for (shape, dtype), size in zip(specs, sizes, strict=True)
-            ]
+    shared = max((size for size in sizes if size < _ONE_BUFFER), default=0)
+    buffer = mx.zeros((shared,), mx.uint8, stream=gpu)
+    zeros = []
+    for (shape, dtype), size in zip(specs, sizes, strict=True):
+        if size < _ONE_BUFFER:
+            raw = mx.as_strided(buffer, (size,), stream=gpu)
+            typed = mx.view(raw, dtype, stream=gpu)
+            zeros.append(mx.reshape(typed, shape, stream=gpu))
         else:
-            zeros = [mx.zeros(shape, dtype) for shape, dtype in specs]
-        mx.eval(*zeros)
-        mx.synchronize(mx.gpu)
+            zeros.append(mx.zeros(shape, dtype, stream=gpu))
+    mx.eval(*zeros)
+    mx.synchronize(gpu)
     return zeros
 
 
