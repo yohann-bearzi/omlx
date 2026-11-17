@@ -829,6 +829,16 @@ _QUOTED_FAMILIES = {
             "its DSpark draft folds the output head into its own projection by "
             "hand, as MLX's quantized layer or as floats",
         ),
+        # No model type: the gate fails closed.
+        ("untyped", {}, "its config names no model type"),
+        ("untyped", {"model_type": None}, "its config names no model type"),
+        ("untyped", {"model_type": " "}, "its config names no model type"),
+        # A decision model's backbone under another spelling.
+        (
+            "d1",
+            {"model_type": "LFM3-VL", "architectures": ["D1Model"]},
+            _NOT_VERIFIED,
+        ),
     ],
     ids=[
         "model type",
@@ -851,6 +861,10 @@ _QUOTED_FAMILIES = {
         "decision model",
         "decision family",
         "inkling2",
+        "no model type",
+        "a null model type",
+        "a blank model type",
+        "decision model spelled otherwise",
     ],
 )
 def test_a_family_neither_stock_nor_verified_is_refused(
@@ -862,6 +876,8 @@ def test_a_family_neither_stock_nor_verified_is_refused(
         for name in ("joint_head.safetensors", "joint_head_config.json"):
             (source / name).write_text("{}")
     (source / "config.json").write_text(json.dumps(config))
+    # Weights that no load reads: refused before any is.
+    (source / "model.safetensors").write_bytes(b"not a checkpoint")
     output = tmp_path / "refused"
     with pytest.raises(formats.FormatRefusedError) as refusal:
         oq.quantize_oq_streaming(
@@ -876,10 +892,56 @@ def test_a_family_neither_stock_nor_verified_is_refused(
     said = str(refusal.value)
     for spelled, quoted in _PAGE_FAMILY.items():
         said = said.replace(spelled, quoted)
-    quoted_spelling = config["model_type"] in (family, "glm5", "qwen3_5")
+    quoted_spelling = config.get("model_type") in (family, "glm5", "qwen3_5")
     if family in _QUOTED_FAMILIES and quoted_spelling:
         assert _quoted(said)
     assert not output.exists() and toy.offered == []
+
+
+@pytest.mark.parametrize(
+    "name, config, why",
+    [
+        (
+            "jina-code-embeddings-1.5b",
+            {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]},
+            "oMLX serves it with its embedding engine, not as an LLM of mlx-lm's "
+            "own code",
+        ),
+        (
+            "source",
+            {"model_type": "llama", "vision_config": {"model_type": "siglip"}},
+            "oMLX serves it with its vlm engine, not as an LLM of mlx-lm's own code",
+        ),
+        (
+            "source",
+            {"model_type": "llama", "dflash_config": {}},
+            "it is a draft model, which oMLX serves beside another",
+        ),
+        (
+            "source",
+            {"model_type": "qwen2", "model_file": "arch.py"},
+            "it builds its architecture from a file of its own (model_file)",
+        ),
+    ],
+    ids=["an embedding model", "a vision model", "a draft", "its own code"],
+)
+def test_a_stock_family_is_written_in_a_format_only_as_an_llm(
+    toy, tmp_path, name, config, why
+):
+    source = tmp_path / name
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(config))
+    (source / "model.safetensors").write_bytes(b"not a checkpoint")
+    output = tmp_path / "refused"
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format="toy"
+        )
+    assert refusal.value.reason == (
+        f"oQ writes no {config['model_type']} checkpoint in it: {why}; write it "
+        "without a quant format, or have the family verified"
+    )
+    assert not output.exists()
 
 
 def test_the_families_oq_writes_in_a_format(tmp_path):
@@ -890,23 +952,26 @@ def test_the_families_oq_writes_in_a_format(tmp_path):
     assert not _VERIFIED
     source = tmp_path / "source"
     source.mkdir()
+    # Model discovery registers a directory with weights.
+    (source / "model.safetensors").write_bytes(b"not a checkpoint")
+
+    def unverified(config):
+        (source / "config.json").write_text(json.dumps(config))
+        return oq._unverified_family(source, config)
+
     for model_type in ("llama", "Mistral", "qwen2", "PHI3", "starcoder2", "olmo2"):
-        config = {"model_type": model_type}
-        assert oq._unverified_family(source, config) is None
+        assert unverified({"model_type": model_type}) is None
     # A text model of a stock family under a stock top level.
-    config = {"model_type": "llama", "text_config": {"model_type": "mistral"}}
-    assert oq._unverified_family(source, config) is None
+    text = {"model_type": "llama", "text_config": {"model_type": "mistral"}}
+    assert unverified(text) is None
     # A verified family, top level or text model.
     nested = {"model_type": "llama", "text_config": {"model_type": "qwen4_exp"}}
     with testing.verified("Qwen4-Exp"):
-        assert oq._unverified_family(source, {"model_type": "qwen4_exp"}) is None
-        assert oq._unverified_family(source, nested) is None
+        assert unverified({"model_type": "qwen4_exp"}) is None
+        assert unverified(nested) is None
     # Not after the block.
-    assert oq._unverified_family(source, nested)[0] == "qwen4_exp"
-    assert oq._unverified_family(source, {"model_type": "qwen3"}) == (
-        "qwen3",
-        _NOT_VERIFIED,
-    )
+    assert unverified(nested)[0] == "qwen4_exp"
+    assert unverified({"model_type": "qwen3"}) == ("qwen3", _NOT_VERIFIED)
 
 
 # What every family oMLX serves runs of oMLX's patches, whichever it is:
@@ -932,6 +997,8 @@ _EVERY_LOAD = {
     "sdpa256_attention.py:apply_sdpa256_attention_patch",
 }
 _EVERY_FORWARD = {
+    # Every MLX quantized layer's call, whatever the model.
+    "batched_decode_qmm.py:patched_call",
     "sdpa256_attention.py:_over_vector_thread_limit",
     "sdpa256_attention.py:_should_route",
     "sdpa256_attention.py:patched_sdpa",
@@ -972,7 +1039,7 @@ _SERVE = textwrap.dedent("""
         if event == "call" and code.co_filename.startswith(patches):
             where = f"{code.co_filename[len(patches) + 1:]}:{code.co_name}"
             if seen["phase"] is forwards or code.co_name.startswith(
-                ("apply_", "configure_", "install_")
+                ("apply_", "configure_", "install_", "enable_", "patch_")
             ):
                 seen["phase"].add(where)
 
@@ -989,8 +1056,9 @@ _SERVE = textwrap.dedent("""
 """)
 
 
+@pytest.mark.parametrize("quantized", [False, True], ids=["floats", "quantized"])
 @pytest.mark.parametrize("family", sorted(_STOCK))
-def test_omlx_patches_no_stock_family(tmp_path, family):
+def test_omlx_patches_no_stock_family(tmp_path, family, quantized):
     import importlib
     import subprocess
     import sys
@@ -1015,6 +1083,10 @@ def test_omlx_patches_no_stock_family(tmp_path, family):
     }
     module = importlib.import_module(f"mlx_lm.models.{module_name}")
     model = module.Model(module.ModelArgs.from_dict(config))
+    if quantized:
+        # As oQ writes it: MLX's affine layers, which oMLX's kernels serve.
+        nn.quantize(model, group_size=64, bits=4)
+        config["quantization"] = {"group_size": 64, "bits": 4}
     weights = dict(tree_flatten(model.parameters()))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     (tmp_path / "config.json").write_text(json.dumps(config))

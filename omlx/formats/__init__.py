@@ -363,13 +363,15 @@ class QuantFormat:
 
 
 class FormatRefusedError(ValueError):
-    """oMLX refuses to load a checkpoint's layers of a quant format, for
-    ``reason``, and says what it knows of them: the ``mode``, the checkpoint
-    at ``path`` (None for a layer built outside a checkpoint's load), the
-    plugin its record says ``written`` it, and the one ``installed``.
+    """oMLX refuses a quant format's layers, for ``reason``, and says what it
+    knows of them: the ``mode``, the checkpoint at ``path`` (None for a
+    layer built outside a checkpoint's load, and for oQ's refusal to write
+    one), the plugin its record says ``written`` it, and the one
+    ``installed``.
 
     Every refusal of a format's checkpoint at load is one of these, and
     oMLX's loaders let it through as it is: no fallback load runs after it.
+    So is oQ's refusal to write a checkpoint of a family in a format.
     """
 
     def __init__(

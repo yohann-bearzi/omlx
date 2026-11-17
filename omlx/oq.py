@@ -67,6 +67,7 @@ from omlx.model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
+    is_helper_model_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -6991,10 +6992,15 @@ def _family(name: str) -> str:
 
 def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
     """(family, why) when oQ writes the checkpoint at ``source`` in no quant
-    format: a decision model whose family is not verified, or a model whose
-    type (or its text model's) is neither a stock family nor a verified one,
-    with what the audits found its own code to read wrongly when they did."""
-    kind = decision_kind(source, config)
+    format: one whose config names no model type; a decision model whose
+    family is not verified; a model whose type (or its text model's) is
+    neither a stock family nor a verified one, with what the audits found
+    its own code to read wrongly when they did; or one of a stock family
+    that oMLX does not serve as an LLM of mlx-lm's own code."""
+    model_type = config.get("model_type")
+    if not isinstance(model_type, str) or not model_type.strip():
+        return "untyped", "its config names no model type"
+    kind = decision_kind(source, {**config, "model_type": _family(model_type)})
     if kind is not None:
         if kind in _QUANT_FORMAT_VERIFIED:
             return None
@@ -7013,9 +7019,40 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
         if family in _QUANT_FORMAT_MISREAD:
             return family, _QUANT_FORMAT_MISREAD[family]
     for family in families:
-        if family not in _QUANT_FORMAT_STOCK | _QUANT_FORMAT_VERIFIED:
+        if family not in _QUANT_FORMAT_STOCK and family not in _QUANT_FORMAT_VERIFIED:
             return family, _NOT_VERIFIED
+    stock = [family for family in families if family not in _QUANT_FORMAT_VERIFIED]
+    if stock:
+        # A stock family is proven as an LLM that mlx-lm's own code builds,
+        # and only so.
+        why = None
+        if config.get("model_file") is not None:
+            why = "it builds its architecture from a file of its own (model_file)"
+        elif is_helper_model_config(config):
+            why = "it is a draft model, which oMLX serves beside another"
+        else:
+            engine = _served_engine(source)
+            if engine is None:
+                why = "oMLX's model discovery registers no model of it"
+            elif engine != "batched":
+                why = (
+                    f"oMLX serves it with its {engine} engine, not as an LLM of "
+                    "mlx-lm's own code"
+                )
+        if why is not None:
+            return stock[0], why
     return None
+
+
+def _served_engine(path: Path) -> str | None:
+    """The engine oMLX's model discovery registers the checkpoint at ``path``
+    for (``batched``, its LLM engine; ``vlm``; ``embedding``...), or None
+    when it registers none."""
+    from omlx.model_discovery import _register_model
+
+    found = {}
+    _register_model(found, path, "served")
+    return found["served"].engine_type if "served" in found else None
 
 
 _NOT_VERIFIED = (
@@ -7378,9 +7415,6 @@ def quantize_oq_streaming(
     normalized_model_type = str(config.get("model_type", "")).lower().replace(
         "-", "_"
     )
-    if inkling2_layout.is_inkling2(config):
-        # The model class is needed before any calibration load registers it.
-        apply_inkling2_patch()
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
@@ -7401,6 +7435,9 @@ def quantize_oq_streaming(
                 "it without a quant format, or have the family verified",
                 mode=quant_format,
             )
+    if inkling2_layout.is_inkling2(config):
+        # The model class is needed before any calibration load registers it.
+        apply_inkling2_patch()
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
 
