@@ -5,6 +5,7 @@ every weight of rows through a tile face. ``staged_tables`` reads a face's
 tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
 where format layers' rows ran: their face's launch, or the format's decode.
+``fresh_proofs`` gives a test proofs of its own.
 
 Nothing here is imported by the layers or the kernels: what a check needs of
 them it wraps for the length of a block.
@@ -542,3 +543,59 @@ def layer_calls():
                 _open -= 1
                 if not _open:
                     _unwrap()
+
+
+class _Swapped:
+    """A registry of the process (``module.name``) that blocks replace with
+    one of their own while they are open: in any thread, and ending in any
+    order. It is the latest of the blocks still open, or, once they have all
+    ended, the one that the first of them replaced. Each block is its own
+    entry, so two blocks of one registry end apart; an exception or an
+    interrupt as a block starts leaves the registry as the blocks still
+    open have it."""
+
+    def __init__(self, module, name: str) -> None:
+        self.module, self.name = module, name
+        self.lock = threading.Lock()
+        self.open: list = []  # the open blocks, oldest first, each (registry,)
+
+    @contextmanager
+    def block(self, registry):
+        entry = None
+        try:
+            with self.lock:
+                if not self.open:
+                    self.replaced = getattr(self.module, self.name)
+                entry = (registry,)
+                self.open.append(entry)
+                setattr(self.module, self.name, registry)
+            yield registry
+        finally:
+            if entry is not None:
+                with self.lock:
+                    self.open = [other for other in self.open if other is not entry]
+                    latest = self.open[-1][0] if self.open else self.replaced
+                    setattr(self.module, self.name, latest)
+
+
+_FRESH_PROOFS = _Swapped(kernels, "_PROOFS")
+
+
+@contextmanager
+def fresh_proofs():
+    """Give the block a registry of proofs of its own (``kernels.proof``),
+    and the registry it replaced back when the block ends.
+
+    A launch that fails keeps every layer and kernel of its key on the
+    composed path for the life of the process: a test that fails a face
+    would leave the tests after it on the decode. oMLX runs each test under
+    ``tests/`` in this block, and so can a plugin, from an autouse fixture.
+    The block's value is its registry.
+
+    The registry is the process's: while the block is open, every thread's
+    kernels prove their launches in it. Blocks may end in any order, in any
+    thread: the registry is then the latest of those still open, or the one
+    that the first replaced. A layer keeps the plan of its first call, proof
+    included: a layer called before the block keeps that call's proof."""
+    with _FRESH_PROOFS.block({}) as proofs:
+        yield proofs

@@ -519,15 +519,23 @@ def dot_defects():
 
 
 @pytest.fixture(autouse=True)
-def kernel_proofs(monkeypatch):
+def kernel_proofs():
     """A launch that fails keeps every kernel of its faces and shapes on the
     composed path for the life of the process (omlx.formats.kernels.Proof).
-    Each test proves its own launches."""
-    from omlx.formats import kernels
+    Each test proves its own launches (omlx.formats.testing.fresh_proofs)."""
+    from omlx.formats import testing
 
-    proofs: dict = {}
-    monkeypatch.setattr(kernels, "_PROOFS", proofs)
-    return proofs
+    with testing.fresh_proofs() as proofs:
+        yield proofs
+
+
+@pytest.fixture
+def monkeypatch(dot_defects, kernel_proofs, monkeypatch):
+    """pytest's monkeypatch, started inside the two blocks of
+    omlx.formats.testing: a test's monkeypatch.setattr of what a block
+    swapped is undone before the block ends and gives the process its own
+    back."""
+    return monkeypatch
 
 
 @pytest.fixture(autouse=True)

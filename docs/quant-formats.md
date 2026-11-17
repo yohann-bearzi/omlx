@@ -735,11 +735,26 @@ Two records are equal when they hold the same layer, the very object (`is`: a la
 
 A face that does not compile leaves its layers to `decode`, so a call recorded with its face ran that face's launch. The layers are wrapped while a block is open in any thread, and rows in a thread without one are not recorded; with no block open, a call is the layer's own and costs nothing more. Not recorded either: a call that raises and the calls it made, rows a layer's subclass computes its own way, a call that a function compiled by `mx.compile` replays (no Python of the layer runs: the call is recorded once, when the function is traced), and a fused kernel's launch over a layer's tensors.
 
+A launch that fails keeps the layers and kernels of its proof's key on their composed path for the life of the process (see [Kernels over faces](#kernels-over-faces)): a test that fails a face would leave the tests after it on `decode`. `omlx.formats.testing.fresh_proofs()` gives its block a registry of proofs of its own and gives the old one back when the block ends. oMLX runs each of its tests in one, and a plugin can too, from an autouse fixture:
+
+```python
+import pytest
+from omlx.formats import testing
+
+
+@pytest.fixture(autouse=True)
+def kernel_proofs():
+    with testing.fresh_proofs():
+        yield
+```
+
+A test's `monkeypatch` is undone after the fixture's block ends, unless `monkeypatch` depends on the fixture: a test that patches the registry would then leave its patch as the process's registry. oMLX's `tests/conftest.py` overrides `monkeypatch` to request the fixture (`def monkeypatch(kernel_proofs, monkeypatch): return monkeypatch`); a plugin that patches the registry in its tests does the same. The block's value is its registry, a dict of `kernels.Proof`, which is not part of the contract. The registry is the process's while the block is open: every thread's kernels prove their launches in it, and blocks may end in any order, in any thread. A layer, and a kernel that a layer of an MoE block feeds, keeps the plan and proof of whichever call ran it first: a layer or a model shared between tests (built by a module or session fixture, or kept by a test for later) keeps the proofs of the first test that ran it, and a face that failed there stays failed for it in every later test. Build the layers a test runs inside the test, or run a shared one first inside the block.
+
 ## Versions
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints`, `omlx_iota` and `omlx_table`.
 

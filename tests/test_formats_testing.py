@@ -13,6 +13,7 @@ import weakref
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import mlx.core as mx
@@ -725,3 +726,226 @@ def test_a_block_ended_from_another_thread_ends_in_its_own(toy):
         pool.submit(outer.__exit__, None, None, None).result()
     face = _toy("linear")
     assert outer_calls == [_call(layer, face, mx.float32)] and inner_calls == []
+
+
+def test_a_block_proves_in_a_registry_of_its_own_and_gives_the_old_one_back():
+    before = kernels._PROOFS
+    outside = kernels.proof("kernel", "key")
+    with testing.fresh_proofs() as proofs:
+        assert kernels._PROOFS is proofs and proofs == {}
+        inside = kernels.proof("kernel", "key")
+        assert inside is not outside and proofs == {("kernel", "key"): inside}
+        inside.fail()
+    assert kernels._PROOFS is before
+    assert kernels.proof("kernel", "key") is outside and not outside.failed
+    # Also when the block's body raises.
+    with pytest.raises(RuntimeError, match="the body's"), testing.fresh_proofs():
+        raise RuntimeError("the body's")
+    assert kernels._PROOFS is before
+
+
+def test_a_face_that_fails_in_a_block_fails_there_alone(toy, caplog):
+    caplog.set_level(logging.WARNING, logger=linear.__name__)
+    toy(_toy("broken", _TOY + 'static_assert(false, "does not compile");\n'))
+    with testing.fresh_proofs() as proofs:
+        layer, x, want = _toy_linear(40, 320)
+        assert mx.array_equal(layer(x), want).item()
+        assert [proof.failed for proof in proofs.values()] == [True]
+    # A layer of the same face, tensor dtypes and shape proves it again.
+    other, x, want = _toy_linear(40, 320, seed=2)
+    assert mx.array_equal(other(x), want).item()
+    assert len(caplog.records) == 2
+
+
+def test_a_layer_keeps_the_proof_of_its_first_call(toy):
+    toy(_toy("linear"))
+    layer, x, _ = _toy_linear(40, 320)
+    layer(x)
+    (proof,) = kernels._PROOFS.values()
+    with testing.fresh_proofs() as proofs:
+        with testing.layer_calls() as calls:
+            layer(x)  # replays the graph its first call kept
+        assert proofs == {} and calls[0].face is not None
+        other, x, _ = _toy_linear(40, 320, seed=2)
+        other(x)
+        (fresh,) = proofs.values()
+        assert fresh is not proof and fresh.ran == proof.ran
+
+
+def test_blocks_end_in_any_order_in_any_thread():
+    """The registry is the latest of the blocks still open, for every
+    thread's kernels; once they have all ended, the one the first replaced."""
+    before = kernels._PROOFS
+    opened, first_ended, seen, errors = (
+        threading.Barrier(2, timeout=30),
+        threading.Event(),
+        {},
+        [],
+    )
+
+    def run(name):
+        try:
+            with testing.fresh_proofs() as proofs:
+                seen[name] = proofs
+                opened.wait()  # both open, the second the latest
+                if name == "first":
+                    seen["both open"] = kernels._PROOFS
+                else:
+                    assert first_ended.wait(timeout=30)
+                    seen["after the first"] = kernels._PROOFS
+                    kernels.proof("kernel", "second's")
+            if name == "first":
+                first_ended.set()
+        except BaseException as error:  # noqa: BLE001 - raised below, in the test
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(name,)) for name in ("first", "second")
+    ]
+    threads[0].start()
+    while "first" not in seen and threads[0].is_alive():
+        threading.Event().wait(0.01)
+    threads[1].start()
+    for thread in threads:
+        thread.join(timeout=60)
+    if errors:
+        raise errors[0]
+    assert seen["both open"] is seen["second"] is seen["after the first"]
+    assert list(seen["second"]) == [("kernel", "second's")]
+    assert kernels._PROOFS is before
+
+
+@pytest.mark.parametrize("_", range(2))
+def test_each_of_omlx_s_tests_proves_in_a_registry_of_its_own(kernel_proofs, _):
+    assert kernels._PROOFS is kernel_proofs and kernel_proofs == {}
+    kernels.proof("kernel", "a test's")
+
+
+def test_the_replaced_registry_comes_back_when_the_last_block_ends():
+    """Whichever block ends last. (Every test runs inside a block of the
+    conftest's: this one swaps a registry of its own.)"""
+    held = SimpleNamespace(registry={})
+    replaced, first, second = held.registry, {}, {}
+    swapped = testing._Swapped(held, "registry")
+    with swapped.block(first):
+        with swapped.block(second):
+            assert held.registry is second
+        assert held.registry is first
+    assert held.registry is replaced
+    one, other = swapped.block(first), swapped.block(second)
+    one.__enter__()
+    other.__enter__()
+    one.__exit__(None, None, None)
+    assert held.registry is second
+    other.__exit__(None, None, None)
+    assert held.registry is replaced
+
+
+_PATCHED: list = []
+
+
+@pytest.mark.parametrize("step", ["patch", "after"])
+def test_a_test_s_patch_of_the_registry_is_undone_into_its_block(monkeypatch, step):
+    """The block ends after the test's monkeypatch is undone: the next test's
+    block replaces the process's registry, not the one a test patched in."""
+    if step == "patch":
+        # The process's registry, as this test's block replaced it.
+        _PATCHED[:] = [testing._FRESH_PROOFS.replaced]
+        monkeypatch.setattr(kernels, "_PROOFS", {})
+    else:
+        assert testing._FRESH_PROOFS.replaced is _PATCHED[0]
+
+
+class _Refusing(SimpleNamespace):
+    """A holder whose registry cannot be set to ``refused``, once."""
+
+    refused = None
+
+    def __setattr__(self, name, value):
+        if value is type(self).refused:
+            type(self).refused = None
+            raise KeyboardInterrupt
+        super().__setattr__(name, value)
+
+
+def test_a_block_is_its_own_entry_and_one_that_cannot_start_leaves_none():
+    held = SimpleNamespace(registry={})
+    replaced, registry = held.registry, {}
+    swapped = testing._Swapped(held, "registry")
+    # Two blocks of one registry end apart.
+    with swapped.block(registry):
+        with swapped.block(registry):
+            pass
+        assert held.registry is registry
+    assert held.registry is replaced
+    # A block whose registry cannot be set leaves the registry as it was.
+    refusing = _Refusing(registry=replaced)
+    _Refusing.refused = registry
+    swapped = testing._Swapped(refusing, "registry")
+    with pytest.raises(KeyboardInterrupt), swapped.block(registry):
+        pytest.fail("the block ran")
+    assert refusing.registry is replaced and swapped.open == []
+    with swapped.block(registry):
+        assert refusing.registry is registry
+    assert refusing.registry is replaced
+
+
+class _Unreadable(SimpleNamespace):
+    """A holder whose registry cannot be read, once."""
+
+    def __getattribute__(self, name):
+        if name == "registry" and type(self).unread:
+            type(self).unread = False
+            raise KeyboardInterrupt
+        return super().__getattribute__(name)
+
+
+def test_a_block_that_did_not_start_ends_as_nothing():
+    _Unreadable.unread = False
+    held = _Unreadable(registry={})
+    replaced = held.registry
+    swapped = testing._Swapped(held, "registry")
+    _Unreadable.unread = True
+    with pytest.raises(KeyboardInterrupt), swapped.block({}):
+        pytest.fail("the block ran")
+    assert swapped.open == [] and held.registry is replaced
+
+
+def test_a_block_ended_in_another_thread_gives_its_registry_back():
+    held = SimpleNamespace(registry={})
+    replaced, registry = held.registry, {}
+    swapped = testing._Swapped(held, "registry")
+    with ThreadPoolExecutor(max_workers=1) as pool:
+
+        def opened():
+            block = swapped.block(registry)
+            block.__enter__()
+            return block
+
+        block = pool.submit(opened).result()
+        assert held.registry is registry
+        block.__exit__(None, None, None)  # here, not in the block's thread
+    assert held.registry is replaced and swapped.open == []
+
+
+def test_a_block_starts_and_ends_under_the_registry_s_lock():
+    held = SimpleNamespace(registry={})
+    swapped = testing._Swapped(held, "registry")
+    started, go, ended = threading.Event(), threading.Event(), threading.Event()
+
+    def run():
+        with swapped.block({}):
+            started.set()
+            assert go.wait(timeout=30)
+        ended.set()
+
+    thread = threading.Thread(target=run)
+    with swapped.lock:
+        thread.start()
+        assert not started.wait(timeout=0.2)
+    assert started.wait(timeout=30)
+    with swapped.lock:
+        go.set()
+        assert not ended.wait(timeout=0.2)
+    assert ended.wait(timeout=30)
+    thread.join(timeout=30)
