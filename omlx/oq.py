@@ -6990,13 +6990,17 @@ def _family(name: str) -> str:
     return name.lower().replace("-", "_")
 
 
-def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
+def _unverified_family(
+    source: Path, config: dict, served_as: str | None = None
+) -> tuple[str, str] | None:
     """(family, why) when oQ writes the checkpoint at ``source`` in no quant
     format: one whose config names no model type; a decision model whose
     family is not verified; a model whose type (or its text model's) is
     neither a stock family nor a verified one, with what the audits found
     its own code to read wrongly when they did; or one of a stock family
-    that oMLX does not serve as an LLM of mlx-lm's own code."""
+    that oMLX does not serve as an LLM of mlx-lm's own code, from the source
+    or from a directory named ``served_as`` (the output's name: model
+    discovery reads a directory's name)."""
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
@@ -7031,7 +7035,10 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
         elif is_helper_model_config(config):
             why = "it is a draft model, which oMLX serves beside another"
         else:
-            engine = _served_engine(source)
+            engines = [_served_engine(source)]
+            if served_as not in (None, source.name):
+                engines.append(_served_engine(source, served_as))
+            engine = next((e for e in engines if e != "batched"), "batched")
             if engine is None:
                 why = "oMLX's model discovery registers no model of it"
             elif engine != "batched":
@@ -7044,14 +7051,23 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
     return None
 
 
-def _served_engine(path: Path) -> str | None:
+def _served_engine(path: Path, name: str | None = None) -> str | None:
     """The engine oMLX's model discovery registers the checkpoint at ``path``
     for (``batched``, its LLM engine; ``vlm``; ``embedding``...), or None
-    when it registers none."""
+    when it registers none; under ``name``, a directory of links to its
+    files named so, when given."""
     from omlx.model_discovery import _register_model
 
     found = {}
-    _register_model(found, path, "served")
+    if name is None:
+        _register_model(found, path, "served")
+    else:
+        with tempfile.TemporaryDirectory(prefix="omlx-oq-served-") as directory:
+            view = Path(directory) / name
+            view.mkdir()
+            for item in path.iterdir():
+                (view / item.name).symlink_to(item.absolute())
+            _register_model(found, view, "served")
     return found["served"].engine_type if "served" in found else None
 
 
@@ -7428,7 +7444,7 @@ def quantize_oq_streaming(
             "format"
         )
     if quant_fmt is not None:
-        refused = _unverified_family(source, config)
+        refused = _unverified_family(source, config, Path(output_path).name)
         if refused is not None:
             raise FormatRefusedError(
                 f"oQ writes no {refused[0]} checkpoint in it: {refused[1]}; write "
@@ -8049,7 +8065,10 @@ def quantize_oq_streaming(
             quantization=quantization_config,
         )
         module_classes = _module_classes(
-            model_path, written, trust_remote_code=trust_remote_code
+            model_path,
+            written,
+            served_as=Path(output_path).name,
+            trust_remote_code=trust_remote_code,
         )
     start_time = _time.monotonic()
     last_quant_display_pct = -1
@@ -11589,7 +11608,9 @@ def _written_layout(
     return written
 
 
-def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
+def _module_classes(
+    model_path, config, *, served_as=None, trust_remote_code=False
+) -> dict:
     """``(class, loads, shape)`` of each module of the model that a checkpoint
     written with ``config`` loads as, by its path, which is the name the
     checkpoint keeps its matrix under: the module's class (its module and
@@ -11612,10 +11633,14 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
 
     source = Path(model_path)
     with tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory:
-        view = Path(directory)
+        # Named as the checkpoint is served (model discovery reads a
+        # directory's name), with a decision model's sidecars.
+        view = Path(directory) / (served_as or source.name)
+        view.mkdir()
         for item in source.iterdir():
-            if item.name != "config.json" and not item.name.endswith(
-                (".safetensors", ".safetensors.index.json")
+            if item.name in DECISION_SIDECAR_WEIGHTS or (
+                item.name != "config.json"
+                and not item.name.endswith((".safetensors", ".safetensors.index.json"))
             ):
                 (view / item.name).symlink_to(item.absolute())
         (view / "config.json").write_text(json.dumps(config))
@@ -11669,11 +11694,7 @@ def _served_by_vlm(view: Path) -> bool:
     """Whether oMLX serves the checkpoint at ``view`` with its VLM engine
     (mlx-vlm's model), as its model discovery registers it, rather than its
     LLM engine (mlx-lm's)."""
-    from omlx.model_discovery import _register_model
-
-    found = {}
-    _register_model(found, view, "walk")
-    engine = found["walk"].engine_type if "walk" in found else None
+    engine = _served_engine(view)
     if engine not in ("vlm", "batched"):
         raise ValueError(
             f"oQ writes a quant format's layers only for a model oMLX serves "
@@ -11697,10 +11718,12 @@ def _source_tensors(source: Path) -> list[str]:
     index's, or its files' headers'."""
     try:
         index = json.loads((source / "model.safetensors.index.json").read_text())
-        return list(index["weight_map"])
-    except (OSError, ValueError, KeyError, TypeError):
-        # None, or not one: the files' headers.
-        pass
+    except (OSError, ValueError):
+        index = None
+    weight_map = index.get("weight_map") if isinstance(index, dict) else None
+    if isinstance(weight_map, dict) and weight_map:
+        return list(weight_map)
+    # None, or not one: the files' headers.
     from safetensors import SafetensorError, safe_open
 
     names = []

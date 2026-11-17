@@ -928,11 +928,30 @@ def test_a_family_neither_stock_nor_verified_is_refused(
 def test_a_stock_family_is_written_in_a_format_only_as_an_llm(
     toy, tmp_path, name, config, why
 ):
-    source = tmp_path / name
-    source.mkdir()
+    _refused_as_served(tmp_path, tmp_path / name, "refused", config, why)
+
+
+def test_a_stock_family_is_written_only_as_its_output_is_served(toy, tmp_path):
+    # Model discovery reads a directory's name: the output's is the served one.
+    config = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}
+    why = (
+        "oMLX serves it with its embedding engine, not as an LLM of mlx-lm's "
+        "own code"
+    )
+    output = "jina-code-embeddings-1.5b-oq4"
+    _refused_as_served(tmp_path, tmp_path / "source", output, config, why)
+    # One whose model discovery skips it (an architecture it does not serve).
+    unserved = ["Florence2ForConditionalGeneration"]
+    config = {"model_type": "qwen2", "architectures": unserved}
+    why = "oMLX's model discovery registers no model of it"
+    _refused_as_served(tmp_path, tmp_path / "skipped", "refused2", config, why)
+
+
+def _refused_as_served(tmp_path, source, output, config, why):
+    source.mkdir(exist_ok=True)
     (source / "config.json").write_text(json.dumps(config))
     (source / "model.safetensors").write_bytes(b"not a checkpoint")
-    output = tmp_path / "refused"
+    output = tmp_path / output
     with pytest.raises(formats.FormatRefusedError) as refusal:
         oq.quantize_oq_streaming(
             str(source), str(output), 4, enhanced=True, quant_format="toy"
@@ -1526,13 +1545,14 @@ def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
     calls, _ = _stub_loaders(monkeypatch)
     config = {"model_type": "llama"}
     source = _checkpoint(tmp_path / "source", config)
-    # An index that does not parse: the files' headers.
-    (source / "model.safetensors.index.json").write_text("{")
     # A file of weights that is a link to nothing declares nothing.
     (source / "extra.safetensors").symlink_to(tmp_path / "nowhere")
-    oq._module_classes(str(source), config)
     declared = {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
-    assert calls[-1][4] == declared
+    # An index that does not parse, or declares no tensor: the files' headers.
+    for text in ('{"weight_map": {}}', '{"weight_map": "ab"}', "[[1]]", "{"):
+        (source / "model.safetensors.index.json").write_text(text)
+        oq._module_classes(str(source), config)
+        assert calls[-1][4] == declared, text
     # The source's own index is not written through.
     assert (source / "model.safetensors.index.json").read_text() == "{"
     index = {"weight_map": {"model.norm.weight": "model.safetensors"}}
@@ -1540,6 +1560,62 @@ def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
     oq._module_classes(str(source), config)
     assert calls[-1][4] == {"weight_map": {"model.norm.weight": "model.safetensors"}}
     assert json.loads((source / "model.safetensors.index.json").read_text()) == index
+
+
+def test_the_walk_s_view_is_named_as_served_with_a_decision_s_sidecars(
+    tmp_path, monkeypatch
+):
+    _stub_loaders(monkeypatch)
+    config = {"model_type": "llama"}
+    source = _checkpoint(tmp_path / "source", config)
+    (source / "joint_head.safetensors").write_bytes(b"")
+    views = []
+
+    def served_by_vlm(view):
+        views.append((view.name, sorted(item.name for item in view.iterdir())))
+        return False
+
+    monkeypatch.setattr(oq, "_served_by_vlm", served_by_vlm)
+    oq._module_classes(str(source), config, served_as="tiny-oq4")
+    oq._module_classes(str(source), config)
+    files = [
+        "config.json",
+        "joint_head.safetensors",
+        "model.safetensors",
+        "model.safetensors.index.json",
+    ]
+    assert views == [("tiny-oq4", files), ("source", files)]
+
+
+def test_one_mlx_executor_whoever_asks_first(monkeypatch):
+    import concurrent.futures
+    import time
+
+    from omlx import engine_core
+
+    made = []
+
+    class Slow(concurrent.futures.ThreadPoolExecutor):
+        def __init__(self, **kwargs):
+            # Long enough for the other first caller to ask meanwhile.
+            time.sleep(0.2)
+            super().__init__(**kwargs)
+            made.append(self)
+
+    monkeypatch.setattr(engine_core, "_global_mlx_executor", None)
+    monkeypatch.setattr(engine_core.concurrent.futures, "ThreadPoolExecutor", Slow)
+    got = []
+    threads = [
+        threading.Thread(target=lambda: got.append(engine_core.get_mlx_executor()))
+        for _ in range(2)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    for executor in made:
+        executor.shutdown()
+    assert len(made) == 1 and got == made * 2
 
 
 def test_the_calibration_patches_the_mtp_runtime_as_upstream_does(
@@ -1570,9 +1646,9 @@ def test_the_engines_apply_pre_load_patches_on_the_thread_that_loads():
 
     from omlx.engine import batched, vlm
 
-    for engine, loader in (
-        (batched.BatchedEngine, "_load_model_sync"),
-        (vlm.VLMBatchedEngine, "_load_vlm_sync"),
+    for engine, loader, extra in (
+        (batched.BatchedEngine, "_load_model_sync", ""),
+        (vlm.VLMBatchedEngine, "_load_vlm_sync", ", for_vlm=True"),
     ):
         tree = ast.parse(textwrap.dedent(inspect.getsource(engine.start)))
         (start,) = tree.body
@@ -1593,6 +1669,17 @@ def test_the_engines_apply_pre_load_patches_on_the_thread_that_loads():
         # a format run, on that thread too, never sets or restores that state
         # while an engine loads.
         assert dispatches(nested) == dispatches(start) == 1, engine
+        # With the arguments the engine gave them before.
+        (call,) = (
+            node
+            for node in ast.walk(nested)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "maybe_apply_pre_load_patches"
+        )
+        assert ast.unparse(call) == (
+            "maybe_apply_pre_load_patches(self._model_name, "
+            f"model_settings=self._model_settings{extra})"
+        )
 
 
 def test_the_walk_reads_no_sidecar_and_keeps_the_calibration_override(

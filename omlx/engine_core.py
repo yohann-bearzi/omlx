@@ -195,6 +195,7 @@ def _raise_request_output_error(output: RequestOutput) -> None:
 
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_GLOBAL_MLX_EXECUTOR_LOCK = threading.Lock()
 _engines_on_own_queues: "weakref.WeakSet[EngineCore]" = weakref.WeakSet()
 _warned_own_queues = False
 
@@ -275,11 +276,13 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
     thread-local stream, so work submitted here needs no stream setup.
     """
     global _global_mlx_executor
-    if _global_mlx_executor is None:
-        _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="mlx-global",
-        )
+    # Two first callers at once (an engine's start, oQ's walk) make one.
+    with _GLOBAL_MLX_EXECUTOR_LOCK:
+        if _global_mlx_executor is None:
+            _global_mlx_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="mlx-global",
+            )
     return _global_mlx_executor
 
 
