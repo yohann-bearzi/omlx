@@ -19,8 +19,10 @@ anywhere else is refused.
 
 Each library function is wrapped once, the first time this patch finds it:
 when the patch is applied, or when its module is imported after that (the
-patch imports none of the libraries). A family's patch that replaces one of
-them afterwards keeps the wrapped function under it: DeepSeek V4's loader
+patch imports none of the libraries). It is wrapped in place, the function
+object itself: a name it was imported under before is wrapped too. A
+family's patch that replaces one of them afterwards keeps the wrapped
+function under it: DeepSeek V4's loader
 (``patches/deepseek_v4/utils_patch.py``, applied after this patch by
 ``maybe_apply_pre_load_patches``) calls it for any other model and builds a
 DeepSeek V4 checkpoint's layers itself, outside any load, so that a
@@ -38,9 +40,10 @@ import inspect
 import json
 import sys
 import threading
+import types
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import wraps
+from functools import update_wrapper, wraps
 from pathlib import Path
 
 import mlx.core as mx
@@ -54,13 +57,12 @@ from ..formats.linear import FormatLinear, FormatSwitchLinear
 _SWITCH_MODULES = ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")
 
 # The functions that build a model from a checkpoint's directory, their
-# first argument, quantizing its layers: oMLX's loads build a format's
-# layers inside one of them. (mlx-vlm's embedding loader calls the encoder
-# loader by the name it imported it under.)
+# first argument, quantizing its layers, by the module that defines them:
+# oMLX's loads build a format's layers inside one of them.
 _LOADERS = (
     ("mlx_lm.utils", "load_model"),
     ("mlx_vlm.utils", "load_model"),
-    ("mlx_vlm.embedding_loader", "load_encoder_model"),
+    ("mlx_vlm.encoder_loader", "load_encoder_model"),
     ("mlx_embeddings.utils", "load_model"),
 )
 
@@ -441,10 +443,31 @@ def _not_installed(mode) -> str:
     return f"no format of this mode is installed: install {written}"
 
 
+def _unwrapped_loader() -> str | None:
+    """The library loader running on this thread's stack, by its module's
+    name, outside any load: one this patch has not wrapped."""
+    frame = sys._getframe(1)
+    while frame is not None:
+        found = (frame.f_globals.get("__name__"), frame.f_code.co_name)
+        if found in _LOADERS:
+            return ".".join(found)
+        frame = frame.f_back
+    return None
+
+
 def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
     """The checkpoint a layer of ``fmt`` built now belongs to."""
     checkpoint = formats._LOADING.get()
     if checkpoint is None:
+        loader = _unwrapped_loader()
+        if loader is not None:
+            raise FormatRefusedError(
+                f"{loader} was imported before oMLX's patches were applied "
+                "and runs unwrapped (a family's loader took its name in its "
+                f"module first): call {loader} through its module, or apply "
+                "the patches first (maybe_apply_pre_load_patches)",
+                mode=fmt.mode,
+            )
         raise FormatRefusedError(
             "a layer is built outside a checkpoint's load, which gives it the "
             "record to be read with: load the checkpoint with mlx-lm's, "
@@ -528,19 +551,60 @@ def loads_in_format(module_class: str) -> bool:
     return module_class in _LOADS_IN_FORMAT
 
 
-def _wrap_loader(module, name: str) -> None:
-    load = getattr(module, name)
-    first = next(iter(inspect.signature(load).parameters))
+def _through(*args, _omlx_loader, **kwargs):
+    """A wrapped loader's code: the patch's loader, for every caller."""
+    return _omlx_loader(*args, **kwargs)
 
-    @wraps(load)
+
+def _wrap_loader(module, name: str) -> None:
+    """Wrap the function ``module.name``. The library's own is wrapped in
+    place: the function object takes ``_through``'s code, so that a name it
+    was imported under before the patch (``from mlx_lm.utils import
+    load_model``) calls the patch's loader too, and the loader runs a copy
+    of it. A closure's code cannot be swapped (a family's loader put over
+    the library's before the patch): the module's name for it is."""
+    load = getattr(module, name)
+    if not isinstance(load, types.FunctionType):
+        raise TypeError(
+            f"{module.__name__}.{name} is a {type(load).__name__}, not a Python "
+            "function: oMLX's load hook cannot wrap it; this version of the "
+            "library needs omlx/patches/format_load.py updated for it"
+        )
+    if load.__code__ is _through.__code__:
+        # Wrapped in place already: the module found again, once more pending.
+        return
+    in_place = load.__closure__ is None
+    own = load
+    if in_place:
+        own = types.FunctionType(
+            load.__code__, load.__globals__, load.__name__, load.__defaults__
+        )
+        own.__kwdefaults__ = load.__kwdefaults__
+        # Its name, text and attributes, and none of the patch's marks.
+        update_wrapper(own, load, updated=())
+        own.__dict__ = dict(load.__dict__)
+    first = next(iter(inspect.signature(own).parameters))
+
     def loader(*args, **kwargs):
         with loading(args[0] if args else kwargs[first]) as checkpoint:
-            loaded = load(*args, **kwargs)
+            loaded = own(*args, **kwargs)
         checkpoint.check(loaded)
         return loaded
 
-    loader._omlx_format_load = True
-    setattr(module, name, loader)
+    if not in_place:
+        update_wrapper(loader, load)
+        loader._omlx_format_load = True
+        setattr(module, name, loader)
+        return
+    # In this order, so that a call on another thread meanwhile runs the
+    # function whole, its own code or _through's: what reads its signature
+    # reads the copy's; the defaults keep the function's own keyword-only
+    # ones, which _through's code ignores, and _through's, which its own
+    # code ignores.
+    load.__wrapped__ = own
+    load.__kwdefaults__ = {**(load.__kwdefaults__ or {}), "_omlx_loader": loader}
+    load.__code__ = _through.__code__
+    load._omlx_format_load = True
 
 
 # The modules whose functions or classes this patch wraps, by name; each is

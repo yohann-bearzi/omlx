@@ -14,6 +14,7 @@ import re
 import sys
 import textwrap
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -86,10 +87,14 @@ def unpatched(monkeypatch):
             cls, "to_quantized", getattr(original, "__wrapped__", original)
         )
     for module, name in _loaders():
-        loader = getattr(module, name)
-        while getattr(loader, "_omlx_format_load", False):
-            # Through each wrapper, a family's that copied the mark included.
-            loader = loader.__wrapped__
+        loader = _library_s(getattr(module, name), module.__name__)
+        if _wrapped(loader):
+            # Wrapped in place: its own code again.
+            own = loader.__wrapped__
+            monkeypatch.setattr(loader, "__code__", own.__code__)
+            monkeypatch.setattr(loader, "__kwdefaults__", own.__kwdefaults__)
+            monkeypatch.delattr(loader, "__wrapped__")
+            monkeypatch.delattr(loader, "_omlx_format_load")
         monkeypatch.setattr(module, name, loader)
     # The patch wraps each module once, the first time it finds it: what it
     # wraps then, as a process starts.
@@ -97,6 +102,23 @@ def unpatched(monkeypatch):
     monkeypatch.setattr(
         format_load, "_PENDING", pending | set(format_load._SWITCH_MODULES)
     )
+
+
+def _library_s(loader, module_name):
+    """The library's own function under ``loader``: through the patch's
+    wrappers and the families' (DeepSeek V4's holds it in its closure,
+    MiniMax M3's as ``_omlx_original``)."""
+    while loader.__module__ != module_name or loader.__closure__:
+        cells = [cell.cell_contents for cell in loader.__closure__ or ()]
+        loader = getattr(loader, "_omlx_original", None) or next(
+            cell for cell in cells if inspect.isfunction(cell)
+        )
+    return loader
+
+
+def _wrapped(loader) -> bool:
+    """Whether the patch wrapped ``loader`` in place."""
+    return loader.__code__ is format_load._through.__code__
 
 
 def _loaders():
@@ -434,24 +456,68 @@ def test_the_classes_whose_matrices_load_in_a_format(unpatched):
 
 def test_the_patch_is_applied_once(toy):
     wrappers = [cls.to_quantized for cls in _PATCHED]
-    wrappers += [getattr(module, name) for module, name in _loaders()]
-    assert len(wrappers) == len(_PATCHED) + len(format_load._LOADERS)
-    assert all(wrapper._omlx_format_load for wrapper in wrappers)
+    loaders = [getattr(module, name) for module, name in _loaders()]
+    assert len(wrappers + loaders) == len(_PATCHED) + len(format_load._LOADERS)
+    assert all(wrapper._omlx_format_load for wrapper in wrappers + loaders)
+    owns = [loader.__wrapped__ for loader in loaders]
+    assert all(map(_wrapped, loaders)) and not any(map(_wrapped, owns))
     format_load.apply_format_load_patch()
-    again = [cls.to_quantized for cls in _PATCHED]
-    assert again + [getattr(module, name) for module, name in _loaders()] == wrappers
+    assert [cls.to_quantized for cls in _PATCHED] == wrappers
+    assert [getattr(module, name).__wrapped__ for module, name in _loaders()] == owns
     assert not any(
-        getattr(wrapper.__wrapped__, "_omlx_format_load", False) for wrapper in wrappers
+        getattr(wrapper.__wrapped__, "_omlx_format_load", False)
+        for wrapper in wrappers + loaders
     )
     # A module found again once wrapped (its import ending on one thread as
     # the patch is applied on another) is left as it is.
-    for module, name in _loaders():
+    for module, _ in _loaders():
         format_load._wrap(module)
-        assert getattr(module, name) in wrappers
-    # What a loader's callers read of it.
-    for module, name in _loaders():
-        loader = getattr(module, name)
-        assert inspect.signature(loader) == inspect.signature(loader.__wrapped__)
+    assert [getattr(module, name).__wrapped__ for module, name in _loaders()] == owns
+    # What a loader's callers read of it: its own name, signature and text.
+    for loader, own in zip(loaders, owns, strict=True):
+        assert inspect.signature(loader) == inspect.signature(own)
+        named = ("__name__", "__qualname__", "__module__", "__doc__")
+        for attribute in (*named, "__annotations__"):
+            assert getattr(own, attribute) == getattr(loader, attribute)
+        assert own.__globals__ is loader.__globals__
+
+
+def test_a_loader_is_wrapped_once_whoever_applies_the_patch(unpatched, monkeypatch):
+    loaders = [getattr(module, name) for module, name in _loaders()]
+    ready = threading.Barrier(4)
+
+    def apply():
+        ready.wait(60)
+        format_load.apply_format_load_patch()
+
+    threads = [threading.Thread(target=apply) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    owns = [loader.__wrapped__ for loader in loaders]
+    assert all(map(_wrapped, loaders)) and not any(map(_wrapped, owns))
+    # Its module found again, pending once more: left as it is.
+    monkeypatch.setattr(format_load, "_PENDING", {n for n, _ in format_load._LOADERS})
+    format_load.apply_format_load_patch()
+    assert [loader.__wrapped__ for loader in loaders] == owns
+
+
+def test_a_library_loader_that_is_no_function_fails_every_load(
+    unpatched, monkeypatch
+):
+    import functools
+    import types
+
+    module = types.ModuleType("changed")
+    module.load_model = functools.partial(lambda path: None)
+    monkeypatch.setitem(sys.modules, "changed", module)
+    monkeypatch.setattr(
+        format_load, "_LOADERS", (*format_load._LOADERS, ("changed", "load_model"))
+    )
+    format_load._PENDING.add("changed")
+    with pytest.raises(TypeError, match=r"changed\.load_model is a partial, not a"):
+        format_load.apply_format_load_patch()
 
 
 def test_a_model_load_applies_the_patch(unpatched, tmp_path):
@@ -461,7 +527,9 @@ def test_a_model_load_applies_the_patch(unpatched, tmp_path):
     maybe_apply_pre_load_patches(str(tmp_path))
     assert all(cls.to_quantized._omlx_format_load for cls in _PATCHED)
     for (module, name), loader in zip(_loaders(), loaders, strict=True):
-        assert getattr(module, name).__wrapped__ is loader
+        # In place: the function object the module held, and every name it
+        # was imported under.
+        assert getattr(module, name) is loader and _wrapped(loader)
 
 
 def test_the_patch_loads_the_plugins(unpatched, monkeypatch):
@@ -1135,8 +1203,13 @@ def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkey
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
     format_load.apply_format_load_patch()
+
+    def load_model():
+        # No library's loader, by its name only.
+        return nn.Linear(64, 16).to_quantized(**_TOY)
+
     with pytest.raises(formats.FormatRefusedError) as refusal:
-        nn.Linear(64, 16).to_quantized(**_TOY)
+        load_model()
     assert str(refusal.value) == _refusal(
         "a layer is built outside a checkpoint's load, which gives it the record "
         "to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or "
@@ -1145,6 +1218,34 @@ def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkey
     assert refusal.value.path is None
     # MLX's layers need none.
     assert type(nn.Linear(64, 16).to_quantized(32, 4)) is nn.QuantizedLinear
+
+
+def test_a_loader_left_unwrapped_is_named_with_the_fix(
+    unpatched, tmp_path, monkeypatch
+):
+    early = mlx_lm.utils.load_model
+
+    def family_s(*args, **kwargs):
+        return early(*args, **kwargs)
+
+    # A family's loader took the module's name before the patch was
+    # applied: the library's own function is not wrapped.
+    monkeypatch.setattr(mlx_lm.utils, "load_model", family_s)
+    formats.load()
+    toy = _Levels([0.0])
+    toy.reads = lambda record: _Levels(record["levels"])
+    monkeypatch.setitem(formats._FORMATS, "toy", toy)
+    format_load.apply_format_load_patch()
+    path = _tiny(tmp_path / "tiny", [2.0])
+    assert _gate_proj(mlx_lm.utils.load_model(path)[0]).fmt.levels == (2.0,)
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        early(path)
+    assert refusal.value.reason == (
+        "mlx_lm.utils.load_model was imported before oMLX's patches were "
+        "applied and runs unwrapped (a family's loader took its name in its "
+        "module first): call mlx_lm.utils.load_model through its module, or "
+        "apply the patches first (maybe_apply_pre_load_patches)"
+    )
 
 
 def test_a_checkpoint_is_accepted_once_for_all_its_layers(toy, tmp_path):
@@ -1488,16 +1589,40 @@ def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
     assert "halfway" not in format_load._PENDING
 
 
-def test_omlx_s_loaders_call_mlx_lm_s_through_its_module():
-    # A name bound at import is the library's own function, which the patch
-    # cannot wrap.
-    for name in (
-        "omlx.oq",
-        "omlx.patches.inkling2.vlm",
-        "omlx.patches.muse_spark.model",
-        "omlx.prefill_helper.adapters.inkling2",
-    ):
-        assert "load_model" not in vars(importlib.import_module(name)), name
+_EARLY = """
+# A user's script: the loader imported before oMLX's patches are applied.
+from {library}.utils import load_model
+
+import json, sys
+from pathlib import Path
+
+from omlx import formats
+from omlx.utils.model_loading import maybe_apply_pre_load_patches
+from tests.test_formats_load import _gate_proj, _Levels
+
+fmt = _Levels([0.0])
+fmt.reads = lambda record: _Levels(record["levels"])
+formats.register(fmt)
+maybe_apply_pre_load_patches(sys.argv[1])
+loaded = load_model(Path(sys.argv[1]))
+model = loaded[0] if isinstance(loaded, tuple) else loaded
+print(json.dumps(_gate_proj(model).fmt.levels))
+"""
+
+
+@pytest.mark.parametrize("library", ["mlx_lm", "mlx_vlm"])
+def test_a_loader_imported_before_the_patch_reads_its_record(tmp_path, library):
+    import subprocess
+
+    path = _tiny(tmp_path / "tiny", [3.0])
+    run = subprocess.run(
+        [sys.executable, "-c", _EARLY.format(library=library), str(path)],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).parent.parent,
+    )
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == [3.0]
 
 
 @pytest.mark.parametrize("drafter", ["DFlash", "VLM-MTP"])
