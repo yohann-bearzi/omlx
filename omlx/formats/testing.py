@@ -6,7 +6,8 @@ every weight of rows through a tile face. ``staged_tables`` reads a face's
 tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
 where format layers' rows ran: their face's launch, or the format's decode.
-``fresh_proofs`` gives a test proofs of its own.
+``fresh_proofs`` gives a test proofs of its own. ``verified`` has oQ take model families
+as verified with quant formats for a test's checkpoints.
 
 Nothing here is imported by the layers or the kernels: what a check needs of
 them it wraps for the length of a block.
@@ -66,6 +67,23 @@ _SHARED_ROWS = r"""
 
 # MLX's threadgroup memory for a kernel, in bytes.
 _THREADGROUP_BYTES = 32768
+
+
+@contextmanager
+def verified(*families: str):
+    """For the block, oQ writes checkpoints of ``families`` (model types, in
+    any spelling) in a quant format as it does those verified with them, and
+    as it then did after. A test's checkpoint of a family oMLX patches (a
+    tiny one, to test a format with) is written so. As a decorator, it holds
+    for one test; in a fixture, ``with verified(...): yield``."""
+    from .. import oq
+
+    kept = oq._QUANT_FORMAT_VERIFIED
+    oq._QUANT_FORMAT_VERIFIED = kept | {oq._family(family) for family in families}
+    try:
+        yield
+    finally:
+        oq._QUANT_FORMAT_VERIFIED = kept
 
 
 @contextmanager

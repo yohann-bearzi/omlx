@@ -28,6 +28,7 @@ from tokenizers.models import WordLevel
 from transformers import PreTrainedTokenizerFast
 
 from omlx import formats, oq
+from omlx.formats import testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches.format_load import loads_in_format
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
@@ -46,20 +47,16 @@ def _quoted(message, name="toy"):
 
 
 # The families verified with quant formats, as this oMLX ships them.
-_VERIFIED = getattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset())
+_VERIFIED = oq._QUANT_FORMAT_VERIFIED
 
 
 @pytest.fixture(autouse=True)
-def verified(monkeypatch):
+def verified():
     """The toy checkpoint's family taken as verified: oMLX patches Qwen3.5
     MoE on an mlx-vlm load, and oQ writes a family it patches in a format
     only once the family is verified."""
-    monkeypatch.setattr(
-        oq,
-        "_QUANT_FORMAT_VERIFIED",
-        frozenset({"qwen3_5_moe_text"}),
-        raising=False,
-    )
+    with testing.verified("qwen3_5_moe_text"):
+        yield
 
 
 class _Codec(_ToyFormat):
@@ -885,7 +882,7 @@ def test_a_family_neither_stock_nor_verified_is_refused(
     assert not output.exists() and toy.offered == []
 
 
-def test_the_families_oq_writes_in_a_format(tmp_path, monkeypatch):
+def test_the_families_oq_writes_in_a_format(tmp_path):
     stock = {"llama", "mistral", "qwen2", "phi3", "starcoder2", "olmo2"}
     assert set(oq._QUANT_FORMAT_STOCK) == stock
     # None is verified yet: Qwen3.8 Flash-Next enters with the run that
@@ -900,10 +897,12 @@ def test_the_families_oq_writes_in_a_format(tmp_path, monkeypatch):
     config = {"model_type": "llama", "text_config": {"model_type": "mistral"}}
     assert oq._unverified_family(source, config) is None
     # A verified family, top level or text model.
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen4_exp"}))
-    assert oq._unverified_family(source, {"model_type": "Qwen4-Exp"}) is None
     nested = {"model_type": "llama", "text_config": {"model_type": "qwen4_exp"}}
-    assert oq._unverified_family(source, nested) is None
+    with testing.verified("Qwen4-Exp"):
+        assert oq._unverified_family(source, {"model_type": "qwen4_exp"}) is None
+        assert oq._unverified_family(source, nested) is None
+    # Not after the block.
+    assert oq._unverified_family(source, nested)[0] == "qwen4_exp"
     assert oq._unverified_family(source, {"model_type": "qwen3"}) == (
         "qwen3",
         _NOT_VERIFIED,
@@ -1037,16 +1036,30 @@ def test_omlx_patches_no_stock_family(tmp_path, family):
     assert "format_load.py:apply_format_load_patch" in loads
 
 
-def test_a_verified_decision_family_is_written_whatever_its_backbone(
-    tmp_path, monkeypatch
-):
+def test_a_verified_decision_family_is_written_whatever_its_backbone(tmp_path):
     source = tmp_path / "d1"
     source.mkdir()
     config = {"model_type": "lfm3_vl", "architectures": ["D1Model"]}
     (source / "config.json").write_text(json.dumps(config))
     assert oq._unverified_family(source, config)[0] == "d1"
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"d1"}))
-    assert oq._unverified_family(source, config) is None
+    with testing.verified("d1"):
+        assert oq._unverified_family(source, config) is None
+
+
+def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
+    shipped = oq._QUANT_FORMAT_VERIFIED
+    config = {"model_type": "qwen4_exp"}
+
+    @testing.verified("QWEN4-EXP")
+    def written():
+        return oq._unverified_family(tmp_path, config)
+
+    assert written() is None and shipped == oq._QUANT_FORMAT_VERIFIED
+    with pytest.raises(RuntimeError), testing.verified("qwen4_exp", "d1"):
+        assert shipped | {"qwen4_exp", "d1"} == oq._QUANT_FORMAT_VERIFIED
+        raise RuntimeError
+    assert shipped == oq._QUANT_FORMAT_VERIFIED
+    assert oq._unverified_family(tmp_path, config)[0] == "qwen4_exp"
 
 
 @pytest.fixture(scope="module")
@@ -1076,9 +1089,10 @@ def llama_source(tmp_path_factory):
 
 
 def test_a_model_omlx_does_not_patch_is_written_in_a_format(
-    llama_source, toy, tmp_path, monkeypatch
+    llama_source, toy, tmp_path
 ):
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", _VERIFIED, raising=False)
+    # Written as a stock family, whatever is verified.
+    assert "llama" in oq._QUANT_FORMAT_STOCK
     output = tmp_path / "oqe-toy"
     _, config, applied = _quantize(llama_source, output, quant_format="toy")
     # Each layer's seven linears.
@@ -1967,19 +1981,17 @@ def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(
     tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
     monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **k: tokens)
     # oMLX patches MiniMax M3: taken as verified, so that the run writes it.
-    monkeypatch.setattr(
-        oq, "_QUANT_FORMAT_VERIFIED", frozenset({"minimax_m3_vl"}), raising=False
-    )
-    oq.quantize_oq_streaming(
-        str(source),
-        str(output),
-        8,
-        enhanced=True,
-        imatrix_num_samples=4,
-        imatrix_seq_length=16,
-        sensitivity_map_override={0: 0.1, 1: 0.2},
-        quant_format="toy",
-    )
+    with testing.verified("minimax_m3_vl"):
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            8,
+            enhanced=True,
+            imatrix_num_samples=4,
+            imatrix_seq_length=16,
+            sensitivity_map_override={0: 0.1, 1: 0.2},
+            quant_format="toy",
+        )
     config = json.loads((output / "config.json").read_text())
     # The loader packs the shared expert with the routed stacks: none of the
     # experts' matrices is the format's.

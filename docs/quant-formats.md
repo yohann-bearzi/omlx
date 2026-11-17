@@ -747,6 +747,24 @@ def test_rows_are_the_dequantized_products():
 
 `operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. A kernel puts such adjacent rows in one pack; `dot_rows` splits them to run both. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants. With `staged=True` the kernel copies `x` into threadgroup memory first and the face's `load` reads it there, as in a kernel that stages its inputs; `x` then fits in a threadgroup's 32 KiB. A `load` that takes only a device pointer fails to compile there: `no matching function for call to 'load'`.
 
+oQ writes a checkpoint in a format only for a family it serves with mlx-lm's own code or one verified with formats (see [Quantize a checkpoint](#quantize-a-checkpoint)). A test that writes a tiny checkpoint of another family, to test a format with, takes it as verified for the test, with `omlx.formats.testing.verified`, which puts the verified families back as they were on leaving:
+
+```python
+import pytest
+from omlx.formats import testing
+
+
+@testing.verified("qwen3_5_moe_text")
+def test_a_tiny_moe_is_written_in_the_format(tmp_path):
+    ...
+
+
+@pytest.fixture(autouse=True)
+def tiny_families_verified():
+    with testing.verified("qwen3_5_moe_text"):
+        yield
+```
+
 Worth testing for every layout a format gives a face for:
 
 - rows against the format's reference, bit for bit when the format has an exact composed path,
@@ -807,7 +825,7 @@ A test's `monkeypatch` is undone after the fixture's block ends, unless `monkeyp
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `Table`, `FormatRefusedError`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls` and `LayerCall` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Table`, `FormatRefusedError`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls`, `LayerCall` and `verified` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints`, `omlx_iota` and `omlx_table`.
 
