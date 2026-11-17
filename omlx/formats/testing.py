@@ -92,7 +92,7 @@ def dot_rows(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
         )
     if not face.exact_for(x.dtype):
-        exact = ", ".join(str(dtype) for dtype in face.dtypes)
+        exact = ", ".join(str(dtype) for dtype in face.dtypes or formats.FLOATS)
         raise ValueError(f"face {face.key} is exact for {exact}, x is {x.dtype}")
     for name, operand in zip(("x", *names), (x, *operands), strict=True):
         if operand.size < 8:

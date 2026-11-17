@@ -890,6 +890,10 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
     half = replace(_toy("half"), dtypes=(mx.float16,))
     with pytest.raises(ValueError, match="toy_half is exact for mlx.core.float16"):
         testing.dot_rows(half, operands, x, 8)
+    # A face that names no dtype is exact for the floats.
+    floats = "toy_a is exact for mlx.core.float16, mlx.core.bfloat16, mlx.core.float32"
+    with pytest.raises(ValueError, match=floats):
+        testing.dot_rows(_toy("a"), operands, x.astype(mx.int32), 8)
     (codes, scales), x, _ = _matrix(7, 512)
     with pytest.raises(ValueError, match="toy_a: scales has 7 elements"):
         testing.dot_rows(_toy("a"), (codes, scales), x, 7, (1, 0))

@@ -668,7 +668,7 @@ def test_the_tile_face_is_the_decode_in_float32():
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints` and `omlx_iota`.
 
@@ -785,7 +785,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 | A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |
 | MoE prefill on tensor units (M5): an affine switch layer's sorted rows, as MLX's sorted `gather_qmm` takes them | tile | `omlx/patches/m5_gather_qmm_nax.py` |
 
-The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face exact for any dtype, or for several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
+The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face that names no dtype (exact for the three of `formats.FLOATS`), or several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
 
 A face that does not compile does not fail the model. The decode evaluates a launch inside the call the first time blocks of the same faces, tensor dtypes and shapes build it, once the block's input is evaluated (a failure ahead of the block is raised as it is). If a one-token launch fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path. If the launch of a verify window or of batched rows fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.
 

@@ -114,11 +114,16 @@ def _plan(layer) -> _Plan | None:
         k,
         n,
     )
-    said = (
-        f"quant format face {face.key}: rows kernel engaged",
-        f"quant format face {face.key}: rows kernel failed; decode fallback",
+    return _Plan(face, _kernel(face, stacked), operands, proof, k, n, _said(face.key))
+
+
+@cache
+def _said(key: str) -> tuple[str, str]:
+    """What a proof of face ``key`` logs: the launches engaged, or failed."""
+    return (
+        f"quant format face {key}: rows kernel engaged",
+        f"quant format face {key}: rows kernel failed; decode fallback",
     )
-    return _Plan(face, _kernel(face, stacked), operands, proof, k, n, said)
 
 
 def _rows(
@@ -176,8 +181,9 @@ def _zeros(*specs) -> list[mx.array]:
     zeros of its own: MLX's shapes are int32."""
     gpu = mx.gpu
     sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
-    shared = max((size for size in sizes if size < _ONE_BUFFER), default=0)
-    buffer = mx.zeros((shared,), mx.uint8, stream=gpu)
+    below = [size for size in sizes if size < _ONE_BUFFER]
+    if below:
+        buffer = mx.zeros((max(below),), mx.uint8, stream=gpu)
     zeros = []
     for (shape, dtype), size in zip(specs, sizes, strict=True):
         if size < _ONE_BUFFER:
@@ -241,9 +247,12 @@ def _switch(kernel, k: int, n: int, x, indices):
 
 def _wrapped(indices, matrices: int):
     """``indices`` with each negative one counted from the end of a stack of
-    ``matrices``."""
+    ``matrices``, in a type wide enough to count them (a stack of 128 is no
+    int8)."""
     if not mx.issubdtype(indices.dtype, mx.signedinteger):
         return indices
+    if indices.dtype.size < 4:
+        indices = indices.astype(mx.int32)
     return mx.where(indices < 0, indices + matrices, indices)
 
 
@@ -274,9 +283,9 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     launch, or the launch does not compile.
 
     The launch's graph (``describe``) is compiled by MLX and kept under
-    ``signature``, which is what it depends on (the arrays' shapes and x's
-    type), by the thread that builds it: a layer's call asks for the graph
-    its thread kept first, and replays it.
+    ``signature``, which is what it depends on (the arrays' shapes, x's
+    type and the indices' type), by the thread that builds it: a layer's
+    call asks for the graph its thread kept first, and replays it.
 
     The first time its Metal is built, it is proven on ``stand_in``: the
     smallest launch that MLX generates the same Metal for, over zeros in
@@ -314,7 +323,8 @@ class _FormatLayer(nn.Module):
     keeps them in its ``__dict__`` with the weight they were found with,
     until one of its arrays or attributes is assigned or removed
     (``__setitem__``, ``__delitem__``, ``pop``: what MLX's loads,
-    ``update``, ``set_dtype`` and attribute writes go through) or its
+    ``update``, ``set_dtype`` and attribute writes go through; a dict's
+    own mutators and ``del`` of an attribute too) or its
     weight is another array: a function that ``mx.compile`` traces over the
     layer's state (``inputs=``) swaps every array of it for a trace's, and
     back, behind those methods. A call then reads one dict entry and the
@@ -371,7 +381,11 @@ class _FormatLayer(nn.Module):
 
     def _keep(self) -> tuple:
         """The layer's plan and bias, worked out and kept."""
-        kept = self.__dict__[_KEPT] = (_plan(self), self.get("bias"), self["weight"])
+        bias = self.get("bias")
+        if "bias" in self and not isinstance(bias, mx.array):
+            # MLX's quantized layers raise as they add it.
+            raise TypeError(f"the bias is an array, not {type(bias).__name__}")
+        kept = self.__dict__[_KEPT] = (_plan(self), bias, self["weight"])
         return kept
 
     def __setitem__(self, key: str, value: Any) -> None:
@@ -385,6 +399,27 @@ class _FormatLayer(nn.Module):
     def pop(self, *key_and_default):
         self.__dict__.pop(_KEPT, None)
         return super().pop(*key_and_default)
+
+    # A dict's own mutators, which do not go through the three above.
+    def setdefault(self, key: str, default: Any = None) -> Any:
+        self.__dict__.pop(_KEPT, None)
+        return super().setdefault(key, default)
+
+    def popitem(self) -> tuple:
+        self.__dict__.pop(_KEPT, None)
+        return super().popitem()
+
+    def clear(self) -> None:
+        self.__dict__.pop(_KEPT, None)
+        super().clear()
+
+    def __ior__(self, other):
+        self.__dict__.pop(_KEPT, None)
+        return super().__ior__(other)
+
+    def __delattr__(self, name: str) -> None:
+        self.__dict__.pop(_KEPT, None)
+        super().__delattr__(name)
 
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
         """The layer's weights as floats: all of them, or the matrices at

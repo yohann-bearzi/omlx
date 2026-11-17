@@ -136,7 +136,7 @@ def test_register_refuses_what_is_not_a_format_instance(plugins):
     class ModeOnly(formats.QuantFormat):
         mode = "toy"
 
-    with pytest.raises(ValueError, match="'toy': tensors are a tuple, not None"):
+    with pytest.raises(ValueError, match="quant format 'toy': tensors are a tuple"):
         formats.register(ModeOnly())
 
     class NoRevision(ModeOnly):
@@ -524,6 +524,11 @@ class _TwoTensors(_Format):
         return replace(_FACE, tensors=("scales", "biases"))
 
 
+class _ThreeTensors(_Format):
+    def dot(self, layer, k, n):
+        return replace(_FACE, tensors=("scales", "biases", "gains"))
+
+
 def _layer_with_small(*names):
     layer = _layer()
     for name in names:
@@ -596,6 +601,11 @@ def _layer_with_a_child_named_scales():
             _TwoTensors(),
             _layer(tensors=("weight", "scales", "biases")),
             "ValueError('face toy_b4: biases is no tensor of quant format toy')",
+        ),
+        (
+            _ThreeTensors(),
+            _layer(),
+            "ValueError('face toy_b4: biases, gains is no tensor of quant format toy')",
         ),
     ],
 )
@@ -886,7 +896,7 @@ def test_faces_compare_by_their_dtypes_too():
     # A dtype read off an array, not the module's constant.
     again = replace(_FACE, dtypes=(mx.zeros(1, mx.float16).dtype,))
     assert half == again and hash(half) == hash(again)
-    assert half != _FACE  # exact for one dtype, exact for any
+    assert half != _FACE  # exact for one dtype, exact for the floats
     assert half != replace(_FACE, dtypes=(mx.bfloat16,))
 
 
@@ -910,7 +920,7 @@ def test_a_face_names_metal_identifiers(names):
 @pytest.mark.parametrize(
     "fields, message",
     [
-        ({"tensors": "scales"}, "tensors and dtypes are tuples"),
+        ({"tensors": "scales"}, "quant format face 'toy_b4': tensors and dtypes are"),
         ({"tensors": ["scales"]}, "tensors and dtypes are tuples"),
         ({"dtypes": mx.float16}, "tensors and dtypes are tuples"),
         ({"tensors": ("scales", "scales")}, "beside 'weight' and 'bias', each named"),

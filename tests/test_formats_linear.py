@@ -1053,6 +1053,8 @@ def test_zeros_of_2_GiB_or_more_are_each_their_own(monkeypatch):  # noqa: N802
         ((head, x, scales), [((2**25,), mx.uint8), head]),
         ((x, under, scales), [((2**31 - 1,), mx.uint8)]),
         ((under, x), [((2**31 - 1,), mx.uint8)]),
+        # Every input its own: no shared buffer is made.
+        ((head, head), [head, head]),
     ):
         del asked[:]
         made = linear._zeros(*specs)
@@ -2337,6 +2339,107 @@ def test_a_launch_s_kernel_is_named_by_its_layer_and_face(toy, monkeypatch, capf
         "omlx_format_linear_toy_linear",
         "omlx_format_switch_linear_toy_linear",
     }
+
+
+def _wide_toy_switch(experts=128):
+    """A toy stack of more matrices than an int8 index can count."""
+    (codes, scales), _, _ = _matrix(experts * 8, 320)
+    tensors = {
+        "weight": codes.reshape(experts, 8, 320),
+        "scales": scales.reshape(experts, 8),
+    }
+    return FormatSwitchLinear("toy", 8, 1, 320, tensors)
+
+
+@pytest.mark.parametrize("face", [True, False], ids=["rows kernel", "decode"])
+def test_narrow_signed_indices_count_from_the_end_of_a_wider_stack(toy, face):
+    """int8 indices on a stack of 128 matrices: 128 is no int8, so the wrap
+    is computed in a wider type; every index, negative or not, names the
+    matrix that MLX's indexing does."""
+    toy(_toy("linear") if face else None)
+    layer = _wide_toy_switch()
+    wrapped = mx.array([0, 1, 127, 127, 0, 5], dtype=mx.uint32)
+    signed = mx.array([0, 1, 127, -1, -128, -123], dtype=mx.int8)
+    # A decode step's few indices, then as many as a prefill's.
+    for count in (1, 32):
+        x = _ints((count * 6, 1, 320), seed=count)
+        mine, want = mx.tile(signed, count), mx.tile(wrapped, count)
+        got = layer(x, mine)
+        assert np.array_equal(np.array(got), _want(layer, x, want))
+
+
+def test_unsigned_indices_take_no_wrap(monkeypatch):
+    """Only signed indices can be negative: an unsigned index's graph is
+    the cast alone."""
+    _, layer = _switch_pair(320, 72)
+    x, indices = _x((16, 1, 320)), _experts((16,))
+    where, wrapped = mx.where, []
+
+    def recorded(*args, **named):
+        wrapped.append(args)
+        return where(*args, **named)
+
+    monkeypatch.setattr(mx, "where", recorded)
+    layer(x, indices)
+    assert not wrapped
+    layer(x, indices.astype(mx.int32))
+    assert len(wrapped) == 1
+
+
+def _mutated(layer, how, bias):
+    """``layer`` changed through one of a dict's own mutators, which MLX's
+    module does not route through ``__setitem__``."""
+    if how == "setdefault":
+        layer.setdefault("bias", bias)
+    elif how == "popitem":
+        layer.popitem()  # the bias, the last item
+    elif how == "ior":
+        layer |= {"scales": layer["scales"] * 2}
+    elif how == "delattr":
+        del layer.group_size
+    return layer
+
+
+@pytest.mark.parametrize("how", ["setdefault", "popitem", "ior", "delattr", "clear"])
+def test_every_mutator_of_a_layer_drops_its_kept_plan(toy, monkeypatch, how):
+    toy(_toy("linear"))
+    planned, plan = [], linear._plan
+
+    def recorded(layer):
+        planned.append(layer)
+        return plan(layer)
+
+    monkeypatch.setattr(linear, "_plan", recorded)
+    bias = mx.arange(40).astype(mx.float32)
+    biased = how == "popitem"
+    layer, x, want = _toy_linear(40, 320, bias=bias if biased else None)
+    assert _equal(layer(x), want + bias if biased else want)
+    if how == "clear":
+        layer.clear()
+        assert linear._KEPT not in layer.__dict__
+        return
+    layer = _mutated(layer, how, bias)
+    assert linear._KEPT not in layer.__dict__
+    got = layer(x)
+    assert len(planned) == 2
+    expected = {"setdefault": want + bias, "popitem": want, "ior": 2 * want}
+    assert _equal(got, expected.get(how, want))
+
+
+def test_a_layer_s_bias_removed_or_none_as_mlx_s_layers_take_it(toy):
+    """``pop`` gives the bias back, ``del`` takes it ahead of any call, and
+    a bias of None is no bias that a call silently leaves out: it raises,
+    as MLX's quantized layer does."""
+    toy(_toy("linear"))
+    bias = mx.arange(40).astype(mx.float32)
+    layer, x, want = _toy_linear(40, 320, bias=bias)
+    del layer["bias"]
+    assert _equal(layer(x), want)
+    layer["bias"] = bias
+    assert layer.pop("bias") is bias
+    layer["bias"] = None
+    with pytest.raises(TypeError):
+        layer(x)
 
 
 def test_the_affine_decode_is_mlx_s_dequantize():
