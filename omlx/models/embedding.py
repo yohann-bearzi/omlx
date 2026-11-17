@@ -22,7 +22,7 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
-from ..patches.format_load import apply_format_load_patch
+from ..patches.format_load import apply_format_load_patch, check_loaded
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import _decode_input_audio_data, load_image, validate_image_data_uri
 from .base_model import (
@@ -448,6 +448,7 @@ class MLXEmbeddingModel:
             self.model = model_instance
             self.processor = tokenizer
             self._hidden_size = config.hidden_size
+            check_loaded(self.model, self.model_name)
             self._loaded = True
             self._using_native = True
             self._is_compiled = False
@@ -496,6 +497,7 @@ class MLXEmbeddingModel:
         self._using_native = False
         self._detect_input_key_remapping()
         self._is_compiled = self._try_compile()
+        check_loaded(self.model, self.model_name)
         self._loaded = True
         logger.info(
             f"Embedding model loaded via mlx-vlm: {self.model_name} "
@@ -559,6 +561,7 @@ class MLXEmbeddingModel:
             self._using_native = False
             self._detect_input_key_remapping()
             self._is_compiled = self._try_compile()
+            check_loaded(self.model, self.model_name)
             self._loaded = True
             logger.info(
                 f"Embedding model loaded successfully: {self.model_name} "

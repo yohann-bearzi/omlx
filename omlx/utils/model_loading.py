@@ -122,7 +122,12 @@ def lm_load_compat(path_or_repo: str, *, trust_remote_code: bool = False, **kwar
         trust_remote_code=trust_remote_code,
     )
     from mlx_lm import load
-    return load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
+
+    from ..patches.format_load import check_loaded
+
+    loaded = load(path_or_repo, trust_remote_code=trust_remote_code, **kwargs)
+    check_loaded(loaded[0], path_or_repo)
+    return loaded
 
 
 def _add_glm5_next_nextn_quant_keys(cfg: dict, quant: dict) -> None:

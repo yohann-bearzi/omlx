@@ -27,7 +27,7 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
-from ..patches.format_load import apply_format_load_patch
+from ..patches.format_load import apply_format_load_patch, check_loaded
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
@@ -856,6 +856,7 @@ class MLXRerankerModel:
             # Try mx.compile for persistent Metal kernel caching
             self._is_compiled = self._try_compile()
 
+            check_loaded(self.model, self.model_name)
             self._loaded = True
             logger.info(
                 f"Reranker model loaded successfully: {self.model_name} "

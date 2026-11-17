@@ -2120,6 +2120,9 @@ class VLMBatchedEngine(BaseEngine):
         self._vlm_model, self._processor = await loop.run_in_executor(
             get_mlx_executor(), _load_vlm_sync
         )
+        from ..patches.format_load import check_loaded
+
+        check_loaded(self._vlm_model, self._model_name)
 
         from ..models.vlm import restore_bonsai_quantized_modules
 

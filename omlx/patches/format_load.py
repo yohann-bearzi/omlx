@@ -97,8 +97,6 @@ class _Checkpoint:
         self._config = None
         self._read: dict[str, formats.QuantFormat] = {}
         self.built: list[nn.Module] = []
-        # Each layer built's placeholders, by the layer's id.
-        self.placeholders: dict[int, dict[str, mx.array]] = {}
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
@@ -212,7 +210,7 @@ class _Checkpoint:
             )
         for layer in self.built:
             path = paths[id(layer)]
-            placeholders = self.placeholders[id(layer)]
+            placeholders = layer._placeholders
             left = [name for name, held in placeholders.items() if layer[name] is held]
             if left and len(left) < len(placeholders):
                 raise _refused(
@@ -319,6 +317,29 @@ def _restore(fmt, kept: dict) -> None:
             value.update(held)
         elif held is not None:
             value[:] = held
+
+
+def check_loaded(model, path=None) -> None:
+    """At the end of oMLX's own load of ``model`` from the checkpoint at
+    ``path``, once what this process does not hold is dropped (a pipeline
+    rank's other layers, a prefill helper's later ones): refuse a format
+    layer it still holds with a placeholder, which no tensor of the
+    checkpoint filled. The layers let their placeholders go."""
+    if not isinstance(model, nn.Module):
+        return
+    for name, module in model.named_modules():
+        held = getattr(module, "_placeholders", None)
+        if held is None:
+            continue
+        left = [tensor for tensor, kept in held.items() if module[tensor] is kept]
+        if left:
+            reason = (
+                f"the loaded model holds {name} without its {', '.join(left)}: the "
+                "checkpoint holds no such tensor, or holds it under another name"
+            )
+            checkpoint = _Checkpoint(path) if path is not None else None
+            raise _refused(reason, module.mode, checkpoint)
+        object.__delattr__(module, "_placeholders")
 
 
 @contextmanager
@@ -444,7 +465,8 @@ def _format_layer(layer, layer_cls, signature, arguments):
     }
     built = layer_cls(fmt, bits, group_size, k, tensors, layer.get("bias"))
     checkpoint.built.append(built)
-    checkpoint.placeholders[id(built)] = tensors
+    # Its placeholders, until oMLX's own load has checked them (check_loaded).
+    object.__setattr__(built, "_placeholders", tensors)
     return built
 
 

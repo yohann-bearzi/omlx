@@ -217,8 +217,12 @@ def progressive_sharded_load(
         trust_remote_code=trust_remote_code,
         **load_kwargs,
     )
+    from ..patches.format_load import check_loaded
+
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
+        # What this rank holds of the model, filled.
+        check_loaded(model, model_path)
         materialize_parameters_progressively(
             model.parameters(),
             mx_module=mx_module,
@@ -226,6 +230,7 @@ def progressive_sharded_load(
             progress=progress,
         )
     elif tensor_group is not None:
+        check_loaded(model, model_path)
         # Fixed embeddings/head weights are replicated. Materialize them first;
         # each strategy then materializes, shards, evaluates and releases one
         # transformer layer before touching the next.

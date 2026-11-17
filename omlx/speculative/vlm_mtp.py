@@ -58,7 +58,7 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
-from ..patches.format_load import apply_format_load_patch  # noqa: E402
+from ..patches.format_load import apply_format_load_patch, check_loaded  # noqa: E402
 from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
@@ -216,6 +216,7 @@ def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     apply_format_load_patch()
     try:
         drafter_model, resolved_kind = _vlm_load_drafter(path, kind=None)
+        check_loaded(drafter_model, path)
     except Exception as e:
         logger.warning(
             "VLM MTP drafter load failed for %r: %s — toggle will be ignored",

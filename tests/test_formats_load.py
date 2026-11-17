@@ -873,6 +873,106 @@ def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path):
     )
 
 
+def _without_gate(tmp_path):
+    """A tiny checkpoint whose files hold none of the toy layer's tensors."""
+    _tiny(tmp_path, [1.0])
+
+    def partial(weights):
+        del weights[f"{_GATE}.weight"], weights[f"{_GATE}.scales"]
+
+    _rewritten(tmp_path, partial)
+    return tmp_path
+
+
+def test_omlx_s_own_load_refuses_a_layer_the_checkpoint_does_not_hold(
+    toy, tmp_path
+):
+    from omlx.patches.mlx_lm_sharded_load import _local_sharded_load
+    from omlx.utils.model_loading import lm_load_compat
+
+    path = _without_gate(tmp_path / "partial")
+    said = _refusal(
+        f"the loaded model holds {_GATE} without its weight, scales: the "
+        "checkpoint holds no such tensor, or holds it under another name",
+        path,
+    )
+    # A load that drops nothing: the cluster's for one rank.
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        _local_sharded_load(str(path))
+    assert str(refusal.value) == said
+    quoted = said.replace(str(path), "/models/my-model")
+    for plugin in ("omlx-toy 0.3.1", "a format registered by hand"):
+        quoted = quoted.replace(plugin, "my-package 0.1.0")
+    assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    # The libraries' strict load says it first.
+    with pytest.raises(ValueError, match="Missing"):
+        lm_load_compat(str(path))
+
+
+def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
+    path = _without_gate(tmp_path / "partial")
+    model, _ = load_model(path, strict=False)
+    layer = model.model.layers[0].mlp.gate_proj
+    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+        format_load.check_loaded(model)
+    # What this process does not hold is dropped before (a prefill helper's
+    # later layers, a pipeline rank's others): no refusal.
+    model.model.layers[0].mlp.gate_proj = nn.Linear(64, 128)
+    format_load.check_loaded(model)
+    # A filled layer lets its placeholders go once checked.
+    full = tmp_path / "full"
+    full.mkdir()
+    _llama(full, **_written({}))
+    model, _ = load_model(full)
+    layer = model.model.layers[0].mlp.gate_proj
+    assert set(layer._placeholders) == {"weight", "scales"}
+    format_load.check_loaded(model, full)
+    assert not hasattr(layer, "_placeholders")
+    format_load.check_loaded(model, full)
+
+
+def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
+    import ast
+    from pathlib import Path
+
+    root = Path(format_load.__file__).parents[1]
+    calls = {}
+    for file in (
+        "utils/model_loading.py",
+        "engine/vlm.py",
+        "patches/mlx_lm_sharded_load.py",
+        "cluster/progressive_loading.py",
+        "prefill_helper/worker.py",
+        "speculative/dflash/__init__.py",
+        "speculative/vlm_mtp.py",
+        "models/embedding.py",
+        "models/reranker.py",
+    ):
+        tree = ast.parse((root / file).read_text())
+        calls[file] = sum(
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", getattr(node.func, "attr", None))
+            == "check_loaded"
+            for node in ast.walk(tree)
+        )
+    # lm_load_compat (the LLM engine, its SpecPrefill draft, oMLX's LLM and
+    # decision wrappers, a causal reranker), the VLM engine, the cluster's
+    # loads after pipeline() (one rank's, and both progressive strategies),
+    # a prefill helper after keep_first, both drafters, the embedding
+    # model's three loads and the reranker's.
+    assert calls == {
+        "utils/model_loading.py": 1,
+        "engine/vlm.py": 1,
+        "patches/mlx_lm_sharded_load.py": 1,
+        "cluster/progressive_loading.py": 2,
+        "prefill_helper/worker.py": 1,
+        "speculative/dflash/__init__.py": 1,
+        "speculative/vlm_mtp.py": 1,
+        "models/embedding.py": 3,
+        "models/reranker.py": 1,
+    }
+
+
 def test_a_loader_wrapped_over_the_wrapped_one_is_one_load(toy, tmp_path):
     import types
 

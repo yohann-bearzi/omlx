@@ -30,7 +30,7 @@ from mlx_vlm.utils import get_model_path
 
 from ...model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
 from ...patches import qwen35_packed_linear
-from ...patches.format_load import apply_format_load_patch
+from ...patches.format_load import apply_format_load_patch, check_loaded
 from .drafter import DFlashDrafter
 from .variants import apply_partial_rope, load_mask_embedding
 
@@ -181,6 +181,7 @@ def load_dflash_drafter(
     apply_format_load_patch()
     adaptive = resolve_verify_mode(verify_mode)
     model, kind = load_drafter(path, kind="dflash")
+    check_loaded(model, path)
     if kind != "dflash":
         raise ValueError(f"{path} resolved to drafter kind {kind!r}, expected 'dflash'")
     cast = match_target_dtype(model, target_model)

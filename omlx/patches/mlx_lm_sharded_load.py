@@ -52,6 +52,10 @@ def _local_sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
+    from omlx.patches.format_load import check_loaded
+
+    # What this rank holds of the model, filled.
+    check_loaded(model, model_path)
     # Lazy load plus a post-slice eval materialises only this rank's shard.
     mx.eval(model.parameters())
     # Synchronise processes to avoid timeout, as the original does.

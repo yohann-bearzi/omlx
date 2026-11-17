@@ -30,6 +30,7 @@ import numpy as np
 
 from .. import __version__
 from ..exceptions import is_metal_out_of_memory
+from ..patches.format_load import check_loaded
 from . import wire
 from .adapter import Capture
 from .adapters import adapter_for
@@ -354,6 +355,8 @@ def main(argv: list[str] | None = None) -> int:
     mx.set_cache_limit(int(info["memory_size"]))
     mx.set_wired_limit(int(info["max_recommended_working_set_size"]))
     lm = adapter.load_first(args.model, args.layers, args.a8_min_tokens)
+    # The helper's first layers, filled.
+    check_loaded(lm, args.model)
 
     began = time.perf_counter()
     warm = np.arange(args.warm_tokens, dtype=np.int32) % 1000 + 3
