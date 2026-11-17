@@ -95,6 +95,8 @@ class _Checkpoint:
         self._config = None
         self._read: dict[str, formats.QuantFormat] = {}
         self.built: list[nn.Module] = []
+        # Each layer built's placeholders, by the layer's id.
+        self.placeholders: dict[int, dict[str, mx.array]] = {}
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
@@ -181,18 +183,21 @@ class _Checkpoint:
         return plugin if isinstance(plugin, str) else "a format registered by hand"
 
     def check(self, loaded) -> None:
-        """Refuse a load that returns ``loaded`` without each format layer
-        built under it: those were another checkpoint's, built here."""
-        if not self.built:
-            return
+        """Refuse, whatever ``strict`` the load had, a load that returns
+        ``loaded`` without each format layer built under it (another
+        checkpoint's, built here); with a layer it filled in part, or with
+        a tensor of another shape or dtype than the layout's; or with an
+        entry of a format's mode in its quantization config that bound no
+        layer. A layer it left wholly unfilled is a layer a partial load
+        does not hold (a pipeline rank's, a prefill helper's)."""
         models = loaded if isinstance(loaded, tuple) else (loaded,)
-        held = {
-            id(module)
+        paths = {
+            id(module): path
             for model in models
             if isinstance(model, nn.Module)
-            for _, module in model.named_modules()
+            for path, module in model.named_modules()
         }
-        stray = [layer for layer in self.built if id(layer) not in held]
+        stray = [layer for layer in self.built if id(layer) not in paths]
         if stray:
             raise _refused(
                 f"{len(stray)} layers were built while the checkpoint loaded, "
@@ -202,12 +207,81 @@ class _Checkpoint:
                 stray[0].mode,
                 self,
             )
+        for layer in self.built:
+            path = paths[id(layer)]
+            placeholders = self.placeholders[id(layer)]
+            left = [name for name, held in placeholders.items() if layer[name] is held]
+            if left and len(left) < len(placeholders):
+                raise _refused(
+                    f"the load filled {path} but its {', '.join(left)}: the "
+                    "checkpoint holds no such tensor, or holds it under another "
+                    "name",
+                    layer.mode,
+                    self,
+                )
+            for name, held in placeholders.items():
+                tensor = layer[name]
+                kept = (tuple(tensor.shape), tensor.dtype)
+                if tensor is not held and kept != (tuple(held.shape), held.dtype):
+                    raise _refused(
+                        f"{path}.{name} is {kept[0]} {kept[1]}, where the format "
+                        f"lays out {tuple(held.shape)} {held.dtype}",
+                        layer.mode,
+                        self,
+                    )
+        bound = [paths[id(layer)] for layer in self.built]
+        for path, mode in self._format_entries():
+            # mlx-vlm finds an entry of a language model's layer under the
+            # model's own path, one prefix deeper.
+            if not any(_same_layer(path, held) for held in bound):
+                raise _refused(
+                    f"its quantization config names {path}, and the load built "
+                    "no layer of the format there: the model has no such "
+                    "module, or its family's loader renames it",
+                    mode,
+                    self,
+                )
+
+    def _format_entries(self) -> list[tuple[str, str]]:
+        """The layers the checkpoint's quantization config names in a mode
+        that is not MLX's, with that mode."""
+        try:
+            if self._config is None:
+                self._config = json.loads((self.path / "config.json").read_text())
+        except OSError:
+            # A loader handed what is no checkpoint's directory: it names
+            # no entry.
+            return []
+        config = self._config
+        quantization = config.get("quantization") or config.get("quantization_config")
+        if not isinstance(quantization, dict):
+            return []
+        return [
+            (path, entry["mode"])
+            for path, entry in quantization.items()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("mode"), str)
+            and not formats._mlx_runs(entry["mode"])
+        ]
+
+
+def _same_layer(entry: str, path: str) -> bool:
+    """Whether a quantization config's ``entry`` names the module at
+    ``path``: the same path, or one nested in a model around it (mlx-vlm's
+    of a language model's checkpoint)."""
+    return entry == path or path.endswith(f".{entry}")
 
 
 @contextmanager
 def loading(path) -> Iterator[_Checkpoint]:
     """While the block runs, the format layers this thread builds belong to
-    the checkpoint at ``path`` (a load nested in it has its own)."""
+    the checkpoint at ``path``: a load nested in it has its own, but one of
+    the same checkpoint (a loader wrapped over the wrapped one) is the
+    outer one."""
+    outer = formats._LOADING.get()
+    if outer is not None and outer.path.resolve() == Path(path).resolve():
+        yield outer
+        return
     checkpoint = _Checkpoint(path)
     token = formats._LOADING.set(checkpoint)
     try:
@@ -301,6 +375,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
     }
     built = layer_cls(fmt, bits, group_size, k, tensors, layer.get("bias"))
     checkpoint.built.append(built)
+    checkpoint.placeholders[id(built)] = tensors
     return built
 
 

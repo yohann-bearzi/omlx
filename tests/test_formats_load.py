@@ -732,6 +732,129 @@ def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(toy, tmp_path):
     )
 
 
+def _rewritten(path, change):
+    """The checkpoint at ``path`` with its weights changed by ``change``."""
+    weights = mx.load(str(path / "model.safetensors"))
+    change(weights)
+    mx.save_safetensors(str(path / "model.safetensors"), weights)
+
+
+_GATE = "model.layers.0.mlp.gate_proj"
+
+
+def _renamed(weights):
+    weights[f"{_GATE}.scalez"] = weights.pop(f"{_GATE}.scales")
+
+
+def _float16(weights):
+    weights[f"{_GATE}.scales"] = weights[f"{_GATE}.scales"].astype(mx.float16)
+
+
+def _short(weights):
+    weights[f"{_GATE}.scales"] = weights[f"{_GATE}.scales"][:64]
+
+
+@pytest.mark.parametrize(
+    "change, strict, reason",
+    [
+        (
+            _renamed,
+            False,
+            f"the load filled {_GATE} but its scales: the checkpoint holds no such "
+            "tensor, or holds it under another name",
+        ),
+        (
+            _float16,
+            True,
+            f"{_GATE}.scales is (128,) {mx.float16}, where the format lays out "
+            f"(128,) {mx.float32}",
+        ),
+        (
+            _short,
+            False,
+            f"{_GATE}.scales is (64,) {mx.float32}, where the format lays out "
+            f"(128,) {mx.float32}",
+        ),
+    ],
+    ids=["a key renamed", "another dtype", "another shape"],
+)
+def test_a_load_that_fills_a_layer_otherwise_than_its_layout_is_refused(
+    toy, tmp_path, change, strict, reason
+):
+    _llama(tmp_path, **_written({}))
+    _rewritten(tmp_path, change)
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path, strict=strict)
+    assert str(refusal.value) == _refusal(reason, tmp_path)
+    if change is _renamed:
+        quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+        for said in ("omlx-toy 0.3.1", "a format registered by hand"):
+            quoted = quoted.replace(said, "my-package 0.1.0")
+        assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+
+
+def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    # A path that is no module of the model, as a family's loader that
+    # renames its modules leaves it.
+    config["quantization"]["model.layers.0.mlp.gate"] = _TOY
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path, strict=False)
+    assert str(refusal.value) == _refusal(
+        "its quantization config names model.layers.0.mlp.gate, and the load "
+        "built no layer of the format there: the model has no such module, or "
+        "its family's loader renames it",
+        tmp_path,
+    )
+
+
+def test_a_loader_wrapped_over_the_wrapped_one_is_one_load(toy, tmp_path):
+    import types
+
+    # A family's loader that calls the libraries' (wrapped) loader, wrapped
+    # in its turn: the layers built belong to the one load of the checkpoint.
+    _llama(tmp_path, **_written({}))
+    module = types.ModuleType("family")
+    module.load_model = lambda path, **kwargs: load_model(path, **kwargs)
+    format_load._wrap_loader(module, "load_model")
+    model, _ = module.load_model(tmp_path, strict=False)
+    assert type(model.model.layers[0].mlp.gate_proj) is FormatLinear
+
+
+def test_a_partial_load_leaves_the_layers_it_does_not_hold(toy, tmp_path):
+    # A pipeline rank's or a prefill helper's files hold some layers only:
+    # the others keep their placeholders until the loader drops them.
+    _llama(tmp_path, **_written({}))
+
+    def partial(weights):
+        del weights[f"{_GATE}.weight"], weights[f"{_GATE}.scales"]
+
+    _rewritten(tmp_path, partial)
+    # An entry of one of MLX's modes is MLX's to bind, or not.
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["quantization"]["model.layers.0.mlp.nothing"] = {
+        "group_size": 64,
+        "bits": 4,
+        "mode": "affine",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model, _ = load_model(tmp_path, strict=False)
+    layer = model.model.layers[0].mlp.gate_proj
+    assert type(layer) is FormatLinear and not mx.any(layer["scales"]).item()
+    # A stock checkpoint loads as it did.
+    stock = tmp_path / "stock"
+    stock.mkdir()
+    del config["quantization"], config["omlx_quant_formats"]
+    (stock / "config.json").write_text(json.dumps(config))
+    weights = mx.load(str(tmp_path / "model.safetensors"))
+    weights[f"{_GATE}.weight"] = mx.zeros((128, 64))
+    mx.save_safetensors(str(stock / "model.safetensors"), weights)
+    model, _ = load_model(stock, strict=True)
+    assert type(model.model.layers[0].mlp.gate_proj) is nn.Linear
+
+
 def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkeypatch):
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
