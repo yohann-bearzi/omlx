@@ -28,6 +28,7 @@ from mlx_lm.models import switch_layers as lm_switch
 from mlx_vlm.models import switch_layers as vlm_switch
 
 from omlx import formats
+from omlx.formats import testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
@@ -119,6 +120,11 @@ def _library_s(loader, module_name):
 def _wrapped(loader) -> bool:
     """Whether the patch wrapped ``loader`` in place."""
     return loader.__code__ is format_load._through.__code__
+
+
+def _typed(written):
+    """A config of a stock family (llama) that records ``written``."""
+    return {"model_type": "llama", "omlx_quant_formats": written}
 
 
 def _loaders():
@@ -297,7 +303,7 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
     assert not formats._mlx_runs("oqel") and formats._mlx_runs("affine")
     # A checkpoint's load names the plugin that wrote it, to install.
     (tmp_path / "config.json").write_text(
-        json.dumps({"omlx_quant_formats": {"oqel": {"plugin": "omlx-oqel 1.0.0"}}})
+        json.dumps(_typed({"oqel": {"plugin": "omlx-oqel 1.0.0"}}))
     )
     with (
         format_load.loading(tmp_path),
@@ -315,7 +321,7 @@ def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
     quoted = quoted.replace("omlx-oqel 1.0.0", "my-package 0.1.0")
     assert quoted.replace("'oqel'", "'myformat'") in " ".join(_PAGE.split())
     # A checkpoint that records no plugin, or a format registered by hand.
-    for kept in ({}, {"omlx_quant_formats": {"oqel": {"plugin": None}}}):
+    for kept in ({}, _typed({"oqel": {"plugin": None}})):
         (tmp_path / "config.json").write_text(json.dumps(kept))
         with (
             format_load.loading(tmp_path),
@@ -332,15 +338,15 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
     # Written before MLX's modes were the built-ins' only, or by a newer oMLX
     # whose built-in format of the mode this one has not.
     entry = {"plugin": "shadow 0.1.0", "contract": 1, "record": {}}
-    (tmp_path / "config.json").write_text(
-        json.dumps({"omlx_quant_formats": {"mxfp4": entry}})
-    )
+    (tmp_path / "config.json").write_text(json.dumps(_typed({"mxfp4": entry})))
     with (
         format_load.loading(tmp_path),
         pytest.raises(formats.FormatRefusedError) as no,
     ):
         nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode="mxfp4")
-    assert no.value.reason == "no format of this mode is installed: install shadow 0.1.0"
+    assert (
+        no.value.reason == "no format of this mode is installed: install shadow 0.1.0"
+    )
     # A checkpoint that records none of it is MLX's, and so is a load of
     # what is no checkpoint's directory.
     (tmp_path / "config.json").write_text("{}")
@@ -352,6 +358,58 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
     with pytest.raises(ValueError) as mlx_s:
         nn.Linear(64, 16).to_quantized(mode=None)
     assert type(mlx_s.value) is not formats.FormatRefusedError
+
+
+@pytest.mark.parametrize(
+    "model_type, family, why",
+    [
+        (
+            "raon1_mini",
+            "raon1_mini",
+            "its merged gate and up projection is sliced by hand on a prefill, "
+            "as MLX's quantized layer or as floats",
+        ),
+        (
+            "Inkling2",
+            "inkling2",
+            "its DSpark draft folds the output head into its own projection by "
+            "hand, as MLX's quantized layer or as floats",
+        ),
+        (
+            "brand-new",
+            "brand_new",
+            "it is no family served by mlx-lm's own code that oMLX proves it does "
+            "not patch, nor one verified with quant formats end to end",
+        ),
+    ],
+)
+def test_a_checkpoint_of_a_family_oq_writes_no_format_of_is_refused_at_load(
+    toy, tmp_path, monkeypatch, model_type, family, why
+):
+    # Written by hand, or by a plugin's own writer: not by oQ, which refuses.
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    typed = {**config, "model_type": model_type}
+    (tmp_path / "config.json").write_text(json.dumps(typed))
+
+    def read(*args, **kwargs):
+        raise AssertionError("a weight read")
+
+    monkeypatch.setattr(mx, "load", read)
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path)
+    assert str(refusal.value) == _refusal(
+        f"oMLX loads no {family} checkpoint in a quant format: {why}; have the "
+        "family verified",
+        tmp_path,
+    )
+    # One without a format's record is the library's.
+    del config["omlx_quant_formats"]
+    typed = {**config, "model_type": model_type}
+    (tmp_path / "config.json").write_text(json.dumps(typed))
+    with pytest.raises(Exception) as other:
+        load_model(tmp_path)
+    assert not isinstance(other.value, formats.FormatRefusedError)
 
 
 @pytest.mark.parametrize(
@@ -382,7 +440,7 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
 def test_a_record_of_one_of_mlx_s_modes_is_never_read_as_mlx_s(
     toy, tmp_path, mode, written, reason
 ):
-    config = {"omlx_quant_formats": written}
+    config = _typed(written)
     (tmp_path / "config.json").write_text(json.dumps(config))
     with (
         format_load.loading(tmp_path),
@@ -413,7 +471,7 @@ def test_a_refusal_names_a_hub_snapshot_not_its_blob(toy, tmp_path):
     snapshot, blobs = repo / "snapshots" / "abc", repo / "blobs"
     snapshot.mkdir(parents=True)
     blobs.mkdir()
-    (blobs / "0f1e").write_text(json.dumps({"omlx_quant_formats": {"toy": None}}))
+    (blobs / "0f1e").write_text(json.dumps(_typed({"toy": None})))
     (snapshot / "config.json").symlink_to(Path("../../blobs/0f1e"))
     view = tmp_path / "view"
     view.mkdir()
@@ -475,7 +533,7 @@ def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(toy, tmp_path):
         "1: update oMLX"
     )
     (tmp_path / "config.json").write_text(
-        json.dumps({"omlx_quant_formats": {"oqel": {"plugin": "omlx-oqel 2.0.0"}}})
+        json.dumps(_typed({"oqel": {"plugin": "omlx-oqel 2.0.0"}}))
     )
     formats._SKIPPED["oqel"] = skipped
     try:
@@ -793,7 +851,7 @@ _ENTRY = "['omlx_quant_formats']['toy']"
 
 def _kept_record(record):
     entry = {"plugin": "omlx-toy 0.3.1", "record": record}
-    return {"omlx_quant_formats": {"toy": entry}}
+    return _typed({"toy": entry})
 
 
 @pytest.mark.parametrize(
@@ -801,10 +859,10 @@ def _kept_record(record):
     [
         ([], "", "an array"),
         (None, "", "null"),
-        ({"omlx_quant_formats": []}, "['omlx_quant_formats']", "an array"),
-        ({"omlx_quant_formats": None}, "['omlx_quant_formats']", "null"),
-        ({"omlx_quant_formats": {"toy": "v1"}}, _ENTRY, "a string"),
-        ({"omlx_quant_formats": {"toy": None}}, _ENTRY, "null"),
+        (_typed([]), "['omlx_quant_formats']", "an array"),
+        (_typed(None), "['omlx_quant_formats']", "null"),
+        (_typed({"toy": "v1"}), _ENTRY, "a string"),
+        (_typed({"toy": None}), _ENTRY, "null"),
         (_kept_record(None), f"{_ENTRY}['record']", "null"),
         (_kept_record([1]), f"{_ENTRY}['record']", "an array"),
         (_kept_record(2.5), f"{_ENTRY}['record']", "a number"),
@@ -855,7 +913,7 @@ def test_what_the_checkpoint_says_of_its_writer(toy, tmp_path):
         (False, "an unknown writer"),
     ):
         entry = {"plugin": plugin, "record": {"layout": 2}}
-        config = {"omlx_quant_formats": {"toy": entry}}
+        config = _typed({"toy": entry})
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert format_load._Checkpoint(tmp_path).writer("toy") == said
     # A directory without a config.
@@ -1858,6 +1916,9 @@ def test_oq_s_vlm_loads_refuse_a_layer_they_left_unfilled(
         calls[load]()
 
 
+# Their checkpoints of a format are refused at load: taken as verified, the
+# test reaches what their loaders do.
+@testing.verified("deepseek_v4", "k2_horizon")
 def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkeypatch):
     import mlx_lm.utils
 
@@ -2013,6 +2074,8 @@ def test_a_drafter_s_loader_installs_the_patch(
     assert [tuple(record["levels"]) for record, _ in toy.accepted] == [(18.0,)]
 
 
+# Of a family oMLX serves with mlx-embeddings' code: taken as verified.
+@testing.verified("bert")
 def test_mlx_embeddings_loads_a_checkpoint_of_the_format(levels, tmp_path):
     from mlx_embeddings.models import bert
     from mlx_embeddings.utils import load_model as embeddings_load_model

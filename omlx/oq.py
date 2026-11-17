@@ -6994,7 +6994,7 @@ def _family(name: str) -> str:
 
 
 def _unverified_family(
-    source: Path, config: dict, served_as: str | None = None
+    source: Path, config: dict, served_as: str | None = None, *, served: bool = True
 ) -> tuple[str, str] | None:
     """(family, why) when oQ writes the checkpoint at ``source`` in no quant
     format: one whose config names no model type; a decision model whose
@@ -7003,7 +7003,8 @@ def _unverified_family(
     its own code to read wrongly when they did; or one of a stock family
     that oMLX does not serve as an LLM of mlx-lm's own code, from the source
     or from a directory named ``served_as`` (the output's name: model
-    discovery reads a directory's name)."""
+    discovery reads a directory's name). Without ``served``, the family
+    alone (a load: the engine loading it is the one that serves it)."""
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
@@ -7030,7 +7031,7 @@ def _unverified_family(
         if family not in _QUANT_FORMAT_STOCK and family not in verified:
             return family, _NOT_VERIFIED
     stock = [family for family in families if family not in verified]
-    if stock:
+    if stock and served:
         # A stock family is proven as an LLM that mlx-lm's own code builds,
         # and only so.
         why = None

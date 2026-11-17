@@ -55,7 +55,7 @@ def verified():
     """The toy checkpoint's family taken as verified: oMLX patches Qwen3.5
     MoE on an mlx-vlm load, and oQ writes a family it patches in a format
     only once the family is verified."""
-    with testing.verified("qwen3_5_moe_text"):
+    with testing.verified("qwen3_5_moe", "qwen3_5_moe_text"):
         yield
 
 
@@ -2195,7 +2195,10 @@ def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(
     # The loader packs the shared expert with the routed stacks: none of the
     # experts' matrices is the format's.
     assert not any(".block_sparse_moe." in name for name in _in_format(config))
-    with _force_minimax_m3_moe_sanitize_on_load(output):
+    with (
+        testing.verified("minimax_m3_vl"),
+        _force_minimax_m3_moe_sanitize_on_load(output),
+    ):
         maybe_apply_pre_load_patches(str(output), for_vlm=True)
         model = vlm_utils.load_model(output)
     logits = model.language_model(mx.array([[1, 2, 3, 4]]))

@@ -446,6 +446,32 @@ def _shown(path: Path) -> Path:
     return path
 
 
+def _refuse_family(checkpoint: _Checkpoint) -> None:
+    """Refuse, before the library reads a weight, a checkpoint that records a
+    quant format and is of a family oQ writes in none (neither stock nor
+    verified): whoever wrote it (a plugin's own writer, a config edited by
+    hand), the family's own code would read the format's layers wrongly."""
+    try:
+        config = checkpoint._read_config()
+    except (OSError, ValueError):
+        # No checkpoint's directory, or the library's to refuse.
+        return
+    written = config.get("omlx_quant_formats") if isinstance(config, dict) else None
+    if not isinstance(written, dict) or not written:
+        return
+    from .. import oq
+
+    refused = oq._unverified_family(checkpoint.path, config, served=False)
+    if refused is not None:
+        family, why = refused
+        raise _refused(
+            f"oMLX loads no {family} checkpoint in a quant format: {why}; have "
+            "the family verified",
+            sorted(written)[0],
+            checkpoint,
+        )
+
+
 def _config_of(path) -> Path:
     """The config file the checkpoint at ``path`` reads (a view of links to
     a checkpoint's files reads the checkpoint's)."""
@@ -463,6 +489,7 @@ def loading(path) -> Iterator[_Checkpoint]:
         yield outer
         return
     checkpoint = _Checkpoint(path)
+    _refuse_family(checkpoint)
     token = formats._LOADING.set(checkpoint)
     try:
         yield checkpoint
