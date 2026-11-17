@@ -2941,6 +2941,50 @@ def test_the_cluster_s_loads_read_their_records(levels, tmp_path):
     assert levels()[1] == (12.0,)
 
 
+def test_a_tensor_group_is_refused_a_format_checkpoint_before_a_shard(
+    levels, tmp_path, monkeypatch
+):
+    """Before the model is sharded, or anything staged: no strategy splits
+    a format's tensors, which every rank would keep whole."""
+    import mlx_lm.utils
+
+    from omlx.cluster.progressive_loading import progressive_sharded_load
+    from omlx.patches.mlx_lm_sharded_load import _local_sharded_load
+
+    loads, load_model = [], mlx_lm.utils.load_model
+
+    def counted(*args, **kwargs):
+        loads.append(args[0])
+        return load_model(*args, **kwargs)
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", counted)
+    words = (
+        "tensor parallelism cannot shard model.layers.0.mlp.gate_proj: a layer "
+        "of quant format 'toy'"
+    )
+    for load in (_local_sharded_load, progressive_sharded_load):
+        with pytest.raises(RuntimeError, match=re.escape(words)):
+            load(str(_tiny(tmp_path / load.__name__, [1.0])), tensor_group=object())
+    # Progressive loading refuses after its first load, before it stages the
+    # weights and loads again.
+    assert len(loads) == 2
+
+
+def test_a_format_checkpoint_is_loaded_by_no_tensor_strategy(
+    levels, tmp_path, monkeypatch
+):
+    """Without a group given, progressive loading takes pipelining for it."""
+    from omlx.cluster import progressive_loading
+
+    def sharded(*args, **kwargs):
+        pytest.fail("a format checkpoint was sharded by tensors")
+
+    monkeypatch.setattr(progressive_loading, "apply_tensor_strategy", sharded)
+    # A tiny Llama is no converted checkpoint a pipeline stages.
+    with pytest.raises(ValueError, match="Pipeline loading|any sharding"):
+        progressive_loading.progressive_sharded_load(str(_tiny(tmp_path, [1.0])))
+
+
 @pytest.mark.parametrize("adapter", ["qwen3_5", "minimax_m3", "glm5_next", "qwen4_exp"])
 def test_a_prefill_helper_reads_its_record(levels, tmp_path, adapter, monkeypatch):
     module = importlib.import_module(f"omlx.prefill_helper.adapters.{adapter}")

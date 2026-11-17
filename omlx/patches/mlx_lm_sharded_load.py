@@ -49,6 +49,9 @@ def _local_sharded_load(
         eos_token_ids=config.get("eos_token_id", None),
     )
     if tensor_group is not None:
+        from ..cluster.tensor_strategies import _refuse_format_layers
+
+        _refuse_format_layers(model)
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)

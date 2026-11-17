@@ -883,22 +883,31 @@ def _shard_muse_spark(
     _shard_layers(list(model.layers), shard_layer, mx, progress, MUSE_SPARK)
 
 
-def _refuse_format_layers(model: Any) -> None:
-    """Refuse a model that holds a quant format's layer, naming the first:
+def format_layer(model: Any) -> tuple[str, Any] | None:
+    """A quant format's layer that ``model`` holds, with its path, or None:
     no strategy splits a format's tensors. A model is walked through its
     ``named_modules`` (an ``nn.Module``'s)."""
     named_modules = getattr(model, "named_modules", None)
     if not callable(named_modules):
-        return
+        return None
     from ..formats.linear import FormatLinear, FormatSwitchLinear
 
     for name, module in named_modules():
         if isinstance(module, (FormatLinear, FormatSwitchLinear)):
-            raise RuntimeError(
-                f"tensor parallelism cannot shard {name}: a layer of quant "
-                f"format {module.mode!r}, which no strategy splits; serve this "
-                "model on one machine"
-            )
+            return name, module
+    return None
+
+
+def _refuse_format_layers(model: Any) -> None:
+    """Refuse a model that holds a quant format's layer, naming one."""
+    held = format_layer(model)
+    if held is not None:
+        name, module = held
+        raise RuntimeError(
+            f"tensor parallelism cannot shard {name}: a layer of quant "
+            f"format {module.mode!r}, which no strategy splits; serve this "
+            "model on one machine"
+        )
 
 
 def apply_tensor_strategy(

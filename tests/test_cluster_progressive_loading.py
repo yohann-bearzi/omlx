@@ -112,6 +112,21 @@ def test_planner_and_loader_apply_the_same_native_tensor_proof():
     assert _supports_tensor_parallel({"model_type": "qwen3_next"}) is True
 
 
+def test_a_checkpoint_with_layers_of_a_quant_format_is_offered_no_tensors():
+    """No strategy splits a format's tensors: by its record, or by a layer
+    of a mode that is not MLX's."""
+    layer = "model.layers.0.mlp.gate_proj"
+    record = {"omlx_quant_formats": {"toy": {"plugin": None, "contract": 1}}}
+    assert _supports_tensor_parallel({"model_type": "qwen3", **record}) is False
+    for key in ("quantization", "quantization_config"):
+        named = {key: {"bits": 4, "group_size": 64, layer: {"mode": "toy"}}}
+        assert _supports_tensor_parallel({"model_type": "qwen3", **named}) is False
+        mlx = {key: {"bits": 4, "group_size": 64, layer: {"mode": "mxfp4"}}}
+        assert _supports_tensor_parallel({"model_type": "qwen3", **mlx}) is True
+    whole = {"quantization": {"bits": 8, "group_size": 1, "mode": "toy"}}
+    assert _supports_tensor_parallel({"model_type": "qwen3", **whole}) is False
+
+
 def test_qwen_next_moe_inplace_shards_are_wrapped_with_an_all_sum(monkeypatch):
     from mlx_lm.models import qwen3_next
 

@@ -10,7 +10,12 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
-from .tensor_strategies import apply_tensor_strategy, supports_model_type
+from .tensor_strategies import (
+    _refuse_format_layers,
+    apply_tensor_strategy,
+    format_layer,
+    supports_model_type,
+)
 
 _LAYER = re.compile(r"(?:^|\.)(?:layers|h|blocks|block)\.(\d+)(?:\.|$)")
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -176,15 +181,18 @@ def progressive_sharded_load(
             getattr(getattr(model, "args", None), "model_type", ""),
         )
     )
-    has_tensor = supports_model_type(
-        model_type,
-        native_shard=has_native_tensor,
+    # A quant format's layers are split by no strategy: such a model
+    # pipelines, and a tensor group is refused before anything is staged.
+    has_tensor = (
+        supports_model_type(model_type, native_shard=has_native_tensor)
+        and format_layer(model) is None
     )
     if pipeline_group is not None and not has_pipeline:
         raise ValueError(
             "The model does not support pipelining but a pipeline_group was provided"
         )
     if tensor_group is not None and not has_tensor:
+        _refuse_format_layers(model)
         raise ValueError(
             "The model does not support tensor parallelism but a tensor_group "
             "was provided"
