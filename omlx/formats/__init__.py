@@ -61,7 +61,7 @@ def _identifier(name) -> bool:
 def _check_tensors(owner: str, tensors) -> None:
     """Refuses ``tensors`` unless they are what a format keeps beside
     ``weight`` and ``bias``, as kernels splice them into Metal: a tuple of
-    distinct identifiers. ``register`` and ``Dot`` ask the same."""
+    distinct identifiers. ``register``, ``Dot`` and ``Tile`` ask the same."""
     if not isinstance(tensors, tuple):
         raise ValueError(f"{owner}: tensors are a tuple, not {tensors!r}")
     for name in tensors:
@@ -446,9 +446,9 @@ def dot(layer, k: int, n: int) -> Dot | None:
     with what it builds for the layer. So a format whose ``dot`` raises, or
     returns anything but None or a ``Dot`` of arrays the layer has (the
     weight and the face's tensors, which are the format's, each of 8
-    elements or more), has no face
-    for the layer either, and the model keeps its composed path there. Each
-    defect of a format is logged once."""
+    elements or more and none of float64), has no face for the layer
+    either, and the model keeps its composed path there. Each defect of a
+    format is logged once."""
     return _face(layer, k, n, Dot, "dot", "the layer keeps its composed path")
 
 
@@ -523,20 +523,23 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str, keeps
                 f"face {face.key}: {', '.join(stray)} is no tensor of quant "
                 f"format {mode}"
             )
-        lacking = [
-            name
-            for name in ("weight", *face.tensors)
-            if not isinstance(layer.get(name), mx.array)
-        ]
+        names = ("weight", *face.tensors)
+        lacking = [name for name in names if not isinstance(layer.get(name), mx.array)]
         if lacking:
             raise ValueError(
                 f"face {face.key}: the layer has no array {', '.join(lacking)}"
             )
-        small = [name for name in ("weight", *face.tensors) if layer[name].size < 8]
+        small = [name for name in names if layer[name].size < 8]
         if small:
             raise ValueError(
                 f"face {face.key}: {', '.join(small)} of fewer than 8 elements, "
                 "which MLX binds as constants, not as the buffer a face reads"
+            )
+        wide = [name for name in names if layer[name].dtype == mx.float64]
+        if wide:
+            raise ValueError(
+                f"face {face.key}: {', '.join(wide)} of float64, which the GPU "
+                "does not take"
             )
     except Exception as error:
         defect = (mode, repr(error))

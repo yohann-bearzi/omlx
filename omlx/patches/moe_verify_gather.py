@@ -332,11 +332,10 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     metal = (rows, top_k, x.dtype, indices.dtype)
     if metal not in plan.proof.ran and (
         # MLX binds an input of fewer than 8 values as constants, and the
-        # kernel reads x from device memory; like gather_qmm, it takes float
-        # activations of the GPU and integer indices only.
+        # kernel reads x from device memory; like gather_qmm, it takes integer
+        # indices only (exact_for above takes float activations of the GPU).
         top_k < 1
         or rows * top_k <= plan.few_pairs
-        or x.dtype not in (mx.float16, mx.bfloat16, mx.float32)
         or rows * width < 8
         or not mx.issubdtype(indices.dtype, mx.integer)
         or not plan.proof.prove(

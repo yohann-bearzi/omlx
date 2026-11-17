@@ -468,9 +468,9 @@ def test_a_row_of_one_expert_runs_the_route(toy):
 
 def test_x_that_is_not_a_float_of_the_gpu_is_left_to_the_composed_route(toy):
     """Like gather_qmm, the block takes float16, bfloat16 or float32
-    activations. A face of no stated dtypes is exact for any: the others are
-    the caller's, refused before the proof (a stand-in of float64 zeros
-    cannot even be made on the GPU)."""
+    activations: a face of no stated dtypes is exact for those three alone
+    (formats.FLOATS), so the others are refused before the proof (a stand-in
+    of float64 zeros cannot even be made on the GPU)."""
     toy(_toy("any_dtype"))
     switch = _ToySwitch(k=320, inter=72, n=40)
     x, indices = _toy_block(switch, 3)

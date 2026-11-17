@@ -644,6 +644,13 @@ def _build_plan(block) -> _Plan | None:
         or any(hidden % _down_rows(window) for window in range(1, WINDOW_MAX_ROWS + 1))
     ):
         return None
+    gate, experts = block.get("gate"), block.num_experts
+    scores = gate.get("weight") if isinstance(gate, nn.Module) else None
+    # The router scores the experts the stacks hold, and the block says so.
+    if gate_up["weight"].shape[0] != experts or (
+        isinstance(scores, mx.array) and scores.shape[0] != experts
+    ):
+        return None
     dtype, top_k = gu_fmt.dtypes[0], block.top_k
     gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
@@ -655,8 +662,7 @@ def _build_plan(block) -> _Plan | None:
         # One launch would hold more tables than a kernel holds: the shared
         # expert keeps its own launches.
         shared = None
-    gate = block.get("gate")
-    router, experts, weight = None, block.num_experts, ()
+    router, weight = None, ()
     if (
         type(gate) is nn.Linear
         and "bias" not in gate
@@ -666,10 +672,6 @@ def _build_plan(block) -> _Plan | None:
         router = router_gemv(gate["weight"])
     if router is not None:
         weight = (gate["weight"],)
-        experts = weight[0].shape[0]
-    # The router scores the experts the stacks hold, and the block says so.
-    if experts != gate_up["weight"].shape[0] or block.num_experts != experts:
-        return None
     # What the launches are compiled from, beside a launch's rows and routing.
     operands = gate_up_operands + down_operands
     if shared is not None:
@@ -910,7 +912,7 @@ def _ranked(rows: int, experts: int, dtype) -> mx.array:
     gpu = mx.gpu
     column = mx.zeros((rows, 1), mx.float32, stream=gpu)
     ranked = mx.subtract(column, mx.arange(experts, stream=gpu), stream=gpu)
-    return ranked.astype(dtype, stream=gpu)
+    return mx.astype(ranked, dtype, stream=gpu)
 
 
 def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> list:
@@ -1065,9 +1067,11 @@ def routed_verify_window(block, x):
     shape and dtype and the router's width on blocks of these faces,
     tensor dtypes and shapes, and that the window's proof keeps for that
     thread. Its Metal is proven first on a stand-in (``_stand_in``):
-    nothing of the call is evaluated. A window of one row is one token's
-    call: its graph and its proof. A failed one-token proof keeps the
-    windows composed too."""
+    nothing of the call is evaluated (once, as the block's plan is built
+    outside a trace, a view of each stack's first matrix is:
+    ``_expert_view``). A window of one row is one token's call: its graph
+    and its proof. A failed one-token proof keeps the windows composed
+    too."""
     if x.ndim != 3:
         return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)

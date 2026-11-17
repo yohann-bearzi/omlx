@@ -1688,14 +1688,18 @@ class _Shaped(nn.Module):
         ("shared_expert_gate", lambda y: y.reshape(1, 1, 1, 1)),
     ],
 )
+@pytest.mark.parametrize("axes", [3, 2])
 def test_what_the_block_computes_outside_the_launches_is_read_in_their_shapes(
-    name, reshape
+    name, reshape, axes
 ):
     """What a block computes outside its launches reaches them as it is: of
     another shape than the launches read, the block is its composed body's
-    (which may refuse it), and no proof fails."""
+    (which may refuse it), and no proof fails. A token of [1, 1, hidden] or
+    of [1, hidden]."""
     block = _block(1024, 320, experts=128, quantized_shared=name == "gate")
     x = _token_of(block)
+    if axes == 2:
+        x = x[0]
     assert _same_bits(*_pair(block, x))
     plan = _plan(block, x)
     original = block[name]
@@ -2085,12 +2089,7 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
     want = type(block).__call__._omlx_routed_decode_original(block, x)
     mx.eval(want)
     _plan(block, x)  # evaluates the experts' views
-    evaluate, synchronize, zeros, arange = (
-        mx.eval,
-        mx.synchronize,
-        kernels.zeros,
-        mx.arange,
-    )
+    evaluate, synchronize, zeros = mx.eval, mx.synchronize, kernels.zeros
     events, streams = [], []
 
     def evaluated(*arrays):
@@ -2105,22 +2104,53 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
         events.append("zeros")
         return zeros(*specs)
 
-    def ranked(*args, **named):
-        streams.append(named.get("stream"))
-        return arange(*args, **named)
+    def on_the_gpu(op, name):
+        def recorded(*args, **named):
+            streams.append((name, mx.default_device(), named.get("stream")))
+            return op(*args, **named)
+
+        return recorded
 
     with monkeypatch.context() as patch:
         patch.setattr(mx, "eval", evaluated)
         patch.setattr(mx, "synchronize", synchronized)
-        patch.setattr(mx, "arange", ranked)
+        for name in ("zeros", "arange", "subtract", "astype"):
+            patch.setattr(mx, name, on_the_gpu(getattr(mx, name), name))
         patch.setattr(kernels, "zeros", made)
         with mx.stream(mx.cpu):
             y = block(x)
     # The zeros made, then the proof's evaluation of them with the logits,
     # the synchronize, and the launch's.
     assert events == ["zeros", "eval", ("synchronize", mx.gpu), "eval"]
-    assert streams == [mx.gpu]
+    # The logits' four ops and the buffer of zeros, each given the GPU's
+    # stream, the caller's default device left as it is.
+    assert [name for name, *_ in streams] == [
+        "zeros",
+        "arange",
+        "subtract",
+        "astype",
+        "zeros",
+    ]
+    for _, device, stream in streams:
+        assert (device, stream) == (mx.cpu, mx.gpu)
     assert _same_bits(want, y)
+
+
+def test_a_stack_of_float64_tensors_is_planned_for_neither_tokens_nor_windows():
+    """The GPU takes no float64: a block whose stack has such a tensor has no
+    face (affine gives none for float64 scales, as for any layout it does not
+    take; a format's face of such a tensor is a defect, test_formats), so
+    neither one token nor a window builds launches or a stand-in, which
+    could not be made; the block keeps its composed path."""
+    for name in ("gate_up_proj", "down_proj"):
+        block = _block(512, 256, top_k=8, experts=128)
+        stack = block.switch_mlp[name]
+        with mx.stream(mx.cpu):
+            stack["scales"] = stack["scales"].astype(mx.float64)
+        assert routed._build_plan(block) is None
+        assert routed.routed_verify_window(block, _rows_of(block, 1, 3)) is None
+        assert routed.routed_verify_window(block, _rows_of(block, 1, 1)) is None
+    assert not kernels._PROOFS
 
 
 def test_a_router_that_scores_other_experts_than_the_stacks_is_not_planned():
@@ -2137,6 +2167,17 @@ def test_a_router_that_scores_other_experts_than_the_stacks_is_not_planned():
     block = _block(1024, 320, experts=128)
     block.num_experts = 256
     assert routed._build_plan(block) is None
+    # Fewer experts than the stacks hold, by the block or by the router.
+    block.num_experts = 48
+    assert routed._build_plan(block) is None
+    # A router the gemv launch declines runs as the block's own linear: its
+    # expert count is checked all the same.
+    for hidden, scored in ((1024, 64), (1024, 48)):
+        block = _block(hidden, 320, experts=128)
+        gate = nn.Linear(hidden, scored, bias=False)
+        gate.set_dtype(mx.bfloat16)
+        block.gate = gate
+        assert routed._build_plan(block) is None
     assert routed._build_plan(_block(1024, 320, experts=128)) is not None
 
 

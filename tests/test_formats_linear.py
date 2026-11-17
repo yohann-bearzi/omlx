@@ -563,6 +563,32 @@ def _want(layer, x, indices=None):
     return want
 
 
+def test_a_tensor_of_float64_is_no_face_and_the_layer_runs_composed(
+    toy, caplog, dot_defects
+):
+    """The GPU takes no float64: a layer with such a tensor has no face (a
+    stand-in of it could not be made), the defect is logged once, and the
+    layer and the stack run their composed path, on the CPU here."""
+    toy(_toy("linear"))
+    layer, x, _ = _toy_linear(16, 320)
+    switch = _toy_switch(8, 320)
+    rows, indices = _ints((2, 1, 320)), mx.array([[3], [5]])
+    with mx.stream(mx.cpu), caplog.at_level(logging.ERROR, logger=formats.__name__):
+        layer["scales"] = layer["scales"].astype(mx.float64)
+        switch["scales"] = switch["scales"].astype(mx.float64)
+        got, stacked = layer(x), switch(rows, indices)
+        mx.eval(got, stacked)
+    assert np.allclose(np.array(got), _want(layer, x))
+    assert np.allclose(np.array(stacked), _want(switch, rows, indices))
+    defect = (
+        "ValueError('face toy_linear: scales of float64, which the GPU does not "
+        "take')"
+    )
+    assert dot_defects == {("toy", defect)} and len(caplog.records) == 1
+    assert not kernels._PROOFS
+    dot_defects.clear()  # expected
+
+
 def test_a_format_oMLX_does_not_know_runs_in_a_linear(toy, monkeypatch):  # noqa: N802
     toy(_toy("linear"))
     # K = 320: one whole block of the toy face, then a last block of 8 lanes.

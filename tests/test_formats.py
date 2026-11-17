@@ -5,6 +5,7 @@ their mode through one door, and a plugin that fails to load is skipped.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import threading
@@ -536,6 +537,13 @@ def _layer_with_small(*names):
     return layer
 
 
+def _layer_of_float64(*names):
+    layer = _layer()
+    for name in names:
+        layer[name] = mx.zeros((8,), mx.float64, stream=mx.cpu)
+    return layer
+
+
 def _layer_with_a_child_named_scales():
     layer = _layer(tensors=("weight",))
     layer.scales = nn.Module()
@@ -606,6 +614,13 @@ def _layer_with_a_child_named_scales():
             _ThreeTensors(),
             _layer(),
             "ValueError('face toy_b4: biases, gains is no tensor of quant format toy')",
+        ),
+        # The GPU takes no float64: a stand-in of such a tensor cannot be made.
+        (
+            _Format(),
+            _layer_of_float64("weight", "scales"),
+            "ValueError('face toy_b4: weight, scales of float64, which the GPU does "
+            "not take')",
         ),
     ],
 )
@@ -836,6 +851,38 @@ def test_a_dot_that_gives_a_tile_is_defective(plugins, caplog, dot_defects):
     dot_defects.clear()  # expected
 
 
+def test_two_threads_that_meet_one_defect_log_it_once(plugins, caplog, monkeypatch):
+    """Two engine threads may ask a defective format for a face at once:
+    the defect is logged once."""
+    formats.register(_TileRaises())
+    together = threading.Barrier(2, timeout=10)
+    asked = []
+
+    class Met(set):
+        def __contains__(self, defect):
+            found = super().__contains__(defect)
+            asked.append(threading.get_ident())
+            if len(asked) <= 2:
+                # Each thread waits for the other between its check and its
+                # insertion: with the two apart, both would find it new.
+                with contextlib.suppress(threading.BrokenBarrierError):
+                    together.wait(timeout=0.5)
+            return found
+
+    met = Met()
+    monkeypatch.setattr(formats, "_DOT_DEFECTS", met)
+    threads = [
+        threading.Thread(target=formats.tile, args=(_layer(), 64, 8)) for _ in range(2)
+    ]
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+    assert len(asked) == 2 and len(caplog.records) == 1
+    assert met == {("toy", "_DefectError('no biases')")}
+
+
 def test_one_error_of_a_formats_dot_and_tile_is_one_defect(
     plugins, caplog, dot_defects
 ):
@@ -915,6 +962,13 @@ def test_a_face_names_metal_identifiers(names):
     # The key and the tensors are spliced into the kernel's Metal.
     with pytest.raises(ValueError, match="is not an identifier"):
         replace(_FACE, **names)
+
+
+def test_a_face_s_refusal_names_the_face():
+    with pytest.raises(ValueError) as refusal:
+        replace(_FACE, tensors=("2nd",))
+    want = f"quant format face {_FACE.key!r}: '2nd' is not an identifier"
+    assert str(refusal.value) == want
 
 
 @pytest.mark.parametrize(
