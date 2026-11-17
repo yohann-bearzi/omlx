@@ -417,7 +417,7 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 2. **A face is safe on zeros**: tensors of zeros give finite weights. A kernel proves its Metal on zeros.
 3. **No loop bound or exit comes from a value read**: a face has no loop over data.
 4. **The constructor reads nothing.** A kernel builds a cursor in each thread of its tile, also for rows past the matrix, and calls `params` and `fetch` only for the rows, groups and runs it computes. A constant of the row (a row scale) is read again at each `params()`: that is the price of this rule. The constructor computes pointers from `row` and K, and nothing else.
-5. **No threadgroup memory of its own, no barrier, no simdgroup operation**: not every thread of a kernel decodes. A face reads its tables through the members it is given: the kernel stages them before any of its own code (see [Tables](#tables)).
+5. **No threadgroup memory of its own, no barrier, no simdgroup operation**: not every thread of a kernel decodes. A face reads its tables through the members it is given: the kernel prepares them before any of its own code (see [Tables](#tables)).
 6. **A face never writes.**
 7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data and the face's tables (through `p`), and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
 8. **The members keep no state but the cursor's**, and `params` and `fetch` are `const`: kernels run on several threads, and a format returns equal `Tile`s for the layers of one layout.
@@ -506,7 +506,7 @@ Its `decode`, the same products in the same order:
 
 ## Tables
 
-A table that a face reads at indices that differ from lane to lane (a level for each code, a codebook) is data, not Metal. The face gives it in Python, and every kernel built on the face copies it into threadgroup memory when it starts; the face reads the copy. A table read per lane from `constant` or `device` memory instead makes the kernel's speed depend on where the GPU loads the kernel: 2 to 7% on an M3 Ultra from one process to the next, for the same source. The staged copy is the fastest form measured and has no such spread.
+A table that a face reads at indices that differ from lane to lane (a level for each code, a codebook) is data, not Metal. The face gives it in Python, and every kernel built on the face holds it in the form this GPU reads fastest: a copy in threadgroup memory, made when the kernel starts, or for a small table its values themselves. A table read per lane from `constant` or `device` memory instead makes the kernel's speed depend on where the GPU loads the kernel: 2 to 7% on an M3 Ultra from one process to the next, for the same source. The staged copy is the fastest form measured for tables of more than 4 values and has no such spread.
 
 ```python
 from omlx.formats import Dot, Table
@@ -522,23 +522,23 @@ Dot(
 
 `Table(name, dtype, values)`: `name` is an identifier, `dtype` one of float32, float16, bfloat16, int8, uint8, int16, uint16, int32 and uint32, and `values` a tuple of 1 to 1024 numbers. A float table rounds each value to its type, to nearest even, when it is made; a value that is NaN or out of the type's range is refused. An integer table takes whole numbers in its range. A face's tables hold at most 4096 bytes, and so do a kernel's.
 
-The face's struct declares one member for each table, after the pointers of its tensors, in the order of `tables`: a threadgroup pointer of the table's type (`float`, `half`, `bfloat16_t`, `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`). A dot face's `Lanes` copies it, and `Row` carries it to `madd`, which reads it; a tile face's `Runs` copies it, and `P` carries it to `weight`:
+The face's struct declares one member for each table, after the pointers of its tensors, in the order of `tables`: an `omlx_table<T, N>`, `T` the table's type (`float`, `half`, `bfloat16_t`, `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`) and `N` its number of values. It reads like an array, `levels[code]`, and is copied like a pointer. A dot face's `Lanes` copies it, and `Row` carries it to `madd`, which reads it; a tile face's `Runs` copies it, and `P` carries it to `weight`:
 
 ```cpp
 struct Dot {
   static constant constexpr int CONTRACT = 1;
   const device uint8_t* codes;
   const device float* scales;
-  const threadgroup float* levels;
+  omlx_table<float, 4> levels;
 
   template <int K>
   struct Lanes {
     ...
-    const threadgroup float* lv;
+    omlx_table<float, 4> lv;
     Lanes(Dot m, size_t row, uint lane) : ..., lv(m.levels) {}
     struct Row {
       const device uint8_t* w;
-      const threadgroup float* lv;
+      omlx_table<float, 4> lv;
     };
     Row row(int r) const { return {w + r * K, lv}; }
     static float madd(float acc, Row r, thread const float* xt, float) {
@@ -548,9 +548,11 @@ struct Dot {
 };
 ```
 
+oMLX defines `omlx_table` when it builds a kernel, for the GPU it runs on, so one source of the face serves every GPU. On a GPU without tensor units (the M3 family), a table of up to 4 values holds the values themselves and reads them by selects on the index's bits: measured up to 15% faster there than a staged copy, on the 2-bit levels of a mixture of experts' layers. On a GPU with tensor units (the M5 family) every table is staged: there a staged copy measured 0.6 to 3% faster than selects. A family not measured follows its tensor units. Larger tables are always staged. The face cannot tell which form it has, and needs not.
+
 A face's tables are part of the face: two faces are equal when their tables' names, dtypes and bits are, and a kernel is compiled once for each. A format whose tables come from a checkpoint (a level table fitted to it) makes the checkpoint's faces with its tables, and puts what tells them apart in the faces' keys, so that a log line names the face that ran.
 
-The copy runs once in every threadgroup, before the kernel's own code, and ends with one barrier for all of a kernel's tables. It costs about 0.3 to 0.5 µs of a one-token launch, which a face without tables does not pay: its kernels are the same Metal as before tables existed. `omlx.formats.testing.staged_tables` reads a face's tables back as a kernel stages them (see [Test a format](#test-a-format)).
+The copy runs once in every threadgroup, before the kernel's own code, and ends with one barrier for all of a kernel's staged tables. It costs about 0.3 to 0.5 µs of a one-token launch, which a face without tables does not pay: its kernels are the same Metal as before tables existed. `omlx.formats.testing.staged_tables` reads a face's tables back as a kernel stages them (see [Test a format](#test-a-format)).
 
 ## Kernels over faces
 

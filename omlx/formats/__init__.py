@@ -137,7 +137,7 @@ def _table_entry(dtype: mx.Dtype, value) -> tuple:
 class Table:
     """A lookup table that a face reads at per-lane indices: kernels built
     on the face stage it in threadgroup memory at their start, and the face
-    reads it through a member ``const threadgroup <type>* <name>``.
+    reads it through a member ``omlx_table<type, N> name``.
 
     ``values`` are numbers, each rounded to ``dtype`` when the table is
     made (a float table) or taken exactly (an integer table). Two tables are

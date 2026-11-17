@@ -265,7 +265,22 @@ def _toy(key, members, *tables):
     )
 
 
-def test_a_kernel_stages_each_table_once_by_element_type():
+@pytest.fixture
+def staged(monkeypatch):
+    """Every table staged, as on a GPU with tensor units."""
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: False)
+
+
+@pytest.fixture(params=["staged", "selects"])
+def form(request, monkeypatch):
+    """Small tables staged, or read as selects: each GPU builds one form,
+    the tests build both."""
+    selects = request.param == "selects"
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: selects)
+    return request.param
+
+
+def test_a_kernel_stages_each_table_once_by_element_type(staged):
     a = Table("a", mx.float32, (1.0, -0.0))
     b = Table("b", mx.int8, (-1, 2, 3))
     c = Table("c", mx.float32, (0.5,))
@@ -291,13 +306,61 @@ def test_a_kernel_stages_each_table_once_by_element_type():
     assert "as_type<int8_t>(omlx_staged::bits_int8_t[i])" in body
     # Equal tables of two faces share one copy.
     assert "m_scales" not in body
-    assert "p_scales, omlx_tg_float + 0, omlx_tg_int8_t + 0};" in body
-    assert "q_scales, omlx_tg_float + 2, omlx_tg_float + 0};" in body
-    assert "decltype(omlx_tables_one::Dot::b), const threadgroup int8_t*>" in body
-    assert "table 'b' is int8 data" in body
+    assert (
+        "p_scales, omlx_table<float, 2>{omlx_tg_float + 0}, "
+        "omlx_table<int8_t, 3>{omlx_tg_int8_t + 0}};" in body
+    )
+    assert (
+        "q_scales, omlx_table<float, 1>{omlx_tg_float + 2}, "
+        "omlx_table<float, 2>{omlx_tg_float + 0}};" in body
+    )
+    assert "decltype(omlx_tables_one::Dot::b), omlx_table<int8_t, 3>>" in body
+    assert "table 'b' is 3 values of int8" in body
+    assert "bool VALUES = (N <= 4 && false)>" in header
 
 
-def test_a_kernel_stages_at_most_4096_bytes_of_tables():
+def test_small_tables_are_values_read_by_selects_where_the_gpu_reads_them_so(
+    monkeypatch,
+):
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: True)
+    small = Table("b", mx.int8, (-1, 2, 3))
+    big = Table("e", mx.float32, (1.0,) * 5)
+    matrices = kernels.Matrices()
+    matrices.add("p", _toy("small", "", small))
+    assert "bool VALUES = (N <= 4 && true)>" in matrices.header
+    assert "omlx_staged" not in matrices.header
+    body = matrices.declarations
+    assert "threadgroup" not in body.split("const auto")[0]
+    assert (
+        "p_scales, omlx_table<int8_t, 3>{as_type<int8_t>(uint8_t(0xffu)), "
+        "as_type<int8_t>(uint8_t(0x2u)), as_type<int8_t>(uint8_t(0x3u)), "
+        "as_type<int8_t>(uint8_t(0x0u))}};" in body
+    )
+    assert matrices.staged_bytes == 0
+    # A larger table is staged beside it.
+    matrices.add("q", _toy("big", "", big))
+    assert matrices.declarations.startswith("    threadgroup float omlx_tg_float[5];\n")
+    assert matrices.staged_bytes == 20
+    # Four values are still values.
+    four = kernels.Matrices()
+    four.add("p", _toy("four", "", Table("t", mx.uint16, (1, 2, 3, 4))))
+    assert "omlx_table<uint16_t, 4>{as_type<uint16_t>(uint16_t(0x1u))" in (
+        four.declarations
+    )
+    assert four.staged_bytes == 0
+
+
+def test_a_gpu_with_tensor_units_stages_small_tables_and_one_without_selects(
+    monkeypatch,
+):
+    from omlx.custom_kernels.quant_matmul import fast
+
+    for tensor_units in (True, False):
+        monkeypatch.setattr(fast, "is_nax_available", lambda t=tensor_units: t)
+        assert kernels._small_tables_as_selects() is (not tensor_units)
+
+
+def test_a_kernel_stages_at_most_4096_bytes_of_tables(staged):
     matrices = kernels.Matrices()
     matrices.add("p", _toy("p", "", Table("a", mx.float32, (0.0,) * 1000)))
     matrices.add("q", _toy("q", "", Table("a", mx.float32, (0.0,) * 1000)))  # the same
@@ -325,11 +388,12 @@ def test_up_to_32_values_of_a_type_are_one_copy_a_thread(count, loop):
 # --- on the GPU -----------------------------------------------------------------
 
 
-_MEMBERS = """  const threadgroup float* a;
-  const threadgroup int8_t* b;
-  const threadgroup half* c;
-  const threadgroup bfloat16_t* d;
-  const threadgroup float* e;"""
+_MEMBERS = """  omlx_table<float, 4> a;
+  omlx_table<int8_t, 3> b;
+  omlx_table<half, 2> c;
+  omlx_table<bfloat16_t, 2> d;
+  omlx_table<float, 40> e;
+  omlx_table<uint32_t, 1> f;"""
 
 _TABLES = (
     Table("a", mx.float32, (1.5, -0.0, 3.0e38, 2.0**-149)),
@@ -337,6 +401,7 @@ _TABLES = (
     Table("c", mx.float16, (0.1, -65504.0)),
     Table("d", mx.bfloat16, (0.1, -3.0)),
     Table("e", mx.float32, (7.0,) * 40),
+    Table("f", mx.uint32, (0xDEADBEEF,)),
 )
 
 
@@ -350,31 +415,31 @@ def _bits(array):
 
 
 @metal
-def test_staged_tables_reads_each_table_back_as_declared():
-    face = _toy("all", _MEMBERS, *_TABLES)
+def test_staged_tables_reads_each_table_back_as_declared(form):
+    face = _toy(f"all_{form}", _MEMBERS, *_TABLES)
     got = testing.staged_tables(face, _operands(), mx.float32)
-    assert list(got) == ["a", "b", "c", "d", "e"]
+    assert list(got) == ["a", "b", "c", "d", "e", "f"]
     for table in _TABLES:
         assert got[table.name].dtype == table.dtype
         assert _bits(got[table.name]) == table.bits
 
 
 @metal
-def test_staged_tables_tells_two_members_in_another_order():
-    members = _MEMBERS.replace("float* a;", "float* x;").replace(
-        "float* e;", "float* a;"
-    )
-    members = members.replace("float* x;", "float* e;")
+def test_staged_tables_tells_two_members_in_another_order(form):
+    x, y = Table("x", mx.float32, (1.0, 2.0)), Table("y", mx.float32, (3.0, 4.0))
+    members = "  omlx_table<float, 2> y;\n  omlx_table<float, 2> x;"
     got = testing.staged_tables(
-        _toy("swapped", members, *_TABLES), _operands(), mx.float32
+        _toy(f"swapped_{form}", members, x, y), _operands(), mx.float32
     )
-    assert _bits(got["a"]) == _TABLES[4].bits[:4]
+    assert _bits(got["x"]) == y.bits and _bits(got["y"]) == x.bits
 
 
 @metal
 def test_a_member_of_another_type_fails_with_the_sentence():
-    members = _MEMBERS.replace("int8_t* b;", "char* b;")
-    with pytest.raises(RuntimeError, match="table 'b' is int8 data: the face declares"):
+    members = _MEMBERS.replace("omlx_table<int8_t, 3> b;", "omlx_table<char, 3> b;")
+    with pytest.raises(
+        RuntimeError, match="table 'b' is 3 values of int8: the face declares"
+    ):
         mx.eval(
             testing.staged_tables(
                 _toy("char", members, *_TABLES), _operands(), mx.float32
@@ -405,7 +470,7 @@ def test_every_thread_of_a_partial_threadgroup_sees_the_whole_table():
         output_names=["y"],
         header=tables.header,
         source=tables.prologue + f"""
-    const threadgroup float* t = {at};
+    const auto t = {at};
     const uint g = threadgroup_position_in_grid.y;
     if (thread_index_in_threadgroup == 0) {{
       for (uint i = 0; i < 300u; ++i) {{
@@ -435,11 +500,11 @@ LUT = Table(
 _TABLED = (
     (
         "  const device T* biases;\n",
-        "  const device T* biases;\n  const threadgroup float* lut;\n",
+        "  const device T* biases;\n  omlx_table<float, 64> lut;\n",
     ),
     (
         "    const device T* b;\n",
-        "    const device T* b;\n    const threadgroup float* l;\n",
+        "    const device T* b;\n    omlx_table<float, 64> l;\n",
     ),
     (
         "          b(m.biases + row * ROW_G + lane / SCALE_STEP_PER_THREAD) {}",
@@ -448,7 +513,7 @@ _TABLED = (
     ),
     (
         "      float b;\n    };",
-        "      float b;\n      const threadgroup float* l;\n    };",
+        "      float b;\n      omlx_table<float, 64> l;\n    };",
     ),
     (
         "      return {w + r * ROW_W, float(s[r * ROW_G]), float(b[r * ROW_G])};",
@@ -457,7 +522,7 @@ _TABLED = (
     ("qdot(r.w, x_thread, r.s, r.b, sum)", "qdot(r.w, x_thread, r.s, r.b, sum, r.l)"),
     (
         "    float sum) {\n  float accum = 0;",
-        "    float sum,\n    const threadgroup float* lut) {\n  float accum = 0;",
+        "    float sum,\n    omlx_table<float, 64> lut) {\n  float accum = 0;",
     ),
     ("(ws[i] & 0x000f)", "lut[ws[i] & 0xf]"),
     ("(ws[i] & 0x00f0)", "lut[16 + ((ws[i] >> 4) & 0xf)]"),
@@ -517,16 +582,16 @@ CODES = Table("codes", mx.float32, tuple(float(j) for j in range(16)))
 _TILED = (
     (
         "  const device S* biases;\n\n  template <int K>",
-        "  const device S* biases;\n  const threadgroup float* codes_lut;\n\n"
+        "  const device S* biases;\n  omlx_table<float, 16> codes_lut;\n\n"
         "  template <int K>",
     ),
     (
         "      float b;\n    };",
-        "      float b;\n      const threadgroup float* l;\n    };",
+        "      float b;\n      omlx_table<float, 16> l;\n    };",
     ),
     (
         "    const device S* b;\n\n    Runs(",
-        "    const device S* b;\n    const threadgroup float* l;\n\n    Runs(",
+        "    const device S* b;\n    omlx_table<float, 16> l;\n\n    Runs(",
     ),
     (
         "          b(m.biases + row * ROW_GROUPS) {",
@@ -587,3 +652,59 @@ def test_a_tile_kernel_gives_its_pad_the_staged_bytes_back(monkeypatch):
     assert "PAD / sizeof(T)];" in plain and "PAD > " not in plain
     assert "(PAD > 64 ? PAD - 64 : 0) / sizeof(T)];" in staged
     assert staged.startswith("    threadgroup float omlx_tg_float[16];\n")
+
+
+# The kernel tests' toy face, its weights a level of a 4-value table picked by
+# the code's two low bits: a table each GPU may read either way.
+LEVELS4 = Table("levels", mx.float32, (-3.0, -1.0, 0.5, 2.0))
+
+_TOY4 = (
+    (
+        "  const device float* scales;\n",
+        "  const device float* scales;\n  omlx_table<float, 4> levels;\n",
+    ),
+    (
+        "    const device float* s;\n",
+        "    const device float* s;\n    omlx_table<float, 4> lv;\n",
+    ),
+    ("s(m.scales + row) {}", "s(m.scales + row), lv(m.levels) {}"),
+    (
+        "      const device uint8_t* w;\n    };",
+        "      const device uint8_t* w;\n      omlx_table<float, 4> lv;\n    };",
+    ),
+    ("return {w + r * K};", "return {w + r * K, lv};"),
+    (
+        "const device uint8_t* w, thread const float* xt) {",
+        "const device uint8_t* w, thread const float* xt,\n"
+        "                     omlx_table<float, 4> lv) {",
+    ),
+    ("(float(w[I]) - 128.0f)", "lv[w[I] & 3u]"),
+    ("dot(omlx_iota<VPT>(), r.w, xt)", "dot(omlx_iota<VPT>(), r.w, xt, r.lv)"),
+)
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 320])
+def test_a_four_value_table_gives_the_face_s_rows_in_either_form(form, k):
+    from tests.test_formats_kernels import _TOY as ROWS_TOY
+    from tests.test_formats_kernels import _matrix
+
+    source = ROWS_TOY.replace("KEY", f"four_{form}")
+    for old, new in _TOY4:
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    face = Dot(
+        key=f"toy_four_{form}",
+        source=source,
+        type=f"omlx_toy_four_{form}::Dot",
+        tensors=("scales",),
+        tables=(LEVELS4,),
+    )
+    (codes, scales), x, _ = _matrix(16, k)
+    levels = np.array(LEVELS4.values, dtype=np.float32)[np.array(codes) & 3]
+    want = (levels @ np.array(x)) * np.array(scales)
+    got = testing.dot_rows(face, (codes, scales), x, 16, packs=(2, 2))
+    assert np.array_equal(np.array(got), want)
+    assert _bits(
+        testing.staged_tables(face, (codes, scales), mx.float32)["levels"]
+    ) == (LEVELS4.bits)
