@@ -58,6 +58,7 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
+from ..patches.format_load import apply_format_load_patch  # noqa: E402
 from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
 from ..utils.model_loading import materialize_lazy_state  # noqa: E402
@@ -211,6 +212,8 @@ def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     """Load an MTP drafter (gemma4_assistant or qwen3_5_mtp); return None
     and log if the artifact is the wrong kind. Soft-fails so a misconfigured
     toggle does not crash model loading."""
+    # A drafter's layers of a quant format load as the format's layers.
+    apply_format_load_patch()
     try:
         drafter_model, resolved_kind = _vlm_load_drafter(path, kind=None)
     except Exception as e:

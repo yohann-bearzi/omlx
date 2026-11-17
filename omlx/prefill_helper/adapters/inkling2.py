@@ -17,8 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx_lm.utils
 from mlx.utils import tree_flatten
-from mlx_lm.utils import load_model
 
 from ...patches.inkling2 import model as inkling2
 from ...utils.model_loading import maybe_apply_pre_load_patches
@@ -151,7 +151,7 @@ class Inkling2Adapter(StageAdapter):
                 loaded.update(out)
                 return out
 
-        lm, _ = load_model(
+        lm, _ = mlx_lm.utils.load_model(
             Path(path),
             lazy=True,
             strict=False,

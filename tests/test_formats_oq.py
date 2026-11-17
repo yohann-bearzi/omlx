@@ -72,7 +72,13 @@ class _Codec(_ToyFormat):
         super().__init__()
         self.offered, self.encoded, self.lays_out = [], [], True
         self.answer = lambda tensors, w: tensors
-        self.accepted = []
+        # What the loads handed it, kept off its own state: a format that
+        # changes its state to accept a checkpoint is refused.
+        self.log = SimpleNamespace(accepted=[])
+
+    @property
+    def accepted(self):
+        return self.log.accepted
 
     def layout(self, k, n, bits, group_size):
         self.offered.append((k, n, bits, group_size))

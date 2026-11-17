@@ -23,8 +23,9 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx_lm.utils
 from mlx_lm.models import muse_spark
-from mlx_lm.utils import load_config, load_model
+from mlx_lm.utils import load_config
 
 from ..mlx_vlm_muse_spark_compat import apply_mlx_vlm_muse_spark_compat_patch
 
@@ -243,7 +244,7 @@ def load(model_path: str | Path, *, lazy: bool = False):
     # Registers the processor with AutoProcessor and the chat prompt format.
     apply_mlx_vlm_muse_spark_compat_patch()
     path = get_model_path(str(model_path))
-    model, config = load_model(path, lazy=lazy, **load_kwargs(path))
+    model, config = mlx_lm.utils.load_model(path, lazy=lazy, **load_kwargs(path))
     text = config.get("text_config") or {}
     model.config = SimpleNamespace(
         model_type=model.model_type,

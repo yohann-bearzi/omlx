@@ -209,13 +209,18 @@ def _build_patched_load_model() -> Callable:
                     return False
                 return f"{p}.scales" in weights
 
-            nn.quantize(
-                model,
-                group_size=quantization["group_size"],
-                bits=quantization["bits"],
-                mode=quantization.get("mode", "affine"),
-                class_predicate=class_predicate,
-            )
+            # Its own layers, built outside any checkpoint's load: one of a
+            # quant format is refused (omlx.patches.format_load).
+            from omlx.patches.format_load import outside_load
+
+            with outside_load():
+                nn.quantize(
+                    model,
+                    group_size=quantization["group_size"],
+                    bits=quantization["bits"],
+                    mode=quantization.get("mode", "affine"),
+                    class_predicate=class_predicate,
+                )
 
         if (quantization := config.get("quantization", None)) is not None:
             _quantize(quantization)

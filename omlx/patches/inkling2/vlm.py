@@ -7,8 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import mlx_lm.utils
 import mlx_vlm.prompt_utils as prompt_utils
-from mlx_lm.utils import load_model
 from mlx_vlm.models.base import InputEmbeddingsFeatures, install_auto_processor_patch
 from mlx_vlm.utils import get_model_path, load_processor
 
@@ -84,7 +84,7 @@ def load(model_path: str | Path, *, lazy: bool = False):
     apply_inkling2_patch()
     _register_mlx_vlm()
     path = get_model_path(str(model_path))
-    model, config = load_model(
+    model, config = mlx_lm.utils.load_model(
         path,
         lazy=lazy,
         get_model_classes=lambda config: (Model, inkling2.ModelArgs),

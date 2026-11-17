@@ -11,8 +11,10 @@ import importlib
 import inspect
 import json
 import re
+import sys
 import textwrap
 import threading
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -45,9 +47,19 @@ class _Loadable(_ToyFormat):
 
     def __init__(self, mode="toy"):
         super().__init__()
-        self.mode, self.asked = mode, []
-        self.accepted, self.refusal = [], None
+        self.mode, self.refusal = mode, None
+        # What it was asked and handed, kept off its own state: a format that
+        # changes its state to accept a checkpoint is refused.
+        self.log = SimpleNamespace(asked=[], accepted=[])
         self.reads = lambda record: self
+
+    @property
+    def asked(self):
+        return self.log.asked
+
+    @property
+    def accepted(self):
+        return self.log.accepted
 
     def accept(self, record):
         # What it was handed, and whether a layer had been built before.
@@ -75,8 +87,10 @@ def unpatched(monkeypatch):
         )
     for module, name in _loaders():
         loader = getattr(module, name)
-        if getattr(loader, "_omlx_format_load", False):
-            monkeypatch.setattr(module, name, loader.__wrapped__)
+        while getattr(loader, "_omlx_format_load", False):
+            # Through each wrapper, a family's that copied the mark included.
+            loader = loader.__wrapped__
+        monkeypatch.setattr(module, name, loader)
     # The patch wraps each module once, the first time it finds it: what it
     # wraps then, as a process starts.
     pending = {name for name, _ in format_load._LOADERS}
@@ -674,6 +688,55 @@ def test_a_format_that_configures_itself_to_accept_is_refused(toy, tmp_path):
     for said in ("the plugin", "omlx-toy 0.3.1", "a format registered by hand"):
         quoted = quoted.replace(said, "my-package 0.1.0")
     assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    # The registered format is left as it was: the next load is refused too.
+    assert not hasattr(toy, "levels")
+    with pytest.raises(formats.FormatRefusedError, match=r"changed .*\(levels\)"):
+        load_model(tmp_path)
+
+
+class _Slotted(_Loadable):
+    __slots__ = ("level",)
+
+
+@pytest.mark.parametrize(
+    "change", ["in place", "a dict in place", "a slot", "then raises", "then fails"]
+)
+def test_what_accept_changes_of_the_registered_format_is_undone(
+    tmp_path, monkeypatch, unpatched, change
+):
+    formats.load()
+    fmt = _Slotted()
+    fmt.table, fmt.options, fmt.level = [0.5, 1.5], {"rows": 1}, 1
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    format_load.apply_format_load_patch()
+
+    def configure(record):
+        if change == "in place":
+            fmt.table[0] = 2.0
+        elif change == "a dict in place":
+            fmt.options["rows"] = 2
+        elif change == "a slot":
+            fmt.level = 2
+        elif change == "then raises":
+            fmt.table.append(3.0)
+            raise ValueError("written in layout 2; this plugin reads layout 1")
+        else:
+            fmt.options.clear()
+            raise KeyError("layout")
+        return fmt
+
+    fmt.reads = configure
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+    # A format's defect is its own error; a refusal is oMLX's.
+    error = KeyError if change == "then fails" else formats.FormatRefusedError
+    with pytest.raises(error) as refusal:
+        load_model(tmp_path)
+    changed = {"in place": "table", "a dict in place": "options", "a slot": "level"}
+    if change in changed:
+        assert f"accept changed the registered format ({changed[change]})" in str(
+            refusal.value
+        )
+    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], {"rows": 1}, 1)
 
 
 class _Wide(_Loadable):
@@ -1152,8 +1215,20 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
             mlx_lm.utils.load_model(
                 v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
             )
+    # Applied before this patch, it is under the wrapped loader: its own
+    # quantize still runs outside any load.
+    mlx_lm.utils.load_model = wrapped.__wrapped__
+    mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
+    monkeypatch.setattr(format_load, "_PENDING", {"mlx_lm.utils"})
+    format_load.apply_format_load_patch()
+    assert getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
+    with pytest.raises(ValueError, match="built outside a checkpoint's load"):
+        mlx_lm.utils.load_model(
+            v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
+        )
     # K2 Horizon's loads a directory of links to the checkpoint's files.
     mlx_lm.utils.load_model = wrapped
+    monkeypatch.setattr(mlx_lm.utils, "load_tokenizer", mlx_lm.utils.load_tokenizer)
     checkpoint.apply_checkpoint_patch()
     k2 = _tiny(tmp_path / "k2", [17.0])
     config = json.loads((k2 / "config.json").read_text())
@@ -1162,6 +1237,104 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
         k2, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
     )
     assert _gate_proj(model).fmt.levels == (17.0,)
+
+
+def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
+    unpatched, monkeypatch
+):
+    import types
+
+    formats.load()
+    module = types.ModuleType("halfway")
+    module.__spec__ = SimpleNamespace(_initializing=True)
+    monkeypatch.setitem(sys.modules, "halfway", module)
+    monkeypatch.setattr(
+        format_load, "_LOADERS", (*format_load._LOADERS, ("halfway", "load_model"))
+    )
+    format_load._PENDING.add("halfway")
+    real, waited = importlib.import_module, []
+
+    def importing(name, *args):
+        if name != "halfway":
+            return real(name, *args)
+        waited.append(name)
+        if len(waited) == 2:
+            # The other thread's import ends.
+            module.load_model = lambda path: None
+            module.__spec__._initializing = False
+        return module
+
+    monkeypatch.setattr(format_load.importlib, "import_module", importing)
+    # Still running (this thread's own import of it): left for its end.
+    format_load.apply_format_load_patch()
+    assert "halfway" in format_load._PENDING and not hasattr(module, "load_model")
+    # Another thread's: waited for, then wrapped.
+    format_load.apply_format_load_patch()
+    assert waited == ["halfway", "halfway"]
+    assert getattr(module.load_model, "_omlx_format_load", False)
+    assert "halfway" not in format_load._PENDING
+
+
+def test_omlx_s_loaders_call_mlx_lm_s_through_its_module():
+    # A name bound at import is the library's own function, which the patch
+    # cannot wrap.
+    for name in (
+        "omlx.oq",
+        "omlx.patches.inkling2.vlm",
+        "omlx.patches.muse_spark.model",
+        "omlx.prefill_helper.adapters.inkling2",
+    ):
+        assert "load_model" not in vars(importlib.import_module(name)), name
+
+
+@pytest.mark.parametrize("drafter", ["DFlash", "VLM-MTP"])
+def test_a_drafter_s_loader_installs_the_patch(
+    unpatched, tmp_path, monkeypatch, drafter
+):
+    toy = _registered(monkeypatch)
+    path = str(_tiny(tmp_path / "drafter", [18.0]))
+    if drafter == "DFlash":
+        from omlx.speculative.dflash import load_dflash_drafter
+
+        with pytest.raises(TypeError):
+            load_dflash_drafter(path, target_model=None)
+    else:
+        from omlx.speculative.vlm_mtp import load_vlm_mtp_drafter
+
+        assert load_vlm_mtp_drafter(path) is None
+    assert [tuple(record["levels"]) for record, _ in toy.accepted] == [(18.0,)]
+
+
+def test_mlx_embeddings_loads_a_checkpoint_of_the_format(levels, tmp_path):
+    from mlx_embeddings.models import bert
+    from mlx_embeddings.utils import load_model as embeddings_load_model
+
+    config = {
+        "model_type": "bert",
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "hidden_size": 64,
+        "intermediate_size": 128,
+        "max_position_embeddings": 16,
+        "vocab_size": 32,
+    }
+    model = bert.Model(bert.ModelArgs.from_dict(config))
+    weights = dict(tree_flatten(model.parameters()))
+    name = next(
+        path
+        for path, module in model.named_modules()
+        if type(module) is nn.Linear and module.weight.shape == (128, 64)
+    )
+    (codes, scales), _, _ = _matrix(128, 64)
+    weights[f"{name}.weight"], weights[f"{name}.scales"] = codes, scales
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    config["quantization"] = {"group_size": 64, "bits": 4, name: _TOY}
+    config["omlx_quant_formats"] = _written({"levels": [19.0]})
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded = embeddings_load_model(tmp_path, lazy=True)
+    layer = dict(loaded.named_modules())[name]
+    assert type(layer) is FormatLinear and layer.fmt.levels == (19.0,)
+    assert levels() == [(19.0,)]
 
 
 def test_the_patch_imports_none_of_the_libraries_and_wraps_them_on_import():

@@ -49,8 +49,8 @@ except ImportError:
     HAS_MLX = False
 
 try:
+    import mlx_lm.utils
     from mlx_lm.tokenizer_utils import load as load_mlx_lm_tokenizer
-    from mlx_lm.utils import load_model
 
     from omlx.patches.muse_spark import model as muse_spark_serving
     from omlx.patches.muse_spark import oq_layout as muse_spark_layout
@@ -10029,7 +10029,7 @@ def _load_muse_spark_calibration_model(model_path):
     """The text model of a Muse Spark checkpoint as oMLX serves it."""
     path = Path(model_path)
     kwargs = muse_spark_serving.load_kwargs(path, text_only=True)
-    model, _ = load_model(path, lazy=True, strict=False, **kwargs)
+    model, _ = mlx_lm.utils.load_model(path, lazy=True, strict=False, **kwargs)
     return model, load_mlx_lm_tokenizer(path)
 
 

@@ -31,6 +31,8 @@ the checkpoint's files, its config among them, whose record the layers read.
 
 from __future__ import annotations
 
+import copy
+import importlib
 import importlib.abc
 import inspect
 import json
@@ -105,21 +107,22 @@ class _Checkpoint:
         read = self._read.get(fmt.mode)
         if read is None:
             plugin = formats.origin(fmt.mode) or "the plugin"
-            kept = dict(getattr(fmt, "__dict__", {}))
+            kept = _state(fmt)
             try:
                 read = fmt.accept(self._record(fmt.mode))
             except FormatRefusedError:
                 raise
             except ValueError as error:
-                # The format's own words.
+                # The format's own words, on the registered format as it was.
+                _restore(fmt, kept)
                 raise _refused(str(error), fmt.mode, self) from error
-            now = getattr(fmt, "__dict__", {})
-            changed = sorted(
-                name
-                for name in kept.keys() | now.keys()
-                if kept.get(name, kept) is not now.get(name, kept)
-            )
+            except Exception:
+                _restore(fmt, kept)
+                raise
+            changed = _changed(fmt, kept)
             if changed:
+                # The registered format is left as it was for the next load.
+                _restore(fmt, kept)
                 raise _refused(
                     f"accept changed the registered format ({', '.join(changed)})"
                     " to accept the checkpoint: accept returns a format "
@@ -263,6 +266,72 @@ class _Checkpoint:
             and isinstance(entry.get("mode"), str)
             and not formats._mlx_runs(entry["mode"])
         ]
+
+
+# A registered format's attributes that its own state can change in place.
+_CONTAINERS = (list, dict, set, bytearray)
+
+
+def _state(fmt) -> dict:
+    """``fmt``'s attributes (its ``__dict__``'s and its slots'), each with a
+    copy of what a container of them holds."""
+    names = set(getattr(fmt, "__dict__", {}))
+    for cls in type(fmt).__mro__:
+        slots = getattr(cls, "__slots__", ())
+        names.update((slots,) if isinstance(slots, str) else slots)
+    names.discard("__dict__")
+    names.discard("__weakref__")
+    state = {}
+    for name in names:
+        try:
+            value = object.__getattribute__(fmt, name)
+        except AttributeError:
+            continue
+        held = copy.deepcopy(value) if isinstance(value, _CONTAINERS) else None
+        state[name] = (value, held)
+    return state
+
+
+def _changed(fmt, kept: dict) -> list[str]:
+    """The attributes of ``fmt`` that are not as ``kept`` (by ``_state``)
+    has them: added, removed, rebound, or a container's contents."""
+    now = _state(fmt)
+    return sorted(
+        name
+        for name in kept.keys() | now.keys()
+        if name not in kept
+        or name not in now
+        or now[name][0] is not kept[name][0]
+        or (kept[name][1] is not None and repr(now[name][0]) != repr(kept[name][1]))
+    )
+
+
+def _restore(fmt, kept: dict) -> None:
+    """``fmt``'s attributes as ``kept`` (by ``_state``) has them."""
+    for name in _changed(fmt, kept):
+        if name not in kept:
+            object.__delattr__(fmt, name)
+            continue
+        value, held = kept[name]
+        object.__setattr__(fmt, name, value)
+        if isinstance(value, (dict, set)):
+            value.clear()
+            value.update(held)
+        elif held is not None:
+            value[:] = held
+
+
+@contextmanager
+def outside_load() -> Iterator[None]:
+    """For the block, no checkpoint's load on this thread: a family's loader
+    that builds its own checkpoints' layers by hand, which no format reads,
+    runs its quantize in it, so that a checkpoint of a format is refused
+    there whichever of its patch and this one was applied first."""
+    token = formats._LOADING.set(None)
+    try:
+        yield
+    finally:
+        formats._LOADING.reset(token)
 
 
 def _same_layer(entry: str, path: str) -> bool:
@@ -428,12 +497,17 @@ def _wrap(module) -> None:
     with _LOCK:
         if module.__name__ not in _PENDING:
             return
+        try:
+            for module_name, name in _LOADERS:
+                if module_name == module.__name__:
+                    _wrap_loader(module, name)
+            if module.__name__ in _SWITCH_MODULES:
+                _patch(module.SwitchLinear, FormatSwitchLinear)
+        except AttributeError:
+            # Not defined yet: its import is still running, and the end of
+            # it wraps the module.
+            return
         _PENDING.discard(module.__name__)
-        for module_name, name in _LOADERS:
-            if module_name == module.__name__:
-                _wrap_loader(module, name)
-        if module.__name__ in _SWITCH_MODULES:
-            _patch(module.SwitchLinear, FormatSwitchLinear)
 
 
 class _Then(importlib.abc.Loader):
@@ -483,7 +557,14 @@ def apply_format_load_patch() -> None:
     with _LOCK:
         if _FINDER not in sys.meta_path:
             sys.meta_path.insert(0, _FINDER)
-        for name in sorted(_PENDING):
-            module = sys.modules.get(name)
-            if module is not None:
-                _wrap(module)
+        pending = sorted(_PENDING)
+    for name in pending:
+        module = sys.modules.get(name)
+        if module is None:
+            continue
+        if getattr(getattr(module, "__spec__", None), "_initializing", False):
+            # Another thread imports it: its import may have begun before
+            # this patch could see it, so it is waited for (outside the lock,
+            # which the end of that import takes).
+            module = importlib.import_module(name)
+        _wrap(module)
