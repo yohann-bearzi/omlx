@@ -742,3 +742,20 @@ def test_the_ordered_launch_reads_each_position_s_pair_from_the_order():
     want = gather.gather_qmv(projection, x, rhs, TOP_K)
     assert _same_bits(y[1], want[1])
     assert mx.isnan(y[0]).all().item() and mx.isnan(y[2:]).all().item()
+
+
+def test_a_face_with_a_table_runs_the_gather_to_the_bit(monkeypatch):
+    """A 4-bit face that reads its weight values from a table the gather's
+    launches stage, ahead of the rank walk and its barrier."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    switch = _switch(4, mx.bfloat16)
+    for batch, length in ((1, 2), (2, 4), (1, 8)):
+        x, indices = _block(batch, length)
+        got = gather.fused_switch(switch, x, indices)
+        assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+    (proof,) = _proofs()
+    assert proof.ran and not proof.failed
+    faces = {key[1] for key in kernels._PROOFS if key[0] == "verify_gather"}
+    assert all(face.key.endswith("_lut") for face in faces)

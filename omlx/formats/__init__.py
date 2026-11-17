@@ -25,8 +25,11 @@ is written for.
 from __future__ import annotations
 
 import logging
+import math
+import numbers
+import struct
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from importlib.metadata import EntryPoint, entry_points
 
 import mlx.core as mx
@@ -71,6 +74,115 @@ def _check_tensors(owner: str, tensors) -> None:
         )
 
 
+# The most bytes of tables a face, or a kernel, stages in threadgroup memory.
+TABLE_BYTES = 4096
+# The most values in a table.
+TABLE_VALUES = 1024
+
+# A table's element types: the struct code of its bits, and of its values
+# where struct rounds them (bfloat16 is rounded here).
+_TABLE_BITS = {
+    mx.float32: ("<I", "<f"),
+    mx.float16: ("<H", "<e"),
+    mx.bfloat16: ("<H", None),
+    mx.int8: ("<B", "<b"),
+    mx.uint8: ("<B", "<B"),
+    mx.int16: ("<H", "<h"),
+    mx.uint16: ("<H", "<H"),
+    mx.int32: ("<I", "<i"),
+    mx.uint32: ("<I", "<I"),
+}
+
+
+def _bfloat16(value: float) -> float:
+    """``value`` rounded to the nearest bfloat16, ties to even."""
+    if value == 0 or math.isinf(value):
+        return value
+    _, exponent = math.frexp(abs(value))
+    # A bfloat16 has 8 significant bits, and its subnormals step by 2^-133.
+    quantum = exponent - 8 if exponent - 1 >= -126 else -133
+    # Past bfloat16's range, the float32 that holds it is out of range too:
+    # struct raises OverflowError for it.
+    rounded = math.ldexp(round(math.ldexp(abs(value), -quantum)), quantum)
+    return math.copysign(rounded, value)
+
+
+def _table_entry(dtype: mx.Dtype, value) -> tuple:
+    """``value`` as a table of ``dtype`` keeps it, and its bits."""
+    bits, packed = _TABLE_BITS[dtype]
+    if dtype in (mx.float32, mx.float16, mx.bfloat16):
+        value = float(value)
+        if math.isnan(value) or math.isinf(value):
+            raise OverflowError("not a finite number")
+        if packed is None:
+            value = _bfloat16(value)
+            (word,) = struct.unpack("<I", struct.pack("<f", value))
+            return value, word >> 16
+        # struct rounds to nearest even, and raises OverflowError past the
+        # type's range.
+        data = struct.pack(packed, value)
+        (value,) = struct.unpack(packed, data)
+    else:
+        if value != int(value):
+            raise OverflowError("not a whole number")
+        value = int(value)
+        try:
+            data = struct.pack(packed, value)
+        except struct.error as error:
+            raise OverflowError(f"out of {dtype}'s range") from error
+    return value, struct.unpack(bits, data)[0]
+
+
+@dataclass(frozen=True)
+class Table:
+    """A lookup table that a face reads at per-lane indices: kernels built
+    on the face stage it in threadgroup memory at their start, and the face
+    reads it through a member ``const threadgroup <type>* <name>``.
+
+    ``values`` are numbers, each rounded to ``dtype`` when the table is
+    made (a float table) or taken exactly (an integer table). Two tables are
+    equal when their names, dtypes and the bits of their values are."""
+
+    name: str
+    dtype: mx.Dtype
+    values: tuple = field(compare=False)
+    bits: tuple = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not (
+            isinstance(self.name, str)
+            and self.name.isascii()
+            and self.name.isidentifier()
+        ):
+            raise ValueError(f"table {self.name!r}: its name is not an identifier")
+        if self.dtype not in _TABLE_BITS:
+            raise ValueError(
+                f"table {self.name!r}: a table holds one of "
+                f"{', '.join(str(d) for d in _TABLE_BITS)}, not {self.dtype!r}"
+            )
+        values = self.values
+        if not (isinstance(values, tuple) and 0 < len(values) <= TABLE_VALUES):
+            raise ValueError(
+                f"table {self.name!r}: values are a tuple of 1 to {TABLE_VALUES} "
+                "numbers"
+            )
+        kept, bits = [], []
+        for value in values:
+            if isinstance(value, bool) or not isinstance(value, numbers.Real):
+                raise ValueError(f"table {self.name!r}: {value!r} is not a number")
+            try:
+                rounded, word = _table_entry(self.dtype, value)
+            except (OverflowError, ValueError) as error:
+                raise ValueError(
+                    f"table {self.name!r}: {value!r} is not a value of {self.dtype} "
+                    f"({error})"
+                ) from None
+            kept.append(rounded)
+            bits.append(word)
+        object.__setattr__(self, "values", tuple(kept))
+        object.__setattr__(self, "bits", tuple(bits))
+
+
 @dataclass(frozen=True)
 class _Face:
     """What every kind of face is: Metal, the type it declares, the tensors
@@ -83,6 +195,8 @@ class _Face:
     tensors: tuple[str, ...]
     # The activations it is exact for; FLOATS if empty.
     dtypes: tuple[mx.Dtype, ...] = ()
+    # Tables the face reads, staged by the kernel (docs/quant-formats.md, Tables).
+    tables: tuple[Table, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         owner = f"quant format face {self.key!r}"
@@ -101,6 +215,28 @@ class _Face:
             raise ValueError(
                 f"{owner}: activations are float16, bfloat16 or float32, "
                 f"not {self.dtypes!r}"
+            )
+        tables = self.tables
+        if not (
+            isinstance(tables, tuple) and all(isinstance(t, Table) for t in tables)
+        ):
+            raise ValueError(
+                f"quant format face {self.key!r}: tables are a tuple of Table, "
+                f"not {tables!r}"
+            )
+        names = [table.name for table in tables]
+        taken = {"weight", *self.tensors}
+        if len(set(names)) != len(names) or taken & set(names):
+            raise ValueError(
+                f"quant format face {self.key!r}: tables are each named once, and "
+                f"not as the weight or a tensor: {names!r}"
+            )
+        size = sum(len(table.values) * table.dtype.size for table in tables)
+        if size > TABLE_BYTES:
+            raise ValueError(
+                f"quant format face {self.key!r}: its tables hold {size} bytes; a "
+                f"kernel stages at most {TABLE_BYTES} bytes of tables in "
+                "threadgroup memory, beside its own"
             )
 
     def exact_for(self, dtype) -> bool:

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 
 from .. import formats
-from . import Dot, Tile
+from . import Dot, Table, Tile
 
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
@@ -622,12 +622,116 @@ def face_kernel(
     return _FACE_KERNELS.setdefault(key, kernel)
 
 
+# What the Metal compiler calls the tables a kernel stages. Only this module
+# writes it: tests/test_metal_tables.py checks that, and skips this section
+# of a kernel's source when it looks for tables written by hand.
+_STAGED = "<omlx staged tables>"
+
+# A table's Metal element type (MLX's names), and the unsigned type of the
+# same width that holds its bits in the kernel's source.
+_METAL = {
+    mx.float32: ("float", "uint32_t"),
+    mx.float16: ("half", "uint16_t"),
+    mx.bfloat16: ("bfloat16_t", "uint16_t"),
+    mx.int8: ("int8_t", "uint8_t"),
+    mx.uint8: ("uint8_t", "uint8_t"),
+    mx.int16: ("int16_t", "uint16_t"),
+    mx.uint16: ("uint16_t", "uint16_t"),
+    mx.int32: ("int32_t", "uint32_t"),
+    mx.uint32: ("uint32_t", "uint32_t"),
+}
+
+
+# A kernel's threadgroups have a whole simdgroup or more: up to this many
+# values of a type are copied one a thread, without a loop.
+_ONE_COPY = 32
+
+
+class Tables:
+    """The tables a kernel stages in threadgroup memory: each distinct table
+    once, end to end with the others of its element type.
+
+    ``header`` declares their bits at program scope, and ``prologue``, the
+    first text of the kernel's body, copies them into threadgroup memory
+    with the threadgroup's threads and waits once for all of them. Both are
+    empty when no table was added: such a kernel's source is as without
+    them. A kernel reads a table through the expression ``add`` returns."""
+
+    def __init__(self) -> None:
+        self._by_type: dict[str, list[Table]] = {}
+        self._at: dict[Table, str] = {}
+
+    @property
+    def size(self) -> int:
+        """The bytes the tables take in threadgroup memory."""
+        return sum(len(table.values) * table.dtype.size for table in self._at)
+
+    def add(self, table: Table) -> str:
+        """Stage ``table`` (once, when an equal table is staged already):
+        the Metal expression of its staged copy."""
+        at = self._at.get(table)
+        if at is None:
+            metal, _ = _METAL[table.dtype]
+            run = self._by_type.setdefault(metal, [])
+            at = f"omlx_tg_{metal} + {sum(len(t.values) for t in run)}"
+            run.append(table)
+            self._at[table] = at
+        return at
+
+    @property
+    def header(self) -> str:
+        if not self._at:
+            return ""
+        arrays = []
+        for metal, run in self._by_type.items():
+            bits = _METAL[run[0].dtype][1]
+            words = ", ".join(f"{word:#x}u" for table in run for word in table.bits)
+            count = sum(len(table.values) for table in run)
+            arrays.append(f"constant {bits} bits_{metal}[{count}] = {{{words}}};\n")
+        return _named(_STAGED, "namespace omlx_staged {\n" + "".join(arrays) + "}\n")
+
+    @property
+    def prologue(self) -> str:
+        if not self._at:
+            return ""
+        lines = []
+        for metal, run in self._by_type.items():
+            count = sum(len(table.values) for table in run)
+            # One copy a thread where the threadgroup's first simdgroup holds
+            # them: at one token 0.2-0.3% of a launch cheaper than the loop
+            # (R-TABLES.md, run 1b).
+            fill = _ONE_FILL if count <= _ONE_COPY else _LOOP_FILL
+            lines.append(fill.replace("TYPE", metal).replace("COUNT", str(count)))
+        return "".join(lines) + (
+            "    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);\n"
+        )
+
+
+# A type's staged copy, filled by the threadgroup's threads: one entry a
+# thread, or a loop over the threadgroup's own size (a smaller threadgroup
+# ends a grid that is not whole threadgroups).
+_COPY = "      omlx_tg_TYPE[i] = as_type<TYPE>(omlx_staged::bits_TYPE[i]);\n"
+_ONE_FILL = (
+    "    threadgroup TYPE omlx_tg_TYPE[COUNT];\n"
+    "    if (thread_index_in_threadgroup < COUNTu) {\n"
+    "      const uint i = thread_index_in_threadgroup;\n" + _COPY + "    }\n"
+)
+_LOOP_FILL = (
+    "    threadgroup TYPE omlx_tg_TYPE[COUNT];\n"
+    "    for (uint i = thread_index_in_threadgroup; i < COUNTu;\n"
+    "         i += threads_per_threadgroup.x * threads_per_threadgroup.y *\n"
+    "             threads_per_threadgroup.z) {\n" + _COPY + "    }\n"
+)
+
+
 class Matrices:
     """The matrices a kernel reads, each under the name its body uses."""
 
     def __init__(self) -> None:
         self._faces: dict[str, Dot | Tile] = {}
         self._names: set[str] = set()
+        self._tables = Tables()
+        self._staged: dict[str, tuple[str, ...]] = {}
 
     def add(self, name: str, face: Dot | Tile) -> list[str]:
         """Add matrix ``name``, read through ``face``, a ``Dot`` or a
@@ -647,9 +751,23 @@ class Matrices:
                 f"matrix {name!r}: {', '.join(repeated)} would repeat a name of "
                 "the kernel"
             )
+        tables = Tables()
+        for table in (*self._tables._at, *face.tables):
+            tables.add(table)
+        if tables.size > formats.TABLE_BYTES:
+            raise ValueError(
+                f"matrix {name!r}: the kernel's tables would hold {tables.size} "
+                f"bytes; a kernel stages at most {formats.TABLE_BYTES}"
+            )
+        self._staged[name] = tuple(self._tables.add(t) for t in face.tables)
         self._faces[name] = face
         self._names.update((name, *inputs))
         return inputs
+
+    @property
+    def staged_bytes(self) -> int:
+        """The threadgroup memory the kernel's staged tables take."""
+        return self._tables.size
 
     @property
     def header(self) -> str:
@@ -667,6 +785,7 @@ class Matrices:
         # own.
         return (
             _named(_SKELETONS, _INDEX_PACKS)
+            + self._tables.header
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
             + _named(
                 _SKELETONS,
@@ -689,12 +808,21 @@ class Matrices:
 
     @property
     def declarations(self) -> str:
-        """The statements that open the kernel body: each matrix, declared
-        over its inputs. The body's own lines follow as ``<kernel>``."""
-        return "".join(
-            f"    const auto {name} = {face.type}{{{_members(name, face)}}};\n"
-            for name, face in self._faces.items()
-        ) + _named("<kernel>", "")
+        """The statements that open the kernel body: the tables' staging,
+        then each matrix, declared over its inputs and its staged tables.
+        The body's own lines follow as ``<kernel>``. A kernel's body starts
+        with them: every thread of a threadgroup meets the staging's
+        barrier."""
+        return (
+            self._tables.prologue
+            + "".join(
+                _members_check(face)
+                + f"    const auto {name} = {face.type}"
+                + f"{{{', '.join((_members(name, face), *self._staged[name]))}}};\n"
+                for name, face in self._faces.items()
+            )
+            + _named("<kernel>", "")
+        )
 
 
 def _revisions() -> str:
@@ -730,6 +858,21 @@ def _named(name: str, source: str, line: int = 1) -> str:
 
 def _inputs(name: str, face: Dot | Tile) -> list[str]:
     return [f"{name}_weight", *(f"{name}_{tensor}" for tensor in face.tensors)]
+
+
+def _members_check(face: Dot | Tile) -> str:
+    """The asserts that state each table's member, for a face's misdeclared
+    table to fail with the sentence."""
+    return "".join(
+        "    static_assert(\n"
+        f"        metal::is_same_v<decltype({face.type}::{table.name}), "
+        f"const threadgroup {_METAL[table.dtype][0]}*>,\n"
+        f"        \"quant format face {face.key}: table '{table.name}' is "
+        f"{str(table.dtype).rpartition('.')[2]} "
+        f"data: the face declares `const threadgroup {_METAL[table.dtype][0]}* "
+        f"{table.name}` after its tensors' pointers\");\n"
+        for table in face.tables
+    )
 
 
 def _members(name: str, face: Dot | Tile) -> str:

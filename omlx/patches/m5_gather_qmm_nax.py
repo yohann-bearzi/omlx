@@ -1574,12 +1574,20 @@ def _face_kernel(face: Tile):
             return None
         matrices = format_kernels.Matrices()
         inputs = ["x", *matrices.add("w", face), "tiles", "tile_count", "params"]
+        source, staged = _FACE_SOURCE, matrices.staged_bytes
+        if staged:
+            # The face's staged tables take threadgroup memory: the pad,
+            # which sets how many threadgroups a core holds, gives it back.
+            source = source.replace(
+                "PAD / sizeof(T)];",
+                f"(PAD > {staged} ? PAD - {staged} : 0) / sizeof(T)];",
+            )
         kernel = mx.fast.metal_kernel(
             name=f"omlx_gqmm_{face.key}",
             input_names=inputs,
             output_names=["y"],
             header=mlx_src + matrices.header + _MM_HEADER + _FACE_HEADER,
-            source=matrices.declarations + _FACE_SOURCE,
+            source=matrices.declarations + source,
         )
         _kernels[face] = kernel
         return kernel

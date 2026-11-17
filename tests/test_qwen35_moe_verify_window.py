@@ -546,3 +546,23 @@ def test_fp32_window_router_equals_one_row_router():
         assert mx.array_equal(logits[r].view(mx.uint32), logits_r.view(mx.uint32)).item()
         assert mx.array_equal(inds[r], inds_r).item()
         assert mx.array_equal(scores[r].view(mx.uint32), scores_r.view(mx.uint32)).item()
+
+
+def test_a_face_with_a_table_runs_the_window_launches_to_the_bit(monkeypatch, engaged):
+    """The routed experts' 4-bit face reads its weight values from a table
+    that the window's launches stage: their rows are the one-token rows and
+    the composed verifier's."""
+    from omlx.formats import kernels
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    block = _block(0, bits=4)
+    for rows in (2, 4):
+        _check(block, _inputs(rows, 1), engaged)
+    plan = _plan(block, _inputs(1, 0))
+    assert plan.window.ran and not plan.window.failed
+    assert any(
+        key[1].key.endswith("_lut")
+        for key in kernels._PROOFS
+        if key[0] == "routed_window"
+    )

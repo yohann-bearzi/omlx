@@ -1626,3 +1626,26 @@ def test_qwen_regrouped_call_row_map(installed, launches, monkeypatch, qwen_regr
     for tokens in (96, 300):
         x, inds, _ = _inputs(tokens)
         _check_row_map_on_off(lambda: glu(x, inds), launches, monkeypatch)
+
+
+@needs_nax
+@pytest.mark.parametrize("plan", _PLANS, ids=_plan_id)
+def test_a_tile_face_with_a_table_runs_the_sorted_gather_to_the_bit(plan):
+    """The affine tile face reading its codes' values from a table the
+    kernel stages (and its pad gives back) has the face's bits."""
+    from tests.test_formats_tables import tabled_tile
+
+    K, N = 256, 128
+    if plan.sched == DB and (K % 64 or N % 64 or plan.bk != 64):
+        plan = plan._replace(sched=SEG)
+    E = len(_COUNTS)
+    mx.random.seed(9)
+    w = mx.random.normal((E, N, K)).astype(mx.bfloat16)
+    operands = mx.quantize(w, group_size=64, bits=4)
+    x, idx = _rows(_COUNTS, K, mx.bfloat16)
+    face = affine_format.tile_face(4, 64, mx.bfloat16)
+    want = nax._launch_face(nax._face_kernel(face), x, operands, idx, plan, None)
+    got = nax._launch_face(
+        nax._face_kernel(tabled_tile(face)), x, operands, idx, plan, None
+    )
+    _assert_bitwise(got, want)

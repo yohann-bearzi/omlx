@@ -235,6 +235,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. A `Tile`'s struct is in a namespace of its own, apart from its format's `Dot`: a kernel includes the source of the faces it reads, and no other. |
 | `tensors` | The layer's parameters beside `weight` and `bias` that the face reads, as a tuple, among its format's `tensors`. They become kernel inputs in this order. Identifiers, each named once, as a format's `tensors` are. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype` among `float16`, `bfloat16` and `float32`; empty (the default) for those three (`formats.FLOATS`). Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
+| `tables` | The lookup tables the face reads, as a tuple of `Table`, given by keyword; empty (the default) for none. See [Tables](#tables). |
 
 ## The dot face
 
@@ -416,9 +417,9 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 2. **A face is safe on zeros**: tensors of zeros give finite weights. A kernel proves its Metal on zeros.
 3. **No loop bound or exit comes from a value read**: a face has no loop over data.
 4. **The constructor reads nothing.** A kernel builds a cursor in each thread of its tile, also for rows past the matrix, and calls `params` and `fetch` only for the rows, groups and runs it computes. A constant of the row (a row scale) is read again at each `params()`: that is the price of this rule. The constructor computes pointers from `row` and K, and nothing else.
-5. **No threadgroup memory, barrier or simdgroup operation**: not every thread of a kernel decodes.
+5. **No threadgroup memory of its own, no barrier, no simdgroup operation**: not every thread of a kernel decodes. A face reads its tables through the members it is given: the kernel stages them before any of its own code (see [Tables](#tables)).
 6. **A face never writes.**
-7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data, and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
+7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data and the face's tables (through `p`), and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
 8. **The members keep no state but the cursor's**, and `params` and `fetch` are `const`: kernels run on several threads, and a format returns equal `Tile`s for the layers of one layout.
 9. **The source is C++17 Metal without derived classes.** See [Compile-time rules](#compile-time-rules).
 10. **`if constexpr` discards a branch only in a template, on a condition that depends on its parameters.** A face's source is one instance, its bit width and group size namespace constants, so an `if constexpr` on one of them compiles both branches, and each must be well-formed for the instance's types. Choose by an overload on a type (`code_at(uint, i)` and `code_at(uint2, i)` in the affine face) or by a template parameter.
@@ -503,6 +504,54 @@ Its `decode`, the same products in the same order:
         return levels * mx.repeat(scales, 32, axis=-1)[..., : levels.shape[-1]]
 ```
 
+## Tables
+
+A table that a face reads at indices that differ from lane to lane (a level for each code, a codebook) is data, not Metal. The face gives it in Python, and every kernel built on the face copies it into threadgroup memory when it starts; the face reads the copy. A table read per lane from `constant` or `device` memory instead makes the kernel's speed depend on where the GPU loads the kernel: 2 to 7% on an M3 Ultra from one process to the next, for the same source. The staged copy is the fastest form measured and has no such spread.
+
+```python
+from omlx.formats import Dot, Table
+
+Dot(
+    key="mytable_b2",
+    source=metal_source,
+    type="omlx_mytable_b2::Dot",
+    tensors=("scales",),
+    tables=(Table("levels", mx.float32, (-1.5, -0.5, 0.5, 1.5)),),
+)
+```
+
+`Table(name, dtype, values)`: `name` is an identifier, `dtype` one of float32, float16, bfloat16, int8, uint8, int16, uint16, int32 and uint32, and `values` a tuple of 1 to 1024 numbers. A float table rounds each value to its type, to nearest even, when it is made; a value that is NaN or out of the type's range is refused. An integer table takes whole numbers in its range. A face's tables hold at most 4096 bytes, and so do a kernel's.
+
+The face's struct declares one member for each table, after the pointers of its tensors, in the order of `tables`: a threadgroup pointer of the table's type (`float`, `half`, `bfloat16_t`, `int8_t`, `uint8_t`, `int16_t`, `uint16_t`, `int32_t`, `uint32_t`). A dot face's `Lanes` copies it, and `Row` carries it to `madd`, which reads it; a tile face's `Runs` copies it, and `P` carries it to `weight`:
+
+```cpp
+struct Dot {
+  static constant constexpr int CONTRACT = 1;
+  const device uint8_t* codes;
+  const device float* scales;
+  const threadgroup float* levels;
+
+  template <int K>
+  struct Lanes {
+    ...
+    const threadgroup float* lv;
+    Lanes(Dot m, size_t row, uint lane) : ..., lv(m.levels) {}
+    struct Row {
+      const device uint8_t* w;
+      const threadgroup float* lv;
+    };
+    Row row(int r) const { return {w + r * K, lv}; }
+    static float madd(float acc, Row r, thread const float* xt, float) {
+      ...  // r.lv[code]
+    }
+  };
+};
+```
+
+A face's tables are part of the face: two faces are equal when their tables' names, dtypes and bits are, and a kernel is compiled once for each. A format whose tables come from a checkpoint (a level table fitted to it) makes the checkpoint's faces with its tables, and puts what tells them apart in the faces' keys, so that a log line names the face that ran.
+
+The copy runs once in every threadgroup, before the kernel's own code, and ends with one barrier for all of a kernel's tables. It costs about 0.3 to 0.5 µs of a one-token launch, which a face without tables does not pay: its kernels are the same Metal as before tables existed. `omlx.formats.testing.staged_tables` reads a face's tables back as a kernel stages them (see [Test a format](#test-a-format)).
+
 ## Kernels over faces
 
 A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot` or a `Tile`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons of the kinds of faces the kernel reads, and no other) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
@@ -546,6 +595,8 @@ y = kernel(
 What the kernel does around the call is its own: which rows a simdgroup takes, the activation, the combine, the stores. For the plain store, a kernel adds `kernels.STORE_ROWS` to its header: `store_rows(omlx_iota<N>(), result, y + row)` rounds a simdgroup's `N` results to the output's type. The kernel calls it from one lane (the example above stores its two rows by hand).
 
 `kernels.face_kernel(name, inputs, matrices, outputs, header, source)` makes that kernel and keeps it: `inputs` are the kernel's inputs in order, a name of `matrices` standing for that matrix's (`Matrices.add`); its header is the faces' Metal, then `header`; its source opens with the matrices' declarations, then `source`; it is named `<name>_<face key>`. Its source is written and MLX's kernel made once for each name, inputs, faces, outputs, header and source, so a kernel may ask for it at every call. So may it ask `formats.dot(layer, k, n)` and `formats.tile(layer, k, n)`: a layer (an `nn.Module`) keeps its format's answer for each kind and (k, n), and asks again only when one of its arrays is another, its bits or group size change, or its mode is another format's.
+
+`declarations` opens the kernel's body, ahead of its own code. When a face has tables it starts with their staging: the copy into threadgroup memory by the threadgroup's threads and one barrier, which every thread of a threadgroup must meet, so nothing of the body may come before it (a `return` ahead of it would leave the others waiting). The tables' bits are in `header`. A kernel that reads a table of its own, without a face, stages it with `kernels.Tables`: `add(table)` gives the Metal expression of the staged copy, `header` goes in the kernel's header and `prologue` first in its body; both are empty without a table.
 
 MLX compiles a kernel when it first evaluates it, which in a model is wherever the graph is evaluated: too late to fall back. So a kernel in a model's forward evaluates a launch inside the call that builds it first, and keeps what it learns in a `kernels.Proof`: the launches that compiled (`ran`) and whether one failed (`failed`). `kernels.proof(kernel, ...)` gives the one proof of a key: the kernel's name, its faces and what else its source is instantiated with (the tensors' dtypes, the shapes), so that layers of the same layout share it. Once a launch has failed, whatever the failure of its first evaluation was, what shares the proof keeps its composed path until the process ends.
 
@@ -646,6 +697,7 @@ Worth testing for every layout a format gives a face for:
 - rows against the format's reference, bit for bit when the format has an exact composed path,
 - the same rows with different `packs`: they must not change by a bit,
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
+- the face's tables, with `testing.staged_tables(face, operands, dtype)`: one launch over the face's operands, compiled for activations of `dtype`, that reads each table back through the face's member of its name, as a kernel stages it. Each array it returns has the table's dtype, length and bits (`table.bits`) when the members are declared as [Tables](#tables) says,
 - the rows in fp32 too, if the reference can be computed in fp32: rounded to bf16 or fp16, a sum in another order than the reference's shows in one row in a thousand or fewer, in fp32 in most rows. `dot_rows` compiles the skeleton for `x.dtype` and refuses a dtype the face is not exact for. For a face whose tensors are typed `T`, `dataclasses.replace(face, dtypes=(mx.float32,))` runs the same traversal in fp32, on fp32 activations and fp32 copies of those tensors.
 
 `omlx.formats.testing.tile_rows` reads every weight of some rows through a tile face, as a tile kernel reads it (`weight(params(g), fetch(run), i)`, with `i` not known when the kernel is compiled), and gives them twice: as `weight` gives them, in float32, and rounded once to a dtype the face is exact for, as a kernel stores them for activations of that dtype:
@@ -670,7 +722,7 @@ def test_the_tile_face_is_the_decode_in_float32():
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Table`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `tile_rows`, `staged_tables` and `no_dot_defects` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints` and `omlx_iota`.
 
@@ -678,7 +730,7 @@ The contract has a revision, a whole number that goes up by one with each change
 
 | Revision | In oMLX since | What it adds |
 |---|---|---|
-| 1 | not released yet | The registry, the dot face and the tile face, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
+| 1 | not released yet | The registry, the dot face and the tile face, a face's tables, what loads and what writes a checkpoint (`layout`, `encode`), `omlx.formats.testing`. |
 
 A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 

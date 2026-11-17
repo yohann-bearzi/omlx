@@ -2456,3 +2456,30 @@ def test_the_affine_decode_is_mlx_s_dequantize():
     alone = affine.FORMAT.decode({name: stack[name][2] for name in _NAMES}, 5, 32)
     assert _same_bits(several[1, 0], alone)
     assert not _same_bits(several[1, 0], several[0, 0])
+
+
+def test_a_face_with_a_table_runs_the_rows_kernels_to_the_bit(monkeypatch):
+    """A 4-bit affine face that reads its weight values from a table the
+    kernel stages: one row, a verify window and a switch's pairs have MLX's
+    bits, as the face without a table has."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    quantized, layer = _pair(512, 64)
+    for rows in (1, 3, MAX_ROWS):
+        x = _x((rows, 512))
+        alone = [quantized(x[row : row + 1]) for row in range(rows)]
+        assert _same_bits(layer(x), mx.concatenate(alone))
+    mx.random.seed(3)
+    theirs, ours = SwitchGLU(512, 64, EXPERTS), SwitchGLU(512, 64, EXPERTS)
+    theirs.set_dtype(mx.bfloat16)
+    for name in ("gate_proj", "up_proj", "down_proj"):
+        quantized = getattr(theirs, name).to_quantized(32, 4)
+        setattr(theirs, name, quantized)
+        k = quantized.input_dims
+        setattr(ours, name, FormatSwitchLinear("affine", 4, 32, k, _tensors(quantized)))
+    x, indices = _x((1, 3, 512)), _experts((1, 3, 6))
+    assert _same_bits(ours(x, indices), theirs(x, indices))
+    faces = {face for _, face, *_ in kernels._PROOFS}
+    assert faces and all(face.key.endswith("_lut") for face in faces)
+    assert all(proof.ran and not proof.failed for proof in kernels._PROOFS.values())

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks for a format's tests. ``dot_rows`` runs a face in the skeletons
 oMLX's kernels are built from, outside any model, and ``tile_rows`` reads
-every weight of rows through a tile face. ``no_dot_defects`` fails a test in
+every weight of rows through a tile face. ``staged_tables`` reads a face's
+tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective.
 """
 
@@ -63,6 +64,63 @@ def _dot_rows_kernel(face: Dot):
         header=matrices.header + kernels.STORE_ROWS,
         source=matrices.declarations + _ROWS,
     )
+
+
+@cache
+def _staged_tables_kernel(face: Dot | Tile):
+    matrices = kernels.Matrices()
+    inputs = matrices.add("m", face)
+    copies = "".join(
+        f"      for (uint i = 0; i < {len(table.values)}u; ++i) {{\n"
+        f"        t_{table.name}[i] = m.{table.name}[i];\n"
+        "      }\n"
+        for table in face.tables
+    )
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_staged_tables_{face.key}",
+        input_names=inputs,
+        output_names=[f"t_{table.name}" for table in face.tables],
+        header=matrices.header,
+        source=matrices.declarations
+        + "    if (thread_index_in_threadgroup == 0) {\n"
+        + copies
+        + "    }\n",
+    )
+
+
+def staged_tables(
+    face: Dot | Tile, operands, dtype: mx.Dtype
+) -> dict[str, mx.array]:
+    """Each of ``face``'s tables as a kernel stages it, read back through the
+    face's member of the table's name: one array of the table's dtype and
+    length, by name. Its bits are the table's ``bits`` when the face
+    declares its members as the page says.
+
+    ``operands`` are a matrix's weight and the face's tensors, as for
+    ``dot_rows`` (the face is declared over them), and ``dtype`` the
+    activations' type ``T`` the face is compiled for."""
+    if not face.tables:
+        raise ValueError(f"face {face.key} has no tables")
+    operands, names = tuple(operands), ("weight", *face.tensors)
+    if len(operands) != len(names):
+        raise ValueError(
+            f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
+        )
+    for name, operand in zip(names, operands, strict=True):
+        if operand.size < 8:
+            raise ValueError(
+                f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
+                "input of fewer than 8 as constants, not as a device buffer"
+            )
+    tables = _staged_tables_kernel(face)(
+        inputs=list(operands),
+        template=[("T", dtype)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(len(table.values),) for table in face.tables],
+        output_dtypes=[table.dtype for table in face.tables],
+    )
+    return {table.name: got for table, got in zip(face.tables, tables, strict=True)}
 
 
 def dot_rows(
