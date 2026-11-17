@@ -3842,8 +3842,14 @@ class _DiscoveredPlan:
             if default:
                 return default[0]
             raise KeyError(key)
+        return self._materialize(key, self._plan.pop(key))
 
-        info = self._plan.pop(key)
+    def __getitem__(self, key):
+        """The tensor at ``key``, materialized as pop does, and kept in the
+        plan (iter_format_offers reads tensors that a run reads again)."""
+        return self._materialize(key, self._plan[key])
+
+    def _materialize(self, key, info):
         transform = info["transform"]
         sources = info["sources"]
         recipe = info.get("recipe") or []
@@ -6292,11 +6298,23 @@ def _save_oqe_imatrix(
     for name, entry in sorted(entries.items()):
         arrays[f"{name}.in_sum2"] = np.asarray(entry.in_sum2, dtype=np.float32)
         arrays[f"{name}.counts"] = np.asarray(entry.counts, dtype=np.int64)
-    np.savez_compressed(path, **arrays)
-    _imatrix_metadata_path(path).write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    # At its own name (numpy adds .npz to a name without it), and whole: a
+    # reader sees the old cache or the new one. The metadata goes last, so
+    # a cache is read with the metadata it was written with.
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f"{path.name}.tmp.", delete=False
+        ) as tmp:
+            temp_name = tmp.name
+            np.savez_compressed(tmp, **arrays)
+        Path(temp_name).replace(path)
+        temp_name = None
+    finally:
+        if temp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+    _atomic_write_json(_imatrix_metadata_path(path), metadata)
 
 
 def _load_oqe_imatrix(path: Path) -> OQImatrixData:
@@ -7310,33 +7328,235 @@ def calibrate_oq_streaming(
     preserve_mtp, trust_remote_code, the imatrix_* settings,
     stream_calibration, sensitivity_map_override, progress_callback, ...).
     Returns the cache's entries and metadata."""
-    cache = Path(imatrix_cache_path)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    # The run's output folder and a calibration proxy (a model above the
-    # calibration budget) are made here and removed with it.
-    with tempfile.TemporaryDirectory(dir=cache.parent) as scratch:
-        run = _open_oq_run(
-            model_path,
-            str(Path(scratch) / "output"),
-            oq_level,
-            enhanced=True,
-            imatrix_cache_path=str(cache),
-            **settings,
-        )
-        if run["normalized_model_type"] == "deepseek_v41":
-            raise ValueError(
-                "oQ calibrates a deepseek_v41 checkpoint inside a writer of its "
-                "own, which takes no quant format"
-            )
+    if not imatrix_cache_path:
+        raise ValueError("calibrate_oq_streaming writes a cache: name its file")
+    settings["imatrix_cache_path"] = imatrix_cache_path
+    with _writing_nothing(model_path, oq_level, settings) as run:
         _calibrate_oq_run(run)
         return run["imatrix_data"]
+
+
+@contextlib.contextmanager
+def _writing_nothing(model_path, oq_level, settings, **fixed):
+    """A run of oQe that writes no checkpoint (a calibration alone, or its
+    offers), opened as quantize_oq_streaming(model_path, output, oq_level,
+    enhanced=True, **fixed, **settings) would be: ``settings`` the run's
+    own, ``enhanced=True`` among them or not. Its output folder, and a
+    calibration proxy a model above the calibration budget needs, are made
+    beside the imatrix cache (a temporary folder without one) and removed;
+    a refused run leaves none of the folders made for the cache."""
+    if not settings.pop("enhanced", True):
+        raise ValueError("a run without a checkpoint is oQe's: enhanced is True")
+    cache = settings.get("imatrix_cache_path")
+    parent = Path(cache).parent if cache else None
+    made = []
+    if parent is not None:
+        made = [folder for folder in (parent, *parent.parents)]
+        made = made[: next(i for i, folder in enumerate(made) if folder.exists())]
+        parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.TemporaryDirectory(dir=parent) as scratch:
+            run = _open_oq_run(
+                model_path,
+                str(Path(scratch) / "output"),
+                oq_level,
+                enhanced=True,
+                **fixed,
+                **settings,
+            )
+            if run["normalized_model_type"] == "deepseek_v41":
+                raise ValueError(
+                    "oQ calibrates a deepseek_v41 checkpoint inside a writer of "
+                    "its own, which takes no quant format"
+                )
+            yield run
+    except BaseException:
+        # The deepest first.
+        for folder in made:
+            with contextlib.suppress(OSError):
+                folder.rmdir()
+        raise
+
+
+class FormatOffer(NamedTuple):
+    """A matrix oQ offers a quant format: its tensor's name in the checkpoint,
+    its shape, a function that reads the source's floats of it (as the
+    writer reads them, one tensor at a time), the importance oQ hands
+    ``encode`` with it, and the bits and group size the level gives it."""
+
+    name: str
+    shape: tuple
+    load: Callable[[], Any]
+    importance: Any
+    bits: int
+    group_size: int
+
+
+def _logical_shapes(all_weights) -> dict:
+    """Each tensor's shape as the writer reads it, without reading one."""
+    if hasattr(all_weights, "plan_shape"):
+        # A plan: no iteration of its own, its keys.
+        planned = all_weights.keys()
+        return {name: tuple(all_weights.plan_shape(name)) for name in planned}
+    if hasattr(all_weights, "logical_metadata"):
+        shapes = {
+            name: tuple(shape)
+            for name, (shape, _) in all_weights.logical_metadata().items()
+        }
+        # What a sanitize set eagerly (an unreplayable one's fallback): held,
+        # and over a checkpoint's tensor of the same name.
+        shapes.update(
+            (name, tuple(tensor.shape))
+            for name, tensor in all_weights._overrides.items()
+        )
+        return shapes
+    return {name: tuple(tensor.shape) for name, tensor in all_weights.items()}
+
+
+def iter_format_offers(model_path: str, oq_level: float, quant_format, **settings):
+    """Each matrix that ``quantize_oq_streaming(model_path, output, oq_level,
+    enhanced=True, quant_format=quant_format, **settings)`` offers its quant
+    format, in the order it writes them, as a FormatOffer: decided by the
+    writer's own code after the same calibration and plan, and nothing else
+    (a matrix the format's layout or encode would then decline is offered
+    all the same). Reads no weight but the calibration's; writes nothing but
+    the imatrix cache (``imatrix_cache_path`` in ``settings`` keeps it for
+    the run that follows). A plugin fits its format from these, then hands
+    oQ the fitted object (docs/quant-formats.md)."""
+    if quant_format is None:
+        raise ValueError(
+            "iter_format_offers offers a quant format's matrices: name one"
+        )
+    with _writing_nothing(
+        model_path, oq_level, settings, quant_format=quant_format
+    ) as run:
+        _calibrate_oq_run(run)
+        _plan_oq_run(run)
+        all_weights = run["all_weights"]
+        folded = _muse_spark_folded_scales(
+            all_weights, run["config"], run["oq_level"], run["group_size"]
+        )
+        shapes = _logical_shapes(all_weights)
+        for name in list(all_weights.keys()):
+            if (
+                name in folded
+                or _kept_packed(run, all_weights, name) is not None
+                or _dropped(run, name)
+            ):
+                continue
+            quantized = _quantized_at(run, name, shapes[name])
+            if quantized is None:
+                continue
+            offer = _format_offer(run, name, shapes[name], *quantized)
+            if offer.offered:
+                yield FormatOffer(
+                    name,
+                    shapes[name],
+                    functools.partial(all_weights.__getitem__, name),
+                    offer.importance,
+                    quantized[0],
+                    quantized[1],
+                )
 
 
 class _OQRun(dict):
     """A quantization's state between its phases, by name: what one phase
     binds and a later one reads. quantize_oq_streaming runs the phases in
     order; calibrate_oq_streaming the first two, iter_format_offers the
-    first three."""
+    first three and the writer's decisions."""
+
+
+def _dropped(run: _OQRun, tensor_name: str) -> bool:
+    """Whether the run writes no ``tensor_name``: a vision or audio tensor
+    of a text-only run, an MTP tensor of a run that keeps none."""
+    return (
+        run["text_only"]
+        and (_is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name))
+    ) or (not run["preserve_mtp"] and _is_mtp_tensor(tensor_name))
+
+
+def _quantized_at(run: _OQRun, tensor_name: str, shape) -> tuple | None:
+    """The (bits, group size, mode) the run's level gives ``tensor_name`` of
+    ``shape``, or None for a tensor oQ does not quantize (a norm, a bias, a
+    table kept with preserve_ngram_table)."""
+    if not _should_quantize_tensor(tensor_name, shape) or (
+        run["preserve_ngram_table"]
+        and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, run["config"])
+    ):
+        return None
+    return _get_predicate_bits(
+        tensor_name, run["config"], run["oq_level"], run["group_size"]
+    )
+
+
+def _kept_packed(run: _OQRun, all_weights, tensor_name: str) -> dict | None:
+    """The packed form's info of a pre-quantized source tensor written as
+    the source has it (at or below the level's bits: no dequant-requant), or
+    None."""
+    if not hasattr(all_weights, "pop_packed") or _dropped(run, tensor_name):
+        return None
+    src_info = all_weights.source_quant_info(tensor_name)
+    if src_info is None:
+        return None
+    quantized = _quantized_at(run, tensor_name, all_weights.plan_shape(tensor_name))
+    if quantized is None or quantized[0] is None or quantized[0] < src_info["bits"]:
+        return None
+    return src_info
+
+
+class _Offer(NamedTuple):
+    """What the run does with a matrix it quantizes, as its format sees it:
+    whether oQ's affine takes it (its K whole groups), its importance (or
+    None), the report its lookup counts in, its layer's path, and whether
+    the format is offered it; else why not: no module of the model it loads
+    as holds it (``unwalked``), or the class that holds it loads no format
+    (``unloaded``)."""
+
+    grouped: bool
+    importance: Any
+    looked_up: dict | None
+    base: str
+    offered: bool
+    unwalked: bool
+    unloaded: str | None
+
+
+def _format_offer(run: _OQRun, tensor_name: str, shape, bits, gs, qmode) -> _Offer:
+    """The writer's decision for a matrix it quantizes, and the format's
+    offer: the source's own floats of a matrix oQe weighs, held at its path
+    and shape by a module whose class loads the format."""
+    quant_fmt = run["quant_fmt"]
+    # oQ's affine keeps a matrix whose K is whole groups. A format is asked
+    # of any matrix that oQe weighs: its groups may be its own.
+    grouped = bits is not None and shape[-1] % gs == 0
+    importance = looked_up = unloaded = None
+    offered = unwalked = False
+    base = tensor_name
+    if base.endswith(".weight"):
+        base = base[:-7]
+    if grouped or quant_fmt is not None:
+        # Outside oQ's groups a matrix is written in floats unless the format
+        # takes it: its importance is looked up for the format alone, and
+        # counted only if the format takes it.
+        looked_up = run["imatrix_report"] if grouped else _no_lookups()
+        if run["imatrix_data"] is not None and qmode == "affine":
+            importance = _lookup_imatrix_importance(
+                run["imatrix_data"],
+                tensor_name,
+                tuple(shape),
+                config=run["config"],
+                strict=run["imatrix_strict"] and grouped,
+                report=looked_up,
+            )
+        if quant_fmt is not None and importance is not None:
+            held = run["module_classes"].get(base)
+            if held is None or held[2] != tuple(shape):
+                unwalked = grouped
+            elif held[1]:
+                offered = True
+            elif grouped:
+                unloaded = held[0]
+    return _Offer(grouped, importance, looked_up, base, offered, unwalked, unloaded)
 
 
 def _open_oq_run(
@@ -7439,6 +7659,11 @@ def _open_oq_run(
         # accept() returns for this record lays it out.
         reader = _format_reader(registered, copy.deepcopy(quant_record))
 
+    if imatrix_cache_path and Path(imatrix_cache_path).is_dir():
+        raise ValueError(
+            f"imatrix_cache_path {imatrix_cache_path} is a folder: name the "
+            "cache's file"
+        )
     source = Path(model_path)
     output = Path(output_path)
     if output.exists():
@@ -8313,11 +8538,9 @@ def quantize_oq_streaming(
     dtype = run.get("dtype")
     formats = run.get("formats")
     group_size = run.get("group_size")
-    imatrix_data = run.get("imatrix_data")
     imatrix_report = run.get("imatrix_report")
     imatrix_strict = run.get("imatrix_strict")
     mimo_multimodal = run.get("mimo_multimodal")
-    module_classes = run.get("module_classes")
     oq_level = run.get("oq_level")
     output = run.get("output")
     output_path = run.get("output_path")
@@ -8372,41 +8595,20 @@ def quantize_oq_streaming(
         # Pre-quantized source tensor at or below the target precision:
         # emit the packed mxfp4/mxfp8 form unchanged (no dequant-requant).
         handled_packed = False
-        if (
-            hasattr(all_weights, "pop_packed")
-            and not (
-                text_only
-                and (_is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name))
-            )
-            and not (not preserve_mtp and _is_mtp_tensor(tensor_name))
-        ):
-            src_info = all_weights.source_quant_info(tensor_name)
-            if (
-                src_info is not None
-                and _should_quantize_tensor(
-                    tensor_name, all_weights.plan_shape(tensor_name)
-                )
-                and not (
-                    preserve_ngram_table
-                    and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
-                )
-            ):
-                bits, gs, qmode = _get_predicate_bits(
-                    tensor_name, config, oq_level, group_size
-                )
-                if bits is not None and bits >= src_info["bits"]:
-                    qw, scales = all_weights.pop_packed(tensor_name)
-                    tensor_bytes = qw.nbytes + scales.nbytes
-                    base = tensor_name[: -len(".weight")]
-                    out_shard_data[f"{base}.weight"] = qw
-                    out_shard_data[f"{base}.scales"] = scales
-                    per_layer_config[base] = {
-                        "bits": src_info["bits"],
-                        "group_size": src_info["group_size"],
-                        "mode": src_info["mode"],
-                    }
-                    del qw, scales
-                    handled_packed = True
+        src_info = _kept_packed(run, all_weights, tensor_name)
+        if src_info is not None:
+            qw, scales = all_weights.pop_packed(tensor_name)
+            tensor_bytes = qw.nbytes + scales.nbytes
+            base = tensor_name[: -len(".weight")]
+            out_shard_data[f"{base}.weight"] = qw
+            out_shard_data[f"{base}.scales"] = scales
+            per_layer_config[base] = {
+                "bits": src_info["bits"],
+                "group_size": src_info["group_size"],
+                "mode": src_info["mode"],
+            }
+            del qw, scales
+            handled_packed = True
 
         if not handled_packed:
             w_mx = all_weights.pop(tensor_name)
@@ -8425,69 +8627,29 @@ def quantize_oq_streaming(
             tensor_bytes = w_mx.nbytes
             shape = w_mx.shape
 
-            if text_only and (
-                _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
-            ):
+            if _dropped(run, tensor_name):
+                # A text-only run's vision and audio tensors; MTP tensors when
+                # the caller asked not to preserve them (_normalize_mtp_in_config
+                # zeroes mtp_num_hidden_layers in the output config).
                 del w_mx
                 processed_bytes += tensor_bytes
                 continue
 
-            if not preserve_mtp and _is_mtp_tensor(tensor_name):
-                # Strip MTP tensors when the caller asked not to preserve them.
-                # _normalize_mtp_in_config will zero mtp_num_hidden_layers in
-                # the output config so the result stays self-consistent.
-                del w_mx
-                processed_bytes += tensor_bytes
-                continue
-
-            if _should_quantize_tensor(tensor_name, shape) and not (
-                preserve_ngram_table
-                and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
-            ):
-                bits, gs, qmode = _get_predicate_bits(
-                    tensor_name, config, oq_level, group_size
-                )
-
-                # oQ's affine keeps a matrix whose K is whole groups. A
-                # format is asked of any matrix that oQe weighs: its groups
-                # may be its own.
-                grouped = bits is not None and shape[-1] % gs == 0
+            quantized = _quantized_at(run, tensor_name, shape)
+            if quantized is not None:
+                bits, gs, qmode = quantized
+                offer = _format_offer(run, tensor_name, shape, bits, gs, qmode)
+                grouped, importance, looked_up, base = offer[:4]
                 encoded = None
-                if grouped or quant_fmt is not None:
-                    importance = None
-                    # Outside oQ's groups a matrix is written in floats unless
-                    # the format takes it: its importance is looked up for the
-                    # format alone, and counted only if the format takes it.
-                    looked_up = imatrix_report if grouped else _no_lookups()
-                    if imatrix_data is not None and qmode == "affine":
-                        importance = _lookup_imatrix_importance(
-                            imatrix_data,
-                            tensor_name,
-                            tuple(shape),
-                            config=config,
-                            strict=imatrix_strict and grouped,
-                            report=looked_up,
-                        )
-                    base = tensor_name
-                    if base.endswith(".weight"):
-                        base = base[:-7]
-
-                    # The format is offered the source's own floats, of a
-                    # matrix that loads as its layer.
-                    if quant_fmt is not None and importance is not None:
-                        held = module_classes.get(base)
-                        if held is None or held[2] != tuple(shape):
-                            if grouped:
-                                unwalked.append(base)
-                        elif held[1]:
-                            _loads_as_laid_out(
-                                quant_fmt, reader, tensor_name, shape, bits, gs
-                            )
-                            encoded = _encode_in_format(
-                                quant_fmt, tensor_name, w_mx, importance, bits, gs
-                            )
-                        elif grouped:
-                            unloaded.append(held[0])
+                if offer.offered:
+                    _loads_as_laid_out(quant_fmt, reader, tensor_name, shape, bits, gs)
+                    encoded = _encode_in_format(
+                        quant_fmt, tensor_name, w_mx, importance, bits, gs
+                    )
+                elif offer.unwalked:
+                    unwalked.append(base)
+                elif offer.unloaded is not None:
+                    unloaded.append(offer.unloaded)
                 if encoded is not None:
                     if not grouped:
                         imatrix_report["applied"] += looked_up["applied"]

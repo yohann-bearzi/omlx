@@ -1655,6 +1655,157 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
     assert report["cache_reused"] is True
 
 
+def test_a_cache_is_written_and_read_at_the_name_given(source, toy, tmp_path):
+    """Without .npz too: numpy's would add it; the run then finds it."""
+    cache = tmp_path / "cache" / "imatrix"
+    with pytest.MonkeyPatch.context() as patch:
+        _calibration(patch)
+        oq.calibrate_oq_streaming(
+            str(source), str(cache), 4, enhanced=True, **_SETTINGS
+        )
+    assert sorted(path.name for path in cache.parent.iterdir()) == [
+        "imatrix",
+        "imatrix.json",
+        f"{source.name}.reference.json",
+        f"{source.name}.reference.npz",
+    ]
+    output = tmp_path / "oqe-toy"
+    _quantize(source, output, quant_format="toy", imatrix_cache_path=str(cache))
+    report = json.loads((output / "oq_imatrix_report.json").read_text())
+    assert report["cache_reused"] is True
+
+
+def test_a_run_without_a_checkpoint_refuses_what_names_no_cache(source, toy, tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    for cache, words in (
+        ("", "calibrate_oq_streaming writes a cache: name its file"),
+        (
+            str(folder),
+            f"imatrix_cache_path {folder} is a folder: name the cache's file",
+        ),
+    ):
+        with pytest.raises(ValueError) as refusal:
+            oq.calibrate_oq_streaming(str(source), cache, 4)
+        assert str(refusal.value) == words
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source),
+            str(tmp_path / "out"),
+            4,
+            enhanced=True,
+            imatrix_cache_path=str(folder),
+        )
+    assert str(refusal.value) == words
+    with pytest.raises(ValueError) as refusal:
+        oq.calibrate_oq_streaming(
+            str(source), str(tmp_path / "c.npz"), 4, enhanced=False
+        )
+    assert str(refusal.value) == "a run without a checkpoint is oQe's: enhanced is True"
+    with pytest.raises(ValueError) as refusal:
+        next(oq.iter_format_offers(str(source), 4, None))
+    assert str(refusal.value) == (
+        "iter_format_offers offers a quant format's matrices: name one"
+    )
+    assert list(folder.iterdir()) == [] and not (tmp_path / "out").exists()
+
+
+@pytest.mark.parametrize("call", ["calibrate", "offers"])
+def test_a_refused_run_leaves_no_folder_it_made_for_the_cache(
+    source, toy, tmp_path, call
+):
+    cache = tmp_path / "a" / "b" / "imatrix.npz"
+    with pytest.raises(ValueError, match="Invalid oQ level"):
+        if call == "calibrate":
+            oq.calibrate_oq_streaming(str(source), str(cache), 1)
+        else:
+            next(
+                oq.iter_format_offers(
+                    str(source), 1, "toy", imatrix_cache_path=str(cache)
+                )
+            )
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_offers_shapes_take_a_sanitize_s_tensors(source):
+    """A sanitize that fell back to an eager run sets tensors on the index:
+    new names, and checkpoint names over again."""
+    index = oq._LazyTensorIndex(oq._source_weight_files(source))
+    name = next(iter(index.keys()))
+    index["model.extra.weight"] = mx.zeros((3, 64))
+    index[name] = mx.zeros((5, 7))
+    shapes = oq._logical_shapes(index)
+    assert shapes["model.extra.weight"] == (3, 64) and shapes[name] == (5, 7)
+    assert set(shapes) == set(index.keys())
+
+
+def _offers(source, cache):
+    with pytest.MonkeyPatch.context() as patch:
+        _calibration(patch)
+        return list(
+            oq.iter_format_offers(
+                str(source), 4, "toy", imatrix_cache_path=cache, **_SETTINGS
+            )
+        )
+
+
+@pytest.mark.parametrize("left", [None, "dropped", "packed"])
+def test_the_offers_are_the_matrices_a_run_offers_its_format(
+    source, toy, tmp_path, monkeypatch, left
+):
+    """iter_format_offers yields what a run then offers the format, in its
+    order: the same matrices, read the same, with the same importance, bits
+    and group size; it encodes and writes none. So also when the run drops a
+    matrix (an MTP tensor of a run that keeps none) or writes it as its
+    source packed it."""
+    cache = str(tmp_path / "imatrix.npz")
+    if left is not None:
+        # The first matrix a run offers, left out of the run.
+        first = _offers(source, cache)[0].name
+        if left == "dropped":
+            mtp = oq._is_mtp_tensor
+            monkeypatch.setattr(
+                oq, "_is_mtp_tensor", lambda name: name == first or mtp(name)
+            )
+        else:
+            packed = {"bits": 4, "group_size": 64, "mode": "affine"}
+            monkeypatch.setattr(
+                oq,
+                "_kept_packed",
+                lambda run, weights, name: packed if name == first else None,
+            )
+            monkeypatch.setattr(
+                oq._DiscoveredPlan,
+                "pop_packed",
+                lambda self, key: (self.pop(key), mx.zeros((1,))),
+            )
+    offers = _offers(source, cache)
+    assert offers and toy.encoded == []
+    if left is not None:
+        assert first not in [offer.name for offer in offers]
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "imatrix.npz",
+        "imatrix.npz.json",
+    ]
+    _, config, _ = _quantize(
+        source, tmp_path / "oqe", quant_format="toy", imatrix_cache_path=cache
+    )
+    names = [offer.name.removesuffix(".weight") for offer in offers]
+    assert names == list(_in_format(config))
+    assert len(toy.encoded) == len(offers)
+    for offer, (w, importance, bits, group_size) in zip(offers, toy.encoded):
+        assert offer.shape == tuple(w.shape)
+        assert (offer.bits, offer.group_size) == (bits, group_size)
+        # Read as often as asked: the source's tensors stay to be read.
+        assert _same({"w": offer.load()}, {"w": w})
+        assert _same({"w": offer.load()}, {"w": w})
+        assert _same({"i": offer.importance}, {"i": importance})
+
+
+def test_the_contract_page_shows_the_offers():
+    assert "iter_format_offers(source, 4, fmt" in _QUOTED
+
+
 def test_a_calibration_alone_refuses_a_writer_of_its_own(tmp_path):
     source = tmp_path / "v41"
     source.mkdir()
