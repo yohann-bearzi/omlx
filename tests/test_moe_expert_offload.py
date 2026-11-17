@@ -595,6 +595,41 @@ class TestApplyAndForward:
         # unknown path -> conservative fallback
         assert estimate_offload_admission_bytes("/nonexistent", full, 0.25) == full
 
+    def test_a_quant_format_s_experts_stay_resident_and_count_in_full(
+        self, tmp_path, caplog
+    ):
+        """Offload streams MLX's quantized experts only: a quant format's
+        layer stays resident, says why, and admission counts it in full."""
+        import json
+        import logging
+
+        from omlx.formats.linear import FormatSwitchLinear
+
+        glu = _make_glu(seed=9)
+        _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+        gate = glu.gate_proj
+        names = ("weight", "scales", "biases")
+        glu.gate_proj = FormatSwitchLinear(
+            "affine", 4, GROUP, D, {name: gate[name] for name in names}
+        )
+        with caplog.at_level(logging.INFO):
+            assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
+        assert "gate_proj is a layer of the 'affine' quant format" in caplog.text
+        gate_path = "layers.0.experts.switch_glu.gate_proj"
+        config = {
+            "quantization": {
+                gate_path: {"group_size": GROUP, "bits": 4, "mode": "toy"}
+            },
+            "omlx_quant_formats": {"toy": {"plugin": "omlx-toy 0.3.1"}},
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        full = 10**9
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
+        # Named in a mode the checkpoint records no format of: MLX's.
+        config["omlx_quant_formats"] = {"other": {}}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) < full
+
     def test_admission_estimate_unsupported_layouts(self, tmp_path):
         """Layouts the wrapper rejects must discount nothing: the estimate
         may never promise savings that wrap zero layers (reported on the

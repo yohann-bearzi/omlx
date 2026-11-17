@@ -52,6 +52,7 @@ from mlx_lm.models.switch_layers import (
 
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
+from ..formats.linear import FormatSwitchLinear
 from ..scheduler import _sync_and_clear_cache
 
 logger = logging.getLogger(__name__)
@@ -1001,6 +1002,13 @@ def _resolve_store_view(
     fields_of: dict[str, list[str]] = {}
     for proj in _PROJS:
         lin = getattr(glu, proj, None)
+        if isinstance(lin, FormatSwitchLinear):
+            # Its slots would hold the format's tensors, which the slot
+            # matmul does not read (DEFERRED row 14): resident, said so.
+            return None, (
+                f"{proj} is a layer of the {lin.mode!r} quant format, whose "
+                "experts offload does not stream yet: they stay resident"
+            )
         if lin is None or not _is_quantized_switch_linear(lin):
             return None, f"{proj} is not a QuantizedSwitchLinear"
         if "bias" in lin:
@@ -1216,6 +1224,9 @@ def estimate_offload_admission_bytes(
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
         nvfp4: set[str] = set()
+        # The projections the checkpoint holds in a quant format: offload
+        # keeps them resident (_resolve_store_view), so they count in full.
+        in_format = _format_projections(model_dir)
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -1262,6 +1273,8 @@ def estimate_offload_admission_bytes(
         for container, b in stacked.items():
             if not required <= b["fields"] or container in nvfp4:
                 continue  # unquantized, partial or NVFP4: wraps nothing
+            if any(f"{container}.{proj}" in in_format for proj in _PROJS):
+                continue  # a quant format's layer: resident
             if len(b["e"]) != 1:  # projections disagree on E
                 continue
             n = next(iter(b["e"]))
@@ -1282,6 +1295,24 @@ def estimate_offload_admission_bytes(
     except Exception:
         logger.debug("offload admission estimate failed", exc_info=True)
         return full_size
+
+
+def _format_projections(model_dir) -> set[str]:
+    """The paths the checkpoint at ``model_dir`` names in its quantization
+    config in a quant format it records (``omlx_quant_formats``)."""
+    config_path = Path(model_dir) / "config.json"
+    if not config_path.exists():
+        return set()
+    config = json.loads(config_path.read_text())
+    recorded = config.get("omlx_quant_formats")
+    quantization = config.get("quantization")
+    if not isinstance(recorded, dict) or not isinstance(quantization, dict):
+        return set()
+    return {
+        path
+        for path, entry in quantization.items()
+        if isinstance(entry, dict) and entry.get("mode") in recorded
+    }
 
 
 def materialize_offload_state(model) -> int:
