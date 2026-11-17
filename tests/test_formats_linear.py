@@ -534,10 +534,9 @@ def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
     got = layer(x, indices)
     assert got.shape == (2, 5, 1, 72) and _equal(got, want(x, indices))
     assert _equal(layer(x, indices, sorted_indices=True), got)
-    # No index decodes no matrix. The first call also reads the decode's
-    # dtype, from one matrix's decode.
+    # No index decodes no matrix.
     assert layer(x, indices[:, :0]).shape == (2, 0, 1, 72)
-    assert whole == [False] * 4 and not hints
+    assert whole == [False, False, False] and not hints
     # As many indices as matrices, then a prefill's, in any integer type.
     for routed, dtype in (((EXPERTS,), mx.uint32), ((2, 4, 3), mx.int64)):
         x = _x((*routed[:-1], 1, 1, 320), mx.float32)
@@ -545,7 +544,7 @@ def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
         got = layer(x, indices)
         assert got.shape == (*routed, 1, 72)
         assert _equal(got, want(x, indices, sorted_indices=False))
-    assert whole == [False] * 4 + [True, True] and hints == [False, False]
+    assert whole == [False, False, False, True, True] and hints == [False, False]
     # Rows of x for each index count for nothing: 15 pairs of 5 indices
     # decode 5 matrices, 24 of 8 the stack.
     del whole[:], hints[:]
@@ -2003,8 +2002,7 @@ def test_a_face_that_does_not_compile_in_a_function_that_mlx_compiles_is_the_dec
     # Each was built once, for its stand-in, and not for the function's
     # arrays.
     assert built == [(320,), (8, 320)]
-    # The switch's decode: one matrix's for its dtype, then the stack.
-    assert decoded == [(40, 320), (1, 40, 320), (EXPERTS, 40, 320)]
+    assert decoded == [(40, 320), (EXPERTS, 40, 320)]
     message = "quant format face toy_broken: rows kernel failed; decode fallback"
     warnings = _logged(caplog, linear, logging.WARNING)
     assert [warning.getMessage() for warning in warnings] == [message] * 2
@@ -3328,18 +3326,17 @@ def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
         ((_ints((24, 1, 320)), mx.sort(_experts((24,))), True), [(4,), (2,)]),
         ((_ints((2, 4, 1, 1, 320)), _experts((2, 4, 3)), False), [(4,), (2,)]),
         ((_ints((5, 1, 320)), _experts((5,)), False), [(4,), (1,)]),
-        # As many as a piece holds: one piece.
-        ((_ints((1, 2, 1, 1, 320)), _experts((1, 2, 2)), False), [(4,)]),
+        # As many as a piece holds: at once, as the indices are.
+        ((_ints((1, 2, 1, 1, 320)), _experts((1, 2, 2)), False), [(1, 2, 2)]),
         # A matrix for each pair of x and the indices broadcast together.
         ((_ints((4, 1, 1, 320)), _experts((1, 2)), False), [(4,), (4,)]),
         # As many indices as the stack has matrices: the stack.
         ((_ints((1, 320)), _experts((EXPERTS,)), False), [(4,), (2,)]),
     ]
-    for i, ((x, indices, hint), pieces) in enumerate(calls):
+    for (x, indices, hint), pieces in calls:
         decoded.clear()
         mx.eval(layer(x, indices, sorted_indices=hint))
-        # The decode's dtype, read once for the layer from one matrix's.
-        assert decoded == [(1,)] * (i == 0) + pieces
+        assert decoded == pieces
     # mlx-vlm's hint goes to each piece's gather.
     assert hints == [True, True, False, False, False, False]
     # Less than a matrix: one at a time.
@@ -3352,12 +3349,14 @@ def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
 
 @pytest.mark.parametrize("decoded", [mx.float32, mx.bfloat16])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
-def test_a_decode_within_its_budget_is_at_once_and_above_it_in_pieces(
+def test_a_stack_is_decoded_whole_from_enough_pairs_within_its_budget(
     toy, monkeypatch, decoded, dtype
 ):
-    """What a call needs is decoded at once within _DECODE_AT_ONCE_BYTES,
-    counted in the decode's dtype and in x's when it differs (a cast to the
-    decode's own dtype copies nothing); one byte above, in pieces."""
+    """The stack is decoded at once for a call of at least _AT_ONCE_PAIRS
+    pairs per matrix, if it is within _DECODE_AT_ONCE_BYTES, counted in the
+    decode's dtype and in x's when it differs (a cast to the decode's own
+    dtype copies nothing): one pair fewer, or one byte over, and it is
+    decoded in pieces."""
     toy()
     decode, pieces = _ToyFormat.decode, []
 
@@ -3369,35 +3368,37 @@ def test_a_decode_within_its_budget_is_at_once_and_above_it_in_pieces(
     layer = _toy_stack(EXPERTS, 40, 320)
     monkeypatch.setattr(linear, "_DECODE_BYTES", 4 * 40 * 320 * (4 + dtype.size))
     size = decoded.size + (dtype.size if dtype != decoded else 0)
-    calls = [
-        # The stack, for 24 sorted indices.
-        (_ints((24, 1, 320)), mx.sort(_experts((24,))), EXPERTS, (EXPERTS,)),
-        # Five matrices: five rows of x, each a pair with the one index.
-        (_ints((5, 1, 1, 320)), _experts((1, 1)), 5, (1, 1)),
-    ]
-    # The first call also reads the decode's dtype, from one matrix's.
-    first = [(1,)]
-    for x, indices, matrices, whole in calls:
-        for under, want in ((0, [whole]), (1, [(4,), (matrices - 4,)])):
-            needed = matrices * 40 * 320 * size
-            monkeypatch.setattr(linear, "_DECODE_AT_ONCE_BYTES", needed - under)
-            pieces.clear()
-            hint = indices.ndim == 1
-            mx.eval(layer(x.astype(dtype), indices, sorted_indices=hint))
-            assert pieces == first + want
-            first = []
+    enough = linear._AT_ONCE_PAIRS * EXPERTS
+
+    def decoded_for(pairs, budget):
+        monkeypatch.setattr(linear, "_DECODE_AT_ONCE_BYTES", budget)
+        pieces.clear()
+        x, indices = _ints((pairs, 1, 320)), mx.sort(_experts((pairs,)))
+        mx.eval(layer(x.astype(dtype), indices, sorted_indices=True))
+        return list(pieces)
+
+    needed = EXPERTS * 40 * 320 * size
+    # Fewer pairs: pieces, within the budget; the decode's dtype not read.
+    assert decoded_for(enough - 1, needed) == [(4,), (2,)]
+    # Enough: the decode's dtype, read once from one matrix's, then whole.
+    assert decoded_for(enough, needed) == [(1,), (EXPERTS,)]
+    assert decoded_for(enough, needed) == [(EXPERTS,)]
+    # One byte over the budget: pieces.
+    assert decoded_for(enough, needed - 1) == [(4,), (2,)]
 
 
 def test_the_page_says_a_decode_is_at_once_or_in_pieces():
     page = " ".join(_PAGE.split())
     assert (
-        "A switch layer's decode outside the rows kernel decodes the matrices a "
-        "call needs at once when they are within "
+        "A switch layer's decode outside the rows kernel decodes its whole stack "
+        f"at once for a call of at least {linear._AT_ONCE_PAIRS} pairs per "
+        "matrix (`linear._AT_ONCE_PAIRS`) when the stack is within "
         f"{linear._DECODE_AT_ONCE_BYTES >> 30} GiB (`linear._DECODE_AT_ONCE_BYTES`)"
         in page
     )
     assert (
-        f"a piece at a time, {linear._DECODE_BYTES >> 20} MiB of them "
+        f"a piece at a time there, and above the budget: {linear._DECODE_BYTES >> 20} "
+        "MiB of them "
         "(`linear._DECODE_BYTES`)" in page
     )
     assert "a call costs pieces × the gather's work" in page

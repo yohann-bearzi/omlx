@@ -36,12 +36,15 @@ logger = logging.getLogger(__name__)
 # bits of its one-row call, whatever rows it is launched with.
 MAX_ROWS = 16
 
-# Outside the rows kernel a switch layer decodes the matrices a call needs at
-# once when they are within _DECODE_AT_ONCE_BYTES (in the decode's dtype, and
-# in x's when it differs), else a piece at a time, _DECODE_BYTES of them
-# counted as float32 and in x's dtype. MLX keeps every piece of one evaluation
-# in flight and frees a buffer when its command buffer completes: only many
-# small pieces, which split its command buffers, hold less than at once.
+# Outside the rows kernel a switch layer decodes its whole stack at once for
+# a call of at least _AT_ONCE_PAIRS pairs per matrix (where that is measured
+# faster than pieces) when the stack is within _DECODE_AT_ONCE_BYTES (in the
+# decode's dtype, and in x's when it differs); else a piece at a time,
+# _DECODE_BYTES of matrices counted as float32 and in x's dtype. MLX keeps
+# every piece of one evaluation in flight and frees a buffer when its command
+# buffer completes: only many small pieces, which split its command buffers,
+# hold less than at once.
+_AT_ONCE_PAIRS = 20
 _DECODE_AT_ONCE_BYTES = 1 << 31
 _DECODE_BYTES = 1 << 28
 
@@ -661,6 +664,14 @@ def _decode_dtype(layer: FormatSwitchLinear) -> mx.Dtype:
     return layer._decoded(slice(0, 1)).dtype
 
 
+def _decoded_size(layer: FormatSwitchLinear, dtype: mx.Dtype) -> int:
+    """The bytes of a weight the layer's decode holds for x of ``dtype``:
+    the decode's own, and the cast's when x's dtype differs. The decode's
+    dtype is read once for the layer."""
+    decoded = cached_per_module(layer, "_omlx_decode_dtype", _decode_dtype, depth=0)
+    return decoded.size + (dtype.size if dtype != decoded else 0)
+
+
 def keeps_dtype(module, key: str) -> bool:
     """Whether ``module``'s array ``key`` keeps its dtype through a recast
     of the model: a format layer's tensors (not its bias) are in the dtypes
@@ -710,20 +721,23 @@ class FormatSwitchLinear(_FormatLayer):
         """``x`` times the matrices at ``indices``, decoded: what the rows
         kernel does not take, a piece of the matrices at a time."""
         dtype = x.dtype
-        decoded = cached_per_module(self, "_omlx_decode_dtype", _decode_dtype, depth=0)
-        size = decoded.size + (dtype.size if dtype != decoded else 0)
         matrix = self.output_dims * self.input_dims
         piece = max(1, _DECODE_BYTES // (matrix * (4 + dtype.size)))
+        # One matrix for each pair of x and the indices broadcast together.
+        pairs = math.prod(mx.broadcast_shapes(x.shape[:-2], indices.shape))
         if indices.size < self.num_experts:
-            # A decode step's indices: their matrices alone are decoded, one
-            # for each pair of x and the indices broadcast together.
-            pairs = math.prod(mx.broadcast_shapes(x.shape[:-2], indices.shape))
-            if pairs * matrix * size > _DECODE_AT_ONCE_BYTES:
+            # A decode step's indices: their matrices alone are decoded.
+            if pairs > piece:
                 return self._selected(x, indices, piece)
             return x @ self._decoded(indices).astype(dtype).swapaxes(-1, -2)
         indices = _wrapped(indices, self.num_experts)
-        # A prefill's: the stack once, not a matrix for each index.
-        if self.num_experts * matrix * size > _DECODE_AT_ONCE_BYTES:
+        # A prefill's: the stack once, not a matrix for each index; whole
+        # from enough pairs, if it is within the budget.
+        if self.num_experts > piece and (
+            pairs < _AT_ONCE_PAIRS * self.num_experts
+            or self.num_experts * matrix * _decoded_size(self, dtype)
+            > _DECODE_AT_ONCE_BYTES
+        ):
             return self._stacked(x, indices, sorted_indices, piece)
         return mx.gather_mm(
             x,
