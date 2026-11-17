@@ -18,7 +18,7 @@ from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 
 import omlx.patches.qwen35_moe_gate_up as gate_up_fusion
 from omlx import formats
-from omlx.formats import affine, kernels
+from omlx.formats import Dot, affine, kernels
 from omlx.patches import moe_verify_gather as gather
 from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
@@ -589,6 +589,51 @@ def test_a_proof_that_fails_after_a_block_ran_keeps_that_block_composed():
     (proof,) = _proofs()
     proof.fail()
     assert gather.fused_switch(switch, x, indices) is None
+
+
+class _TwoTensors(_ToyExperts):
+    """The toy experts with a second tensor that its face reads: ones."""
+
+    def __init__(self, experts, n, k, seed):
+        super().__init__(experts, n, k, seed)
+        self.unit = mx.ones_like(self.scales)
+
+
+class _ByTensors(formats.QuantFormat):
+    mode, tensors, contract = "toy", ("scales", "unit"), formats.CONTRACT
+
+    def __init__(self, one, two):
+        self.one, self.two = one, two
+
+    def dot(self, layer, k, n):
+        return self.two if "unit" in layer else self.one
+
+
+def test_projections_of_different_tensor_counts_take_their_own(monkeypatch):
+    """A block's stand-in and launches split the stacks' operands at the
+    gate+up's count: a down face of two tensors under a gate+up of one."""
+    formats.load()
+    source = _TOY.replace("KEY", "two_tensors").replace(
+        "  const device float* scales;\n",
+        "  const device float* scales;\n  const device float* unit;\n",
+    )
+    two = Dot(
+        key="toy_two_tensors",
+        source=source,
+        type="omlx_toy_two_tensors::Dot",
+        tensors=("scales", "unit"),
+    )
+    monkeypatch.setitem(formats._FORMATS, "toy", _ByTensors(_toy("gather"), two))
+    switch = _ToySwitch(k=320, inter=72, n=40)
+    switch.down_proj = _TwoTensors(6, 40, 72, 1)
+    x, indices = _toy_block(switch, 3)
+    got = gather.fused_switch(switch, x, indices)
+    experts = np.array(indices).reshape(-1)
+    gate_up = switch.gate_up_proj.rows(experts, np.repeat(np.array(x[0]), 3, 0))
+    gate, up = np.split(gate_up, 2, axis=-1)
+    want = switch.down_proj.rows(experts, switch.activation(up, gate))
+    assert np.array_equal(np.array(got).reshape(9, 40), want)
+    assert [proof.failed for proof in _proofs()] == [False]
 
 
 def test_a_failed_block_keeps_only_its_tensor_dtypes_and_shapes_composed(toy, caplog):
