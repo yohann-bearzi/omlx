@@ -1340,6 +1340,40 @@ def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path, entry):
     )
 
 
+def test_an_entry_binds_a_layer_of_its_own_mode_only(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    # The same layer under language_model., in a mode no layer of it has:
+    # not bound by the toy one.
+    config["quantization"][f"language_model.{_GATE}"] = {
+        "group_size": 1,
+        "bits": 8,
+        "mode": "uninstalled",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path, strict=False)
+    assert refusal.value.mode == "uninstalled"
+    # In its own mode, it is (a VLM's checkpoint loaded by mlx-lm).
+    config["quantization"][f"language_model.{_GATE}"] = _TOY
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    load_model(tmp_path, strict=False)
+
+
+def test_an_entry_binds_a_layer_at_any_path_its_model_holds_it(toy, tmp_path):
+    config = {
+        "model_type": "llama",
+        "quantization": {"a": _TOY, "b": _TOY},
+        "omlx_quant_formats": {"toy": {}},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with format_load.loading(tmp_path) as checkpoint:
+        layer = nn.Linear(64, 128).to_quantized(**_TOY)
+    model = nn.Module()
+    model.a = model.b = layer
+    checkpoint.check(model)
+
+
 def test_a_format_entry_of_a_load_that_built_no_layer_is_refused(toy, tmp_path):
     _llama(tmp_path, **_written({}))
     config = json.loads((tmp_path / "config.json").read_text())
@@ -1369,6 +1403,7 @@ def test_a_load_that_leaves_no_array_where_the_layout_has_one_is_refused(toy, tm
         f"the load left {_GATE}.scales list, where the format lays out an array: "
         "the checkpoint holds tensors under that name"
     )
+    assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
 
 
 def test_a_stock_load_is_not_walked(toy, tmp_path, monkeypatch):
@@ -1387,12 +1422,159 @@ def test_a_stock_load_is_not_walked(toy, tmp_path, monkeypatch):
 
 def test_a_load_joined_to_an_outer_one_leaves_it_the_check(toy, tmp_path):
     _llama(tmp_path, **_written({}))
-    with format_load.loading(tmp_path) as outer:
+    with format_load.loading(tmp_path, by_loader=True) as outer:
         # The outer load builds a layer of its own model before the inner
         # one: the inner load's model has no such layer, and is not refused.
         own = nn.Linear(64, 128).to_quantized(**_TOY)
         model, _ = load_model(tmp_path, strict=True)
     assert own in outer.built and _gate_proj(model) in outer.built
+
+
+def test_a_load_joins_only_a_running_loader_s_load_on_its_thread(toy, tmp_path):
+    import contextvars
+
+    partial = _renamed_scales(tmp_path / "partial")
+    with format_load.loading(partial) as bare:
+        # A block no library's loader opened (oMLX's helpers, a test's): the
+        # load nested in it is its own, and checks what it loaded.
+        with pytest.raises(formats.FormatRefusedError, match="but its scales"):
+            load_model(partial, strict=False)
+        assert bare.built == []
+    with format_load.loading(partial, by_loader=True) as outer:
+        copied = contextvars.copy_context()
+        # Another thread that copied the load's context loads on its own.
+        seen = []
+        worker = threading.Thread(
+            target=copied.run,
+            args=(lambda: seen.append(format_load._current()),),
+        )
+        worker.start()
+        worker.join(60)
+        assert seen == [outer]
+        # Its own load of the checkpoint is its own, while this one runs too.
+        worker = threading.Thread(
+            target=copied.run,
+            args=(lambda: seen.append(_joined(partial, outer)),),
+        )
+        worker.start()
+        worker.join(60)
+        assert seen[-1] is False
+        with format_load.loading(partial) as inner:
+            assert inner is outer
+    other = threading.Thread(
+        target=copied.run,
+        args=(lambda: seen.append(_joined(partial, outer)),),
+    )
+    other.start()
+    other.join(60)
+    # After the load: no layer is the ended load's.
+    assert seen[-1] is False
+    with pytest.raises(formats.FormatRefusedError, match="built outside"):
+        copied.run(nn.Linear(64, 128).to_quantized, **_TOY)
+
+
+def _renamed_scales(path):
+    """A tiny checkpoint whose toy layer's scales are under another name."""
+    path.mkdir()
+    _llama(path, **_written({}))
+    _rewritten(path, _renamed)
+    return path
+
+
+def _joined(path, outer):
+    with format_load.loading(path) as checkpoint:
+        return checkpoint is outer
+
+
+def test_snapshots_sharing_a_config_blob_are_two_checkpoints(toy, tmp_path):
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    (blobs / "0f1e").write_text(json.dumps({"model_type": "llama"}))
+    snapshots = [tmp_path / "snapshots" / name for name in ("abc", "def")]
+    for snapshot in snapshots:
+        snapshot.mkdir(parents=True)
+        (snapshot / "config.json").symlink_to(blobs / "0f1e")
+    with (
+        format_load.loading(snapshots[0], by_loader=True) as first,
+        format_load.loading(snapshots[1]) as second,
+    ):
+        assert second is not first
+
+
+def test_a_load_nested_in_another_checkpoint_s_checks_its_own(toy, tmp_path):
+    (tmp_path / "outer").mkdir()
+    _llama(tmp_path / "outer", **_written({}))
+    partial = _renamed_scales(tmp_path / "partial")
+    with (
+        format_load.loading(tmp_path / "outer", by_loader=True),
+        pytest.raises(formats.FormatRefusedError, match="but its scales"),
+    ):
+        load_model(partial, strict=False)
+
+
+def test_a_layout_is_asked_while_no_accept_runs(toy, tmp_path):
+    import time
+
+    paths = [tmp_path / name for name in ("first", "second")]
+    for path in paths:
+        path.mkdir()
+        _llama(path, **_written({"levels": [1.0]}))
+    accepting, ended, laid_out = threading.Event(), [], []
+
+    def accept(record):
+        accepting.set()
+        time.sleep(0.3)
+        ended.append(time.monotonic())
+
+    real = toy.layout
+
+    def layout(k, n, bits, group_size):
+        if accepting.is_set():
+            laid_out.append(time.monotonic())
+        return real(k, n, bits, group_size)
+
+    toy.accept, toy.layout = accept, layout
+
+    def build(path):
+        with format_load.loading(path):
+            nn.Linear(64, 128).to_quantized(**_TOY)
+
+    first = threading.Thread(target=build, args=(paths[0],))
+    first.start()
+    assert accepting.wait(60)
+    build(paths[1])
+    first.join(60)
+    # The second load's layout waited for the first one's accept.
+    assert laid_out and laid_out[0] >= ended[0]
+
+
+def test_accepts_of_one_format_never_overlap(toy, tmp_path):
+    import time
+
+    paths = [tmp_path / name for name in ("first", "second")]
+    for path in paths:
+        path.mkdir()
+        _llama(path, **_written({"levels": [1.0]}))
+    running, most = [], []
+
+    def accept(record):
+        running.append(record)
+        most.append(len(running))
+        time.sleep(0.2)
+        running.pop()
+
+    toy.accept = accept
+
+    def build(path):
+        with format_load.loading(path):
+            nn.Linear(64, 128).to_quantized(**_TOY)
+
+    threads = [threading.Thread(target=build, args=(path,)) for path in paths]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert most == [1, 1]
 
 
 def test_a_load_under_home_or_in_a_view_joins_the_checkpoint_s(
@@ -1405,7 +1587,7 @@ def test_a_load_under_home_or_in_a_view_joins_the_checkpoint_s(
     view = tmp_path / "view"
     view.mkdir()
     (view / "config.json").symlink_to(home / "tiny" / "config.json")
-    with format_load.loading(home / "tiny") as outer:
+    with format_load.loading(home / "tiny", by_loader=True) as outer:
         for path in ("~/tiny", view):
             with format_load.loading(path) as inner:
                 assert inner is outer

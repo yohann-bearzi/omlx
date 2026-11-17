@@ -7859,6 +7859,8 @@ def quantize_oq_streaming(
                     seq_length=256,
                     trust_remote_code=trust_remote_code,
                 )
+            except FormatRefusedError:
+                raise
             except Exception as e:
                 raise RuntimeError(
                     f"oQ{oq_level:g}: auto-proxy sensitivity failed ({e}). "

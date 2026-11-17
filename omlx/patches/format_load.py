@@ -108,8 +108,13 @@ class _Checkpoint:
     are built, its config, the object that reads each of its formats and
     the layers built."""
 
-    def __init__(self, path) -> None:
+    def __init__(self, path, *, by_loader: bool = False) -> None:
         self.path = Path(path).expanduser()
+        # A load of it joins the outer one only on the thread that runs it,
+        # while it runs, and when a library's loader opened it.
+        self.owner = threading.get_ident()
+        self.active = True
+        self.by_loader = by_loader
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
         self.shown = _shown(self.path)
@@ -236,12 +241,11 @@ class _Checkpoint:
             # A load of no format's layers: a stock checkpoint's.
             return
         models = loaded if isinstance(loaded, tuple) else (loaded,)
-        paths = {
-            id(module): path
-            for model in models
-            if isinstance(model, nn.Module)
-            for path, module in model.named_modules()
-        }
+        paths: dict[int, list[str]] = {}
+        for model in models:
+            if isinstance(model, nn.Module):
+                for path, module in model.named_modules():
+                    paths.setdefault(id(module), []).append(path)
         stray = [layer for layer in self.built if id(layer) not in paths]
         if stray:
             raise _refused(
@@ -253,7 +257,7 @@ class _Checkpoint:
                 self,
             )
         for layer in self.built:
-            path = paths[id(layer)]
+            path = paths[id(layer)][0]
             placeholders = layer._placeholders[0]
             left = [name for name, held in placeholders.items() if layer[name] is held]
             if left and len(left) < len(placeholders):
@@ -282,11 +286,20 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-        bound = {paths[id(layer)] for layer in self.built}
+        # Each layer at each path its model holds it under, in its mode.
+        bound = {
+            (path, layer.mode) for layer in self.built for path in paths[id(layer)]
+        }
         for path, mode in entries:
             # mlx-vlm builds a language model's checkpoint inside a model of
-            # its own, under language_model.
-            if path not in bound and f"language_model.{path}" not in bound:
+            # its own, under language_model., and mlx-lm a VLM's text model
+            # without it.
+            names = (
+                path,
+                f"language_model.{path}",
+                path.removeprefix("language_model."),
+            )
+            if not any((name, mode) in bound for name in names):
                 raise _refused(
                     f"its quantization config names {path}, and the load built "
                     "no layer of the format there: the model has no such "
@@ -472,28 +485,37 @@ def _refuse_family(checkpoint: _Checkpoint) -> None:
         )
 
 
-def _config_of(path) -> Path:
-    """The config file the checkpoint at ``path`` reads (a view of links to
-    a checkpoint's files reads the checkpoint's)."""
-    return (Path(path).expanduser() / "config.json").resolve()
+def _current() -> _Checkpoint | None:
+    """The checkpoint whose load is running and whose layers this thread
+    builds: a thread that copied a load's context after it ended (or another
+    thread's) builds none of its layers."""
+    checkpoint = formats._LOADING.get()
+    return checkpoint if checkpoint is not None and checkpoint.active else None
 
 
 @contextmanager
-def loading(path) -> Iterator[_Checkpoint]:
-    """While the block runs, the format layers this thread builds belong to
-    the checkpoint at ``path``: a load nested in it has its own, but one of
-    the same checkpoint (a loader wrapped over the wrapped one) is the
-    outer one."""
-    outer = formats._LOADING.get()
-    if outer is not None and _config_of(outer.path) == _config_of(path):
+def loading(path, *, by_loader: bool = False) -> Iterator[_Checkpoint]:
+    """While the block runs, the format layers built on this thread (and on
+    threads that copied its context) belong to the checkpoint at ``path``: a
+    load nested in it has its own, but one of the same checkpoint (a view of
+    links to it, a loader wrapped over the wrapped one) on the same thread is
+    the outer one, when a library's loader (``by_loader``) opened that."""
+    outer = _current()
+    if (
+        outer is not None
+        and outer.by_loader
+        and outer.owner == threading.get_ident()
+        and outer.shown == _shown(Path(path).expanduser())
+    ):
         yield outer
         return
-    checkpoint = _Checkpoint(path)
+    checkpoint = _Checkpoint(path, by_loader=by_loader)
     _refuse_family(checkpoint)
     token = formats._LOADING.set(checkpoint)
     try:
         yield checkpoint
     finally:
+        checkpoint.active = False
         formats._LOADING.reset(token)
 
 
@@ -501,7 +523,7 @@ def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
     """The refusal of ``mode``'s layers of ``checkpoint`` (the one loading
     on this thread when not given) for ``reason``."""
     if checkpoint is None:
-        checkpoint = formats._LOADING.get()
+        checkpoint = _current()
     if checkpoint is None:
         return FormatRefusedError(reason, mode=mode)
     installed = formats.origin(mode) or (
@@ -519,7 +541,7 @@ def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
 def _recorded(mode) -> bool:
     """Whether the checkpoint loading on this thread records a format of
     ``mode`` in its config."""
-    checkpoint = formats._LOADING.get()
+    checkpoint = _current()
     if checkpoint is None:
         return False
     try:
@@ -536,7 +558,7 @@ def _not_installed(mode) -> str:
     skipped = formats._SKIPPED.get(mode)
     if skipped is not None:
         return skipped
-    checkpoint = formats._LOADING.get()
+    checkpoint = _current()
     written = checkpoint.writer(mode) if checkpoint is not None else None
     if written in (None, "an unknown writer", "a format registered by hand"):
         written = "the plugin the checkpoint was written with"
@@ -562,7 +584,7 @@ def _unwrapped_loader() -> str | None:
 
 def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
     """The checkpoint a layer of ``fmt`` built now belongs to."""
-    checkpoint = formats._LOADING.get()
+    checkpoint = _current()
     if checkpoint is None:
         loader = _unwrapped_loader()
         if loader is not None:
@@ -591,12 +613,16 @@ def _format_layer(layer, layer_cls, signature, arguments):
     fmt = formats.get(mode)
     layout = None
     if fmt is not None and bits is not None and group_size is not None:
-        layout = fmt.layout(k, n, bits, group_size)
+        with _ACCEPTING:
+            # Not while another thread's load sees whether accept changed
+            # the format (a format that keeps what it laid out).
+            layout = fmt.layout(k, n, bits, group_size)
     if layout is not None:
         checkpoint = _reading(fmt)
         read = checkpoint.read(fmt)
         if read is not fmt:
-            layout = read.layout(k, n, bits, group_size)
+            with _ACCEPTING:
+                layout = read.layout(k, n, bits, group_size)
         fmt = read
     if layout is None:
         if not isinstance(mode, str):
@@ -607,7 +633,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
             return None
         if recorded:
             # A damaged record is refused as such.
-            formats._LOADING.get()._record(mode)
+            _current()._record(mode)
         if fmt is None:
             # No format reads it: one of MLX's modes too when the checkpoint
             # records a format of it (written before MLX's modes were the
@@ -718,8 +744,9 @@ def _wrap_loader(module, name: str) -> None:
     first = next(iter(inspect.signature(own).parameters))
 
     def loader(*args, **kwargs):
-        outer = formats._LOADING.get()
-        with loading(args[0] if args else kwargs[first]) as checkpoint:
+        outer = _current()
+        path = args[0] if args else kwargs[first]
+        with loading(path, by_loader=True) as checkpoint:
             loaded = own(*args, **kwargs)
         if checkpoint is not outer:
             # A load joined to an outer one of the checkpoint is checked by
