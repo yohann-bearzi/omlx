@@ -143,7 +143,8 @@ def _order_kernel():
 
 
 def _order(rhs: mx.array) -> mx.array:
-    """Pair indices in expert order, ties by pair: ``rhs``'s stable argsort."""
+    """Pair indices in expert order (the experts as 32-bit unsigned
+    integers), ties by pair: ``rhs``'s stable argsort for expert ids."""
     pairs = rhs.shape[0]
     return _order_kernel()(
         inputs=[rhs],
@@ -194,7 +195,7 @@ class Projection(NamedTuple):
 class _Plan(NamedTuple):
     gate_up: Projection
     down: Projection
-    proof: kernels.Proof  # of a block's two launches
+    proof: kernels.Proof  # of a block's launches (and its order's)
     width: int  # the K of gate_up: a row of x
     pairs: int | None  # the most pairs of a block it takes, if a limit
 
@@ -324,7 +325,7 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         or not plan.down.face.exact_for(x.dtype)
     ):
         return None
-    # What a block's two launches are instantiated with beside the proof's
+    # What a block's launches are instantiated with beside the proof's
     # key. A Metal in ran passed the checks below when it was proven: a call
     # pays for neither, nor for the stand-in and the log line it would build.
     metal = (rows, top_k, x.dtype, indices.dtype)

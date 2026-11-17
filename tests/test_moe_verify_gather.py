@@ -284,6 +284,15 @@ def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
         mx.eval(gather.gather_qmv(projection, x, rhs[:6], 4))
     with pytest.raises(RuntimeError, match="LHS_DIV is the experts of a row, 1 or"):
         mx.eval(gather.gather_qmv(projection, x, rhs, 0))
+    # The same words from the ordered launch.
+    rhs = mx.arange(24).astype(mx.uint32) % EXPERTS
+    x = mx.random.normal((6, k)).astype(mx.bfloat16)
+    order = gather._order(rhs)
+    mx.eval(gather.gather_qmv(projection, x, rhs, 4, order))
+    with pytest.raises(RuntimeError, match="N must be whole tiles of 8 outputs"):
+        mx.eval(gather.gather_qmv(projection._replace(n=60), x, rhs, 4, order))
+    with pytest.raises(RuntimeError, match="LHS_DIV is the experts of a row, 1 or"):
+        mx.eval(gather.gather_qmv(projection, x, rhs, 0, order))
 
 
 def test_a_block_outside_the_kernel_is_left_to_the_composed_route():
@@ -713,7 +722,8 @@ def test_a_block_of_24_pairs_or_more_is_put_in_expert_order_once(monkeypatch):
 def test_the_order_is_the_pairs_stable_sort_by_expert(pairs, dtype):
     mx.random.seed(pairs)
     for experts in (2, 512):  # ties everywhere, few ties
-        rhs = mx.random.randint(0, min(experts, 255), (pairs,)).astype(dtype)
+        top = min(experts, 256) if dtype == mx.uint8 else experts
+        rhs = mx.random.randint(0, top, (pairs,)).astype(dtype)
         want = np.argsort(np.array(rhs).astype(np.int64), kind="stable")
         assert np.array_equal(np.array(gather._order(rhs)), want)
 
@@ -759,3 +769,43 @@ def test_a_face_with_a_table_runs_the_gather_to_the_bit(monkeypatch):
     assert proof.ran and not proof.failed
     faces = {key[1] for key in kernels._PROOFS if key[0] == "verify_gather"}
     assert all(face.key.endswith("_lut") for face in faces)
+
+
+def test_the_pairs_are_ordered_from_24_and_searched_below(toy, monkeypatch):
+    """20, 21, 22 and 23 pairs keep each threadgroup's search; 24 is the
+    first ordered block. Either way: the pairs' own rows."""
+    toy(_toy("ordered_from"))
+    switch = _ToySwitch(k=320, inter=72, n=40)
+    order, ordered = gather._order, []
+    monkeypatch.setattr(
+        gather, "_order", lambda rhs: (ordered.append(rhs.shape[0]), order(rhs))[1]
+    )
+    for rows, top_k in ((2, 10), (3, 7), (2, 11), (2, 12), (3, 8)):
+        x, indices = _toy_block(switch, rows, top_k)
+        got = gather.fused_switch(switch, x, indices)
+        experts = np.array(indices).reshape(-1)
+        rows_x = np.repeat(np.array(x[0]), top_k, 0)
+        gate, up = np.split(switch.gate_up_proj.rows(experts, rows_x), 2, axis=-1)
+        want = switch.down_proj.rows(experts, switch.activation(up, gate))
+        assert np.array_equal(np.array(got).reshape(rows * top_k, 40), want)
+    assert sorted(set(ordered)) == [24]
+
+
+def test_a_face_s_kernels_are_built_once():
+    k, n = 320, 64
+    linear = _experts(k, n)
+    first, second = gather.projection(linear, k), gather.projection(linear, k)
+    assert first.kernel is second.kernel and first.ordered is second.ordered
+    assert gather._order_kernel() is gather._order_kernel()
+
+
+def test_an_ordered_block_is_proven_in_a_function_that_mlx_compiles(monkeypatch):
+    switch = _switch()
+    x, indices = _block(1, 4)  # 24 pairs
+    want = _composed(monkeypatch, switch, x, indices)
+    compiled = mx.compile(
+        lambda x, i: gather.fused_switch(switch, x, i) * 2, inputs=switch.state
+    )
+    assert _same_bits(compiled(x, indices), want * 2)
+    (proof,) = _proofs()
+    assert proof.ran == {(4, TOP_K, x.dtype, mx.uint32)} and not proof.failed
