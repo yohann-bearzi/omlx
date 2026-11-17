@@ -190,6 +190,7 @@ class OQManager:
                 _is_readable_dir,
                 _iter_readable_entries,
                 _resolve_hf_cache_entry,
+                _skipped_entry,
             )
             from ..oq import estimate_memory, validate_quantizable
             from ..utils.model_loading import (
@@ -208,9 +209,9 @@ class OQManager:
                 # unreadable without Full Disk Access; skip them like
                 # discover_models does so one entry can't fail the whole scan.
                 for subdir in _iter_readable_entries(model_dir, "model directory"):
-                    if not _is_readable_dir(
-                        subdir, "model entry"
-                    ) or subdir.name.startswith("."):
+                    if not _is_readable_dir(subdir, "model entry") or _skipped_entry(
+                        subdir
+                    ):
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
@@ -228,7 +229,7 @@ class OQManager:
                             )
                         else:
                             for child in _iter_readable_entries(subdir, "model group"):
-                                if child.name.startswith("."):
+                                if _skipped_entry(child):
                                     continue
                                 if (
                                     _is_readable_dir(child, "model group entry")

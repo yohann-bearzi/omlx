@@ -1476,6 +1476,16 @@ class TestDiscoverModels:
         models = discover_models(tmp_path)
         assert len(models) == 0
 
+    def test_skip_unverified_directories(self, tmp_path):
+        """A checkpoint written in a quant format and not yet verified (still
+        <name>.unverified) is not served."""
+        unverified = tmp_path / "llama-3b-oQ4.unverified"
+        unverified.mkdir()
+        (unverified / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (unverified / "model.safetensors").write_bytes(b"0" * 1000)
+
+        assert discover_models(tmp_path) == {}
+
     def test_skip_files(self, tmp_path):
         """Test that files are skipped (only directories processed)."""
         # Create a file at top level
@@ -1815,6 +1825,14 @@ class TestTwoLevelDiscovery:
         models = discover_models(tmp_path)
         assert len(models) == 1
         assert "llama-3b" in models
+
+    def test_org_folder_unverified_children_skipped(self, tmp_path):
+        org = tmp_path / "mlx-community"
+        self._make_model(org / "llama-3b")
+        self._make_model(org / "llama-3b-oQ4.unverified")
+
+        models = discover_models(tmp_path)
+        assert list(models) == ["llama-3b"]
 
     def test_org_folder_invalid_children_skipped(self, tmp_path):
         """Test that children without config.json in org folders are skipped."""

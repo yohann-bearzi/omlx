@@ -937,6 +937,23 @@ class TestOQManagerUnreadableEntries:
         assert [m["name"] for m in all_models] == ["Llama-3B"]
 
     @pytest.mark.asyncio
+    async def test_unverified_checkpoints_are_not_listed(self, fp_model_dir):
+        """A checkpoint written in a quant format and not yet verified (still
+        <name>.unverified), at the root or in an organization folder."""
+        shutil.copytree(
+            fp_model_dir / "Llama-3B", fp_model_dir / "Llama-3B-oQ4.unverified"
+        )
+        shutil.copytree(
+            fp_model_dir / "Llama-3B", fp_model_dir / "Org" / "Llama-3B.unverified"
+        )
+
+        manager = OQManager(model_dirs=[str(fp_model_dir)])
+        source_models, all_models = await manager.list_quantizable_models()
+
+        assert [m["name"] for m in source_models] == ["Llama-3B"]
+        assert [m["name"] for m in all_models] == ["Llama-3B"]
+
+    @pytest.mark.asyncio
     async def test_unreadable_model_group_and_root_are_skipped(
         self, fp_model_dir, second_fp_model_dir, tmp_path, monkeypatch
     ):

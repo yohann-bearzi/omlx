@@ -65,6 +65,7 @@ from omlx.model_discovery import (
     DECISION_SIDECAR_WEIGHTS,
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     SOURCE_RECORDS,
+    UNVERIFIED_SUFFIX,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
@@ -7673,6 +7674,12 @@ def _open_oq_run(
     output = Path(output_path)
     if output.exists():
         raise ValueError(f"Output directory already exists: {output_path}")
+    final_output = None
+    if quant_fmt is not None:
+        # Written beside its place, where no scan serves it, until verified.
+        final_output, output = output, Path(output_path + UNVERIFIED_SUFFIX)
+        if output.exists():
+            raise ValueError(f"Output directory already exists: {output}")
 
     _progress_last_log = {"time": 0.0, "pct": -100.0, "detail": ""}
 
@@ -8550,6 +8557,7 @@ def quantize_oq_streaming(
     oq_level = run.get("oq_level")
     output = run.get("output")
     output_path = run.get("output_path")
+    final_output = run.get("final_output")
     preserve_mtp = run.get("preserve_mtp")
     preserve_ngram_table = run.get("preserve_ngram_table")
     quant_fmt = run.get("quant_fmt")
@@ -8948,6 +8956,8 @@ def quantize_oq_streaming(
 
         export_sidecars(source, output, config)
 
+    if final_output is not None:
+        output.rename(final_output)
     cb("saving", 100.0, "Quantized model saved")
     logger.info(
         f"oQ{oq_level:g} streaming: completed -> {output_path} ({total_shards} shards)"

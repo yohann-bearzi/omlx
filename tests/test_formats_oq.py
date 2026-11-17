@@ -346,6 +346,43 @@ def test_rows_are_cut_from_a_tensor_of_no_rows_or_of_empty_rows():
     assert [(r0, r1) for r0, r1, _ in chunks] == [(0, 2), (2, 3)]
 
 
+def test_a_run_in_a_format_writes_beside_its_output_until_done(
+    source, toy, tmp_path, monkeypatch
+):
+    """A run with a quant format writes into <output>.unverified, which no
+    scan serves, and renames it to <output> once written."""
+    output = tmp_path / "oqe-toy"
+    unverified = tmp_path / "oqe-toy.unverified"
+    copy, seen = oq._copy_model_sidecars, []
+
+    def copied(src, out, **kwargs):
+        # The run's last writes: where it writes them.
+        seen.append((out, output.exists()))
+        return copy(src, out, **kwargs)
+
+    monkeypatch.setattr(oq, "_copy_model_sidecars", copied)
+    _quantize(source, output, quant_format="toy")
+    assert seen == [(unverified, False)]
+    assert output.is_dir() and not unverified.exists()
+    # Without a format, the run writes straight into its output.
+    seen.clear()
+    _quantize(source, tmp_path / "oqe")
+    assert seen == [(tmp_path / "oqe", True)]
+
+
+def test_a_run_in_a_format_refuses_a_folder_it_would_write(source, toy, tmp_path):
+    output = tmp_path / "oqe-toy"
+    unverified = tmp_path / "oqe-toy.unverified"
+    unverified.mkdir()
+    with pytest.raises(ValueError) as refusal:
+        oq.quantize_oq_streaming(
+            str(source), str(output), 4, enhanced=True, quant_format="toy"
+        )
+    assert str(refusal.value) == f"Output directory already exists: {unverified}"
+    assert not output.exists() and list(unverified.iterdir()) == []
+    assert toy.offered == []
+
+
 def test_a_stack_s_join_is_evaluated_once_the_writer_lets_its_source_go(
     source, toy, tmp_path, monkeypatch
 ):

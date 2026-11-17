@@ -1456,11 +1456,22 @@ def model_directory_write_error(path: Path, *, create: bool = False) -> str | No
     return None
 
 
+# A quantization in a quant format writes its checkpoint here, beside its
+# place, until it is verified and renamed: nothing serves it before.
+UNVERIFIED_SUFFIX = ".unverified"
+
+
 VERIFICATION = "omlx_verification"
 # A checkpoint's records of the run in a quant format that wrote it: what
 # reads its layers, and its verification. A checkpoint written from it
 # keeps neither.
 SOURCE_RECORDS = ("omlx_quant_formats", VERIFICATION)
+
+
+def _skipped_entry(path: Path) -> bool:
+    """An entry no scan serves: a hidden one (.Trashes, .Spotlight-V100,
+    ...) or a checkpoint not yet verified."""
+    return path.name.startswith(".") or path.name.endswith(UNVERIFIED_SUFFIX)
 
 
 def _iter_readable_entries(path: Path, context: str) -> list[Path]:
@@ -2046,7 +2057,7 @@ def discover_models(
     models: dict[str, DiscoveredModel] = {}
 
     for subdir in _iter_readable_entries(model_dir, "model directory"):
-        if not _is_readable_dir(subdir, "model entry") or subdir.name.startswith("."):
+        if not _is_readable_dir(subdir, "model entry") or _skipped_entry(subdir):
             continue
         if gguf_root is not None and subdir.resolve() == gguf_root.resolve():
             continue
@@ -2092,9 +2103,8 @@ def discover_models(
             # Level 2: organization folder — scan children
             has_children = False
             for child in _iter_readable_entries(subdir, "model group"):
-                if (
-                    not _is_readable_dir(child, "model group entry")
-                    or child.name.startswith(".")
+                if not _is_readable_dir(child, "model group entry") or _skipped_entry(
+                    child
                 ):
                     continue
                 if _is_adapter_dir(child):
