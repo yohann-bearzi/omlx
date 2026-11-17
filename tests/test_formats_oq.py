@@ -399,6 +399,48 @@ def test_a_run_in_a_format_records_its_verification(source, toy, tmp_path, monke
     }
 
 
+def test_a_run_in_a_format_keeps_the_source_s_reference(source, toy, tmp_path):
+    """Made once before it writes, beside its calibration's cache, and
+    copied into the output; another run of the same source and tokenizer
+    reuses it."""
+    from omlx import oq_verify
+
+    made = []
+    reference_of = oq_verify.reference_of
+
+    def making(model, prompt, layers):
+        made.append(prompt.tolist())
+        return reference_of(model, prompt, layers)
+
+    cached = tmp_path / ".oqe_imatrix" / f"{source.name}.reference.npz"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(oq_verify, "reference_of", making)
+        # A run without a format makes none.
+        _quantize(source, tmp_path / "c")
+        assert made == [] and not cached.exists()
+        _quantize(source, tmp_path / "a", quant_format="toy")
+        _quantize(source, tmp_path / "b", quant_format="toy")
+        tokens = (mx.arange(16) % 63 + 1).tolist()
+        assert made == [tokens]
+        # The same source with another tokenizer: made again.
+        other = tmp_path / "other" / source.name
+        shutil.copytree(source, other)
+        told = json.loads((other / "tokenizer_config.json").read_text())
+        (other / "tokenizer_config.json").write_text(
+            json.dumps({**told, "model_max_length": 7})
+        )
+        _quantize(other, tmp_path / "d", quant_format="toy")
+        assert made == [tokens, tokens]
+    kept = [np.load(cached)] + [
+        np.load(tmp_path / name / "verify" / "reference.npz") for name in ("a", "b")
+    ]
+    for reference in kept:
+        assert reference["prompt"].tolist() == tokens
+        assert reference["ids"].shape == (16, 16)
+        np.testing.assert_array_equal(reference["logprobs"], kept[0]["logprobs"])
+    assert not (tmp_path / "c" / "verify").exists()
+
+
 def test_a_run_keeps_no_record_of_its_source_s_verification(source, tmp_path):
     """A source written by a run in a format tells of that run's checks,
     not of this one's."""
@@ -1757,7 +1799,8 @@ def _cache(path):
 
 def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_path):
     """calibrate_oq_streaming writes the imatrix cache that a run with the
-    same settings writes, and nothing else; that run then reuses it."""
+    same settings writes, and the source's reference beside it, nothing
+    else; that run then reuses it."""
     alone, sampled = tmp_path / "alone" / "imatrix.npz", []
     with pytest.MonkeyPatch.context() as patch:
         _calibration(patch, sampled)
@@ -1766,6 +1809,8 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
     assert sorted(path.name for path in alone.parent.iterdir()) == [
         "imatrix.npz",
         "imatrix.npz.json",
+        f"{source.name}.reference.json",
+        f"{source.name}.reference.npz",
     ]
     assert sorted(data.entries) == sorted(oq._load_oqe_imatrix(alone).entries)
     # A plain run collects the same cache.

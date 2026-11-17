@@ -7331,7 +7331,9 @@ def calibrate_oq_streaming(
     oq_level, enhanced=True, imatrix_cache_path=imatrix_cache_path,
     **settings)`` collects (or reuses) before it reads a weight, by the same
     code. That call then reuses the cache. A quant format's plugin fits from
-    it before it hands oQ its configured format (docs/quant-formats.md).
+    it before it hands oQ its configured format (docs/quant-formats.md). The
+    source's reference that the run verifies its output against is made
+    beside the cache too.
 
     ``settings`` are quantize_oq_streaming's other arguments, those of the
     run that will reuse the cache (group_size, text_only, dtype,
@@ -7343,6 +7345,7 @@ def calibrate_oq_streaming(
     settings["imatrix_cache_path"] = imatrix_cache_path
     with _writing_nothing(model_path, oq_level, settings) as run:
         _calibrate_oq_run(run)
+        _source_reference(run)
         return run["imatrix_data"]
 
 
@@ -8391,6 +8394,20 @@ def _plan_oq_run(run: _OQRun) -> None:
     run.update((k, v) for k, v in locals().items() if k != "run")
 
 
+def _source_reference(run: _OQRun) -> Path:
+    """The file of the source's reference (oq_verify), kept beside the
+    run's calibration cache: made once per source and prompt."""
+    from .oq_verify import source_reference
+
+    return source_reference(
+        run.get("model_path"),
+        run.get("config"),
+        # A run with a format is oQe's, so it has its cache.
+        Path(run.get("imatrix_cache_path")).parent,
+        trust_remote_code=run.get("trust_remote_code"),
+    )
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
@@ -8545,6 +8562,10 @@ def quantize_oq_streaming(
             preserve_ngram_table=preserve_ngram_table,
         )
     _calibrate_oq_run(run)
+    reference = None
+    if run.get("quant_fmt") is not None:
+        # What the written checkpoint is verified against: the source's own.
+        reference = _source_reference(run)
     _plan_oq_run(run)
     # The writer's alone: its del below lets the source's index go.
     all_weights = run.pop("all_weights")
@@ -8969,6 +8990,12 @@ def quantize_oq_streaming(
         export_sidecars(source, output, config)
 
     if final_output is not None:
+        # The reference goes with the checkpoint, to verify it again.
+        (output / "verify").mkdir()
+        for kind in (".npz", ".json"):
+            shutil.copy2(
+                reference.with_suffix(kind), output / "verify" / f"reference{kind}"
+            )
         written = json.loads((output / "config.json").read_text())
         written[VERIFICATION] = {
             "verified": True,
