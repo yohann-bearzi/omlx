@@ -7,7 +7,8 @@ order. Consecutive tokens often pick the same experts, so the same expert
 weights are fetched from DRAM once per row that selects them.
 
 This kernel runs the same pairs, one threadgroup per pair and output tile,
-but in expert order: each threadgroup finds the pair at its sorted position,
+but in expert order: each threadgroup takes the pair at its sorted position
+(read from the block's order from ORDERED_PAIRS pairs, searched for below),
 and the grid covers all pairs of one output tile before the next. Pairs that
 share an expert then run back to back and read the expert tile from cache.
 Per pair, the rows are the dot face of the weights' format in the mat-vec
@@ -35,12 +36,18 @@ MAX_ROWS = 8
 # MLX's 2- and 3-bit experts run the gather only in blocks of at least
 # MANY_EXPERTS experts and of at most FEW_PAIRS pairs (rows x top-k): there
 # it was measured faster than the composed path on both Macs, at Flash-Next's
-# and the 35B-A3B's blocks (BLOCK-P.md, Item 5). Above FEW_PAIRS, each
-# threadgroup's search of its pair's rank costs more than the gather saves;
-# a block of 8 experts lost at 8 to 16 pairs as well. Other widths and
-# formats engage as they did before those faces.
+# and the 35B-A3B's blocks (BLOCK-P.md, Item 5), when every threadgroup
+# searched its pair's rank: above FEW_PAIRS the search cost more than the
+# gather saved, and a block of 8 experts lost at 8 to 16 pairs as well.
+# Other widths and formats engage as they did before those faces.
 FEW_PAIRS = 32
 MANY_EXPERTS = 64
+# From this many pairs a block's pairs are put in expert order once, by a
+# launch of their own (_ORDER) ahead of the block's two (_ORDERED_SOURCE);
+# below it, each threadgroup ranks its pair among all of them (_SOURCE).
+# Measured with 16 instances a side in 3 processes on both Macs: the extra
+# launch costs 0.3-0.8% at 16 and 20 pairs and gains from 24 pairs.
+ORDERED_PAIRS = 24
 
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
@@ -90,6 +97,77 @@ _SOURCE = r"""
 """
 
 
+# _SOURCE with the pair at position ``y`` read from the block's order.
+_ORDERED_SOURCE = r"""
+    constexpr int RPS = 4;     // output rows of a simdgroup
+    static_assert(
+        N_SIZE % (2 * RPS) == 0,
+        "verify gather: N must be whole tiles of 8 outputs");
+    static_assert(
+        LHS_DIV >= 1,
+        "verify gather: LHS_DIV is the experts of a row, 1 or more");
+    const uint pair = order[threadgroup_position_in_grid.y];
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint out_row = threadgroup_position_in_grid.z * (2 * RPS) + simd_gid * RPS;
+    float result[RPS];
+    qmv_rows<T, K_SIZE, RPS, 0>(
+        rt, size_t(rhs[pair]) * N_SIZE + out_row, rt, 0,
+        x + (pair / uint(LHS_DIV)) * K_SIZE, thread_index_in_simdgroup, result);
+    if (thread_index_in_simdgroup == 0) {
+      store_rows(omlx_iota<RPS>(), result, y + pair * N_SIZE + out_row);
+    }
+"""
+
+# Thread p ranks pair p by (expert, pair index), the order _SOURCE's search
+# uses, and writes p at that place.
+_ORDER = r"""
+    const uint p = thread_position_in_grid.x;
+    const uint e = rhs[p];
+    uint rank = 0;
+    for (uint q = 0; q < uint(N_PAIRS); ++q) {
+      const uint f = rhs[q];
+      rank += (f < e || (f == e && q < p)) ? 1 : 0;
+    }
+    order[rank] = p;
+"""
+
+
+@cache
+def _order_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_moe_verify_gather_order",
+        input_names=["rhs"],
+        output_names=["order"],
+        source=_ORDER,
+    )
+
+
+def _order(rhs: mx.array) -> mx.array:
+    """Pair indices in expert order, ties by pair: ``rhs``'s stable argsort."""
+    pairs = rhs.shape[0]
+    return _order_kernel()(
+        inputs=[rhs],
+        template=[("N_PAIRS", pairs)],
+        grid=(pairs, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(pairs,)],
+        output_dtypes=[mx.uint32],
+    )[0]
+
+
+@cache
+def _ordered_kernel(face: Dot):
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", face), "rhs", "order"]
+    return mx.fast.metal_kernel(
+        name=f"omlx_moe_verify_gather_ordered_{face.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations + _ORDERED_SOURCE,
+    )
+
+
 @cache
 def _kernel(face: Dot):
     matrices = kernels.Matrices()
@@ -107,7 +185,8 @@ class Projection(NamedTuple):
     """Stacked expert weights as this kernel runs them."""
 
     face: Dot
-    kernel: Any
+    kernel: Any  # the pairs ranked in each threadgroup
+    ordered: Any  # the pairs read from the block's order
     operands: tuple  # the weight, then the face's tensors
     n: int
 
@@ -134,7 +213,7 @@ def projection(linear, k: int) -> Projection | None:
     if face is None:
         return None
     operands = tuple(linear[name] for name in ("weight", *face.tensors))
-    return Projection(face, _kernel(face), operands, n)
+    return Projection(face, _kernel(face), _ordered_kernel(face), operands, n)
 
 
 def _build_plan(switch_mlp, width: int) -> _Plan | None:
@@ -178,9 +257,10 @@ def _stand_in(plan: _Plan, metal) -> list[mx.array]:
     rhs = mx.zeros((pairs,), index)
     x = mx.zeros((rows, plan.width), dtype)
     hidden = mx.zeros((pairs, plan.gate_up.n // 2), dtype)
+    order = _order(rhs) if pairs >= ORDERED_PAIRS else None
     return [
-        gather_qmv(_zeros(plan.gate_up), x, rhs, top_k),
-        gather_qmv(_zeros(plan.down), hidden, rhs, 1),
+        gather_qmv(_zeros(plan.gate_up), x, rhs, top_k, order),
+        gather_qmv(_zeros(plan.down), hidden, rhs, 1, order),
     ]
 
 
@@ -255,35 +335,43 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     ):
         return None
     pairs = indices.reshape(rows * top_k)
-    gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k)
+    order = _order(pairs) if rows * top_k >= ORDERED_PAIRS else None
+    gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
     gate, up = mx.split(gate_up, 2, axis=-1)
     hidden = switch_mlp.activation(up, gate)
     if hidden.dtype != x.dtype or hidden.shape != up.shape:
         # Not the rows that the down launch is planned and proven for.
         # Nothing is kept of it: the next block asks its activation again.
         return None
-    return gather_qmv(plan.down, hidden, pairs, 1).reshape(batch, length, top_k, -1)
+    down = gather_qmv(plan.down, hidden, pairs, 1, order)
+    return down.reshape(batch, length, top_k, -1)
 
 
 def gather_qmv(
-    projection: Projection, x: mx.array, rhs: mx.array, pairs_per_row: int
+    projection: Projection,
+    x: mx.array,
+    rhs: mx.array,
+    pairs_per_row: int,
+    order: mx.array | None = None,
 ) -> mx.array:
     """``gather_qmm`` over P (row, expert) pairs, pairs grouped by expert.
 
     ``rhs`` holds the expert of each pair; pair ``p`` reads row
-    ``p // pairs_per_row`` of ``x`` (``[R, K]``). Returns ``[P, N]``.
+    ``p // pairs_per_row`` of ``x`` (``[R, K]``). ``order`` is the pairs in
+    expert order (``_order``), or None for each threadgroup to find its
+    pair. Returns ``[P, N]``.
     """
     n = projection.n
     pairs = rhs.shape[0]
-    return projection.kernel(
-        inputs=[x, *projection.operands, rhs],
-        template=[
-            ("T", x.dtype),
-            ("K_SIZE", x.shape[-1]),
-            ("N_SIZE", n),
-            ("N_PAIRS", pairs),
-            ("LHS_DIV", pairs_per_row),
-        ],
+    template = [("T", x.dtype), ("K_SIZE", x.shape[-1]), ("N_SIZE", n)]
+    if order is None:
+        kernel, inputs = projection.kernel, [x, *projection.operands, rhs]
+        template.append(("N_PAIRS", pairs))
+    else:
+        kernel, inputs = projection.ordered, [x, *projection.operands, rhs, order]
+    return kernel(
+        inputs=inputs,
+        template=[*template, ("LHS_DIV", pairs_per_row)],
         grid=(32, 2 * pairs, n // 8),
         threadgroup=(32, 2, 1),
         output_shapes=[(pairs, n)],

@@ -207,9 +207,9 @@ def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
     monkeypatch.setattr(mx, "eval", lambda *a: (evaluated.append(a), evaluate(*a)))
     launch, read = gather.gather_qmv, []
 
-    def built(projection, x, rhs, per_row):
+    def built(projection, x, rhs, per_row, order):
         read.append(rhs.dtype)
-        return launch(projection, x, rhs, per_row)
+        return launch(projection, x, rhs, per_row, order)
 
     monkeypatch.setattr(gather, "gather_qmv", built)
     assert _same_bits(gather.fused_switch(switch, x, indices), want)
@@ -605,9 +605,9 @@ def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
 
     launch, launched = gather.gather_qmv, []
 
-    def built(projection, x, rhs, per_row):
+    def built(projection, x, rhs, per_row, order):
         launched.append((projection.operands, x, rhs, per_row))
-        return launch(projection, x, rhs, per_row)
+        return launch(projection, x, rhs, per_row, order)
 
     monkeypatch.setattr(mx, "eval", recorded)
     monkeypatch.setattr(gather, "gather_qmv", built)
@@ -651,3 +651,64 @@ def test_a_block_is_proven_in_a_function_that_mlx_compiles(monkeypatch, state):
     assert proof.ran == {(3, TOP_K, x.dtype, mx.uint32)} and not proof.failed
     mx.eval(switch.parameters())
     assert _same_bits(gather.fused_switch(switch, x, indices), want)
+
+
+def test_a_block_of_24_pairs_or_more_is_put_in_expert_order_once(monkeypatch):
+    """Below 24 pairs each threadgroup finds its pair; from 24 one launch
+    orders them ahead of the block's two. Either way: the composed bits."""
+    switch = _switch()
+    order, ordered = gather._order, []
+    monkeypatch.setattr(
+        gather, "_order", lambda rhs: (ordered.append(rhs.shape[0]), order(rhs))[1]
+    )
+    launch, launched = gather.gather_qmv, []
+
+    def built(projection, x, rhs, per_row, order):
+        launched.append((rhs.shape[0], order is not None))
+        return launch(projection, x, rhs, per_row, order)
+
+    for batch, length in ((1, 3), (1, 4), (2, 3), (1, 8)):  # 18, 24, 36, 48 pairs
+        x, indices = _block(batch, length)
+        with monkeypatch.context() as patch:
+            patch.setattr(gather, "gather_qmv", built)
+            got = gather.fused_switch(switch, x, indices)
+        assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+    # Each ordered Metal: its stand-in, then the call; both launches of each.
+    assert ordered == [24, 24, 36, 36, 48, 48]
+    assert launched == [(p, p >= 24) for p in (18, 24, 36, 48) for _ in range(4)]
+
+
+@pytest.mark.parametrize("pairs", [24, 25, 80, 128])
+@pytest.mark.parametrize("dtype", [mx.uint32, mx.int32, mx.uint8])
+def test_the_order_is_the_pairs_stable_sort_by_expert(pairs, dtype):
+    mx.random.seed(pairs)
+    for experts in (2, 512):  # ties everywhere, few ties
+        rhs = mx.random.randint(0, min(experts, 255), (pairs,)).astype(dtype)
+        want = np.argsort(np.array(rhs).astype(np.int64), kind="stable")
+        assert np.array_equal(np.array(gather._order(rhs)), want)
+
+
+def test_the_ordered_launch_reads_each_position_s_pair_from_the_order():
+    """Every position named pair 1: pair 1's rows alone are written."""
+    switch = _switch()
+    x, indices = _block(1, 4)
+    projection = gather.projection(switch.gate_up_proj, HIDDEN)
+    x, rhs, n = x.reshape(4, HIDDEN), indices.reshape(-1), projection.n
+    pairs = rhs.shape[0]
+    y = projection.ordered(
+        inputs=[x, *projection.operands, rhs, mx.ones((pairs,), mx.uint32)],
+        template=[
+            ("T", x.dtype),
+            ("K_SIZE", HIDDEN),
+            ("N_SIZE", n),
+            ("LHS_DIV", TOP_K),
+        ],
+        grid=(32, 2 * pairs, n // 8),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(pairs, n)],
+        output_dtypes=[x.dtype],
+        init_value=float("nan"),
+    )[0]
+    want = gather.gather_qmv(projection, x, rhs, TOP_K)
+    assert _same_bits(y[1], want[1])
+    assert mx.isnan(y[0]).all().item() and mx.isnan(y[2:]).all().item()
