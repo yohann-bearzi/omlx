@@ -15,6 +15,7 @@ them it wraps for the length of a block.
 
 from __future__ import annotations
 
+import inspect
 import threading
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -69,21 +70,74 @@ _SHARED_ROWS = r"""
 _THREADGROUP_BYTES = 32768
 
 
-@contextmanager
-def verified(*families: str):
-    """For the block, oQ writes checkpoints of ``families`` (model types, in
-    any spelling) in a quant format as it does those verified with them, and
-    as it then did after. A test's checkpoint of a family oMLX patches (a
-    tiny one, to test a format with) is written so. As a decorator, it holds
-    for one test; in a fixture, ``with verified(...): yield``."""
+# The families of the open blocks of verified, in any thread.
+_VERIFYING: list[frozenset[str]] = []
+_VERIFYING_LOCK = threading.Lock()
+
+
+def verified(*families: str) -> _Verified:
+    """While a block of it is open, in any thread, oQ writes and oMLX loads
+    checkpoints of ``families`` in a quant format as it does those verified
+    with them: model types in any spelling (a decision model's family, a
+    text model's type). A test's checkpoint of a family oMLX patches (a tiny
+    one, to test a format with) is written so. A decorator of a test (async
+    too) holds for the test; in a fixture, ``with verified(...): yield``.
+    Blocks of several threads open and close in any order."""
+    return _Verified(*families)
+
+
+class _Verified:
+    """A block of ``verified``, and the decorator it is."""
+
+    def __init__(self, *families: str):
+        if not families or not all(isinstance(family, str) for family in families):
+            raise TypeError(
+                "testing.verified takes the model types it verifies: "
+                "@verified('qwen3_5_moe_text'), not a bare @verified"
+            )
+        from .. import oq
+
+        self._families = frozenset(oq._family(family) for family in families)
+
+    def __enter__(self):
+        with _VERIFYING_LOCK:
+            _VERIFYING.append(self._families)
+            _publish()
+        return self
+
+    def __exit__(self, *raised):
+        with _VERIFYING_LOCK:
+            _VERIFYING.remove(self._families)
+            _publish()
+
+    def __call__(self, test):
+        if inspect.isgeneratorfunction(test) or inspect.isasyncgenfunction(test):
+            raise TypeError(
+                "testing.verified decorates a test; a fixture opens a block of "
+                "it: with verified(...): yield"
+            )
+        if inspect.iscoroutinefunction(test):
+
+            @wraps(test)
+            async def run(*args, **kwargs):
+                with self:
+                    return await test(*args, **kwargs)
+
+        else:
+
+            @wraps(test)
+            def run(*args, **kwargs):
+                with self:
+                    return test(*args, **kwargs)
+
+        return run
+
+
+def _publish() -> None:
+    """oQ's test-verified families: those of the open blocks."""
     from .. import oq
 
-    kept = oq._QUANT_FORMAT_VERIFIED
-    oq._QUANT_FORMAT_VERIFIED = kept | {oq._family(family) for family in families}
-    try:
-        yield
-    finally:
-        oq._QUANT_FORMAT_VERIFIED = kept
+    oq._TEST_VERIFIED = frozenset().union(*_VERIFYING)
 
 
 @contextmanager

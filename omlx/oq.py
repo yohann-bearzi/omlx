@@ -6911,6 +6911,9 @@ _QUANT_FORMAT_STOCK: frozenset[str] = frozenset(
 # models, a decision model's) that quant formats are verified with end to
 # end; a family enters with the run that verifies it.
 _QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
+# The families tests take as verified (omlx.formats.testing.verified), while
+# one of their blocks is open, in any thread.
+_TEST_VERIFIED: frozenset[str] = frozenset()
 
 # What the audits found a family's own code to read wrongly of a format's
 # layer: a layer's quantized tensors read by hand, taken for MLX's layer or
@@ -7004,9 +7007,10 @@ def _unverified_family(
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
+    verified = _QUANT_FORMAT_VERIFIED | _TEST_VERIFIED
     kind = decision_kind(source, {**config, "model_type": _family(model_type)})
     if kind is not None:
-        if kind in _QUANT_FORMAT_VERIFIED:
+        if kind in verified:
             return None
         why = _QUANT_FORMAT_MISREAD.get(kind, _NOT_VERIFIED)
         return kind, why
@@ -7020,12 +7024,12 @@ def _unverified_family(
         if isinstance(name, str)
     ]
     for family in families:
-        if family in _QUANT_FORMAT_MISREAD:
+        if family in _QUANT_FORMAT_MISREAD and family not in verified:
             return family, _QUANT_FORMAT_MISREAD[family]
     for family in families:
-        if family not in _QUANT_FORMAT_STOCK and family not in _QUANT_FORMAT_VERIFIED:
+        if family not in _QUANT_FORMAT_STOCK and family not in verified:
             return family, _NOT_VERIFIED
-    stock = [family for family in families if family not in _QUANT_FORMAT_VERIFIED]
+    stock = [family for family in families if family not in verified]
     if stock:
         # A stock family is proven as an LLM that mlx-lm's own code builds,
         # and only so.
