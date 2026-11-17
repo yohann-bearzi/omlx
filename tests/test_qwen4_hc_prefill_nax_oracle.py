@@ -46,6 +46,7 @@ def _live():
 # The oracle is the live code.
 
 _METAL = (
+    "_QDOT_HEADER",
     "_NAX_HEADER",
     "_TG_LOAD",
     "_NORM_TEMPLATE",
@@ -78,20 +79,24 @@ def test_the_oracle_s_launches_are_the_live_ones(name):
 
 
 def test_the_oracle_s_kernels_differ_from_the_live_ones_by_name_alone():
-    renamed = inspect.getsource(oracle._kernel).replace(
+    rename = (
         "    # The oracle's kernels carry names of their own.\n"
-        '    name = "oracle_" + name\n',
-        "",
+        '    name = "oracle_" + name\n'
     )
-    assert renamed == inspect.getsource(_live()._kernel)
+    source = inspect.getsource(oracle._kernel)
+    assert rename in source
+    assert source.replace(rename, "", 1) == inspect.getsource(_live()._kernel)
 
 
 def test_plain_qmm_nax_answers_as_the_oracle():
     live = _live().plain_qmm_nax
     # The boundaries: 64 rows (one tile; N 16384 is 256 tiles of 64 there),
-    # 256 tiles of 64 (N 1024 at 1024 rows), and Flash-Next's widths.
+    # and where 256 tiles of 64 are reached: 961 rows at N 1024, 385 at N
+    # 2560, 16321 at N 64, 3265 at N 320.
+    rows_list = (*range(1, 130), 384, 385, 800, 801, 960, 961, 1024)
+    rows_list += (3264, 3265, 8192, 16320, 16321)
     for n_out in (64, 320, 1024, 2560, 10240, 16384):
-        for rows in (*range(1, 130), 800, 801, 1023, 1024, 1025, 3264, 3265, 8192):
+        for rows in rows_list:
             assert live(rows, n_out) == oracle.plain_qmm_nax(rows, n_out), (
                 rows,
                 n_out,
@@ -114,20 +119,20 @@ def _projection(k: int, n: int, bits: int, dtype, seed: int) -> nn.QuantizedLine
 
 
 def _zero_rows(a: mx.array) -> mx.array:
-    """``a`` with its first and last rows all zero (each a row of +0)."""
-    rows = a.shape[0]
-    keep = mx.ones((rows, 1), dtype=a.dtype)
-    if rows > 2:
-        keep[0] = 0
-        keep[rows - 1] = 0
-    return a * keep
+    """``a`` with its first row all +0, when it has more than one row: every
+    other row, a tile's last ones included, keeps its values."""
+    if a.shape[0] < 2:
+        return a
+    first = (mx.arange(a.shape[0]) == 0)[:, None]
+    return mx.where(first, mx.zeros((), dtype=a.dtype), a)
 
 
 def _same(a: mx.array, b: mx.array) -> bool:
-    if a.dtype != b.dtype or a.shape != b.shape:
-        return False
-    view = mx.uint32 if a.dtype == mx.float32 else mx.uint16
-    return mx.array_equal(a.view(view), b.view(view)).item()
+    return (
+        a.dtype == b.dtype
+        and a.shape == b.shape
+        and mx.array_equal(a.view(mx.uint8), b.view(mx.uint8)).item()
+    )
 
 
 def _assert_same(observed, expected):
@@ -178,7 +183,8 @@ def test_norm_inject_computes_the_oracle_s_bits(shape, dtype, bits, write, rows)
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 @pytest.mark.parametrize("dtype", sorted(DTYPES))
 @pytest.mark.parametrize("bits", BITS)
-@pytest.mark.parametrize("rows", [1, 64, 65, 130])
+# 186 rows: a last tile of 58 rows (tm 32, both fragment halves, rows past it).
+@pytest.mark.parametrize("rows", [1, 64, 65, 186])
 def test_down_silu_computes_the_oracle_s_bits(shape, dtype, bits, rows):
     hc, hidden, lowrank = SHAPES[shape]
     dtype = DTYPES[dtype]
@@ -195,7 +201,8 @@ def test_down_silu_computes_the_oracle_s_bits(shape, dtype, bits, rows):
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 @pytest.mark.parametrize("dtype", sorted(DTYPES))
 @pytest.mark.parametrize("bits", BITS)
-@pytest.mark.parametrize("rows", [1, 64, 65, 130])
+# 186 rows: a last tile of 58 rows (tm 32, both fragment halves, rows past it).
+@pytest.mark.parametrize("rows", [1, 64, 65, 186])
 def test_up_tail_computes_the_oracle_s_bits(shape, dtype, bits, rows):
     hc, hidden, lowrank = SHAPES[shape]
     dtype = DTYPES[dtype]
