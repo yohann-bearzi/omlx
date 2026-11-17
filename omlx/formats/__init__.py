@@ -433,6 +433,9 @@ def origin(mode: str) -> str | None:
 # The dot() and tile() defects that are logged: a format's mode and the
 # error's repr.
 _DOT_DEFECTS: set[tuple[str, str]] = set()
+# Held to note a defect and learn whether it is new (threads that meet one at
+# once log it once), and by omlx.formats.testing to swap the set.
+_NOTING = threading.Lock()
 
 
 def dot(layer, k: int, n: int) -> Dot | None:
@@ -521,8 +524,11 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, keeps: str):
             )
     except Exception as error:
         defect = (mode, repr(error))
-        if defect not in _DOT_DEFECTS:
-            _DOT_DEFECTS.add(defect)
+        with _NOTING:
+            defects = _DOT_DEFECTS
+            new = defect not in defects
+            defects.add(defect)
+        if new:
             logger.exception(
                 "quant format %s gave no usable %s face for a %s (n=%s, k=%s); %s",
                 mode,

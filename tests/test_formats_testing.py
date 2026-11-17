@@ -12,6 +12,7 @@ import threading
 import weakref
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from unittest.mock import ANY
@@ -849,11 +850,13 @@ def test_a_test_s_patch_of_the_registry_is_undone_into_its_block(monkeypatch, st
     """The block ends after the test's monkeypatch is undone: the next test's
     block replaces the process's registry, not the one a test patched in."""
     if step == "patch":
-        # The process's registry, as this test's block replaced it.
-        _PATCHED[:] = [testing._FRESH_PROOFS.replaced]
+        # The process's registries, as this test's blocks replaced them.
+        _PATCHED[:] = [testing._FRESH_PROOFS.replaced, testing._DEFECTS.replaced]
         monkeypatch.setattr(kernels, "_PROOFS", {})
+        monkeypatch.setattr(formats, "_DOT_DEFECTS", set())
     else:
         assert testing._FRESH_PROOFS.replaced is _PATCHED[0]
+        assert testing._DEFECTS.replaced is _PATCHED[1]
 
 
 class _Refusing(SimpleNamespace):
@@ -948,4 +951,121 @@ def test_a_block_starts_and_ends_under_the_registry_s_lock():
         go.set()
         assert not ended.wait(timeout=0.2)
     assert ended.wait(timeout=30)
+    thread.join(timeout=30)
+
+
+class _Raising(_ToyFormat):
+    """The toy format, with a dot() that fails."""
+
+    def dot(self, layer, k, n):
+        raise RuntimeError("a defect")
+
+
+_DEFECT = ("toy", "RuntimeError('a defect')")
+
+
+def test_threads_that_meet_a_defect_together_log_it_once(monkeypatch, caplog):
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _Raising())
+    together = threading.Barrier(2, timeout=0.5)
+
+    class Together(set):
+        """The defects, read by two threads at once when two ask."""
+
+        def __contains__(self, defect):
+            found = super().__contains__(defect)
+            # A read under the lock has the set alone. Otherwise each
+            # thread reads before either adds (broken when the other does
+            # not come).
+            if not formats._NOTING.locked():
+                with suppress(threading.BrokenBarrierError):
+                    together.wait()
+            return found
+
+    noted = Together()
+    monkeypatch.setattr(formats, "_DOT_DEFECTS", noted)
+    layer, _, _ = _toy_linear(8, 64)
+    caplog.set_level(logging.ERROR, logger=formats.__name__)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        faces = list(pool.map(lambda _: formats.dot(layer, 64, 8), range(2)))
+    assert faces == [None, None] and noted == {_DEFECT}
+    assert len([r for r in caplog.records if r.name == formats.__name__]) == 1
+
+
+def test_blocks_that_admit_no_defect_end_in_any_order_in_any_thread(monkeypatch):
+    """The set is the latest of the blocks still open, for every thread's
+    defects; once they have all ended, the one the first replaced."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _Raising())
+    before = formats._DOT_DEFECTS
+    layer, _, _ = _toy_linear(8, 64)
+    opened, first_ended, seen, errors = (
+        threading.Barrier(2, timeout=30),
+        threading.Event(),
+        {},
+        [],
+    )
+
+    def run(name):
+        try:
+            with testing.no_dot_defects() as defects:
+                seen[name] = defects
+                opened.wait()  # both open, the second the latest
+                if name == "first":
+                    seen["both open"] = formats._DOT_DEFECTS
+                else:
+                    assert first_ended.wait(timeout=30)
+                    seen["after the first"] = formats._DOT_DEFECTS
+                    assert formats.dot(layer, 64, 8) is None
+                    seen["met"] = set(defects)
+                    defects.clear()  # expected
+            if name == "first":
+                first_ended.set()
+        except BaseException as error:  # noqa: BLE001 - raised below, in the test
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=run, args=(name,)) for name in ("first", "second")
+    ]
+    threads[0].start()
+    while "first" not in seen and threads[0].is_alive():
+        threading.Event().wait(0.01)
+    threads[1].start()
+    for thread in threads:
+        thread.join(timeout=60)
+    if errors:
+        raise errors[0]
+    assert seen["both open"] is seen["second"] is seen["after the first"]
+    assert seen["met"] == {_DEFECT}
+    assert not seen["first"] and formats._DOT_DEFECTS is before
+
+
+def test_dot_rows_refuses_operands_beyond_the_face_s():
+    operands, x, _ = _matrix(8, 512)
+    with pytest.raises(ValueError, match="weight, scales; operands given: 3"):
+        testing.dot_rows(_toy("a"), (*operands, operands[1]), x, 8)
+
+
+def test_a_defect_of_another_thread_fails_the_latest_block(monkeypatch):
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _Raising())
+    layer, _, _ = _toy_linear(8, 64)
+    with pytest.raises(AssertionError, match="defective"), testing.no_dot_defects():
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            assert pool.submit(formats.dot, layer, 64, 8).result() is None
+
+
+def test_the_defects_are_swapped_under_the_lock_a_defect_is_noted_under():
+    assert testing._DEFECTS.lock is formats._NOTING
+    started = threading.Event()
+
+    def run():
+        with testing.no_dot_defects():
+            started.set()
+
+    thread = threading.Thread(target=run)
+    with formats._NOTING:
+        thread.start()
+        assert not started.wait(timeout=0.2)
+    assert started.wait(timeout=30)
     thread.join(timeout=30)

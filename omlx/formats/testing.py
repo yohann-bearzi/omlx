@@ -49,13 +49,14 @@ def no_dot_defects():
     of this failure.
 
     The block's value is the set of the defects met so far, each a format's
-    mode and the error's ``repr``. A test that expects one removes it."""
-    defects: set = set()
-    kept, formats._DOT_DEFECTS = formats._DOT_DEFECTS, defects
-    try:
+    mode and the error's ``repr``. A test that expects one removes it.
+
+    The set is the process's while the block is open: the latest block still
+    open takes the defects that any thread meets, and a block opened inside
+    another (in any thread) takes them from the other until it ends. Blocks
+    may end in any order, in any thread, as those of ``fresh_proofs`` do."""
+    with _DEFECTS.block(set()) as defects:
         yield defects
-    finally:
-        formats._DOT_DEFECTS = kept
     if defects:
         raise AssertionError(
             f"a quant format's dot() or tile() is defective: {sorted(defects)}"
@@ -554,9 +555,11 @@ class _Swapped:
     interrupt as a block starts leaves the registry as the blocks still
     open have it."""
 
-    def __init__(self, module, name: str) -> None:
+    def __init__(self, module, name: str, lock=None) -> None:
         self.module, self.name = module, name
-        self.lock = threading.Lock()
+        # Held to swap the registry, and by whoever reads and writes it as
+        # one step.
+        self.lock = threading.Lock() if lock is None else lock
         self.open: list = []  # the open blocks, oldest first, each (registry,)
 
     @contextmanager
@@ -579,6 +582,9 @@ class _Swapped:
 
 
 _FRESH_PROOFS = _Swapped(kernels, "_PROOFS")
+# Swapped under the lock that omlx.formats.dot notes a defect under: a note
+# lands in the set it read, the one of the latest block then open.
+_DEFECTS = _Swapped(formats, "_DOT_DEFECTS", formats._NOTING)
 
 
 @contextmanager
