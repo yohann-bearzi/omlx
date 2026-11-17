@@ -69,6 +69,11 @@ _LOADERS = (
 # What a config holds nothing at (a key it has not), apart from a null.
 _ABSENT = object()
 
+# Held while a format accepts a checkpoint's record: a load's threads (one
+# that copied its context) accept it once, and no two accepts of a format
+# run at once.
+_ACCEPTING = threading.Lock()
+
 # A value of config.json by its JSON type.
 _JSON_TYPES = {
     list: "an array",
@@ -98,7 +103,7 @@ class _Checkpoint:
     the layers built."""
 
     def __init__(self, path) -> None:
-        self.path = Path(path)
+        self.path = Path(path).expanduser()
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
         config = self.path / "config.json"
@@ -111,46 +116,50 @@ class _Checkpoint:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
         what ``fmt.accept`` returns for the record oQ stored (None: ``fmt``
         itself), asked once."""
-        read = self._read.get(fmt.mode)
-        if read is None:
-            plugin = formats.origin(fmt.mode) or "the plugin"
-            record = self._record(fmt.mode)
-            kept = _state(fmt)
-            try:
-                read = fmt.accept(record)
-            except ValueError as error:
-                # The format's own words, on the registered format as it was,
-                # with what oMLX knows of the checkpoint.
-                _restore(fmt, kept)
-                said = error.reason if isinstance(error, FormatRefusedError) else error
-                raise _refused(str(said), fmt.mode, self) from error
-            except Exception:
-                _restore(fmt, kept)
-                raise
-            changed = _changed(fmt, kept)
-            if changed:
-                # The registered format is left as it was for the next load.
-                _restore(fmt, kept)
-                raise _refused(
-                    f"accept changed the registered format ({', '.join(changed)})"
-                    " to accept the checkpoint: accept returns a format "
-                    f"configured from the record instead; report it to {plugin}",
-                    fmt.mode,
-                    self,
-                )
-            read = fmt if read is None else read
-            if not (
-                isinstance(read, formats.QuantFormat)
-                and (read.mode, read.tensors, read.contract)
-                == (fmt.mode, fmt.tensors, fmt.contract)
-            ):
-                raise _refused(
-                    f"accept returned {read!r}, not a format of its mode, "
-                    f"tensors and contract: report it to {plugin}",
-                    fmt.mode,
-                    self,
-                )
-            self._read[fmt.mode] = read
+        with _ACCEPTING:
+            read = self._read.get(fmt.mode)
+            return self._accepted(fmt) if read is None else read
+
+    def _accepted(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
+        """``read`` the first time, under ``_ACCEPTING``."""
+        plugin = formats.origin(fmt.mode) or "the plugin"
+        record = self._record(fmt.mode)
+        kept = _state(fmt)
+        try:
+            read = fmt.accept(record)
+        except ValueError as error:
+            # The format's own words, on the registered format as it was,
+            # with what oMLX knows of the checkpoint.
+            _restore(fmt, kept)
+            said = error.reason if isinstance(error, FormatRefusedError) else error
+            raise _refused(str(said), fmt.mode, self) from error
+        except Exception:
+            _restore(fmt, kept)
+            raise
+        changed = _changed(fmt, kept)
+        if changed:
+            # The registered format is left as it was for the next load.
+            _restore(fmt, kept)
+            raise _refused(
+                f"accept changed the registered format ({', '.join(changed)})"
+                " to accept the checkpoint: accept returns a format "
+                f"configured from the record instead; report it to {plugin}",
+                fmt.mode,
+                self,
+            )
+        read = fmt if read is None else read
+        if not (
+            isinstance(read, formats.QuantFormat)
+            and (read.mode, read.tensors, read.contract)
+            == (fmt.mode, fmt.tensors, fmt.contract)
+        ):
+            raise _refused(
+                f"accept returned {read!r}, not a format of its mode, "
+                f"tensors and contract: report it to {plugin}",
+                fmt.mode,
+                self,
+            )
+        self._read[fmt.mode] = read
         return read
 
     def _written(self, mode: str):
@@ -208,6 +217,10 @@ class _Checkpoint:
         entry of a format's mode in its quantization config that bound no
         layer. A layer it left wholly unfilled is a layer a partial load
         does not hold (a pipeline rank's, a prefill helper's)."""
+        entries = self._format_entries()
+        if not self.built and not entries:
+            # A load of no format's layers: a stock checkpoint's.
+            return
         models = loaded if isinstance(loaded, tuple) else (loaded,)
         paths = {
             id(module): path
@@ -239,6 +252,14 @@ class _Checkpoint:
                 )
             for name, held in placeholders.items():
                 tensor = layer[name]
+                if not isinstance(tensor, mx.array):
+                    raise _refused(
+                        f"the load left {path}.{name} {type(tensor).__name__}, "
+                        "where the format lays out an array: the checkpoint "
+                        "holds tensors under that name",
+                        layer.mode,
+                        self,
+                    )
                 kept = (tuple(tensor.shape), tensor.dtype)
                 if tensor is not held and kept != (tuple(held.shape), held.dtype):
                     raise _refused(
@@ -247,11 +268,11 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-        bound = [paths[id(layer)] for layer in self.built]
-        for path, mode in self._format_entries():
-            # mlx-vlm finds an entry of a language model's layer under the
-            # model's own path, one prefix deeper.
-            if not any(_same_layer(path, held) for held in bound):
+        bound = {paths[id(layer)] for layer in self.built}
+        for path, mode in entries:
+            # mlx-vlm builds a language model's checkpoint inside a model of
+            # its own, under language_model.
+            if path not in bound and f"language_model.{path}" not in bound:
                 raise _refused(
                     f"its quantization config names {path}, and the load built "
                     "no layer of the format there: the model has no such "
@@ -372,11 +393,10 @@ def outside_load() -> Iterator[None]:
         formats._LOADING.reset(token)
 
 
-def _same_layer(entry: str, path: str) -> bool:
-    """Whether a quantization config's ``entry`` names the module at
-    ``path``: the same path, or one nested in a model around it (mlx-vlm's
-    of a language model's checkpoint)."""
-    return entry == path or path.endswith(f".{entry}")
+def _config_of(path) -> Path:
+    """The config file the checkpoint at ``path`` reads (a view of links to
+    a checkpoint's files reads the checkpoint's)."""
+    return (Path(path).expanduser() / "config.json").resolve()
 
 
 @contextmanager
@@ -386,7 +406,7 @@ def loading(path) -> Iterator[_Checkpoint]:
     the same checkpoint (a loader wrapped over the wrapped one) is the
     outer one."""
     outer = formats._LOADING.get()
-    if outer is not None and outer.path.resolve() == Path(path).resolve():
+    if outer is not None and _config_of(outer.path) == _config_of(path):
         yield outer
         return
     checkpoint = _Checkpoint(path)
@@ -586,9 +606,13 @@ def _wrap_loader(module, name: str) -> None:
     first = next(iter(inspect.signature(own).parameters))
 
     def loader(*args, **kwargs):
+        outer = formats._LOADING.get()
         with loading(args[0] if args else kwargs[first]) as checkpoint:
             loaded = own(*args, **kwargs)
-        checkpoint.check(loaded)
+        if checkpoint is not outer:
+            # A load joined to an outer one of the checkpoint is checked by
+            # that one, when it returns.
+            checkpoint.check(loaded)
         return loaded
 
     if not in_place:

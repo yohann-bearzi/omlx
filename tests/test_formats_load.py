@@ -158,8 +158,8 @@ class _Model(nn.Module):
 
 
 def load_model(path, **kwargs):
-    """mlx-lm's loader as the patch leaves it: the function a module bound
-    at its import is the library's own, which builds no layer of a format."""
+    """mlx-lm's loader as the patch leaves it, whichever the test put in its
+    module's name."""
     return mlx_lm.utils.load_model(path, **kwargs)
 
 
@@ -1037,21 +1037,133 @@ def test_a_load_that_fills_a_layer_otherwise_than_its_layout_is_refused(
         assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
 
 
-def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path):
+@pytest.mark.parametrize(
+    "entry",
+    [
+        # A path that is no module of the model, as a family's loader that
+        # renames its modules leaves it.
+        "model.layers.0.mlp.gate",
+        # The end of a path of the model, which the libraries bind nothing
+        # with: an entry names a module by its whole path.
+        "gate_proj",
+        "mlp.gate_proj",
+    ],
+)
+def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path, entry):
     _llama(tmp_path, **_written({}))
     config = json.loads((tmp_path / "config.json").read_text())
-    # A path that is no module of the model, as a family's loader that
-    # renames its modules leaves it.
-    config["quantization"]["model.layers.0.mlp.gate"] = _TOY
+    config["quantization"][entry] = _TOY
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path, strict=False)
     assert str(refusal.value) == _refusal(
-        "its quantization config names model.layers.0.mlp.gate, and the load "
-        "built no layer of the format there: the model has no such module, or "
-        "its family's loader renames it",
+        f"its quantization config names {entry}, and the load built no layer "
+        "of the format there: the model has no such module, or its family's "
+        "loader renames it",
         tmp_path,
     )
+
+
+def test_a_format_entry_of_a_load_that_built_no_layer_is_refused(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    del config["quantization"][_GATE]
+    config["quantization"]["model.layers.0.mlp.gate"] = _TOY
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.scales"))
+    with pytest.raises(
+        formats.FormatRefusedError, match="names model.layers.0.mlp.gate,"
+    ):
+        load_model(tmp_path, strict=False)
+
+
+def test_a_load_that_leaves_no_array_where_the_layout_has_one_is_refused(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    # Tensors nested under the layout's name: MLX's partial load puts a
+    # list there.
+    _rewritten(
+        tmp_path,
+        lambda weights: weights.update(
+            {f"{_GATE}.scales.0": weights.pop(f"{_GATE}.scales")}
+        ),
+    )
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(tmp_path, strict=False)
+    assert refusal.value.reason == (
+        f"the load left {_GATE}.scales list, where the format lays out an array: "
+        "the checkpoint holds tensors under that name"
+    )
+
+
+def test_a_stock_load_is_not_walked(toy, tmp_path, monkeypatch):
+    _llama(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    del config["quantization"][_GATE]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.scales"))
+
+    def walked(self):
+        raise AssertionError("a stock load's model walked")
+
+    monkeypatch.setattr(nn.Module, "named_modules", walked)
+    load_model(tmp_path, strict=False)
+
+
+def test_a_load_joined_to_an_outer_one_leaves_it_the_check(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    with format_load.loading(tmp_path) as outer:
+        # The outer load builds a layer of its own model before the inner
+        # one: the inner load's model has no such layer, and is not refused.
+        own = nn.Linear(64, 128).to_quantized(**_TOY)
+        model, _ = load_model(tmp_path, strict=True)
+    assert own in outer.built and _gate_proj(model) in outer.built
+
+
+def test_a_load_under_home_or_in_a_view_joins_the_checkpoint_s(
+    toy, tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    (home / "tiny").mkdir(parents=True)
+    _llama(home / "tiny", **_written({}))
+    monkeypatch.setenv("HOME", str(home))
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").symlink_to(home / "tiny" / "config.json")
+    with format_load.loading(home / "tiny") as outer:
+        for path in ("~/tiny", view):
+            with format_load.loading(path) as inner:
+                assert inner is outer
+    assert format_load._Checkpoint("~/tiny").path == home / "tiny"
+
+
+def test_a_load_s_threads_accept_its_record_once(toy, tmp_path):
+    import contextvars
+    import time
+
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+    accepted = []
+
+    def accept(record):
+        accepted.append(record)
+        # Long enough for the other thread to ask meanwhile.
+        time.sleep(0.2)
+
+    toy.accept = accept
+    built = []
+    with format_load.loading(tmp_path):
+        # Threads that copied the load's context (asyncio.to_thread's).
+        threads = [
+            threading.Thread(
+                target=contextvars.copy_context().run,
+                args=(lambda: built.append(nn.Linear(64, 128).to_quantized(**_TOY)),),
+            )
+            for _ in range(2)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+    assert len(built) == 2 and accepted == [{"levels": [1.0]}]
 
 
 def _without_gate(tmp_path):
@@ -1128,6 +1240,7 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "speculative/vlm_mtp.py",
         "models/embedding.py",
         "models/reranker.py",
+        "oq.py",
     ):
         tree = ast.parse((root / file).read_text())
         calls[file] = sum(
@@ -1140,7 +1253,8 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
     # decision wrappers, a causal reranker), the VLM engine, the cluster's
     # loads after pipeline() (one rank's, and both progressive strategies),
     # a prefill helper after keep_first, both drafters, the embedding
-    # model's three loads and the reranker's.
+    # model's three loads and the reranker's, oQ's three of mlx-vlm (its
+    # calibration and both sensitivity measures).
     assert calls == {
         "utils/model_loading.py": 1,
         "engine/vlm.py": 1,
@@ -1151,6 +1265,7 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "speculative/vlm_mtp.py": 1,
         "models/embedding.py": 3,
         "models/reranker.py": 1,
+        "oq.py": 3,
     }
 
 
@@ -1501,6 +1616,34 @@ def test_oq_s_calibration_reads_the_record_of_its_source(levels, tmp_path):
     config = json.loads((path / "config.json").read_text())
     model, _ = oq._calibration_model(str(path), config)
     assert _gate_proj(model).fmt.levels == (14.0,)
+
+
+@pytest.mark.parametrize("load", ["calibration", "sensitivity", "proxy"])
+def test_oq_s_vlm_loads_refuse_a_layer_they_left_unfilled(
+    levels, tmp_path, monkeypatch, load
+):
+    from omlx import oq
+
+    path = _tiny(tmp_path / "source", [14.0])
+    _rewritten(
+        path,
+        lambda weights: [
+            weights.pop(f"{_GATE}.{name}") for name in ("weight", "scales")
+        ],
+    )
+    config = json.loads((path / "config.json").read_text())
+    monkeypatch.setattr(oq, "_is_vlm_load", lambda config: True)
+    calls = {
+        "calibration": lambda: oq._calibration_model(str(path), config),
+        "sensitivity": lambda: oq._measure_sensitivity(str(path), config, 4),
+        "proxy": lambda: oq._measure_sensitivity_from_quantized_model(
+            str(path), config, 4
+        ),
+    }
+    # A partial load leaves the layer: oQ's own load refuses it, and lets the
+    # refusal through as it is.
+    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+        calls[load]()
 
 
 def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkeypatch):
