@@ -13,6 +13,7 @@ import re
 import sys
 import textwrap
 import threading
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -244,9 +245,17 @@ def test_a_stack_s_runs_are_let_go_one_by_one(toy, monkeypatch):
     evaluate = mx.eval
 
     def evaluated(*arrays):
-        if answers and any(a is t for a in arrays for t in answers[-1].values()):
+        # Every tensor of the run's answer.
+        if answers and all(any(a is t for a in arrays) for t in answers[-1].values()):
             events.append("eval")
         return evaluate(*arrays)
+
+    chunks = oq._row_chunks_with_bounds
+
+    def read(t, max_elems):
+        for chunk in chunks(t, max_elems):
+            events.append("read")
+            yield chunk
 
     def recorded(name, call):
         def record():
@@ -256,14 +265,12 @@ def test_a_stack_s_runs_are_let_go_one_by_one(toy, monkeypatch):
         return record
 
     monkeypatch.setattr(mx, "eval", evaluated)
+    monkeypatch.setattr(oq, "_row_chunks_with_bounds", read)
     for name in ("synchronize", "clear_cache"):
         monkeypatch.setattr(mx, name, recorded(name, getattr(mx, name)))
     w = _weights(5, 8, 64)
     oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
-    # Then the join hands its runs' cache back.
-    assert events == ["encode", "eval", "synchronize", "clear_cache"] * 3 + [
-        "clear_cache"
-    ]
+    assert events == ["read", "encode", "eval", "synchronize", "clear_cache"] * 3
 
 
 def test_a_run_holds_at_most_a_launch_s_weights(toy, monkeypatch):
@@ -299,31 +306,27 @@ def test_runs_are_counted_in_matrices_of_any_shape(toy, monkeypatch):
 def test_an_empty_matrix_or_stack_is_not_offered(toy, shape):
     w = mx.zeros(shape)
     assert oq._encode_in_format(toy, "a.weight", w, mx.ones((64,)), 4, 64) is None
-    assert toy.encoded == []
+    # Not asked of the format: its layout may divide by an axis.
+    assert toy.offered == [] and toy.encoded == []
 
 
 def test_a_name_s_runs_are_let_go_once_it_is_joined(toy, monkeypatch):
-    """Joining a stack's runs name by name, a name's run tensors are let go
-    once that name is joined: the next join does not hold them too."""
+    """A stack's runs are joined name by name, each name's run tensors held
+    by its own join alone: evaluating it lets them go."""
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", _matrix_bytes(64, 512))
-    concatenate, active = mx.concatenate, []
-
-    def measured(arrays, *args, **kwargs):
-        mx.synchronize()
-        active.append(mx.get_active_memory())
-        return concatenate(arrays, *args, **kwargs)
-
-    monkeypatch.setattr(mx, "concatenate", measured)
     w = _weights(4, 64, 512)
-    oq._encode_in_format(toy, "experts.weight", w, mx.ones((512,)), 4, 64)
-    # The codes, a byte a weight, joined and their runs let go: as much held
-    # when the scales are joined as when the codes were.
-    assert len(active) == 2 and active[1] - active[0] < 4 * 64 * 512 // 2
+    kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((512,)), 4, 64)
+    mx.synchronize()
+    before = mx.get_active_memory()
+    mx.eval(kept["weight"])
+    mx.synchronize()
+    # The codes, a byte a weight, joined and their runs let go: as much held.
+    assert mx.get_active_memory() - before < 4 * 64 * 512 // 2
 
 
 def test_a_stack_in_one_run_is_kept_as_it_was_encoded(toy):
     """A stack that one run holds is not joined: oQ keeps the tensors the
-    format gave, no copy."""
+    format gave."""
     answers = []
     toy.answer = lambda tensors, w: answers.append(tensors) or tensors
     w = _weights(3, 8, 64)
@@ -334,24 +337,68 @@ def test_a_stack_in_one_run_is_kept_as_it_was_encoded(toy):
 
 def test_rows_are_cut_from_a_tensor_of_no_rows_or_of_empty_rows():
     """oQ's row chunks (its affine writer's and a format's runs): none of a
-    tensor without rows, one of a tensor whose rows are empty."""
+    tensor without rows; of a tensor whose rows are empty, each row counts
+    one element."""
     assert list(oq._row_chunks_with_bounds(mx.zeros((0, 4)), 8)) == []
-    chunks = oq._row_chunks_with_bounds(mx.zeros((3, 0)), 8)
+    chunks = oq._row_chunks_with_bounds(mx.zeros((3, 0)), 3)
     assert [(r0, r1, chunk.shape) for r0, r1, chunk in chunks] == [(0, 3, (3, 0))]
+    chunks = oq._row_chunks_with_bounds(mx.zeros((3, 0)), 2)
+    assert [(r0, r1) for r0, r1, _ in chunks] == [(0, 2), (2, 3)]
 
 
-def test_a_stack_s_runs_are_joined_evaluated(toy, monkeypatch):
-    """The writer keeps a layer's tensors until its shard is saved: they are
-    joined here, evaluated, not left a graph over every run's tensors."""
-    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 2 * _matrix_bytes(8, 64))
-    w = _weights(5, 8, 64)
-    kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
-    assert len(toy.encoded) == 3
-    mx.synchronize()
-    mx.reset_peak_memory()
-    mx.eval(*kept.values())
-    # Nothing is left to compute, so nothing is allocated.
-    assert mx.get_peak_memory() < sum(tensor.nbytes for tensor in kept.values())
+def test_a_stack_s_join_is_evaluated_once_the_writer_lets_its_source_go(
+    source, toy, tmp_path, monkeypatch
+):
+    """The writer keeps a layer's tensors until its shard is saved: it
+    evaluates a stack's joined tensors, one name at a time, once it has let
+    the source stack go, so that a join does not overlap it, and waits for
+    the GPU after each, so that its runs go before the next; the format's
+    encoding returns them unevaluated."""
+    # Runs of one matrix: every stack of experts is joined.
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 16)
+    encode, evaluate, joins, evaluated = oq._encode_in_format, mx.eval, {}, []
+    synchronize, events = mx.synchronize, []
+    # What is evaluated while the format encodes; held for that call alone,
+    # so that nothing here keeps the source alive.
+    window = []
+
+    def watched(*arrays):
+        if window:
+            window[-1].append(arrays)
+        events.append("eval")
+        for array in arrays:
+            joined = joins.get(id(array))
+            if joined is not None and joined[0] is array:
+                evaluated.append((len(arrays), joined[1]() is None))
+                events[-1] = "join"
+        return evaluate(*arrays)
+
+    def synchronized(*args, **kwargs):
+        events.append("synchronize")
+        return synchronize(*args, **kwargs)
+
+    def encoding(fmt, tensor_name, w, *args):
+        window.append([])
+        runs = len(toy.encoded)
+        tensors = encode(fmt, tensor_name, w, *args)
+        during = window.pop()
+        if tensors is not None and len(toy.encoded) - runs > 1:
+            for tensor in tensors.values():
+                # Not evaluated while the source is held.
+                assert not any(tensor is a for arrays in during for a in arrays)
+                joins[id(tensor)] = (tensor, weakref.ref(w))
+        return tensors
+
+    monkeypatch.setattr(oq, "_encode_in_format", encoding)
+    monkeypatch.setattr(mx, "eval", watched)
+    monkeypatch.setattr(mx, "synchronize", synchronized)
+    _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
+    # Each alone, each once the source stack is gone, each once.
+    assert evaluated and set(evaluated) == {(1, True)}
+    assert len(evaluated) == len(joins)
+    # A join's runs are let go before anything else is evaluated.
+    after = [events[i + 1] for i, event in enumerate(events) if event == "join"]
+    assert after == ["synchronize"] * len(joins)
 
 
 def test_a_matrix_the_format_lays_out_none_of_is_not_offered(toy):
@@ -1371,9 +1418,11 @@ def test_the_record_names_the_contract_the_format_states(
 ):
     """A checkpoint keeps the revision of the contract its format states,
     not the newest this oMLX knows."""
-    monkeypatch.setattr(formats, "CONTRACT", formats.CONTRACT + 1)
+    # A revision between the oldest and the newest: neither is written for it.
+    monkeypatch.setattr(formats, "CONTRACT", 3)
+    monkeypatch.setattr(toy, "contract", 2)
     _, config, _ = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
-    assert config[_RECORD]["toy"]["contract"] == toy.contract
+    assert config[_RECORD]["toy"]["contract"] == 2
 
 
 _CYCLE: dict = {}

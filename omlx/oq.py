@@ -7121,6 +7121,17 @@ def _loads_as_laid_out(fmt, reader, tensor_name, shape, bits, group_size):
         )
 
 
+def _encodable(shape) -> bool:
+    """Whether oQ asks a format of a tensor of ``shape``: a matrix, or a
+    stack of matrices, not empty, each matrix within one launch
+    (_LAUNCH_WEIGHTS)."""
+    return (
+        len(shape) in (2, 3)
+        and math.prod(shape) > 0
+        and shape[-2] * shape[-1] <= _LAUNCH_WEIGHTS
+    )
+
+
 def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
@@ -7130,19 +7141,18 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
     Metal buffer. A stack is encoded in runs of whole matrices, each run
     within _LAUNCH_WEIGHTS and its input and tensors within
     ``_QUANTIZE_CHUNK_BYTES`` in their own dtypes, and the runs' tensors are
-    joined here and evaluated. The tensors are checked
+    joined here, lazily: the writer evaluates the joins once it has let the
+    source go. The tensors are checked
     against the format's layout, which is what a checkpoint loads by."""
     from . import formats
 
+    if not _encodable(w.shape):
+        # Not asked of the format.
+        return None
     *stack, n, k = w.shape
     count = stack[0] if stack else 1
     layout = fmt.layout(k, n, bits, group_size)
-    if (
-        layout is None
-        or len(stack) > 1
-        or n * k > _LAUNCH_WEIGHTS
-        or count * n * k == 0
-    ):
+    if layout is None:
         return None
     formats.check_layout(fmt, n, k, layout)
     # What one matrix holds while it is encoded: its input, and its tensors.
@@ -7191,14 +7201,9 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
         mx.clear_cache()
     if len(parts) == 1:
         return parts[0]
-    # The writer keeps a layer's tensors until its shard is saved: evaluated,
-    # they hold no run; each name's run tensors are let go once it is joined.
-    joined = {}
-    for name in layout:
-        joined[name] = mx.concatenate([part.pop(name) for part in parts])
-        mx.eval(joined[name])
-    mx.clear_cache()
-    return joined
+    # Joined lazily, each name's runs held by its own join alone: the writer
+    # evaluates the joins once it has let the source go.
+    return {name: mx.concatenate([part[name] for part in parts]) for name in layout}
 
 
 def _quantize_chunked(w, group_size, bits, mode, importance=None):
@@ -7553,7 +7558,7 @@ def _format_offer(run: _OQRun, tensor_name: str, shape, bits, gs, qmode) -> _Off
             if held is None or held[2] != tuple(shape):
                 unwalked = grouped
             elif held[1]:
-                offered = True
+                offered = _encodable(shape)
             elif grouped:
                 unloaded = held[0]
     return _Offer(grouped, importance, looked_up, base, offered, unwalked, unloaded)
@@ -8530,7 +8535,8 @@ def quantize_oq_streaming(
         )
     _calibrate_oq_run(run)
     _plan_oq_run(run)
-    all_weights = run.get("all_weights")
+    # The writer's alone: its del below lets the source's index go.
+    all_weights = run.pop("all_weights")
     base_bits = run.get("base_bits")
     cast_predicate = run.get("cast_predicate")
     cb = run.get("cb")
@@ -8595,6 +8601,7 @@ def quantize_oq_streaming(
         # Pre-quantized source tensor at or below the target precision:
         # emit the packed mxfp4/mxfp8 form unchanged (no dequant-requant).
         handled_packed = False
+        encoded = None
         src_info = _kept_packed(run, all_weights, tensor_name)
         if src_info is not None:
             qw, scales = all_weights.pop_packed(tensor_name)
@@ -8640,7 +8647,6 @@ def quantize_oq_streaming(
                 bits, gs, qmode = quantized
                 offer = _format_offer(run, tensor_name, shape, bits, gs, qmode)
                 grouped, importance, looked_up, base = offer[:4]
-                encoded = None
                 if offer.offered:
                     _loads_as_laid_out(quant_fmt, reader, tensor_name, shape, bits, gs)
                     encoded = _encode_in_format(
@@ -8703,6 +8709,18 @@ def quantize_oq_streaming(
                 out_shard_data[tensor_name] = w_mx
 
             del w_mx
+            if encoded is not None:
+                # A format's joined tensors, evaluated name by name once the
+                # source stack is let go (the GPU done with it, its buffer
+                # out of MLX's cache): a join does not overlap it, and each
+                # name's runs go before the next name is joined. The shard
+                # then holds the tensors alone.
+                mx.synchronize()
+                mx.clear_cache()
+                for tensor in encoded.values():
+                    mx.eval(tensor)
+                    mx.synchronize()
+                encoded = None
 
         current_bytes = sum(v.nbytes for v in out_shard_data.values())
         if current_bytes >= _MAX_SHARD_BYTES:
