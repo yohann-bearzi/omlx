@@ -1608,6 +1608,38 @@ class TestVLMFallback:
         assert excinfo.value.__cause__ is refusal
 
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("first_fails", [False, True], ids=["first", "fallback"])
+    async def test_a_load_hook_that_cannot_wrap_fails_every_load(
+        self, small_mock_model_dir, first_fails
+    ):
+        """oMLX's load hook unable to wrap a library's loader: no other
+        library's load runs after it."""
+        from omlx.formats import LoadHookError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        error = LoadHookError("mlx_vlm.utils.load_model is a partial")
+        first, second = MagicMock(), MagicMock()
+        first.start = AsyncMock(
+            side_effect=error if first_fails else TypeError("ModelArgs mismatch")
+        )
+        first.stop = AsyncMock()
+        second.start = AsyncMock(side_effect=error)
+        with (
+            patch("omlx.engine_pool.VLMBatchedEngine", return_value=first),
+            patch("omlx.engine_pool.BatchedEngine", return_value=second),
+            pytest.raises(ModelUnavailableError) as excinfo,
+        ):
+            await pool._load_engine("model-a")
+
+        assert excinfo.value.__cause__ is error
+        assert second.start.await_count == (0 if first_fails else 1)
+
+
 class TestEnginePoolLRU:
     """Tests for LRU eviction logic."""
 

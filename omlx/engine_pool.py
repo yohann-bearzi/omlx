@@ -67,7 +67,7 @@ from .exceptions import (
     describe_ceiling_binding,
     is_metal_out_of_memory,
 )
-from .formats import FormatRefusedError
+from .formats import FormatRefusedError, LoadHookError
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     detect_model_type,
@@ -4353,7 +4353,7 @@ class EnginePool:
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
                     raise
-                if isinstance(start_error, FormatRefusedError):
+                if isinstance(start_error, (FormatRefusedError, LoadHookError)):
                     # A checkpoint's quant format refused: the other library
                     # would load the same layers and meet the same refusal.
                     raise
@@ -4386,7 +4386,9 @@ class EnginePool:
                     try:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
-                        if isinstance(fallback_error, FormatRefusedError):
+                        if isinstance(
+                            fallback_error, (FormatRefusedError, LoadHookError)
+                        ):
                             # The other library's load of it was refused.
                             raise
                         raise RuntimeError(
@@ -4425,7 +4427,9 @@ class EnginePool:
                     try:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
-                        if isinstance(fallback_error, FormatRefusedError):
+                        if isinstance(
+                            fallback_error, (FormatRefusedError, LoadHookError)
+                        ):
                             # The other library's load of it was refused.
                             raise
                         raise RuntimeError(

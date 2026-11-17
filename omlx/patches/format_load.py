@@ -52,7 +52,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
-from ..formats import FormatRefusedError
+from ..formats import FormatRefusedError, LoadHookError
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 
 # The modules whose SwitchLinear holds a stack of matrices, (E, N, K).
@@ -550,6 +550,11 @@ def _unwrapped_loader() -> str | None:
     while frame is not None:
         found = (frame.f_globals.get("__name__"), frame.f_code.co_name)
         if found in _LOADERS:
+            caller = frame.f_back
+            if caller is not None and caller.f_code in _LOADER_CODES:
+                # The wrapped one, run by this patch's loader: the layer was
+                # built outside its load (a family's outside_load).
+                return None
             return ".".join(found)
         frame = frame.f_back
     return None
@@ -665,6 +670,23 @@ def _through(*args, _omlx_loader, **kwargs):
     return _omlx_loader(*args, **kwargs)
 
 
+# The code of the loaders this patch puts in a module's name.
+_LOADER_CODES: set = set()
+
+
+def _wrapped_already(load) -> bool:
+    """Whether ``load``, or a function it wraps (``__wrapped__``), is this
+    patch's loader."""
+    seen = set()
+    while load is not None and id(load) not in seen:
+        seen.add(id(load))
+        code = getattr(load, "__code__", None)
+        if code is _through.__code__ or code in _LOADER_CODES:
+            return True
+        load = getattr(load, "__wrapped__", None)
+    return False
+
+
 def _wrap_loader(module, name: str) -> None:
     """Wrap the function ``module.name``. The library's own is wrapped in
     place: the function object takes ``_through``'s code, so that a name it
@@ -674,13 +696,14 @@ def _wrap_loader(module, name: str) -> None:
     the library's before the patch): the module's name for it is."""
     load = getattr(module, name)
     if not isinstance(load, types.FunctionType):
-        raise TypeError(
+        raise LoadHookError(
             f"{module.__name__}.{name} is a {type(load).__name__}, not a Python "
             "function: oMLX's load hook cannot wrap it; this version of the "
             "library needs omlx/patches/format_load.py updated for it"
         )
-    if load.__code__ is _through.__code__:
-        # Wrapped in place already: the module found again, once more pending.
+    if _wrapped_already(load):
+        # The module found again, once more pending: its loader is this
+        # patch's, or a family's put over it (K2 Horizon's).
         return
     in_place = load.__closure__ is None
     own = load
@@ -704,6 +727,7 @@ def _wrap_loader(module, name: str) -> None:
             checkpoint.check(loaded)
         return loaded
 
+    _LOADER_CODES.add(loader.__code__)
     if not in_place:
         update_wrapper(loader, load)
         loader._omlx_format_load = True

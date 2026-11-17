@@ -50,6 +50,7 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
+from ..formats import LoadHookError
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -2006,7 +2007,9 @@ class VLMBatchedEngine(BaseEngine):
                     model_settings=self._model_settings,
                     for_vlm=True,
                 )
-            except ValueError:
+            except (ValueError, LoadHookError):
+                # A refusal, or oMLX's load hook unable to wrap the library's
+                # loader: every load fails with it.
                 raise
             except Exception as e:
                 logger.debug(f"pre-load patches skipped: {e}")

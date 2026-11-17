@@ -362,6 +362,11 @@ class QuantFormat:
         return self
 
 
+class LoadHookError(TypeError):
+    """oMLX's load hook cannot wrap a library's loader of this version (it is
+    no Python function): every load fails with it, no fallback load runs."""
+
+
 class FormatRefusedError(ValueError):
     """oMLX refuses a quant format's layers, for ``reason``, and says what it
     knows of them: the ``mode``, the checkpoint at ``path`` (None for a
