@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import io
+import logging
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -22,10 +23,12 @@ import pytest
 
 import omlx.patches.m5_gather_qmm as patch_mod
 import omlx.patches.m5_gather_qmm_nax as nax
+from omlx.formats import affine as affine_format
 from omlx.patches import mlx_vlm_minimax_m3_compat as minimax_compat
 from omlx.patches import moe_gate_up_fusion as fusion
 from omlx.patches.m5_gather_qmm import apply_m5_gather_qmm_workaround
 from omlx.patches.moe_routes import sort_routes
+from tests.test_formats_tile import _TOY, _toy, _toy_decode, _toy_matrix
 
 
 def _on_nax() -> bool:
@@ -228,6 +231,124 @@ def test_bit_identical_to_stock_sorted_kernel(mode, bits, gs, dtype, plan, K):
     ref = _stock_sorted(x, wq, scales, biases, idx, mode, bits, gs)
     assert out.shape == ref.shape and out.dtype == ref.dtype
     assert mx.array_equal(out, ref).item()
+
+
+# ---------------------------------------------------------------------------
+# Any tile face (docs/quant-formats.md, The tile face)
+# ---------------------------------------------------------------------------
+
+
+def _toy_stack(E, N, K, dtype, seed):
+    """The page's toy face over a stack of E matrices of N rows: its
+    operands, and its weights as MLX's dense gather multiplies them."""
+    codes, group_scales, row_scales = _toy_matrix(E * N, K, seed=seed)
+    operands = (
+        codes.reshape(E, N, K),
+        group_scales.reshape(E, N, -1),
+        row_scales.reshape(E, N),
+    )
+    w = _toy_decode(codes, group_scales, row_scales).reshape(E, N, K)
+    return operands, w.astype(dtype)
+
+
+@needs_nax
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("plan", _PLANS, ids=_plan_id)
+# Whole K steps, a 64-deep K tail after 128-deep steps, 32-deep tails
+# (K 96, 544) with a ragged N (96).
+@pytest.mark.parametrize("K, N", [(256, 128), (320, 128), (96, 96), (544, 128)])
+def test_a_tile_face_runs_through_the_sorted_gather(K, N, plan, dtype):
+    """Not affine's bits alone: the toy face through the plain kernel is MLX's
+    sorted gather_mm over the face's weights rounded to the activations'
+    type, bit for bit (TILE-MEASURE.md, TM8)."""
+    if plan.sched == DB and (K % 64 or N % 64 or plan.bk != 64):
+        plan = plan._replace(sched=SEG)  # as sorted_gather_qmm does
+    E = len(_COUNTS)
+    operands, w = _toy_stack(E, N, K, dtype, seed=K + N)
+    x, idx = _rows(_COUNTS, K, dtype)
+    face = _toy("nax")
+    out = nax._launch_face(nax._face_kernel(face), x, operands, idx, plan, None)
+    ref = mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=idx, sorted_indices=True)
+    assert out.shape == ref.shape == (int(idx.shape[0]), 1, N)
+    assert out.dtype == dtype
+    _assert_bitwise(out, ref)
+
+
+@needs_nax
+def test_a_tile_face_that_breaks_a_rule_fails_the_gather_with_that_rule():
+    broken = _toy("nax_run16", _TOY.replace("RUN = 8;", "RUN = 16;"))
+    operands, _ = _toy_stack(len(_COUNTS), 128, 256, mx.bfloat16, seed=3)
+    x, idx = _rows(_COUNTS, 256, mx.bfloat16)
+    kernel = nax._face_kernel(broken)
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(nax._launch_face(kernel, x, operands, idx, _PLANS[1], None))
+    message = str(failure.value)
+    assert "tile face: Runs<K>::RUN must be 8" in message
+    assert message.count("error:") == 1
+
+
+def test_one_kernel_per_tile_face(monkeypatch):
+    monkeypatch.setattr(nax, "_kernels", {})
+    built = []
+    face_kernel = nax._face_kernel
+
+    def counted(face):
+        built.append(face)
+        return face_kernel(face)
+
+    monkeypatch.setattr(nax, "_face_kernel", counted)
+    b4 = nax._affine_kernel(4, 64, mx.bfloat16)
+    assert b4 is not None and nax._affine_kernel(4, 64, mx.bfloat16) is b4
+    others = [
+        nax._affine_kernel(8, 64, mx.bfloat16),
+        nax._affine_kernel(4, 32, mx.bfloat16),
+        nax._affine_kernel(4, 64, mx.float16),
+    ]
+    assert len({id(k) for k in [b4, *others]}) == 4
+    # Each affine kernel is the kernel over its layout's tile face, built
+    # once; a face's kernel is found by the face.
+    assert built == [
+        affine_format.tile_face(4, 64, mx.bfloat16),
+        affine_format.tile_face(8, 64, mx.bfloat16),
+        affine_format.tile_face(4, 32, mx.bfloat16),
+        affine_format.tile_face(4, 64, mx.float16),
+    ]
+    assert face_kernel(affine_format.tile_face(4, 64, mx.bfloat16)) is b4
+    toy = face_kernel(_toy("nax_kernel"))
+    assert toy is face_kernel(_toy("nax_kernel")) and toy is not b4
+
+
+def test_without_mlx_s_headers_no_kernel_over_a_face_is_built(monkeypatch, caplog):
+    monkeypatch.setattr(nax, "_kernels", {})
+    monkeypatch.setattr(nax, "_header_failed", False)
+    monkeypatch.setattr(nax, "_read_mlx_headers", lambda paths: None)
+    with caplog.at_level(logging.WARNING, logger=nax.__name__):
+        assert nax._face_kernel(_toy("nax_headers")) is None
+        assert nax._affine_kernel(4, 64, mx.bfloat16) is None
+    # Said once: the module's sorted gathers are off from then on.
+    (record,) = caplog.records
+    assert record.getMessage().endswith("NAX sorted gather_qmm disabled")
+    assert nax._header_failed and nax._kernels == {}
+
+
+def test_the_plain_affine_kernel_reads_the_affine_tile_face(monkeypatch):
+    monkeypatch.setattr(nax, "_kernels", {})
+    faces = []
+    face_kernel = nax._face_kernel
+    monkeypatch.setattr(
+        nax, "_face_kernel", lambda face: faces.append(face) or face_kernel(face)
+    )
+    E, N, K = len(_COUNTS), 128, 256
+    for bits, gs, dtype in [(4, 64, mx.bfloat16), (8, 32, mx.float16)]:
+        wq, scales, biases, _ = _quantized(E, N, K, "affine", bits, gs, dtype)
+        x, idx = _rows(_COUNTS, K, dtype)
+        nax.sorted_gather_qmm(
+            x, wq, scales, biases, idx, group_size=gs, bits=bits, verify=False
+        )
+    assert faces == [
+        affine_format.tile_face(4, 64, mx.bfloat16),
+        affine_format.tile_face(8, 32, mx.float16),
+    ]
 
 
 @needs_nax
