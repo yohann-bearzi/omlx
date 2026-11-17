@@ -151,6 +151,43 @@ def _rows(
     )[0]
 
 
+class _Pairs(NamedTuple):
+    """How a stack's launch pairs the rows of x with the indices."""
+
+    pairs: int
+    per_row: int  # the matrices of a row of x: its indices, or 1 if broadcast
+    batch: tuple  # the leading axes of the result, ahead of x's rows (M) and N
+    as_they_are: bool  # each row of x meets its own run of experts
+
+
+def _pairs(k: int, x, indices) -> _Pairs | None:
+    """How a stack's launch pairs ``x`` (rows of K in any shape) with
+    ``indices``, from their shapes alone; None when there is no pair."""
+    if not indices.size * x.size:
+        return None
+    shape, batch = x.shape, indices.shape
+    lead, m = shape[:-2], shape[-2]
+    own = len(lead)  # x's leading axes ahead of its trailing ones of 1
+    while own and lead[own - 1] == 1:
+        own -= 1
+    # Each row of x meets its own run of experts: nothing is broadcast, in
+    # memory or in shape. MLX binds indices of no axis as a scalar.
+    as_they_are = m == 1 and len(batch) == len(lead) > 0 and batch[:own] == lead[:own]
+    if as_they_are:
+        pairs = indices.size
+        return _Pairs(pairs, pairs // (x.size // k), batch, True)
+    batch = mx.broadcast_shapes(lead, batch)
+    return _Pairs(math.prod(batch) * m, 1, batch, False)
+
+
+def _metal(x, pairs: _Pairs | None = None):
+    """What a launch's Metal is instantiated with beside its proof's key:
+    x's type, and for a stack the pairs of a row of x and whether there are
+    fewer than 8 pairs (MLX binds fewer than 8 indices as constants: other
+    Metal)."""
+    return x.dtype if pairs is None else (x.dtype, pairs.per_row, pairs.pairs < 8)
+
+
 def _linear(kernel, k: int, n: int, x):
     """A matrix's launch for ``x``: what its Metal is instantiated with
     beside the proof's key, and its graph, from ``x`` and the operands.
@@ -160,7 +197,7 @@ def _linear(kernel, k: int, n: int, x):
     def graph(x, *operands):
         return _rows(kernel, k, n, x, operands, pairs, shape)
 
-    return x.dtype, graph
+    return _metal(x), graph
 
 
 def _linear_stand_in(plan: _Plan, metal):
@@ -182,25 +219,12 @@ def _switch(kernel, k: int, n: int, x, indices):
     matrix's, with the indices ahead of the operands; None when there is no
     pair to launch, or more than a grid takes. A negative index counts from
     the stack's end, as MLX's indexing does."""
-    if not indices.size * x.size:
-        return None
-    shape, batch = x.shape, indices.shape
-    lead, m = shape[:-2], shape[-2]
-    own = len(lead)  # x's leading axes ahead of its trailing ones of 1
-    while own and lead[own - 1] == 1:
-        own -= 1
-    # Each row of x meets its own run of experts: nothing is broadcast, in
-    # memory or in shape. MLX binds indices of no axis as a scalar.
-    as_they_are = m == 1 and len(batch) == len(lead) > 0 and batch[:own] == lead[:own]
-    if as_they_are:
-        pairs = indices.size
-        per_row = pairs // (x.size // k)
-    else:
-        batch = mx.broadcast_shapes(lead, batch)
-        pairs, per_row = math.prod(batch) * m, 1
+    paired = _pairs(k, x, indices)
     # MLX's grid is int32, of 2 rows of threadgroups a pair.
-    if pairs >= 2**30:
+    if paired is None or paired.pairs >= 2**30:
         return None
+    pairs, per_row, batch, as_they_are = paired
+    m = x.shape[-2]
     shape = (*batch, m, n)
 
     def graph(x, indices, *operands):
@@ -210,8 +234,7 @@ def _switch(kernel, k: int, n: int, x, indices):
         rhs = _wrapped(indices, operands[0].shape[0]).astype(mx.uint32)
         return _rows(kernel, k, n, x, operands, pairs, shape, rhs, per_row)
 
-    # MLX binds fewer than 8 indices as constants: other Metal.
-    return (x.dtype, per_row, pairs < 8), graph
+    return _metal(x, paired), graph
 
 
 def _wrapped(indices, matrices: int):

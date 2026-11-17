@@ -4,7 +4,7 @@ oMLX's kernels are built from, outside any model, and ``tile_rows`` reads
 every weight of rows through a tile face. ``staged_tables`` reads a face's
 tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
-which format layers' calls ran their face, and which the format's decode.
+where format layers' rows ran: their face's launch, or the format's decode.
 
 Nothing here is imported by the layers or the kernels: what a check needs of
 them it wraps for the length of a block.
@@ -12,18 +12,17 @@ them it wraps for the length of a block.
 
 from __future__ import annotations
 
-import inspect
 import threading
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, wraps
 from typing import Any
 
 import mlx.core as mx
 
 from .. import formats
-from ..patches.module_cache import cached_per_module
-from . import Dot, Tile, kernels, linear
+from . import Dot, Tile, kernels
 
 # One threadgroup of one simdgroup per NA + NB rows.
 _ROWS = r"""
@@ -282,13 +281,14 @@ def tile_rows(
 
 @dataclass(frozen=True, eq=False)
 class LayerCall:
-    """A format layer's call, as ``layer_calls`` records it: the layer, the
-    face its rows ran through, and what the launch's Metal is instantiated
-    with beside the face (x's type; for a stack, also the pairs of a row of
-    x and whether there are fewer than 8 pairs, which MLX binds as
-    constants). ``face`` and ``metal`` are None for a call that the format's
-    decode ran. Two calls are equal when they are of the same layer, with
-    equal faces and Metal."""
+    """Rows of a format layer, as ``layer_calls`` records them where they
+    ran: the layer, the face whose launch ran them (or the replay of the
+    launch the layer kept), and what that launch's Metal is instantiated
+    with beside the face (``metal``: x's type; for a stack, the tuple of
+    x's type, the pairs of a row of x and whether there are fewer than 8
+    pairs). ``face`` and ``metal`` are None for rows of the format's decode.
+    Two are equal when they are of the same layer, with equal faces and
+    Metal; like the layer, a dict of its arrays, a record has no hash."""
 
     layer: Any
     face: Dot | None = None
@@ -302,125 +302,243 @@ class LayerCall:
             other.metal,
         )
 
-    def __hash__(self) -> int:
-        return hash((id(self.layer), self.face, self.metal))
-
     def __repr__(self) -> str:
         layer = self.layer
-        called = (
+        rows = (
             f"{type(layer).__name__} {layer.mode} "
             f"{layer.input_dims} -> {layer.output_dims}"
         )
-        if self.face is None:
-            return f"LayerCall({called}: decode)"
-        return f"LayerCall({called}: face {self.face.key}, Metal {self.metal})"
+        if self.face is None and self.metal is None:
+            return f"LayerCall({rows}: decode)"
+        key = self.face.key if self.face is not None else None
+        return f"LayerCall({rows}: face {key}, Metal {self.metal})"
 
 
-# This thread's open blocks of layer_calls, innermost last ("blocks"), and the
-# layers' calls running in it, each with whether the decode ran ("decoded").
-_RECORDING = threading.local()
-# Held to wrap the layers when a first block opens, in any thread, and to
-# give them back their own methods when the last one ends.
+class _Frame:
+    """A format layer's call running in a recording thread: the layer, and
+    what the call has recorded so far, the thread's blocks' when it
+    returns."""
+
+    __slots__ = ("layer", "calls")
+
+    def __init__(self, layer) -> None:
+        self.layer, self.calls = layer, []
+
+
+class _Thread:
+    """What a thread records in: its open blocks of ``layer_calls``,
+    innermost last (a tuple, replaced under ``_WRAPPING`` when a block
+    starts or ends, which may be in another thread), and the calls of
+    format layers running in it, innermost last."""
+
+    __slots__ = ("blocks", "frames")
+
+    def __init__(self) -> None:
+        self.blocks: tuple[list[LayerCall], ...] = ()
+        self.frames: list[_Frame] = []
+
+
+class _Recording(threading.local):
+    def __init__(self) -> None:
+        self.thread = _Thread()
+
+
+_RECORDING = _Recording()
+# Held to wrap the layers when a first block opens, in any thread, to give
+# them back their own when the last one ends, and to edit a thread's blocks.
 _WRAPPING = threading.Lock()
-_wrapped: dict = {}  # (class, method name): the class's own method
-_blocks = 0  # open in every thread
+_wrapped: list = []  # (owner, name, its own), in the order they were wrapped
+_open = 0  # blocks open in every thread
 
 
-def _recorded(call, describe):
-    """A layer class's ``__call__``, recorded in this thread's blocks.
-    ``describe`` is the launch's, which says what its Metal is built for."""
-    signature = inspect.signature(call)
+def _record(thread: _Thread, calls: list[LayerCall]) -> None:
+    for block in thread.blocks:
+        block.extend(calls)
 
-    def called(self, *args, **kwargs):
-        blocks = getattr(_RECORDING, "blocks", None)
-        if not blocks:
-            return call(self, *args, **kwargs)
-        _RECORDING.decoded.append(False)
-        try:
-            y = call(self, *args, **kwargs)
-        finally:
-            decoded = _RECORDING.decoded.pop()
-        if decoded:
-            record = LayerCall(self)
-        else:
-            plan = cached_per_module(self, "_omlx_format_plan", linear._plan, depth=0)
-            arrays = signature.bind(self, *args, **kwargs).arguments
-            metal, _ = describe(
-                plan.kernel,
-                plan.k,
-                plan.n,
-                *(arrays[name] for name in ("x", "indices") if name in arrays),
-            )
-            record = LayerCall(self, plan.face, metal)
-        for block in blocks:
-            block.append(record)
+
+def _described(linear, plan, arrays) -> Any:
+    """What a launch's Metal is built for, by the helpers the launch itself
+    describes it with: ``arrays`` are x, then a stack's indices."""
+    x, *indices = arrays
+    return linear._metal(x, linear._pairs(plan.k, x, *indices) if indices else None)
+
+
+class _Replays(Mapping):
+    """A proof's kept graphs as a recording thread's running call reads
+    them: the thread's own, not a copy, in which a graph that the call
+    finds (``get``) records its rows in the call when it is called."""
+
+    def __init__(self, kept: dict, linear, frame: _Frame, plan) -> None:
+        self._kept, self._linear, self._frame, self._plan = kept, linear, frame, plan
+
+    def __getitem__(self, signature):
+        return self._kept[signature]
+
+    def __iter__(self):
+        return iter(self._kept)
+
+    def __len__(self) -> int:
+        return len(self._kept)
+
+    def get(self, signature, default=None):
+        graph = self._kept.get(signature)
+        if graph is None:
+            return default
+        linear, frame, plan = self._linear, self._frame, self._plan
+
+        def replayed(*arrays):
+            y = graph(*arrays)
+            launched = arrays[: len(arrays) - len(plan.operands)]
+            described = _described(linear, plan, launched)
+            frame.calls.append(LayerCall(frame.layer, plan.face, described))
+            return y
+
+        return replayed
+
+
+def _framed(call, layer, *args):
+    """``call(layer, *args)``, a format layer's own call, in a frame of the
+    calling thread while it has a block open: what the call records is
+    recorded when it returns (in the call that made it, if any), and
+    dropped when it raises."""
+    thread = _RECORDING.thread
+    if not thread.blocks:
+        return call(layer, *args)
+    frames, frame = thread.frames, _Frame(layer)
+    try:
+        frames.append(frame)
+        y = call(layer, *args)
+    finally:
+        # Gone if the thread's last block ended meanwhile.
+        if frame in frames:
+            del frames[frames.index(frame) :]
+    if frames:
+        frames[-1].calls += frame.calls
+    else:
+        _record(thread, frame.calls)
+    return y
+
+
+def _wrappers(linear) -> list:
+    """What a block wraps, and its wrapper: the layers' two calls (a frame
+    for each), a kept graph's hit, a launch that returns rows and the
+    decode, each wrapper recording in the calling thread's blocks alone,
+    with the signature of what it wraps."""
+    linear_call = vars(linear.FormatLinear)["__call__"]
+    switch_call = vars(linear.FormatSwitchLinear)["__call__"]
+    graphs = vars(kernels.Proof)["graphs"]
+    kept = graphs.fget
+    launch = vars(linear)["_launch"]
+    decoded = vars(linear._FormatLayer)["_decoded"]
+
+    @wraps(linear_call)
+    def linear_called(self, x):
+        return _framed(linear_call, self, x)
+
+    @wraps(switch_call)
+    def switch_called(self, x, indices, sorted_indices=False):
+        return _framed(switch_call, self, x, indices, sorted_indices)
+
+    def replays(proof):
+        graphs, frames = kept(proof), _RECORDING.thread.frames
+        if not frames:
+            return graphs
+        # The running call's plan, as its layer keeps it.
+        plan = frames[-1].layer.__dict__.get(linear._KEPT, (None,))[0]
+        if getattr(plan, "proof", None) is proof:
+            return _Replays(graphs, linear, frames[-1], plan)
+        return graphs
+
+    @wraps(launch)
+    def _launch(plan, signature, describe, stand_in, *arrays):
+        # The running call, before the launch runs any other.
+        frames = _RECORDING.thread.frames
+        frame = frames[-1] if frames else None
+        y = launch(plan, signature, describe, stand_in, *arrays)
+        if y is not None and frame is not None:
+            described = _described(linear, plan, arrays)
+            frame.calls.append(LayerCall(frame.layer, plan.face, described))
         return y
 
-    return called
+    @wraps(decoded)
+    def _decoded(self, indices=None):
+        weights = decoded(self, indices)
+        thread = _RECORDING.thread
+        if thread.frames:
+            thread.frames[-1].calls.append(LayerCall(self))
+        else:
+            _record(thread, [LayerCall(self)])
+        return weights
 
-
-def _decoding(decoded):
-    """A layer's decode, which marks the call that runs it."""
-
-    def _decoded(self, *args, **kwargs):
-        calls = getattr(_RECORDING, "decoded", None)
-        if calls:
-            calls[-1] = True
-        return decoded(self, *args, **kwargs)
-
-    return _decoded
+    return [
+        (linear.FormatLinear, "__call__", linear_called),
+        (linear.FormatSwitchLinear, "__call__", switch_called),
+        (kernels.Proof, "graphs", property(replays, doc=graphs.__doc__)),
+        (linear, "_launch", _launch),
+        (linear._FormatLayer, "_decoded", _decoded),
+    ]
 
 
 def _wrap() -> None:
-    for cls, name, wrapper in (
-        (linear.FormatLinear, "__call__", lambda own: _recorded(own, linear._linear)),
-        (
-            linear.FormatSwitchLinear,
-            "__call__",
-            lambda own: _recorded(own, linear._switch),
-        ),
-        (linear._FormatLayer, "_decoded", _decoding),
-    ):
-        own = vars(cls)[name]
-        _wrapped[cls, name] = own
-        setattr(cls, name, wrapper(own))
+    """Every wrapper, or none: an exception on the way gives back what was
+    wrapped. What an end interrupted while it gave the layers back left
+    wrapped is given back first."""
+    from . import linear
+
+    _unwrap()
+    wrappers = _wrappers(linear)
+    try:
+        for owner, name, wrapper in wrappers:
+            _wrapped.append((owner, name, vars(owner)[name]))
+            setattr(owner, name, wrapper)
+    except BaseException:
+        _unwrap()
+        raise
 
 
 def _unwrap() -> None:
-    for (cls, name), own in _wrapped.items():
-        setattr(cls, name, own)
-    _wrapped.clear()
+    while _wrapped:
+        owner, name, own = _wrapped[-1]
+        setattr(owner, name, own)
+        _wrapped.pop()
 
 
 @contextmanager
 def layer_calls():
-    """Record the calls of format layers that this thread makes in the
-    block, in order, each a ``LayerCall``: the face whose launch ran the
-    call's rows, or None for the format's decode (more rows than a launch
-    takes, no face, a face not exact for x's type, one that did not
-    compile). The block's value is the list of the calls so far.
+    """Record where the rows of format layers ran in this thread, in the
+    block, in order, each a ``LayerCall``: a launch of the face, or the
+    replay of the launch a layer kept (``face``), or the format's decode
+    (``face`` None: more rows than a launch takes, no face, a face not
+    exact for x's type, one that did not compile). Each is recorded where
+    it ran, tagged with its layer, when the layer's call returns. The
+    block's value is the list so far.
 
-    The layers are wrapped while a block is open, in any thread; a call in a
-    thread without a block runs as it does without, and when the last block
-    ends the layers have their own methods back: outside a block a call
-    costs nothing more. A call that raises is not recorded. Nor is what runs
-    no Python of the layer: a call that a function compiled by ``mx.compile``
-    replays, or a fused kernel's launch over a layer's tensors."""
-    global _blocks
+    The layers are wrapped while a block is open, in any thread; a thread
+    without a block runs as it does without, and when the last block ends
+    the layers have their own back: outside a block a call costs nothing
+    more. A call that raises records nothing, nor do the calls it made.
+    Nor is what runs no Python of the layer recorded: a call that a
+    function compiled by ``mx.compile`` replays (it is recorded once, as it
+    is traced), or a fused kernel's launch over a layer's tensors."""
+    global _open
     calls: list[LayerCall] = []
-    state = vars(_RECORDING)
-    blocks = state.setdefault("blocks", [])
-    state.setdefault("decoded", [])
-    with _WRAPPING:
-        if not _blocks:
-            _wrap()
-        _blocks += 1
-    blocks.append(calls)
+    # This thread's: the block's end, in whichever thread, ends it here.
+    thread, opened = _RECORDING.thread, False
     try:
+        with _WRAPPING:
+            if not _open:
+                _wrap()
+            _open += 1
+            opened = True
+            thread.blocks = (*thread.blocks, calls)
         yield calls
     finally:
-        del blocks[next(i for i, block in enumerate(blocks) if block is calls)]
         with _WRAPPING:
-            _blocks -= 1
-            if not _blocks:
-                _unwrap()
+            blocks = thread.blocks
+            thread.blocks = tuple(block for block in blocks if block is not calls)
+            if not thread.blocks:
+                thread.frames.clear()
+            if opened:
+                _open -= 1
+                if not _open:
+                    _unwrap()
