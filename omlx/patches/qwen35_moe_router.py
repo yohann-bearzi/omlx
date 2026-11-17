@@ -467,9 +467,10 @@ _GEMV_SOURCE = """
 
 
 def router_gemv(weight):
-    """A launcher for ``x @ weight.T`` (a bias-free bf16 or fp16 ``nn.Linear``)
-    on rows of the weight dtype and width K, or None outside the layout it
-    reproduces.
+    """A launcher of ``x @ w.T`` for the weights ``w`` of ``weight``'s shape
+    and dtype (a bias-free bf16 or fp16 ``nn.Linear``'s), on rows of that
+    dtype and width K: ``launch(x, w)``. None outside the layout it
+    reproduces. The launcher holds no array: the weight is its argument.
 
     It runs MLX's one-row gemv arithmetic with one simdgroup per row (MLX
     runs four rows per simdgroup on N / 16 threadgroups). The layout is
@@ -491,14 +492,14 @@ def router_gemv(weight):
             header=_GEMV_ROWS_HEADER,
             source=_GEMV_SOURCE,
         )
-    kernel = _GEMV_KERNEL
+    kernel, dtype = _GEMV_KERNEL, weight.dtype
 
-    def launch(x):
+    def launch(x, w):
         rows = x.size // k
         return kernel(
-            inputs=[x, weight],
+            inputs=[x, w],
             template=[
-                ("T", weight.dtype),
+                ("T", dtype),
                 ("K", k),
                 ("N", n),
                 ("M", rows),
@@ -507,7 +508,7 @@ def router_gemv(weight):
             grid=(32, n * rows, 1),
             threadgroup=(32, _GEMV_SIMDGROUPS, 1),
             output_shapes=[(*x.shape[:-1], n)],
-            output_dtypes=[weight.dtype],
+            output_dtypes=[dtype],
         )[0]
 
     return launch
@@ -522,7 +523,7 @@ def router_logits_row(x, weight):
     ):
         return None
     launch = router_gemv(weight)
-    return None if launch is None else launch(x)
+    return None if launch is None else launch(x, weight)
 
 
 def softmax_topk_eligible(logits, max_rows: int = _MAX_ROWS) -> bool:

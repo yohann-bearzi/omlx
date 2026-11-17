@@ -50,10 +50,16 @@ Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down each take ``qmv_fast``
 or ``qmv``. A shared expert or gate without such faces (unquantized,
 packed, ...) runs as composed launches and only its outputs enter the
 combine. Prefill, multi-row calls and every other shape keep the
-original body. MLX compiles a kernel when it first evaluates it, so a launch
-is evaluated inside the call the first time blocks of its faces, tensor
-dtypes and shapes build it; if that fails, those blocks keep their composed
-body.
+original body.
+
+One token's launches (router, gate+up, down) are one function of the token
+and the block's arrays, which MLX's compile builds into a graph the first
+time a thread meets the token's shape and dtype on blocks of the same faces,
+tensor dtypes and shapes; their proof keeps it for that thread, and a
+decode step replays it. MLX compiles a kernel when it first evaluates it, so
+before the graph is first built its Metal is proven on a stand-in: the
+smallest launches that MLX generates the same Metal for, over zeros, and
+nothing of the call. If that fails, those blocks keep their composed body.
 
 Row-exact MTP verify windows (up to 16 rows whose logits must equal serial
 decode) run the same arithmetic for the whole window in the same launches:
@@ -84,7 +90,7 @@ nothing to bound here. Only scheduling changes.
 from __future__ import annotations
 
 import logging
-from functools import cache, wraps
+from functools import cache, partial, wraps
 from typing import NamedTuple
 
 import mlx.core as mx
@@ -99,7 +105,6 @@ from .qwen35_moe_router import (
     router_eligible,
     router_gemv,
     softmax_topk_eligible,
-    softmax_topk_row,
     softmax_topk_rows,
     topk_header,
 )
@@ -517,41 +522,56 @@ def _expert_view(a: mx.array) -> mx.array:
     were copied (or offset) would read the wrong bytes; keep the whole array
     unless the first-expert slice provably aliases it. An expert of fewer
     than 8 elements keeps the whole array too: MLX binds so small an input
-    as constants, not as the buffer a face reads."""
+    as constants, not as the buffer a face reads. So does a placeholder of
+    a function that MLX compiles over the block's state: MLX refuses to
+    evaluate it (a ``ValueError``), and it has no buffer to share."""
     if a.ndim < 2 or a.size < 8 * a.shape[0]:
         return a
     view = a[:1]
-    mx.eval(view)
+    try:
+        mx.eval(view)
+    except ValueError:
+        return a
     whole, first = memoryview(a), memoryview(view)
     if whole.c_contiguous and first.c_contiguous and _address(view) == _address(a):
         return view
     return a
 
 
-class _Plan(NamedTuple):
+class _Launches(NamedTuple):
+    """What a block's launches are built from beside its arrays: kernels,
+    template values, grids. It holds no array, so a graph built over it
+    serves every block of its proof, each over its own arrays."""
+
     hidden: int
     dtype: mx.Dtype  # activations and outputs: what the gate+up face is exact for
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
-    proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
+    router: object  # router_gemv's launcher; None: the block's gate runs as it is
     gate_up_kernel: object
-    gate_up_operands: tuple
     gate_up_template: list
     gate_up_grid: tuple
     gate_up_output: tuple
     down_kernel: object
-    down_operands: tuple
     down_template: list
     down_threadgroup: tuple
-    shared_gate_up_operands: tuple = ()  # gate_proj, up_proj, gate (fold)
-    shared_down_operands: tuple = ()  # down_proj (fold)
-    router_logits: object = None  # qwen35_moe_router.router_gemv launcher
     window_gate_up_kernel: object = None  # verify-window launches (fold)
     window_down_kernel: object = None
-    window: kernels.Proof | None = None  # theirs; failed: one token still runs
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
+
+
+class _Plan(NamedTuple):
+    launches: _Launches
+    # The arrays the launches read: the router's weight (none when the gate
+    # runs as it is), the routed gate+up, the routed down, then the shared
+    # expert's gate+up with its gate and its down (none unless folded).
+    operands: tuple
+    experts: int  # the router's width: the experts it scores, the block's own
+    outside: bool  # the block computes a router or shared expert outside them
+    proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
+    window: kernels.Proof | None = None  # theirs; failed: one token still runs
 
 
 def _shared_formats(block, hidden: int, dtype: mx.Dtype):
@@ -627,14 +647,17 @@ def _build_plan(block) -> _Plan | None:
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
     shared = _shared_formats(block, hidden, dtype)
     gate = block.get("gate")
-    router_logits = None
+    router, experts, weight = None, block.num_experts, ()
     if (
         type(gate) is nn.Linear
         and "bias" not in gate
         and gate["weight"].shape[-1] == hidden
         and gate["weight"].dtype == dtype
     ):
-        router_logits = router_gemv(gate["weight"])
+        router = router_gemv(gate["weight"])
+    if router is not None:
+        weight = (gate["weight"],)
+        experts = weight[0].shape[0]
     # What the launches are compiled from, beside a launch's rows and routing.
     operands = gate_up_operands + down_operands
     if shared is not None:
@@ -647,7 +670,7 @@ def _build_plan(block) -> _Plan | None:
         hidden,
         inter,
         top_k,
-        router_logits is not None,
+        router is not None,
     )
     proof = kernels.proof("routed_decode", *key)
     gate_up_template = [
@@ -665,37 +688,38 @@ def _build_plan(block) -> _Plan | None:
         ("TOPK", top_k),
     ]
     if shared is None:
-        return _Plan(
+        launches = _Launches(
             hidden=hidden,
             dtype=dtype,
             top_k=top_k,
-            router_logits=router_logits,
+            router=router,
             fold=False,
-            proof=proof,
             gate_up_kernel=_gate_up_kernel(gu_fmt, None, None),
-            gate_up_operands=gate_up_operands,
             gate_up_template=gate_up_template,
             gate_up_grid=(32, _GATE_UP_SIMDGROUPS * top_k * inter // rows, 1),
             gate_up_output=(top_k, inter),
             down_kernel=_down_kernel(d_fmt, None),
-            down_operands=down_operands,
             down_template=down_template + [("NPART", top_k)],
             down_threadgroup=(32, top_k, 1),
             topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None),
             topk_blocks=1 + top_k * inter // rows,
             topk_width=top_k * inter,
         )
+        return _Plan(
+            launches=launches,
+            operands=(weight, gate_up_operands, down_operands, (), ()),
+            experts=experts,
+            outside=True,
+            proof=proof,
+        )
     width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
-    return _Plan(
+    launches = _Launches(
         hidden=hidden,
         dtype=dtype,
         top_k=top_k,
-        router_logits=router_logits,
+        router=router,
         fold=True,
-        proof=proof,
-        window=kernels.proof("routed_window", *key),
         gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
-        gate_up_operands=gate_up_operands,
         gate_up_template=gate_up_template + [("NS", width)],
         gate_up_grid=(
             32,
@@ -704,139 +728,268 @@ def _build_plan(block) -> _Plan | None:
         ),
         gate_up_output=(top_k * inter + width + 1,),
         down_kernel=_down_kernel(d_fmt, sd_fmt),
-        down_operands=down_operands,
         down_template=down_template + [("KS", width), ("NPART", top_k + 1)],
         down_threadgroup=(32, top_k + 1, 1),
-        shared_gate_up_operands=shared_gate_up,
-        shared_down_operands=shared_down,
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
         window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
         topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
     )
+    return _Plan(
+        launches=launches,
+        operands=(weight, gate_up_operands, down_operands, shared_gate_up, shared_down),
+        experts=experts,
+        outside=router is None,
+        proof=proof,
+        window=kernels.proof("routed_window", *key),
+    )
 
 
-def routed_decode_plan(block, x) -> _Plan | None:
-    """The block's cached plan when ``x`` is one bf16 or fp16 token it can route."""
-    if x.dtype not in (mx.bfloat16, mx.float16) or block.top_k not in TOP_KS:
-        return None
-    hidden = x.shape[-1]
-    if x.size != hidden:
-        return None
-    # Depth 2 keys the plan on the expert and shared-expert weight arrays.
-    plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
-    if (
-        plan is None
-        or plan.proof.failed
-        or plan.hidden != hidden
-        or plan.dtype != x.dtype
-    ):
-        return None
-    return plan
+def _routes(plan: _Plan, x) -> bool:
+    """Whether one token ``x`` runs through the plan's launches: a row of
+    the plan's width, in the dtype they are compiled for, for a router of
+    whole simdgroups, and none of their proof's launches failed."""
+    launches = plan.launches
+    return (
+        x.dtype == launches.dtype
+        and x.shape[-1] == launches.hidden
+        and not plan.proof.failed
+        and router_eligible(x, plan.experts)
+    )
 
 
-def _down(plan: _Plan, h, indices, scores, shape, shared=None, gate=None):
-    """The one-token down/combine launch over gate+up output ``h``."""
-    if plan.fold:
-        down_inputs = [h, *plan.down_operands, *plan.shared_down_operands, indices, scores]
+def _gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
+    """The one-token gate+up/SwiGLU launch on the routing ``indices``."""
+    return launches.gate_up_kernel(
+        inputs=[x, *gate_up, indices, *shared_gate_up],
+        template=launches.gate_up_template,
+        grid=launches.gate_up_grid,
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[launches.gate_up_output],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _down(launches: _Launches, h, indices, scores, shape, down, shared_down, *beside):
+    """The one-token down/combine launch over gate+up output ``h``.
+    ``beside`` is the composed shared expert's output and its gate's, where
+    the launches do not fold them."""
+    if launches.fold:
+        inputs = [h, *down, *shared_down, indices, scores]
     else:
         # The shared expert comes first in the inputs, so its launches are
         # encoded (and can run) before the router's.
-        down_inputs = [shared, gate, h, *plan.down_operands, indices, scores]
+        inputs = [*beside, h, *down, indices, scores]
     rps = _down_rows(1)
-    return plan.down_kernel(
-        inputs=down_inputs,
-        template=plan.down_template + [("RPS", rps)],
-        grid=(32, plan.down_threadgroup[1] * plan.hidden // rps, 1),
-        threadgroup=plan.down_threadgroup,
+    return launches.down_kernel(
+        inputs=inputs,
+        template=launches.down_template + [("RPS", rps)],
+        grid=(32, launches.down_threadgroup[1] * launches.hidden // rps, 1),
+        threadgroup=launches.down_threadgroup,
         output_shapes=[shape],
-        output_dtypes=[plan.dtype],
+        output_dtypes=[launches.dtype],
     )[0]
 
 
-def routed_decode(plan: _Plan, x, indices, scores, shared=None, gate=None):
-    """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
-    + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for one token
-    in two launches. ``shared`` and ``gate`` are the composed shared expert
-    and gate outputs, used only when the plan does not fold them."""
-    h = plan.gate_up_kernel(
-        inputs=[x, *plan.gate_up_operands, indices, *plan.shared_gate_up_operands],
-        template=plan.gate_up_template,
-        grid=plan.gate_up_grid,
-        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
-        output_shapes=[plan.gate_up_output],
-        output_dtypes=[plan.dtype],
-    )[0]
-    return _down(plan, h, indices, scores, x.shape, shared, gate)
-
-
-def _topk_folds(plan: _Plan, logits) -> bool:
+def _topk_folds(launches: _Launches, logits) -> bool:
     return (
-        plan.topk_kernel is not None
+        launches.topk_kernel is not None
         # The launch reads the logits in the plan's dtype.
-        and logits.dtype == plan.dtype
+        and logits.dtype == launches.dtype
         and logits.size // logits.shape[-1] <= _TOPK_FOLD_MAX_ROWS
         and softmax_topk_eligible(logits)
     )
 
 
-def _gate_up_topk(plan: _Plan, x, logits):
+def _gate_up_topk(launches: _Launches, x, logits, gate_up, shared_gate_up):
     """Gate+up output, indices and scores of every row of ``x`` from its
     router ``logits`` (the rows' softmax + top-k run inside the launch)."""
-    rows = x.size // plan.hidden
-    return plan.topk_kernel(
-        inputs=[x, *plan.gate_up_operands, logits, *plan.shared_gate_up_operands],
-        template=plan.gate_up_template
-        + [("NE", logits.shape[-1]), ("M", rows), ("YW", plan.topk_width)],
-        grid=(32, _GATE_UP_SIMDGROUPS * plan.topk_blocks * rows, 1),
+    rows = x.size // launches.hidden
+    top_k, width = launches.top_k, launches.topk_width
+    return launches.topk_kernel(
+        inputs=[x, *gate_up, logits, *shared_gate_up],
+        template=launches.gate_up_template
+        + [("NE", logits.shape[-1]), ("M", rows), ("YW", width)],
+        grid=(32, _GATE_UP_SIMDGROUPS * launches.topk_blocks * rows, 1),
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
-        output_shapes=[(rows, plan.topk_width), (rows, plan.top_k), (rows, plan.top_k)],
-        output_dtypes=[plan.dtype, mx.uint32, plan.dtype],
+        output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
+        output_dtypes=[launches.dtype, mx.uint32, launches.dtype],
     )
 
 
-def routed_decode_logits(plan: _Plan, x, logits, shared=None, gate=None):
-    """``routed_decode`` on the routing of one token's router ``logits``
-    (``softmax_topk_row``'s), selected inside the gate+up launch."""
-    h, indices, scores = _gate_up_topk(plan, x, logits)
-    return _down(plan, h, indices, scores, x.shape, shared, gate)
+def _routing(logits, top_k: int):
+    """Each row's experts and scores from its router ``logits``, as
+    ``fused_router_topk`` selects them over the precise softmax: in one
+    launch where ``softmax_topk_rows`` takes the rows."""
+    routing = softmax_topk_rows(logits, top_k, WINDOW_MAX_ROWS)
+    if routing is None:
+        routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), top_k)
+    return routing
 
 
-def _window_down(plan: _Plan, h, indices, scores):
+def _window_gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
+    rows = x.shape[0]
+    return launches.window_gate_up_kernel(
+        inputs=[x, *gate_up, indices, *shared_gate_up],
+        template=launches.gate_up_template + [("M", rows)],
+        grid=(32, launches.gate_up_grid[1] * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[(rows, *launches.gate_up_output)],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
     rows = indices.shape[0]
     rps = _down_rows(rows)
-    return plan.window_down_kernel(
-        inputs=[h, *plan.down_operands, *plan.shared_down_operands, indices, scores],
-        template=plan.down_template + [("RPS", rps), ("M", rows)],
-        grid=(32, plan.down_threadgroup[1] * plan.hidden // rps * rows, 1),
-        threadgroup=plan.down_threadgroup,
-        output_shapes=[(rows, plan.hidden)],
-        output_dtypes=[plan.dtype],
+    return launches.window_down_kernel(
+        inputs=[h, *down, *shared_down, indices, scores],
+        template=launches.down_template + [("RPS", rps), ("M", rows)],
+        grid=(32, launches.down_threadgroup[1] * launches.hidden // rps * rows, 1),
+        threadgroup=launches.down_threadgroup,
+        output_shapes=[(rows, launches.hidden)],
+        output_dtypes=[launches.dtype],
     )[0]
 
 
-def routed_window(plan: _Plan, x, indices, scores):
-    """``routed_decode`` for each row of ``x`` ([M, hidden], 2..M rows,
-    ``indices`` / ``scores`` [M, top-k]) in the same two launches: row r
-    runs the one-token arithmetic on its own routing. Needs a folded plan."""
-    rows = x.shape[0]
-    h = plan.window_gate_up_kernel(
-        inputs=[x, *plan.gate_up_operands, indices, *plan.shared_gate_up_operands],
-        template=plan.gate_up_template + [("M", rows)],
-        grid=(32, plan.gate_up_grid[1] * rows, 1),
-        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
-        output_shapes=[(rows, *plan.gate_up_output)],
-        output_dtypes=[plan.dtype],
-    )[0]
-    return _window_down(plan, h, indices, scores)
+def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
+    """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
+    + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for each row
+    of ``x`` (one token, or [M, hidden] for a window), on the routing of
+    its router ``logits``, in two launches: gate+up (the routing inside it
+    where it ``folded``: ``_topk_folds``) and down. Row r of a window runs
+    the one-token arithmetic on its own routing. ``beside`` is the composed
+    shared expert's output and its gate's, where the launches do not fold
+    them (one token)."""
+    _, gate_up, down, shared_gate_up, shared_down = operands
+    if folded:
+        h, indices, scores = _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+    else:
+        indices, scores = _routing(logits, launches.top_k)
+        gate_up_launch = _gate_up if x.size == launches.hidden else _window_gate_up
+        h = gate_up_launch(launches, x, indices, gate_up, shared_gate_up)
+    if x.size == launches.hidden:
+        return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
+    return _window_down(launches, h, indices, scores, down, shared_down)
 
 
-def routed_window_logits(plan: _Plan, x, logits):
-    """``routed_window`` on the routing of the rows' router ``logits``,
-    selected inside the gate+up launch."""
-    h, indices, scores = _gate_up_topk(plan, x, logits)
-    return _window_down(plan, h, indices, scores)
+def _token(launches: _Launches, folded: bool):
+    """One token's launches as one function of its arrays, for MLX's
+    compile: ``x``, what the block computes outside the launches (its
+    gate's logits where the gate runs as it is, then a shared expert's
+    output and its gate's where the launches do not fold them) and the
+    plan's operands. It closes over no array."""
+
+    def graph(x, outside, operands):
+        if launches.router is None:
+            logits, *outside = outside
+        else:
+            logits = launches.router(x, *operands[0])
+        return _experts(launches, x, logits, operands, folded, *outside)
+
+    return graph
+
+
+def _ranked(rows: int, experts: int, dtype) -> mx.array:
+    """Router logits for ``rows`` rows that rank the experts in order: each
+    row selects the first top-k."""
+    return (mx.zeros((rows, 1), mx.float32) - mx.arange(experts)).astype(dtype)
+
+
+def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> list:
+    """The smallest launches of a block's rows that MLX generates the Metal
+    of the call's for, over zeros: the rows, the router's weight, the whole
+    of each shared matrix, what the block computes outside the launches,
+    and as many matrices of each stack as a row selects. ``logits`` (of
+    ``_ranked``) stand for the router's: each row selects the first
+    matrices, which the stacks have. Nothing of the call is read but the
+    shapes and dtypes of ``outside`` and of the operands."""
+    rows, top_k = logits.shape[0], launches.top_k
+    x = mx.zeros((rows, launches.hidden), launches.dtype)
+    weight, gate_up, down, shared_gate_up, shared_down = operands
+    stand_ins = (
+        _zeros(weight),
+        tuple(mx.zeros((top_k, *a.shape[1:]), a.dtype) for a in gate_up),
+        tuple(mx.zeros((top_k, *a.shape[1:]), a.dtype) for a in down),
+        _zeros(shared_gate_up),
+        _zeros(shared_down),
+    )
+    if launches.router is None:
+        outside = outside[1:]
+    launched = [_experts(launches, x, logits, stand_ins, folded, *_zeros(outside))]
+    if launches.router is not None:
+        launched.append(launches.router(x, *stand_ins[0]))
+    return launched
+
+
+def _zeros(arrays) -> tuple:
+    return tuple(mx.zeros(a.shape, a.dtype) for a in arrays)
+
+
+def _outside(block, plan: _Plan, x):
+    """What one token's launches take that the block computes outside them:
+    the logits of a gate that runs as it is, then a shared expert's output
+    and its gate's where the launches do not fold them. None where one is
+    not what the launches read: an array in ``x``'s dtype (they are
+    compiled for that one), a shared output of the block's width, one gate
+    value on an axis (the down launch reads ``gate[0]``), logits of the
+    router's width."""
+    launches, outside = plan.launches, ()
+    if not launches.fold:
+        # Children by item: this runs for every MoE layer of every decode step.
+        shared = block["shared_expert"](x)
+        gate = block["shared_expert_gate"](x)
+        if (
+            shared.dtype != x.dtype
+            or gate.dtype != x.dtype
+            or shared.size != launches.hidden
+            or gate.size != 1
+            or gate.ndim == 0
+        ):
+            return None
+        outside = (shared, gate)
+    if launches.router is None:
+        logits = block["gate"](x)
+        if logits.dtype != x.dtype or logits.shape[-1] != plan.experts:
+            return None
+        outside = (logits, *outside)
+    return outside
+
+
+_SAID = (
+    "Qwen MoE fused routed-expert decode engaged",
+    "fused routed-expert decode failed; composed fallback",
+)
+
+
+def _decode(block, plan: _Plan, x, graph):
+    """One token's block output through the plan's launches, or None: ``x``
+    does not run through them, or their launch for it does not compile.
+    ``graph`` is the one the calling thread kept for ``x``'s signature, or
+    None.
+
+    The launches are one graph of ``x`` and the block's arrays, which MLX's
+    compile builds the first time a thread meets the signature and the
+    proof keeps for that thread. Its Metal is proven first, on the stand-in
+    of ``_stand_in``: nothing of the call is evaluated."""
+    launches = plan.launches
+    if graph is None and not _routes(plan, x):
+        return None
+    outside = _outside(block, plan, x)
+    if outside is None:
+        return None
+    if graph is not None:
+        return graph(x, outside, plan.operands)
+    logits = _ranked(1, plan.experts, launches.dtype)
+    folded = _topk_folds(launches, logits)
+    stand_in = partial(_stand_in, launches, logits, folded, outside, plan.operands)
+    if not plan.proof.prove((plan.experts, folded), stand_in, logger, *_SAID):
+        return None
+    graph = mx.compile(_token(launches, folded))
+    y = graph(x, outside, plan.operands)
+    plan.proof.keep((x.shape, x.dtype, plan.experts), graph)
+    return y
 
 
 def routed_verify_window(block, x):
@@ -859,36 +1012,28 @@ def routed_verify_window(block, x):
     ):
         return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
+    if plan is None:
+        return None
+    launches = plan.launches
     if (
-        plan is None
-        or plan.proof.failed
-        or not plan.fold
+        plan.proof.failed
+        or not launches.fold
         or plan.window.failed
-        or plan.hidden != hidden
-        or plan.dtype != x.dtype
-        or plan.router_logits is None
+        or launches.hidden != hidden
+        or launches.dtype != x.dtype
+        or launches.router is None
     ):
         return None
     x = x.reshape(rows, hidden)
-    logits = plan.router_logits(x)
-    folded = _topk_folds(plan, logits)
-    if not folded:
-        routing = softmax_topk_rows(logits, plan.top_k, WINDOW_MAX_ROWS)
-        if routing is None:
-            routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), plan.top_k)
-        inds, scores = routing
+    logits = launches.router(x, *plan.operands[0])
+    folded = _topk_folds(launches, logits)
     launch = (rows, logits.shape[-1], folded)
     proven = launch in plan.window.ran
     if not proven:
         # What fails ahead of the block is not the launch's failure.
         mx.eval(x)
     try:
-        if folded:
-            y = (routed_decode_logits if rows == 1 else routed_window_logits)(plan, x, logits)
-        elif rows == 1:
-            y = routed_decode(plan, x, inds, scores)
-        else:
-            y = routed_window(plan, x, inds, scores)
+        y = _experts(launches, x, logits, plan.operands, folded)
         if not proven:
             mx.eval(y)
             plan.window.ran.add(launch)
@@ -952,58 +1097,27 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     orig_call = cls.__call__
 
     def patched_call(self, x):
-        plan = routed_decode_plan(self, x)
-        if plan is None and x.ndim == 3 and x.shape[1] == 1 and x.shape[0] > 1:
+        shape = x.shape
+        if x.size == shape[-1]:
+            # Depth 2 keys the plan on the expert and shared-expert weight arrays.
+            plan = cached_per_module(
+                self, "_omlx_routed_decode_plan", _build_plan, depth=2
+            )
+            if plan is not None:
+                # A decode step is the replay of the graph its thread kept.
+                graph = plan.proof.graphs.get((shape, x.dtype, plan.experts))
+                if graph is not None and not plan.outside:
+                    return graph(x, (), plan.operands)
+                y = _decode(self, plan, x, graph)
+                if y is not None:
+                    return y
+        elif x.ndim == 3 and shape[1] == 1:
             # Batched one-token decode: every row runs the one-token
             # arithmetic of its own stream in the window launches.
             y = routed_verify_window(self, x)
             if y is not None:
-                return y.reshape(x.shape)
-        if plan is None or not router_eligible(x, self.num_experts):
-            return orig_call(self, x)
-        shared = shared_gate = None
-        if not plan.fold:
-            # Children by item: this runs for every MoE layer of every decode step.
-            shared = self["shared_expert"](x)
-            shared_gate = self["shared_expert_gate"](x)
-            if shared.dtype != x.dtype or shared_gate.dtype != x.dtype:
-                return orig_call(self, x)
-        if plan.router_logits is not None:
-            logits = plan.router_logits(x)
-        else:
-            logits = self["gate"](x)
-        folded = _topk_folds(plan, logits)
-        if not folded:
-            routing = softmax_topk_row(logits, self.top_k)
-            if routing is None:
-                routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), self.top_k)
-            inds, scores = routing
-            if scores.dtype != x.dtype:
-                return orig_call(self, x)
-        launch = (logits.shape[-1], folded)
-        proven = launch in plan.proof.ran
-        if not proven:
-            # What fails ahead of the block is not the launch's failure.
-            mx.eval(x)
-        try:
-            if folded:
-                y = routed_decode_logits(plan, x, logits, shared, shared_gate)
-            else:
-                y = routed_decode(plan, x, inds, scores, shared, shared_gate)
-            if not proven:
-                # Surface a kernel build failure while the call can still
-                # fall back.
-                mx.eval(y)
-                plan.proof.ran.add(launch)
-                logger.info("Qwen MoE fused routed-expert decode engaged")
-        except Exception:
-            plan.proof.failed = True
-            logger.warning(
-                "fused routed-expert decode failed; composed fallback",
-                exc_info=True,
-            )
-            return orig_call(self, x)
-        return y
+                return y.reshape(shape)
+        return orig_call(self, x)
 
     patched_call._omlx_routed_decode_original = orig_call
     cls.__call__ = patched_call

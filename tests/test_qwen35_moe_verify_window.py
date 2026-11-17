@@ -18,6 +18,7 @@ import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx.formats import affine
 from omlx.patches import qwen35_moe_router as router
 from omlx.patches import qwen35_verify_qmm
+from tests.test_qwen35_moe_routed_decode import _plan
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -153,7 +154,7 @@ def _does_not_compile(a, shape=None):
 def _serial(block, x):
     """The served one-token decode of every row (the fused routed call)."""
     rows = x.reshape(-1, 1, 1, x.shape[-1])
-    assert routed.routed_decode_plan(block, rows[0]).fold
+    assert _plan(block, rows[0]).launches.fold
     return mx.concatenate([block(row) for row in rows]).reshape(x.shape)
 
 
@@ -223,8 +224,8 @@ def topk_fold(request, monkeypatch):
 
 def test_window_rows_equal_one_token_decode(topk_fold, engaged):
     block = _block(0)
-    plan = routed.routed_decode_plan(block, mx.zeros((1, 1, HIDDEN), mx.bfloat16))
-    assert plan.topk_kernel is not None
+    plan = _plan(block, mx.zeros((1, 1, HIDDEN), mx.bfloat16))
+    assert plan.launches.topk_kernel is not None
     # Row bounds: 3 folded rows, 8 composed-router rows, 16 window rows.
     # Past 3 rows both variants take the routing launch.
     window_rows = (1, 2, 3, 4, 5, 8, 9, 16) if topk_fold else (1, 2, 3, 4)
@@ -295,8 +296,9 @@ def test_router_ties_and_high_experts(engaged):
                     x = (_inputs(rows, step) + lean * direction).astype(mx.bfloat16)
                     _check(block, x, engaged)
                     if lean:
-                        logits = router.router_gemv(block.gate.weight)(
-                            x.reshape(rows, HIDDEN)
+                        weight = block.gate.weight
+                        logits = router.router_gemv(weight)(
+                            x.reshape(rows, HIDDEN), weight
                         )
                         inds, _ = router.softmax_topk_rows(logits, 10)
                         assert mx.min(inds).item() >= experts - 14
@@ -310,13 +312,13 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     block = _block(0)
     x = _inputs(4, 1)
     old = _verify(block, x, window=False)
-    plan = routed.routed_decode_plan(block, x[:, :1])
+    plan = _plan(block, x[:, :1])
     assert not plan.proof.ran and not plan.window.ran
     calls = []
 
-    def broken(plan, h, indices, scores):
+    def broken(launches, h, indices, scores, *operands):
         calls.append(1)
-        return _does_not_compile(h, (indices.shape[0], plan.hidden))
+        return _does_not_compile(h, (indices.shape[0], launches.hidden))
 
     monkeypatch.setattr(routed, "_window_down", broken)
     for _ in range(2):
@@ -325,7 +327,7 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
         assert _same_bits(out, old)
     assert len(calls) == 1 and not plan.window.ran and not plan.proof.ran
     # One token still takes the fused launches.
-    assert routed.routed_decode_plan(block, x[:, :1]) is plan
+    assert _plan(block, x[:, :1]) is plan
     assert _same_bits(_serial(block, x), old)
     assert plan.proof.ran == {(BLOCK_EXPERTS, True)} and not plan.proof.failed
 
@@ -333,7 +335,7 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
 def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
     block = _block(0)
     x = _inputs(4, 1)
-    plan = routed.routed_decode_plan(block, x[:, :1])
+    plan = _plan(block, x[:, :1])
     with pytest.raises(RuntimeError, match="Unable to build metal library"):
         routed.routed_verify_window(block, _does_not_compile(x))
     assert engaged == [] and not plan.window.failed and not plan.window.ran
@@ -343,7 +345,7 @@ def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
 def test_only_an_unproven_window_launch_is_evaluated_in_the_call(monkeypatch):
     block = _block(0)
     x = _inputs(4, 1)
-    routed.routed_decode_plan(block, x[:, :1])  # evaluates the experts' views
+    _plan(block, x[:, :1])  # evaluates the experts' views
     evaluate, evaluated = mx.eval, []
 
     def recorded(*arrays):
@@ -364,9 +366,9 @@ def test_a_failed_one_token_launch_keeps_windows_composed(monkeypatch, engaged):
     block = _block(0)
     x = _inputs(4, 1)
     old = _verify(block, x, window=False)
-    plan = routed.routed_decode_plan(block, x[:, :1])
+    plan = _plan(block, x[:, :1])
     monkeypatch.setattr(plan.proof, "failed", True)
-    assert routed.routed_decode_plan(block, x[:, :1]) is None
+    assert _plan(block, x[:, :1]) is None
     out = _verify(block, x, window=True)
     assert engaged[-1] is False
     assert _same_bits(out, old)
@@ -495,8 +497,8 @@ def test_fp32_window_router_equals_one_row_router():
     # A few duplicated router rows give exactly tied probabilities.
     weight = mx.concatenate([weight[:480], weight[:32]])
     x = mx.random.normal((rows, HIDDEN))
-    launch = router.router_gemv(weight.astype(mx.bfloat16))
-    mx.eval(launch(x.astype(mx.bfloat16)))
+    halves = weight.astype(mx.bfloat16)
+    mx.eval(router.router_gemv(halves)(x.astype(mx.bfloat16), halves))
 
     def gemv(x, rows):
         return router._GEMV_KERNEL(

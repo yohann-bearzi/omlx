@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import logging
+import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
@@ -11,10 +14,12 @@ from types import SimpleNamespace
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from mlx.utils import tree_flatten
 
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
 from omlx.formats import affine, kernels
+from omlx.patches.module_cache import cached_per_module
 from tests.test_formats_affine import uncalled
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -113,6 +118,96 @@ def _pair(block, x):
     return ref, out
 
 
+def _plan(block, x):
+    """The plan that one token ``x`` runs through, as the block's call finds
+    it, or None."""
+    if x.size != x.shape[-1]:
+        return None
+    plan = cached_per_module(
+        block, "_omlx_routed_decode_plan", routed._build_plan, depth=2
+    )
+    return plan if plan is not None and routed._routes(plan, x) else None
+
+
+def _compiled(monkeypatch):
+    """The functions that MLX's compile is given, as it is given them: each
+    with the calls it then serves and the threads that call it."""
+    compile_, compiled = mx.compile, []
+
+    def recorded(fn, *args, **kwargs):
+        graph = compile_(fn, *args, **kwargs)
+        record = SimpleNamespace(calls=0, threads=set())
+        compiled.append(record)
+
+        def called(*arrays):
+            record.calls += 1
+            record.threads.add(threading.get_ident())
+            return graph(*arrays)
+
+        return called
+
+    monkeypatch.setattr(mx, "compile", recorded)
+    return compiled
+
+
+# The kernels of a block's launches: the routed decode's and the router's.
+_BLOCK_KERNELS = ("omlx_qwen35_moe_",)
+_BUILDERS = (
+    "_gate_up_kernel",
+    "_down_kernel",
+    "_gate_up_window_kernel",
+    "_down_window_kernel",
+    "_gate_up_topk_kernel",
+)
+_ROUTER_KERNELS = (
+    "_GEMV_KERNEL",
+    "_SOFTMAX_TOPK_KERNEL",
+    "_SOFTMAX_TOPK_ROWS_KERNEL",
+    "_KERNEL",
+    "_COMBINE_KERNEL",
+)
+
+
+@pytest.fixture
+def launched(monkeypatch):
+    """Every launch of a block's kernels, as it is built: the kernel's
+    name, its inputs and outputs (``launched.built``), while
+    ``launched.recording``. ``launched.verbose = True`` has MLX print the
+    source it generates for each."""
+    from omlx.patches import qwen35_moe_router as router
+
+    make, built = mx.fast.metal_kernel, []
+    built_with = SimpleNamespace(verbose=False, recording=True)
+
+    def kernel(**spec):
+        made = make(**spec)
+        if not spec["name"].startswith(_BLOCK_KERNELS):
+            return made
+
+        def launch(**call):
+            if not built_with.recording:
+                return made(**call)
+            outputs = made(**call, verbose=built_with.verbose)
+            built.append(
+                SimpleNamespace(
+                    name=spec["name"], inputs=call["inputs"], outputs=outputs
+                )
+            )
+            return outputs
+
+        return launch
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", kernel)
+    for name in _ROUTER_KERNELS:
+        monkeypatch.setattr(router, name, None)
+    for name in _BUILDERS:
+        getattr(routed, name).cache_clear()
+    built_with.built = built
+    yield built_with
+    for name in _BUILDERS:
+        getattr(routed, name).cache_clear()
+
+
 def _engaged():
     """Whether one token's launches ran for every plan built since the test
     began, and no window's failed."""
@@ -157,6 +252,19 @@ def _does_not_compile(a):
     )[0]
 
 
+class _Counted(nn.Module):
+    """A module that records its calls."""
+
+    def __init__(self, module, calls):
+        super().__init__()
+        self.module = module
+        self.calls = calls
+
+    def __call__(self, x):
+        self.calls.append(1)
+        return self.module(x)
+
+
 class _CastGate(nn.Module):
     """A router whose logits are not in its input's dtype."""
 
@@ -190,20 +298,17 @@ class _CastGate(nn.Module):
     ],
 )
 def test_fused_decode_is_bit_identical(hidden, inter, bits, group_size, monkeypatch):
-    calls = []
-    fused = routed.routed_decode
-    monkeypatch.setattr(
-        routed, "routed_decode", lambda *a: calls.append(1) or fused(*a)
-    )
+    compiled = _compiled(monkeypatch)
     for seed in range(2):
         block = _block(hidden, inter, bits=bits, group_size=group_size, seed=seed)
         for step in range(6):
             x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
             # The shared expert and its gate run inside the two launches.
-            assert routed.routed_decode_plan(block, x).fold
+            assert _plan(block, x).launches.fold
             ref, out = _pair(block, x)
             assert _same_bits(ref, out)
-    assert len(calls) == 12
+    # Every call is the one graph's: the blocks share a proof.
+    assert [graph.calls for graph in compiled] == [12]
     assert _engaged()
 
 
@@ -215,9 +320,9 @@ def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
     block = _block(hidden, inter, bits=5, quantized_shared=False, experts=experts)
     for step in range(4):
         x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
-        plan = routed.routed_decode_plan(block, x)
-        assert not plan.fold
-        assert routed._topk_folds(plan, block.gate(x)) == (experts == 128)
+        plan = _plan(block, x)
+        assert not plan.launches.fold
+        assert routed._topk_folds(plan.launches, block.gate(x)) == (experts == 128)
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert _engaged()
@@ -244,7 +349,7 @@ def test_qmv_gate_up_is_bit_identical(
     )
     for step in range(4):
         x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(dtype)
-        assert routed.routed_decode_plan(block, x).fold == quantized_shared
+        assert _plan(block, x).launches.fold == quantized_shared
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert _engaged()
@@ -452,8 +557,12 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
     from omlx.patches.qwen35_moe_router import fused_moe_combine
 
     block = _block(1024, 320, bits=5, experts=128)
-    plan = routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), mx.bfloat16))
-    assert all(o.shape[0] == 1 for o in plan.gate_up_operands + plan.down_operands)
+    plan = _plan(block, mx.zeros((1, 1, 1024), mx.bfloat16))
+    launches, (_, gate_up, down, shared_gate_up, shared_down) = (
+        plan.launches,
+        plan.operands,
+    )
+    assert all(o.shape[0] == 1 for o in gate_up + down)
     for ids in (list(range(118, 128)), [127, 0, 116, 64, 1, 126, 3, 115, 7, 100]):
         x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
         inds = mx.array(ids, dtype=mx.uint32).reshape(1, 1, 10)
@@ -461,7 +570,8 @@ def test_experts_past_the_bound_view_are_read_from_the_stacked_weights():
         shared = block["shared_expert"](x)
         gate = block["shared_expert_gate"](x)
         ref = fused_moe_combine(block.switch_mlp(x, inds), scores, shared, gate)
-        out = routed.routed_decode(plan, x, inds, scores, shared, gate)
+        h = routed._gate_up(launches, x, inds, gate_up, shared_gate_up)
+        out = routed._down(launches, h, inds, scores, x.shape, down, shared_down)
         mx.eval(ref, out)
         assert _same_bits(ref, out)
 
@@ -517,8 +627,9 @@ def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
     block = _block(1024, 512, bits=bits, top_k=top_k, dtype=dtype)
     for step in range(8):
         x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(dtype)
-        plan = routed.routed_decode_plan(block, x)
-        assert plan.fold and plan.dtype == dtype and plan.top_k == top_k
+        plan = _plan(block, x)
+        launches = plan.launches
+        assert launches.fold and launches.dtype == dtype and launches.top_k == top_k
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert _engaged()
@@ -534,9 +645,9 @@ def test_top8_routing_folded_into_gate_up_is_bit_identical(dtype, quantized_shar
     )
     for step in range(4):
         x = (mx.random.normal((1, 1, 1024)) * (0.5 + step)).astype(dtype)
-        plan = routed.routed_decode_plan(block, x)
-        assert plan.fold == quantized_shared
-        assert routed._topk_folds(plan, block.gate(x))
+        plan = _plan(block, x)
+        assert plan.launches.fold == quantized_shared
+        assert routed._topk_folds(plan.launches, block.gate(x))
         ref, out = _pair(block, x)
         assert _same_bits(ref, out)
     assert _engaged()
@@ -548,13 +659,13 @@ def test_mismatched_dtypes_keep_the_composed_body():
     # A router of another dtype runs as the block's own linear.
     gate = block.gate["weight"]
     block.gate["weight"] = gate.astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x).router_logits is None
+    assert _plan(block, x).launches.router is None
     block.gate["weight"] = gate
-    assert routed.routed_decode_plan(block, x.astype(mx.bfloat16)) is None
+    assert _plan(block, x.astype(mx.bfloat16)) is None
     down = block.switch_mlp.down_proj
     down["scales"] = down["scales"].astype(mx.bfloat16)
     down["biases"] = down["biases"].astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
 
 
 def test_router_logits_of_another_dtype_keep_the_composed_body():
@@ -562,11 +673,11 @@ def test_router_logits_of_another_dtype_keep_the_composed_body():
     x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
     logits = block.gate(x)
     block.gate = _CastGate(block.gate, mx.float16)
-    plan = routed.routed_decode_plan(block, x)
-    assert plan.router_logits is None
+    plan = _plan(block, x)
+    assert plan.launches.router is None
     # The folded routing takes fp16 logits, in a launch compiled for fp16.
-    assert routed._topk_folds(plan, logits)
-    assert not routed._topk_folds(plan, block.gate(x))
+    assert routed._topk_folds(plan.launches, logits)
+    assert not routed._topk_folds(plan.launches, block.gate(x))
     assert _same_bits(*_pair(block, x))
     assert not plan.proof.ran and not plan.proof.failed
 
@@ -574,7 +685,7 @@ def test_router_logits_of_another_dtype_keep_the_composed_body():
 def test_a_shared_expert_of_another_width_is_folded():
     block = _block(1024, 320, shared_inter=448)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x).fold
+    assert _plan(block, x).launches.fold
     assert _same_bits(*_pair(block, x))
     assert _engaged()
 
@@ -589,12 +700,12 @@ def test_a_shared_expert_of_another_width_is_folded():
 def test_plan_follows_replaced_weights(owner, names):
     block = _block(1024, 320, bits=5)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    first = routed.routed_decode_plan(block, x)
+    first = _plan(block, x)
     donor = _block(1024, 320, bits=5, seed=7)
     for name in names:
         for key in ("weight", "scales", "biases"):
             block[owner][name][key] = donor[owner][name][key]
-    assert routed.routed_decode_plan(block, x) is not first
+    assert _plan(block, x) is not first
     ref, out = _pair(block, x)
     assert _same_bits(ref, out)
 
@@ -609,7 +720,7 @@ def test_ineligible_shapes_keep_the_composed_body(kwargs):
     block = _block(**kwargs)
     hidden = kwargs["hidden"]
     x = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
 
 
 @pytest.mark.parametrize(
@@ -637,7 +748,7 @@ def test_rows_that_are_not_whole_launch_groups_keep_the_composed_body(
     monkeypatch.setattr(routed, name, value)
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
     assert _same_bits(*_pair(block, x))
     assert not kernels._PROOFS
 
@@ -657,16 +768,16 @@ def test_a_gate_up_face_names_the_one_dtype_of_the_launches(dtypes, monkeypatch)
     monkeypatch.setattr(affine.AffineFormat, "dot", several)
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
     assert _same_bits(*_pair(block, x))
     assert not kernels._PROOFS
 
 
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
     block = _block(1024, 320)
-    assert routed.routed_decode_plan(block, mx.zeros((1, 4, 1024), dtype=mx.bfloat16)) is None
-    assert routed.routed_decode_plan(block, mx.zeros((2, 1, 1024), dtype=mx.bfloat16)) is None
-    assert routed.routed_decode_plan(block, mx.zeros((1, 1, 1024), dtype=mx.float16)) is None
+    assert _plan(block, mx.zeros((1, 4, 1024), dtype=mx.bfloat16)) is None
+    assert _plan(block, mx.zeros((2, 1, 1024), dtype=mx.bfloat16)) is None
+    assert _plan(block, mx.zeros((1, 1, 1024), dtype=mx.float16)) is None
     x = mx.random.normal((1, 5, 1024)).astype(mx.bfloat16)
     ref, out = _pair(block, x)
     assert _same_bits(ref, out)
@@ -686,7 +797,7 @@ def test_block_without_gate_up_fusion_is_not_routed():
     block = Qwen3_5MoeSparseMoeBlock(args)
     block.set_dtype(mx.bfloat16)
     x = mx.zeros((1, 1, 1024), dtype=mx.bfloat16)
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
 
 
 def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog):
@@ -694,18 +805,20 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
     calls = []
+    down = routed._down
 
     def broken(*args):
+        """A down launch that fails when it is first evaluated."""
         calls.append(1)
-        raise RuntimeError("no pipeline")
+        return _does_not_compile(down(*args))
 
     with monkeypatch.context() as patch:
-        patch.setattr(routed, "routed_decode", broken)
+        patch.setattr(routed, "_down", broken)
         assert _same_bits(*_pair(block, x))
-        assert routed.routed_decode_plan(block, x) is None
+        assert _plan(block, x) is None
         # Another block of these faces and shapes does not try again.
         twin = _block(1024, 320, seed=1)
-        assert routed.routed_decode_plan(twin, x) is None
+        assert _plan(twin, x) is None
         assert _same_bits(*_pair(twin, x))
         assert _same_bits(*_pair(block, x))
     assert len(calls) == 1
@@ -713,30 +826,48 @@ def test_a_failed_launch_keeps_its_faces_and_shapes_composed(monkeypatch, caplog
     assert [r.getMessage() for r in warnings] == [
         "fused routed-expert decode failed; composed fallback"
     ]
+    # The block's own gate runs once a call: the composed body's.
+    asked = []
+    gate = block["gate"]
+    block["gate"] = _Counted(gate, asked)
+    assert _same_bits(*_pair(block, x))
+    block["gate"] = gate
+    assert len(asked) == 2  # the reference's call, then the block's
     # Other shapes still route.
     other = _block(1024, 512)
-    assert routed.routed_decode_plan(other, x) is not None
+    assert _plan(other, x) is not None
     assert _same_bits(*_pair(other, x))
-    assert routed.routed_decode_plan(other, x).proof.ran
+    assert _plan(other, x).proof.ran
 
 
-def test_a_failure_ahead_of_the_block_is_raised_and_not_its_launch_s(caplog):
+def test_a_failure_ahead_of_the_block_is_raised_where_its_output_is_evaluated(caplog):
+    """The block proves its launches on zeros and builds them over its
+    arrays: a failure in its input, its gate's or its router's weight is
+    its caller's, raised where the caller evaluates the result."""
     caplog.set_level(logging.WARNING, logger=routed.__name__)
-    block = _block(1024, 320)
+    composed, fused = _block(1024, 320), _block(1024, 320, experts=128)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    plan = routed.routed_decode_plan(block, x)
-    with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        block(_does_not_compile(x))
-    assert not plan.proof.failed and not plan.proof.ran
+    for block, metal in ((composed, (EXPERTS, False)), (fused, (128, True))):
+        plan = _plan(block, x)
+        y = block(_does_not_compile(x))
+        with pytest.raises(RuntimeError, match="Unable to build metal library"):
+            mx.eval(y)
+        assert plan.proof.ran == {metal} and not plan.proof.failed
+        weight = block.gate["weight"]
+        block.gate["weight"] = _does_not_compile(weight)
+        y = block(x)
+        block.gate["weight"] = weight
+        with pytest.raises(RuntimeError, match="Unable to build metal library"):
+            mx.eval(y)
+        assert not plan.proof.failed
     assert not _logged(caplog, routed, logging.WARNING)
-    assert _same_bits(*_pair(block, x))
+    for block in (composed, fused):
+        assert _same_bits(*_pair(block, x))
     assert _engaged()
 
 
-def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
-    block = _block(1024, 320)
-    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    routed.routed_decode_plan(block, x)  # evaluates the experts' views
+def _evaluations(monkeypatch):
+    """What ``mx.eval`` is given, call by call."""
     evaluate, evaluated = mx.eval, []
 
     def recorded(*arrays):
@@ -744,12 +875,22 @@ def test_only_an_unproven_launch_is_evaluated_in_the_call(monkeypatch):
         evaluate(*arrays)
 
     monkeypatch.setattr(mx, "eval", recorded)
+    return evaluated
+
+
+def test_an_unproven_block_evaluates_its_stand_in_and_a_proven_one_nothing(monkeypatch):
+    """A block's one evaluation is the stand-in of launches whose Metal is
+    not proven. Nothing of the call is evaluated: not x, not a tensor, not
+    the result."""
+    block = _block(1024, 320, experts=128)
+    x, other = (mx.random.normal((1, 1, 1024)).astype(mx.bfloat16) for _ in range(2))
+    _plan(block, x)  # evaluates the experts' views
+    evaluated = _evaluations(monkeypatch)
     y = block(x)
-    # The input first, outside the launch's guard, then the launch.
-    assert [len(arrays) for arrays in evaluated] == [1, 1]
-    assert evaluated[0][0] is x and evaluated[1][0] is y
+    ((proving,),) = evaluated
+    assert len(proving) == 2 and not any(a is y for a in proving)
     del evaluated[:]
-    block(x)
+    block(x), block(other), block(x[0])
     assert not evaluated
 
 
@@ -779,8 +920,8 @@ def test_a_face_that_does_not_compile_keeps_only_its_blocks_composed(
     # The warning carries the compiler's message.
     (warning,) = _logged(caplog, routed, logging.WARNING)
     assert "does not compile" in str(warning.exc_info[1])
-    assert routed.routed_decode_plan(bad, x) is None
-    assert routed.routed_decode_plan(good, x) is not None
+    assert _plan(bad, x) is None
+    assert _plan(good, x) is not None
     assert _same_bits(*_pair(good, x))
 
 
@@ -799,7 +940,7 @@ def test_a_format_whose_dot_raises_keeps_its_blocks_composed(
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
-    assert routed.routed_decode_plan(block, x) is None
+    assert _plan(block, x) is None
     assert not kernels._PROOFS
     # The answer is kept with the block's plan: no projection is asked twice.
     own = {id(block.switch_mlp.gate_up_proj), id(block.switch_mlp.down_proj)}
@@ -819,8 +960,8 @@ def test_blocks_share_a_proof_when_they_compile_the_same_launches(monkeypatch):
         """One token's proof, then a window's: only a folded plan has window
         launches."""
         x = mx.zeros((1, 1, block.switch_mlp.down_proj.weight.shape[1]), mx.bfloat16)
-        plan = routed.routed_decode_plan(block, x)
-        if not plan.fold:
+        plan = _plan(block, x)
+        if not plan.launches.fold:
             assert plan.window is None
             return (plan.proof,)
         assert plan.window is not plan.proof
@@ -896,9 +1037,9 @@ def test_a_window_that_fails_keeps_its_twin_s_windows_composed(monkeypatch):
     x = mx.random.normal((1, 3, 512)).astype(mx.bfloat16)
     built = []
 
-    def broken(plan, h, indices, scores):
-        built.append(plan)
-        rows = mx.zeros((indices.shape[0], plan.hidden), plan.dtype)
+    def broken(launches, h, indices, scores, *operands):
+        built.append(launches)
+        rows = mx.zeros((indices.shape[0], launches.hidden), launches.dtype)
         return _does_not_compile(rows)
 
     monkeypatch.setattr(routed, "_window_down", broken)
@@ -908,7 +1049,7 @@ def test_a_window_that_fails_keeps_its_twin_s_windows_composed(monkeypatch):
     # One token still takes the fused launches, in both.
     for block in (first, twin):
         assert _same_bits(*_pair(block, x[:, :1]))
-        plan = routed.routed_decode_plan(block, x[:, :1])
+        plan = _plan(block, x[:, :1])
         assert plan.window.failed and not plan.window.ran
         assert plan.proof.ran == {(128, True)} and not plan.proof.failed
 
@@ -929,14 +1070,492 @@ def test_a_launch_is_evaluated_once_per_router_width_and_fold(monkeypatch, caplo
         for _ in range(2):
             assert _same_bits(*_pair(block, x))
         ran.add((experts, True))
-        plan = routed.routed_decode_plan(block, x)
-        assert plan.fold and plan.proof.ran == ran
+        plan = _plan(block, x)
+        assert plan.launches.fold and plan.proof.ran == ran
+    # Whether the routing folds is decided where the launches are built,
+    # once for a signature: x of another shape.
     monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
-    assert _same_bits(*_pair(block, x))
-    assert routed.routed_decode_plan(block, x).proof.ran == ran | {(128, False)}
+    assert _same_bits(*_pair(block, x[0]))
+    assert _plan(block, x).proof.ran == ran | {(128, False)}
     assert [r.getMessage() for r in _logged(caplog, routed)] == [
         "Qwen MoE fused routed-expert decode engaged"
     ] * 3
+
+
+def _quiet(launched, block, x):
+    """The composed body's output for ``x``, its launches not recorded."""
+    launched.recording = False
+    ref = type(block).__call__._omlx_routed_decode_original(block, x)
+    mx.eval(ref)
+    launched.recording = True
+    return ref
+
+
+_TOKEN = ("router_gemv", "gate_up_topk", "down_combine_decode")
+
+
+def _kinds(launches):
+    """The launches' kernels, by what they run."""
+    kinds = []
+    for launch in launches:
+        name = launch.name.removeprefix("omlx_qwen35_moe_")
+        kinds.append(
+            next(k for k in (*_TOKEN, "gate_up_decode", "router") if name.startswith(k))
+        )
+    return kinds
+
+
+def test_a_block_s_launches_are_built_once_for_a_signature_and_replayed(
+    launched, monkeypatch
+):
+    """MLX writes a kernel's source out for every launch that is built. A
+    block's launches are one graph, built once for the token's shape and
+    dtype and the router's width, and replayed; the blocks of a proof
+    replay it over their own arrays."""
+    compiled = _compiled(monkeypatch)
+    decode, decoded = routed._decode, []
+    monkeypatch.setattr(routed, "_decode", lambda *a: decoded.append(1) or decode(*a))
+    block, twin = (_block(1024, 320, experts=128, seed=seed) for seed in (0, 1))
+    xs = [
+        (mx.random.normal((1, 1, 1024)) * (1 + s)).astype(mx.bfloat16) for s in range(3)
+    ]
+    for b in (block, twin):
+        for x in xs:
+            assert _same_bits(_quiet(launched, b, x), b(x))
+    # The block's first call builds the graph; every other call is its replay,
+    # looked up ahead of anything else the call asks.
+    assert decoded == [1]
+    # The stand-in's launches, then the graph's, built as MLX traces it.
+    assert _kinds(launched.built) == [
+        "gate_up_topk",
+        "down_combine_decode",
+        "router_gemv",
+    ] + [*_TOKEN]
+    assert [graph.calls for graph in compiled] == [6]
+    plan = _plan(block, xs[0])
+    assert _plan(twin, xs[0]).proof is plan.proof
+    assert set(plan.proof.graphs) == {((1, 1, 1024), mx.bfloat16, 128)}
+    # Another shape of the token is another graph, of the Metal proven.
+    del launched.built[:]
+    row = xs[0].reshape(1, 1024)
+    assert _same_bits(_quiet(launched, block, row), block(row))
+    assert _kinds(launched.built) == [*_TOKEN] and len(compiled) == 2
+    assert plan.proof.ran == {(128, True)}
+
+
+def test_a_graph_that_cannot_be_built_is_raised_and_not_kept(monkeypatch):
+    """What fails as the call's launches are built, after their Metal is
+    proven, is a defect of the kernel or of its caller: raised by the call,
+    and nothing is kept for the signature."""
+    block = _block(1024, 320, experts=128)
+    x = _token_of(block)
+    experts, built = routed._experts, []
+
+    def refused(*args):
+        built.append(1)
+        if len(built) > 1:  # the stand-in's are built, the call's are not
+            raise RuntimeError("no launch")
+        return experts(*args)
+
+    monkeypatch.setattr(routed, "_experts", refused)
+    with pytest.raises(RuntimeError, match="no launch"):
+        block(x)
+    plan = _plan(block, x)
+    assert plan.proof.ran == {(128, True)} and not plan.proof.failed
+    assert not plan.proof.graphs
+    monkeypatch.setattr(routed, "_experts", experts)
+    assert _same_bits(*_pair(block, x))
+    assert len(plan.proof.graphs) == 1
+
+
+def test_routers_of_other_widths_are_graphs_of_their_own(monkeypatch):
+    """Blocks of the same faces and shapes share a proof whatever their
+    router's width, and the router's width is a template value of two
+    launches: their graphs are kept apart."""
+    compiled = _compiled(monkeypatch)
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    blocks = [_block(512, 256, top_k=8, experts=experts) for experts in (128, 256)]
+    for block in blocks * 2:
+        assert _same_bits(*_pair(block, x))
+    proof = _plan(blocks[0], x).proof
+    assert _plan(blocks[1], x).proof is proof
+    assert set(proof.graphs) == {((1, 1, 512), mx.bfloat16, e) for e in (128, 256)}
+    assert [graph.calls for graph in compiled] == [2, 2]
+
+
+def test_a_launch_that_fails_drops_the_graphs_that_ran(monkeypatch, caplog):
+    """A proof's launches stop together: a graph it kept is dropped with
+    the failure of another of its launches, which composes from then on."""
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
+    block = _block(512, 256, top_k=8, experts=128)
+    x = mx.random.normal((1, 1, 512)).astype(mx.bfloat16)
+    assert _same_bits(*_pair(block, x))
+    proof = _plan(block, x).proof
+    assert len(proof.graphs) == 1
+    routing = routed._routing
+
+    def broken(logits, top_k):
+        """The routing launch, failing at its first evaluation."""
+        return tuple(_does_not_compile(a) for a in routing(logits, top_k))
+
+    monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
+    monkeypatch.setattr(routed, "_routing", broken)
+    assert _same_bits(*_pair(block, x[0]))
+    assert proof.failed and proof.ran == {(128, True)} and not proof.graphs
+    assert len(_logged(caplog, routed, logging.WARNING)) == 1
+    # The first signature composes too, and builds nothing.
+    monkeypatch.setattr(mx, "compile", lambda *a: pytest.fail("built"))
+    assert _same_bits(*_pair(block, x))
+    assert not proof.graphs
+
+
+def _selected(launch):
+    """The experts that a launch selects, if it selects."""
+    name = launch.name.removeprefix("omlx_qwen35_moe_")
+    if name.startswith("gate_up_topk"):
+        return launch.outputs[1]
+    if name.startswith(("router_softmax_topk", "router_topk")):
+        return launch.outputs[0]
+    return None
+
+
+@pytest.mark.parametrize(
+    "experts,fold,quantized_shared",
+    [
+        (128, True, True),  # the routing inside the gate+up launch
+        (128, False, True),  # the routing launch
+        (EXPERTS, False, True),  # the block's own gate, a composed softmax
+        (128, True, False),  # a shared expert outside the launches
+    ],
+)
+def test_a_stand_in_reads_zeros_and_routes_inside_its_stacks(
+    launched, monkeypatch, experts, fold, quantized_shared
+):
+    """A stand-in reads no array of the call: zeros for the token, the
+    router's weight, each shared matrix and what the block computes outside
+    the launches, and as many matrices of each stack as a row selects.
+    Logits that rank the experts route the row to the first matrices, which
+    the stacks have: no launch reads past them."""
+    if not fold:
+        monkeypatch.setattr(routed, "_topk_folds", lambda plan, logits: False)
+    block = _block(1024, 320, experts=experts, quantized_shared=quantized_shared)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    plan = _plan(block, x)
+    called = [x, *(a for group in plan.operands for a in group)]
+    called += [a for _, a in tree_flatten(block.parameters())]
+    assert _same_bits(_quiet(launched, block, x), block(x))
+    # The stand-in's launches, then the call's: the same kernels.
+    launches = launched.built
+    half = len(launches) // 2
+    stand_in = launches[:half]
+    assert sorted(_kinds(stand_in)) == sorted(_kinds(launches[half:]))
+    assert not any(a is b for launch in stand_in for a in launch.inputs for b in called)
+    top_k = plan.launches.top_k
+    stacks = [
+        a
+        for launch in stand_in
+        for a in launch.inputs
+        if a.ndim == 3 and a.shape[0] > 1
+    ]
+    assert len(stacks) == len(plan.operands[1]) + len(plan.operands[2])
+    for a in stacks:
+        assert a.shape[0] == top_k and mx.array_equal(a, mx.zeros_like(a)).item()
+    (indices,) = (i for i in map(_selected, stand_in) if i is not None)
+    assert sorted(indices.reshape(-1).tolist()) == list(range(top_k))
+    # Every other input is zeros, or what a launch of the stand-in gave.
+    given = {id(a) for launch in stand_in for a in launch.outputs}
+    for launch in stand_in:
+        for a in launch.inputs:
+            if id(a) not in given and a.shape[-1] != experts:
+                assert mx.array_equal(a, mx.zeros_like(a)).item()
+
+
+def _sources(capfd):
+    """The sources that MLX printed since they were last read, launch by
+    launch."""
+    out = capfd.readouterr().out
+    opening = r"^Generated source code for `\w+`:\n```\n"
+    return re.findall(opening + r"(.*?)\n```$", out, re.DOTALL | re.MULTILINE)
+
+
+def test_a_stand_in_has_the_metal_of_the_launches_it_proves(
+    launched, monkeypatch, capfd
+):
+    """MLX writes a launch's Metal from the kernel's source, the template's
+    values and, input by input, the dtype, whether the input has fewer than
+    8 elements and whether it has no axis. A block's stand-in is the
+    smallest launch of which all of that is the call's: MLX generates the
+    same sources for the two, byte for byte, kernel by kernel."""
+    launched.verbose = True
+    folds = routed._topk_folds
+    calls = [
+        (_block(1024, 320, experts=128), mx.bfloat16, folds),
+        (_block(1024, 512, top_k=8, experts=256, dtype=mx.float16), mx.float16, folds),
+        (_block(960, 320, bits=4, group_size=32, experts=128), mx.bfloat16, folds),
+        (_block(1024, 320, experts=128, quantized_shared=False), mx.bfloat16, folds),
+        (_block(1024, 320), mx.bfloat16, folds),
+        (_block(1024, 320, quantized_shared=False), mx.bfloat16, folds),
+        # The routing launch of a router that the gate+up launch could fold.
+        (_block(1024, 384, bits=6, group_size=128, experts=128), mx.bfloat16, None),
+    ]
+    generated, names = set(), set()
+    for block, dtype, fold in calls:
+        kernels._PROOFS.clear()
+        monkeypatch.setattr(
+            routed, "_topk_folds", fold or (lambda launches, logits: False)
+        )
+        x = mx.random.normal((1, 1, block.gate["weight"].shape[-1])).astype(dtype)
+        capfd.readouterr()
+        _quiet(launched, block, x)
+        capfd.readouterr()
+        mx.eval(block(x))
+        sources = _sources(capfd)
+        half = len(sources) // 2
+        assert half >= 2 and sorted(sources[:half]) == sorted(sources[half:])
+        (proof,) = (
+            p
+            for (kernel, *_), p in kernels._PROOFS.items()
+            if kernel == "routed_decode"
+        )
+        assert len(proof.ran) == 1 and not proof.failed
+        generated.update(sources)
+        names.update(
+            launch.name.removeprefix("omlx_qwen35_moe_") for launch in launched.built
+        )
+        del launched.built[:]
+    # Among them: the gemv router, the routing inside the gate+up launch and
+    # on its own (one launch, or the softmax and one), a shared expert in and
+    # outside the launches.
+    kinds = {(name.split("_affine")[0], "_shared_" in name) for name in names}
+    assert kinds == {
+        ("router_gemv", False),
+        ("router_topk", False),
+        ("router_softmax_topk_row", False),
+        ("gate_up_topk_bf16", True),
+        ("gate_up_topk_bf16", False),
+        ("gate_up_topk_scan", True),
+        ("gate_up_decode", True),
+        ("gate_up_decode", False),
+        ("down_combine_decode", True),
+        ("down_combine_decode", False),
+    }
+    assert len(generated) == 16
+
+
+def _token_of(block, seed=0):
+    mx.random.seed(100 + seed)
+    return mx.random.normal((1, 1, block.gate["weight"].shape[-1])).astype(mx.bfloat16)
+
+
+def test_a_proven_block_is_built_into_a_function_that_mlx_compiles(monkeypatch):
+    """MLX's compile calls a block once for the shapes it is given, over an
+    x that cannot be evaluated: a proven block needs nothing evaluated."""
+    folded, composed = _block(1024, 320, experts=128), _block(1024, 320)
+    x = _token_of(folded)
+    folded(x), composed(x)
+    evaluated = _evaluations(monkeypatch)
+    graph = mx.compile(lambda x: (folded(x) * 2, composed(x) * 2))
+    for seed in range(3):
+        x = _token_of(folded, seed)
+        y, z = graph(x)
+        assert _same_bits(y, folded(x) * 2) and _same_bits(z, composed(x) * 2)
+    assert not evaluated
+    assert [len(_plan(b, x).proof.graphs) for b in (folded, composed)] == [1, 1]
+
+
+def test_an_unproven_block_is_proven_in_a_function_that_mlx_compiles(
+    monkeypatch, caplog
+):
+    """A block's first call may be the one MLX's compile makes, over an x
+    that cannot be evaluated: the launches are proven on their stand-in,
+    which reads no array of the call, and the graph is kept."""
+    caplog.set_level(logging.INFO, logger=routed.__name__)
+    block = _block(1024, 320, experts=128)
+    x, later = _token_of(block), _token_of(block, 1)
+    graph = mx.compile(lambda x: block(x) * 2)
+    compiled = _compiled(monkeypatch)
+    want = type(block).__call__._omlx_routed_decode_original(block, x) * 2
+    assert _same_bits(graph(x), want)
+    plan = _plan(block, x)
+    assert plan.proof.ran == {(128, True)} and len(plan.proof.graphs) == 1
+    assert [r.getMessage() for r in _logged(caplog, routed)] == [_ENGAGED]
+    # Outside the function the kept graph is traced once, then replayed;
+    # nothing is evaluated or proven again.
+    evaluated = _evaluations(monkeypatch)
+    for call in (later, x):
+        assert _same_bits(
+            block(call), type(block).__call__._omlx_routed_decode_original(block, call)
+        )
+        assert _same_bits(graph(call), block(call) * 2)
+    assert len(compiled) == 1 and len(_logged(caplog, routed)) == 1
+    assert not evaluated
+
+
+_ENGAGED = "Qwen MoE fused routed-expert decode engaged"
+
+
+def test_a_block_is_proven_and_kept_in_a_function_compiled_over_its_state(
+    monkeypatch, caplog
+):
+    """``mx.compile(fn, inputs=state)`` hands a block its own tensors as
+    arrays that cannot be evaluated, nor bound as a view of one expert: the
+    launches are proven on their stand-in, built over the trace's stacks
+    whole and kept, and the block keeps its tensors."""
+    caplog.set_level(logging.INFO, logger=routed.__name__)
+    block = _block(1024, 320, experts=128)
+    x, later = _token_of(block), _token_of(block, 1)
+    want = type(block).__call__._omlx_routed_decode_original(block, x)
+    mx.eval(want)
+    graph = mx.compile(lambda x: block(x) * 2, inputs=block.state)
+    for _ in range(2):
+        assert _same_bits(graph(x), want * 2)
+    # The function left the block its own tensors.
+    mx.eval(block.parameters())
+    plan = _plan(block, x)
+    assert plan.proof.ran == {(128, True)} and len(plan.proof.graphs) == 1
+    assert all(a.shape[0] == 1 for a in plan.operands[1] + plan.operands[2])
+    assert [r.getMessage() for r in _logged(caplog, routed)] == [_ENGAGED]
+    for call in (later, x):
+        assert _same_bits(*_pair(block, call))
+    assert len(plan.proof.graphs) == 1
+
+
+def test_a_face_that_does_not_compile_in_a_compiled_function_is_the_composed_body(
+    monkeypatch, caplog
+):
+    """The stand-in fails as the launches would: the function is built over
+    the block's composed body, in a plain trace and over the state."""
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
+    dot = formats.dot
+
+    def broken(layer, k, n):
+        face = dot(layer, k, n)
+        if face is None or k != 320:
+            return face
+        source = face.source + 'static_assert(false, "does not compile");\n'
+        return replace(face, key=face.key + "_broken", source=source)
+
+    monkeypatch.setattr(formats, "dot", broken)
+    block = _block(1024, 320, experts=128)
+    x = _token_of(block)
+    want = type(block).__call__._omlx_routed_decode_original(block, x)
+    mx.eval(want)
+    for inputs in ([], block.state):
+        graph = mx.compile(lambda x: block(x), inputs=inputs)
+        assert _same_bits(graph(x), want)
+    mx.eval(block.parameters())
+    (warning,) = _logged(caplog, routed, logging.WARNING)
+    assert "does not compile" in str(warning.exc_info[1])
+    proof = kernels._PROOFS[next(k for k in kernels._PROOFS if k[0] == "routed_decode")]
+    assert proof.failed and not proof.ran and not proof.graphs
+
+
+class _Thread:
+    """A thread that runs MLX as oMLX's engines do: one executor's worker."""
+
+    def __init__(self, name):
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=name)
+        self(lambda: mx.zeros((1,)).item())
+        self.ident = self(threading.get_ident)
+
+    def __call__(self, fn, *args):
+        return self.pool.submit(fn, *args).result(timeout=60)
+
+    def end(self):
+        self.pool.shutdown()
+
+
+def _called(block, x):
+    y = block(x)
+    mx.eval(y)
+    return y
+
+
+def test_a_block_s_graph_is_called_by_the_thread_that_built_it(monkeypatch):
+    """MLX keeps what it traces a compiled function into thread by thread,
+    and the function's end forgets it for its last caller alone. So each
+    thread keeps the graphs it builds, calls no other's, and proves nothing
+    that another thread proved."""
+    block = _block(1024, 320, experts=128)
+    x = _token_of(block)
+    want = type(block).__call__._omlx_routed_decode_original(block, x)
+    mx.eval(want)
+    compiled = _compiled(monkeypatch)
+    engines = [_Thread("mlx-engine-a"), _Thread("mlx-engine-b")]
+    try:
+        for run in (engines[0], engines[1], engines[0], engines[1]):
+            assert _same_bits(run(_called, block, x), want)
+        assert _same_bits(_called(block, x), want)
+        idents = {engine.ident for engine in engines} | {threading.get_ident()}
+        plan = _plan(block, x)
+        counts = [engine(lambda: len(plan.proof.graphs)) for engine in engines]
+    finally:
+        for engine in engines:
+            engine.end()
+    assert len(compiled) == 3 and all(len(graph.threads) == 1 for graph in compiled)
+    assert set.union(*(graph.threads for graph in compiled)) == idents
+    assert counts == [1, 1] and plan.proof.ran == {(128, True)}
+
+
+def test_a_kept_graph_is_not_replayed_for_a_token_of_another_dtype():
+    """x's dtype is part of a graph's signature: a token in another dtype
+    than the launches are compiled for is the composed body's, whatever
+    graphs the shape has."""
+    block = _block(1024, 512, top_k=8, experts=128)
+    x = _token_of(block)
+    assert _same_bits(*_pair(block, x))
+    plan = _plan(block, x)
+    kept = dict(plan.proof.graphs)
+    half = x.astype(mx.float16)
+    ref, out = _pair(block, half)
+    assert out.dtype == ref.dtype and mx.array_equal(out, ref).item()
+    assert plan.proof.graphs == kept and plan.proof.ran == {(128, True)}
+
+
+@pytest.mark.parametrize("experts", [EXPERTS, 128])
+def test_x_of_another_width_is_the_composed_body_s(experts):
+    """A row of another width than the block's is not routed: the block's
+    composed body refuses it, as before."""
+    block = _block(1024, 320, experts=experts)
+    assert _same_bits(*_pair(block, _token_of(block)))
+    wide = mx.zeros((1, 1, 2048), mx.bfloat16)
+    original = type(block).__call__._omlx_routed_decode_original
+    with pytest.raises(ValueError) as composed:
+        mx.eval(original(block, wide))
+    with pytest.raises(ValueError) as routed_call:
+        mx.eval(block(wide))
+    assert str(routed_call.value) == str(composed.value)
+
+
+def test_a_router_of_partial_simdgroups_keeps_the_composed_body():
+    """The fused routing reads an expert count of whole simdgroups."""
+    block = _block(1024, 320, experts=48)
+    x = _token_of(block)
+    assert _plan(block, x) is None
+    assert _same_bits(*_pair(block, x))
+    assert not any(proof.ran for proof in kernels._PROOFS.values())
+
+
+@pytest.mark.parametrize("outside", ["shared", "shared_gate", "router"])
+def test_a_kept_graph_takes_only_outside_arrays_of_the_token_s_dtype(outside):
+    """A shared expert, its gate and a gate that run as they are give the
+    graph an array each call: one in another dtype than the token's is not
+    what the graph was built for, and the block composes."""
+    if outside in ("shared", "shared_gate"):
+        block = _block(1024, 320, experts=128, quantized_shared=False)
+        name = {"shared": "shared_expert", "shared_gate": "shared_expert_gate"}[outside]
+    else:
+        block = _block(1024, 320)
+        name = "gate"
+    x = _token_of(block)
+    assert _same_bits(*_pair(block, x))
+    plan = _plan(block, x)
+    assert len(plan.proof.graphs) == 1
+    original = block[name]
+    block[name] = _CastGate(original, mx.float16)
+    assert _same_bits(*_pair(block, x))
+    block[name] = original
+    assert len(plan.proof.graphs) == 1 and plan.proof.ran and not plan.proof.failed
 
 
 def test_apply_requires_the_fused_router(_patched_block):
@@ -983,3 +1602,99 @@ def test_apply_is_idempotent(_patched_block):
     call = cls.__call__
     assert routed.apply_qwen35_moe_routed_decode_patch()
     assert cls.__call__ is call
+
+
+class _Shaped(nn.Module):
+    """A module whose output is reshaped or cut by ``reshape``."""
+
+    def __init__(self, module, reshape):
+        super().__init__()
+        self.module = module
+        self.reshape = reshape
+
+    def __call__(self, x):
+        return self.reshape(self.module(x))
+
+
+@pytest.mark.parametrize(
+    "name,reshape",
+    [
+        # A shared expert of half the width: the composed body refuses it.
+        ("shared_expert", lambda y: y[..., : y.shape[-1] // 2]),
+        # A gate value of no axis: the down launch reads gate[0].
+        ("shared_expert_gate", lambda y: y.reshape(())),
+        # A gate of two values: the down launch would read the first alone.
+        ("shared_expert_gate", lambda y: mx.concatenate([y, y + 1], axis=-1)),
+        # A router that scores fewer experts than the block has.
+        ("gate", lambda y: y[..., :96]),
+    ],
+)
+def test_what_the_block_computes_outside_the_launches_is_read_in_their_shapes(
+    name, reshape
+):
+    """What a block computes outside its launches reaches them as it is: of
+    another shape than the launches read, the block is its composed body's
+    (which may refuse it), and no proof fails."""
+    block = _block(1024, 320, experts=128, quantized_shared=name == "gate")
+    x = _token_of(block)
+    assert _same_bits(*_pair(block, x))
+    plan = _plan(block, x)
+    original = block[name]
+    block[name] = _Shaped(original, reshape)
+    composed = type(block).__call__._omlx_routed_decode_original
+    try:
+        want = composed(block, x)
+        mx.eval(want)
+    except ValueError as refused:
+        with pytest.raises(ValueError, match=re.escape(str(refused))):
+            mx.eval(block(x))
+    else:
+        got = block(x)
+        assert got.dtype == want.dtype and mx.array_equal(got, want).item()
+    finally:
+        block[name] = original
+    assert plan.proof.ran and not plan.proof.failed and len(plan.proof.graphs) == 1
+    assert not any(proof.failed for proof in kernels._PROOFS.values())
+
+
+def test_a_shared_expert_of_rows_the_launches_do_not_group_is_left_out(monkeypatch):
+    """The launches take a shared expert in whole groups of a simdgroup's
+    rows: of a width that is not, the shared expert runs as it is."""
+    monkeypatch.setattr(routed, "_GATE_UP_ROWS", 3)  # groups of 6 rows
+    block = _block(1024, 384, experts=128, shared_inter=320)
+    x = _token_of(block)
+    assert not _plan(block, x).launches.fold
+    assert _same_bits(*_pair(block, x))
+
+
+def test_a_shared_expert_whose_up_has_another_face_is_left_out():
+    """The gate+up launch reads the shared expert's gate and up rows through
+    one face: an up of other bits keeps the shared expert as it is."""
+    block = _block(1024, 320, experts=128, quantized_shared=False)
+    shared = block.shared_expert
+    for name, bits, group in (
+        ("gate_proj", 8, 128),
+        ("up_proj", 4, 64),
+        ("down_proj", 8, 64),
+    ):
+        setattr(
+            shared,
+            name,
+            nn.QuantizedLinear.from_linear(getattr(shared, name), group, bits),
+        )
+    block.shared_expert_gate = nn.QuantizedLinear.from_linear(
+        block.shared_expert_gate, 64, 8
+    )
+    mx.eval(block.parameters())
+    x = _token_of(block)
+    assert not _plan(block, x).launches.fold
+    assert _same_bits(*_pair(block, x))
+
+
+def test_stacks_of_other_expert_counts_are_not_planned():
+    """Gate+up and down index one expert count."""
+    block = _block(1024, 320, experts=128)
+    down = block.switch_mlp.down_proj
+    for name in ("weight", "scales", "biases"):
+        down[name] = down[name][:-32]
+    assert _plan(block, _token_of(block)) is None
