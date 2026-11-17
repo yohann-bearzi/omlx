@@ -38,6 +38,7 @@ import importlib.abc
 import inspect
 import json
 import operator
+import os
 import sys
 import threading
 import types
@@ -107,8 +108,7 @@ class _Checkpoint:
         self.path = Path(path).expanduser()
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
-        config = self.path / "config.json"
-        self.shown = config.resolve().parent if config.is_symlink() else self.path
+        self.shown = _shown(self.path)
         self._config = _ABSENT
         self._read: dict[str, formats.QuantFormat] = {}
         self.built: list[nn.Module] = []
@@ -163,12 +163,21 @@ class _Checkpoint:
         self._read[fmt.mode] = read
         return read
 
+    def _read_config(self):
+        """The checkpoint's config.json, read once (and its failure kept)."""
+        if self._config is _ABSENT:
+            try:
+                self._config = json.loads((self.path / "config.json").read_text())
+            except (OSError, ValueError) as error:
+                self._config = error
+        if isinstance(self._config, Exception):
+            raise self._config
+        return self._config
+
     def _written(self, mode: str):
         """What the checkpoint's config keeps of ``mode``'s format, as it is
         (``_ABSENT`` for nothing), and the JSON path to it."""
-        if self._config is _ABSENT:
-            self._config = json.loads((self.path / "config.json").read_text())
-        kept, where = self._config, "config.json"
+        kept, where = self._read_config(), "config.json"
         for key in ("omlx_quant_formats", mode):
             if not isinstance(kept, dict):
                 return kept, where
@@ -286,13 +295,14 @@ class _Checkpoint:
         """The layers the checkpoint's quantization config names in a mode
         that is not MLX's, with that mode."""
         try:
-            if self._config is _ABSENT:
-                self._config = json.loads((self.path / "config.json").read_text())
+            config = self._read_config()
         except OSError:
             # A loader handed what is no checkpoint's directory: it names
             # no entry.
             return []
-        config = self._config
+        if not isinstance(config, dict):
+            # The library refuses it, when it reads it.
+            return []
         quantization = config.get("quantization") or config.get("quantization_config")
         if not isinstance(quantization, dict):
             return []
@@ -301,7 +311,7 @@ class _Checkpoint:
             for path, entry in quantization.items()
             if isinstance(entry, dict)
             and isinstance(entry.get("mode"), str)
-            and not formats._mlx_runs(entry["mode"])
+            and (not formats._mlx_runs(entry["mode"]) or self.records(entry["mode"]))
         ]
 
 
@@ -416,6 +426,20 @@ def outside_load() -> Iterator[None]:
         yield
     finally:
         formats._LOADING.reset(token)
+
+
+def _shown(path: Path) -> Path:
+    """The checkpoint a refusal names for a load of ``path``: a view of links
+    to a checkpoint's files (a family's loader's, a decision model's) by the
+    checkpoint its config is, link by link while each link is to a config
+    file (a Hugging Face snapshot's is to a blob of content, not one)."""
+    config = path / "config.json"
+    while config.is_symlink():
+        target = config.parent / os.readlink(config)
+        if target.name != "config.json":
+            break
+        path, config = target.parent, target
+    return path
 
 
 def _config_of(path) -> Path:
@@ -542,13 +566,19 @@ def _format_layer(layer, layer_cls, signature, arguments):
         if not isinstance(mode, str):
             # MLX's to refuse.
             return None
-        if fmt is None and (_recorded(mode) or not formats._mlx_runs(mode)):
+        recorded = _recorded(mode)
+        if not recorded and formats._mlx_runs(mode):
+            return None
+        if recorded:
+            # A damaged record is refused as such.
+            formats._LOADING.get()._record(mode)
+        if fmt is None:
             # No format reads it: one of MLX's modes too when the checkpoint
             # records a format of it (written before MLX's modes were the
             # built-ins' only, or by a newer oMLX).
             raise _refused(_not_installed(mode), mode)
-        if formats._mlx_runs(mode):
-            return None
+        # The registered format lays out no such matrix: one of MLX's modes
+        # (affine) that the checkpoint records a format of too.
         raise _refused(
             f"it lays out no ({n}, {k}) matrix of {bits} bits in groups of "
             f"{group_size}",

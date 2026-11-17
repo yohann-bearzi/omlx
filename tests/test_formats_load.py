@@ -354,6 +354,118 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
     assert type(mlx_s.value) is not formats.FormatRefusedError
 
 
+@pytest.mark.parametrize(
+    "mode, written, reason",
+    [
+        # The built-in affine format lays out no matrix: a checkpoint that
+        # records a format of affine is not read as MLX's.
+        (
+            "affine",
+            {"affine": {"plugin": "shadow 0.1.0", "contract": 1, "record": {}}},
+            "it lays out no (16, 64) matrix of 4 bits in groups of 32",
+        ),
+        (
+            "affine",
+            {"affine": None},
+            "config.json['omlx_quant_formats']['affine'] is null, where oQ writes "
+            "an object: the checkpoint's config is damaged",
+        ),
+        (
+            "mxfp4",
+            None,
+            "config.json['omlx_quant_formats'] is null, where oQ writes an "
+            "object: the checkpoint's config is damaged",
+        ),
+    ],
+    ids=["affine", "affine null", "formats null"],
+)
+def test_a_record_of_one_of_mlx_s_modes_is_never_read_as_mlx_s(
+    toy, tmp_path, mode, written, reason
+):
+    config = {"omlx_quant_formats": written}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with (
+        format_load.loading(tmp_path),
+        pytest.raises(formats.FormatRefusedError) as refusal,
+    ):
+        nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode=mode)
+    assert refusal.value.reason == reason
+
+
+def test_an_entry_of_a_recorded_mlx_mode_that_binds_no_layer_is_refused(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    config["omlx_quant_formats"]["mxfp4"] = {"plugin": "shadow 0.1.0", "contract": 1}
+    config["quantization"]["model.layers.0.mlp.gate"] = {
+        "group_size": 32,
+        "bits": 4,
+        "mode": "mxfp4",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(
+        formats.FormatRefusedError, match="names model.layers.0.mlp.gate"
+    ):
+        load_model(tmp_path, strict=False)
+
+
+def test_a_refusal_names_a_hub_snapshot_not_its_blob(toy, tmp_path):
+    repo = tmp_path / "models--org--tiny"
+    snapshot, blobs = repo / "snapshots" / "abc", repo / "blobs"
+    snapshot.mkdir(parents=True)
+    blobs.mkdir()
+    (blobs / "0f1e").write_text(json.dumps({"omlx_quant_formats": {"toy": None}}))
+    (snapshot / "config.json").symlink_to(Path("../../blobs/0f1e"))
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").symlink_to(snapshot / "config.json")
+    for path in (snapshot, view):
+        with format_load.loading(path), pytest.raises(formats.FormatRefusedError) as no:
+            nn.Linear(64, 128).to_quantized(**_TOY)
+        assert no.value.path == snapshot
+
+
+def test_a_checkpoint_s_config_is_read_once_whatever_it_holds(tmp_path, monkeypatch):
+    reads = []
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        reads.append(self)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    for text in (None, "null", "{"):
+        if text is not None:
+            (tmp_path / "config.json").write_text(text)
+        reads.clear()
+        checkpoint = format_load._Checkpoint(tmp_path)
+        # What is no object names no entry; what is not read is read once.
+        if text == "null":
+            assert checkpoint._format_entries() == []
+        for _ in range(2):
+            with contextlib.suppress(OSError, ValueError):
+                checkpoint.records("toy")
+        assert checkpoint.writer("toy") == "an unknown writer"
+        assert len(reads) == 1, text
+        (tmp_path / "config.json").unlink(missing_ok=True)
+
+
+def test_a_format_s_refusals_outside_a_load_name_the_checkpoint(toy, tmp_path):
+    _llama(tmp_path, **_written({"levels": [1.0]}))
+
+    def refuses(record):
+        raise ValueError("written in layout 2")
+
+    def configures(record):
+        toy.levels = 1
+        return toy
+
+    for reads in (refuses, configures, lambda record: "a string"):
+        toy.reads = reads
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            format_load._Checkpoint(tmp_path).read(toy)
+        assert refusal.value.path == tmp_path
+
+
 def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(toy, tmp_path):
     # Installed, and skipped when the registry loaded (here for the revision
     # of the contract it is written for).

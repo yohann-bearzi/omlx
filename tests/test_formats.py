@@ -435,6 +435,25 @@ def test_what_a_checkpoint_of_a_plugin_that_did_not_load_is_told(plugins, caplog
     assert formats.get("good") is not None and formats.get("also") is None
 
 
+def test_a_format_registered_by_hand_meanwhile_is_no_plugin_s(plugins):
+    import threading
+    import time
+
+    def failing():
+        # Another thread registers a format by hand while this plugin loads:
+        # it waits for the load, and is not this plugin's.
+        threading.Thread(target=formats.register, args=(_Format("byhand"),)).start()
+        time.sleep(0.2)
+        raise ImportError("no module named its_codec")
+
+    plugins.append(_Entry("failing", failing))
+    formats.load()
+    deadline = time.monotonic() + 60
+    while formats._FORMATS.get("byhand") is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert formats.get("byhand") is not None and "byhand" not in formats._SKIPPED
+
+
 def test_only_the_thread_that_loads_the_builtins_takes_an_mlx_mode(plugins):
     import threading
 

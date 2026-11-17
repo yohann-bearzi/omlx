@@ -461,9 +461,10 @@ def load() -> None:
     order of their entry points' names, then values. A plugin is logged with
     its distribution and the modes it registered. One that fails to load is
     logged and skipped, with every format registered while it loaded:
-    a checkpoint of a mode it registered, or built a format of, is then
-    refused with its error, everything else is served. A built-in that fails to load is oMLX's own defect and raises,
-    here and at every later lookup.
+    a checkpoint of a mode it registered, or handed to register (which
+    refused it), is then refused with its error, everything else is served.
+    A built-in that fails to load is oMLX's own defect and raises, here and
+    at every later lookup.
 
     A lookup the loading thread makes while the load runs sees the formats
     registered so far. Plugins do not rely on it (docs/quant-formats.md).
@@ -497,7 +498,7 @@ def load() -> None:
                         del _FORMATS[mode]
                     # What a checkpoint of each mode it would have registered
                     # is told, unless a plugin before it has one or said why.
-                    for mode in sorted(tried - _FORMATS.keys()):
+                    for mode in tried - _FORMATS.keys():
                         _SKIPPED.setdefault(
                             mode, f"{plugin} is installed but did not load: {error}"
                         )
@@ -530,7 +531,7 @@ def _mlx_runs(mode) -> bool:
     if not isinstance(mode, str):
         return False
     try:
-        mx.quantize(mx.zeros((1, 1)), mode=mode, stream=mx.cpu)
+        mx.quantize(mx.zeros((1, 1), stream=mx.cpu), mode=mode, stream=mx.cpu)
     except ValueError as error:
         return "Invalid quantization mode" not in str(error)
     return True
