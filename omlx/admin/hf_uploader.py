@@ -20,7 +20,12 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS, VERIFICATION
+from ..model_discovery import (
+    CLEF_HEAD_WEIGHTS,
+    D3_READOUT_WEIGHTS,
+    VERIFICATION,
+    unverified,
+)
 from ..oq import (
     _is_audio_tensor,
     _is_mtp_tensor,
@@ -478,14 +483,18 @@ class HFUploader:
                 if not model_dir.exists():
                     continue
                 for subdir in sorted(model_dir.iterdir()):
-                    if not subdir.is_dir():
+                    if not subdir.is_dir() or unverified(subdir):
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
                         candidates.append(subdir)
                     else:
                         for child in sorted(subdir.iterdir()):
-                            if child.is_dir() and (child / "config.json").exists():
+                            if (
+                                child.is_dir()
+                                and (child / "config.json").exists()
+                                and not unverified(child)
+                            ):
                                 candidates.append(child)
 
                     for path in candidates:
@@ -528,14 +537,18 @@ class HFUploader:
                 if not model_dir.exists():
                     continue
                 for subdir in sorted(model_dir.iterdir()):
-                    if not subdir.is_dir():
+                    if not subdir.is_dir() or unverified(subdir):
                         continue
                     candidates = []
                     if (subdir / "config.json").exists():
                         candidates.append(subdir)
                     else:
                         for child in sorted(subdir.iterdir()):
-                            if child.is_dir() and (child / "config.json").exists():
+                            if (
+                                child.is_dir()
+                                and (child / "config.json").exists()
+                                and not unverified(child)
+                            ):
                                 candidates.append(child)
 
                     for path in candidates:

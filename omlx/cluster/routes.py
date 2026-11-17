@@ -26,6 +26,7 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..exceptions import ModelBusyError, ModelNotFoundError
+from ..model_discovery import unverified
 from .autoconfigure import (
     STRATEGIES,
     build_rdma_matrix,
@@ -3429,7 +3430,11 @@ async def cluster_catalogue(request: ClusterCatalogueRequest) -> dict[str, Any]:
     if request.model_dir:
         root = Path(request.model_dir).expanduser()
         try:
-            paths.extend(child for child in sorted(root.iterdir()) if child.is_dir())
+            paths.extend(
+                child
+                for child in sorted(root.iterdir())
+                if child.is_dir() and not unverified(child)
+            )
         except OSError as exc:
             raise HTTPException(
                 status_code=400, detail=f"could not read {root}: {exc}"

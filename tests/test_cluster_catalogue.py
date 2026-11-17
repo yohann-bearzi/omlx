@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from omlx.cluster.catalogue import (
@@ -310,6 +311,34 @@ def test_the_endpoint_answers_for_every_model_it_was_given(monkeypatch, tmp_path
     assert body["largest_runnable"]["model_id"] == "big"
     assert body["runnable_count"] == 2
     assert body["cluster_capacity_bytes"] == int(128 * GiB)
+
+
+def test_the_endpoint_leaves_out_a_checkpoint_not_verified(monkeypatch, tmp_path):
+    def _fake(path, nodes, **_):
+        return ModelFit(
+            model_id=Path(path).name,
+            weight_bytes=int(10 * GiB),
+            fits=True,
+            reason="",
+            nodes_required=1,
+            max_context_tokens=32768,
+        )
+
+    monkeypatch.setattr("omlx.cluster.catalogue.assess_model_path", _fake)
+    for name, record in (
+        ("served", None),
+        ("written.unverified", None),
+        ("failed", False),
+    ):
+        (tmp_path / name).mkdir()
+        config = {} if record is None else {"omlx_verification": {"verified": record}}
+        (tmp_path / name / "config.json").write_text(json.dumps(config))
+    response = _client().post(
+        CATALOGUE,
+        json={"nodes": [_node_payload(128)], "model_dir": str(tmp_path)},
+    )
+    assert response.status_code == 200
+    assert [model["model_id"] for model in response.json()["models"]] == ["served"]
 
 
 def test_a_subset_of_nodes_is_renumbered_for_the_planner():

@@ -410,6 +410,33 @@ class TestHFUploaderListModels:
     """Test model listing functionality."""
 
     @pytest.mark.asyncio
+    async def test_a_checkpoint_not_verified_is_not_offered(self, model_dirs):
+        """Neither a run's <name>.unverified folder nor a checkpoint whose
+        record says its checks failed, at the root or in an org folder."""
+        root = Path(model_dirs[0])
+        failed = {"omlx_verification": {"verified": False, "mode": "toy"}}
+        for path, config in (
+            (root / "Llama-3B-oQ2.unverified", {}),
+            (root / "Llama-3B-oQ3", failed),
+            (root / "org" / "Qwen-7B-oQ2.unverified", {}),
+            (root / "org" / "Qwen-7B-oQ4", failed),
+        ):
+            path.mkdir(parents=True)
+            (path / "config.json").write_text(json.dumps(config))
+            _write_safetensors_stub(path / "model.safetensors", 1024)
+        uploader = HFUploader(model_dirs=model_dirs)
+        for models in (
+            await uploader.list_oq_models(),
+            await uploader.list_all_models(),
+        ):
+            assert {m["name"] for m in models} & {
+                "Llama-3B-oQ2.unverified",
+                "Llama-3B-oQ3",
+                "Qwen-7B-oQ2.unverified",
+                "Qwen-7B-oQ4",
+            } == set()
+
+    @pytest.mark.asyncio
     async def test_list_oq_models(self, model_dirs):
         uploader = HFUploader(model_dirs=model_dirs)
         models = await uploader.list_oq_models()

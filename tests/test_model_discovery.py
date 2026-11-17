@@ -1770,10 +1770,14 @@ class TestReadModelContextLength:
 class TestTwoLevelDiscovery:
     """Tests for two-level model discovery."""
 
-    def _make_model(self, path: Path, model_type: str = "llama"):
-        """Helper to create a valid model directory."""
+    def _make_model(self, path: Path, model_type: str = "llama", verified=None):
+        """Helper to create a valid model directory; ``verified``: the record
+        of a run in a quant format that wrote it."""
         path.mkdir(parents=True, exist_ok=True)
-        (path / "config.json").write_text(json.dumps({"model_type": model_type}))
+        config = {"model_type": model_type}
+        if verified is not None:
+            config["omlx_verification"] = {"verified": verified, "mode": "toy"}
+        (path / "config.json").write_text(json.dumps(config))
         (path / "model.safetensors").write_bytes(b"0" * 1000)
 
     def test_two_level_org_folder(self, tmp_path):
@@ -1830,9 +1834,19 @@ class TestTwoLevelDiscovery:
         org = tmp_path / "mlx-community"
         self._make_model(org / "llama-3b")
         self._make_model(org / "llama-3b-oQ4.unverified")
+        self._make_model(org / "llama-3b-oQ3", verified=False)
 
         models = discover_models(tmp_path)
         assert list(models) == ["llama-3b"]
+
+    def test_a_checkpoint_its_run_did_not_verify_is_not_served(self, tmp_path):
+        """Moved out of its <name>.unverified folder by hand, or with failed
+        checks: its config's record says so."""
+        self._make_model(tmp_path / "llama-3b-oQ4", verified=False)
+        self._make_model(tmp_path / "llama-3b-oQ3", verified=True)
+        assert list(discover_models(tmp_path)) == ["llama-3b-oQ3"]
+        # Pointed at the checkpoint itself.
+        assert discover_models(tmp_path / "llama-3b-oQ4") == {}
 
     def test_org_folder_invalid_children_skipped(self, tmp_path):
         """Test that children without config.json in org folders are skipped."""

@@ -1263,8 +1263,13 @@ def _is_adapter_dir(path: Path) -> bool:
 
 
 def _is_model_dir(path: Path) -> bool:
-    """Check if a directory contains a valid model (has config.json)."""
-    return (path / "config.json").exists() and not _is_adapter_dir(path)
+    """Check if a directory contains a valid model (has config.json), one
+    no run left unverified."""
+    return (
+        (path / "config.json").exists()
+        and not _is_adapter_dir(path)
+        and not unverified(path)
+    )
 
 
 _SHARD_FILE_RE = re.compile(r"-(\d+)-of-(\d+)\.safetensors$")
@@ -1472,10 +1477,24 @@ VERIFICATION = "omlx_verification"
 SOURCE_RECORDS = ("omlx_quant_formats", VERIFICATION)
 
 
+def unverified(path: Path) -> bool:
+    """A checkpoint a run in a quant format wrote and did not verify: in
+    its <output>.unverified folder, or with a config whose record does not
+    say verified (moved by hand, or its checks failed)."""
+    if path.name.endswith(UNVERIFIED_SUFFIX):
+        return True
+    try:
+        config = json.loads((path / "config.json").read_text())
+    except (OSError, ValueError):
+        return False
+    record = config.get(VERIFICATION) if isinstance(config, dict) else None
+    return isinstance(record, dict) and record.get("verified") is not True
+
+
 def _skipped_entry(path: Path) -> bool:
     """An entry no scan serves: a hidden one (.Trashes, .Spotlight-V100,
-    ...) or a checkpoint not yet verified."""
-    return path.name.startswith(".") or path.name.endswith(UNVERIFIED_SUFFIX)
+    ...) or a checkpoint not verified."""
+    return path.name.startswith(".") or unverified(path)
 
 
 def _iter_readable_entries(path: Path, context: str) -> list[Path]:
