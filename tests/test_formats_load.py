@@ -2805,6 +2805,65 @@ def test_the_vlm_engine_reads_its_record(levels, tmp_path):
     assert _gate_proj(model).fmt.levels == (7.0,)
 
 
+def _verification(path, **record):
+    """``path``'s checkpoint with ``record`` as its config's record of the
+    verification of the run that wrote it."""
+    config = json.loads((path / "config.json").read_text())
+    config["omlx_verification"] = record
+    (path / "config.json").write_text(json.dumps(config))
+    return path
+
+
+def _loads():
+    """Each way oMLX loads a checkpoint's directory: mlx-lm's loader, the
+    LLM engine's, the VLM engine's."""
+    from mlx_vlm.utils import load_model as vlm_load_model
+
+    from omlx.utils.model_loading import load_text_model
+
+    return [
+        lambda path: load_model(path),
+        lambda path: load_text_model(str(path)),
+        lambda path: vlm_load_model(path, lazy=True),
+    ]
+
+
+@pytest.mark.parametrize("load", range(3))
+def test_a_checkpoint_its_run_left_unverified_is_refused_before_a_read(
+    levels, tmp_path, load
+):
+    path = _verification(
+        _tiny(tmp_path / "toy", [1.0]),
+        verified=False,
+        mode="toy",
+        reason="its quantization did not complete",
+    )
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        _loads()[load](path)
+    assert str(refusal.value) == _refusal(
+        "not verified: its quantization did not complete", path
+    )
+    # Before a layer of the format is built, and no load is left active.
+    assert levels() == [] and formats._LOADING.get() is None
+
+
+def test_a_record_that_does_not_say_verified_is_refused(levels, tmp_path):
+    path = _verification(
+        _tiny(tmp_path / "toy", [1.0]), mode="toy", reason="its checks failed"
+    )
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        load_model(path)
+    assert str(refusal.value) == _refusal("not verified: its checks failed", path)
+
+
+def test_a_verified_checkpoint_loads(levels, tmp_path):
+    path = _verification(
+        _tiny(tmp_path / "toy", [3.0]), verified=True, mode="toy", verify_version=0
+    )
+    model, _ = load_model(path)
+    assert _gate_proj(model).fmt.levels == (3.0,)
+
+
 @pytest.mark.parametrize("drafter", ["DFlash", "VLM-MTP"])
 def test_a_drafter_reads_its_record(levels, tmp_path, drafter):
     path = str(_tiny(tmp_path / "drafter", [8.0]))

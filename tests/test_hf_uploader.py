@@ -234,6 +234,32 @@ class TestGenerateModelCard:
             "embedding table, or"
         ) in card
 
+    def test_the_card_says_the_checks_a_format_s_layers_passed(self, tmp_path):
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {"model.norm.weight": mx.ones((64,), dtype=mx.bfloat16)},
+        )
+        record = {"verified": True, "mode": "toy", "verify_version": 2}
+        card = _generate_model_card(
+            "Llama-oQ4e", tmp_path, {"omlx_verification": record}
+        )
+        assert (
+            "Its layers in quant format `toy` were verified by oQ's checks, version 2."
+        ) in card
+        # At version 0 nothing was checked.
+        unchecked = {**record, "verify_version": 0}
+        card = _generate_model_card(
+            "Llama-oQ4e", tmp_path, {"omlx_verification": unchecked}
+        )
+        assert (
+            "Written by oQ in quant format `toy`; this oMLX version does not check "
+            "format checkpoints yet."
+        ) in card
+        assert "verified by" not in card
+        for config in ({"omlx_verification": {**record, "verified": False}}, {}):
+            card = _generate_model_card("Llama-oQ4e", tmp_path, config)
+            assert "verified by" not in card and "Written by oQ" not in card
+
     def test_v41_fp8_engram_tables_keep_source_storage(self, tmp_path):
         engram = "language_model.layers.1.engram.embed"
         rows, width = 32, 256

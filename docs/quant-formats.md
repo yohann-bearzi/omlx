@@ -341,6 +341,14 @@ What oQ writes:
 
   `record()` gives what a checkpoint keeps of the format beside its layers: the revision of its layout, what the format needs to read its own checkpoints. It is a dict that JSON keeps as it is (string keys; strings of UTF-8, finite numbers, lists, dicts; no tuple, array, NaN or infinity), asked once for the whole checkpoint, and empty by default. oQ stores it as it checked it: a record the format changes afterwards (while it encodes) is not what the checkpoint keeps. A source written in a format carries its own record in its config; oQ leaves it out of an output with no layer in a format. oQ refuses another before it reads a weight: `quant format 'myformat' gives the record {'levels': (1, 2)}, not a dict that JSON keeps as it is: report it to the plugin`. The load hands it back to [`accept`](#load-a-checkpoint).
 
+- In `config.json`, the record of the run's verification, whatever the format took:
+
+  ```json
+  "omlx_verification": {"verified": true, "mode": "myformat", "verify_version": 0}
+  ```
+
+  `verify_version` is the version of oQ's checks that the output passed (`omlx.oq.VERIFY_VERSION`); a model card that oMLX's uploader writes says it. Version 0: the run completed, nothing is checked yet, and the card says so (`this oMLX version does not check format checkpoints yet`). While the run writes, its record says `"verified": false` with the reason, and so does the record of a checkpoint whose checks fail: a load refuses it before it reads a weight, `quant format 'myformat' of the checkpoint at <output> (written by my-package 0.1.0; installed: my-package 0.1.0): not verified: its quantization did not complete`.
+- All of it in `<output>.unverified`, which model discovery and the oQ manager do not list, renamed to `<output>` once written. A run with a format refuses an existing `<output>` or `<output>.unverified` before it reads a weight.
 - A line in the log, `oQ4: 23 layers in quant format myformat`, or a warning when the format took none: `oQ4: quant format myformat took no layer: the output is as without it`.
 
 oQ checks each answer against the layout, which is what the checkpoint loads by. Tensors of other names, shapes or dtypes stop the run:

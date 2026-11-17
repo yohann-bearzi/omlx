@@ -56,6 +56,7 @@ import mlx.nn as nn
 from .. import formats
 from ..formats import FormatRefusedError, LoadHookError
 from ..formats.linear import FormatLinear, FormatSwitchLinear
+from ..model_discovery import VERIFICATION
 
 # The modules whose SwitchLinear holds a stack of matrices, (E, N, K).
 _SWITCH_MODULES = ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")
@@ -339,6 +340,23 @@ class _Checkpoint:
                 self,
             )
         return written
+
+    def refuse_unverified(self) -> None:
+        """Refuse the checkpoint, before a weight is read, when a run in a
+        quant format wrote it and its verification did not pass: the run
+        did not complete, or its checks failed."""
+        try:
+            if self._config is None:
+                self._config = json.loads((self.path / "config.json").read_text())
+        except OSError:
+            # A loader handed what is no checkpoint's directory.
+            return
+        config = self._config
+        record = config.get(VERIFICATION) if isinstance(config, dict) else None
+        if isinstance(record, dict) and record.get("verified") is not True:
+            raise _refused(
+                f"not verified: {record.get('reason')}", record.get("mode"), self
+            )
 
     def writer(self, mode: str) -> str:
         """The plugin the checkpoint's record says wrote ``mode``'s layers."""
@@ -868,6 +886,7 @@ def loading(path, *, by_loader: bool = False) -> Iterator[_Checkpoint]:
         yield outer
         return
     checkpoint = _Checkpoint(path, by_loader=by_loader)
+    checkpoint.refuse_unverified()
     _refuse_family(checkpoint)
     token = formats._LOADING.set(checkpoint)
     try:

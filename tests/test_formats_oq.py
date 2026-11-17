@@ -10,6 +10,7 @@ import inspect
 import json
 import logging
 import re
+import shutil
 import sys
 import textwrap
 import threading
@@ -40,6 +41,7 @@ from tests.test_formats_linear import _ToyFormat
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
 _RECORD = "omlx_quant_formats"  # in a checkpoint's config: what reads its layers
+_VERIFICATION = "omlx_verification"  # in its config: its run's verification
 # docs/quant-formats.md quotes what oQ says of a format, one named myformat.
 _QUOTED = " ".join(_PAGE.split())
 
@@ -368,6 +370,45 @@ def test_a_run_in_a_format_writes_beside_its_output_until_done(
     seen.clear()
     _quantize(source, tmp_path / "oqe")
     assert seen == [(tmp_path / "oqe", True)]
+
+
+def test_a_run_in_a_format_records_its_verification(source, toy, tmp_path, monkeypatch):
+    """Not verified while it writes, so a crash leaves what a load refuses;
+    verified, by the version of the checks it passed, once done."""
+    output = tmp_path / "oqe-toy"
+    copy, seen = oq._copy_model_sidecars, []
+
+    def copied(src, out, **kwargs):
+        seen.append(json.loads((out / "config.json").read_text())[_VERIFICATION])
+        return copy(src, out, **kwargs)
+
+    monkeypatch.setattr(oq, "_copy_model_sidecars", copied)
+    _, config, _ = _quantize(source, output, quant_format="toy")
+    assert seen == [
+        {
+            "verified": False,
+            "mode": "toy",
+            "verify_version": oq.VERIFY_VERSION,
+            "reason": "its quantization did not complete",
+        }
+    ]
+    assert config[_VERIFICATION] == {
+        "verified": True,
+        "mode": "toy",
+        "verify_version": oq.VERIFY_VERSION,
+    }
+
+
+def test_a_run_keeps_no_record_of_its_source_s_verification(source, tmp_path):
+    """A source written by a run in a format tells of that run's checks,
+    not of this one's."""
+    copy = tmp_path / "written"
+    shutil.copytree(source, copy)
+    config = json.loads((copy / "config.json").read_text())
+    config[_VERIFICATION] = {"verified": True, "mode": "toy", "verify_version": 0}
+    (copy / "config.json").write_text(json.dumps(config))
+    _, config, _ = _quantize(copy, tmp_path / "oqe")
+    assert _VERIFICATION not in config
 
 
 def test_a_run_in_a_format_refuses_a_folder_it_would_write(source, toy, tmp_path):
@@ -706,13 +747,17 @@ def _in_format(config, mode="toy"):
 
 def _beside(tensors, config, layers):
     """An output without ``layers``: its other tensors, and its config
-    without their entries and the formats' record."""
+    without their entries, the formats' record and the verification's."""
     tensors = {
         name: tensor
         for name, tensor in tensors.items()
         if name.rpartition(".")[0] not in layers
     }
-    config = {name: value for name, value in config.items() if name != _RECORD}
+    config = {
+        name: value
+        for name, value in config.items()
+        if name not in (_RECORD, _VERIFICATION)
+    }
     for key in ("quantization", "quantization_config"):
         config[key] = {
             name: entry for name, entry in config[key].items() if name not in layers
@@ -889,7 +934,10 @@ def test_a_format_that_takes_no_layer_is_said_so(
     assert _quoted(warnings[0])
     assert not any("layers in quant format" in message for message in caplog.messages)
     assert _RECORD not in config
-    _assert_same_output((tensors, config), plain[:2])
+    # As without it, but for the record of its verification: a run in a
+    # format is checked whatever the format took.
+    assert config[_VERIFICATION]["verified"] is True
+    _assert_same_output(_beside(tensors, config, ()), plain[:2])
 
 
 def test_without_a_format_oq_says_nothing_of_one(source, tmp_path, caplog, monkeypatch):
@@ -2563,7 +2611,11 @@ def test_the_walk_is_of_the_config_the_run_writes(source, toy, tmp_path, monkeyp
     # of sequence.
     run = {k: v for k, v in written["quantization"].items() if not isinstance(v, dict)}
     learned = {"quantization": run, "quantization_config": run}
-    unlearned = {k: v for k, v in written.items() if k not in (_RECORD, "eos_token_id")}
+    unlearned = {
+        k: v
+        for k, v in written.items()
+        if k not in (_RECORD, _VERIFICATION, "eos_token_id")
+    }
     assert given == [{**unlearned, **learned}]
 
 

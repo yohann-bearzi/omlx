@@ -1459,6 +1459,10 @@ def model_directory_write_error(path: Path, *, create: bool = False) -> str | No
 # A quantization in a quant format writes its checkpoint here, beside its
 # place, until it is verified and renamed: nothing serves it before.
 UNVERIFIED_SUFFIX = ".unverified"
+# The config's record of that verification: {"verified": ..., "mode": the
+# run's quant format, "verify_version": the version of oQ's checks, and
+# "reason" while not verified}. A load refuses a checkpoint whose record is
+# not verified.
 
 
 VERIFICATION = "omlx_verification"

@@ -66,6 +66,7 @@ from omlx.model_discovery import (
     MLX_LM_TEXT_ONLY_MODEL_TYPES,
     SOURCE_RECORDS,
     UNVERIFIED_SUFFIX,
+    VERIFICATION,
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
@@ -74,6 +75,9 @@ from omlx.model_discovery import (
 logger = logging.getLogger(__name__)
 
 OQ_LEVELS = {2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8}
+# The version of the checks a run in a quant format passes before its output
+# is verified (its config's record): 0, the run completed, nothing checked.
+VERIFY_VERSION = 0
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -8903,6 +8907,14 @@ def quantize_oq_streaming(
     # this output does not have, and tell of another run's verification.
     for key in SOURCE_RECORDS:
         output_config.pop(key, None)
+    if quant_fmt is not None:
+        # Until the checks pass: what a crash leaves is refused at load.
+        output_config[VERIFICATION] = {
+            "verified": False,
+            "mode": quant_fmt.mode,
+            "verify_version": VERIFY_VERSION,
+            "reason": "its quantization did not complete",
+        }
     if format_layers:
         logger.info(
             "oQ%s: %d layers in quant format %s",
@@ -8957,6 +8969,13 @@ def quantize_oq_streaming(
         export_sidecars(source, output, config)
 
     if final_output is not None:
+        written = json.loads((output / "config.json").read_text())
+        written[VERIFICATION] = {
+            "verified": True,
+            "mode": quant_fmt.mode,
+            "verify_version": VERIFY_VERSION,
+        }
+        _atomic_write_json(output / "config.json", written)
         output.rename(final_output)
     cb("saving", 100.0, "Quantized model saved")
     logger.info(

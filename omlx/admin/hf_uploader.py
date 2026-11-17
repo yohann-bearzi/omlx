@@ -20,7 +20,7 @@ from datetime import date
 from pathlib import Path
 from typing import Optional
 
-from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS
+from ..model_discovery import CLEF_HEAD_WEIGHTS, D3_READOUT_WEIGHTS, VERIFICATION
 from ..oq import (
     _is_audio_tensor,
     _is_mtp_tensor,
@@ -263,6 +263,21 @@ def _generate_model_card(
         f"(oMLX v{__version__}) mixed-precision quantization.",
         "",
     ]
+    verification = config.get(VERIFICATION)
+    if isinstance(verification, dict) and verification.get("verified") is True:
+        mode, version = verification.get("mode"), verification.get("verify_version")
+        if version:
+            said = (
+                f"Its layers in quant format `{mode}` were verified by oQ's "
+                f"checks, version {version}."
+            )
+        else:
+            # Version 0: the run completed, nothing was checked.
+            said = (
+                f"Written by oQ in quant format `{mode}`; this oMLX version does "
+                "not check format checkpoints yet."
+            )
+        lines += [said, ""]
 
     average = f"{8 * total_b / total_w:.3f} bits/weight"
     scope = "the complete checkpoint" if draft is None else "the model weights"
