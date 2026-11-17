@@ -32,15 +32,17 @@ from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
+# A block of 2 to MAX_ROWS rows takes the gather, but one of FEW_PAIRS
+# pairs or fewer over MANY_EXPERTS experts or more. Chained against the
+# composed path on both Macs (Flash-Next's block, the 35B-A3B's, one of 8
+# experts; 2, 3, 4 and 8 bits; independent and correlated routing), the
+# gather is faster in every block but 2 rows (16 pairs) of the 35B-A3B's
+# 256 experts with independent routing on the M5 Max: 1.011 at 4 bits,
+# above the bar of 1.005 whatever correlated routing gains there. Few
+# pairs over many experts share few experts: little for the gather to
+# save. The 8-expert block wins at 8 to 16 pairs.
 MAX_ROWS = 8
-# MLX's 2- and 3-bit experts run the gather only in blocks of at least
-# MANY_EXPERTS experts and of at most FEW_PAIRS pairs (rows x top-k): there
-# it was measured faster than the composed path on both Macs, at Flash-Next's
-# and the 35B-A3B's blocks (BLOCK-P.md, Item 5), when every threadgroup
-# searched its pair's rank: above FEW_PAIRS the search cost more than the
-# gather saved, and a block of 8 experts lost at 8 to 16 pairs as well.
-# Other widths and formats engage as they did before those faces.
-FEW_PAIRS = 32
+FEW_PAIRS = 16
 MANY_EXPERTS = 64
 # From this many pairs a block's pairs are put in expert order once, by a
 # launch of their own (_ORDER) ahead of the block's two (_ORDERED_SOURCE);
@@ -197,7 +199,7 @@ class _Plan(NamedTuple):
     down: Projection
     proof: kernels.Proof  # of a block's launches (and its order's)
     width: int  # the K of gate_up: a row of x
-    pairs: int | None  # the most pairs of a block it takes, if a limit
+    few_pairs: int  # blocks of this many pairs or fewer keep the composed path
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -223,14 +225,12 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
     if gate_up is None:
         return None
     down = projection(layers[1], gate_up.n // 2)
-    if down is None:
+    # A pair's expert indexes both stacks.
+    if down is None or down.operands[0].shape[0] != gate_up.operands[0].shape[0]:
         return None
-    pairs = None
-    if any(layer.mode == "affine" and layer.bits in (2, 3) for layer in layers):
-        if gate_up.operands[0].shape[0] < MANY_EXPERTS:
-            return None
-        pairs = FEW_PAIRS
-    # What the launches are compiled from, beside a block's rows and routing.
+    few_pairs = FEW_PAIRS if gate_up.operands[0].shape[0] >= MANY_EXPERTS else 0
+    # What the launches are compiled from, beside a block's rows and routing,
+    # and the bound (a Metal in ran passed it).
     proof = kernels.proof(
         "verify_gather",
         gate_up.face,
@@ -239,8 +239,9 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
         width,
         gate_up.n,
         down.n,
+        few_pairs,
     )
-    return _Plan(gate_up, down, proof, width, pairs)
+    return _Plan(gate_up, down, proof, width, few_pairs)
 
 
 _FAILED = "expert-ordered verify gather failed; composed fallback"
@@ -290,11 +291,11 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     """Fused gate/up then down routed projections for 2..MAX_ROWS rows.
 
     Returns ``[B, L, top_k, D]`` like the verifier's gather path, or None when
-    the block is outside this kernel (its rows, indices that are not integers
-    or not top_k >= 1 of them for each row of x, x that is not float16,
-    bfloat16 or float32 or has fewer than 8 values, 2- or 3-bit affine
-    experts outside MANY_EXPERTS and FEW_PAIRS), a
-    projection has no dot face that is exact for ``x``'s dtype, the
+    the block is outside this kernel (its rows, FEW_PAIRS pairs or fewer
+    over MANY_EXPERTS experts or more, indices that are not integers or not
+    top_k >= 1 of them for each row of x, x that is not float16, bfloat16
+    or float32 or has fewer than 8 values), a projection has no dot face
+    that is exact for ``x``'s dtype, the
     activation gives another dtype than ``x``'s or another shape than the
     up's, or a block of these faces and shapes failed.
 
@@ -334,8 +335,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         # kernel reads x from device memory; like gather_qmm, it takes float
         # activations of the GPU and integer indices only.
         top_k < 1
+        or rows * top_k <= plan.few_pairs
         or x.dtype not in (mx.float16, mx.bfloat16, mx.float32)
-        or (plan.pairs is not None and rows * top_k > plan.pairs)
         or rows * width < 8
         or not mx.issubdtype(indices.dtype, mx.integer)
         or not plan.proof.prove(

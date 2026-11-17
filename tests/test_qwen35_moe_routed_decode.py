@@ -339,7 +339,14 @@ def test_bf16_shared_expert_stays_composed_and_bit_identical(experts):
 @pytest.mark.parametrize("quantized_shared", [True, False])
 @pytest.mark.parametrize(
     "hidden,inter,bits,group_size",
-    [(960, 320, 4, 32), (896, 384, 5, 128), (832, 320, 6, 32), (896, 384, 8, 128)],
+    [
+        (960, 320, 2, 64),
+        (896, 320, 3, 64),
+        (960, 320, 4, 32),
+        (896, 384, 5, 128),
+        (832, 320, 6, 32),
+        (896, 384, 8, 128),
+    ],
 )
 def test_qmv_gate_up_is_bit_identical(
     hidden, inter, bits, group_size, quantized_shared, dtype

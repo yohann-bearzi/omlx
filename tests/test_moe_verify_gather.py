@@ -74,7 +74,7 @@ def _composed(monkeypatch, switch, x, indices):
         return gate_up_fusion._fused_verify_switch(switch, x, indices)
 
 
-@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 def test_a_projection_is_the_layer_s_dot_face_and_tensors(bits):
     # K = 1024 takes the qmv_fast traversal, K = 320 the qmv one.
     for k, n, fast in ((1024, 64, True), (320, 1024, False)):
@@ -160,33 +160,43 @@ def _routed(rows, top_k, experts, seed=7):
     return x, indices
 
 
-@pytest.mark.parametrize("bits, down_bits", [(2, None), (3, None), (3, 4), (4, 2)])
-def test_2_and_3_bit_experts_take_the_gather_up_to_32_pairs(
-    monkeypatch, bits, down_bits
+@pytest.mark.parametrize("experts", [8, 64])
+@pytest.mark.parametrize(
+    "bits, down_bits, dtype, group",
+    [
+        (2, None, mx.bfloat16, 32),
+        (3, None, mx.bfloat16, 32),
+        (3, 4, mx.bfloat16, 32),
+        (4, 2, mx.bfloat16, 32),
+        (2, None, mx.float16, 64),
+        (3, None, mx.float16, 64),
+    ],
+)
+def test_2_and_3_bit_experts_take_the_gather_at_every_block(
+    monkeypatch, bits, down_bits, dtype, group, experts
 ):
-    """In a block of 64 experts or more; either projection at 2 or 3 bits is
-    enough."""
-    switch = _switch(bits, down_bits=down_bits, experts=64)
-    few = ((2, 6), (5, 6), (4, 8), (8, 4), (2, 16))  # 32 pairs or fewer
-    many = ((6, 6), (5, 8), (8, 5), (3, 11), (3, 16))
-    for rows, top_k in few + many:
-        x, indices = _routed(rows, top_k, 64)
-        got = gather.fused_switch(switch, x, indices)
-        assert (got is not None) == ((rows, top_k) in few), (rows, top_k)
-        if got is not None:
-            assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+    """Few experts or many, 32 pairs or more: with the pairs ordered once
+    the gather was faster than the composed path at every block measured
+    but 16 pairs over 256 experts."""
+    switch = _switch(bits, dtype, group=group, down_bits=down_bits, experts=experts)
+    blocks = ((2, 6), (4, 8), (8, 4), (6, 6), (5, 8), (3, 11), (3, 16))
+    for rows, top_k in blocks:
+        x, indices = _routed(rows, top_k, experts)
+        got = gather.fused_switch(switch, x.astype(dtype), indices)
+        if experts == 64 and rows * top_k <= 16:
+            assert got is None
+            continue
+        want = _composed(monkeypatch, switch, x.astype(dtype), indices)
+        assert _same_bits(got, want), (rows, top_k)
     (proof,) = _proofs()
-    assert len(proof.ran) == 5 and not proof.failed
+    assert len(proof.ran) == len(blocks) - (experts == 64) and not proof.failed
 
 
-@pytest.mark.parametrize("bits, down_bits", [(2, None), (3, None), (4, 3)])
-def test_2_and_3_bit_experts_of_fewer_than_64_leave_every_block_composed(
-    bits, down_bits
-):
-    """A block of 8 experts lost to the composed path at 8 to 16 pairs."""
-    switch = _switch(bits, down_bits=down_bits, experts=63)
-    for rows, top_k in ((2, 4), (2, 6), (4, 8)):
-        assert gather.fused_switch(switch, *_routed(rows, top_k, 63)) is None
+def test_a_down_stack_of_other_experts_than_the_gate_up_s_has_no_plan():
+    """A pair's expert indexes both stacks."""
+    switch = _switch()
+    switch.down_proj = _switch(experts=16).down_proj
+    assert gather.fused_switch(switch, *_block(1, 3)) is None
     assert not _proofs()
 
 
@@ -809,3 +819,18 @@ def test_an_ordered_block_is_proven_in_a_function_that_mlx_compiles(monkeypatch)
     assert _same_bits(compiled(x, indices), want * 2)
     (proof,) = _proofs()
     assert proof.ran == {(4, TOP_K, x.dtype, mx.uint32)} and not proof.failed
+
+
+def test_few_pairs_over_many_experts_keep_the_composed_path(monkeypatch):
+    """16 pairs or fewer over 64 experts or more: 2 rows of a 256-expert
+    top-8 block read 1.011 against the composed path. Over fewer experts,
+    and from 17 pairs, the gather. The bound is part of the proof's key: a
+    block of few experts proving such a Metal does not let many take it."""
+    few, many = _switch(experts=63), _switch(experts=64)
+    for rows, top_k, runs in ((2, 8, False), (4, 4, False), (3, 6, True), (2, 9, True)):
+        x, indices = _routed(rows, top_k, 63)
+        assert (gather.fused_switch(many, x, indices) is not None) == runs
+        got = gather.fused_switch(few, x, indices)
+        assert _same_bits(got, _composed(monkeypatch, few, x, indices))
+    proofs = sorted(_proofs(), key=lambda proof: len(proof.ran))
+    assert [len(proof.ran) for proof in proofs] == [2, 4]
