@@ -364,8 +364,10 @@ def test_an_unproven_window_evaluates_its_stand_in_and_a_proven_one_nothing(
 
     monkeypatch.setattr(mx, "eval", recorded)
     y = routed.routed_verify_window(block, x)
-    ((proving,),) = evaluated
+    *inputs, (proving,) = evaluated
     assert len(proving) == 2 and not any(a is y for a in proving)
+    # Ahead of it, the stand-in's logits, then its zeros: none of the call's.
+    assert len(inputs) == 2 and not any(a is x for arrays in inputs for a in arrays)
     del evaluated[:]
     assert routed.routed_verify_window(block, x) is not None
     assert routed.routed_verify_window(block, _inputs(4, 0)) is not None

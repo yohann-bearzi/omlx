@@ -18,7 +18,7 @@ from mlx.utils import tree_flatten
 
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
-from omlx.formats import affine, kernels
+from omlx.formats import affine, kernels, linear
 from omlx.patches.module_cache import cached_per_module
 from tests.test_formats_affine import uncalled
 
@@ -887,8 +887,10 @@ def test_an_unproven_block_evaluates_its_stand_in_and_a_proven_one_nothing(monke
     _plan(block, x)  # evaluates the experts' views
     evaluated = _evaluations(monkeypatch)
     y = block(x)
-    ((proving,),) = evaluated
+    *inputs, (proving,) = evaluated
     assert len(proving) == 2 and not any(a is y for a in proving)
+    # Ahead of it, the stand-in's logits, then its zeros: none of the call's.
+    assert len(inputs) == 2 and not any(a is x for arrays in inputs for a in arrays)
     del evaluated[:]
     block(x), block(other), block(x[0])
     assert not evaluated
@@ -1627,6 +1629,12 @@ class _Shaped(nn.Module):
         ("shared_expert_gate", lambda y: mx.concatenate([y, y + 1], axis=-1)),
         # A router that scores fewer experts than the block has.
         ("gate", lambda y: y[..., :96]),
+        # Logits of two rows for one token.
+        ("gate", lambda y: mx.concatenate([y, y], axis=0)),
+        # A shared output of the block's size in another shape.
+        ("shared_expert", lambda y: y.reshape(2, 1, -1)),
+        # A gate value on one more axis than the token's.
+        ("shared_expert_gate", lambda y: y.reshape(1, 1, 1, 1)),
     ],
 )
 def test_what_the_block_computes_outside_the_launches_is_read_in_their_shapes(
@@ -1764,6 +1772,18 @@ def test_a_kept_window_is_not_replayed_for_rows_of_another_dtype():
 def test_windows_of_no_rows_or_of_more_than_the_verify_kernels_take_are_composed():
     block = _block(512, 256, top_k=8, experts=128)
     assert routed.routed_verify_window(block, _rows_of(block, 1, 0)) is None
+    # Axes other than a verify block's [B, L, hidden], of one row too.
+    for x in (
+        mx.zeros((), mx.bfloat16),
+        _rows_of(block, 1, 1)[0],
+        _rows_of(block, 1, 3)[None],
+    ):
+        assert routed.routed_verify_window(block, x) is None
+    # One row of another dtype than the launches': one token's call declines.
+    assert (
+        routed.routed_verify_window(block, _rows_of(block, 1, 1).astype(mx.float16))
+        is None
+    )
     wide = _rows_of(block, 1, routed.WINDOW_MAX_ROWS + 1)
     assert routed.routed_verify_window(block, wide) is None
     # A window has the axes of a verify block's: [B, L, hidden].
@@ -1958,7 +1978,7 @@ def test_windows_the_launches_do_not_take_are_composed():
     nothing is proven or kept."""
     block = _block(512, 256, top_k=8, experts=128)
     assert (
-        routed.routed_verify_window(block, mx.zeros((1, 3, 256), mx.bfloat16)) is None
+        routed.routed_verify_window(block, mx.zeros((1, 3, 1024), mx.bfloat16)) is None
     )
     gated = _block(1024, 320)
     plan = routed._build_plan(gated)
@@ -1971,3 +1991,135 @@ def test_windows_the_launches_do_not_take_are_composed():
     x = _rows_of(partial_router, 1, 3)
     assert routed.routed_verify_window(partial_router, x) is None
     assert not any(proof.ran or proof.graphs for proof in kernels._PROOFS.values())
+
+
+class _ZerosError(Exception):
+    """No exception oMLX or MLX raises."""
+
+
+def test_what_fails_in_a_block_s_stand_in_zeros_is_raised_and_fails_no_proof(
+    monkeypatch,
+):
+    """A block's and a window's stand-in inputs are made and evaluated ahead of
+    the proof (``linear._zeros``): what fails there (an allocation, an error
+    an earlier evaluation left pending on the GPU) is the call's, raised, and
+    neither proof fails or proves anything."""
+    block = _block(512, 256, top_k=8, experts=128)
+    x, rows = _rows_of(block, 1, 1), _rows_of(block, 1, 3)
+    error = _ZerosError("no zeros")
+    with monkeypatch.context() as patch:
+        patch.setattr(linear, "_zeros", lambda *specs: (_ for _ in ()).throw(error))
+        for call in (
+            lambda: block(x),
+            lambda: routed.routed_verify_window(block, rows),
+        ):
+            with pytest.raises(_ZerosError):
+                call()
+    plan = _plan(block, x)
+    for proof in (plan.proof, plan.window):
+        assert not proof.failed and not proof.ran and not proof.graphs
+    assert _same_bits(
+        routed.routed_verify_window(block, rows), _one_by_one(block, rows)
+    )
+    assert plan.proof.ran and plan.window.ran
+
+
+def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
+    """Under a caller's CPU stream, the stand-in's logits and zeros are made
+    on the GPU's stream and evaluated, and the stream is synchronized, before
+    the launch is evaluated: one buffer of zeros for all of them."""
+    block = _block(1024, 320, experts=128)
+    x = _token_of(block)
+    want = type(block).__call__._omlx_routed_decode_original(block, x)
+    mx.eval(want)
+    _plan(block, x)  # evaluates the experts' views
+    evaluate, synchronize, zeros, arange = (
+        mx.eval,
+        mx.synchronize,
+        linear._zeros,
+        mx.arange,
+    )
+    events, streams = [], []
+
+    def evaluated(*arrays):
+        events.append("eval")
+        evaluate(*arrays)
+
+    def synchronized(*stream):
+        events.append(("synchronize", *stream))
+        synchronize(*stream)
+
+    def made(*specs):
+        events.append("zeros")
+        return zeros(*specs)
+
+    def ranked(*args, **named):
+        streams.append(named.get("stream"))
+        return arange(*args, **named)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "eval", evaluated)
+        patch.setattr(mx, "synchronize", synchronized)
+        patch.setattr(mx, "arange", ranked)
+        patch.setattr(linear, "_zeros", made)
+        with mx.stream(mx.cpu):
+            y = block(x)
+    # The logits, the zeros (their evaluation, the synchronize), the launch.
+    assert events == ["eval", "zeros", "eval", ("synchronize", mx.gpu), "eval"]
+    assert streams == [mx.gpu]
+    assert _same_bits(want, y)
+
+
+def test_a_router_that_scores_other_experts_than_the_stacks_is_not_planned():
+    """The router, the stacks and the block name one expert count: routing to
+    an expert past the stacks would read past their buffers."""
+    block = _block(1024, 320, experts=128)
+    gate = nn.Linear(1024, 256, bias=False)
+    gate.set_dtype(mx.bfloat16)
+    block.gate = gate
+    assert routed._build_plan(block) is None
+    # Even where the block says so.
+    block.num_experts = 256
+    assert routed._build_plan(block) is None
+    block = _block(1024, 320, experts=128)
+    block.num_experts = 256
+    assert routed._build_plan(block) is None
+    assert routed._build_plan(_block(1024, 320, experts=128)) is not None
+
+
+def test_a_kept_window_follows_the_block_s_replaced_weights():
+    """A window's plan is keyed two levels down: weights replaced after a
+    window graph was kept are the ones the next window reads."""
+    block = _block(512, 256, top_k=8, experts=128)
+    rows = _rows_of(block, 1, 3)
+    assert _same_bits(
+        routed.routed_verify_window(block, rows), _one_by_one(block, rows)
+    )
+    down = block.switch_mlp.down_proj
+    down["scales"] = down["scales"] * 2
+    # Against the composed body row by row, which keeps no plan.
+    composed = type(block).__call__._omlx_routed_decode_original
+    want = mx.concatenate([composed(block, row[None, None]) for row in rows[0]])
+    got = routed.routed_verify_window(block, rows)
+    assert _same_bits(got, want.reshape(got.shape))
+
+
+def test_x_of_no_axis_is_refused_as_the_composed_body_refuses_it():
+    block = _block(1024, 320, experts=128)
+    x = mx.array(1.0, dtype=mx.bfloat16)
+    composed = type(block).__call__._omlx_routed_decode_original
+    with pytest.raises(Exception) as refused:
+        mx.eval(composed(block, x))
+    with pytest.raises(type(refused.value)):
+        mx.eval(block(x))
+
+
+def test_a_router_launcher_holds_no_array():
+    """A kept graph closes over no array: the launcher takes the weight as
+    an argument."""
+    from omlx.patches.qwen35_moe_router import router_gemv
+
+    weight = (mx.random.normal((128, 1024)) * 0.02).astype(mx.bfloat16)
+    launch = router_gemv(weight)
+    held = [cell.cell_contents for cell in launch.__closure__ or ()]
+    assert held and not any(isinstance(value, mx.array) for value in held)

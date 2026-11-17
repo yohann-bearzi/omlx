@@ -54,8 +54,9 @@ original body.
 
 One token's launches (router, gate+up, down) are one function of the token
 and the block's arrays, which MLX's compile builds into a graph the first
-time a thread meets the token's shape and dtype on blocks of the same faces,
-tensor dtypes and shapes; their proof keeps it for that thread, and a
+time a thread meets the token's shape and dtype and the router's width on
+blocks of the same faces, tensor dtypes and shapes; their proof keeps it for
+that thread, and a
 decode step replays it. MLX compiles a kernel when it first evaluates it, so
 before the graph is first built its Metal is proven on a stand-in: the
 smallest launches that MLX generates the same Metal for, over zeros, and
@@ -75,8 +76,8 @@ verifier's composed MoE (about fifteen launches, two of them binding the
 whole stacked experts) only while row-exact verify is armed and the block
 folds its shared expert; one-row windows are one token's call. A window's
 launches are one graph too, kept per thread in the window's proof for the
-window's shape; if its stand-in fails, the verifier keeps its composed MoE
-for blocks of these faces and shapes.
+window's shape and dtype and the router's width; if its stand-in fails, the
+verifier keeps its composed MoE for blocks of these faces and shapes.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -99,7 +100,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .. import formats
-from ..formats import Dot, kernels
+from ..formats import Dot, kernels, linear
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
     fused_router_topk,
@@ -659,6 +660,9 @@ def _build_plan(block) -> _Plan | None:
     if router is not None:
         weight = (gate["weight"],)
         experts = weight[0].shape[0]
+    # The router scores the experts the stacks hold, and the block says so.
+    if experts != gate_up["weight"].shape[0] or block.num_experts != experts:
+        return None
     # What the launches are compiled from, beside a launch's rows and routing.
     operands = gate_up_operands + down_operands
     if shared is not None:
@@ -894,8 +898,12 @@ def _token(launches: _Launches, folded: bool):
 
 def _ranked(rows: int, experts: int, dtype) -> mx.array:
     """Router logits for ``rows`` rows that rank the experts in order: each
-    row selects the first top-k."""
-    return (mx.zeros((rows, 1), mx.float32) - mx.arange(experts)).astype(dtype)
+    row selects the first top-k. Made on the GPU's stream, as a stand-in's
+    zeros are (``linear._zeros``)."""
+    gpu = mx.gpu
+    column = mx.zeros((rows, 1), mx.float32, stream=gpu)
+    ranked = mx.subtract(column, mx.arange(experts, stream=gpu), stream=gpu)
+    return ranked.astype(dtype, stream=gpu)
 
 
 def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> list:
@@ -905,27 +913,32 @@ def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> l
     and as many matrices of each stack as a row selects. ``logits`` (of
     ``_ranked``) stand for the router's: each row selects the first
     matrices, which the stacks have. Nothing of the call is read but the
-    shapes and dtypes of ``outside`` and of the operands."""
+    shapes and dtypes of ``outside`` and of the operands.
+
+    The logits and the zeros are evaluated here, on the GPU's stream, and
+    the stream is synchronized (``linear._zeros``), ahead of the proof's
+    guard: what fails in making them (an allocation, an error an earlier
+    evaluation left pending) is raised by the call and fails no proof."""
     rows, top_k = logits.shape[0], launches.top_k
-    x = mx.zeros((rows, launches.hidden), launches.dtype)
     weight, gate_up, down, shared_gate_up, shared_down = operands
-    stand_ins = (
-        _zeros(weight),
-        tuple(mx.zeros((top_k, *a.shape[1:]), a.dtype) for a in gate_up),
-        tuple(mx.zeros((top_k, *a.shape[1:]), a.dtype) for a in down),
-        _zeros(shared_gate_up),
-        _zeros(shared_down),
-    )
     if launches.router is None:
         outside = outside[1:]
-    launched = [_experts(launches, x, logits, stand_ins, folded, *_zeros(outside))]
+    groups = (
+        (((rows, launches.hidden), launches.dtype),),
+        tuple((a.shape, a.dtype) for a in weight),
+        tuple(((top_k, *a.shape[1:]), a.dtype) for a in gate_up),
+        tuple(((top_k, *a.shape[1:]), a.dtype) for a in down),
+        tuple((a.shape, a.dtype) for a in shared_gate_up),
+        tuple((a.shape, a.dtype) for a in shared_down),
+        tuple((a.shape, a.dtype) for a in outside),
+    )
+    mx.eval(logits)
+    made = iter(linear._zeros(*(spec for group in groups for spec in group)))
+    (x,), *stand_ins, outside = (tuple(next(made) for _ in group) for group in groups)
+    launched = [_experts(launches, x, logits, stand_ins, folded, *outside)]
     if launches.router is not None:
         launched.append(launches.router(x, *stand_ins[0]))
     return launched
-
-
-def _zeros(arrays) -> tuple:
-    return tuple(mx.zeros(a.shape, a.dtype) for a in arrays)
 
 
 def _outside(block, plan: _Plan, x):
@@ -933,10 +946,11 @@ def _outside(block, plan: _Plan, x):
     the logits of a gate that runs as it is, then a shared expert's output
     and its gate's where the launches do not fold them. None where one is
     not what the launches read: an array in ``x``'s dtype (they are
-    compiled for that one), a shared output of the block's width, one gate
-    value on an axis (the down launch reads ``gate[0]``), logits of the
-    router's width."""
+    compiled for that one), a shared output of ``x``'s shape, one gate
+    value of each of ``x``'s rows (the down launch reads ``gate[0]``),
+    logits of the router's width for each row."""
     launches, outside = plan.launches, ()
+    rows = x.shape[:-1]
     if not launches.fold:
         # Children by item: this runs for every MoE layer of every decode step.
         shared = block["shared_expert"](x)
@@ -944,15 +958,14 @@ def _outside(block, plan: _Plan, x):
         if (
             shared.dtype != x.dtype
             or gate.dtype != x.dtype
-            or shared.size != launches.hidden
-            or gate.size != 1
-            or gate.ndim == 0
+            or shared.shape != x.shape
+            or gate.shape != (*rows, 1)
         ):
             return None
         outside = (shared, gate)
     if launches.router is None:
         logits = block["gate"](x)
-        if logits.dtype != x.dtype or logits.shape[-1] != plan.experts:
+        if logits.dtype != x.dtype or logits.shape != (*rows, plan.experts):
             return None
         outside = (logits, *outside)
     return outside
@@ -973,7 +986,10 @@ def _decode(block, plan: _Plan, x, graph):
     The launches are one graph of ``x`` and the block's arrays, which MLX's
     compile builds the first time a thread meets the signature and the
     proof keeps for that thread. Its Metal is proven first, on the stand-in
-    of ``_stand_in``: nothing of the call is evaluated."""
+    of ``_stand_in``: nothing of the call is evaluated. (Once, as the
+    block's plan is built outside a trace, a view of each stack's first
+    matrix is evaluated to learn whether it shares the stack's buffer:
+    ``_expert_view``.)"""
     launches = plan.launches
     if graph is None and not _routes(plan, x):
         return None
@@ -1008,17 +1024,16 @@ def _window(launches: _Launches, folded: bool):
 
 
 def _windows(plan: _Plan, x) -> bool:
-    """Whether the rows of ``x`` run through the plan's window launches: a
-    window ([B, L, hidden]) of 1..``WINDOW_MAX_ROWS`` rows of the plan's
+    """Whether the rows of a window ``x`` ([B, L, hidden]) run through the
+    plan's window launches: 2..``WINDOW_MAX_ROWS`` rows of the plan's
     width, in the dtype the launches are compiled for, for a router of
     whole simdgroups that the launches run. (A window of one row is one
     token's call.)"""
     launches = plan.launches
     return (
-        x.ndim == 3
-        and x.dtype == launches.dtype
+        x.dtype == launches.dtype
         and x.shape[-1] == launches.hidden
-        and 1 <= x.size // launches.hidden <= WINDOW_MAX_ROWS
+        and 2 <= x.size // launches.hidden <= WINDOW_MAX_ROWS
         and launches.router is not None
         and router_eligible(x, plan.experts, WINDOW_MAX_ROWS)
     )
@@ -1030,23 +1045,24 @@ def routed_verify_window(block, x):
     one-token call on that row, as [rows, hidden]; or None outside the
     fused layout.
 
-    Router gemv, gate+up (with the softmax + top-k folded in) and
-    down/combine each run once for the whole window, in one graph of the
-    rows and the block's arrays that MLX's compile builds the first time a
-    thread meets the window's shape and dtype on blocks of these faces,
+    Router gemv, gate+up (with the softmax + top-k folded in up to 3
+    rows, after the routing launch from 4) and down/combine each run once
+    for the whole window, in one graph of the rows and the block's arrays
+    that MLX's compile builds the first time a thread meets the window's
+    shape and dtype and the router's width on blocks of these faces,
     tensor dtypes and shapes, and that the window's proof keeps for that
     thread. Its Metal is proven first on a stand-in (``_stand_in``):
     nothing of the call is evaluated. A window of one row is one token's
     call: its graph and its proof. A failed one-token proof keeps the
     windows composed too."""
+    if x.ndim != 3:
+        return None
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
     if plan is None or plan.window is None or plan.proof.failed:
         return None
     signature = (x.shape, x.dtype, plan.experts)
     if x.size == x.shape[-1]:
         # One row runs the one-token launches: their proof and graph.
-        if x.ndim != 3:
-            return None
         y = _decode(block, plan, x, plan.proof.graphs.get(signature))
         return None if y is None else y.reshape(1, -1)
     # A verify step's block is the replay of the graph its thread kept.
@@ -1124,7 +1140,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
 
     def patched_call(self, x):
         shape = x.shape
-        if x.size == shape[-1]:
+        if shape and x.size == shape[-1]:
             # Depth 2 keys the plan on the expert and shared-expert weight arrays.
             plan = cached_per_module(
                 self, "_omlx_routed_decode_plan", _build_plan, depth=2
