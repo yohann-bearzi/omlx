@@ -35,9 +35,11 @@ struct Tile {
   const device float* group_scales;
   const device float* row_scales;
 
+  template <int K>
   struct Runs {
     static constant constexpr int RUN = 8;
     static constant constexpr int GROUP = 32;
+    static constant constexpr int GROUPS = (K + GROUP - 1) / GROUP;
     struct P {
       float s;  // the group's scale times the row's
     };
@@ -47,9 +49,9 @@ struct Tile {
     const device float* g;
     const device float* r;
 
-    Runs(Tile m, size_t row, int k)
-        : c((const device uint2*)(m.codes + row * size_t(k))),
-          g(m.group_scales + row * size_t((k + GROUP - 1) / GROUP)),
+    Runs(Tile m, size_t row)
+        : c((const device uint2*)(m.codes + row * K)),
+          g(m.group_scales + row * GROUPS),
           r(m.row_scales + row) {}
 
     P params(int group) const {
@@ -77,22 +79,22 @@ def _toy(key, source=_TOY) -> formats.Tile:
     )
 
 
-def _toy_matrix(rows, k, seed=0):
+def _toy_matrix(rows, k, seed=0, group=32):
     """The toy's tensors for ``rows`` rows of K inputs: random codes, and
     scales with every bit of a float32 mantissa, so that the order of the
     two products shows."""
     mx.random.seed(seed)
     codes = mx.random.randint(0, 256, (rows, k)).astype(mx.uint8)
-    group_scales = mx.random.normal((rows, (k + 31) // 32))
+    group_scales = mx.random.normal((rows, (k + group - 1) // group))
     row_scales = mx.random.normal((rows,))
     return codes, group_scales, row_scales
 
 
-def _toy_decode(codes, group_scales, row_scales):
+def _toy_decode(codes, group_scales, row_scales, group=32):
     """The toy's decode in float32, as the page gives it."""
     levels = codes.astype(mx.float32) - 128.0
     scales = group_scales * row_scales[..., None]
-    return levels * mx.repeat(scales, 32, axis=-1)[..., : levels.shape[-1]]
+    return levels * scales[..., mx.arange(levels.shape[-1]) // group]
 
 
 def _same(a, b) -> bool:
@@ -203,6 +205,27 @@ def test_a_kernel_of_both_kinds_has_both_skeletons():
     )
 
 
+def test_a_kernel_of_no_matrix_ends_the_macros_on_a_line_of_their_own():
+    header = kernels.Matrices().header
+    assert (
+        f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}\n"
+        "#undef OMLX_CONTRACT\n#undef OMLX_OLDEST_CONTRACT\n"
+    ) in header
+    assert "omlx_tile" not in header and "qmv_rows" not in header
+
+
+def test_a_matrix_is_read_through_a_dot_or_a_tile():
+    matrices = kernels.Matrices()
+    for face in (object(), "toy", None):
+        with pytest.raises(TypeError, match="is not a Dot or a Tile"):
+            matrices.add("m", face)
+    assert matrices.add("m", _toy("added")) == [
+        "m_weight",
+        "m_group_scales",
+        "m_row_scales",
+    ]
+
+
 # The sha256 of the header and the declarations of a kernel of one affine dot
 # face, as oMLX's dot kernels have them at 5054fde: a dot kernel's source is
 # the parent's to the byte, so that every kernel a checkpoint runs is too.
@@ -237,7 +260,7 @@ def _both_error(face, operands, k=64) -> str:
         header=matrices.header + testing._TILE_ROWS_HEADER,
         source=matrices.declarations + r"""
     const uint w = thread_position_in_grid.x;
-    omlx_tile_rows<T>(t, 0, int(threads_per_grid.x), int(w), w32 + w, wt + w);
+    omlx_tile_rows<T, K>(t, 0, int(w), w32 + w, wt + w);
 """,
     )
     layer = _layer(512, 8, 4, 64)
@@ -251,7 +274,7 @@ def _both_error(face, operands, k=64) -> str:
                     layer.biases,
                     *operands,
                 ],
-                template=[("T", mx.bfloat16)],
+                template=[("T", mx.bfloat16), ("K", k)],
                 grid=(k, 1, 1),
                 threadgroup=(k, 1, 1),
                 output_shapes=[(k,), (k,)],
@@ -261,85 +284,160 @@ def _both_error(face, operands, k=64) -> str:
     return str(failure.value)
 
 
-# A rule each face breaks, the edit of the toy that breaks it, and its
-# sentence. The compiler cites the sentence at the skeleton's line that
-# states it, and says nothing else.
+# A rule each face breaks, the edit of the toy that breaks it (or the edits),
+# and its sentence. The compiler cites the sentence at the skeleton's line
+# that states it, and says nothing else.
 _BREAKS = {
+    "contract": (
+        ("  static constant constexpr int CONTRACT = 1;\n", ""),
+        "tile face: the face needs a static constant constexpr int CONTRACT: the "
+        "revision of the contract it is written for",
+    ),
+    "runs_misnamed": (
+        [
+            ("  struct Runs {", "  struct Cursor {"),
+            ("    Runs(Tile", "    Cursor(Tile"),
+        ],
+        "tile face: the face needs a member template Runs<int K>: the cursor of a "
+        "row of K inputs",
+    ),
     "run": (
         ("RUN = 8;", "RUN = 16;"),
-        "tile face: Runs::RUN must be 8: every tile kernel reads runs of 8 codes",
+        "tile face: Runs<K>::RUN must be 8: every tile kernel reads runs of 8 codes",
     ),
+    "run_misnamed": (("int RUN = 8;", "int RUNS = 8;"), "Runs<K>::RUN must be 8"),
     "group_of_12": (
         ("GROUP = 32;", "GROUP = 12;"),
-        "tile face: Runs::GROUP must be 8 times a power of two (8, 16, 32, ...): "
-        "the values a kernel's thread decodes are then whole groups or in one",
+        "tile face: Runs<K>::GROUP must be 8 times a power of two (8, 16, 32, ..., "
+        "2^30): the values a kernel's thread decodes are then whole groups or in one",
     ),
-    "group_of_24": (("GROUP = 32;", "GROUP = 24;"), "Runs::GROUP must be 8 times"),
-    "group_of_4": (("GROUP = 32;", "GROUP = 4;"), "Runs::GROUP must be 8 times"),
+    "group_of_24": (("GROUP = 32;", "GROUP = 24;"), "Runs<K>::GROUP must be 8 times"),
+    "group_of_4": (("GROUP = 32;", "GROUP = 4;"), "Runs<K>::GROUP must be 8 times"),
+    "group_past_an_int": (
+        ("int GROUP = 32;", "size_t GROUP = size_t(1) << 32;"),
+        "Runs<K>::GROUP must be 8 times",
+    ),
+    "group_misnamed": (
+        [
+            ("int GROUP = 32;", "int GROUPED = 32;"),
+            ("(K + GROUP - 1) / GROUP;", "(K + GROUPED - 1) / GROUPED;"),
+        ],
+        "Runs<K>::GROUP must be 8 times",
+    ),
     "held": (
         (
             "    struct P {\n      float s;",
             "    struct P {\n      P(float v) : s(v) {}\n      float s;",
         ),
-        "tile face: Runs::P and Runs::Codes must be default-constructible: a "
-        "kernel holds arrays of them",
+        "tile face: Runs<K>::P and Runs<K>::Codes must be types that are "
+        "default-constructible and copy-assignable: a kernel holds arrays of them",
+    ),
+    "held_not_assignable": (
+        ("      float s;  //", "      const float s = 0.0f;  //"),
+        "Runs<K>::P and Runs<K>::Codes must be types",
     ),
     "codes_a_reference": (
         (
             "using Codes = uint2;  // 8 codes of 8 bits",
             "using Codes = const device uint2&;  // 8 codes of 8 bits",
         ),
-        "Runs::P and Runs::Codes must be default-constructible",
+        "Runs<K>::P and Runs<K>::Codes must be types",
+    ),
+    "p_misnamed": (
+        [
+            ("    struct P {", "    struct Q {"),
+            ("    P params(", "    Q params("),
+            ("thread const P& p", "thread const Q& p"),
+        ],
+        "Runs<K>::P and Runs<K>::Codes must be types",
+    ),
+    "codes_misnamed": (
+        [
+            ("using Codes = uint2;", "using Code = uint2;"),
+            ("    Codes fetch(", "    Code fetch("),
+            ("Codes q, int i", "Code q, int i"),
+        ],
+        "Runs<K>::P and Runs<K>::Codes must be types",
     ),
     "cursor": (
-        (
-            "Runs(Tile m, size_t row, int k)\n",
-            "Runs(Tile m, size_t row, int k, int s)\n",
-        ),
-        "tile face: Runs must be constructible from the face, a size_t row and an "
-        "int K",
+        ("Runs(Tile m, size_t row)\n", "Runs(Tile m, size_t row, int k)\n"),
+        "tile face: Runs<K> must be constructible from the face and a size_t row",
+    ),
+    "cursor_of_a_moved_face": (
+        ("Runs(Tile m, size_t row)\n", "Runs(thread Tile&& m, size_t row)\n"),
+        "Runs<K> must be constructible from the face and a size_t row",
     ),
     "params_not_const": (
         ("P params(int group) const {", "P params(int group) {"),
-        "tile face: Runs needs a const member params(int g) that returns a Runs::P",
+        "tile face: Runs<K> needs a const member params(int g) that returns a P",
     ),
     "params_misnamed": (
         ("P params(int group) const {", "P param(int group) const {"),
-        "Runs needs a const member params(int g)",
+        "Runs<K> needs a const member params(int g)",
+    ),
+    "params_of_another_type": (
+        (
+            "    P params(int group) const {\n      return {g[group] * r[0]};\n",
+            "    float params(int group) const {\n      return g[group] * r[0];\n",
+        ),
+        "Runs<K> needs a const member params(int g)",
+    ),
+    "params_of_a_pointer": (
+        (
+            "    P params(int group) const {\n      return {g[group] * r[0]};\n",
+            "    P params(const device int*) const {\n      return {g[0] * r[0]};\n",
+        ),
+        "Runs<K> needs a const member params(int g)",
+    ),
+    "fetch_misnamed": (
+        ("Codes fetch(int run) const {", "Codes fetches(int run) const {"),
+        "tile face: Runs<K> needs a const member fetch(int run) that returns a Codes",
+    ),
+    "fetch_not_const": (
+        ("Codes fetch(int run) const {", "Codes fetch(int run) {"),
+        "Runs<K> needs a const member fetch(int run)",
     ),
     "fetch_of_another_type": (
         (
             "    Codes fetch(int run) const {\n      return c[run];\n",
             "    uint fetch(int run) const {\n      return c[run].x;\n",
         ),
-        "tile face: Runs needs a const member fetch(int run) that returns a "
-        "Runs::Codes",
+        "Runs<K> needs a const member fetch(int run)",
     ),
     "weight_not_static": (
         ("static float weight(", "float weight("),
-        "tile face: Runs needs a static member weight(P, Codes, int i) that returns "
-        "a float",
+        "tile face: Runs<K> needs a static member weight(P, Codes, int i) that "
+        "returns a float",
     ),
     "weight_a_const_member": (
         (
             "static float weight(thread const P& p, Codes q, int i) {",
             "float weight(thread const P& p, Codes q, int i) const {",
         ),
-        "Runs needs a static member weight(P, Codes, int i)",
+        "Runs<K> needs a static member weight(P, Codes, int i)",
     ),
     "weight_of_another_type": (
         ("static float weight(", "static half weight("),
-        "Runs needs a static member weight(P, Codes, int i)",
+        "Runs<K> needs a static member weight(P, Codes, int i)",
     ),
 }
+
+
+def _broken(rule) -> str:
+    """The toy's source with ``rule`` broken."""
+    edits, _ = _BREAKS[rule]
+    source = _TOY
+    for old, new in edits if isinstance(edits, list) else [edits]:
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    return source
 
 
 @metal
 @pytest.mark.parametrize("rule", _BREAKS)
 def test_a_tile_face_that_breaks_a_rule_is_told_that_rule(rule):
-    (old, new), sentence = _BREAKS[rule]
-    assert _TOY.count(old) == 1
-    message = _error(_toy(f"break_{rule}", _TOY.replace(old, new)), _toy_operands())
+    _, sentence = _BREAKS[rule]
+    message = _error(_toy(f"break_{rule}", _broken(rule)), _toy_operands())
     assert sentence in message
     # The rule, and no error of the kernel's that uses the face after it.
     assert message.count("error:") == 1
@@ -353,8 +451,8 @@ def test_a_tile_face_that_breaks_a_rule_is_told_that_rule(rule):
 
 @metal
 def test_a_rule_is_cited_at_its_line_whatever_else_the_kernel_reads():
-    (old, new), sentence = _BREAKS["run"]
-    face = _toy("cited", _TOY.replace(old, new))
+    _, sentence = _BREAKS["run"]
+    face = _toy("cited", _broken("run"))
     alone = _error(face, _toy_operands())
     beside_a_dot = _both_error(replace(face, key="toy_cited_beside"), _toy_operands())
     cited = r"<omlx skeletons, docs/quant-formats\.md>:\d+:\d+: error"
@@ -408,6 +506,71 @@ def test_a_kernel_runs_the_tile_faces_of_the_revisions_omlx_runs(monkeypatch):
         assert message.count("tile face: ") == 1 and "<quant format" not in message
 
 
+@metal
+def test_a_tile_face_that_breaks_several_rules_is_told_the_first():
+    source = _TOY
+    for rule in ("params_not_const", "group_of_12", "run"):
+        (old, new), _ = _BREAKS[rule]
+        source = source.replace(old, new)
+    message = _error(_toy("several", source), _toy_operands())
+    assert _BREAKS["run"][1] in message and message.count("error:") == 1
+
+
+# Groups of 8, and of 2^30: the smallest and the largest of the rule.
+@metal
+@pytest.mark.parametrize("group", [8, 1 << 30])
+def test_a_tile_face_of_the_smallest_and_the_largest_groups_runs(group):
+    face = _toy(f"group_{group}", _TOY.replace("GROUP = 32;", f"GROUP = {group};"))
+    operands = _toy_matrix(8, 64, seed=2, group=group)
+    exact, _ = testing.tile_rows(face, operands, 64, range(8), mx.float32)
+    assert _same(exact, _toy_decode(*operands, group=group))
+
+
+# A face that keeps state between calls (rule 8): params, or fetch, answers
+# the first group or run it was asked for; fetch, the run after the one it
+# gave last.
+_KEEPS_STATE = {
+    "params": [
+        (
+            "    const device float* r;\n",
+            "    const device float* r;\n    mutable int first = -1;\n",
+        ),
+        (
+            "      return {g[group] * r[0]};",
+            "      first = first < 0 ? group : first;\n      return {g[first] * r[0]};",
+        ),
+    ],
+    "fetch": [
+        (
+            "    const device float* r;\n",
+            "    const device float* r;\n    mutable int first = -1;\n",
+        ),
+        (
+            "      return c[run];",
+            "      first = first < 0 ? run : first;\n      return c[first];",
+        ),
+    ],
+    "fetch_advancing": [
+        ("    const device uint2* c;\n", "    mutable const device uint2* c;\n"),
+        ("      return c[run];", "      return *c++;"),
+    ],
+}
+
+
+@metal
+@pytest.mark.parametrize("member", _KEEPS_STATE)
+def test_tile_rows_show_a_member_that_keeps_state(member):
+    source = _TOY
+    for old, new in _KEEPS_STATE[member]:
+        assert source.count(old) == 1
+        source = source.replace(old, new)
+    operands = _toy_matrix(8, 64, seed=4)
+    exact, _ = testing.tile_rows(
+        _toy(f"state_{member}", source), operands, 64, range(8), mx.float32
+    )
+    assert not _same(exact, _toy_decode(*operands))
+
+
 def _sentences(source) -> list[str]:
     """The sentences of the static_asserts in ``source``, each from its
     adjacent string literals."""
@@ -419,7 +582,7 @@ def test_the_page_lists_every_sentence_of_the_tile_skeleton():
     section = _PAGE.split("\n## The tile face\n")[1].split("\n## ")[0]
     listed = re.findall(r"^- `(tile face: [^`]*)`$", section, re.M)
     assert listed == _sentences(kernels._TILE_FACE)
-    assert len(listed) == 9 and all(s.startswith("tile face: ") for s in listed)
+    assert len(listed) == 11 and all(s.startswith("tile face: ") for s in listed)
 
 
 # --- testing.tile_rows ------------------------------------------------------
@@ -431,7 +594,7 @@ def test_tile_rows_refuses_what_it_cannot_read():
     for k in (0, 12, -8):
         with pytest.raises(ValueError, match=f"k={k} is not one run or more of 8"):
             testing.tile_rows(face, operands, k, range(8), mx.float32)
-    for rows in ([], [-1], [0.0], ["0"]):
+    for rows in ([], [-1], [0.0], ["0"], [True], [0, False]):
         with pytest.raises(ValueError, match="are not one row index or more"):
             testing.tile_rows(face, operands, 64, rows, mx.float32)
     with pytest.raises(ValueError, match="weight, group_scales, row_scales; operands"):
@@ -439,11 +602,14 @@ def test_tile_rows_refuses_what_it_cannot_read():
     half = replace(face, dtypes=(mx.float16,))
     with pytest.raises(ValueError, match="exact for mlx.core.float16, not mlx.core"):
         testing.tile_rows(half, operands, 64, range(8), mx.bfloat16)
-    codes, group_scales, row_scales = _toy_matrix(4, 64)
-    with pytest.raises(ValueError, match="toy_refusals: row_scales has 4 elements"):
-        testing.tile_rows(
-            face, (codes, group_scales, row_scales), 64, range(4), mx.float32
-        )
+    for rows in (4, 7):
+        codes, group_scales, row_scales = _toy_matrix(rows, 64)
+        with pytest.raises(
+            ValueError, match=f"toy_refusals: row_scales has {rows} elements"
+        ):
+            testing.tile_rows(
+                face, (codes, group_scales, row_scales), 64, range(rows), mx.float32
+            )
     with pytest.raises(ValueError, match="is not a Tile"):
         testing.tile_rows(
             affine.face(4, 64, True, mx.bfloat16), operands, 64, [0], mx.float32
@@ -638,6 +804,8 @@ _NO_TILE = [
     "a stack of stacks",
     "scales of other rows",
     "biases of other rows",
+    "no weight",
+    "biases that are not an array",
 ]
 
 
@@ -654,8 +822,10 @@ def _no_tile(name):
         )
     if name == "biases of another dtype":
         return _with(layer, biases=layer.biases.astype(mx.float16))
-    if name in ("no scales", "no biases"):
+    if name in ("no scales", "no biases", "no weight"):
         del layer[name[3:]]
+    if name == "biases that are not an array":
+        return _with(layer, biases=None)
     if name == "codes of another type":
         return _with(layer, weight=layer.weight.view(mx.int32))
     if name == "a stack of stacks":
@@ -748,6 +918,20 @@ def test_the_affine_tile_source_reads_runs_of_4_and_8_bits_only(bits):
         "fetch of their own"
     ) in message
     assert f"<quant format affine_tile_b{bits}>:" in message
+    assert message.count("error:") == 1
+
+
+@metal
+def test_the_affine_tile_face_does_not_compile_for_a_k_that_is_not_whole_groups():
+    layer = _layer(256, 16, 4, 64)
+    face = formats.tile(layer, 256, 16)
+    operands = [layer[name] for name in ("weight", *face.tensors)]
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(testing.tile_rows(face, operands, 96, [0], mx.bfloat16))
+    message = str(failure.value)
+    assert (
+        "affine tile face: K must be whole groups; AffineFormat.tile gives a K its face"
+    ) in message
     assert message.count("error:") == 1
 
 

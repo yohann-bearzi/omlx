@@ -358,7 +358,7 @@ Dot(
 
 A kernel that multiplies many rows of activations by a matrix (a prompt's prefill, a switch layer's experts over a prompt) decodes a tile of the weights, some rows by some inputs, into threadgroup memory once, and every row of activations it computes reads them there. The tile face is how it decodes them: the matrix of the dot face, read in runs of 8 codes and given weight by weight. A format gives it with `QuantFormat.tile(layer, k, n)` (see [Faces](#faces)).
 
-The struct named by `type` is the matrix, an aggregate as a dot face's: `CONTRACT`, the weight as bytes, then one device pointer per name in `tensors`, in order. Its member struct `Runs` is the cursor of one row:
+The struct named by `type` is the matrix, an aggregate as a dot face's: `CONTRACT`, the weight as bytes, then one device pointer per name in `tensors`, in order. Its member template `Runs<K>` is the cursor of one row of K inputs:
 
 ```cpp
 struct Tile {
@@ -367,33 +367,40 @@ struct Tile {
   const device float* group_scales;
   const device float* row_scales;
 
+  template <int K>
   struct Runs { ... };
 };
 ```
 
-A kernel builds a cursor for each row a thread decodes, and reads the row through it in runs of 8 codes, and in groups of codes that share their parameters.
+A kernel builds a cursor for each row a thread decodes, and reads the row through it in runs of 8 codes, and in groups of codes that share their parameters. K is known when the kernel is compiled, as a dot face's `Lanes<K>` has it: a row's strides are `constexpr`, and a face that takes only some K states which in a `static_assert` in its constructor (the affine face: whole groups). An assert that fails in the body of `Runs<K>` itself leaves it without members for the kernel's checks, each of which then fails too.
 
-| Member of `Runs` | Role |
+| Member of `Runs<K>` | Role |
 |---|---|
 | `static constant constexpr int RUN` | 8, the codes of a run. A run of 8 codes of b bits is b whole bytes. |
-| `static constant constexpr int GROUP` | The codes that share one `params()`: 8 times a power of two (8, 16, 32, ...). A row has `(K + GROUP - 1) / GROUP` groups, the last of which may be partial. |
+| `static constant constexpr int GROUP` | The codes that share one `params()`: 8 times a power of two (8, 16, 32, ..., 2^30). A row has `(K + GROUP - 1) / GROUP` groups, the last of which may be partial. |
 | `struct P` | A group's parameters, as a kernel holds them in registers. |
 | `Codes` | A run's codes, as a kernel holds them in registers: a `uint`, a `uint2`, ... |
-| `Runs(Tile m, size_t row, int k)` | The cursor of row `row` of `m`, of K = `k` inputs. In a stack of matrices of N rows each, row `n` of matrix `e` is row `e * N + n`. |
-| `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (k + GROUP - 1) / GROUP)`. |
-| `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, k / 8)`. |
+| `Runs(Tile m, size_t row)` | The cursor of row `row` of `m`. In a stack of matrices of N rows each, row `n` of matrix `e` is row `e * N + n`. |
+| `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (K + GROUP - 1) / GROUP)`. |
+| `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, K / 8)`. |
 | `static float weight(thread const P& p, Codes c, int i)` | Weight `i` (0 to 7) of a run of codes `c` in a group of parameters `p`, as a float32. |
 
-`P` and `Codes` are default-constructible: a kernel holds arrays of them. K is a whole number of runs. A kernel runs a face in this order, in each thread that decodes values of a row, for each block of K that it decodes, with `T` the activations' type:
+`P` and `Codes` are types that are default-constructible and copy-assignable: a kernel holds arrays of them and assigns their elements. K is a whole number of runs. A kernel runs a face in this order, in each thread that decodes values of a row, for each block of K that it decodes, with `T` the activations' type:
 
 ```
-runs = Runs(m, row, k)                            once for the row
+runs = Runs<K>(m, row)                            once for the row
 c[r] = fetch(first_run + r)                       for each run r of the thread's values
 p[g] = params(first_group + g)                    for each group g they lie in
 w[8 r + i] = T(weight(p[group of run r], c[r], i))  for each run r, i from 0 to 7
 ```
 
-The values a thread decodes are whole groups or lie in one group: hence a `GROUP` of 8 times a power of two.
+The values a thread decodes are whole groups or lie in one group: hence a `GROUP` of 8 times a power of two. A kernel calls `params` and `fetch` on one cursor as often as it needs, for any group and run, in any order.
+
+Three things to know when writing one:
+
+- A run of 8 codes of b bits is b bytes, a multiple of b bytes from the start of the codes. A run of 2, 4 or 8 bits is one load of a `ushort`, a `uint` or a `uint2`; a 3-bit run is three bytes, read as three `uint8_t` loads (or a `uint8_t` and a `ushort`): a 4-byte load at a 3-bit run reads a byte past it, which at a row's last run of the last matrix lies past the array (rule 1).
+- A face's source is a function of its `key`: two faces of one key are one kernel. Whatever the source is built from goes in the key: the bit width and the group size, and a table of values that a checkpoint carries (a digest of it), so that faces of two checkpoints with different tables are two kernels.
+- In a face's source, MLX names a bf16 tensor's element type `bfloat16_t` and an fp16 one's `float16_t`, as in `T` and in the `type` of a face whose struct is a template of it (`omlx_affine_tile_b4g64::Tile<bfloat16_t>`).
 
 ### The weight
 
@@ -406,7 +413,7 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 1. **Every address a member forms lies inside the arrays of its aggregate**, for tensors of any value: an index read from a tensor is masked to its table's size.
 2. **A face is safe on zeros**: tensors of zeros give finite weights. A kernel proves its Metal on zeros.
 3. **No loop bound or exit comes from a value read**: a face has no loop over data.
-4. **The constructor reads nothing.** A kernel builds a cursor in each thread of its tile, also for rows past the matrix, and calls `params` and `fetch` only for the rows, groups and runs it computes. A constant of the row (a row scale) is read again at each `params()`: that is the price of this rule.
+4. **The constructor reads nothing.** A kernel builds a cursor in each thread of its tile, also for rows past the matrix, and calls `params` and `fetch` only for the rows, groups and runs it computes. A constant of the row (a row scale) is read again at each `params()`: that is the price of this rule. The constructor computes pointers from `row` and K, and nothing else.
 5. **No threadgroup memory, barrier or simdgroup operation**: not every thread of a kernel decodes.
 6. **A face never writes.**
 7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data, and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
@@ -414,17 +421,21 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 9. **The source is C++17 Metal without derived classes.** See [Compile-time rules](#compile-time-rules).
 10. **`if constexpr` discards a branch only in a template, on a condition that depends on its parameters.** A face's source is one instance, its bit width and group size namespace constants, so an `if constexpr` on one of them compiles both branches, and each must be well-formed for the instance's types. Choose by an overload on a type (`code_at(uint, i)` and `code_at(uint2, i)` in the affine face) or by a template parameter.
 
-Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). The compiler checks the rest of what it can see when a kernel is compiled, the face's revision first. A face that breaks one of those rules fails with the rule, cited in `<omlx skeletons, docs/quant-formats.md>`: one error for each rule it breaks and none after them. A face of another revision is told that and nothing else, as a dot face is (see [Versions](#versions)).
+Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). It also calls `params` and `fetch` twice on one cursor, another group and run first, and keeps the second answers, so a member that keeps state between calls (rule 8) shows in its weights. Nothing checks rules 3, 4, 5 and 6: a face is read against them. (A constructor that reads cannot be caught by building a cursor past the matrix: the compiler moves the read to where the cursor is used, which for such a row is nowhere.)
+
+The compiler checks the members a kernel uses when it is compiled, the face's revision first. A face that lacks one, or has it with another signature, fails with the rule, cited in `<omlx skeletons, docs/quant-formats.md>`. The compiler reports the first rule a face breaks, in the order below, and no error after it: fix that one, and the next is reported. A face of another revision is told that and nothing else, as a dot face is (see [Versions](#versions)).
 
 - `tile face: written for a later revision of the contract than this oMLX runs`
 - `tile face: written for a revision of the contract this oMLX no longer runs`
-- `tile face: Runs::RUN must be 8: every tile kernel reads runs of 8 codes`
-- `tile face: Runs::GROUP must be 8 times a power of two (8, 16, 32, ...): the values a kernel's thread decodes are then whole groups or in one`
-- `tile face: Runs::P and Runs::Codes must be default-constructible: a kernel holds arrays of them`
-- `tile face: Runs must be constructible from the face, a size_t row and an int K`
-- `tile face: Runs needs a const member params(int g) that returns a Runs::P`
-- `tile face: Runs needs a const member fetch(int run) that returns a Runs::Codes`
-- `tile face: Runs needs a static member weight(P, Codes, int i) that returns a float`
+- `tile face: the face needs a static constant constexpr int CONTRACT: the revision of the contract it is written for`
+- `tile face: the face needs a member template Runs<int K>: the cursor of a row of K inputs`
+- `tile face: Runs<K>::RUN must be 8: every tile kernel reads runs of 8 codes`
+- `tile face: Runs<K>::GROUP must be 8 times a power of two (8, 16, 32, ..., 2^30): the values a kernel's thread decodes are then whole groups or in one`
+- `tile face: Runs<K>::P and Runs<K>::Codes must be types that are default-constructible and copy-assignable: a kernel holds arrays of them`
+- `tile face: Runs<K> must be constructible from the face and a size_t row`
+- `tile face: Runs<K> needs a const member params(int g) that returns a P`
+- `tile face: Runs<K> needs a const member fetch(int run) that returns a Codes`
+- `tile face: Runs<K> needs a static member weight(P, Codes, int i) that returns a float`
 
 ### An example of a tile face
 
@@ -438,9 +449,11 @@ struct Tile {
   const device float* group_scales;
   const device float* row_scales;
 
+  template <int K>
   struct Runs {
     static constant constexpr int RUN = 8;
     static constant constexpr int GROUP = 32;
+    static constant constexpr int GROUPS = (K + GROUP - 1) / GROUP;
     struct P {
       float s;  // the group's scale times the row's
     };
@@ -450,9 +463,9 @@ struct Tile {
     const device float* g;
     const device float* r;
 
-    Runs(Tile m, size_t row, int k)
-        : c((const device uint2*)(m.codes + row * size_t(k))),
-          g(m.group_scales + row * size_t((k + GROUP - 1) / GROUP)),
+    Runs(Tile m, size_t row)
+        : c((const device uint2*)(m.codes + row * K)),
+          g(m.group_scales + row * GROUPS),
           r(m.row_scales + row) {}
 
     P params(int group) const {
@@ -751,14 +764,14 @@ Any other affine layer has no face and runs MLX's ops:
 
 The `qmv_fast` face does not compile for a K that is not whole blocks: `AffineFormat.dot` is what gives a matrix its traversal.
 
-Its tile face gives each weight as `scale * q + bias` computed in float32, which a kernel rounds once to the activations' dtype: MLX's `dequantize` of the weight (`scale * q` is exact in float32), and what MLX's sorted `gather_qmm` loads into its tiles.
+Its tile face gives each weight as `scale * q + bias` computed in float32, which a kernel rounds once to the activations' dtype: MLX's `dequantize` of the weight over float32 copies of the scales and the biases (`scale * q` is exact in float32 where it is finite), and what MLX's sorted `gather_qmm` loads into its tiles. MLX's `dequantize` over bf16 or fp16 scales computes in their type, and can differ from it.
 
 | | Covered |
 |---|---|
 | Bits | 4, 8: a run of 8 codes is one 32-bit word, or two. 2- and 3-bit runs are 2 and 3 bytes, which the face's `fetch` does not read: its source asserts the width. |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
-| Weights | 32-bit words, a matrix or a stack of them, K whole groups, scales of 8 elements or more |
+| Weights | 32-bit words, a matrix or a stack of them, K whole groups (its `Runs<K>` asserts it), scales of 8 elements or more |
 | Face key | `affine_tile_b{bits}g{group_size}_bf16`, or `_fp16`, by the scales' dtype |
 
 ## Kernels built on faces

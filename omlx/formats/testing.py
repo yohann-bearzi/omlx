@@ -110,28 +110,36 @@ def dot_rows(
     )[0]
 
 
-# Each weight of the rows, one a thread: weight w of row rows[r], of K, the
-# grid's width.
+# Each weight of the rows, one a thread: weight w of row rows[r], of the
+# kernel's K, the grid's width.
 _TILE_ROWS = r"""
     const uint w = thread_position_in_grid.x;
     const uint r = thread_position_in_grid.y;
-    const int k = int(threads_per_grid.x);
-    const size_t at = size_t(r) * size_t(k) + w;
-    omlx_tile_rows<T>(m, size_t(rows[r]), k, int(w), w32 + at, wt + at);
+    const size_t at = size_t(r) * size_t(K) + w;
+    omlx_tile_rows<T, K>(m, size_t(rows[r]), int(w), w32 + at, wt + at);
 """
 
 # Weight w of row `row`, as a tile kernel reads it: the code's run, its
 # group's parameters, then the weight, stored as a float32 and rounded once
 # to T. Its position in the run is not known when the kernel is compiled.
+# As a kernel does, it calls params and fetch more than once on one cursor,
+# into arrays of P and Codes, another group and run first, and keeps the
+# second answers.
 _TILE_ROWS_HEADER = r"""
-template <typename T, typename F>
+template <typename T, int K, typename F>
 METAL_FUNC void omlx_tile_rows(
-    F m, size_t row, int k, int w, device float* w32, device T* wt) {
-  if constexpr (omlx_tile_face<F>::value) {
-    using R = typename F::Runs;
-    const R runs(m, row, k);
-    const float v =
-        R::weight(runs.params(w / R::GROUP), runs.fetch(w / R::RUN), w % R::RUN);
+    F m, size_t row, int w, device float* w32, device T* wt) {
+  if constexpr (omlx_tile_face<F, K>::value) {
+    using R = typename F::template Runs<K>;
+    constexpr int GROUPS = (K + R::GROUP - 1) / R::GROUP;
+    const R runs(m, row);
+    typename R::P p[2];
+    typename R::Codes c[2];
+    p[0] = runs.params((w / R::GROUP + 1) % GROUPS);
+    c[0] = runs.fetch((w / R::RUN + 1) % (K / R::RUN));
+    p[1] = runs.params(w / R::GROUP);
+    c[1] = runs.fetch(w / R::RUN);
+    const float v = R::weight(p[1], c[1], w % R::RUN);
     *w32 = v;
     *wt = static_cast<T>(v);
   }
@@ -166,7 +174,7 @@ def tile_rows(
     rounded once to ``dtype``, a dtype the face is exact for, as a kernel
     stores them for activations of that dtype. Each operand has 8 elements
     or more. Anything else is refused with a ``ValueError``. The kernel is
-    compiled for ``face`` and ``dtype``; K and the rows are values it is
+    compiled for ``face``, ``dtype`` and K; the rows are values it is
     given.
     """
     if not isinstance(face, Tile):
@@ -174,7 +182,9 @@ def tile_rows(
     if k <= 0 or k % 8:
         raise ValueError(f"k={k} is not one run or more of 8 inputs")
     rows = list(rows)
-    if not rows or not all(isinstance(r, int) and r >= 0 for r in rows):
+    if not rows or not all(
+        isinstance(r, int) and not isinstance(r, bool) and r >= 0 for r in rows
+    ):
         raise ValueError(f"rows={rows} are not one row index or more")
     operands, names = tuple(operands), ("weight", *face.tensors)
     if len(operands) != len(names):
@@ -192,8 +202,8 @@ def tile_rows(
             )
     return tuple(
         _tile_rows_kernel(face)(
-            inputs=[mx.array(rows, dtype=mx.uint32), *operands],
-            template=[("T", dtype)],
+            inputs=[mx.array(rows, dtype=mx.uint64), *operands],
+            template=[("T", dtype), ("K", k)],
             grid=(k, len(rows), 1),
             threadgroup=(min(k, 256), 1, 1),
             output_shapes=[(len(rows), k), (len(rows), k)],

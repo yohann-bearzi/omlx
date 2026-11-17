@@ -105,7 +105,7 @@ class Tile(_Face):
     ``Dot``, read the way a kernel that decodes a tile of weights reads it.
 
     The fields are a ``Dot``'s. The struct ``type`` names is the matrix, an
-    aggregate as a dot face's, with the member struct ``Runs`` that
+    aggregate as a dot face's, with the member template ``Runs<K>`` that
     ``docs/quant-formats.md`` specifies: a row's cursor that reads a group's
     parameters and runs of 8 codes, and gives each weight as a float32.
     """

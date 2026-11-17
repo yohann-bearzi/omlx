@@ -13,8 +13,11 @@ has no face.
 
 The tile face gives each weight as ``scale * q + bias`` in float32, which a
 kernel rounds once to the activations' dtype: MLX's ``dequantize`` of the
-same weight (``scale * q`` is exact in float32), and what MLX's sorted
-``gather_qmm`` loads into its tiles. It reads runs of 4 and 8 bits only.
+same weight over float32 copies of the scales and the biases (``scale * q``
+is exact in float32 where it is finite), and what MLX's sorted
+``gather_qmm`` loads into its tiles. MLX's ``dequantize`` over scales of
+bf16 or fp16 computes in that type, and can differ. It reads runs of 4 and
+8 bits only.
 """
 
 from __future__ import annotations
@@ -327,7 +330,10 @@ _TILE_BITS = (4, 8)
 # A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8. The
 # code at position i comes from an overload on the run's type: BITS is not a
 # template parameter of Tile, so an `if constexpr` on it would not discard
-# the branch of the other width, which does not compile for this one.
+# the branch of the other width, which does not compile for this one. K is
+# asserted whole groups in the constructor, not in the class: a failed assert
+# there would leave Runs<K> without members for the skeleton's checks, each
+# then an error of its own.
 _TILE = r"""
 using namespace metal;
 
@@ -345,9 +351,12 @@ struct Tile {
   const device S* scales;
   const device S* biases;
 
+  template <int K>
   struct Runs {
     static constant constexpr int RUN = 8;
     static constant constexpr int GROUP = GS;
+    static constant constexpr int ROW_BYTES = K / 8 * BITS;
+    static constant constexpr int ROW_GROUPS = K / GS;
     struct P {
       float s;
       float b;
@@ -358,10 +367,15 @@ struct Tile {
     const device S* s;
     const device S* b;
 
-    Runs(Tile m, size_t row, int k)
-        : c((const device Codes*)(m.codes + row * size_t(k / 8 * BITS))),
-          s(m.scales + row * size_t((k + GS - 1) / GS)),
-          b(m.biases + row * size_t((k + GS - 1) / GS)) {}
+    Runs(Tile m, size_t row)
+        : c((const device Codes*)(m.codes + row * ROW_BYTES)),
+          s(m.scales + row * ROW_GROUPS),
+          b(m.biases + row * ROW_GROUPS) {
+      static_assert(
+          K % GS == 0,
+          "affine tile face: K must be whole groups; AffineFormat.tile gives a K "
+          "its face");
+    }
 
     P params(int g) const {
       return {float(s[g]), float(b[g])};
@@ -450,8 +464,10 @@ class AffineFormat(QuantFormat):
         if (
             layer.bits not in _TILE_BITS
             or layer.group_size not in _GROUP_SIZES
-            or "scales" not in layer
-            or "biases" not in layer
+            or not all(
+                isinstance(layer.get(name), mx.array)
+                for name in ("weight", "scales", "biases")
+            )
         ):
             return None
         weight, scales, biases = layer["weight"], layer["scales"], layer["biases"]
