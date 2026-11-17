@@ -33,17 +33,18 @@ the checkpoint's files, its config among them, whose record the layers read.
 
 from __future__ import annotations
 
-import copy
 import importlib
 import importlib.abc
 import inspect
 import json
+import operator
 import sys
 import threading
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import update_wrapper, wraps
+from importlib import _bootstrap
 from pathlib import Path
 
 import mlx.core as mx
@@ -130,16 +131,16 @@ class _Checkpoint:
         except ValueError as error:
             # The format's own words, on the registered format as it was,
             # with what oMLX knows of the checkpoint.
-            _restore(fmt, kept)
+            _restore(fmt, kept, _changed(fmt, kept))
             said = error.reason if isinstance(error, FormatRefusedError) else error
             raise _refused(str(said), fmt.mode, self) from error
         except Exception:
-            _restore(fmt, kept)
+            _restore(fmt, kept, _changed(fmt, kept))
             raise
         changed = _changed(fmt, kept)
         if changed:
             # The registered format is left as it was for the next load.
-            _restore(fmt, kept)
+            _restore(fmt, kept, changed)
             raise _refused(
                 f"accept changed the registered format ({', '.join(changed)})"
                 " to accept the checkpoint: accept returns a format "
@@ -304,28 +305,49 @@ class _Checkpoint:
         ]
 
 
-# A registered format's attributes that its own state can change in place.
-_CONTAINERS = (list, dict, set, bytearray)
+def _snapshot(value):
+    """What ``_changed`` compares a container attribute of a format with:
+    its contents, shallowly (the objects themselves, not copies, which a
+    face's dtypes or a lock would refuse); None for any other value."""
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, (list, set)):
+        return type(value)(value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    return None
 
 
 def _state(fmt) -> dict:
-    """``fmt``'s attributes (its ``__dict__``'s and its slots'), each with a
-    copy of what a container of them holds."""
+    """``fmt``'s attributes (its ``__dict__``'s and its slots'), each with
+    a ``_snapshot`` of it."""
     names = set(getattr(fmt, "__dict__", {}))
     for cls in type(fmt).__mro__:
         slots = getattr(cls, "__slots__", ())
         names.update((slots,) if isinstance(slots, str) else slots)
-    names.discard("__dict__")
-    names.discard("__weakref__")
     state = {}
     for name in names:
         try:
             value = object.__getattribute__(fmt, name)
         except AttributeError:
             continue
-        held = copy.deepcopy(value) if isinstance(value, _CONTAINERS) else None
-        state[name] = (value, held)
+        state[name] = (value, _snapshot(value))
     return state
+
+
+def _differs(value, held) -> bool:
+    """Whether the container ``value`` holds other than ``held``, its
+    ``_snapshot``. A key a dict gained is not counted: a format's cache of
+    faces gains them from forwards on other threads meanwhile."""
+    if isinstance(value, dict):
+        return any(
+            key not in value or value[key] is not old for key, old in held.items()
+        )
+    if isinstance(value, list):
+        return len(value) != len(held) or any(map(operator.is_not, value, held))
+    if isinstance(value, set):
+        return value != held
+    return bytes(value) != held
 
 
 def _changed(fmt, kept: dict) -> list[str]:
@@ -338,19 +360,22 @@ def _changed(fmt, kept: dict) -> list[str]:
         if name not in kept
         or name not in now
         or now[name][0] is not kept[name][0]
-        or (kept[name][1] is not None and repr(now[name][0]) != repr(kept[name][1]))
+        or (kept[name][1] is not None and _differs(now[name][0], kept[name][1]))
     )
 
 
-def _restore(fmt, kept: dict) -> None:
-    """``fmt``'s attributes as ``kept`` (by ``_state``) has them."""
-    for name in _changed(fmt, kept):
+def _restore(fmt, kept: dict, changed: list[str]) -> None:
+    """``fmt``'s ``changed`` attributes as ``kept`` (by ``_state``) has
+    them; a dict keeps the keys it gained."""
+    for name in changed:
         if name not in kept:
             object.__delattr__(fmt, name)
             continue
         value, held = kept[name]
         object.__setattr__(fmt, name, value)
-        if isinstance(value, (dict, set)):
+        if isinstance(value, dict):
+            value.update(held)
+        elif isinstance(value, set):
             value.clear()
             value.update(held)
         elif held is not None:
@@ -703,12 +728,14 @@ def apply_format_load_patch() -> None:
             sys.meta_path.insert(0, _FINDER)
         pending = sorted(_PENDING)
     for name in pending:
-        module = sys.modules.get(name)
-        if module is None:
-            continue
-        if getattr(getattr(module, "__spec__", None), "_initializing", False):
-            # Another thread imports it: its import may have begun before
-            # this patch could see it, so it is waited for (outside the lock,
-            # which the end of that import takes).
-            module = importlib.import_module(name)
-        _wrap(module)
+        # An import of it on another thread may have begun before this patch
+        # could see it, even before the module is in sys.modules: it is
+        # waited for by the module's import lock (outside this patch's lock,
+        # which the end of that import takes), and what it left is wrapped.
+        # One that failed left nothing, and is not imported again here. This
+        # thread's own import of it holds the lock already: it is wrapped when
+        # it ends, or by the next application of the patch.
+        with _bootstrap._ModuleLockManager(name):
+            module = sys.modules.get(name)
+        if module is not None:
+            _wrap(module)

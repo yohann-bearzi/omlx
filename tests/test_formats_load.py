@@ -874,25 +874,63 @@ class _Slotted(_Loadable):
     __slots__ = ("level",)
 
 
-@pytest.mark.parametrize(
-    "change", ["in place", "a dict in place", "a slot", "then raises", "then fails"]
-)
+class _OneSlot(_Loadable):
+    __slots__ = "level"
+
+
+# What accept does to the registered format, and the attributes the refusal
+# names (none: the load goes on).
+_ACCEPT_CHANGES = {
+    "in place": ("table", lambda fmt: fmt.table.__setitem__(0, 2.0)),
+    "a dict in place": ("options", lambda fmt: fmt.options.__setitem__("rows", 2)),
+    "a key removed": ("options", lambda fmt: fmt.options.clear()),
+    "a slot": ("level", lambda fmt: setattr(fmt, "level", 2)),
+    "a slot named alone": ("level", lambda fmt: setattr(fmt, "level", 2)),
+    "a set": ("tags", lambda fmt: fmt.tags.add(2)),
+    "a bytearray": ("raw", lambda fmt: fmt.raw.__setitem__(0, 122)),
+    "deleted": ("table", lambda fmt: delattr(fmt, "table")),
+    "added": ("extra", lambda fmt: setattr(fmt, "extra", 1)),
+    "rebound to an equal list": (
+        "table",
+        lambda fmt: setattr(fmt, "table", list(fmt.table)),
+    ),
+    "several": (
+        "level, options, raw, table, tags",
+        lambda fmt: (
+            fmt.tags.add(2),
+            fmt.table.append(1.0),
+            fmt.raw.append(0),
+            fmt.options.__setitem__("rows", 2),
+            setattr(fmt, "level", 2),
+        ),
+    ),
+    # A key a cache gained meanwhile is kept when the format is put back.
+    "a key added and one changed": (
+        "options",
+        lambda fmt: fmt.options.update({"face": 1, "rows": 2}),
+    ),
+    # A cache of faces gains keys from forwards on other threads.
+    "a key added": (None, lambda fmt: fmt.options.__setitem__("face", 1)),
+}
+
+
+@pytest.mark.parametrize("change", [*_ACCEPT_CHANGES, "then raises", "then fails"])
 def test_what_accept_changes_of_the_registered_format_is_undone(
     tmp_path, monkeypatch, unpatched, change
 ):
     formats.load()
-    fmt = _Slotted()
+    fmt = _OneSlot() if change == "a slot named alone" else _Slotted()
     fmt.table, fmt.options, fmt.level = [0.5, 1.5], {"rows": 1}, 1
+    fmt.tags, fmt.raw = {1}, bytearray(b"ab")
+    # What no copy takes: a face's dtypes, a lock.
+    fmt.faces = {"dtypes": (mx.float16,), "lock": threading.Lock()}
+    faces = dict(fmt.faces)
     monkeypatch.setitem(formats._FORMATS, "toy", fmt)
     format_load.apply_format_load_patch()
 
     def configure(record):
-        if change == "in place":
-            fmt.table[0] = 2.0
-        elif change == "a dict in place":
-            fmt.options["rows"] = 2
-        elif change == "a slot":
-            fmt.level = 2
+        if change in _ACCEPT_CHANGES:
+            _ACCEPT_CHANGES[change][1](fmt)
         elif change == "then raises":
             fmt.table.append(3.0)
             raise ValueError("written in layout 2; this plugin reads layout 1")
@@ -903,16 +941,29 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
 
     fmt.reads = configure
     _llama(tmp_path, **_written({"levels": [1.0]}))
+    named = _ACCEPT_CHANGES.get(change, ("",))[0]
+    if named is None:
+        load_model(tmp_path)
+        assert fmt.options == {"rows": 1, "face": 1}
+        return
     # A format's defect is its own error; a refusal is oMLX's.
     error = KeyError if change == "then fails" else formats.FormatRefusedError
     with pytest.raises(error) as refusal:
         load_model(tmp_path)
-    changed = {"in place": "table", "a dict in place": "options", "a slot": "level"}
-    if change in changed:
-        assert f"accept changed the registered format ({changed[change]})" in str(
-            refusal.value
-        )
-    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], {"rows": 1}, 1)
+    if named:
+        assert f"accept changed the registered format ({named})" in str(refusal.value)
+    options = {"rows": 1, "face": 1} if "key added" in change else {"rows": 1}
+    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], options, 1)
+    assert (fmt.tags, fmt.raw, fmt.faces) == ({1}, bytearray(b"ab"), faces)
+    assert not hasattr(fmt, "extra")
+
+
+def test_a_load_s_record_is_its_own_again_after_a_block_outside_it(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    with format_load.loading(tmp_path) as checkpoint:
+        with format_load.outside_load():
+            assert formats._LOADING.get() is None
+        assert formats._LOADING.get() is checkpoint
 
 
 class _Wide(_Loadable):
@@ -1700,36 +1751,51 @@ def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
     unpatched, monkeypatch
 ):
     import types
+    from importlib import _bootstrap
 
     formats.load()
-    module = types.ModuleType("halfway")
-    module.__spec__ = SimpleNamespace(_initializing=True)
-    monkeypatch.setitem(sys.modules, "halfway", module)
     monkeypatch.setattr(
         format_load, "_LOADERS", (*format_load._LOADERS, ("halfway", "load_model"))
     )
-    format_load._PENDING.add("halfway")
-    real, waited = importlib.import_module, []
+    module = types.ModuleType("halfway")
+    held, applied = threading.Event(), threading.Event()
 
-    def importing(name, *args):
-        if name != "halfway":
-            return real(name, *args)
-        waited.append(name)
-        if len(waited) == 2:
-            # The other thread's import ends.
-            module.load_model = lambda path: None
-            module.__spec__._initializing = False
-        return module
+    def importing(then):
+        # Another thread's import of it, begun before the patch was applied:
+        # not in sys.modules yet.
+        with _bootstrap._ModuleLockManager("halfway"):
+            held.set()
+            applied.wait(0.5)
+            then()
 
-    monkeypatch.setattr(format_load.importlib, "import_module", importing)
-    # Still running (this thread's own import of it): left for its end.
-    format_load.apply_format_load_patch()
-    assert "halfway" in format_load._PENDING and not hasattr(module, "load_model")
-    # Another thread's: waited for, then wrapped.
-    format_load.apply_format_load_patch()
-    assert waited == ["halfway", "halfway"]
-    assert getattr(module.load_model, "_omlx_format_load", False)
-    assert "halfway" not in format_load._PENDING
+    def ends():
+        module.load_model = lambda path: None
+        monkeypatch.setitem(sys.modules, "halfway", module)
+
+    for then, wrapped in ((lambda: None, False), (ends, True)):
+        format_load._PENDING.add("halfway")
+        held.clear()
+        applied.clear()
+        other = threading.Thread(target=importing, args=(then,))
+        other.start()
+        assert held.wait(60)
+        # Waited for; a failed import left nothing, and is not imported here.
+        format_load.apply_format_load_patch()
+        applied.set()
+        other.join(60)
+        assert ("halfway" in format_load._PENDING) is not wrapped
+    assert _wrapped(module.load_model)
+    # This thread's own import, still running: left for its end.
+    module = types.ModuleType("mine")
+    monkeypatch.setattr(
+        format_load, "_LOADERS", (*format_load._LOADERS, ("mine", "load_model"))
+    )
+    format_load._PENDING.add("mine")
+    monkeypatch.setitem(sys.modules, "mine", module)
+    with _bootstrap._ModuleLockManager("mine"):
+        format_load.apply_format_load_patch()
+    assert "mine" in format_load._PENDING
+
 
 
 _EARLY = """
