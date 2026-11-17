@@ -823,7 +823,6 @@ class _Guard:
 def _model_type_alternatives(
     test: ast.expr,
     aliases: Mapping[str, frozenset[str]],
-    helpers: Mapping[str, ast.FunctionDef] | None = None,
 ) -> frozenset[tuple[str, str]]:
     """Model types one ``if`` test admits, as ("eq"|"prefix", literal) pairs.
 
@@ -831,95 +830,41 @@ def _model_type_alternatives(
     ever ``and``s a model-type test with a type check or the VLM flag, so the
     union is exact there, and over-admitting is the safe direction: it asks a
     peer for one import too many rather than missing the one that kills it.
-
-    With ``helpers`` (the dispatcher module's functions, for the families
-    oMLX patches) a test also reads a model type through ``str(...)`` or an
-    attribute, a name bound to one string, ``startswith`` of a tuple, and a
-    call of one of ``helpers``, as what the helper returns.
     """
 
     if isinstance(test, ast.BoolOp):
         return frozenset().union(
-            *(
-                _model_type_alternatives(value, aliases, helpers)
-                for value in test.values
-            )
+            *(_model_type_alternatives(value, aliases) for value in test.values)
         )
-    reads = _reads_model_type if helpers is not None else _names_model_type
-    if isinstance(test, ast.Compare) and reads(test.left):
+    if isinstance(test, ast.Compare) and isinstance(test.left, ast.Name):
+        if test.left.id not in _MODEL_TYPE_NAMES:
+            return frozenset()
         found: set[tuple[str, str]] = set()
         for operator, comparator in zip(test.ops, test.comparators):
             if isinstance(operator, ast.Eq) and isinstance(comparator, ast.Constant):
                 found.add(("eq", str(comparator.value)))
-            elif isinstance(operator, ast.In) or (
-                helpers is not None and isinstance(operator, ast.Eq)
-            ):
+            elif isinstance(operator, ast.In):
                 found.update(("eq", value) for value in _literals(comparator, aliases))
         return frozenset(found)
     if (
         isinstance(test, ast.Call)
         and isinstance(test.func, ast.Attribute)
         and test.func.attr == "startswith"
-        and reads(test.func.value)
+        and isinstance(test.func.value, ast.Name)
+        and test.func.value.id in _MODEL_TYPE_NAMES
         and test.args
+        and isinstance(test.args[0], ast.Constant)
     ):
-        prefix = test.args[0]
-        if isinstance(prefix, ast.Constant):
-            return frozenset({("prefix", str(prefix.value))})
-        if helpers is not None:
-            return frozenset(("prefix", value) for value in _literals(prefix, aliases))
-        return frozenset()
-    if (
-        helpers is not None
-        and isinstance(test, ast.Call)
-        and isinstance(test.func, ast.Name)
-        and test.func.id in helpers
-    ):
-        helper = helpers[test.func.id]
-        inner = {name: node for name, node in helpers.items() if node is not helper}
-        return frozenset().union(
-            *(
-                _model_type_alternatives(node.value, aliases, inner)
-                for node in ast.walk(helper)
-                if isinstance(node, ast.Return) and node.value is not None
-            )
-        )
+        return frozenset({("prefix", str(test.args[0].value))})
     return frozenset()
-
-
-def _names_model_type(node: ast.expr) -> bool:
-    return isinstance(node, ast.Name) and node.id in _MODEL_TYPE_NAMES
-
-
-def _reads_model_type(node: ast.expr) -> bool:
-    """Whether ``node`` reads a model type: a name or an attribute called
-    ``model_type`` or ``text_model_type``, or ``str(...)`` of one (``or`` a
-    default)."""
-
-    if isinstance(node, ast.Attribute):
-        return node.attr in _MODEL_TYPE_NAMES
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "str"
-        and len(node.args) == 1
-    ):
-        (inner,) = node.args
-        if isinstance(inner, ast.BoolOp) and isinstance(inner.op, ast.Or):
-            inner = inner.values[0]
-        return _reads_model_type(inner)
-    return _names_model_type(node)
 
 
 def _literals(
     node: ast.expr,
     aliases: Mapping[str, frozenset[str]],
 ) -> frozenset[str]:
-    """String constants in a constant, in a collection literal, or in a name
-    bound to either."""
+    """String constants in a collection literal, or in a name bound to one."""
 
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return frozenset({node.value})
     if isinstance(node, ast.Name):
         return aliases.get(node.id, frozenset())
     if isinstance(node, (ast.Set, ast.Tuple, ast.List)):
@@ -952,10 +897,8 @@ def _walk_dispatch(
     guard: _Guard,
     aliases: dict[str, frozenset[str]],
     found: list[tuple[_Guard, str]],
-    helpers: Mapping[str, ast.FunctionDef] | None = None,
 ) -> None:
-    """Record every ``omlx.patches`` import with the guard that reaches it
-    (tests read as ``_model_type_alternatives`` reads them with ``helpers``)."""
+    """Record every ``omlx.patches`` import with the guard that reaches it."""
 
     for node in body:
         if isinstance(node, ast.Assign):
@@ -968,14 +911,13 @@ def _walk_dispatch(
             _walk_dispatch(
                 node.body,
                 guard.narrowed(
-                    _model_type_alternatives(node.test, aliases, helpers),
+                    _model_type_alternatives(node.test, aliases),
                     _vlm_polarity(node.test),
                 ),
                 aliases,
                 found,
-                helpers,
             )
-            _walk_dispatch(node.orelse, guard, aliases, found, helpers)
+            _walk_dispatch(node.orelse, guard, aliases, found)
         elif isinstance(node, ast.ImportFrom) and node.module:
             # ``from ..patches.step3p7 import ...`` and the absolute form both
             # name the same package; the level lives outside ``module``.
@@ -986,7 +928,7 @@ def _walk_dispatch(
             for attribute in ("body", "orelse", "finalbody"):
                 inner = getattr(node, attribute, None)
                 if isinstance(inner, list):
-                    _walk_dispatch(inner, guard, aliases, found, helpers)
+                    _walk_dispatch(inner, guard, aliases, found)
 
 
 @lru_cache(maxsize=1)
@@ -999,87 +941,22 @@ def _dispatch_rules() -> tuple[tuple[_Guard, str], ...]:
     failure mode this whole check exists to remove.
     """
 
-    return _read_dispatch(with_helpers=False)
-
-
-@lru_cache(maxsize=1)
-def _family_rules() -> tuple[tuple[_Guard, str], ...]:
-    """The dispatch as the families oMLX patches read it: each test also
-    through the dispatcher module's helpers (``_is_mtp_compatible``) and the
-    forms ``_model_type_alternatives`` reads with them."""
-
-    return _read_dispatch(with_helpers=True)
-
-
-def _read_dispatch(*, with_helpers: bool) -> tuple[tuple[_Guard, str], ...]:
     try:
         tree = ast.parse(_DISPATCHER.read_text())
     except (OSError, SyntaxError, ValueError):
         return ()
-    functions = {
-        node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)
-    }
-    dispatcher = functions.pop(_DISPATCH_FUNCTION, None)
+    dispatcher = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == _DISPATCH_FUNCTION
+        ),
+        None,
+    )
     if dispatcher is None:
         return ()
     found: list[tuple[_Guard, str]] = []
-    helpers = functions if with_helpers else None
-    _walk_dispatch(dispatcher.body, _Guard(), {}, found, helpers)
-    return tuple(found)
-
-
-# Where oMLX keeps code of its own for a family besides the dispatcher: its
-# patches (and the models they vendor) and its engines and model wrappers.
-_FAMILY_CODE = ("patches", "engine", "models", "engine_pool.py")
-_MODEL_MODULE = re.compile(r"mlx_(?:lm|vlm)\.models\.(\w+)")
-
-
-@lru_cache(maxsize=1)
-def _family_code() -> tuple[tuple[str, frozenset[tuple[str, str]]], ...]:
-    """For each module of oMLX's own code outside the dispatcher, the model
-    types it names: the model modules of mlx-lm and mlx-vlm it imports or
-    names (``("eq", type)``), and the model types its tests compare with."""
-
-    found = []
-    for root in _FAMILY_CODE:
-        path = _OMLX_ROOT / root
-        for file in sorted(path.rglob("*.py")) if path.is_dir() else [path]:
-            try:
-                tree = ast.parse(file.read_text())
-            except (OSError, SyntaxError, ValueError):
-                continue
-            types: set[tuple[str, str]] = set()
-            aliases: dict[str, frozenset[str]] = {}
-            for node in tree.body:
-                if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                    target = node.targets[0]
-                    literals = _literals(node.value, aliases)
-                    if isinstance(target, ast.Name) and literals:
-                        aliases[target.id] = literals
-            helpers = {
-                node.name: node
-                for node in tree.body
-                if isinstance(node, ast.FunctionDef)
-            }
-            for node in ast.walk(tree):
-                if isinstance(node, (ast.Compare, ast.Call)):
-                    types |= _model_type_alternatives(node, aliases, helpers)
-                if isinstance(node, ast.ImportFrom) and node.module:
-                    named = [node.module]
-                    if node.module in ("mlx_lm.models", "mlx_vlm.models"):
-                        named += [f"{node.module}.{a.name}" for a in node.names]
-                elif isinstance(node, ast.Import):
-                    named = [alias.name for alias in node.names]
-                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-                    named = [node.value]
-                else:
-                    continue
-                for name in named:
-                    if match := _MODEL_MODULE.match(name):
-                        types.add(("eq", match.group(1)))
-            module = file.relative_to(_OMLX_ROOT.parent).with_suffix("")
-            name = ".".join(module.parts).removesuffix(".__init__")
-            found.append((name, frozenset(types)))
+    _walk_dispatch(dispatcher.body, _Guard(), {}, found)
     return tuple(found)
 
 
@@ -1238,34 +1115,6 @@ def _declared_model_types(config: Mapping[str, Any]) -> frozenset[str]:
         text_config.get("model_type") if isinstance(text_config, dict) else None,
     )
     return frozenset(value for value in candidates if isinstance(value, str))
-
-
-def family_patches(model_types: Collection[str]) -> tuple[str, ...]:
-    """The modules of oMLX's own code for the family of a model of
-    ``model_types`` (its ``model_type`` and its ``text_config``'s, as the
-    dispatcher spells them): the patches the pre-load dispatch applies behind
-    a test of the model type, on an mlx-lm load or an mlx-vlm one, and the
-    patches, engines and model wrappers that name the model type or import
-    its mlx-lm or mlx-vlm model module. Empty for a model served by mlx-lm's
-    and mlx-vlm's own code.
-
-    Raises when the dispatcher cannot be read: no model can then be told
-    apart from one oMLX patches.
-    """
-
-    rules = _family_rules()
-    if not rules:
-        raise RuntimeError(f"cannot read the pre-load patch dispatch in {_DISPATCHER}")
-    modules = {
-        module
-        for guard, module in rules
-        if guard.model_types and guard.matches(model_types, bool(guard.for_vlm))
-    }
-    family = _Guard()
-    for module, types in _family_code():
-        if types and family.narrowed(types, None).matches(model_types, False):
-            modules.add(module)
-    return tuple(sorted(modules))
 
 
 def required_imports(

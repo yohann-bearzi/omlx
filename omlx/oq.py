@@ -6896,11 +6896,17 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
-# Families that oMLX serves with code of its own (a branch of its pre-load
-# patches taken for their model type, or a decision model's own code) and
-# that quant formats have been verified with end to end. oQ writes a family
-# oMLX does not patch in a format by default, and one it patches only once
-# it is here: a family enters with the run that verifies it.
+# The families oQ writes in a quant format; every other is refused, under
+# any spelling (lower case, "-" for "_"): the gate fails closed.
+# STOCK: families oMLX serves with mlx-lm's own code and applies no patch of
+# its own to, each proven by a test that serves a tiny checkpoint of it and
+# records every patch that runs (tests/test_formats_oq.py).
+_QUANT_FORMAT_STOCK: frozenset[str] = frozenset(
+    {"llama", "mistral", "qwen2", "phi3", "starcoder2", "olmo2"}
+)
+# VERIFIED: families oMLX serves with code of its own (patches, its own
+# models, a decision model's) that quant formats are verified with end to
+# end; a family enters with the run that verifies it.
 _QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
 
 # What the audits found a family's own code to read wrongly of a format's
@@ -6976,50 +6982,45 @@ def _no_lookups() -> dict:
     return {"applied": [], "missing": [], "mismatched": [], "zero_count_experts": 0}
 
 
+def _family(name: str) -> str:
+    """A model type as the family tables spell it."""
+    return name.lower().replace("-", "_")
+
+
 def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
     """(family, why) when oQ writes the checkpoint at ``source`` in no quant
-    format: a family whose own code the audits found reading a format's
-    layer wrongly, or one oMLX serves with code of its own that formats are
-    not verified with yet. A decision model is its decision family."""
-    from .cluster.autoconfigure import family_patches
-    from .utils.model_loading import normalize_qwen35_text_config
-
+    format: a decision model whose family is not verified, or a model whose
+    type (or its text model's) is neither a stock family nor a verified one,
+    with what the audits found its own code to read wrongly when they did."""
+    kind = decision_kind(source, config)
+    if kind is not None:
+        if kind in _QUANT_FORMAT_VERIFIED:
+            return None
+        why = _QUANT_FORMAT_MISREAD.get(kind, _NOT_VERIFIED)
+        return kind, why
     text_config = config.get("text_config")
-    declared = [
-        name
+    families = [
+        _family(name)
         for name in (
             config.get("model_type"),
             text_config.get("model_type") if isinstance(text_config, dict) else None,
         )
         if isinstance(name, str)
     ]
-    kind = decision_kind(source, config)
-    families = [name.lower().replace("-", "_") for name in declared]
-    for family in (kind, *families):
+    for family in families:
         if family in _QUANT_FORMAT_MISREAD:
             return family, _QUANT_FORMAT_MISREAD[family]
-    if kind is not None:
-        if kind in _QUANT_FORMAT_VERIFIED:
-            return None
-        return kind, _own_code("omlx.models")
-    for name, family in zip(declared, families, strict=True):
-        # The dispatcher compares the model type as the config spells it,
-        # after its own renames.
-        spelled = normalize_qwen35_text_config({"model_type": name})["model_type"]
-        patches = family_patches({name, spelled, family})
-        if patches and family not in _QUANT_FORMAT_VERIFIED:
-            shown = ", ".join(patches[:3])
-            if len(patches) > 3:
-                shown += f" and {len(patches) - 3} more"
-            return family, _own_code(shown)
+    for family in families:
+        if family not in _QUANT_FORMAT_STOCK | _QUANT_FORMAT_VERIFIED:
+            return family, _NOT_VERIFIED
     return None
 
 
-def _own_code(where: str) -> str:
-    return (
-        f"oMLX serves it with code of its own ({where}), not verified with "
-        "quant formats yet"
-    )
+_NOT_VERIFIED = (
+    "it is no family served by mlx-lm's own code that oMLX proves it does not "
+    "patch, nor one verified with quant formats end to end"
+)
+
 
 def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
     """What a run with a quant format says of the matrices it offered none:
@@ -7393,9 +7394,12 @@ def quantize_oq_streaming(
     if quant_fmt is not None:
         refused = _unverified_family(source, config)
         if refused is not None:
-            raise ValueError(
-                f"oQ writes no {refused[0]} checkpoint in quant format "
-                f"{quant_format!r}: {refused[1]}; write it without a quant format"
+            from .formats import FormatRefusedError
+
+            raise FormatRefusedError(
+                f"oQ writes no {refused[0]} checkpoint in it: {refused[1]}; write "
+                "it without a quant format, or have the family verified",
+                mode=quant_format,
             )
     if normalized_model_type == "deepseek_v41":
         from .patches.deepseek_v41.oq import quantize as quantize_v41
