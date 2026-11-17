@@ -318,19 +318,20 @@ class BatchedEngine(BaseEngine):
             trust_remote_code=self._trust_remote_code,
         )
 
-        # Apply pre-load patches that need to register modules into
-        # sys.modules before mlx_lm.load() runs (e.g. DeepSeek V4 PR 1192,
-        # native MTP PR 990 / PR 15). Gated on model_type and per-model
-        # settings, so other models pay zero cost.
-        maybe_apply_pre_load_patches(
-            self._model_name, model_settings=self._model_settings
-        )
-
         # Load model on the global MLX executor to avoid blocking the event loop
         # while ensuring no concurrent Metal operations. See issue #85.
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            # Apply pre-load patches that need to register modules into
+            # sys.modules before mlx_lm.load() runs (e.g. DeepSeek V4 PR 1192,
+            # native MTP PR 990 / PR 15). Gated on model_type and per-model
+            # settings, so other models pay zero cost. On the thread that
+            # loads, as every load's: the process-wide state they set is not
+            # another load's meanwhile.
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
             custom_loaded = maybe_load_custom_quantization(
                 self._model_name,
                 is_vlm=False,

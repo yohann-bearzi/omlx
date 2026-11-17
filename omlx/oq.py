@@ -11500,8 +11500,8 @@ def _load_globals_kept(config: dict):
             apply_mlx_vlm_qwen4_exp_compat_patch,
         )
 
+        # It registers, and so imports, the module its runtime is in.
         apply_mlx_vlm_qwen4_exp_compat_patch()
-        importlib.import_module("mlx_vlm.models.qwen4_exp.language")
     kept = [
         (module, name, getattr(module, name))
         for module_name, names in _LOAD_GLOBALS
@@ -11559,16 +11559,18 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
     qualified name), whether a format's layer is built for it, and its
     weight's shape (None for a module without one).
 
-    The model is built from ``config`` by the loader oQe's calibration uses,
-    over a directory with the source's files but its weights and its config:
-    no weight is read, no tokenizer loaded, and the process-wide state the
-    pre-load patches set is kept as it was. With no weight given, the loader
-    quantizes only the layers ``config``'s quantization names (a run's has
-    none yet): the others are the modules whose ``to_quantized`` builds the
-    checkpoint's layers. mlx-vlm drops a module beside the language model
-    that no weight is given for unless the checkpoint's index declares it:
-    the source's index is the view's, so a module the source holds (an MTP
-    head) is kept, and one it does not is no module of the walk."""
+    The model is built from ``config`` over a view of the source: links to
+    its files but its weights and its config, the written config, an empty
+    file of weights, and an index declaring each tensor the source holds
+    (mlx-vlm drops a module beside the language model that no weight is
+    declared for, so a module the source holds, an MTP head, is kept). It is
+    built by the library of the engine oMLX serves the view with, with the
+    source's pre-load patches, on the thread the engines load on (see
+    ``_walk_model``): no weight is read, no tokenizer loaded, and the
+    process-wide state the patches set is kept as it was. With no weight
+    given, the loader quantizes only the layers ``config``'s quantization
+    names (a run's has none yet): the others are the modules whose
+    ``to_quantized`` builds the checkpoint's layers."""
     from .patches.format_load import loads_in_format
 
     source = Path(model_path)
@@ -11578,7 +11580,7 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
             if item.name != "config.json" and not item.name.endswith(
                 (".safetensors", ".safetensors.index.json")
             ):
-                (view / item.name).symlink_to(item.resolve())
+                (view / item.name).symlink_to(item.absolute())
         (view / "config.json").write_text(json.dumps(config))
         # The loaders want a file of weights: one with none, and an index
         # that declares each tensor of the source in it.
@@ -11626,6 +11628,23 @@ def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool)
         return lm_utils.load_model(view, model_config=override, **built)[0]
 
 
+def _served_by_vlm(view: Path) -> bool:
+    """Whether oMLX serves the checkpoint at ``view`` with its VLM engine
+    (mlx-vlm's model), as its model discovery registers it, rather than its
+    LLM engine (mlx-lm's)."""
+    from omlx.model_discovery import _register_model
+
+    found = {}
+    _register_model(found, view, "walk")
+    engine = found["walk"].engine_type if "walk" in found else None
+    if engine not in ("vlm", "batched"):
+        raise ValueError(
+            f"oQ writes a quant format's layers only for a model oMLX serves "
+            f"with its LLM or VLM engine; it serves this one with {engine!r}"
+        )
+    return engine == "vlm"
+
+
 def _on_mlx_thread(load):
     """``load()`` on the thread the engines load models on, so that the
     process-wide state a load sets is not another load's meanwhile."""
@@ -11639,13 +11658,16 @@ def _on_mlx_thread(load):
 def _source_tensors(source: Path) -> list[str]:
     """The names of the tensors the checkpoint at ``source`` holds: its
     index's, or its files' headers'."""
-    index = source / "model.safetensors.index.json"
-    if index.is_file():
-        return list(json.loads(index.read_text())["weight_map"])
+    try:
+        index = json.loads((source / "model.safetensors.index.json").read_text())
+        return list(index["weight_map"])
+    except (OSError, ValueError, KeyError, TypeError):
+        # None, or not one: the files' headers.
+        pass
     from safetensors import SafetensorError, safe_open
 
     names = []
-    for shard in sorted(source.glob("*.safetensors")):
+    for shard in source.glob("*.safetensors"):
         try:
             with safe_open(str(shard), framework="numpy") as tensors:
                 names += tensors.keys()
@@ -11672,12 +11694,7 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
         maybe_apply_pre_load_patches,
     )
 
-    if walk is None:
-        is_vlm = _is_vlm_load(config)
-    else:
-        from omlx.model_discovery import detect_model_type
-
-        is_vlm = detect_model_type(walk) == "vlm"
+    is_vlm = _is_vlm_load(config) if walk is None else _served_by_vlm(walk)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
     calibration_settings = _calibration_model_settings(

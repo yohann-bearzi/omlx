@@ -919,6 +919,10 @@ _EVERY_LOAD = {
     "batched_decode_qmm.py:apply_batched_decode_qmm_patch",
     "format_load.py:apply_format_load_patch",
     "m5_gather_qmm.py:apply_m5_gather_qmm_workaround",
+    # These walk any model the engine loads, and fuse MoE switch layers only.
+    "moe_gate_up_fusion.py:apply_moe_gate_up_fusion",
+    "moe_gate_up_fusion.py:apply_switch_glu_gate_up_fusion",
+    "qwen35_moe_gate_up.py:apply_qwen35_moe_gate_up_fusion",
     "qwen35_fa256_attention.py:apply_qwen35_fa256_attention_patch",
     "qwen35_moe_router.py:apply_qwen35_moe_router_patch",
     "qwen35_moe_weighted_sum.py:apply_qwen35_moe_weighted_sum_patch",
@@ -949,7 +953,7 @@ _STOCK = {
 # checkpoint: what another test applied (a family's loader patched into the
 # process) is not the family's.
 _SERVE = textwrap.dedent("""
-    import asyncio, json, sys
+    import asyncio, json, sys, threading
     from pathlib import Path
     import mlx.core as mx
     import omlx
@@ -961,6 +965,11 @@ _SERVE = textwrap.dedent("""
 
     def record(frame, event, arg):
         code = frame.f_code
+        if seen["phase"] is forwards and (
+            threading.current_thread() is not threading.main_thread()
+        ):
+            # The engine's own threads, not the model's forward.
+            return
         if event == "call" and code.co_filename.startswith(patches):
             where = f"{code.co_filename[len(patches) + 1:]}:{code.co_name}"
             if seen["phase"] is forwards or code.co_name.startswith(
@@ -969,7 +978,9 @@ _SERVE = textwrap.dedent("""
                 seen["phase"].add(where)
 
     engine = BatchedEngine(sys.argv[1])
+    # This thread's, and the threads the engine loads on.
     sys.setprofile(record)
+    threading.setprofile(record)
     asyncio.run(engine.start())
     seen["phase"] = forwards
     mx.eval(engine._model(mx.array([[1, 2, 3]])))
@@ -1374,25 +1385,36 @@ def _checkpoint(path, config, tensors=("model.embed_tokens.weight",)):
     "config, library",
     [
         ({"model_type": "llama"}, "mlx-lm"),
-        # mlx-vlm serves these without a vision config, as a text-only run
-        # of them writes it.
-        ({"model_type": "gemma4_unified"}, "mlx-vlm"),
+        # mlx-vlm serves this one without a vision config, as a text-only
+        # run of it writes it.
         ({"model_type": "lfm3_audio"}, "mlx-vlm"),
         ({"model_type": "qwen3_vl", "vision_config": {"depth": 1}}, "mlx-vlm"),
+        # A text-only Gemma 4 is served by mlx-lm, unless it has an MTP head.
+        ({"model_type": "gemma4_unified"}, "mlx-lm"),
+        (
+            {
+                "model_type": "gemma4",
+                "text_config": {"mtp_assistant_config": {"num_layers": 1}},
+            },
+            "mlx-vlm",
+        ),
     ],
-    ids=["llama", "gemma4_unified", "lfm3_audio", "qwen3_vl"],
+    ids=["llama", "lfm3_audio", "qwen3_vl", "gemma4_unified", "gemma4 with MTP"],
 )
 def test_the_walk_builds_the_model_with_the_library_that_serves_it(
     tmp_path, monkeypatch, config, library
 ):
-    from omlx.model_discovery import detect_model_type
+    from omlx.model_discovery import _register_model
 
     calls, model = _stub_loaders(monkeypatch)
     source = _checkpoint(tmp_path / "source", config)
     walked = oq._module_classes(str(source), config)
     ((loaded, thread, kwargs, given, index),) = calls
+    # As oMLX's model discovery registers the checkpoint.
+    found = {}
+    _register_model(found, source, "source")
     assert loaded == library
-    assert (detect_model_type(source) == "vlm") == (library == "mlx-vlm")
+    assert found["source"].engine_type == ("vlm" if library == "mlx-vlm" else "batched")
     # Lazily, unchecked, on the thread the engines load models on; the
     # model is let go of.
     assert kwargs["lazy"] is True and kwargs["strict"] is False
@@ -1401,6 +1423,90 @@ def test_the_walk_builds_the_model_with_the_library_that_serves_it(
     # The view: the source's files but its weights and config, and an index
     # declaring the source's tensors.
     assert index == {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
+
+
+def test_the_walk_is_of_models_the_llm_and_vlm_engines_serve(tmp_path, monkeypatch):
+    calls, _ = _stub_loaders(monkeypatch)
+    config = {"model_type": "bert", "architectures": ["BertModel"]}
+    source = _checkpoint(tmp_path / "source", config)
+    with pytest.raises(ValueError, match="with 'embedding'"):
+        oq._module_classes(str(source), config)
+    assert calls == []
+
+
+def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
+    tmp_path, monkeypatch
+):
+    calls, _ = _stub_loaders(monkeypatch)
+    config = {"model_type": "llama"}
+    source = _checkpoint(tmp_path / "source", config)
+    # An index that does not parse: the files' headers.
+    (source / "model.safetensors.index.json").write_text("{")
+    # A file of weights that is a link to nothing declares nothing.
+    (source / "extra.safetensors").symlink_to(tmp_path / "nowhere")
+    oq._module_classes(str(source), config)
+    declared = {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
+    assert calls[-1][4] == declared
+    # The source's own index is not written through.
+    assert (source / "model.safetensors.index.json").read_text() == "{"
+    index = {"weight_map": {"model.norm.weight": "model.safetensors"}}
+    (source / "model.safetensors.index.json").write_text(json.dumps(index))
+    oq._module_classes(str(source), config)
+    assert calls[-1][4] == {"weight_map": {"model.norm.weight": "model.safetensors"}}
+    assert json.loads((source / "model.safetensors.index.json").read_text()) == index
+
+
+def test_the_calibration_patches_the_mtp_runtime_as_upstream_does(
+    tmp_path, monkeypatch
+):
+    from omlx.patches import mlx_vlm_mtp
+
+    asked = []
+    monkeypatch.setattr(
+        mlx_vlm_mtp, "apply_mlx_vlm_mtp_runtime_patch", lambda *a: asked.append(a)
+    )
+    monkeypatch.setattr(mlx_vlm_mtp, "apply_mlx_vlm_mtp_patch", lambda: True)
+    config = {
+        "model_type": "qwen3_vl",
+        "vision_config": {"depth": 1},
+        "mtp_num_hidden_layers": 1,
+    }
+    source = _checkpoint(tmp_path / "source", config, tensors=("mtp.fc.weight",))
+    with oq._calibration_patches(source, config):
+        pass
+    # Unscoped, as upstream's calibration does (UPSTREAM-BUGS O16).
+    assert asked == [()]
+
+
+def test_the_engines_apply_pre_load_patches_on_the_thread_that_loads():
+    import ast
+    import inspect
+
+    from omlx.engine import batched, vlm
+
+    for engine, loader in (
+        (batched.BatchedEngine, "_load_model_sync"),
+        (vlm.VLMBatchedEngine, "_load_vlm_sync"),
+    ):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(engine.start)))
+        (start,) = tree.body
+        nested = next(
+            node
+            for node in ast.walk(start)
+            if isinstance(node, ast.FunctionDef) and node.name == loader
+        )
+
+        def dispatches(node):
+            return sum(
+                isinstance(call, ast.Call)
+                and getattr(call.func, "id", None) == "maybe_apply_pre_load_patches"
+                for call in ast.walk(node)
+            )
+
+        # Once, inside the function the global MLX executor runs: the walk of
+        # a format run, on that thread too, never sets or restores that state
+        # while an engine loads.
+        assert dispatches(nested) == dispatches(start) == 1, engine
 
 
 def test_the_walk_reads_no_sidecar_and_keeps_the_calibration_override(

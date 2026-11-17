@@ -1986,31 +1986,31 @@ class VLMBatchedEngine(BaseEngine):
 
         from mlx_vlm.utils import load as vlm_load
 
-        from ..engine_core import AsyncEngineCore, EngineConfig
+        # The VLM model loads on the global MLX executor to avoid blocking the
+        # event loop while ensuring no concurrent Metal operations. See #85.
+        from ..engine_core import AsyncEngineCore, EngineConfig, get_mlx_executor
         from ..scheduler import SchedulerConfig
         from ..utils.model_loading import maybe_load_custom_quantization
 
-        # Apply pre-load patches (MTP runtime patch, etc.) before the model
-        # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
-        # is a no-op when the model is incompatible.
-        try:
-            from ..utils.model_loading import maybe_apply_pre_load_patches
-
-            maybe_apply_pre_load_patches(
-                self._model_name,
-                model_settings=self._model_settings,
-                for_vlm=True,
-            )
-        except ValueError:
-            raise
-        except Exception as e:
-            logger.debug(f"pre-load patches skipped: {e}")
-
-        # Load VLM model on the global MLX executor to avoid blocking the event loop
-        # while ensuring no concurrent Metal operations. See issue #85.
-        from ..engine_core import get_mlx_executor
-
         def _load_vlm_sync():
+            # Apply pre-load patches (MTP runtime patch, etc.) before the model
+            # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
+            # is a no-op when the model is incompatible. On the thread that
+            # loads, as every load's: the process-wide state they set is not
+            # another load's meanwhile.
+            try:
+                from ..utils.model_loading import maybe_apply_pre_load_patches
+
+                maybe_apply_pre_load_patches(
+                    self._model_name,
+                    model_settings=self._model_settings,
+                    for_vlm=True,
+                )
+            except ValueError:
+                raise
+            except Exception as e:
+                logger.debug(f"pre-load patches skipped: {e}")
+
             _patch_video_processor_bug()
             apply_pixtral_torch_free_patch()
             apply_gemma4_audio_patch()
