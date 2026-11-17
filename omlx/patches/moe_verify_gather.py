@@ -245,7 +245,7 @@ def _build_plan(switch_mlp, width: int) -> _Plan | None:
 _FAILED = "expert-ordered verify gather failed; composed fallback"
 
 
-def _stand_in(plan: _Plan, metal) -> list[mx.array]:
+def _stand_in(plan: _Plan, metal):
     """The smallest launches of a block that MLX generates the Metal of
     ``metal`` for, over zeros. The pairs and a row's experts are template
     values, so x has the block's rows and the indices its pairs, of their
@@ -254,23 +254,35 @@ def _stand_in(plan: _Plan, metal) -> list[mx.array]:
     that the activation gives, not the gate/up launch's output."""
     rows, top_k, dtype, index = metal
     pairs = rows * top_k
-    rhs = mx.zeros((pairs,), index)
-    x = mx.zeros((rows, plan.width), dtype)
-    hidden = mx.zeros((pairs, plan.gate_up.n // 2), dtype)
-    order = _order(rhs) if pairs >= ORDERED_PAIRS else None
-    return [
-        gather_qmv(_zeros(plan.gate_up), x, rhs, top_k, order),
-        gather_qmv(_zeros(plan.down), hidden, rhs, 1, order),
+    stacks = [
+        ((_experts(projection), *a.shape[1:]), a.dtype)
+        for projection in (plan.gate_up, plan.down)
+        for a in projection.operands
     ]
-
-
-def _zeros(projection: Projection) -> Projection:
-    experts = max(-(-8 * a.shape[0] // a.size) for a in projection.operands)
-    return projection._replace(
-        operands=tuple(
-            mx.zeros((experts, *a.shape[1:]), a.dtype) for a in projection.operands
-        )
+    specs = (
+        ((pairs,), index),
+        ((rows, plan.width), dtype),
+        ((pairs, plan.gate_up.n // 2), dtype),
+        *stacks,
     )
+    cut = len(plan.gate_up.operands)
+
+    def launch(rhs, x, hidden, *stacks):
+        gate_up = plan.gate_up._replace(operands=stacks[:cut])
+        down = plan.down._replace(operands=stacks[cut:])
+        order = _order(rhs) if pairs >= ORDERED_PAIRS else None
+        return [
+            gather_qmv(gate_up, x, rhs, top_k, order),
+            gather_qmv(down, hidden, rhs, 1, order),
+        ]
+
+    return kernels.zeros(*specs), launch
+
+
+def _experts(projection: Projection) -> int:
+    """The fewest experts that leave each of ``projection``'s tensors 8
+    elements, as a stand-in's stacks have."""
+    return max(-(-8 * a.shape[0] // a.size) for a in projection.operands)
 
 
 def fused_switch(switch_mlp, x: mx.array, indices: mx.array):

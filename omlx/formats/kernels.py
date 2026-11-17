@@ -17,6 +17,7 @@ faster.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass, field
 
@@ -376,6 +377,35 @@ METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T
 """
 
 
+# MLX's shapes are int32: a buffer of zeros as one axis of bytes is smaller.
+_ONE_BUFFER = 2**31
+
+
+def zeros(*specs) -> list[mx.array]:
+    """Zeros of each ``(shape, dtype)`` of ``specs``, a stand-in's inputs,
+    not evaluated: ``Proof.prove`` evaluates them. They are made on the
+    GPU's stream, the launch's. Each op is given the stream: the default
+    device is the process's, every thread's, and is left as it is. The
+    zeros are views of one buffer of as many bytes as the largest, from its
+    first byte: one fill and, where MLX's buffer cache is empty (oMLX clears
+    it after each prefill chunk), one new buffer. One of 2 GiB or more is
+    zeros of its own: MLX's shapes are int32."""
+    gpu = mx.gpu
+    sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
+    below = [size for size in sizes if size < _ONE_BUFFER]
+    if below:
+        buffer = mx.zeros((max(below),), mx.uint8, stream=gpu)
+    made = []
+    for (shape, dtype), size in zip(specs, sizes, strict=True):
+        if size < _ONE_BUFFER:
+            raw = mx.as_strided(buffer, (size,), stream=gpu)
+            typed = mx.view(raw, dtype, stream=gpu)
+            made.append(mx.reshape(typed, shape, stream=gpu))
+        else:
+            made.append(mx.zeros(shape, dtype, stream=gpu))
+    return made
+
+
 class _Kept(threading.local):
     """The graphs that a thread keeps of one proof, each under its launch's
     signature. Every thread that asks has a dict of its own, which ends with
@@ -434,20 +464,21 @@ class Proof:
 
         ``metal`` names one Metal of the proof's kernel: what its source is
         instantiated with beside the proof's key (x's type, a template
-        value, an input that MLX binds another way). ``build`` gives a
-        launch of that Metal, not evaluated. Its caller answers for three
-        things:
+        value, an input that MLX binds another way). ``build`` gives the
+        stand-in of a launch of that Metal: its inputs, not evaluated, and
+        the function that launches it over them. The proof evaluates the
+        inputs, then synchronizes the GPU's stream, ahead of the launch and
+        outside its guard: what fails in making them (an allocation, an
+        error that an earlier evaluation left pending on the GPU) is raised,
+        the proof neither failed nor proven, and the next call proves the
+        Metal again. Its caller answers for three things:
 
-        - the launch reads stand-ins alone, arrays that the kernel makes
-          for it (zeros): no array of the call, no tensor of a layer. Those
-          may belong to a function that MLX is tracing, which refuses to
-          evaluate them; what fails in them is their owner's failure, not
-          the Metal's; and they have the call's size, where a proof needs
-          the smallest. ``build`` evaluates the stand-ins on the GPU's
-          stream before it gives the launch, then synchronizes the stream:
-          what fails in making them (an allocation, an error that an
-          earlier evaluation left pending on the GPU) is raised as its own,
-          not taken for the Metal's.
+        - the launch reads its inputs alone, arrays that the kernel makes
+          for it (``zeros``): no array of the call, no tensor of a layer.
+          Those may belong to a function that MLX is tracing, which refuses
+          to evaluate them; what fails in them is their owner's failure,
+          not the Metal's; and they have the call's size, where a proof
+          needs the smallest.
         - MLX generates the source of the call's launch for it: the same
           kernel, template values and output dtypes and, input by input,
           the same dtype, fewer than 8 elements or not, an axis or none.
@@ -456,8 +487,9 @@ class Proof:
           against the pipeline's limit at every evaluation, and the grid
           not at all.
 
-        What ``build`` raises is raised: a launch that cannot be built is
-        the kernel's defect, or its caller's. What the evaluation raises,
+        What ``build`` and the function raise is raised: a launch that
+        cannot be built is the kernel's defect, or its caller's. What the
+        launch's evaluation raises,
         of any type, is the Metal's failure: the proof fails (``fail``),
         ``failed`` is logged to ``log`` with the error, and the answer is
         False, as it is from then on for every Metal. A launch that runs
@@ -474,11 +506,14 @@ class Proof:
             return False
         if metal in self.ran:
             return True
-        launch = build()
+        inputs, launch = build()
+        mx.eval(*inputs)
+        mx.synchronize(mx.gpu)
+        launched = launch(*inputs)
         try:
             # Surface a kernel build failure while the call can still fall
             # back.
-            mx.eval(launch)
+            mx.eval(launched)
         except Exception:
             self.fail()
             log.warning(failed, exc_info=True)

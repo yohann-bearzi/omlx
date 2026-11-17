@@ -100,7 +100,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .. import formats
-from ..formats import Dot, kernels, linear
+from ..formats import Dot, kernels
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
     fused_router_topk,
@@ -899,7 +899,7 @@ def _token(launches: _Launches, folded: bool):
 def _ranked(rows: int, experts: int, dtype) -> mx.array:
     """Router logits for ``rows`` rows that rank the experts in order: each
     row selects the first top-k. Made on the GPU's stream, as a stand-in's
-    zeros are (``linear._zeros``)."""
+    zeros are (``kernels.zeros``)."""
     gpu = mx.gpu
     column = mx.zeros((rows, 1), mx.float32, stream=gpu)
     ranked = mx.subtract(column, mx.arange(experts, stream=gpu), stream=gpu)
@@ -915,8 +915,8 @@ def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> l
     matrices, which the stacks have. Nothing of the call is read but the
     shapes and dtypes of ``outside`` and of the operands.
 
-    The logits and the zeros are evaluated here, on the GPU's stream, and
-    the stream is synchronized (``linear._zeros``), ahead of the proof's
+    The logits and the zeros are the stand-in's inputs, made on the GPU's
+    stream (``kernels.zeros``), which the proof evaluates ahead of its
     guard: what fails in making them (an allocation, an error an earlier
     evaluation left pending) is raised by the call and fails no proof."""
     rows, top_k = logits.shape[0], launches.top_k
@@ -932,13 +932,19 @@ def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> l
         tuple((a.shape, a.dtype) for a in shared_down),
         tuple((a.shape, a.dtype) for a in outside),
     )
-    mx.eval(logits)
-    made = iter(linear._zeros(*(spec for group in groups for spec in group)))
-    (x,), *stand_ins, outside = (tuple(next(made) for _ in group) for group in groups)
-    launched = [_experts(launches, x, logits, stand_ins, folded, *outside)]
-    if launches.router is not None:
-        launched.append(launches.router(x, *stand_ins[0]))
-    return launched
+
+    def launch(logits, *made):
+        made = iter(made)
+        (x,), *stand_ins, outside = (
+            tuple(next(made) for _ in group) for group in groups
+        )
+        launched = [_experts(launches, x, logits, stand_ins, folded, *outside)]
+        if launches.router is not None:
+            launched.append(launches.router(x, *stand_ins[0]))
+        return launched
+
+    zeros = kernels.zeros(*(spec for group in groups for spec in group))
+    return [logits, *zeros], launch
 
 
 def _outside(block, plan: _Plan, x):

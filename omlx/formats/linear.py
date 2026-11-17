@@ -163,49 +163,18 @@ def _linear(kernel, k: int, n: int, x):
     return x.dtype, graph
 
 
-# MLX's shapes are int32: a buffer of zeros as one axis of bytes is smaller.
-_ONE_BUFFER = 2**31
-
-
-def _zeros(*specs) -> list[mx.array]:
-    """Zeros of each ``(shape, dtype)`` of ``specs``, a stand-in's inputs,
-    evaluated here, ahead of the proof and outside its guard: what fails in
-    making them (an allocation, an error that an earlier evaluation left
-    pending on the GPU) is not the face's. They are made on the GPU's
-    stream, the launch's, which is synchronized after their evaluation, so
-    such an error is raised here. Each op is given the stream: the default
-    device is the process's, every thread's, and is left as it is. The
-    zeros are views of one buffer of as many bytes as the largest, from its
-    first byte: one fill and, where MLX's buffer cache is empty (oMLX clears
-    it after each prefill chunk), one new buffer. One of 2 GiB or more is
-    zeros of its own: MLX's shapes are int32."""
-    gpu = mx.gpu
-    sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
-    below = [size for size in sizes if size < _ONE_BUFFER]
-    if below:
-        buffer = mx.zeros((max(below),), mx.uint8, stream=gpu)
-    zeros = []
-    for (shape, dtype), size in zip(specs, sizes, strict=True):
-        if size < _ONE_BUFFER:
-            raw = mx.as_strided(buffer, (size,), stream=gpu)
-            typed = mx.view(raw, dtype, stream=gpu)
-            zeros.append(mx.reshape(typed, shape, stream=gpu))
-        else:
-            zeros.append(mx.zeros(shape, dtype, stream=gpu))
-    mx.eval(*zeros)
-    mx.synchronize(gpu)
-    return zeros
-
-
-def _linear_stand_in(plan: _Plan, metal) -> mx.array:
+def _linear_stand_in(plan: _Plan, metal):
     """The smallest launch of a matrix that MLX generates the Metal of
     ``metal`` for (x's type), over zeros: one vector, and the whole of each
     tensor. What follows the rows in a matrix's tensors is the format's
     own, so no part of a tensor is known to be all that a row reads."""
     operands = ((a.shape, a.dtype) for a in plan.operands)
-    x, *tensors = _zeros(((plan.k,), metal), *operands)
-    # Its first tile of outputs.
-    return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,), None, 1, 1)
+
+    def launch(x, *tensors):
+        # Its first tile of outputs.
+        return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,), None, 1, 1)
+
+    return kernels.zeros(((plan.k,), metal), *operands), launch
 
 
 def _switch(kernel, k: int, n: int, x, indices):
@@ -256,7 +225,7 @@ def _wrapped(indices, matrices: int):
     return mx.where(indices < 0, indices + matrices, indices)
 
 
-def _switch_stand_in(plan: _Plan, metal) -> mx.array:
+def _switch_stand_in(plan: _Plan, metal):
     """The smallest launch of a stack that MLX generates the Metal of
     ``metal`` for, over zeros. MLX binds an input of fewer than 8 elements
     as constants, which is other Metal: the stand-in has the fewest rows of
@@ -270,10 +239,17 @@ def _switch_stand_in(plan: _Plan, metal) -> mx.array:
     # with a tensor of fewer than 8 elements.
     matrices = max(-(-8 * a.shape[0] // a.size) for a in plan.operands)
     operands = (((matrices, *a.shape[1:]), a.dtype) for a in plan.operands)
-    x, *tensors, rhs = _zeros(((rows, plan.k), dtype), *operands, ((pairs,), mx.uint32))
     shape = (pairs, plan.n)
-    # Each pair's first tile of outputs.
-    return _rows(plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row, 1)
+
+    def launch(x, *tensors):
+        *tensors, rhs = tensors
+        # Each pair's first tile of outputs.
+        return _rows(
+            plan.kernel, plan.k, plan.n, x, tensors, pairs, shape, rhs, per_row, 1
+        )
+
+    specs = (((rows, plan.k), dtype), *operands, ((pairs,), mx.uint32))
+    return kernels.zeros(*specs), launch
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):

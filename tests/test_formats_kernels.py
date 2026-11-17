@@ -350,30 +350,36 @@ def _proves(proof, metal, build):
 
 
 def test_a_proof_evaluates_the_launch_it_is_given_once_for_a_metal(monkeypatch, caplog):
-    """A kernel hands a proof the smallest launch of a Metal: the proof
-    builds it, evaluates it and marks the Metal, in the kernel's words."""
+    """A kernel hands a proof the smallest launch of a Metal, as its inputs
+    and the function that launches it over them: the proof evaluates the
+    inputs, then the launch, and marks the Metal, in the kernel's words."""
     caplog.set_level(logging.INFO, logger=_LOG.name)
-    proof, built, evaluated = kernels.Proof(), [], []
+    proof, built, launched, evaluated = kernels.Proof(), [], [], []
     evaluate = mx.eval
 
     def recorded(*arrays):
         evaluated.append(arrays)
         evaluate(*arrays)
 
+    def launch(x):
+        launched.append(x + 1)
+        return launched[-1]
+
     def build():
         built.append(mx.zeros((8,)) + len(built))
-        return built[-1]
+        return [built[-1]], launch
 
     monkeypatch.setattr(mx, "eval", recorded)
     assert _proves(proof, "metal", build) is True
     assert proof.ran == {"metal"} and not proof.failed
-    assert len(built) == 1 and evaluated == [(built[0],)]
+    assert len(built) == 1 and evaluated == [(built[0],), (launched[0],)]
     assert _said(caplog) == [("INFO", "engaged", None)]
     # A Metal that ran is neither built nor evaluated again. Another one is.
     assert _proves(proof, "metal", build) is True
-    assert len(built) == 1 and len(evaluated) == 1 and len(_said(caplog)) == 1
+    assert len(built) == 1 and len(evaluated) == 2 and len(_said(caplog)) == 1
     assert _proves(proof, "other", build) is True
-    assert proof.ran == {"metal", "other"} and evaluated[1:] == [(built[1],)]
+    assert proof.ran == {"metal", "other"}
+    assert evaluated[2:] == [(built[1],), (launched[1],)]
     assert len(_said(caplog)) == 2
     # A proof keeps no graph by itself.
     assert proof.graphs == {}
@@ -395,10 +401,11 @@ def test_a_launch_that_fails_its_evaluation_fails_the_proof(monkeypatch, caplog)
 
     def build():
         built.append(mx.zeros((8,)))
-        return built[-1]
+        return [], lambda: built[-1]
 
     with monkeypatch.context() as patch:
-        patch.setattr(mx, "eval", lambda *arrays: _raise(error))
+        # The launch's evaluation fails: the stand-in has no input.
+        patch.setattr(mx, "eval", lambda *arrays: arrays and _raise(error))
         assert _proves(proof, "metal", build) is False
     assert proof.failed and proof.ran == {"ran"} and proof.graphs == {}
     assert _said(caplog) == [("WARNING", "failed; fallback", error)]
@@ -411,13 +418,80 @@ def test_a_launch_that_fails_its_evaluation_fails_the_proof(monkeypatch, caplog)
 
 def test_what_fails_as_a_proof_s_launch_is_built_is_raised(caplog):
     """A launch that cannot be built is not one that failed: the error is
-    the kernel's own, or its caller's."""
+    the kernel's own, or its caller's, whether the stand-in or the launch
+    over it raised it."""
     caplog.set_level(logging.INFO, logger=_LOG.name)
     proof, error = kernels.Proof(), _ProofError("no launch")
-    with pytest.raises(_ProofError) as raised:
-        _proves(proof, "metal", lambda: _raise(error))
-    assert raised.value is error
+    for build in (
+        lambda: _raise(error),
+        lambda: ([mx.zeros((8,))], lambda x: _raise(error)),
+    ):
+        with pytest.raises(_ProofError) as raised:
+            _proves(proof, "metal", build)
+        assert raised.value is error
     assert not proof.failed and not proof.ran and not _said(caplog)
+
+
+def test_a_stand_in_left_lazy_is_evaluated_by_the_proof_ahead_of_its_launch(
+    monkeypatch,
+):
+    """A kernel's stand-in hands its inputs to the proof unevaluated: the
+    proof evaluates them and synchronizes the GPU's stream, outside the
+    guard, then builds the launch over them and evaluates it."""
+    proof, events, given, launched = kernels.Proof(), [], [], []
+    evaluate, synchronize = mx.eval, mx.synchronize
+    lazy = mx.add(mx.zeros((8,), stream=mx.gpu), 1, stream=mx.gpu)
+
+    def evaluated(*arrays):
+        events.append("eval")
+        given.append(arrays)
+        evaluate(*arrays)
+
+    def synchronized(*stream):
+        events.append(("synchronize", *stream))
+        synchronize(*stream)
+
+    def launch(x):
+        events.append("launch")
+        given.append((x,))
+        launched.append(x * 2)
+        return launched[-1]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "eval", evaluated)
+        patch.setattr(mx, "synchronize", synchronized)
+        assert _proves(proof, "metal", lambda: ([lazy], launch)) is True
+    assert events == ["eval", ("synchronize", mx.gpu), "launch", "eval"]
+    assert [[id(a) for a in arrays] for arrays in given] == [
+        [id(lazy)],
+        [id(lazy)],
+        [id(launched[0])],
+    ]
+    assert mx.array_equal(launched[0], mx.full((8,), 2.0)).item()
+    assert proof.ran == {"metal"} and not proof.failed
+
+
+def test_an_allocation_that_fails_in_a_stand_in_is_raised_and_proven_again(caplog):
+    """MLX allocates a stand-in's zeros when the proof evaluates them, ahead
+    of the guard: an allocation that fails is raised, the proof has neither
+    failed nor proven the Metal, and the next call proves it."""
+    caplog.set_level(logging.INFO, logger=_LOG.name)
+    proof, launched = kernels.Proof(), []
+
+    def launch(x):
+        launched.append(x + 1)
+        return launched[-1]
+
+    # 2**60 bytes: past any device's largest buffer.
+    huge = kernels.zeros(((2**30, 2**30), mx.uint8))
+    with pytest.raises(RuntimeError, match="allocate"):
+        _proves(proof, "metal", lambda: (huge, launch))
+    assert not launched and not proof.failed and not proof.ran
+    assert not _said(caplog)
+    stand_in = kernels.zeros(((8,), mx.float32))
+    assert _proves(proof, "metal", lambda: (stand_in, launch)) is True
+    assert len(launched) == 1 and proof.ran == {"metal"} and not proof.failed
+    assert _said(caplog) == [("INFO", "engaged", None)]
 
 
 def test_two_threads_prove_a_metal_at_once_without_waiting_for_each_other(
@@ -432,11 +506,12 @@ def test_two_threads_prove_a_metal_at_once_without_waiting_for_each_other(
     def build():
         met.append(("built", threading.get_ident()))
         together.wait()
-        return mx.zeros((8,))
+        return [], lambda: mx.zeros((8,))
 
     def evaluated(*arrays):
-        met.append(("evaluated", threading.get_ident()))
-        together.wait()
+        if arrays:  # the launch: the stand-in has no input
+            met.append(("evaluated", threading.get_ident()))
+            together.wait()
         evaluate(*arrays)
 
     monkeypatch.setattr(mx, "eval", evaluated)

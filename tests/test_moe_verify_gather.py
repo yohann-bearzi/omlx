@@ -13,6 +13,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 import pytest
+from mlx.utils import tree_flatten
 from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 
 import omlx.patches.qwen35_moe_gate_up as gate_up_fusion
@@ -216,12 +217,41 @@ def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
     assert not evaluated  # proven
     signed = indices.astype(mx.int32)
     assert _same_bits(gather.fused_switch(switch, x, signed), want)
-    ((stand_in,),) = evaluated
+    inputs, (stand_in,) = evaluated
+    assert inputs[0].dtype == mx.int32
     assert [a.shape for a in stand_in] == [(3 * TOP_K, 2 * INTER), (3 * TOP_K, HIDDEN)]
     # The proven call's two launches, the stand-in's, then the signed call's.
     assert read == [mx.uint32] * 2 + [mx.int32] * 4
     (proof,) = _proofs()
     assert proof.ran == {(3, TOP_K, x.dtype, dtype) for dtype in (mx.uint32, mx.int32)}
+
+
+def test_an_allocation_that_fails_in_a_stand_in_is_raised_and_fails_no_proof(
+    monkeypatch,
+):
+    """A block's stand-in inputs are evaluated by the proof ahead of its
+    guard: an allocation that fails in them is the call's, raised, and the
+    proof has neither failed nor proven the Metal. The next block proves
+    it."""
+    switch = _switch()
+    x, indices = _block(1, 3)
+    zeros = mx.zeros
+
+    def unallocated(shape, dtype=mx.float32, **named):
+        # Zeros of the shape and dtype asked for, over 2**60 bytes: past any
+        # device's largest buffer, allocated where they are evaluated.
+        huge = zeros((2**30, 2**30), mx.uint8, **named).sum()
+        return mx.broadcast_to(huge.astype(dtype), shape)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(mx, "zeros", unallocated)
+        with pytest.raises(RuntimeError, match="allocate"):
+            gather.fused_switch(switch, x, indices)
+    (proof,) = _proofs()
+    assert not proof.failed and not proof.ran
+    want = _composed(monkeypatch, switch, x, indices)
+    assert _same_bits(gather.fused_switch(switch, x, indices), want)
+    assert proof.ran and not proof.failed
 
 
 def test_a_stand_in_s_stack_has_the_fewest_experts_that_leave_each_tensor_8():
@@ -236,10 +266,7 @@ def test_a_stand_in_s_stack_has_the_fewest_experts_that_leave_each_tensor_8():
         ((weight, scales[:, :1, :3]), 3),  # three
         ((weight, scales[:, :1, :4]), 2),
     ):
-        zeros = gather._zeros(projection._replace(operands=tensors)).operands
-        assert [a.shape for a in zeros] == [(experts, *a.shape[1:]) for a in tensors]
-        assert [a.dtype for a in zeros] == [a.dtype for a in tensors]
-        assert not any(mx.any(a).item() for a in zeros)
+        assert gather._experts(projection._replace(operands=tensors)) == experts
 
 
 def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
@@ -612,7 +639,10 @@ def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
     monkeypatch.setattr(mx, "eval", recorded)
     monkeypatch.setattr(gather, "gather_qmv", built)
     y = gather.fused_switch(switch, x, indices)
-    ((stand_in,),) = evaluated
+    # The proof evaluates the stand-in's inputs, then its launches.
+    inputs, (stand_in,) = evaluated
+    called = (x, indices, *(a for _, a in tree_flatten(switch.parameters())))
+    assert not any(a is b for a in inputs for b in called)
     assert [a.shape for a in stand_in] == [(3 * TOP_K, 2 * INTER), (3 * TOP_K, HIDDEN)]
     zeros = launched[:2]
     assert [(len(z[2]), z[3]) for z in zeros] == [(3 * TOP_K, TOP_K), (3 * TOP_K, 1)]
@@ -625,13 +655,13 @@ def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
     assert zeros[0][1].dtype == zeros[1][1].dtype == mx.float16
     # Then the block's own launches, built and not evaluated.
     assert launched[2][1].shape == (3, HIDDEN) and launched[3][3] == 1
-    assert len(launched) == 4 and len(evaluated) == 1
+    assert len(launched) == 4 and len(evaluated) == 2
     del evaluated[:], launched[:]
     assert _same_bits(gather.fused_switch(switch, x, indices), y)
     assert not evaluated and len(launched) == 2
     # Another Metal: its rows are not these.
     gather.fused_switch(switch, *shorter)
-    assert len(evaluated) == 1 and evaluated[0][0][0].shape == (2 * TOP_K, 2 * INTER)
+    assert len(evaluated) == 2 and evaluated[1][0][0].shape == (2 * TOP_K, 2 * INTER)
 
 
 @pytest.mark.parametrize("state", [False, True])

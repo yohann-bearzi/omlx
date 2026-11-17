@@ -929,8 +929,8 @@ def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(
 def test_what_fails_in_a_stand_in_s_zeros_is_raised_and_fails_no_proof(
     monkeypatch, caplog
 ):
-    """A stand-in's zeros are evaluated as it is built, ahead of its launch
-    and outside the guard of the launch's evaluation: what fails there (an
+    """A stand-in's zeros are evaluated by the proof ahead of its launch,
+    outside the guard of the launch's evaluation: what fails there (an
     allocation, an error that an earlier evaluation left pending on the GPU)
     is not the face's. The call raises it, and the proof has neither failed
     nor proven anything."""
@@ -1044,7 +1044,6 @@ def test_zeros_of_2_GiB_or_more_are_each_their_own(monkeypatch):  # noqa: N802
         return zeros(shape, *dtype, **named)
 
     monkeypatch.setattr(mx, "zeros", recorded)
-    monkeypatch.setattr(mx, "eval", lambda *arrays: None)
     x, scales = ((4096,), mx.bfloat16), ((262144, 64), mx.bfloat16)
     head = ((262144, 4096), mx.bfloat16)
     under = ((2**31 - 1,), mx.uint8)
@@ -1057,7 +1056,7 @@ def test_zeros_of_2_GiB_or_more_are_each_their_own(monkeypatch):  # noqa: N802
         ((head, head), [head, head]),
     ):
         del asked[:]
-        made = linear._zeros(*specs)
+        made = kernels.zeros(*specs)
         assert [(a.shape, a.dtype) for a in made] == list(specs)
         assert asked == buffers
     # Each on the GPU's stream, the launch's.
@@ -1068,9 +1067,9 @@ def test_a_stand_in_s_zeros_are_made_and_waited_for_on_the_gpu(monkeypatch):
     """A launch runs on the GPU's stream, whatever the caller's default
     stream. Its stand-in's zeros are made there too, each op given the GPU's
     stream (the process's default device, which every thread shares, is
-    left as it is), and the stream is synchronized after their evaluation:
-    what an earlier evaluation left pending on the GPU is raised then, ahead
-    of the proof, not in the evaluation of the launch."""
+    left as it is), and the proof synchronizes the stream after their
+    evaluation: what an earlier evaluation left pending on the GPU is raised
+    then, ahead of the launch, not in its evaluation."""
     quantized, layer = _pair(320, 72)
     x = _x((1, 320))
     synchronize, evaluate, events = mx.synchronize, mx.eval, []
@@ -1103,10 +1102,10 @@ def test_a_stand_in_s_zeros_are_made_and_waited_for_on_the_gpu(monkeypatch):
     assert events[len(ops) :] == [("eval", 4), ("synchronize", mx.gpu), ("eval", 1)]
     assert _same_bits(y, quantized(x))
     assert (
-        "The stand-in's zeros are evaluated on the GPU's stream as it is built, "
-        "ahead of the proof, and the stream is synchronized: what fails in making "
-        "them, or what an earlier evaluation left pending on the GPU, is raised by "
-        "the call and fails no proof."
+        "The stand-in's zeros are made on the GPU's stream and evaluated by the "
+        "proof ahead of the launch, and the stream is synchronized: what fails in "
+        "making them, or what an earlier evaluation left pending on the GPU, is "
+        "raised by the call and fails no proof."
     ) in _PAGE
 
 

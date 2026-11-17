@@ -18,7 +18,7 @@ from mlx.utils import tree_flatten
 
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
-from omlx.formats import affine, kernels, linear
+from omlx.formats import affine, kernels
 from omlx.patches.module_cache import cached_per_module
 from tests.test_formats_affine import uncalled
 
@@ -889,8 +889,10 @@ def test_an_unproven_block_evaluates_its_stand_in_and_a_proven_one_nothing(monke
     y = block(x)
     *inputs, (proving,) = evaluated
     assert len(proving) == 2 and not any(a is y for a in proving)
-    # Ahead of it, the stand-in's logits, then its zeros: none of the call's.
-    assert len(inputs) == 2 and not any(a is x for arrays in inputs for a in arrays)
+    # Ahead of it, the stand-in's logits and zeros: none of the call's.
+    assert len(inputs) == 1 and not any(a is x for arrays in inputs for a in arrays)
+    # The logits first: one row's, over the 128 experts.
+    assert inputs[0][0].shape == (1, 128)
     del evaluated[:]
     block(x), block(other), block(x[0])
     assert not evaluated
@@ -2000,15 +2002,15 @@ class _ZerosError(Exception):
 def test_what_fails_in_a_block_s_stand_in_zeros_is_raised_and_fails_no_proof(
     monkeypatch,
 ):
-    """A block's and a window's stand-in inputs are made and evaluated ahead of
-    the proof (``linear._zeros``): what fails there (an allocation, an error
+    """A block's and a window's stand-in inputs are made (``kernels.zeros``)
+    and evaluated by the proof ahead of its guard: what fails there (an allocation, an error
     an earlier evaluation left pending on the GPU) is the call's, raised, and
     neither proof fails or proves anything."""
     block = _block(512, 256, top_k=8, experts=128)
     x, rows = _rows_of(block, 1, 1), _rows_of(block, 1, 3)
     error = _ZerosError("no zeros")
     with monkeypatch.context() as patch:
-        patch.setattr(linear, "_zeros", lambda *specs: (_ for _ in ()).throw(error))
+        patch.setattr(kernels, "zeros", lambda *specs: (_ for _ in ()).throw(error))
         for call in (
             lambda: block(x),
             lambda: routed.routed_verify_window(block, rows),
@@ -2036,7 +2038,7 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
     evaluate, synchronize, zeros, arange = (
         mx.eval,
         mx.synchronize,
-        linear._zeros,
+        kernels.zeros,
         mx.arange,
     )
     events, streams = [], []
@@ -2061,11 +2063,12 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
         patch.setattr(mx, "eval", evaluated)
         patch.setattr(mx, "synchronize", synchronized)
         patch.setattr(mx, "arange", ranked)
-        patch.setattr(linear, "_zeros", made)
+        patch.setattr(kernels, "zeros", made)
         with mx.stream(mx.cpu):
             y = block(x)
-    # The logits, the zeros (their evaluation, the synchronize), the launch.
-    assert events == ["eval", "zeros", "eval", ("synchronize", mx.gpu), "eval"]
+    # The zeros made, then the proof's evaluation of them with the logits,
+    # the synchronize, and the launch's.
+    assert events == ["zeros", "eval", ("synchronize", mx.gpu), "eval"]
     assert streams == [mx.gpu]
     assert _same_bits(want, y)
 
