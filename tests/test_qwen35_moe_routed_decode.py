@@ -1698,3 +1698,276 @@ def test_stacks_of_other_expert_counts_are_not_planned():
     for name in ("weight", "scales", "biases"):
         down[name] = down[name][:-32]
     assert _plan(block, _token_of(block)) is None
+
+
+def _rows_of(block, batch, length, seed=0):
+    mx.random.seed(200 + seed)
+    hidden = block.gate["weight"].shape[-1]
+    return mx.random.normal((batch, length, hidden)).astype(mx.bfloat16)
+
+
+def _one_by_one(block, x):
+    """Each row of ``x`` through the block's one-token call: what a window's
+    rows equal."""
+    rows = x.reshape(-1, 1, 1, x.shape[-1])
+    return mx.concatenate([block(row) for row in rows]).reshape(-1, x.shape[-1])
+
+
+def test_a_window_s_launches_are_built_once_for_a_signature_and_replayed(
+    launched, monkeypatch
+):
+    """A window's launches are one graph too, built once for the window's
+    shape and dtype and the router's width and replayed, by every block of
+    the window's proof; a window of other rows, and batched decode rows,
+    are graphs of their own."""
+    block, twin = (_block(512, 256, top_k=8, experts=128, seed=s) for s in (0, 1))
+    launched.recording = False
+    calls = [(b, _rows_of(b, 1, 3, seed)) for b in (block, twin) for seed in range(3)]
+    wants = [_one_by_one(b, x) for b, x in calls]
+    more = [_rows_of(block, 1, 8), _rows_of(block, 4, 1)]
+    more_wants = [_one_by_one(block, x) for x in more]
+    mx.eval(wants, more_wants)
+    launched.recording = True
+    compiled = _compiled(monkeypatch)
+    for (b, x), want in zip(calls, wants, strict=True):
+        assert _same_bits(routed.routed_verify_window(b, x), want)
+    # The stand-in's launches, then the graph's: router, gate+up with the
+    # routing, down; built once.
+    assert len(launched.built) == 6
+    assert [graph.calls for graph in compiled] == [6]
+    plan = _plan(block, _rows_of(block, 1, 1))
+    assert set(plan.window.graphs) == {((1, 3, 512), mx.bfloat16, 128)}
+    # A verify window of 8 rows, and 4 requests' decode rows through the
+    # block's call.
+    window, rows = more
+    assert _same_bits(routed.routed_verify_window(block, window), more_wants[0])
+    assert _same_bits(block(rows).reshape(-1, 512), more_wants[1])
+    assert set(plan.window.graphs) == {
+        ((1, 3, 512), mx.bfloat16, 128),
+        ((1, 8, 512), mx.bfloat16, 128),
+        ((4, 1, 512), mx.bfloat16, 128),
+    }
+    assert plan.window.ran == {(3, 128, True), (8, 128, False), (4, 128, False)}
+    assert len(compiled) == 3
+
+
+def test_a_kept_window_is_not_replayed_for_rows_of_another_dtype():
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    assert routed.routed_verify_window(block, x) is not None
+    plan = _plan(block, x[:, :1])
+    kept = dict(plan.window.graphs)
+    assert routed.routed_verify_window(block, x.astype(mx.float16)) is None
+    assert plan.window.graphs == kept
+
+
+def test_windows_of_no_rows_or_of_more_than_the_verify_kernels_take_are_composed():
+    block = _block(512, 256, top_k=8, experts=128)
+    assert routed.routed_verify_window(block, _rows_of(block, 1, 0)) is None
+    wide = _rows_of(block, 1, routed.WINDOW_MAX_ROWS + 1)
+    assert routed.routed_verify_window(block, wide) is None
+    # A window has the axes of a verify block's: [B, L, hidden].
+    assert routed.routed_verify_window(block, _rows_of(block, 1, 3)[0]) is None
+    assert (
+        routed.routed_verify_window(block, wide[:, : routed.WINDOW_MAX_ROWS])
+        is not None
+    )
+    plan = _plan(block, wide[:, :1])
+    assert plan.window.ran == {(routed.WINDOW_MAX_ROWS, 128, False)}
+
+
+def test_windows_of_routers_of_other_widths_are_graphs_of_their_own():
+    blocks = [_block(512, 256, top_k=8, experts=e) for e in (128, 256)]
+    for block in blocks * 2:
+        x = _rows_of(block, 1, 3)
+        assert _same_bits(routed.routed_verify_window(block, x), _one_by_one(block, x))
+    window = _plan(blocks[0], _rows_of(blocks[0], 1, 1)).window
+    assert _plan(blocks[1], _rows_of(blocks[1], 1, 1)).window is window
+    assert set(window.graphs) == {((1, 3, 512), mx.bfloat16, e) for e in (128, 256)}
+    assert window.ran == {(3, 128, True), (3, 256, True)}
+
+
+def test_a_failed_one_token_launch_stops_the_windows_kept(monkeypatch, caplog):
+    """A one-token launch that fails keeps the blocks' windows composed,
+    whatever window graphs their threads kept."""
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    assert routed.routed_verify_window(block, x) is not None
+    plan = _plan(block, x[:, :1])
+    assert len(plan.window.graphs) == 1
+    down = routed._down
+    monkeypatch.setattr(routed, "_down", lambda *a: _does_not_compile(down(*a)))
+    assert _same_bits(*_pair(block, x[:, :1]))
+    assert plan.proof.failed and len(_logged(caplog, routed, logging.WARNING)) == 1
+    assert routed.routed_verify_window(block, x) is None
+
+
+def test_a_window_whose_stand_in_fails_drops_its_graphs(monkeypatch, caplog):
+    """The windows of a proof stop together: the window graphs kept are
+    dropped with a window that fails; one token still runs."""
+    caplog.set_level(logging.WARNING, logger=routed.__name__)
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    assert routed.routed_verify_window(block, x) is not None
+    window = _plan(block, x[:, :1]).window
+    assert len(window.graphs) == 1
+    down = routed._window_down
+    monkeypatch.setattr(routed, "_window_down", lambda *a: _does_not_compile(down(*a)))
+    assert routed.routed_verify_window(block, _rows_of(block, 1, 5)) is None
+    assert window.failed and not window.graphs
+    # A failed window builds nothing of a launch again.
+    with monkeypatch.context() as patch:
+        patch.setattr(routed, "_ranked", lambda *a: pytest.fail("built"))
+        assert routed.routed_verify_window(block, x) is None
+    warnings = _logged(caplog, routed, logging.WARNING)
+    assert [r.getMessage() for r in warnings] == [
+        "fused verify-window experts failed; verifier fallback"
+    ]
+    assert _same_bits(*_pair(block, x[:, :1]))
+
+
+@pytest.mark.parametrize("rows,fold", [(2, True), (3, True), (4, False), (16, False)])
+def test_a_window_s_stand_in_has_the_metal_of_its_launches_and_its_stacks(
+    launched, capfd, rows, fold
+):
+    """A window's stand-in keeps the window's rows (a template value) over
+    zeros, routes every row to the first matrices of stacks of top-k, and
+    MLX generates the same sources for it as for the window's launches."""
+    launched.verbose = True
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, rows)
+    plan = _plan(block, x[:, :1])
+    called = [x, *(a for group in plan.operands for a in group)]
+    capfd.readouterr()
+    y = routed.routed_verify_window(block, x)
+    mx.eval(y)
+    sources = _sources(capfd)
+    half = len(sources) // 2
+    assert half >= 3 and sorted(sources[:half]) == sorted(sources[half:])
+    stand_in = launched.built[: len(launched.built) // 2]
+    assert not any(a is b for launch in stand_in for a in launch.inputs for b in called)
+    stacks = [a for launch in stand_in for a in launch.inputs if a.ndim == 3]
+    assert len(stacks) == len(plan.operands[1]) + len(plan.operands[2])
+    assert all(a.shape[0] == 8 and not mx.any(a).item() for a in stacks)
+    (indices,) = (i for i in map(_selected, stand_in) if i is not None)
+    assert indices.shape == (rows, 8)
+    assert all(sorted(row) == list(range(8)) for row in indices.tolist())
+    assert plan.window.ran == {(rows, 128, fold)}
+
+
+def test_a_window_is_proven_and_kept_in_functions_that_mlx_compiles(caplog):
+    """A window's first call may be inside a function that MLX's compile
+    traces, over the block's state too: proven on its stand-in and kept."""
+    caplog.set_level(logging.INFO, logger=routed.__name__)
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    want = _one_by_one(block, x)
+    mx.eval(want)
+    window = mx.compile(lambda x: routed.routed_verify_window(block, x) * 2)
+    assert _same_bits(window(x), want * 2)
+    plan = _plan(block, x[:, :1])
+    assert plan.window.ran == {(3, 128, True)} and len(plan.window.graphs) == 1
+    stated = mx.compile(
+        lambda x: routed.routed_verify_window(block, x), inputs=block.state
+    )
+    wide = _rows_of(block, 1, 5)
+    wide_want = _one_by_one(block, wide)
+    for _ in range(2):
+        assert _same_bits(stated(wide), wide_want)
+    mx.eval(block.parameters())
+    plan = _plan(block, x[:, :1])
+    assert plan.window.ran == {(3, 128, True), (5, 128, False)}
+    assert len(plan.window.graphs) == 2
+    engaged = [r.getMessage() for r in _logged(caplog, routed)]
+    assert [m for m in engaged if "window" in m] == [
+        "Qwen MoE fused verify-window experts engaged (3 rows)",
+        "Qwen MoE fused verify-window experts engaged (5 rows)",
+    ]
+
+
+def test_a_window_s_graph_is_called_by_the_thread_that_built_it(monkeypatch):
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    want = _one_by_one(block, x)
+    mx.eval(want)
+    compiled = _compiled(monkeypatch)
+    engines = [_Thread("mlx-engine-a"), _Thread("mlx-engine-b")]
+
+    def window(x):
+        y = routed.routed_verify_window(block, x)
+        mx.eval(y)
+        return y
+
+    try:
+        for run in (engines[0], engines[1], engines[0], engines[1]):
+            assert _same_bits(run(window, x), want)
+        assert _same_bits(window(x), want)
+        idents = {engine.ident for engine in engines} | {threading.get_ident()}
+        plan = _plan(block, x[:, :1])
+        counts = [engine(lambda: len(plan.window.graphs)) for engine in engines]
+    finally:
+        for engine in engines:
+            engine.end()
+    assert len(compiled) == 3 and all(len(graph.threads) == 1 for graph in compiled)
+    assert set.union(*(graph.threads for graph in compiled)) == idents
+    assert counts == [1, 1] and plan.window.ran == {(3, 128, True)}
+
+def test_a_window_of_one_row_is_one_token_s_call(monkeypatch):
+    """A verify window of one row runs one token's launches: their graph and
+    their proof, not the window's (cold-fused MEDIUM-1), so a window that
+    failed leaves it fused."""
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 1)
+    want = _one_by_one(block, x)
+    mx.eval(want)
+    plan = _plan(block, x)
+    compiled = _compiled(monkeypatch)
+    assert _same_bits(routed.routed_verify_window(block, x), want)
+    # The one-token graph kept by the block's call, replayed.
+    assert not compiled and len(plan.proof.graphs) == 1
+    assert not plan.window.ran and not plan.window.graphs
+    plan.window.fail()
+    assert _same_bits(routed.routed_verify_window(block, x), want)
+
+
+def test_a_window_graph_that_cannot_be_built_is_raised_and_not_kept(monkeypatch):
+    """What fails as a window's launches are built, after their Metal is
+    proven, is raised by the call, and nothing is kept for the window."""
+    block = _block(512, 256, top_k=8, experts=128)
+    x = _rows_of(block, 1, 3)
+    experts, built = routed._experts, []
+
+    def refused(*args):
+        built.append(1)
+        if len(built) > 1:  # the stand-in's are built, the call's are not
+            raise RuntimeError("no launch")
+        return experts(*args)
+
+    monkeypatch.setattr(routed, "_experts", refused)
+    with pytest.raises(RuntimeError, match="no launch"):
+        routed.routed_verify_window(block, x)
+    window = _plan(block, x[:, :1]).window
+    assert window.ran == {(3, 128, True)} and not window.failed
+    assert not window.graphs
+
+
+def test_windows_the_launches_do_not_take_are_composed():
+    """A window of another width than the block's, of a block whose gate
+    runs as it is, or of a router of partial simdgroups is the verifier's:
+    nothing is proven or kept."""
+    block = _block(512, 256, top_k=8, experts=128)
+    assert (
+        routed.routed_verify_window(block, mx.zeros((1, 3, 256), mx.bfloat16)) is None
+    )
+    gated = _block(1024, 320)
+    plan = routed._build_plan(gated)
+    assert plan.launches.router is None and plan.window is not None
+    assert routed.routed_verify_window(gated, _rows_of(gated, 1, 3)) is None
+    # 100 experts: the router gemv runs them, the routing kernels do not.
+    partial_router = _block(1024, 320, experts=100)
+    plan = routed._build_plan(partial_router)
+    assert plan.launches.router is not None and plan.window is not None
+    x = _rows_of(partial_router, 1, 3)
+    assert routed.routed_verify_window(partial_router, x) is None
+    assert not any(proof.ran or proof.graphs for proof in kernels._PROOFS.values())

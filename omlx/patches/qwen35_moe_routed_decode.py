@@ -73,9 +73,10 @@ rows on the recomputed selections cost more than the routing launch
 bit-identical to the fused one-token call on that row. This replaces the
 verifier's composed MoE (about fifteen launches, two of them binding the
 whole stacked experts) only while row-exact verify is armed and the block
-folds its shared expert; one-row windows run the one-token launches. If a
-window launch fails the first time it is built, the verifier keeps its
-composed MoE for blocks of these faces and shapes.
+folds its shared expert; one-row windows are one token's call. A window's
+launches are one graph too, kept per thread in the window's proof for the
+window's shape; if its stand-in fails, the verifier keeps its composed MoE
+for blocks of these faces and shapes.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
 (50 MB by default), counting each input array whole. The stacked expert
@@ -992,56 +993,81 @@ def _decode(block, plan: _Plan, x, graph):
     return y
 
 
+def _window(launches: _Launches, folded: bool):
+    """A window's launches as one function of its rows and the plan's
+    operands, for MLX's compile: the router, gate+up and down of every row
+    of ``x`` ([B, L, hidden]), the rows ([rows, hidden]) out. It closes over
+    no array."""
+
+    def graph(x, operands):
+        x = x.reshape(-1, launches.hidden)
+        logits = launches.router(x, *operands[0])
+        return _experts(launches, x, logits, operands, folded)
+
+    return graph
+
+
+def _windows(plan: _Plan, x) -> bool:
+    """Whether the rows of ``x`` run through the plan's window launches: a
+    window ([B, L, hidden]) of 1..``WINDOW_MAX_ROWS`` rows of the plan's
+    width, in the dtype the launches are compiled for, for a router of
+    whole simdgroups that the launches run. (A window of one row is one
+    token's call.)"""
+    launches = plan.launches
+    return (
+        x.ndim == 3
+        and x.dtype == launches.dtype
+        and x.shape[-1] == launches.hidden
+        and 1 <= x.size // launches.hidden <= WINDOW_MAX_ROWS
+        and launches.router is not None
+        and router_eligible(x, plan.experts, WINDOW_MAX_ROWS)
+    )
+
+
 def routed_verify_window(block, x):
     """The block's output for a row-exact verify window ``x`` ([B, L, hidden],
     1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
-    one-token call on that row, or None outside the fused layout.
+    one-token call on that row, as [rows, hidden]; or None outside the
+    fused layout.
 
     Router gemv, gate+up (with the softmax + top-k folded in) and
-    down/combine each run once for the whole window."""
-    if (
-        x.ndim != 3
-        or x.dtype not in (mx.bfloat16, mx.float16)
-        or block.top_k not in TOP_KS
-    ):
-        return None
-    hidden = x.shape[-1]
-    rows = x.size // hidden
-    if not 1 <= rows <= WINDOW_MAX_ROWS or not router_eligible(
-        x, block.num_experts, WINDOW_MAX_ROWS
-    ):
-        return None
+    down/combine each run once for the whole window, in one graph of the
+    rows and the block's arrays that MLX's compile builds the first time a
+    thread meets the window's shape and dtype on blocks of these faces,
+    tensor dtypes and shapes, and that the window's proof keeps for that
+    thread. Its Metal is proven first on a stand-in (``_stand_in``):
+    nothing of the call is evaluated. A window of one row is one token's
+    call: its graph and its proof. A failed one-token proof keeps the
+    windows composed too."""
     plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
-    if plan is None:
+    if plan is None or plan.window is None or plan.proof.failed:
         return None
-    launches = plan.launches
-    if (
-        plan.proof.failed
-        or not launches.fold
-        or plan.window.failed
-        or launches.hidden != hidden
-        or launches.dtype != x.dtype
-        or launches.router is None
-    ):
+    signature = (x.shape, x.dtype, plan.experts)
+    if x.size == x.shape[-1]:
+        # One row runs the one-token launches: their proof and graph.
+        if x.ndim != 3:
+            return None
+        y = _decode(block, plan, x, plan.proof.graphs.get(signature))
+        return None if y is None else y.reshape(1, -1)
+    # A verify step's block is the replay of the graph its thread kept.
+    graph = plan.window.graphs.get(signature)
+    if graph is not None:
+        return graph(x, plan.operands)
+    if plan.window.failed or not _windows(plan, x):
         return None
-    x = x.reshape(rows, hidden)
-    logits = launches.router(x, *plan.operands[0])
+    launches, rows = plan.launches, x.size // x.shape[-1]
+    logits = _ranked(rows, plan.experts, launches.dtype)
     folded = _topk_folds(launches, logits)
-    launch = (rows, logits.shape[-1], folded)
-    proven = launch in plan.window.ran
-    if not proven:
-        # What fails ahead of the block is not the launch's failure.
-        mx.eval(x)
-    try:
-        y = _experts(launches, x, logits, plan.operands, folded)
-        if not proven:
-            mx.eval(y)
-            plan.window.ran.add(launch)
-            logger.info("Qwen MoE fused verify-window experts engaged (%d rows)", rows)
-    except Exception:
-        plan.window.failed = True
-        logger.warning("fused verify-window experts failed; verifier fallback", exc_info=True)
+    stand_in = partial(_stand_in, launches, logits, folded, (), plan.operands)
+    said = (
+        f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
+        "fused verify-window experts failed; verifier fallback",
+    )
+    if not plan.window.prove((rows, plan.experts, folded), stand_in, logger, *said):
         return None
+    graph = mx.compile(_window(launches, folded))
+    y = graph(x, plan.operands)
+    plan.window.keep(signature, graph)
     return y
 
 

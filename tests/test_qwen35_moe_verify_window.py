@@ -234,9 +234,11 @@ def test_window_rows_equal_one_token_decode(topk_fold, engaged):
             _check(block, _inputs(rows, step), engaged)
     # Batched verify rows (requests x drafts) are rows too.
     _check(block, _inputs(3, 1, batch=2), engaged)
+    # A window of one row is one token's call (its proof, not the window's).
     assert plan.window.ran == {
         (rows, BLOCK_EXPERTS, topk_fold and rows <= routed._TOPK_FOLD_MAX_ROWS)
         for rows in (*window_rows, 6)
+        if rows > 1
     }
     # One token's launches are proven beside the windows'.
     assert plan.proof.ran == {(BLOCK_EXPERTS, topk_fold)}
@@ -332,17 +334,25 @@ def test_a_window_launch_that_does_not_compile_falls_back_to_the_composed_verifi
     assert plan.proof.ran == {(BLOCK_EXPERTS, True)} and not plan.proof.failed
 
 
-def test_a_failure_ahead_of_a_window_is_raised_and_not_its_launch_s(engaged):
+def test_a_failure_ahead_of_a_window_is_raised_where_its_rows_are_evaluated(engaged):
+    """A window is proven on zeros and built over its rows: their failure is
+    the caller's, raised where the caller evaluates the result."""
     block = _block(0)
     x = _inputs(4, 1)
     plan = _plan(block, x[:, :1])
+    y = routed.routed_verify_window(block, _does_not_compile(x))
     with pytest.raises(RuntimeError, match="Unable to build metal library"):
-        routed.routed_verify_window(block, _does_not_compile(x))
-    assert engaged == [] and not plan.window.failed and not plan.window.ran
+        mx.eval(y)
+    assert engaged == [True] and not plan.window.failed
+    assert plan.window.ran == {(4, BLOCK_EXPERTS, False)}
     _check(block, x, engaged)
 
 
-def test_only_an_unproven_window_launch_is_evaluated_in_the_call(monkeypatch):
+def test_an_unproven_window_evaluates_its_stand_in_and_a_proven_one_nothing(
+    monkeypatch,
+):
+    """A window's one evaluation is the stand-in of launches whose Metal is
+    not proven: not its rows, not a tensor, not the result."""
     block = _block(0)
     x = _inputs(4, 1)
     _plan(block, x[:, :1])  # evaluates the experts' views
@@ -354,11 +364,11 @@ def test_only_an_unproven_window_launch_is_evaluated_in_the_call(monkeypatch):
 
     monkeypatch.setattr(mx, "eval", recorded)
     y = routed.routed_verify_window(block, x)
-    # The window's rows first, outside the launch's guard, then the launch.
-    assert [len(arrays) for arrays in evaluated] == [1, 1]
-    assert evaluated[0][0].shape == (4, HIDDEN) and evaluated[1][0] is y
+    ((proving,),) = evaluated
+    assert len(proving) == 2 and not any(a is y for a in proving)
     del evaluated[:]
     assert routed.routed_verify_window(block, x) is not None
+    assert routed.routed_verify_window(block, _inputs(4, 0)) is not None
     assert not evaluated
 
 
