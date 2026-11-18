@@ -568,8 +568,13 @@ class _FormatLayer(nn.Module):
             loading = formats._LOADING.get() is not None
             if value.shape != held.shape or value.dtype != held.dtype:
                 if loading:
+                    unloads = key not in self._placeholders
                     # The dtype's name: a Dtype neither pickles nor copies.
                     self._placeholders[key] = (value.shape, str(value.dtype))
+                    if unloads:
+                        # A loaded tensor goes: a plan cached over it is
+                        # built again, and refuses.
+                        super().__setitem__(key, mx.zeros_like(held))
                 return
             # Stored before its placeholder is cleared: a call on another
             # thread that finds no placeholder finds the tensor.
@@ -584,7 +589,12 @@ class _FormatLayer(nn.Module):
         of the two loads nothing into the other."""
         clone = type(self).__new__(type(self))
         dict.update(clone, self)
-        clone.__dict__.update(self.__dict__, _placeholders=dict(self._placeholders))
+        clone.__dict__.update(
+            self.__dict__,
+            _placeholders=dict(self._placeholders),
+            # Frozen or not, each on its own.
+            _no_grad=set(self._no_grad),
+        )
         return clone
 
     def refuse_placeholders(self) -> None:
@@ -658,18 +668,20 @@ class _FormatLayer(nn.Module):
         )
 
 
-def _decode_dtype(layer: FormatSwitchLinear) -> mx.Dtype:
-    """The dtype of the layer's decode: read from the graph of one matrix's
-    decode, never evaluated."""
-    return layer._decoded(slice(0, 1)).dtype
+def _decode_dtype(layer: FormatSwitchLinear) -> tuple[str, int]:
+    """The name and size of the dtype of the layer's decode (a Dtype
+    neither copies nor pickles with the layer): read from the graph of one
+    matrix's decode, never evaluated."""
+    dtype = layer._decoded(slice(0, 1)).dtype
+    return str(dtype), dtype.size
 
 
 def _decoded_size(layer: FormatSwitchLinear, dtype: mx.Dtype) -> int:
     """The bytes of a weight the layer's decode holds for x of ``dtype``:
     the decode's own, and the cast's when x's dtype differs. The decode's
     dtype is read once for the layer."""
-    decoded = cached_per_module(layer, "_omlx_decode_dtype", _decode_dtype, depth=0)
-    return decoded.size + (dtype.size if dtype != decoded else 0)
+    name, size = cached_per_module(layer, "_omlx_decode_dtype", _decode_dtype, depth=0)
+    return size + (dtype.size if str(dtype) != name else 0)
 
 
 def keeps_dtype(module, key: str) -> bool:
@@ -719,22 +731,31 @@ class FormatSwitchLinear(_FormatLayer):
 
     def _through_decode(self, x, indices, sorted_indices):
         """``x`` times the matrices at ``indices``, decoded: what the rows
-        kernel does not take, a piece of the matrices at a time."""
+        kernel does not take, the indices' matrices or the stack, at once
+        within a budget, else a piece at a time."""
         dtype = x.dtype
+        batch = mx.broadcast_shapes(x.shape[:-2], indices.shape)
+        if x.size == 0 or indices.size == 0:
+            # No product: no matrix is decoded.
+            return mx.zeros((*batch, x.shape[-2], self.output_dims), dtype)
         matrix = self.output_dims * self.input_dims
-        piece = max(1, _DECODE_BYTES // (matrix * (4 + dtype.size)))
+        piece = max(1, _DECODE_BYTES // max(1, matrix * (4 + dtype.size)))
         # One matrix for each pair of x and the indices broadcast together.
-        pairs = math.prod(mx.broadcast_shapes(x.shape[:-2], indices.shape))
+        pairs = math.prod(batch)
         if indices.size < self.num_experts:
-            # A decode step's indices: their matrices alone are decoded.
-            if pairs > piece:
+            # A decode step's indices: their matrices alone are decoded, at
+            # once (broadcast over x) as a piece holds them, else a pair at
+            # a time while the pairs are fewer than the stack's matrices.
+            if indices.size <= piece:
+                return x @ self._decoded(indices).astype(dtype).swapaxes(-1, -2)
+            if pairs < self.num_experts:
                 return self._selected(x, indices, piece)
-            return x @ self._decoded(indices).astype(dtype).swapaxes(-1, -2)
         indices = _wrapped(indices, self.num_experts)
         # A prefill's: the stack once, not a matrix for each index; whole
         # from enough pairs, if it is within the budget.
         if self.num_experts > piece and (
-            pairs < _AT_ONCE_PAIRS * self.num_experts
+            # A pair's rows each a product.
+            pairs * x.shape[-2] < _AT_ONCE_PAIRS * self.num_experts
             or self.num_experts * matrix * _decoded_size(self, dtype)
             > _DECODE_AT_ONCE_BYTES
         ):
@@ -748,10 +769,11 @@ class FormatSwitchLinear(_FormatLayer):
 
     def _selected(self, x, indices, piece):
         """``x`` times the matrices at ``indices``, ``piece`` pairs at a
-        time, each piece one matmul. With one row of x a pair (a model's
-        call) and a decode that works element by element, each pair has the
-        bits of the matmul of all of them at once; with more rows, MLX may
-        choose another kernel for a smaller batch."""
+        time, each piece one matmul. With one row of x for each index (a
+        model's call) and a decode that works element by element, each pair
+        has the bits of the matmul of all of them at once; with more rows,
+        or x broadcast over the indices, MLX may choose another kernel for a
+        smaller batch."""
         dtype, (m, k) = x.dtype, x.shape[-2:]
         batch = mx.broadcast_shapes(x.shape[:-2], indices.shape)
         rows = mx.broadcast_to(x, (*batch, m, k)).reshape(-1, m, k)
@@ -769,6 +791,9 @@ class FormatSwitchLinear(_FormatLayer):
         gather's work), and each pair keeps the product of the piece that
         holds its matrix. With a decode that works element by element, that
         product has the bits of the gather over the whole stack."""
+        # Clipped to a piece's bounds, which an index of a small integer
+        # dtype may not hold.
+        indices = indices.astype(mx.uint32)
         y = None
         for first in range(0, self.num_experts, piece):
             last = min(first + piece, self.num_experts)

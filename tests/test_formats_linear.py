@@ -536,7 +536,7 @@ def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
     assert _equal(layer(x, indices, sorted_indices=True), got)
     # No index decodes no matrix.
     assert layer(x, indices[:, :0]).shape == (2, 0, 1, 72)
-    assert whole == [False, False, False] and not hints
+    assert whole == [False, False] and not hints
     # As many indices as matrices, then a prefill's, in any integer type.
     for routed, dtype in (((EXPERTS,), mx.uint32), ((2, 4, 3), mx.int64)):
         x = _x((*routed[:-1], 1, 1, 320), mx.float32)
@@ -544,7 +544,7 @@ def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
         got = layer(x, indices)
         assert got.shape == (*routed, 1, 72)
         assert _equal(got, want(x, indices, sorted_indices=False))
-    assert whole == [False, False, False, True, True] and hints == [False, False]
+    assert whole == [False, False, True, True] and hints == [False, False]
     # Rows of x for each index count for nothing: 15 pairs of 5 indices
     # decode 5 matrices, 24 of 8 the stack.
     del whole[:], hints[:]
@@ -2735,6 +2735,26 @@ def _over_placeholders(toy):
     return layer, (codes, scales), x, want
 
 
+def test_a_tensor_a_load_unloads_drops_the_plan_built_over_it(toy, tmp_path):
+    """A plan built while the tensor was loaded is not used once a load
+    unloads it: the layer refuses, as one never loaded does."""
+    toy(_toy("unloaded"))
+    # 40 rows: whole tiles of 8, which the face's plan takes.
+    layer, x, want = _toy_linear(40, 320)
+    # Twice: the second call replays the graph the first one kept.
+    assert _equal(layer(x), want) and _equal(layer(x), want)
+    assert layer.__dict__["_omlx_format_plan"][-1] is not None
+    with format_load.loading(tmp_path):
+        layer["scales"] = layer["scales"].astype(mx.float16)
+    offered = _refusal(
+        layer,
+        "scales (offered (40,) mlx.core.float16, not the layout's (40,) "
+        "mlx.core.float32)",
+    )
+    with pytest.raises(ValueError, match=offered):
+        layer(x)
+
+
 def _refusal(layer, held):
     return re.escape(
         f"{layer!r} computes on its checkpoint's tensors alone; it still holds "
@@ -2802,25 +2822,43 @@ def test_the_page_says_only_a_load_fills_a_placeholder():
     assert "Only a load fills a placeholder" in " ".join(_PAGE.split())
 
 
-def _pending(toy):
-    """A layer built for a load, its scales offered in float16 (not taken),
-    its weight never loaded; its tensors and the refusal that names them."""
+def _pending(toy, kind="linear"):
+    """A layer built for a load (a FormatLinear, or a FormatSwitchLinear of
+    two matrices), its scales offered in float16 (not taken), its weight
+    never loaded: its tensors, its call on an input, what the call gives
+    once loaded, and the refusal that names them."""
     toy()
-    (codes, scales), x, want = _matrix(36, 320)
+    stack = (2,) if kind == "switch" else ()
+    (codes, scales), x, _ = _matrix(36 * math.prod(stack), 320)
+    codes, scales = codes.reshape(*stack, 36, 320), scales.reshape(*stack, 36)
+    cls = FormatSwitchLinear if stack else FormatLinear
     stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
-    layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
+    layer = cls("toy", 8, 1, 320, stand_ins, placeholders=True)
     layer["scales"] = scales.astype(mx.float16)
+    if stack:
+        xs, indices = mx.stack([x, -x])[:, None], mx.array([1, 0])
+
+        def call(module):
+            return module(xs, indices)
+
+    else:
+
+        def call(module):
+            return module(x)
+
+    want = call(cls("toy", 8, 1, 320, {"weight": codes, "scales": scales}))
+    shape = (*stack, 36)
     refusal = re.escape(
-        "weight (never loaded), scales (offered (36,) mlx.core.float16, not the "
-        "layout's (36,) mlx.core.float32)"
+        f"weight (never loaded), scales (offered {shape} mlx.core.float16, not "
+        f"the layout's {shape} mlx.core.float32)"
     )
-    return layer, (codes, scales), x, want, refusal
+    return layer, (codes, scales), call, want, refusal
 
 
 def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, a_load, monkeypatch):
     """A call on another thread that finds no placeholder finds the tensor:
     the load stores it first."""
-    layer, (codes, scales), _, _, _ = _pending(toy)
+    layer, (codes, scales), *_ = _pending(toy)
     store, seen = nn.Module.__setitem__, []
 
     def stored(self, key, value):
@@ -2833,32 +2871,42 @@ def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, a_load, monke
     assert seen == [("scales", True)] and "scales" not in layer._placeholders
 
 
+@pytest.mark.parametrize("kind", ["linear", "switch"])
 @pytest.mark.parametrize(
     "copied",
     [copy.deepcopy, lambda layer: pickle.loads(pickle.dumps(layer))],
     ids=["deepcopy", "pickle"],
 )
-def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(toy, a_load, copied):
-    layer, (codes, scales), x, want, refusal = _pending(toy)
+def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(
+    toy, a_load, copied, kind
+):
+    layer, (codes, scales), call, want, refusal = _pending(toy, kind)
     clone = copied(layer)
+    assert type(clone) is type(layer)
     with pytest.raises(ValueError, match=refusal):
-        clone(x)
+        call(clone)
     clone["weight"], clone["scales"] = codes, scales
-    assert _equal(clone(x), want)
+    assert _equal(call(clone), want)
     with pytest.raises(ValueError, match=refusal):
-        layer(x)
+        call(layer)
 
 
-def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy, a_load):
-    """copy.copy shares the tensors and not the record of placeholders: the
-    original, never loaded, still refuses."""
-    layer, (codes, scales), x, want, refusal = _pending(toy)
+@pytest.mark.parametrize("kind", ["linear", "switch"])
+def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy, a_load, kind):
+    """copy.copy shares the tensors and not the record of placeholders, nor
+    whether a tensor is frozen: the original, never loaded, still refuses,
+    and stays frozen when the copy is not."""
+    layer, (codes, scales), call, want, refusal = _pending(toy, kind)
     clone = copy.copy(layer)
-    assert clone["weight"] is layer["weight"]
-    clone["weight"], clone["scales"] = codes, scales
-    assert _equal(clone(x), want)
+    assert type(clone) is type(layer) and clone["weight"] is layer["weight"]
     with pytest.raises(ValueError, match=refusal):
-        layer(x)
+        call(clone)
+    clone["weight"], clone["scales"] = codes, scales
+    assert _equal(call(clone), want)
+    with pytest.raises(ValueError, match=refusal):
+        call(layer)
+    clone.unfreeze()
+    assert clone.trainable_parameters() and not layer.trainable_parameters()
 
 
 def test_a_layer_s_placeholders_are_checked_where_its_plan_is_built(toy, monkeypatch):
@@ -2892,7 +2940,7 @@ def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy, a_lo
             layer["scales"] = scales
             return "36"
 
-    layer._placeholders["weight"] = ((Loading(),), mx.float16)
+    layer._placeholders["weight"] = ((Loading(),), str(mx.float16))
     with pytest.raises(ValueError, match=re.escape("scales (never loaded)")):
         layer(x)
 
@@ -3278,7 +3326,7 @@ _DECODED_CALLS = [
 
 
 @pytest.mark.parametrize("exact", [True, False], ids=["exact", "any floats"])
-@pytest.mark.parametrize("matrices", [1, 4, EXPERTS])
+@pytest.mark.parametrize("matrices", [1, 4, EXPERTS - 1])
 @pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16, mx.float16])
 def test_a_decode_in_pieces_has_the_bits_of_a_decode_at_once(
     toy, monkeypatch, exact, matrices, dtype
@@ -3289,9 +3337,13 @@ def test_a_decode_in_pieces_has_the_bits_of_a_decode_at_once(
     for seed, (shape, batch, hint) in enumerate(_DECODED_CALLS):
         if exact:
             x = _ints(shape, seed).astype(dtype)
-        elif shape[-2] > 1 and math.prod(batch) < EXPERTS:
-            # The matrices of the indices, with more rows of x than one: a
-            # piece's matmul may run another kernel than the whole batch's.
+        elif math.prod(batch) < EXPERTS and (
+            shape[-2] > 1
+            or math.prod(mx.broadcast_shapes(shape[:-2], batch)) > math.prod(batch)
+        ):
+            # The matrices of the indices, with more rows of x than one, or
+            # x broadcast over them: a piece's matmul may run another kernel
+            # than the whole batch's.
             continue
         else:
             x = _x(shape, dtype, seed)
@@ -3300,6 +3352,98 @@ def test_a_decode_in_pieces_has_the_bits_of_a_decode_at_once(
             indices = mx.sort(indices)
         got = layer(x, indices, sorted_indices=hint)
         assert _equal(got, _at_once(layer, x, indices, hint)), (shape, batch)
+
+
+def test_a_stack_a_piece_holds_is_decoded_whole(toy, monkeypatch):
+    """Whatever the pairs and the budget: its decode's dtype is not read."""
+    toy()
+    layer = _toy_stack(EXPERTS, 40, 320)
+    _pieces_of(monkeypatch, EXPERTS, 40, 320, mx.float32)
+    decode, pieces = _ToyFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        pieces.append(tensors["weight"].shape[:-2])
+        return decode(self, tensors, bits, group_size)
+
+    monkeypatch.setattr(_ToyFormat, "decode", recorded)
+    for pairs in (EXPERTS, 2 * EXPERTS):
+        pieces.clear()
+        mx.eval(layer(_ints((pairs, 1, 320)), _experts((pairs,))))
+        assert pieces == [(EXPERTS,)]
+    assert "_omlx_decode_dtype" not in layer.__dict__
+
+
+def test_indices_of_any_integer_dtype_go_through_pieces(toy, monkeypatch):
+    """An index of a small dtype is clipped to a piece's bounds as uint32:
+    a stack of more matrices than uint8 holds is decoded in pieces."""
+    toy()
+    layer = _toy_stack(300, 8, 64)
+    _pieces_of(monkeypatch, 100, 8, 64, mx.float32)
+    # As many pairs as the stack has matrices, or more: the stack, in
+    # pieces whose bounds pass 255.
+    mx.random.seed(3)
+    x, indices = _ints((400, 1, 64)), mx.random.randint(0, 256, (400,))
+    want = layer(x, indices.astype(mx.int32))
+    for dtype in (mx.uint8, mx.int16, mx.uint32):
+        assert _equal(layer(x, indices.astype(dtype)), want)
+
+
+@pytest.mark.parametrize(
+    "shape,batch", [((0, 5, 1, 320), (5,)), ((5, 0, 320), (5,)), ((1, 1, 320), (0,))]
+)
+def test_a_call_of_no_product_decodes_no_matrix(toy, monkeypatch, shape, batch):
+    toy()
+    layer = _toy_stack(EXPERTS, 40, 320)
+    decode, decoded = _ToyFormat.decode, []
+
+    def recorded(self, tensors, bits, group_size):
+        decoded.append(tensors["weight"].shape)
+        return decode(self, tensors, bits, group_size)
+
+    monkeypatch.setattr(_ToyFormat, "decode", recorded)
+    x = _ints(shape)
+    y = layer(x, _experts(batch))
+    want = (*mx.broadcast_shapes(shape[:-2], batch), shape[-2], 40)
+    assert y.shape == want and y.dtype == x.dtype and decoded == []
+
+
+def test_a_stack_of_matrices_of_no_rows_gives_no_outputs(toy):
+    toy()
+    tensors = {
+        "weight": mx.zeros((EXPERTS, 0, 320), mx.uint8),
+        "scales": mx.zeros((EXPERTS, 0)),
+    }
+    layer = FormatSwitchLinear("toy", 8, 1, 320, tensors)
+    assert layer(_ints((2, 1, 320)), _experts((2,))).shape == (2, 1, 0)
+
+
+def test_a_layer_whose_decode_dtype_is_read_copies_and_pickles(toy, monkeypatch):
+    toy()
+    layer = _toy_stack(EXPERTS, 40, 320)
+    _pieces_of(monkeypatch, 4, 40, 320, mx.float32)
+    monkeypatch.setattr(linear, "_DECODE_AT_ONCE_BYTES", 1 << 30)
+    pairs = linear._AT_ONCE_PAIRS * EXPERTS
+    x, indices = _ints((pairs, 1, 320)), mx.sort(_experts((pairs,)))
+    want = layer(x, indices, sorted_indices=True)
+    assert "_omlx_decode_dtype" in layer.__dict__
+    for clone in (copy.deepcopy(layer), pickle.loads(pickle.dumps(layer))):
+        assert _equal(clone(x, indices, sorted_indices=True), want)
+
+
+def test_a_call_outside_the_rows_kernel_evaluates_nothing(toy, monkeypatch):
+    """Its decode's dtype included: a call stays lazy, as one inside a
+    function that mx.compile traces must."""
+    toy()
+    for shape, batch, hint in _DECODED_CALLS:
+        # Each proof made first, by another stack of the same faces.
+        _toy_stack(EXPERTS, 40, 320)(_ints(shape), _experts(batch), hint)
+    layer, evaluated = _toy_stack(EXPERTS, 40, 320), []
+    calls = [(_ints(s), _experts(b), hint) for s, b, hint in _DECODED_CALLS]
+    evaluate = mx.eval
+    monkeypatch.setattr(mx, "eval", lambda *a: evaluated.append(a) or evaluate(*a))
+    for x, indices, hint in calls:
+        layer(x, indices, sorted_indices=hint)
+    assert evaluated == []
 
 
 def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
@@ -3328,8 +3472,11 @@ def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
         ((_ints((5, 1, 320)), _experts((5,)), False), [(4,), (1,)]),
         # As many as a piece holds: at once, as the indices are.
         ((_ints((1, 2, 1, 1, 320)), _experts((1, 2, 2)), False), [(1, 2, 2)]),
-        # A matrix for each pair of x and the indices broadcast together.
-        ((_ints((4, 1, 1, 320)), _experts((1, 2)), False), [(4,), (4,)]),
+        # The indices' matrices as a piece holds them, broadcast over x.
+        ((_ints((4, 1, 1, 320)), _experts((1, 2)), False), [(1, 2)]),
+        # More than a piece holds, broadcast past the stack's matrices: the
+        # stack, not a matrix for each pair.
+        ((_ints((2, 1, 1, 320)), _experts((1, 5)), False), [(4,), (2,)]),
         # As many indices as the stack has matrices: the stack.
         ((_ints((1, 320)), _experts((EXPERTS,)), False), [(4,), (2,)]),
     ]
@@ -3338,7 +3485,7 @@ def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
         mx.eval(layer(x, indices, sorted_indices=hint))
         assert decoded == pieces
     # mlx-vlm's hint goes to each piece's gather.
-    assert hints == [True, True, False, False, False, False]
+    assert hints == [True, True, False, False, False, False, False, False]
     # Less than a matrix: one at a time.
     monkeypatch.setattr(linear, "_DECODE_BYTES", 1)
     for (x, indices, hint), _ in calls[:3]:
@@ -3385,6 +3532,12 @@ def test_a_stack_is_decoded_whole_from_enough_pairs_within_its_budget(
     assert decoded_for(enough, needed) == [(EXPERTS,)]
     # One byte over the budget: pieces.
     assert decoded_for(enough, needed - 1) == [(4,), (2,)]
+    # Half the pairs, of two rows each: as many products, whole.
+    monkeypatch.setattr(linear, "_DECODE_AT_ONCE_BYTES", needed)
+    pieces.clear()
+    x, indices = _ints((enough // 2, 2, 320)), mx.sort(_experts((enough // 2,)))
+    mx.eval(layer(x.astype(dtype), indices, sorted_indices=True))
+    assert pieces == [(EXPERTS,)]
 
 
 def test_the_page_says_a_decode_is_at_once_or_in_pieces():
@@ -3397,8 +3550,8 @@ def test_the_page_says_a_decode_is_at_once_or_in_pieces():
         in page
     )
     assert (
-        f"a piece at a time there, and above the budget: {linear._DECODE_BYTES >> 20} "
-        "MiB of them "
+        "a piece at a time there (pairs counted with their rows of `x`), and above "
+        f"the budget: {linear._DECODE_BYTES >> 20} MiB of them "
         "(`linear._DECODE_BYTES`)" in page
     )
     assert "a call costs pieces × the gather's work" in page
