@@ -231,7 +231,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 | `Dot` and `Tile` field | Meaning |
 |---|---|
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
-| `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`). A kernel includes each distinct source once. |
+| `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`, or one that the faces sharing the source share: the affine tile face's bf16 and fp16 keys share `omlx_affine_tile_b{bits}g{group_size}`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. A `Tile`'s struct is in a namespace of its own, apart from its format's `Dot`: a kernel includes the source of the faces it reads, and no other. |
 | `tensors` | The layer's parameters beside `weight` and `bias` that the face reads, as a tuple, among its format's `tensors`. They become kernel inputs in this order. Identifiers, each named once, as a format's `tensors` are. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype` among `float16`, `bfloat16` and `float32`; empty (the default) for those three (`formats.FLOATS`). Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
@@ -379,11 +379,11 @@ A kernel builds a cursor for each row a thread decodes, and reads the row throug
 | Member of `Runs<K>` | Role |
 |---|---|
 | `static constant constexpr int RUN` | 8, the codes of a run. A run of 8 codes of b bits is b whole bytes. |
-| `static constant constexpr int GROUP` | The codes that share one `params()`: 8 times a power of two (8, 16, 32, ..., 2^30). A row has `(K + GROUP - 1) / GROUP` groups, the last of which may be partial. |
+| `static constant constexpr int GROUP` | The codes that share one `params()`: 8 times a power of two (8, 16, 32, ..., 2^30). A row has `(K - 1) / GROUP + 1` groups, the last of which may be partial. |
 | `struct P` | A group's parameters, as a kernel holds them in registers. |
 | `Codes` | A run's codes, as a kernel holds them in registers: a `uint`, a `uint2`, ... |
 | `Runs(Tile m, size_t row)` | The cursor of row `row` of `m`. In a stack of matrices of N rows each, row `n` of matrix `e` is row `e * N + n`. |
-| `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (K + GROUP - 1) / GROUP)`. |
+| `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (K - 1) / GROUP + 1)`. |
 | `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, K / 8)`. |
 | `static float weight(thread const P& p, Codes c, int i)` | Weight `i` (0 to 7) of a run of codes `c` in a group of parameters `p`, as a float32. |
 
@@ -423,7 +423,7 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 9. **The source is C++17 Metal without derived classes.** See [Compile-time rules](#compile-time-rules).
 10. **`if constexpr` discards a branch only in a template, on a condition that depends on its parameters.** A face's source is one instance, its bit width and group size namespace constants, so an `if constexpr` on one of them compiles both branches, and each must be well-formed for the instance's types. Choose by an overload on a type (`code_at(uint, i)` and `code_at(uint2, i)` in the affine face) or by a template parameter.
 
-Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). It also calls `params` and `fetch` twice on one cursor, another group and run first, and keeps the second answers, so a member that keeps state between calls (rule 8) shows in its weights. Nothing checks rules 3, 4, 5 and 6: a face is read against them. (A constructor that reads cannot be caught by building a cursor past the matrix: the compiler moves the read to where the cursor is used, which for such a row is nowhere.)
+Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). It also calls `params` and `fetch` twice on one cursor, another group and run first (where the row has more than one: K above `GROUP` and above 8), and keeps the second answers, so a member that keeps state between calls (rule 8) shows in its weights. Nothing checks rules 3, 4, 5 and 6: a face is read against them. (A constructor that reads cannot be caught by building a cursor past the matrix: the compiler moves the read to where the cursor is used, which for such a row is nowhere.)
 
 The compiler checks the members a kernel uses when it is compiled, the face's revision first. A face that lacks one, or has it with another signature, fails with the rule, cited in `<omlx skeletons, docs/quant-formats.md>`. The compiler reports the first rule a face breaks, in the order below, and no error after it: fix that one, and the next is reported. A face of another revision is told that and nothing else, as a dot face is (see [Versions](#versions)).
 
@@ -455,7 +455,7 @@ struct Tile {
   struct Runs {
     static constant constexpr int RUN = 8;
     static constant constexpr int GROUP = 32;
-    static constant constexpr int GROUPS = (K + GROUP - 1) / GROUP;
+    static constant constexpr int GROUPS = (K - 1) / GROUP + 1;
     struct P {
       float s;  // the group's scale times the row's
     };
@@ -760,7 +760,7 @@ An affine checkpoint's linears stay MLX's layers (`nn.QuantizedLinear`, `Quantiz
 | Traversal | MLX's `qmv_fast` when K is a multiple of its block (512 at 2 to 5 bits, 256 at 6 and 8) and, for stacked expert weights, N is a multiple of 8. MLX's `qmv` otherwise. |
 | Face key | `affine_b{bits}g{group_size}f` (`qmv_fast`) or `affine_b{bits}g{group_size}s` |
 
-Any other affine layer has no face and runs MLX's ops:
+Any other affine layer has no dot face and runs MLX's ops:
 
 - another bit width or group size, fp32 scales, biases of another dtype than the scales, no scales or no biases, a K that is not whole groups, weights that are neither 2-D nor 3-D or that are not the N by K asked for,
 - a matrix of fewer than 8 groups, counted in one expert for stacked weights (MLX binds an input of fewer than 8 elements as constants, not as a buffer),
@@ -772,7 +772,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 
 | | Covered |
 |---|---|
-| Bits | 4, 8: a run of 8 codes is one 32-bit word, or two. 2- and 3-bit runs are 2 and 3 bytes, which the face's `fetch` does not read: its source asserts the width. |
+| Bits | 4, 8: a run of 8 codes is one 32-bit word, or two. 2- and 3-bit runs are 2 and 3 bytes, which the face's `fetch` does not read: `affine.tile_face` refuses them. |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
 | Weights | 32-bit words, a matrix or a stack of them, K whole groups (its `Runs<K>` asserts it), scales of 8 elements or more |

@@ -39,7 +39,7 @@ struct Tile {
   struct Runs {
     static constant constexpr int RUN = 8;
     static constant constexpr int GROUP = 32;
-    static constant constexpr int GROUPS = (K + GROUP - 1) / GROUP;
+    static constant constexpr int GROUPS = (K - 1) / GROUP + 1;
     struct P {
       float s;  // the group's scale times the row's
     };
@@ -231,7 +231,7 @@ def test_a_matrix_is_read_through_a_dot_or_a_tile():
 
 
 # The sha256 of the header and the declarations of a kernel of one affine dot
-# face, as oMLX's dot kernels have them at 5054fde: a dot kernel's source is
+# face, as oMLX's dot kernels have them at 059e4a8: a dot kernel's source is
 # the parent's to the byte, so that every kernel a checkpoint runs is too.
 _DOT_KERNEL = "8247e35050747bd5c6b15961714316d1a1eb7aa8c2bf40fbea127643fe7079aa"
 
@@ -297,6 +297,10 @@ _BREAKS = {
         "tile face: the face needs a static constant constexpr int CONTRACT: the "
         "revision of the contract it is written for",
     ),
+    "contract_a_float": (
+        ("int CONTRACT = 1;", "float CONTRACT = 1.0f;"),
+        "tile face: the face needs a static constant constexpr int CONTRACT",
+    ),
     "runs_misnamed": (
         [
             ("  struct Runs {", "  struct Cursor {"),
@@ -310,6 +314,10 @@ _BREAKS = {
         "tile face: Runs<K>::RUN must be 8: every tile kernel reads runs of 8 codes",
     ),
     "run_misnamed": (("int RUN = 8;", "int RUNS = 8;"), "Runs<K>::RUN must be 8"),
+    "run_not_static": (
+        ("    static constant constexpr int RUN = 8;", "    int RUN = 8;"),
+        "Runs<K>::RUN must be 8",
+    ),
     "group_of_12": (
         ("GROUP = 32;", "GROUP = 12;"),
         "tile face: Runs<K>::GROUP must be 8 times a power of two (8, 16, 32, ..., "
@@ -321,10 +329,14 @@ _BREAKS = {
         ("int GROUP = 32;", "size_t GROUP = size_t(1) << 32;"),
         "Runs<K>::GROUP must be 8 times",
     ),
+    "group_a_float": (
+        ("int GROUP = 32;", "float GROUP = 32.0f;"),
+        "Runs<K>::GROUP must be 8 times",
+    ),
     "group_misnamed": (
         [
             ("int GROUP = 32;", "int GROUPED = 32;"),
-            ("(K + GROUP - 1) / GROUP;", "(K + GROUPED - 1) / GROUPED;"),
+            ("(K - 1) / GROUP + 1;", "(K - 1) / GROUPED + 1;"),
         ],
         "Runs<K>::GROUP must be 8 times",
     ),
@@ -418,6 +430,10 @@ _BREAKS = {
             "static float weight(thread const P& p, Codes q, int i) {",
             "float weight(thread const P& p, Codes q, int i) const {",
         ),
+        "Runs<K> needs a static member weight(P, Codes, int i)",
+    ),
+    "weight_of_a_moved_run": (
+        ("Codes q, int i) {", "thread Codes&& q, int i) {"),
         "Runs<K> needs a static member weight(P, Codes, int i)",
     ),
     "weight_of_another_type": (
@@ -595,9 +611,12 @@ def test_the_page_lists_every_sentence_of_the_tile_skeleton():
 def test_tile_rows_refuses_what_it_cannot_read():
     operands = _toy_operands()
     face = _toy("refusals")
-    for k in (0, 12, -8):
+    for k in (0, 12, -8, 8.0, True, 1 << 31):
         with pytest.raises(ValueError, match=f"k={k} is not one run or more of 8"):
             testing.tile_rows(face, operands, k, range(8), mx.float32)
+    for dtype in (mx.int32, mx.bool_, mx.float64, "bfloat16"):
+        with pytest.raises(ValueError, match="is not a float type of the GPU"):
+            testing.tile_rows(face, operands, 64, range(8), dtype)
     for rows in ([], [-1], [0.0], ["0"], [True], [0, False]):
         with pytest.raises(ValueError, match="are not one row index or more"):
             testing.tile_rows(face, operands, 64, rows, mx.float32)
@@ -900,29 +919,16 @@ def test_no_affine_tile_face_for_float32_scales():
         affine.tile_face(4, 64, mx.float32)
 
 
-@metal
-@pytest.mark.parametrize("bits", [2, 3])
-def test_the_affine_tile_source_reads_runs_of_4_and_8_bits_only(bits):
-    face = formats.Tile(
-        key=f"affine_tile_b{bits}",
-        source=affine._tile_source(bits, 64),
-        type=f"omlx_affine_tile_b{bits}g64::Tile<bfloat16_t>",
-        tensors=("scales", "biases"),
-    )
-    layer = _layer(256, 16, 4, 64)
-    with pytest.raises(RuntimeError) as failure:
-        mx.eval(
-            testing.tile_rows(
-                face, [layer.weight, layer.scales, layer.biases], 256, [0], mx.bfloat16
-            )
-        )
-    message = str(failure.value)
-    assert (
-        "affine tile face: runs of 4 and 8 bits only; 2- and 3-bit runs need a "
-        "fetch of their own"
-    ) in message
-    assert f"<quant format affine_tile_b{bits}>:" in message
-    assert message.count("error:") == 1
+# Each width's source holds its own run's type and code alone (what is not
+# used is not hashed at every launch).
+@pytest.mark.parametrize(
+    "bits, kept, left",
+    [(4, "uint code_at(uint q", ("uint2", "0xFFu")), (8, "packed_uint2", ("0xFu;",))],
+)
+def test_each_affine_tile_width_has_its_runs_alone(bits, kept, left):
+    source = affine.tile_face(bits, 64, mx.bfloat16).source
+    assert kept in source and source.count("code_at(") == 2
+    assert not any(text in source for text in left)
 
 
 @metal

@@ -176,9 +176,11 @@ METAL_FUNC void qmv_rows(
 # compiler's on the line that would use it: CONTRACT, Runs<K>, RUN, GROUP, P
 # and Codes, the cursor's constructor, params, fetch and weight. The rules
 # that need a member come after the rule that names it. The members are
-# asked of a `thread const` cursor with int arguments, as a kernel calls
-# them. omlx_tile_face's FACE is a template parameter so that a failed
-# assert prints both numbers.
+# asked of a `thread const` cursor with int arguments, and weight of a
+# group's and a run's `thread const` lvalues, as a kernel calls them; the
+# constants as int template arguments, so that one that is not static, or
+# not an integer, is its rule's error too. omlx_tile_face's FACE is a
+# template parameter so that a failed assert prints both numbers.
 _TILE_FACE = r"""
 template <typename...>
 using omlx_void = void;
@@ -189,7 +191,7 @@ struct omlx_tile_contract {
   static constant constexpr int value = 0;
 };
 template <typename F>
-struct omlx_tile_contract<F, omlx_void<decltype(F::CONTRACT)>> {
+struct omlx_tile_contract<F, omlx_void<omlx_ints<F::CONTRACT>>> {
   static constant constexpr bool found = true;
   static constant constexpr int value = F::CONTRACT;
 };
@@ -211,7 +213,7 @@ struct omlx_tile_run {
   static constant constexpr bool value = false;
 };
 template <typename R>
-struct omlx_tile_run<R, omlx_void<decltype(R::RUN)>> {
+struct omlx_tile_run<R, omlx_void<omlx_ints<R::RUN>>> {
   static constant constexpr bool value = R::RUN == 8;
 };
 
@@ -220,7 +222,7 @@ struct omlx_tile_group {
   static constant constexpr bool value = false;
 };
 template <typename R>
-struct omlx_tile_group<R, omlx_void<decltype(R::GROUP)>> {
+struct omlx_tile_group<R, omlx_void<omlx_ints<R::GROUP>>> {
   static constant constexpr bool value = R::GROUP >= 8 &&
       R::GROUP <= (1 << 30) && (R::GROUP & (R::GROUP - 1)) == 0;
 };
@@ -286,12 +288,12 @@ struct omlx_tile_weight<
     R,
     omlx_void<decltype(R::weight(
         metal::declval<thread const typename R::P&>(),
-        metal::declval<typename R::Codes>(),
+        metal::declval<thread const typename R::Codes&>(),
         metal::declval<int>()))>> {
   static constant constexpr bool value = metal::is_same_v<
       decltype(R::weight(
           metal::declval<thread const typename R::P&>(),
-          metal::declval<typename R::Codes>(),
+          metal::declval<thread const typename R::Codes&>(),
           metal::declval<int>())),
       float>;
 };
@@ -660,7 +662,6 @@ class Matrices:
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
         faces = self._faces.values()
-        revisions = _INDEX_PACKS.count("\n") + 1
         # The row skeleton opens with a line break, as the tile skeleton's
         # #line does; with neither, the macros' end is put on a line of its
         # own.
@@ -671,13 +672,13 @@ class Matrices:
                 _SKELETONS,
                 _revisions()
                 + (_QMV_ROWS if any(isinstance(f, Dot) for f in faces) else ""),
-                line=revisions,
+                line=_REVISIONS_LINE,
             )
             + (
                 _named(
                     _SKELETONS,
                     _TILE_FACE,
-                    line=revisions + (_revisions() + _QMV_ROWS).count("\n"),
+                    line=_TILE_LINE,
                 )
                 if any(isinstance(f, Tile) for f in faces)
                 else "" if faces else "\n"
@@ -708,6 +709,12 @@ def _revisions() -> str:
         f"#define OMLX_OLDEST_CONTRACT {formats.OLDEST_CONTRACT}"
     )
 
+
+# Where the skeletons start in the text the compiler cites: the revisions
+# after the index packs, the tile skeleton after the row skeleton. The
+# revisions are two lines whatever their numbers.
+_REVISIONS_LINE = _INDEX_PACKS.count("\n") + 1
+_TILE_LINE = _REVISIONS_LINE + 1 + _QMV_ROWS.count("\n")
 
 # The skeletons' asserts hold the numbers by now. What follows (a face's
 # type, a kernel's header and body) does not read the macros.

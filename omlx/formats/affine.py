@@ -327,22 +327,17 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
 
 _TILE_BITS = (4, 8)
 
-# A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8. The
-# code at position i comes from an overload on the run's type: BITS is not a
-# template parameter of Tile, so an `if constexpr` on it would not discard
-# the branch of the other width, which does not compile for this one. K is
-# asserted whole groups in the constructor, not in the class: a failed assert
-# there would leave Runs<K> without members for the skeleton's checks, each
-# then an error of its own.
+# A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8, read
+# where they lie (an 8-bit run is two words, which a weight's slice aligns to
+# 4 bytes, not 8: a packed_uint2). Each width's source has its run's type and
+# the code at position i alone. K is asserted whole groups in the
+# constructor, not in the class: a failed assert there would leave Runs<K>
+# without members for the skeleton's checks, each then an error of its own.
 _TILE = r"""
 using namespace metal;
 
 constant constexpr int BITS = __BITS__;
 constant constexpr int GS = __GS__;
-static_assert(
-    BITS == 4 || BITS == 8,
-    "affine tile face: runs of 4 and 8 bits only; 2- and 3-bit runs need a "
-    "fetch of their own");
 
 template <typename S>
 struct Tile {
@@ -361,14 +356,12 @@ struct Tile {
       float s;
       float b;
     };
-    using Codes = metal::conditional_t<BITS == 8, uint2, uint>;
-
-    const device Codes* c;
+__RUNS__
     const device S* s;
     const device S* b;
 
     Runs(Tile m, size_t row)
-        : c((const device Codes*)(m.codes + row * ROW_BYTES)),
+        : c((const device Stored*)(m.codes + row * ROW_BYTES)),
           s(m.scales + row * ROW_GROUPS),
           b(m.biases + row * ROW_GROUPS) {
       static_assert(
@@ -381,13 +374,7 @@ struct Tile {
       return {float(s[g]), float(b[g])};
     }
     Codes fetch(int run) const {
-      return c[run];
-    }
-    static uint code_at(uint q, int i) {
-      return (q >> (BITS * i)) & ((1u << BITS) - 1u);
-    }
-    static uint code_at(uint2 q, int i) {
-      return ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
+      return Codes(c[run]);
     }
     static float weight(thread const P& p, Codes q, int i) {
       return p.s * float(code_at(q, i)) + p.b;
@@ -396,16 +383,36 @@ struct Tile {
 };
 """
 
+# A run's type as a kernel holds it, as it is stored, and its code i, by width.
+_RUNS = {
+    4: r"""    using Codes = uint;
+    using Stored = uint;
+    const device Stored* c;
+    static uint code_at(uint q, int i) {
+      return (q >> (4 * i)) & 0xFu;
+    }""",
+    8: r"""    using Codes = uint2;
+    using Stored = packed_uint2;
+    const device Stored* c;
+    static uint code_at(uint2 q, int i) {
+      return ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
+    }""",
+}
+
 # Metal's names of the scales' types.
 _METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "float16_t"}
 
 
 def _tile_source(bits: int, group_size: int) -> str:
-    """The Metal of the affine tile face of ``bits``-bit codes in groups of
-    ``group_size``: ``omlx_affine_tile_b{bits}g{group_size}::Tile<S>``, S the
-    scales' type. One source serves both types of scales."""
+    """The Metal of the affine tile face of ``bits``-bit codes (4 or 8) in
+    groups of ``group_size``: ``omlx_affine_tile_b{bits}g{group_size}::Tile<S>``,
+    S the scales' type. One source serves both types of scales."""
     namespace = f"omlx_affine_tile_b{bits}g{group_size}"
-    tile = _TILE.replace("__BITS__", str(bits)).replace("__GS__", str(group_size))
+    tile = (
+        _TILE.replace("__BITS__", str(bits))
+        .replace("__GS__", str(group_size))
+        .replace("__RUNS__", _RUNS[bits])
+    )
     return f"namespace {namespace} {{\n{tile}\n}}  // namespace {namespace}\n"
 
 

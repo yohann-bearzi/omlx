@@ -533,8 +533,9 @@ struct TileLoader {
 };
 
 // The loader of a gather's thread over the weight rows from w_row (paired:
-// through pair_row): the packed words w through dequantizer q (FP4), q
-// advanced to row w_row. A tile face's matrix has a factory of its own
+// through pair_row): the packed words w through dequantizer q (FP4, and
+// affine's epilogues until they read the tile face), q advanced to row
+// w_row. A tile face's matrix has a factory of its own
 // (_FACE_HEADER), which the gathers find by the type of their q.
 template <typename G, bool PAIR, typename Q>
 METAL_FUNC TileLoader<Q, G, PAIR> make_loader(
@@ -1226,6 +1227,10 @@ METAL_FUNC void gather_face(
     const uint sgid,
     const uint lane) {
   if constexpr (omlx_tile_face<F, K>::value) {
+    static_assert(K % kSK == 0, "NAX gather: K is whole 32-deep sub-steps");
+    static_assert(
+        SCHED != 1 || (ALIGN_N && K % G::kBK == 0),
+        "NAX gather: the double-buffer schedule takes whole tiles of N and K");
     using Q = FaceQ<T, F, K>;
     Q q{m};
     if constexpr (SCHED == 1) {
@@ -1444,7 +1449,8 @@ _kernels: dict[object, object] = {}
 _header_failed = False
 _act_header_failed = False
 # Self-test verdict per kernel instantiation:
-# (dtype, mode, bits, group_size, plan, align_n, align_k) -> bool, and for
+# (dtype, mode, bits, group_size, plan, align_n, align_k or, for the plain
+# affine kernel, the call's K) -> bool, and for
 # the activation epilogue the same key + (epi, limit).
 _verified: dict[tuple, bool] = {}
 
@@ -1555,7 +1561,7 @@ def _face_kernel(face: Tile):
         return kernel
     with _lock:
         kernel = _kernels.get(face)
-        if kernel is not None:
+        if kernel is not None or _header_failed:
             return kernel
         mlx_src = _read_mlx_headers(_MLX_MM_HEADERS)
         if mlx_src is None:
@@ -1885,7 +1891,8 @@ def _self_test(key: tuple) -> Optional[bool]:
     """
     dtype, mode, bits, group_size, plan, align_n, align_k = key
     N = 128 if align_n else 96
-    K = _canary_k(plan, align_k)
+    # A K in the key (an int, not a bool) is the call's: the canary's too.
+    K = align_k if type(align_k) is int else _canary_k(plan, align_k)
     try:
         wq, scales, biases, wd, x, idx = _canary_problem(
             dtype, mode, bits, group_size, N, K
@@ -1937,6 +1944,8 @@ def _self_test(key: tuple) -> Optional[bool]:
 
 def _describe(key: tuple) -> str:
     dtype, mode, bits, group_size, plan, align_n, align_k = key[:7]
+    if type(align_k) is int:
+        align_k = align_k % plan.bk == 0
     epi = ""
     if len(key) > 7:
         limit = key[8]
@@ -2150,7 +2159,10 @@ def sorted_gather_qmm(
         # db runs aligned 64-deep K steps only.
         plan = plan._replace(sched=_SCHED_SEG)
     if verify:
-        key = (x.dtype, mode, bits, group_size, plan, N % _BN == 0, K % plan.bk == 0)
+        # The affine kernel compiles K in: its canary is the call's K, so the
+        # kernel a call launches is the one proven. FP4's takes K as a value.
+        k_key = K if mode == "affine" else K % plan.bk == 0
+        key = (x.dtype, mode, bits, group_size, plan, N % _BN == 0, k_key)
         if not _checked(key, _self_test):
             return None
     return _launch(x, w, scales, biases, indices, group_size, bits, mode, plan, stream)

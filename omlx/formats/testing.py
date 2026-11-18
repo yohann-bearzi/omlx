@@ -123,15 +123,15 @@ _TILE_ROWS = r"""
 # group's parameters, then the weight, stored as a float32 and rounded once
 # to T. Its position in the run is not known when the kernel is compiled.
 # As a kernel does, it calls params and fetch more than once on one cursor,
-# into arrays of P and Codes, another group and run first, and keeps the
-# second answers.
+# into arrays of P and Codes, another group and run first (where the row has
+# more than one), and keeps the second answers.
 _TILE_ROWS_HEADER = r"""
 template <typename T, int K, typename F>
 METAL_FUNC void omlx_tile_rows(
     F m, size_t row, int w, device float* w32, device T* wt) {
   if constexpr (omlx_tile_face<F, K>::value) {
     using R = typename F::template Runs<K>;
-    constexpr int GROUPS = (K + R::GROUP - 1) / R::GROUP;
+    constexpr int GROUPS = (K - 1) / R::GROUP + 1;
     const R runs(m, row);
     typename R::P p[2];
     typename R::Codes c[2];
@@ -169,9 +169,10 @@ def tile_rows(
     ``operands`` are the matrix's weight and the face's tensors, in order.
     ``rows`` are the rows' indices (in a stack, the row ``n`` of matrix
     ``e`` is ``e * N + n``), none past the matrix's (which is not checked).
-    K is a whole number of runs of 8. Returns the weights twice, each array
-    of shape ``(len(rows), k)``: as ``weight`` gives them, in float32, and
-    rounded once to ``dtype``, a dtype the face is exact for, as a kernel
+    K is an int, a whole number of runs of 8 below 2^31. Returns the weights
+    twice, each array of shape ``(len(rows), k)``: as ``weight`` gives them,
+    in float32, and rounded once to ``dtype`` (float32, float16 or bfloat16,
+    and one the face is exact for), as a kernel
     stores them for activations of that dtype. Each operand has 8 elements
     or more. Anything else is refused with a ``ValueError``. The kernel is
     compiled for ``face``, ``dtype`` and K; the rows are values it is
@@ -179,7 +180,7 @@ def tile_rows(
     """
     if not isinstance(face, Tile):
         raise ValueError(f"{face!r} is not a Tile")
-    if k <= 0 or k % 8:
+    if not (isinstance(k, int) and 0 < k < 1 << 31 and k % 8 == 0):
         raise ValueError(f"k={k} is not one run or more of 8 inputs")
     rows = list(rows)
     if not rows or not all(
@@ -191,6 +192,8 @@ def tile_rows(
         raise ValueError(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
         )
+    if dtype not in (mx.float32, mx.float16, mx.bfloat16):
+        raise ValueError(f"dtype={dtype} is not a float type of the GPU")
     if not face.exact_for(dtype):
         exact = ", ".join(str(exact) for exact in face.dtypes)
         raise ValueError(f"face {face.key} is exact for {exact}, not {dtype}")

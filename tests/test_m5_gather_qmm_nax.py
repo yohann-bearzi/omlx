@@ -287,6 +287,45 @@ def test_a_tile_face_that_breaks_a_rule_fails_the_gather_with_that_rule():
     assert message.count("error:") == 1
 
 
+@needs_nax
+@pytest.mark.parametrize(
+    "K, plan, rule",
+    [
+        (40, P(SEG, 64, 64, 0, 0), "NAX gather: K is whole 32-deep sub-steps"),
+        (96, P(DB, 64, 64, 0, 0), "NAX gather: the double-buffer schedule takes"),
+    ],
+)
+def test_a_face_gather_refuses_the_ks_its_schedule_cannot_run(K, plan, rule):
+    operands, _ = _toy_stack(len(_COUNTS), 128, K, mx.bfloat16, seed=5)
+    x, idx = _rows(_COUNTS, K, mx.bfloat16)
+    kernel = nax._face_kernel(_toy(f"nax_k{K}"))
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(nax._launch_face(kernel, x, operands, idx, plan, None))
+    assert rule in str(failure.value)
+
+
+@needs_nax
+def test_the_affine_self_test_proves_the_call_s_k(monkeypatch):
+    monkeypatch.setattr(nax, "_verified", {})
+    keys = []
+    self_test = nax._self_test
+    monkeypatch.setattr(
+        nax, "_self_test", lambda key: keys.append(key) or self_test(key)
+    )
+    canaries = []
+    problem = nax._canary_problem
+    monkeypatch.setattr(
+        nax, "_canary_problem", lambda *a: canaries.append(a[5]) or problem(*a)
+    )
+    E, N, K = len(_COUNTS), 128, 640
+    wq, scales, biases, _ = _quantized(E, N, K, "affine", 4, 64, mx.bfloat16)
+    x, idx = _rows(_COUNTS, K, mx.bfloat16)
+    out = _nax(x, wq, scales, biases, idx, "affine", 4, 64)
+    ((*_, k_key),) = keys
+    assert type(k_key) is int and k_key == K and canaries == [K]
+    _assert_bitwise(out, _stock_sorted(x, wq, scales, biases, idx, "affine", 4, 64))
+
+
 def test_one_kernel_per_tile_face(monkeypatch):
     monkeypatch.setattr(nax, "_kernels", {})
     built = []
