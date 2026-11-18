@@ -29,15 +29,19 @@ def test_the_oracle_is_the_live_code_verbatim():
         assert getattr(oracle, name) == getattr(live, name), name
 
 
-# Every width and group size the kernel takes, both dtypes; rows from 7 to
-# 24 (one to three row tiles, padded and whole).
+# Every width and group size the kernel takes, both dtypes; rows from 1 to
+# 24 (one to three row tiles, padded and whole); K whose simdgroup chunks
+# (K / 8 each) end inside a group (256, 768) and on one (1024).
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
-def test_the_tile_kernel_is_the_oracle_s(dtype, bits, group_size):
-    k, n = 1024, 4096
+@pytest.mark.parametrize("k", [1024, 768, 256])
+def test_the_tile_kernel_is_the_oracle_s(dtype, bits, group_size, k):
+    if k % group_size:
+        pytest.skip("MLX quantizes K in whole groups")
+    n = 4096
     w = _linear(n, k, bits, group_size, dtype, seed=bits * group_size)
-    for rows in (7, 8, 13, 16, 24):
+    for rows in (1, 7, 8, 13, 16, 17, 23, 24):
         x = _x(rows, k, dtype, seed=rows)
         kw = dict(bits=bits, group_size=group_size)
         got = live.vk_qmm_mma(x, *w, **kw)

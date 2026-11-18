@@ -154,137 +154,92 @@ def is_row_exact_armed() -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _fma_block(m: int, bits: int) -> str:
-    per = 8 if bits == 4 else 4
-    mask = "0xFu" if bits == 4 else "0xFFu"
-    shift = 4 if bits == 4 else 8
-    lines = [f"for (int ki = 0; ki < {per}; ++ki) {{"]
-    for j in range(4):
-        lines.append(
-            f"    float w{j} = float((p{j} >> (ki * {shift})) & {mask}) * s{j} + b{j};"
-        )
-    for j in range(4):
-        for r in range(m):
-            lines.append(
-                f"    acc[{j} * {m} + {r}] += "
-                f"float(v{r}[ki{'' if bits == 4 else ' + koff'}]) * w{j};"
-            )
-    lines.append("}")
-    return "\n            ".join(lines)
-
-
-def _build_msg_kernel(m: int, bits: int, group_size: int, dtype, nsg: int):
-    import mlx.core as mx
-
-    key = ("msg", m, bits, group_size, dtype, nsg)
-    if key in _KERNEL_CACHE:
-        return _KERNEL_CACHE[key]
-
-    xloads = "\n            ".join(
-        f"Vec8 v{r} = xv[({r} * K + k_base) / 8];" for r in range(m)
-    )
-    if bits == 4:
-        pack_setup = """
-            int k_base = pack * 8;
-            int gi = k_base / GS;
-            uint32_t p0 = w_q[(n0 + 0) * K_by_p + pack];
-            uint32_t p1 = w_q[(n0 + 1) * K_by_p + pack];
-            uint32_t p2 = w_q[(n0 + 2) * K_by_p + pack];
-            uint32_t p3 = w_q[(n0 + 3) * K_by_p + pack];
-        """
-        body = f"""
-        for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-            {pack_setup}
-            {xloads}
-            float s0 = float(scales[(n0 + 0) * K_by_gs + gi]);
-            float s1 = float(scales[(n0 + 1) * K_by_gs + gi]);
-            float s2 = float(scales[(n0 + 2) * K_by_gs + gi]);
-            float s3 = float(scales[(n0 + 3) * K_by_gs + gi]);
-            float b0 = float(biases[(n0 + 0) * K_by_gs + gi]);
-            float b1 = float(biases[(n0 + 1) * K_by_gs + gi]);
-            float b2 = float(biases[(n0 + 2) * K_by_gs + gi]);
-            float b3 = float(biases[(n0 + 3) * K_by_gs + gi]);
-            _Pragma("unroll")
-            {_fma_block(m, 4)}
-        }}
-        """
-    else:
-        body = f"""
-        for (int pair = int(lane); pair < K_by_p; pair += 32) {{
-            int k_base = pair * 8;
-            int gi = k_base / GS;
-            {xloads}
-            _Pragma("unroll")
-            for (int wsel = 0; wsel < 2; ++wsel) {{
-                int koff = wsel * 4;
-                uint32_t p0 = w_q[(n0 + 0) * (K / 4) + pair * 2 + wsel];
-                uint32_t p1 = w_q[(n0 + 1) * (K / 4) + pair * 2 + wsel];
-                uint32_t p2 = w_q[(n0 + 2) * (K / 4) + pair * 2 + wsel];
-                uint32_t p3 = w_q[(n0 + 3) * (K / 4) + pair * 2 + wsel];
-                float s0 = float(scales[(n0 + 0) * K_by_gs + gi]);
-                float s1 = float(scales[(n0 + 1) * K_by_gs + gi]);
-                float s2 = float(scales[(n0 + 2) * K_by_gs + gi]);
-                float s3 = float(scales[(n0 + 3) * K_by_gs + gi]);
-                float b0 = float(biases[(n0 + 0) * K_by_gs + gi]);
-                float b1 = float(biases[(n0 + 1) * K_by_gs + gi]);
-                float b2 = float(biases[(n0 + 2) * K_by_gs + gi]);
-                float b3 = float(biases[(n0 + 3) * K_by_gs + gi]);
-                _Pragma("unroll")
-                {_fma_block(m, 8)}
-            }}
-        }}
-        """
-
-    n_acc = 4 * m
-    source = f"""
-        using namespace metal;
-        constexpr int GS = {group_size};
-        constexpr int NSG = {nsg};
-        constexpr int MROWS = {m};
-
-        uint sg = simdgroup_index_in_threadgroup;
-        uint lane = thread_index_in_simdgroup;
-        uint tg_n = threadgroup_position_in_grid.y;
-
-        int K = int(K_size);
-        int N = int(N_size);
-        int K_by_p = {"K / 8" if bits == 4 else "K / 8"};
-        int K_by_gs = K / GS;
-        int n0 = (int(tg_n) * NSG + int(sg)) * 4;
-        if (n0 + 3 >= N) {{ return; }}
-
-        float acc[{n_acc}];
+# The multi-simdgroup (msg) kernel of huge N (a vocabulary head) over the
+# tile face ``F`` of its matrix ``w`` (docs/quant-formats.md, The tile face):
+# NSG simdgroups a threadgroup, each four rows n0..n0 + 3 of the matrix with
+# the full K walked lane-strided, a run of 8 inputs a lane and step, every
+# input row against each row's weights in the run's order; then simd_sum and
+# one lane a result stores. The rows' cursors are made once; per run each
+# row's group parameters and codes are read once.
+_MSG_SOURCE = """
+    constexpr int NSG = __NSG__;
+    constexpr int MROWS = __M__;
+    using F = __FACE__;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint tg_n = threadgroup_position_in_grid.y;
+    int N = int(N_size);
+    int n0 = (int(tg_n) * NSG + int(sg)) * 4;
+    if (n0 + 3 >= N) { return; }
+    if constexpr (omlx_tile_face<F, K>::value) {
+      using R = typename F::template Runs<K>;
+      const R r0(w, size_t(n0));
+      const R r1(w, size_t(n0 + 1));
+      const R r2(w, size_t(n0 + 2));
+      const R r3(w, size_t(n0 + 3));
+      float acc[4 * MROWS];
+      _Pragma("unroll")
+      for (int i = 0; i < 4 * MROWS; ++i) {
+        acc[i] = 0.0f;
+      }
+      using Vec8 = metal::vec<T, 8>;
+      const device Vec8* xv = (const device Vec8*)x;
+      for (int run = int(lane); run < K / 8; run += 32) {
+        const int gi = run * 8 / R::GROUP;
+__XLOADS__
+        const auto p0 = r0.params(gi);
+        const auto p1 = r1.params(gi);
+        const auto p2 = r2.params(gi);
+        const auto p3 = r3.params(gi);
+        const auto c0 = r0.fetch(run);
+        const auto c1 = r1.fetch(run);
+        const auto c2 = r2.fetch(run);
+        const auto c3 = r3.fetch(run);
         _Pragma("unroll")
-        for (int i = 0; i < {n_acc}; ++i) {{
-            acc[i] = 0.0f;
-        }}
+        for (int ki = 0; ki < 8; ++ki) {
+          float w0 = R::weight(p0, c0, ki);
+          float w1 = R::weight(p1, c1, ki);
+          float w2 = R::weight(p2, c2, ki);
+          float w3 = R::weight(p3, c3, ki);
+__FMAS__
+        }
+      }
+      _Pragma("unroll")
+      for (int i = 0; i < 4 * MROWS; ++i) {
+        acc[i] = metal::simd_sum(acc[i]);
+      }
+      if (lane < 4 * MROWS) {
+        int j = int(lane) / MROWS;
+        int row = int(lane) - j * MROWS;
+        y[row * N + n0 + j] = T(acc[int(lane)]);
+      }
+    }
+"""
 
-        using Vec8 = vec<T, 8>;
-        const device Vec8 *xv = (const device Vec8*)x;
 
-        {body}
+@cache
+def _msg_kernel(m: int, face, nsg: int):
+    """The msg kernel of ``m`` input rows over the tile face ``face``."""
+    from omlx.formats import kernels
 
-        _Pragma("unroll")
-        for (int i = 0; i < {n_acc}; ++i) {{
-            acc[i] = simd_sum(acc[i]);
-        }}
-
-        if (lane < {n_acc}) {{
-            int j = int(lane) / MROWS;
-            int row = int(lane) - j * MROWS;
-            y[row * N + n0 + j] = T(acc[int(lane)]);
-        }}
-    """
-
-    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
-    kernel = mx.fast.metal_kernel(
-        name=f"omlx_vk_m{m}_q{bits}_nsg{nsg}_gs{group_size}_{dtype_tag}",
-        input_names=["x", "w_q", "scales", "biases", "K_size", "N_size"],
-        output_names=["y"],
-        source=source,
+    xloads = "".join(
+        f"        Vec8 v{r} = xv[{r} * (K / 8) + run];\n" for r in range(m)
     )
-    _KERNEL_CACHE[key] = kernel
-    return kernel
+    fmas = "".join(
+        f"          acc[{j} * {m} + {r}] += float(v{r}[ki]) * w{j};\n"
+        for j in range(4)
+        for r in range(m)
+    )
+    source = (
+        _MSG_SOURCE.replace("__NSG__", str(nsg))
+        .replace("__M__", str(m))
+        .replace("__FACE__", face.type)
+        .replace("__XLOADS__\n", xloads)
+        .replace("__FMAS__\n", fmas)
+    )
+    return kernels.face_kernel(
+        f"omlx_vk_m{m}_nsg{nsg}", ("x", "w", "N_size"), {"w": face}, ("y",), "", source
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1071,22 +1026,31 @@ def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
     """Verify-shape qmm: (M, K) x (N, K)^T -> (M, N), M in 2..6.
 
     Rows are padded up to the kernel's M template. split-K for regular
-    shapes, msg tile for huge N (lm_head).
+    shapes, msg tile for huge N (lm_head). Its kernels take 6 rows at most
+    and columns in fours: other shapes are refused. None for a head whose
+    scales no tile face reads.
     """
     import mlx.core as mx
 
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
+    if not 1 <= M <= 6 or N % 4:
+        raise ValueError(f"vk_qmm takes 1 to 6 rows and N in fours, not {M} x {N}")
     m = 4 if M <= 4 else 6
 
     if N >= 100000 and N % (4 * _MSG_NSG) == 0:
+        from omlx.formats import affine
+
+        if scales.dtype not in (mx.bfloat16, mx.float16):
+            return None  # no tile face reads such scales
         xm, M0 = _pad_rows(mx, x2, m)
-        kernel = _build_msg_kernel(m, bits, group_size, x2.dtype, _MSG_NSG)
+        face = affine.tile_face(bits, group_size, scales.dtype)
+        kernel = _msg_kernel(m, face, _MSG_NSG)
         cols = 4 * _MSG_NSG
         (y,) = kernel(
-            inputs=[xm, w_q, scales, biases, K, N],
-            template=[("T", x2.dtype)],
+            inputs=[xm, w_q, scales, biases, N],
+            template=[("T", x2.dtype), ("K", K)],
             grid=(32 * _MSG_NSG, (N + cols - 1) // cols, 1),
             threadgroup=(32 * _MSG_NSG, 1, 1),
             output_shapes=[(m, N)],
