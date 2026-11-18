@@ -265,7 +265,7 @@ class _Checkpoint:
                 self,
             )
         if not self.built and not entries:
-            # A load of no format's layers: a stock checkpoint's.
+            # A load of no format's layers: an MLX checkpoint's.
             return
         models = loaded if isinstance(loaded, tuple) else (loaded,)
         paths: dict[int, list[str]] = {}

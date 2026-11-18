@@ -6902,7 +6902,7 @@ def _row_chunks(t, max_elems):
 # with quant formats end to end (a family enters with the run that verifies
 # it). Every other is refused, under any spelling (lower case, "-" for "_"):
 # the gate fails closed. Families served by mlx-lm's own code alone come back
-# after the proof of concept (DEFERRED.md row 19).
+# after the proof of concept (DEFERRED.md row 22).
 _QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
 # The families tests take as verified (omlx.formats.testing.verified), while
 # one of their blocks is open, in any thread.
@@ -6983,7 +6983,7 @@ def _no_lookups() -> dict:
 
 def _family(name: str) -> str:
     """A model type as the family tables spell it."""
-    return name.lower().replace("-", "_")
+    return name.strip().lower().replace("-", "_")
 
 
 def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
@@ -7009,7 +7009,7 @@ def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
             config.get("model_type"),
             text_config.get("model_type") if isinstance(text_config, dict) else None,
         )
-        if isinstance(name, str)
+        if isinstance(name, str) and name.strip()
     ]
     for family in families:
         if family in _QUANT_FORMAT_MISREAD and family not in verified:
@@ -7397,7 +7397,11 @@ def quantize_oq_streaming(
             "format"
         )
     if quant_fmt is not None:
-        refused = _unverified_family(source, config)
+        # The source and the output by their directories' names, which name
+        # a decision model's family (OpenJev's).
+        refused = _unverified_family(
+            Path(os.path.abspath(source)), config
+        ) or _unverified_family(Path(os.path.abspath(output_path)), config)
         if refused is not None:
             fix = (
                 "name its model type in its config"
@@ -11652,7 +11656,12 @@ def _on_mlx_thread(load):
         return load()
     from .engine_core import get_mlx_executor
 
-    return get_mlx_executor().submit(load).result()
+    try:
+        future = get_mlx_executor().submit(load)
+    except RuntimeError:
+        # Shut down between the two (the pool's shutdown): the next one.
+        future = get_mlx_executor().submit(load)
+    return future.result()
 
 
 def _source_tensors(source: Path) -> list[str]:
@@ -11687,8 +11696,9 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
     has one; yields whether mlx-vlm loads it.
 
     For the walk over the checkpoint a run writes (``walk``, its directory):
-    the library is the one oMLX serves that checkpoint with, the dispatch
-    reads its config, the runtime MTP patch is the model type's, and
+    the library is the calibration's (by the source's config: a text-only
+    run's written one has lost its vision config), the dispatch reads the
+    written config, the runtime MTP patch is the model type's, and
     Qwen4-Exp's tables are resident."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
@@ -11696,7 +11706,10 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
         maybe_apply_pre_load_patches,
     )
 
-    is_vlm = _is_vlm_load(config)
+    source_config = config
+    if walk is not None:
+        source_config = json.loads((Path(model_path) / "config.json").read_text())
+    is_vlm = _is_vlm_load(source_config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
     calibration_settings = _calibration_model_settings(

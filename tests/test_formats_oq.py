@@ -792,15 +792,16 @@ _QUOTED_FAMILIES = {
         ("unlimited_ocr", {"model_type": "unlimited-ocr"}, _NOT_VERIFIED),
         ("unlimited_ocr", {"model_type": "Unlimited_OCR"}, _NOT_VERIFIED),
         ("qwen3_5_text", {"model_type": "qwen3_5_text"}, _NOT_VERIFIED),
-        # Families the static reader of 57e0cbf missed: they are no stock
-        # family, so they are refused.
+        # Families the static reader of 57e0cbf missed: not verified, they
+        # are refused.
         ("minicpmv4_7", {"model_type": "minicpmv4_7"}, _NOT_VERIFIED),
         ("olmoe", {"model_type": "olmoe"}, _NOT_VERIFIED),
         ("qwen3_omni_moe", {"model_type": "qwen3_omni_moe"}, _NOT_VERIFIED),
         ("xlm_roberta", {"model_type": "xlm-roberta"}, _NOT_VERIFIED),
         # One nobody has heard of: the gate fails closed.
         ("brand_new", {"model_type": "brand-new"}, _NOT_VERIFIED),
-        # A stock top level with a text model that is not.
+        # A verified top level (llama, in these tests) with a text model that
+        # is not.
         (
             "gemma4_text",
             {"model_type": "llama", "text_config": {"model_type": "gemma4_text"}},
@@ -808,7 +809,7 @@ _QUOTED_FAMILIES = {
         ),
         (
             "d1",
-            # Its backbone is not stock either; it is refused as its decision
+            # Its backbone is not verified either; it is refused as its decision
             # family.
             {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
             _NOT_VERIFIED,
@@ -854,7 +855,7 @@ _QUOTED_FAMILIES = {
         "qwen3_omni_moe",
         "xlm-roberta",
         "unknown",
-        "text model not stock",
+        "text model not verified",
         "decision model",
         "decision family",
         "inkling2",
@@ -864,9 +865,7 @@ _QUOTED_FAMILIES = {
         "decision model spelled otherwise",
     ],
 )
-def test_a_family_neither_stock_nor_verified_is_refused(
-    toy, tmp_path, family, config, why
-):
+def test_a_family_not_verified_is_refused(toy, tmp_path, family, config, why):
     source = tmp_path / "source"
     source.mkdir()
     if family == "clef":
@@ -896,6 +895,45 @@ def test_a_family_neither_stock_nor_verified_is_refused(
     assert not output.exists() and toy.offered == []
 
 
+def test_no_family_is_verified_but_by_a_test(tmp_path, monkeypatch):
+    # Outside every block (this file's tests take llama as verified).
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
+    for model_type in ("llama", " Llama ", "qwen2"):
+        refused = oq._unverified_family(tmp_path, {"model_type": model_type})
+        assert refused == (oq._family(model_type), _NOT_VERIFIED)
+    # Spaces and a blank text model type: the family the audits read.
+    blank = {"model_type": " raon1_mini ", "text_config": {"model_type": " "}}
+    assert oq._unverified_family(tmp_path, blank)[0] == "raon1_mini"
+    with testing.verified("raon1_mini"):
+        assert oq._unverified_family(tmp_path, blank) is None
+
+
+def test_a_decision_family_is_read_from_any_path_and_the_output(
+    toy, tmp_path, monkeypatch
+):
+    openjev = tmp_path / "openjev-1"
+    openjev.mkdir()
+    (openjev / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+
+    def quantize(model_path, output):
+        oq.quantize_oq_streaming(
+            model_path, output, 4, enhanced=True, quant_format="toy"
+        )
+
+    with testing.verified("qwen3_5"):
+        # The source named ".", a relative path inside OpenJev's directory.
+        monkeypatch.chdir(openjev)
+        with pytest.raises(formats.FormatRefusedError, match="no openjev"):
+            quantize(".", str(tmp_path / "out"))
+        # An output named as OpenJev's is served as it.
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(formats.FormatRefusedError, match="no openjev"):
+            quantize(str(source), str(tmp_path / "openjev-oq4"))
+
+
 @pytest.mark.parametrize("mode", ["affine", "mxfp4"])
 def test_one_of_mlx_s_modes_is_written_without_a_quant_format(tmp_path, mode):
     source = tmp_path / "source"
@@ -910,7 +948,7 @@ def test_one_of_mlx_s_modes_is_written_without_a_quant_format(tmp_path, mode):
 def test_the_families_oq_writes_in_a_format(tmp_path):
     # Verified ones only, and none is yet: Qwen3.8 Flash-Next enters with the
     # run that verifies it. Families mlx-lm's own code serves come back after
-    # the proof of concept (DEFERRED.md row 19).
+    # the proof of concept (DEFERRED.md row 22).
     assert not _VERIFIED and not hasattr(oq, "_QUANT_FORMAT_STOCK")
     source = tmp_path / "source"
     source.mkdir()
@@ -1378,6 +1416,16 @@ def test_the_walk_builds_the_model_with_the_library_of_the_calibration(
     assert index == {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
 
 
+def test_a_text_only_walk_builds_with_the_source_s_library(tmp_path, monkeypatch):
+    calls, _ = _stub_loaders(monkeypatch)
+    source = _checkpoint(
+        tmp_path / "source", {"model_type": "qwen3_vl", "vision_config": {"depth": 1}}
+    )
+    # A text-only run writes no vision config.
+    oq._module_classes(str(source), {"model_type": "qwen3_vl"})
+    assert calls[-1][0] == "mlx-vlm"
+
+
 def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
     tmp_path, monkeypatch
 ):
@@ -1430,6 +1478,49 @@ def test_one_mlx_executor_whoever_asks_first(monkeypatch):
     for executor in made:
         executor.shutdown()
     assert len(made) == 1 and got == made * 2
+
+
+def test_a_walk_after_the_executor_is_shut_down_runs_on_the_next(monkeypatch):
+    import concurrent.futures
+
+    from omlx import engine_core
+
+    gone = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    gone.shutdown()
+    live = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="mlx-global"
+    )
+    executors = iter((gone, live))
+    monkeypatch.setattr(engine_core, "get_mlx_executor", lambda: next(executors))
+    try:
+        assert oq._on_mlx_thread(lambda: 7) == 7
+    finally:
+        live.shutdown()
+
+
+def test_the_executor_is_read_under_its_lock(monkeypatch):
+    import threading as threads
+
+    from omlx import engine_core
+
+    class Shut:
+        """The lock, with a shutdown taking the executor as it is let go."""
+
+        def __init__(self):
+            self.lock = threads.Lock()
+
+        def __enter__(self):
+            self.lock.acquire()
+
+        def __exit__(self, *raised):
+            self.lock.release()
+            engine_core._global_mlx_executor = None
+
+    monkeypatch.setattr(engine_core, "_global_mlx_executor", None)
+    monkeypatch.setattr(engine_core, "_GLOBAL_MLX_EXECUTOR_LOCK", Shut())
+    executor = engine_core.get_mlx_executor()
+    assert executor is not None
+    executor.shutdown()
 
 
 def test_the_calibration_patches_the_mtp_runtime_as_upstream_does(

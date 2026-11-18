@@ -134,7 +134,8 @@ def _wrapped(loader) -> bool:
 
 
 def _typed(written):
-    """A config of a stock family (llama) that records ``written``."""
+    """A config of the tests' verified family (llama) that records
+    ``written``."""
     return {"model_type": "llama", "omlx_quant_formats": written}
 
 

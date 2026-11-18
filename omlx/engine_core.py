@@ -283,7 +283,8 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
                 max_workers=1,
                 thread_name_prefix="mlx-global",
             )
-    return _global_mlx_executor
+        # Read under the lock: a shutdown meanwhile leaves this one to it.
+        return _global_mlx_executor
 
 
 def shutdown_mlx_executor() -> None:
