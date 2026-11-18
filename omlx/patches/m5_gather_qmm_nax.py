@@ -42,10 +42,11 @@ package's ``include`` directory):
 mean rows per expert and K (measured on M5 Ultra at the Qwen3.8, GLM-5.3
 and MiMo-V2.6 expert shapes).
 
-The plain affine kernel reads its weights through the affine tile face
-(``omlx.formats.affine``; docs/quant-formats.md, The tile face): one kernel
-per face, the face's runs of 8 codes decoded by ``FaceLoader``. FP4 weights,
-and the activation epilogues for now, keep their own dequantizers.
+The affine kernels, plain and with the activation epilogue, read their
+weights through the affine tile face (``omlx.formats.affine``;
+docs/quant-formats.md, The tile face): one kernel per face and kind, the
+face's runs of 8 codes decoded by ``FaceLoader``. FP4 weights keep their own
+dequantizer.
 
 Every configuration dequantizes exactly like mlx (fp32 ``scale * q +
 bias`` rounded once to the activation dtype for affine; ``bfloat(scale) *
@@ -332,33 +333,6 @@ struct Geo {
   static_assert(kTPR >= 1 && kTPR * kVPT == BK, "loader split");
 };
 
-// Affine: w = scale * q + bias computed in fp32 and rounded once to T, as
-// mlx's dequantize() does (scale * q is exact in fp32).
-template <typename T, int GS, int BITS>
-struct AffineQ {
-  using WT = T;
-  STEEL_CONST int kBits = BITS;
-  STEEL_CONST int kGroup = GS;
-  const device T* scales;
-  const device T* biases;
-
-  struct P {
-    float s;
-    float b;
-  };
-
-  METAL_FUNC void advance(const size_t n) thread {
-    scales += n;
-    biases += n;
-  }
-  METAL_FUNC P params(const int g) const thread {
-    return P{float(scales[g]), float(biases[g])};
-  }
-  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
-    return static_cast<WT>(p.s * float(q) + p.b);
-  }
-};
-
 // FP4: e2m1 values times the group scale, dequantized to bfloat like
 // mlx's fp QuantizedBlockLoader (Wtype = bfloat).
 // GS 32 is MXFP4 (e8m0 scales), GS 16 is NVFP4 (e4m3 scales).
@@ -533,9 +507,8 @@ struct TileLoader {
 };
 
 // The loader of a gather's thread over the weight rows from w_row (paired:
-// through pair_row): the packed words w through dequantizer q (FP4, and
-// affine's epilogues until they read the tile face), q advanced to row
-// w_row. A tile face's matrix has a factory of its own
+// through pair_row): the packed words w through dequantizer q (FP4), q
+// advanced to row w_row. A tile face's matrix has a factory of its own
 // (_FACE_HEADER), which the gathers find by the type of their q.
 template <typename G, bool PAIR, typename Q>
 METAL_FUNC TileLoader<Q, G, PAIR> make_loader(
@@ -868,9 +841,11 @@ METAL_FUNC void gather_seg(
 }
 
 // db: the same tiles and arithmetic with double-buffered 64-deep weight
-// tiles: the packed words of step k + 1 are fetched before the tensor ops
-// of step k and dequantized into the other buffer after them, so each K
-// step has a single barrier. Activation fragments are read straight from
+// tiles. Each step fetches the next tile before its tensor ops. The last
+// barrier freed the other bank: a mapped tile face can dequantize there
+// immediately, so its codes and group parameters need not span the tensor
+// ops. Other loaders fill that bank after the tensor ops. Each K step
+// still has a single barrier. Activation fragments are read straight from
 // device memory (rows past the tile are clamped to its last row and never
 // stored) and 16-row fragments without rows of the tile are skipped.
 // Requires K % 64 == 0 and N % 64 == 0. EPI > 0: the activation epilogue
@@ -881,7 +856,8 @@ template <
     typename G,
     int EPI = 0,
     bool MAP = false,
-    bool SPLIT = false>
+    bool SPLIT = false,
+    bool STORE_ON_FETCH = false>
 METAL_FUNC void gather_db(
     const device T* x,
     const device uint32_t* rmap,
@@ -949,8 +925,12 @@ METAL_FUNC void gather_db(
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (int kb = 0; kb < K_it; kb++) {
     const bool more = kb + 1 < K_it;
+    threadgroup WT* next = Ws + ((kb + 1) & 1) * kTile;
     if (more && loads) {
       loader.fetch(kb + 1);
+      if constexpr (STORE_ON_FETCH) {
+        loader.store(next);
+      }
     }
     const threadgroup WT* wb = wsg + (kb & 1) * kTile;
     STEEL_PRAGMA_UNROLL
@@ -990,8 +970,8 @@ METAL_FUNC void gather_db(
         }
       }
     }
-    if (more && loads) {
-      loader.store(Ws + ((kb + 1) & 1) * kTile);
+    if (!STORE_ON_FETCH && more && loads) {
+      loader.store(next);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
@@ -1101,8 +1081,8 @@ struct FaceQ {
 // runs and the parameters of the kNG groups they lie in, then stores each
 // run's 8 weights, rounded to T, as one 8-wide threadgroup write. The K
 // tail's guards are TileLoader's, per run: with K % 32 == 0 they select the
-// same codes.
-template <typename T, typename F, typename G, int K>
+// same codes. PAIR maps tile rows through pair_row(), as TileLoader does.
+template <typename T, typename F, typename G, int K, bool PAIR>
 struct FaceLoader {
   using R = typename F::template Runs<K>;
   using P = typename R::P;
@@ -1115,14 +1095,22 @@ struct FaceLoader {
   STEEL_CONST int kBKP = G::kBK + 16 / sizeof(T);
   static_assert(kRuns * R::RUN == kVPT && kNG * kRPG == kRuns, "group split");
 
-  R runs;
+  const R runs;
   const short row;
   const short col;
   Codes codes[kRuns];
   P p[kNG];
 
-  METAL_FUNC FaceLoader(const F m, const size_t w_row, const uint lid) thread
-      : runs(m, w_row + size_t(lid / G::kTPR)),
+  METAL_FUNC FaceLoader(
+      const F m,
+      const size_t w_row,
+      const uint lid,
+      const int half_n) thread
+      : runs(
+            m,
+            w_row +
+                size_t(PAIR ? pair_row(int(lid / G::kTPR), half_n)
+                            : int(lid / G::kTPR))),
         row(short(lid / G::kTPR)),
         col(short((lid % G::kTPR) * kVPT)) {}
 
@@ -1197,47 +1185,61 @@ struct FaceLoader {
 };
 
 // make_loader for a tile face's matrix: the gathers find it by their q's
-// type (FaceQ), and pass no words (w). Plain tiles only: no gather pairs a
-// face's gate and up rows yet.
+// type (FaceQ), and pass no words (w).
 template <typename G, bool PAIR, typename T, typename F, int K>
-METAL_FUNC FaceLoader<T, F, G, K> make_loader(
+METAL_FUNC FaceLoader<T, F, G, K, PAIR> make_loader(
     const device uint8_t*,
     thread FaceQ<T, F, K>& q,
     const size_t w_row,
     const int,
     const uint lid,
-    const int) {
-  static_assert(!PAIR, "a face's gate/up rows are not paired by this loader");
-  return FaceLoader<T, F, G, K>(q.m, w_row, lid);
+    const int half_n) {
+  return FaceLoader<T, F, G, K, PAIR>(q.m, w_row, lid, half_n);
 }
 
-// The plain gather over tile face m of rows of K inputs, of either
-// schedule: in a template of F, so that a face that breaks a rule of the
-// contract fails with that rule alone (omlx_tile_face).
-template <typename T, typename G, int SCHED, bool ALIGN_N, int K, typename F>
+// The gather over tile face m of rows of K inputs, of either schedule,
+// plain (EPI 0) or with the activation epilogue of fused [gate; up] rows
+// (EPI > 0, rows read through rmap with MAP): in a template of F, so that a
+// face that breaks a rule of the contract fails with that rule alone
+// (omlx_tile_face).
+template <
+    typename T,
+    typename G,
+    int SCHED,
+    bool ALIGN_N,
+    int K,
+    int EPI,
+    bool MAP,
+    typename F>
 METAL_FUNC void gather_face(
     const device T* x,
+    const device uint32_t* rmap,
     const F m,
-    const device uint32_t* tiles,
     const uint4 desc,
     const int y_col,
     device T* y,
     const int N,
     threadgroup T* Ws,
     const uint sgid,
-    const uint lane) {
+    const uint lane,
+    const ActArgs<T> args) {
   if constexpr (omlx_tile_face<F, K>::value) {
-    static_assert(K % kSK == 0, "NAX gather: K is whole 32-deep sub-steps");
+    static_assert(
+        K > 0 && K % kSK == 0, "NAX gather: K is whole 32-deep sub-steps");
     static_assert(
         SCHED != 1 || (ALIGN_N && K % G::kBK == 0),
         "NAX gather: the double-buffer schedule takes whole tiles of N and K");
     using Q = FaceQ<T, F, K>;
     Q q{m};
     if constexpr (SCHED == 1) {
-      gather_db<T, Q, G>(x, tiles, nullptr, q, desc, y_col, y, N, K, Ws, sgid, lane);
+      // With a partial loader group, finish its stores before the mapped
+      // activation MMAs. Full loader groups overlap the fetch with those MMAs.
+      constexpr bool store_on_fetch = MAP && G::kLT != G::kThreads;
+      gather_db<T, Q, G, EPI, MAP, false, store_on_fetch>(
+          x, rmap, nullptr, q, desc, y_col, y, N, K, Ws, sgid, lane, args);
     } else {
-      gather_seg<T, Q, G, ALIGN_N, K % G::kBK == 0>(
-          x, tiles, nullptr, q, desc, y_col, y, N, K, Ws, sgid, lane);
+      gather_seg<T, Q, G, ALIGN_N, K % G::kBK == 0, EPI, MAP>(
+          x, rmap, nullptr, q, desc, y_col, y, N, K, Ws, sgid, lane, args);
     }
   }
 }
@@ -1245,9 +1247,10 @@ METAL_FUNC void gather_face(
 } // namespace omlx_gqmm
 """
 
-# The plain kernel over a tile face: its matrix is ``w``, declared by
-# omlx.formats.kernels.Matrices.declarations ahead of this.
-_FACE_SOURCE = """
+# A kernel over a tile face: its matrix is ``w``, declared by
+# omlx.formats.kernels.Matrices.declarations ahead of this. Plain kernels pass
+# ``tiles`` as the (unread) row map, as the words kernels do.
+_FACE_SOURCE_TMPL = """
     using G = omlx_gqmm::Geo<BM, BK>;
     constexpr int BKP = BK + 16 / sizeof(T);
     threadgroup T Ws[(SCHED == 1 ? 2 : 1) * omlx_gqmm::kBN * BKP +
@@ -1256,13 +1259,41 @@ _FACE_SOURCE = """
     int y_col;
     if (!omlx_gqmm::tile_of<GX>(
             tiles, tile_count[0], threadgroup_position_in_grid, params[0],
-            desc, y_col)) {
+            desc, y_col)) {{
         return;
-    }
-    omlx_gqmm::gather_face<T, G, SCHED, ALIGN_N, K>(
-        x, w, tiles, desc, y_col, y, params[0], Ws,
-        simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+    }}
+    omlx_gqmm::gather_face<T, G, SCHED, {align_n}, K, {epi}, {mapped}>(
+        x, {rmap}, w, desc, y_col, y, params[0], Ws,
+        simdgroup_index_in_threadgroup, thread_index_in_simdgroup,
+        omlx_gqmm::ActArgs<T>{{{args}}});
 """
+
+# The kernels over a face, by kind: the plain matmul, and its activation
+# epilogue on a fused [gate; up] matrix, on the sorted rows or through the
+# row map: (name suffix, source, inputs after params).
+_FACE_KINDS = {
+    "plain": (
+        "",
+        _FACE_SOURCE_TMPL.format(
+            align_n="ALIGN_N", epi="0", mapped="false", rmap="tiles", args=""
+        ),
+        [],
+    ),
+    "act": (
+        "_swiglu",
+        _FACE_SOURCE_TMPL.format(
+            align_n="true", epi="EPI", mapped="false", rmap="tiles", args="lim[0]"
+        ),
+        ["lim"],
+    ),
+    "act_map": (
+        "_swiglu_map",
+        _FACE_SOURCE_TMPL.format(
+            align_n="true", epi="EPI", mapped="true", rmap="rmap", args="lim[0]"
+        ),
+        ["lim", "rmap"],
+    ),
+}
 
 # ---------------------------------------------------------------------------
 # Gate/up activation epilogue
@@ -1398,14 +1429,8 @@ def _act_source(q_type: str, q_init: str, mapped: bool, oai: bool = False) -> st
     )
 
 
-_AFFINE_Q = (
-    "using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
-    "Q q{scales, biases};",
-)
 _FP_Q = ("using Q = omlx_gqmm::Fp4Q<GS>;", "Q q{scales};")
-_AFFINE_ACT_SOURCE = _act_source(*_AFFINE_Q, mapped=False)
 _FP_ACT_SOURCE = _act_source(*_FP_Q, mapped=False)
-_AFFINE_ACT_MAP_SOURCE = _act_source(*_AFFINE_Q, mapped=True)
 _FP_ACT_MAP_SOURCE = _act_source(*_FP_Q, mapped=True)
 _FP_OAI_SOURCE = _act_source(*_FP_Q, mapped=False, oai=True)
 _FP_OAI_MAP_SOURCE = _act_source(*_FP_Q, mapped=True, oai=True)
@@ -1456,15 +1481,16 @@ _verified: dict[tuple, bool] = {}
 
 
 def _get_act_kernel(kind: str):
-    """Build (once) the ``affine_act``, ``fp_act`` or ``fp_oai`` kernel object,
-    or its row-mapped variant (``*_map``: sorted rows read through ``rmap``)."""
+    """Build (once) the ``fp_act`` or ``fp_oai`` kernel object, or its
+    row-mapped variant (``*_map``: sorted rows read through ``rmap``). The
+    affine epilogues are kernels over a tile face (``_face_kernel``)."""
     global _act_header_failed
     kernel = _kernels.get(kind)
     if kernel is not None or _act_header_failed:
         return kernel
     with _lock:
         kernel = _kernels.get(kind)
-        if kernel is not None:
+        if kernel is not None or _act_header_failed:
             return kernel
         mlx_src = _read_mlx_headers(_MLX_MM_HEADERS + _MLX_OPS_HEADERS)
         if mlx_src is None:
@@ -1479,21 +1505,18 @@ def _get_act_kernel(kind: str):
         mapped = kind.endswith("_map")
         family = kind.removesuffix("_map")
         inputs = ["x", "w", "scales"]
-        inputs += {"affine_act": ["biases"], "fp_oai": ["wu", "su"]}.get(family, [])
+        inputs += {"fp_oai": ["wu", "su"]}.get(family, [])
         inputs += ["tiles", "tile_count", "params"]
         inputs += ["oai", "gsc", "usc"] if family == "fp_oai" else ["lim"]
         if mapped:
             inputs.append("rmap")
         source = {
-            "affine_act": _AFFINE_ACT_SOURCE,
             "fp_act": _FP_ACT_SOURCE,
             "fp_oai": _FP_OAI_SOURCE,
-            "affine_act_map": _AFFINE_ACT_MAP_SOURCE,
             "fp_act_map": _FP_ACT_MAP_SOURCE,
             "fp_oai_map": _FP_OAI_MAP_SOURCE,
         }[kind]
         name = {
-            "affine_act": "omlx_gqmm_affine_swiglu",
             "fp_act": "omlx_gqmm_mxfp4_swiglu",
             "fp_oai": "omlx_gqmm_fp4_swiglu_oai",
         }[family]
@@ -1520,7 +1543,7 @@ def _get_kernel(kind: str):
         return kernel
     with _lock:
         kernel = _kernels.get(kind)
-        if kernel is not None:
+        if kernel is not None or _header_failed:
             return kernel
         if kind == "scan":
             kernel = mx.fast.metal_kernel(
@@ -1551,30 +1574,37 @@ def _get_kernel(kind: str):
         return kernel
 
 
-def _face_kernel(face: Tile):
-    """Build (once) the plain kernel over tile face ``face``,
-    ``omlx_gqmm_<key>``: its inputs are ``x``, the face's matrix (``w_weight``
-    and ``w_<tensor>``), ``tiles``, ``tile_count`` and ``params``."""
-    global _header_failed
-    kernel = _kernels.get(face)
-    if kernel is not None or _header_failed:
+def _face_kernel(face: Tile, kind: str = "plain"):
+    """Build (once) the kernel of ``kind`` (``_FACE_KINDS``) over tile face
+    ``face``, ``omlx_gqmm_<key>[_swiglu[_map]]``: its inputs are ``x``, the
+    face's matrix (``w_weight`` and ``w_<tensor>``), ``tiles``, ``tile_count``
+    and ``params``, then the epilogue's ``lim`` and the row map's ``rmap``."""
+    global _header_failed, _act_header_failed
+    kernel = _kernels.get((face, kind))
+    act = kind != "plain"
+    if kernel is not None or _header_failed or (act and _act_header_failed):
         return kernel
     with _lock:
-        kernel = _kernels.get(face)
-        if kernel is not None or _header_failed:
+        kernel = _kernels.get((face, kind))
+        act = kind != "plain"
+        if kernel is not None or _header_failed or (act and _act_header_failed):
             return kernel
-        mlx_src = _read_mlx_headers(_MLX_MM_HEADERS)
+        mlx_src = _read_mlx_headers(_MLX_MM_HEADERS + (_MLX_OPS_HEADERS if act else ()))
         if mlx_src is None:
-            _header_failed = True
+            if act:
+                _act_header_failed = True
+            else:
+                _header_failed = True
             logger.warning(
-                "mlx kernel headers not found under %s; NAX sorted "
-                "gather_qmm disabled",
+                "mlx kernel headers not found under %s; NAX %s disabled",
                 Path(mx.__file__).parent / "include",
+                "gate/up activation epilogue" if act else "sorted gather_qmm",
             )
             return None
+        suffix, source, extra = _FACE_KINDS[kind]
         matrices = format_kernels.Matrices()
         inputs = ["x", *matrices.add("w", face), "tiles", "tile_count", "params"]
-        source, staged = _FACE_SOURCE, matrices.staged_bytes
+        staged = matrices.staged_bytes
         if staged:
             # The face's staged tables take threadgroup memory: the pad,
             # which sets how many threadgroups a core holds, gives it back.
@@ -1583,27 +1613,36 @@ def _face_kernel(face: Tile):
                 f"(PAD > {staged} ? PAD - {staged} : 0) / sizeof(T)];",
             )
         kernel = mx.fast.metal_kernel(
-            name=f"omlx_gqmm_{face.key}",
-            input_names=inputs,
+            name=f"omlx_gqmm_{face.key}{suffix}",
+            input_names=inputs + extra,
             output_names=["y"],
-            header=mlx_src + matrices.header + _MM_HEADER + _FACE_HEADER,
+            header=mlx_src
+            + matrices.header
+            + _MM_HEADER
+            + (_ACT_HEADER if act else "")
+            + _FACE_HEADER,
             source=matrices.declarations + source,
         )
-        _kernels[face] = kernel
+        _kernels[(face, kind)] = kernel
         return kernel
 
 
-def _affine_kernel(bits: int, group_size: int, dtype: mx.Dtype):
-    """The plain kernel over the affine tile face of ``bits``-bit weights in
-    groups of ``group_size`` with scales of ``dtype``, found by those three
-    once it is built."""
-    key = ("affine", bits, group_size, dtype)
+def _affine_kernel(bits: int, group_size: int, dtype: mx.Dtype, kind: str):
+    """The kernel of ``kind`` over the affine tile face of ``bits``-bit
+    weights in groups of ``group_size`` with scales of ``dtype``, found by
+    those four once it is built."""
+    key = ("affine", bits, group_size, dtype, kind)
     kernel = _kernels.get(key)
-    if kernel is None:
-        kernel = _face_kernel(affine_format.tile_face(bits, group_size, dtype))
-        if kernel is not None:
-            _kernels[key] = kernel
-    return kernel
+    if kernel is not None:
+        return kernel
+    with _lock:
+        kernel = _kernels.get(key)
+        if kernel is None:
+            face = affine_format.tile_face(bits, group_size, dtype)
+            kernel = _face_kernel(face, kind)
+            if kernel is not None:
+                _kernels[key] = kernel
+        return kernel
 
 
 def _plan(rows: int, experts: int, K: int, N: int) -> Plan:
@@ -1676,7 +1715,7 @@ def supports(
         return False
     E, N = int(w.shape[0]), int(w.shape[1])
     # Ragged N is canaried at N % 64 == 32 only.
-    if E == 0 or E > _MAX_EXPERTS or N == 0 or N % 32 or K % 32:
+    if E == 0 or E > _MAX_EXPERTS or N == 0 or N % 32 or K == 0 or K % 32:
         return False
     if mode == "affine":
         if bits not in (4, 8) or group_size not in (32, 64, 128):
@@ -1721,15 +1760,18 @@ def _launch(
     ``[M, 1, N / 2]``; with it, ``row_map`` reads the sorted rows as
     ``x[row_map]`` in place. ``_EPI_OAI`` takes the gate rows in ``w`` and the
     up operand in ``up`` = ``(w, scales)``, ``limit`` = ``(alpha, limit,
-    beta)`` and ``expert_scales`` = ``(gate, up)``. The plain affine
-    matmul is the kernel over the affine tile face (``_launch_face``)."""
+    beta)`` and ``expert_scales`` = ``(gate, up)``. An affine matmul is a
+    kernel over the affine tile face (``_launch_face``)."""
     if row_map is not None and not epi:
         return None
-    if mode == "affine" and not epi:
-        mm = _affine_kernel(bits, group_size, scales.dtype)
-        return _launch_face(mm, x, (w, scales, biases), indices, plan, stream)
+    if mode == "affine":
+        kind = "plain" if not epi else ("act" if row_map is None else "act_map")
+        mm = _affine_kernel(bits, group_size, scales.dtype, kind)
+        return _launch_face(
+            mm, x, (w, scales, biases), indices, plan, stream, epi, limit, row_map
+        )
     scan = _get_kernel("scan")
-    kind = "affine" if mode == "affine" else "fp"
+    kind = "fp"
     if epi:
         kind += "_oai" if epi == _EPI_OAI else "_act"
         if row_map is not None:
@@ -1746,9 +1788,6 @@ def _launch(
     tiles, tile_count, max_tiles = _tiles(scan, indices, E, bm, kw)
     inputs = [x, w, scales]
     template = [("T", x.dtype), ("GS", group_size)]
-    if mode == "affine":
-        inputs.append(biases)
-        template.append(("BITS", bits))
     if up is not None:
         inputs += up
     inputs += [tiles, tile_count, mx.array([N, K], dtype=mx.int32)]
@@ -1784,10 +1823,13 @@ def _launch(
     )[0]
 
 
-def _launch_face(mm, x, operands, indices, plan, stream):
-    """Tile pre-pass + the plain matmul over a tile face's matrix: ``mm`` its
-    kernel (``_face_kernel``), ``operands`` its weight and the face's tensors,
-    each of shape ``[E, N, ...]``."""
+def _launch_face(
+    mm, x, operands, indices, plan, stream, epi=0, limit=None, row_map=None
+):
+    """Tile pre-pass + a matmul over a tile face's matrix: ``mm`` its kernel
+    (``_face_kernel``), ``operands`` its weight and the face's tensors, each
+    with the stack's E and N first; ``epi``, ``limit`` and ``row_map`` as
+    ``_launch``'s, ``mm`` a kernel of the matching kind."""
     scan = _get_kernel("scan")
     if scan is None or mm is None:
         return None
@@ -1795,20 +1837,29 @@ def _launch_face(mm, x, operands, indices, plan, stream):
     E, N = int(operands[0].shape[0]), int(operands[0].shape[1])
     kw = {} if stream is None else {"stream": stream}
     tiles, tile_count, max_tiles = _tiles(scan, indices, E, plan.bm, kw)
+    inputs = [x, *operands, tiles, tile_count, mx.array([N], dtype=mx.int32)]
+    template = [("T", x.dtype), ("K", K), ("SCHED", int(plan.sched))]
+    if epi:
+        # The clip bound converts like the unfused path's Python-float
+        # operand of mx.clip (float, then the activation dtype).
+        bound = 0.0 if limit is None else limit
+        inputs.append(mx.array(bound, dtype=x.dtype).reshape(1))
+        template.append(("EPI", int(epi)))
+        if row_map is not None:
+            inputs.append(row_map)
+    else:
+        template.append(("ALIGN_N", N % _BN == 0))
+    template += [
+        ("BM", plan.bm),
+        ("BK", plan.bk),
+        ("GX", plan.gx),
+        ("PAD", plan.pad),
+    ]
     return mm(
-        inputs=[x, *operands, tiles, tile_count, mx.array([N], dtype=mx.int32)],
-        template=[
-            ("T", x.dtype),
-            ("K", K),
-            ("SCHED", int(plan.sched)),
-            ("ALIGN_N", N % _BN == 0),
-            ("BM", plan.bm),
-            ("BK", plan.bk),
-            ("GX", plan.gx),
-            ("PAD", plan.pad),
-        ],
+        inputs=inputs,
+        template=template,
         **_grid(N, max_tiles, plan),
-        output_shapes=[(M, 1, N)],
+        output_shapes=[(M, 1, N // 2 if epi else N)],
         output_dtypes=[x.dtype],
         **kw,
     )[0]
@@ -2039,12 +2090,12 @@ def _self_test_act(key: tuple) -> Optional[bool]:
     scale so the projections cover sigmoid's saturated tails and the clip
     bounds. None: could not be evaluated here (see ``_self_test``)."""
     dtype, mode, bits, group_size, plan, _, align_k, epi, limit = key
-    K = _canary_k(plan, align_k)
+    k = align_k if type(align_k) is int else _canary_k(plan, align_k)
     try:
         M = sum(_CANARY_COUNTS)
         row_scale = mx.power(10.0, mx.linspace(-1.0, 1.2, M)).reshape(M, 1, 1)
         wq, scales, biases, _, x, idx = _canary_problem(
-            dtype, mode, bits, group_size, 2 * _BN, K, x_scale=row_scale
+            dtype, mode, bits, group_size, 2 * _BN, k, x_scale=row_scale
         )
         ops, kw = _canary_epilogue(wq, scales, biases, epi, limit)
         tail = (idx, group_size, bits, mode, plan, None)
@@ -2084,16 +2135,16 @@ def _self_test_act_map(key: tuple) -> Optional[bool]:
     (the same configuration's unmapped instantiation is itself checked
     against the unfused path). None: could not be evaluated here."""
     dtype, mode, bits, group_size, plan, _, align_k, epi, limit, _ = key
-    K = _canary_k(plan, align_k)
+    k = align_k if type(align_k) is int else _canary_k(plan, align_k)
     try:
         M = sum(_CANARY_COUNTS)
         T = M // 3
         tok_scale = mx.power(10.0, mx.linspace(-1.0, 1.2, T)).reshape(T, 1, 1)
         wq, scales, biases, _, _, idx = _canary_problem(
-            dtype, mode, bits, group_size, 2 * _BN, K
+            dtype, mode, bits, group_size, 2 * _BN, k
         )
         x_tok = (
-            mx.random.normal((T, 1, K), key=mx.random.key(0x70C)) * tok_scale
+            mx.random.normal((T, 1, k), key=mx.random.key(0x70C)) * tok_scale
         ).astype(dtype)
         row_map = ((mx.arange(M, dtype=mx.uint32) * 7 + 3) % T).astype(mx.uint32)
         ops, kw = _canary_epilogue(wq, scales, biases, epi, limit)
@@ -2234,7 +2285,9 @@ def sorted_gather_qmm_swiglu(
         plan = plan._replace(sched=_SCHED_SEG)
     epi = _EPI_SWIGLU if limit is None else _EPI_CLAMPED
     if verify:
-        key = (x.dtype, mode, bits, group_size, plan, True, K % plan.bk == 0)
+        # Affine kernels compile K in: their canaries are the call's K.
+        k_key = K if mode == "affine" else K % plan.bk == 0
+        key = (x.dtype, mode, bits, group_size, plan, True, k_key)
         # The plain instantiation (the unfused path's kernel) must hold too.
         if not _checked(key, _self_test) or not _checked(
             key + (epi, limit), _self_test_act

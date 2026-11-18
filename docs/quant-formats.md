@@ -577,7 +577,11 @@ The values a thread decodes are whole groups or lie in one group: hence a `GROUP
 
 Three things to know when writing one:
 
-- A run of 8 codes of b bits is b bytes, a multiple of b bytes from the start of the codes. A run of 2, 4 or 8 bits is one load of a `ushort`, a `uint` or a `uint2`; a 3-bit run is three bytes, read as three `uint8_t` loads (or a `uint8_t` and a `ushort`): a 4-byte load at a 3-bit run reads a byte past it, which at a row's last run of the last matrix lies past the array (rule 1).
+- A run of eight b-bit codes occupies b bytes. For 2-, 4- and 8-bit codes,
+  read a run as a `ushort`, `uint` or `packed_uint2` when the base is aligned to
+  2, 4 or 4 bytes respectively. Byte loads also work on unaligned storage.
+  A 3-bit run takes three byte loads, or one byte and an aligned `ushort`. A
+  four-byte load at the last run of the last matrix reads past the array (rule 1).
 - A face's source is a function of its `key`: whatever the source is built from goes in the key (the bit width, the group size). A table of values that a checkpoint carries is no part of the source: it is the face's `tables` (see [Tables](#tables)), and faces of two checkpoints with different tables are two kernels whatever their keys.
 - In a face's source, MLX names a bf16 tensor's element type `bfloat16_t` and an fp16 one's `float16_t`, as in `T` and in the `type` of a face whose struct is a template of it (`omlx_affine_tile_b4g64::Tile<bfloat16_t>`).
 
@@ -598,7 +602,11 @@ Where a weight has several scales, a group's and a row's, `params` multiplies th
 7. **`weight` is pure and exact**: a function of `p`, `c` and `i` alone, which reads no memory but `constant` data and the face's tables (through `p`), and gives the format's decode computed in float32. `i` is not always known when the kernel is compiled.
 8. **The members keep no state but the cursor's**, and `params` and `fetch` are `const`: kernels run on several threads, and a format returns equal `Tile`s for the layers of one layout.
 9. **The source is C++17 Metal without derived classes.** See [Compile-time rules](#compile-time-rules).
-10. **`if constexpr` discards a branch only in a template, on a condition that depends on its parameters.** A face's source is one instance, its bit width and group size namespace constants, so an `if constexpr` on one of them compiles both branches, and each must be well-formed for the instance's types. Choose by an overload on a type (`code_at(uint, i)` and `code_at(uint2, i)` in the affine face) or by a template parameter.
+10. **Use templates for branches that depend on an instance's types.** Outside
+    a template, the compiler checks both branches of `if constexpr`, even when
+    the condition uses namespace constants for the bit width and group size.
+    Use a type overload, a dependent template parameter, or generate the source
+    for each width separately (as the affine face does in `_tile_source`).
 
 Rules 1, 2 and 7 are what `tile_rows` checks, on codes and scales at their largest values, on random ones and on zeros (see [Test a format](#test-a-format)). It also calls `params` and `fetch` twice on one cursor, another group and run first (where the row has more than one: K above `GROUP` and above 8), and keeps the second answers, so a member that keeps state between calls (rule 8) shows in its weights. Nothing checks rules 3, 4, 5 and 6: a face is read against them. (A constructor that reads cannot be caught by building a cursor past the matrix: the compiler moves the read to where the cursor is used, which for such a row is nowhere.)
 
@@ -638,12 +646,12 @@ struct Tile {
     };
     using Codes = uint2;  // 8 codes of 8 bits
 
-    const device uint2* c;
+    const device packed_uint2* c;
     const device float* g;
     const device float* r;
 
     Runs(Tile m, size_t row)
-        : c((const device uint2*)(m.codes + row * K)),
+        : c((const device packed_uint2*)(m.codes + row * K)),
           g(m.group_scales + row * GROUPS),
           r(m.row_scales + row) {}
 
@@ -651,7 +659,7 @@ struct Tile {
       return {g[group] * r[0]};
     }
     Codes fetch(int run) const {
-      return c[run];
+      return Codes(c[run]);
     }
     static float weight(thread const P& p, Codes q, int i) {
       const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
@@ -1074,12 +1082,17 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 | Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
 | A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |
-| MoE prefill on tensor units (M5): an affine switch layer's sorted rows, as MLX's sorted `gather_qmm` takes them | tile | `omlx/patches/m5_gather_qmm_nax.py` |
+| M5 sorted prefill and fused SwiGLU | tile | `omlx/patches/m5_gather_qmm_nax.py` |
 
 The routed decode runs a block in the one dtype its gate+up face is exact for. With a gate+up face that names no dtype (exact for the three of `formats.FLOATS`), or several, the block keeps its composed path, as it does with a down face that is not exact for that dtype. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches.
 
 A face that does not compile does not fail the model. One token's launches (the router's, gate+up and down) are one graph of the token and the block's arrays: built once on a thread for the token's shape and dtype and the router's width, kept in the proof of the block's faces, tensor dtypes and shapes (see [Kernels over faces](#kernels-over-faces)), and replayed by every block that shares the proof, over its own arrays. Before the graph is first built its Metal is proven on a stand-in, as a format layer's is: zeros for the token, the router's weight, each shared matrix and what the block computes outside the launches, as many matrices of each stack as a token selects, and router logits that rank the experts, so that it selects those, all made on the GPU's stream and evaluated by the proof ahead of the launch (what fails there is raised by the call and fails no proof). Nothing of the call is evaluated (once, as a block's plan is built outside a trace, a view of each stack's first matrix is, to learn whether it shares the stack's buffer): a failure in the block's input or tensors is raised where the caller evaluates the result, and a block's first call is safe inside a function that `mx.compile` traces, over the model's state too (the stacks are then bound whole). If the stand-in fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path, for one token, verify windows and batched rows. A verify window or batched rows of 2 rows or more are a graph of the same kind, kept in the window's own proof for the window's shape and dtype and the router's width, and proven on a stand-in of the window's rows; a window of one row is one token's call. If a window's stand-in fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.
 
-The tensor-unit sorted gather (M5 Max and later) runs the experts of MLX's affine switch layers over a prompt's sorted rows through the affine tile face: one kernel per face, with the bits of MLX's sorted `gather_qmm`, which its self-test checks for each configuration before it is used. A format's own switch layers do not take it yet: they run their rows kernel.
+On the M5 Max and later, MLX's affine switch layers use the affine tile face
+for sorted prompt rows. The gather can apply SwiGLU to fused gate/up outputs
+using sorted rows or a row map. Before use, each configuration checks the
+plain result against MLX's sorted `gather_qmm` at the call's K. The fused
+variants check the result of splitting the plain output and applying SwiGLU.
+A format's own switch layers use their rows kernel.
 
 The verify gather runs a block's fused gate+up projection, then its down projection, when both are stacked expert weights without a bias, of an N that is whole tiles of 8 outputs, each with a dot face that is exact for the block's dtype, and the block's activation returns that dtype in the shape of the up's rows. From 24 pairs (rows times top-k) one launch puts a block's pairs in expert order ahead of its two; below, each threadgroup searches for its own. A block of 2 to 8 rows takes it at any bit width, but one of 16 pairs or fewer over 64 experts or more, which keeps the composed path (measured faster than the composed path everywhere else; 2 rows of a 256-expert top-8 block read 1% slower). The block's indices are integers, top-k of them (one or more) for each row of `x`, and `x` is float16, bfloat16 or float32 (as `gather_qmm` takes) with 8 values or more (MLX binds fewer as constants). The gather proves each Metal of a block's two launches (and, from 24 pairs, its order's) as a format layer does, on a stand-in: zeros of the block's rows and pairs, every pair with expert 0 of stacks of the fewest experts that leave each tensor 8 elements, views of one buffer made on the GPU's stream and evaluated by the proof ahead of the launch (what fails in making them is raised by the call and fails no proof). It evaluates nothing of the call, so a block may be built inside a function that `mx.compile` traces, and what fails in `x`, in the indices, in a tensor or in the activation's arrays is raised where the caller evaluates the result; the activation itself runs in the call, so what it raises, the call raises. A block whose stand-in fails (`expert-ordered verify gather failed; composed fallback`) keeps the projections of the same faces, tensor dtypes and shapes on their composed path, on every thread.

@@ -217,7 +217,8 @@ def _builder_digest(monkeypatch) -> str:
         gather._ordered_kernel.__wrapped__(face)
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
         tile = affine.tile_face(bits, group, dtype)
-        nax._face_kernel(tile)
+        for kind in ("plain", "act", "act_map"):
+            nax._face_kernel(tile, kind)
     shared, gate = affine.face(8, 128, True, mx.bfloat16), affine.face(
         8, 64, True, mx.bfloat16
     )
@@ -236,14 +237,14 @@ def _builder_digest(monkeypatch) -> str:
     return f"{len(recorded)} {digest.hexdigest()}"
 
 
-# The digest of the served kernels over affine faces without tables, as they
-# are carried since the skeletons are compact: what a face without tables
-# compiles is this text, to the byte, so the same MLX library.
-_PARENT_DIGEST = "364 c0f1bbfccbdf6e1537662b42c0e84329b0d14907fac1cae9ed1d2db86c063bf4"
+# B8's kernels on the compact skeletons (U3b), as served: 352 existing builders and
+# 36 plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
+# preserve their Metal byte for byte when the face declares none.
+_METAL_DIGEST = "388 c8324095bedae2bc68f5d7c5044506a8cf9ecf92893f7edd22fdedc4281fd33d"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
-    assert _builder_digest(monkeypatch) == _PARENT_DIGEST
+    assert _builder_digest(monkeypatch) == _METAL_DIGEST
 
 
 _TOY = r"""

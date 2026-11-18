@@ -211,6 +211,9 @@ _TILE_FACE = _compact(r"""
 template <typename...>
 using omlx_void = void;
 
+template <typename X>
+thread const X& omlx_lvalue();
+
 template <typename F, typename = void>
 struct omlx_tile_contract {
   static constant constexpr bool found = false;
@@ -260,8 +263,9 @@ struct omlx_tile_held {
 template <typename X>
 struct omlx_tile_held<
     X,
-    omlx_void<decltype(
-        metal::declval<thread X&>() = metal::declval<thread const X&>())>> {
+    omlx_void<
+        decltype(metal::declval<thread X&>() = omlx_lvalue<X>()),
+        decltype(metal::declval<thread X&>() = X())>> {
   static constant constexpr bool value = metal::is_default_constructible_v<X>;
 };
 
@@ -284,9 +288,9 @@ struct omlx_tile_params<
     R,
     omlx_void<
         typename R::P,
-        decltype(metal::declval<thread const R&>().params(metal::declval<int>()))>> {
+        decltype(metal::declval<thread const R&>().params(omlx_lvalue<int>()))>> {
   static constant constexpr bool value = metal::is_same_v<
-      decltype(metal::declval<thread const R&>().params(metal::declval<int>())),
+      decltype(metal::declval<thread const R&>().params(omlx_lvalue<int>())),
       typename R::P>;
 };
 
@@ -299,9 +303,9 @@ struct omlx_tile_fetch<
     R,
     omlx_void<
         typename R::Codes,
-        decltype(metal::declval<thread const R&>().fetch(metal::declval<int>()))>> {
+        decltype(metal::declval<thread const R&>().fetch(omlx_lvalue<int>()))>> {
   static constant constexpr bool value = metal::is_same_v<
-      decltype(metal::declval<thread const R&>().fetch(metal::declval<int>())),
+      decltype(metal::declval<thread const R&>().fetch(omlx_lvalue<int>())),
       typename R::Codes>;
 };
 
@@ -315,12 +319,12 @@ struct omlx_tile_weight<
     omlx_void<decltype(R::weight(
         metal::declval<thread const typename R::P&>(),
         metal::declval<thread const typename R::Codes&>(),
-        metal::declval<int>()))>> {
+        omlx_lvalue<int>()))>> {
   static constant constexpr bool value = metal::is_same_v<
       decltype(R::weight(
           metal::declval<thread const typename R::P&>(),
           metal::declval<thread const typename R::Codes&>(),
-          metal::declval<int>())),
+          omlx_lvalue<int>())),
       float>;
 };
 
@@ -357,7 +361,7 @@ struct omlx_tile_face<F, K, true, FACE, true> {
   static constant constexpr bool GROUP = omlx_tile_group<R>::value;
   static constant constexpr bool HELD = omlx_tile_types<R>::value;
   static constant constexpr bool CURSOR =
-      metal::is_constructible_v<R, thread const F&, size_t>;
+      metal::is_constructible_v<R, thread const F&, thread const size_t&>;
   static constant constexpr bool PARAMS = omlx_tile_params<R>::value;
   static constant constexpr bool FETCH = omlx_tile_fetch<R>::value;
   static constant constexpr bool WEIGHT = omlx_tile_weight<R>::value;

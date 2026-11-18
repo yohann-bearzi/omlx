@@ -45,12 +45,12 @@ struct Tile {
     };
     using Codes = uint2;  // 8 codes of 8 bits
 
-    const device uint2* c;
+    const device packed_uint2* c;
     const device float* g;
     const device float* r;
 
     Runs(Tile m, size_t row)
-        : c((const device uint2*)(m.codes + row * K)),
+        : c((const device packed_uint2*)(m.codes + row * K)),
           g(m.group_scales + row * GROUPS),
           r(m.row_scales + row) {}
 
@@ -58,7 +58,7 @@ struct Tile {
       return {g[group] * r[0]};
     }
     Codes fetch(int run) const {
-      return c[run];
+      return Codes(c[run]);
     }
     static float weight(thread const P& p, Codes q, int i) {
       const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
@@ -427,7 +427,7 @@ _BREAKS = {
     ),
     "fetch_of_another_type": (
         (
-            "    Codes fetch(int run) const {\n      return c[run];\n",
+            "    Codes fetch(int run) const {\n      return Codes(c[run]);\n",
             "    uint fetch(int run) const {\n      return c[run].x;\n",
         ),
         "Runs<K> needs a const member fetch(int run)",
@@ -443,6 +443,38 @@ _BREAKS = {
             "float weight(thread const P& p, Codes q, int i) const {",
         ),
         "Runs<K> needs a static member weight(P, Codes, int i)",
+    ),
+    "fetch_of_a_moved_index": (
+        ("Codes fetch(int run) const {", "Codes fetch(thread int&& run) const {"),
+        "Runs<K> needs a const member fetch(int run)",
+    ),
+    "params_reject_prvalue_assignment": (
+        (
+            "      float s;  //",
+            "      P() = default;\n"
+            "      P(float v) : s(v) {}\n"
+            "      P(thread const P&) = default;\n"
+            "      thread P& operator=(thread const P&) thread = default;\n"
+            "      thread P& operator=(thread P&&) thread = delete;\n"
+            "      float s;  //",
+        ),
+        "Runs<K>::P and Runs<K>::Codes must be types",
+    ),
+    "weight_of_a_mutable_run": (
+        ("Codes q, int i) {", "thread Codes& q, int i) {"),
+        "Runs<K> needs a static member weight(P, Codes, int i)",
+    ),
+    "weight_of_a_moved_index": (
+        ("Codes q, int i) {", "Codes q, thread int&& i) {"),
+        "Runs<K> needs a static member weight(P, Codes, int i)",
+    ),
+    "cursor_of_a_moved_row": (
+        ("Runs(Tile m, size_t row)\n", "Runs(Tile m, thread size_t&& row)\n"),
+        "Runs<K> must be constructible from the face and a size_t row",
+    ),
+    "params_of_a_moved_index": (
+        ("P params(int group) const {", "P params(thread int&& group) const {"),
+        "Runs<K> needs a const member params(int g)",
     ),
     "weight_of_a_moved_run": (
         ("Codes q, int i) {", "thread Codes&& q, int i) {"),
@@ -578,13 +610,16 @@ _KEEPS_STATE = {
             "    const device float* r;\n    mutable int first = -1;\n",
         ),
         (
-            "      return c[run];",
+            "      return Codes(c[run]);",
             "      first = first < 0 ? run : first;\n      return c[first];",
         ),
     ],
     "fetch_advancing": [
-        ("    const device uint2* c;\n", "    mutable const device uint2* c;\n"),
-        ("      return c[run];", "      return *c++;"),
+        (
+            "    const device packed_uint2* c;\n",
+            "    mutable const device packed_uint2* c;\n",
+        ),
+        ("      return Codes(c[run]);", "      return Codes(*c++);"),
     ],
 }
 
@@ -601,6 +636,38 @@ def test_tile_rows_show_a_member_that_keeps_state(member):
         _toy(f"state_{member}", source), operands, 64, range(8), mx.float32
     )
     assert not _same(exact, _toy_decode(*operands))
+
+
+@metal
+def test_tile_rows_stays_in_the_only_group():
+    # Observe the first group requested. There is a second physical row so
+    # reading its scale by mistake stays inside the allocation.
+    source = _TOY
+    for old, new in _KEEPS_STATE["params"]:
+        source = source.replace(old, new)
+    operands = _toy_matrix(8, 32, seed=7)
+    face = _toy("only_group", source)
+    exact, _ = testing.tile_rows(face, operands, 32, [0], mx.float32)
+    assert _same(exact, _toy_decode(*operands)[:1])
+
+
+@metal
+def test_tile_rows_uses_the_const_overloads_it_checked():
+    source = _TOY.replace(
+        "    Runs(Tile m, size_t row)",
+        "    Runs(thread Tile&, size_t) = delete;\n"
+        "    Runs(thread const Tile& m, size_t row)",
+    ).replace(
+        "    static float weight(thread const P& p, Codes q, int i) {",
+        "    static float weight(thread P&, thread const Codes&, int) = delete;\n"
+        "    static float weight(thread const P&, thread Codes&, int) = delete;\n"
+        "    static float weight(thread const P& p, thread const Codes& q, int i) {",
+    )
+    operands = _toy_operands()
+    exact, _ = testing.tile_rows(
+        _toy("const_inputs", source), operands, 64, range(8), mx.float32
+    )
+    assert _same(exact, _toy_decode(*operands))
 
 
 def _sentences(source) -> list[str]:
@@ -629,7 +696,7 @@ def test_tile_rows_refuses_what_it_cannot_read():
     for dtype in (mx.int32, mx.bool_, mx.float64, "bfloat16"):
         with pytest.raises(ValueError, match="is not a float type of the GPU"):
             testing.tile_rows(face, operands, 64, range(8), dtype)
-    for rows in ([], [-1], [0.0], ["0"], [True], [0, False]):
+    for rows in ([], [-1], [0.0], ["0"], [True], [0, False], [1 << 63]):
         with pytest.raises(ValueError, match="are not one row index or more"):
             testing.tile_rows(face, operands, 64, rows, mx.float32)
     with pytest.raises(ValueError, match="weight, group_scales, row_scales; operands"):
@@ -645,10 +712,36 @@ def test_tile_rows_refuses_what_it_cannot_read():
             testing.tile_rows(
                 face, (codes, group_scales, row_scales), 64, range(rows), mx.float32
             )
+    for rows, ops in ((5, operands), (range(8), 5)):
+        with pytest.raises(ValueError, match="rows and operands are sequences"):
+            testing.tile_rows(face, ops, 64, rows, mx.float32)
+    with pytest.raises(ValueError, match="toy_refusals: weight is not an mx.array"):
+        testing.tile_rows(face, (list(range(64)), *operands[1:]), 64, [0], mx.float32)
     with pytest.raises(ValueError, match="is not a Tile"):
         testing.tile_rows(
             affine.face(4, 64, True, mx.bfloat16), operands, 64, [0], mx.float32
         )
+
+
+@metal
+def test_tile_rows_supports_the_largest_k_of_whole_runs(monkeypatch):
+    # At row 0, weight 0, the kit reads only the first two runs and groups.
+    # Launch just that thread so the limit can be exercised with small arrays.
+    face = _toy("max_k")
+    operands = _toy_operands()
+    kernel = testing._tile_rows_kernel(face)
+    k = (1 << 31) - 8
+
+    def first_weight(**kw):
+        assert kw["grid"] == (k, 1, 1)
+        kw.update(grid=(1, 1, 1), threadgroup=(1, 1, 1), output_shapes=[(1,), (1,)])
+        return kernel(**kw)
+
+    monkeypatch.setattr(testing, "_tile_rows_kernel", lambda f: first_weight)
+    exact, rounded = testing.tile_rows(face, operands, k, [0], mx.bfloat16)
+    first = _toy_decode(*operands)[0, :1]
+    assert _same(exact, first)
+    assert _same(rounded, first.astype(mx.bfloat16))
 
 
 # K of whole groups, of a last group that is partial (40: 32 + 8; 8: one run

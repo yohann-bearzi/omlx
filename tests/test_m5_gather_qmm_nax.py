@@ -15,6 +15,8 @@ from __future__ import annotations
 import importlib
 import io
 import logging
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -275,6 +277,36 @@ def test_a_tile_face_runs_through_the_sorted_gather(K, N, plan, dtype):
 
 
 @needs_nax
+def test_the_gather_reads_through_a_const_cursor():
+    source = _TOY.replace(
+        "    Codes fetch(int run) const {",
+        "    Codes fetch(int run) = delete;\n    Codes fetch(int run) const {",
+    )
+    dtype = mx.bfloat16
+    ops, w = _toy_stack(len(_COUNTS), 64, 64, dtype, seed=71)
+    x, idx = _rows(_COUNTS, 64, dtype)
+    kernel = nax._face_kernel(_toy("nax_const_cursor", source))
+    out = nax._launch_face(kernel, x, ops, idx, P(DB, 64, 64, 0, 0), None)
+    ref = mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=idx, sorted_indices=True)
+    _assert_bitwise(out, ref)
+
+
+@needs_nax
+def test_the_gather_compiler_refuses_a_zero_k():
+    # Bind device buffers with the normal ABI even for this invalid template.
+    # An empty MLX input would change its address space before the check runs.
+    ops, _ = _toy_stack(len(_COUNTS), 64, 64, mx.bfloat16, seed=73)
+    x, idx = _rows(_COUNTS, 64, mx.bfloat16)
+    kernel = nax._face_kernel(_toy("nax_zero_k"))
+
+    def zero_k(*, template, **rest):
+        return kernel(template=[(n, 0 if n == "K" else v) for n, v in template], **rest)
+
+    with pytest.raises(RuntimeError, match="NAX gather: K is whole 32-deep sub-steps"):
+        mx.eval(nax._launch_face(zero_k, x, ops, idx, P(SEG, 64, 64, 0, 0), None))
+
+
+@needs_nax
 def test_a_tile_face_that_breaks_a_rule_fails_the_gather_with_that_rule():
     broken = _toy("nax_run16", _TOY.replace("RUN = 8;", "RUN = 16;"))
     operands, _ = _toy_stack(len(_COUNTS), 128, 256, mx.bfloat16, seed=3)
@@ -289,19 +321,34 @@ def test_a_tile_face_that_breaks_a_rule_fails_the_gather_with_that_rule():
 
 @needs_nax
 @pytest.mark.parametrize(
-    "K, plan, rule",
+    "k, n, plan, rule",
     [
-        (40, P(SEG, 64, 64, 0, 0), "NAX gather: K is whole 32-deep sub-steps"),
-        (96, P(DB, 64, 64, 0, 0), "NAX gather: the double-buffer schedule takes"),
+        (40, 128, P(SEG, 64, 64, 0, 0), "NAX gather: K is whole 32-deep sub-steps"),
+        (96, 128, P(DB, 64, 64, 0, 0), "NAX gather: the double-buffer schedule takes"),
+        (256, 96, P(DB, 64, 64, 0, 0), "NAX gather: the double-buffer schedule takes"),
     ],
 )
-def test_a_face_gather_refuses_the_ks_its_schedule_cannot_run(K, plan, rule):
-    operands, _ = _toy_stack(len(_COUNTS), 128, K, mx.bfloat16, seed=5)
-    x, idx = _rows(_COUNTS, K, mx.bfloat16)
-    kernel = nax._face_kernel(_toy(f"nax_k{K}"))
+def test_a_face_gather_refuses_the_ks_its_schedule_cannot_run(k, n, plan, rule):
+    operands, _ = _toy_stack(len(_COUNTS), n, k, mx.bfloat16, seed=5)
+    x, idx = _rows(_COUNTS, k, mx.bfloat16)
+    kernel = nax._face_kernel(_toy(f"nax_k{k}_n{n}"))
     with pytest.raises(RuntimeError) as failure:
         mx.eval(nax._launch_face(kernel, x, operands, idx, plan, None))
     assert rule in str(failure.value)
+
+
+def test_no_sorted_gather_of_rows_of_no_inputs():
+    experts, n = 2, 128
+    x, idx = mx.zeros((8, 1, 0), mx.bfloat16), mx.zeros((8,), mx.uint32)
+    w = mx.zeros((experts, n, 0), mx.uint32)
+    scales = mx.zeros((experts, n, 0), mx.bfloat16)
+    assert not nax.supports(x, w, scales, scales, idx, 32, 4, "affine")
+
+
+@pytest.mark.parametrize("k, tail", [(640, False), (320, True)])
+def test_a_verdict_of_a_call_s_k_says_whether_k_has_a_tail(k, tail):
+    key = (mx.bfloat16, "affine", 4, 64, P(SEG, 64, 128, 0, 0), True, k)
+    assert ("K tail" in nax._describe(key)) is tail
 
 
 @needs_nax
@@ -326,33 +373,58 @@ def test_the_affine_self_test_proves_the_call_s_k(monkeypatch):
     _assert_bitwise(out, _stock_sorted(x, wq, scales, biases, idx, "affine", 4, 64))
 
 
+@needs_nax
+def test_the_affine_epilogue_self_tests_prove_the_call_s_k(monkeypatch):
+    monkeypatch.setattr(nax, "_verified", {})
+    keys = []
+    for name in ("_self_test", "_self_test_act", "_self_test_act_map"):
+        test = getattr(nax, name)
+        monkeypatch.setattr(
+            nax, name, lambda key, test=test: keys.append(key) or test(key)
+        )
+    experts, n, k = len(_COUNTS), 256, 640
+    wq, scales, biases, _ = _quantized(experts, n, k, "affine", 4, 64, mx.bfloat16)
+    x, idx = _rows(_COUNTS, k, mx.bfloat16)
+    rows = mx.arange(int(idx.shape[0]), dtype=mx.uint32)
+    out = nax.sorted_gather_qmm_swiglu(
+        x, wq, scales, biases, idx, group_size=64, bits=4, row_map=rows
+    )
+    assert out is not None and len(keys) == 3
+    assert all(type(key[6]) is int and key[6] == k for key in keys)
+
+
 def test_one_kernel_per_tile_face(monkeypatch):
     monkeypatch.setattr(nax, "_kernels", {})
     built = []
     face_kernel = nax._face_kernel
 
-    def counted(face):
-        built.append(face)
-        return face_kernel(face)
+    def counted(face, kind="plain"):
+        built.append((face, kind))
+        return face_kernel(face, kind)
 
     monkeypatch.setattr(nax, "_face_kernel", counted)
-    b4 = nax._affine_kernel(4, 64, mx.bfloat16)
-    assert b4 is not None and nax._affine_kernel(4, 64, mx.bfloat16) is b4
+    b4 = nax._affine_kernel(4, 64, mx.bfloat16, "plain")
+    assert b4 is not None and nax._affine_kernel(4, 64, mx.bfloat16, "plain") is b4
     others = [
-        nax._affine_kernel(8, 64, mx.bfloat16),
-        nax._affine_kernel(4, 32, mx.bfloat16),
-        nax._affine_kernel(4, 64, mx.float16),
+        nax._affine_kernel(8, 64, mx.bfloat16, "plain"),
+        nax._affine_kernel(4, 32, mx.bfloat16, "plain"),
+        nax._affine_kernel(4, 64, mx.float16, "plain"),
+        nax._affine_kernel(4, 64, mx.bfloat16, "act"),
+        nax._affine_kernel(4, 64, mx.bfloat16, "act_map"),
     ]
-    assert len({id(k) for k in [b4, *others]}) == 4
-    # Each affine kernel is the kernel over its layout's tile face, built
-    # once; a face's kernel is found by the face.
+    assert len({id(k) for k in [b4, *others]}) == 6
+    # Each affine kernel is the kernel of its kind over its layout's tile
+    # face, built once; a face's kernel is found by the face and the kind.
+    b4_face = affine_format.tile_face(4, 64, mx.bfloat16)
     assert built == [
-        affine_format.tile_face(4, 64, mx.bfloat16),
-        affine_format.tile_face(8, 64, mx.bfloat16),
-        affine_format.tile_face(4, 32, mx.bfloat16),
-        affine_format.tile_face(4, 64, mx.float16),
+        (b4_face, "plain"),
+        (affine_format.tile_face(8, 64, mx.bfloat16), "plain"),
+        (affine_format.tile_face(4, 32, mx.bfloat16), "plain"),
+        (affine_format.tile_face(4, 64, mx.float16), "plain"),
+        (b4_face, "act"),
+        (b4_face, "act_map"),
     ]
-    assert face_kernel(affine_format.tile_face(4, 64, mx.bfloat16)) is b4
+    assert face_kernel(b4_face) is b4 and face_kernel(b4_face, "act") is others[3]
     toy = face_kernel(_toy("nax_kernel"))
     assert toy is face_kernel(_toy("nax_kernel")) and toy is not b4
 
@@ -363,31 +435,133 @@ def test_without_mlx_s_headers_no_kernel_over_a_face_is_built(monkeypatch, caplo
     monkeypatch.setattr(nax, "_read_mlx_headers", lambda paths: None)
     with caplog.at_level(logging.WARNING, logger=nax.__name__):
         assert nax._face_kernel(_toy("nax_headers")) is None
-        assert nax._affine_kernel(4, 64, mx.bfloat16) is None
+        assert nax._affine_kernel(4, 64, mx.bfloat16, "plain") is None
     # Said once: the module's sorted gathers are off from then on.
     (record,) = caplog.records
     assert record.getMessage().endswith("NAX sorted gather_qmm disabled")
     assert nax._header_failed and nax._kernels == {}
 
 
-def test_the_plain_affine_kernel_reads_the_affine_tile_face(monkeypatch):
+@pytest.mark.parametrize("kind", ["fp", "fp_act", "face", "face_act"])
+def test_two_builders_report_missing_headers_once(kind, monkeypatch, caplog):
+    # Both callers have already seen a cold cache when either takes the lock.
+    barrier = threading.Barrier(2, timeout=10)
+    lock = nax._lock
+
+    class Together:
+        def __enter__(self):
+            barrier.wait()
+            lock.acquire()
+
+        def __exit__(self, *_):
+            lock.release()
+
+    monkeypatch.setattr(nax, "_lock", Together())
+    monkeypatch.setattr(nax, "_kernels", {})
+    monkeypatch.setattr(nax, "_header_failed", False)
+    monkeypatch.setattr(nax, "_act_header_failed", False)
+    monkeypatch.setattr(nax, "_read_mlx_headers", lambda paths: None)
+    face = _toy("racing_headers")
+
+    def build():
+        if kind == "face":
+            return nax._face_kernel(face)
+        if kind == "face_act":
+            return nax._face_kernel(face, "act")
+        return nax._get_kernel(kind)
+
+    with (
+        caplog.at_level(logging.WARNING, logger=nax.__name__),
+        ThreadPoolExecutor(max_workers=2) as pool,
+    ):
+        calls = [pool.submit(build) for _ in range(2)]
+        assert [call.result() for call in calls] == [None, None]
+    assert len(caplog.records) == 1
+    assert "disabled" in caplog.records[0].getMessage()
+
+
+def test_two_builders_publish_one_affine_kernel(monkeypatch):
+    key = ("affine", 8, 64, mx.bfloat16, "act_map")
+    barrier = threading.Barrier(2, timeout=10)
+    thread = threading.local()
+    publications = []
+
+    class ColdCache(dict):
+        def get(self, k):
+            entry = super().get(k)
+            if k == key and entry is None and not getattr(thread, "saw_miss", False):
+                thread.saw_miss = True
+                barrier.wait()
+            return entry
+
+        def __setitem__(self, k, value):
+            if k == key:
+                publications.append(value)
+            super().__setitem__(k, value)
+
+    monkeypatch.setattr(nax, "_kernels", ColdCache())
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        calls = [pool.submit(nax._affine_kernel, *key[1:]) for _ in range(2)]
+        first, second = (call.result() for call in calls)
+    assert first is second and first is not None
+    assert publications == [first]
+
+
+def test_the_affine_kernels_read_the_affine_tile_face(monkeypatch):
     monkeypatch.setattr(nax, "_kernels", {})
     faces = []
     face_kernel = nax._face_kernel
-    monkeypatch.setattr(
-        nax, "_face_kernel", lambda face: faces.append(face) or face_kernel(face)
-    )
+
+    def recorded(face, kind="plain"):
+        faces.append((face, kind))
+        return face_kernel(face, kind)
+
+    monkeypatch.setattr(nax, "_face_kernel", recorded)
     E, N, K = len(_COUNTS), 128, 256
     for bits, gs, dtype in [(4, 64, mx.bfloat16), (8, 32, mx.float16)]:
         wq, scales, biases, _ = _quantized(E, N, K, "affine", bits, gs, dtype)
         x, idx = _rows(_COUNTS, K, dtype)
-        nax.sorted_gather_qmm(
-            x, wq, scales, biases, idx, group_size=gs, bits=bits, verify=False
-        )
+        kw = dict(group_size=gs, bits=bits, verify=False)
+        nax.sorted_gather_qmm(x, wq, scales, biases, idx, **kw)
+        nax.sorted_gather_qmm_swiglu(x, wq, scales, biases, idx, **kw)
+        row_map = mx.arange(int(idx.shape[0]), dtype=mx.uint32)
+        nax.sorted_gather_qmm_swiglu(x, wq, scales, biases, idx, row_map=row_map, **kw)
     assert faces == [
-        affine_format.tile_face(4, 64, mx.bfloat16),
-        affine_format.tile_face(8, 32, mx.float16),
+        (affine_format.tile_face(bits, gs, dtype), kind)
+        for bits, gs, dtype in [(4, 64, mx.bfloat16), (8, 32, mx.float16)]
+        for kind in ("plain", "act", "act_map")
     ]
+
+
+@needs_nax
+@pytest.mark.parametrize("plan", _PLANS, ids=_plan_id)
+@pytest.mark.parametrize("limit", [None, 10.0])
+@pytest.mark.parametrize("mapped", [False, True], ids=["rows", "row-map"])
+def test_a_tile_face_runs_through_the_epilogues(mapped, limit, plan):
+    """The toy face's fused [gate; up] rows through the activation epilogue
+    are its plain kernel's, split, then the models' activation, bit for bit;
+    through the row map, the same on the token rows the map names."""
+    if plan.sched == DB and plan.bk != 64:
+        plan = plan._replace(sched=SEG)  # as sorted_gather_qmm_swiglu does
+    k = 256
+    operands, _ = _toy_stack(len(_COUNTS), 128, k, mx.bfloat16, seed=11)
+    x, idx = _wide_rows(_COUNTS, k, mx.bfloat16)
+    face = _toy("nax_epi")
+    row_map = None
+    ref_x = x
+    if mapped:
+        rows = int(idx.shape[0])
+        tokens = rows // 3
+        x = x[:tokens]
+        row_map = (mx.arange(rows, dtype=mx.uint32) * 7 + 3) % tokens
+        ref_x = x[row_map]
+    plain = nax._launch_face(nax._face_kernel(face), ref_x, operands, idx, plan, None)
+    gate, up = mx.split(plain, 2, axis=-1)
+    ref = nax.reference_activation(up, gate, limit)
+    epi = nax._EPI_SWIGLU if limit is None else nax._EPI_CLAMPED
+    kernel = nax._face_kernel(face, "act_map" if mapped else "act")
+    out = nax._launch_face(kernel, x, operands, idx, plan, None, epi, limit, row_map)
+    _assert_bitwise(out, ref)
 
 
 @needs_nax
@@ -1150,6 +1324,9 @@ def test_fused_gate_up_activation_reads_token_rows(installed, launches, monkeypa
     x_tok, row_map, idx, _ = sort_routes(mx.expand_dims(h, (-2, -3)), inds)
     x = x_tok[row_map]
     act = SwiGLU()
+    # The self-tests of this K's kernels launch their canaries once, first.
+    patch_mod.fused_gate_up_activation(proj, x, idx, act, token_rows=(x_tok, row_map))
+    del launches[:]
     got = patch_mod.fused_gate_up_activation(
         proj, x, idx, act, token_rows=(x_tok, row_map)
     )
@@ -1649,3 +1826,34 @@ def test_a_tile_face_with_a_table_runs_the_sorted_gather_to_the_bit(plan):
         nax._face_kernel(tabled_tile(face)), x, operands, idx, plan, None
     )
     _assert_bitwise(got, want)
+
+
+@needs_nax
+@pytest.mark.parametrize("mapped", [True, False], ids=["mapped", "materialized"])
+@pytest.mark.parametrize(
+    "plan", [P(DB, 96, 64, 32, 0), P(SEG, 128, 128, 32, 8192)], ids=_plan_id
+)
+def test_fused_gathers_stage_the_faces_table(plan, mapped):
+    from tests.test_formats_tables import tabled_tile
+
+    k = 256
+    dtype = mx.bfloat16
+    wq, scales, biases, _ = _quantized(len(_COUNTS), 256, k, "affine", 4, 64, dtype)
+    ops = wq, scales, biases
+    x, idx = _wide_rows(_COUNTS, k, dtype)
+    row_map = None
+    ref_x = x
+    if mapped:
+        tokens = idx.size // 3
+        x = x[:tokens]
+        row_map = (mx.arange(idx.size, dtype=mx.uint32) * 7 + 3) % tokens
+        ref_x = x[row_map]
+    face = affine_format.tile_face(4, 64, dtype)
+    plain = nax._launch_face(nax._face_kernel(face), ref_x, ops, idx, plan, None)
+    gate, up = mx.split(plain, 2, axis=-1)
+    limit = None if mapped else 10.0
+    ref = nax.reference_activation(up, gate, limit)
+    kernel = nax._face_kernel(tabled_tile(face), "act_map" if mapped else "act")
+    epi = nax._EPI_SWIGLU if mapped else nax._EPI_CLAMPED
+    got = nax._launch_face(kernel, x, ops, idx, plan, None, epi, limit, row_map)
+    _assert_bitwise(got, ref)

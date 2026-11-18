@@ -381,7 +381,7 @@ _TILE_ROWS = r"""
 _TILE_ROWS_HEADER = r"""
 template <typename T, int K, typename F>
 METAL_FUNC void omlx_tile_rows(
-    F m, size_t row, int w, device float* w32, device T* wt) {
+    const F m, size_t row, int w, device float* w32, device T* wt) {
   if constexpr (omlx_tile_face<F, K>::value) {
     using R = typename F::template Runs<K>;
     constexpr int GROUPS = (K - 1) / R::GROUP + 1;
@@ -392,7 +392,9 @@ METAL_FUNC void omlx_tile_rows(
     c[0] = runs.fetch((w / R::RUN + 1) % (K / R::RUN));
     p[1] = runs.params(w / R::GROUP);
     c[1] = runs.fetch(w / R::RUN);
-    const float v = R::weight(p[1], c[1], w % R::RUN);
+    thread const auto& params = p[1];
+    thread const auto& codes = c[1];
+    const float v = R::weight(params, codes, w % R::RUN);
     *w32 = v;
     *wt = static_cast<T>(v);
   }
@@ -421,7 +423,8 @@ def tile_rows(
 
     ``operands`` are the matrix's weight and the face's tensors, in order.
     ``rows`` are the rows' indices (in a stack, the row ``n`` of matrix
-    ``e`` is ``e * N + n``), none past the matrix's (which is not checked).
+    ``e`` is ``e * N + n``). Each index is an int in [0, 2**63) and names
+    a row of the matrix (the matrix bound is unchecked).
     K is an int, a whole number of runs of 8 below 2^31. Returns the weights
     twice, each array of shape ``(len(rows), k)``: as ``weight`` gives them,
     in float32, and rounded once to ``dtype`` (float32, float16 or bfloat16,
@@ -435,12 +438,16 @@ def tile_rows(
         raise ValueError(f"{face!r} is not a Tile")
     if not (isinstance(k, int) and 0 < k < 1 << 31 and k % 8 == 0):
         raise ValueError(f"k={k} is not one run or more of 8 inputs")
-    rows = list(rows)
+    try:
+        rows, operands = list(rows), tuple(operands)
+    except TypeError as error:
+        raise ValueError(f"rows and operands are sequences: {error}") from None
     if not rows or not all(
-        isinstance(r, int) and not isinstance(r, bool) and r >= 0 for r in rows
+        isinstance(r, int) and not isinstance(r, bool) and 0 <= r < 1 << 63
+        for r in rows
     ):
         raise ValueError(f"rows={rows} are not one row index or more")
-    operands, names = tuple(operands), ("weight", *face.tensors)
+    names = ("weight", *face.tensors)
     if len(operands) != len(names):
         raise ValueError(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
@@ -451,6 +458,8 @@ def tile_rows(
         exact = ", ".join(str(exact) for exact in face.dtypes)
         raise ValueError(f"face {face.key} is exact for {exact}, not {dtype}")
     for name, operand in zip(names, operands, strict=True):
+        if not isinstance(operand, mx.array):
+            raise ValueError(f"face {face.key}: {name} is not an mx.array")
         if operand.size < 8:
             raise ValueError(
                 f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
