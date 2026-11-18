@@ -480,7 +480,7 @@ def _refuse_family(checkpoint: _Checkpoint) -> None:
         return
     from .. import oq
 
-    refused = oq._unverified_family(checkpoint.path, config, served=False)
+    refused = oq._unverified_family(checkpoint.path, config)
     if refused is not None:
         family, why = refused
         raise _refused(

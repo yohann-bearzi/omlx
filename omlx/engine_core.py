@@ -289,7 +289,10 @@ def get_mlx_executor() -> concurrent.futures.ThreadPoolExecutor:
 def shutdown_mlx_executor() -> None:
     """Shut down the global MLX worker after clearing its thread-local streams."""
     global _global_mlx_executor
-    executor = _global_mlx_executor
+    # Taken under the lock its first callers make it under: a caller after
+    # this makes a new one, none gets the one being shut down.
+    with _GLOBAL_MLX_EXECUTOR_LOCK:
+        executor, _global_mlx_executor = _global_mlx_executor, None
     if executor is None:
         return
 
@@ -311,7 +314,6 @@ def shutdown_mlx_executor() -> None:
             fatal_exit(f"Global MLX executor teardown failed: {exc!r}")
 
     executor.shutdown(wait=False)
-    _global_mlx_executor = None
 
 
 @dataclass

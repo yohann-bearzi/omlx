@@ -55,7 +55,7 @@ def verified():
     """The toy checkpoint's family taken as verified: oMLX patches Qwen3.5
     MoE on an mlx-vlm load, and oQ writes a family it patches in a format
     only once the family is verified."""
-    with testing.verified("qwen3_5_moe", "qwen3_5_moe_text"):
+    with testing.verified("llama", "qwen3_5_moe", "qwen3_5_moe_text"):
         yield
 
 
@@ -746,10 +746,7 @@ _GLM5_NEXT = (
 
 
 _DEEPSEEK_V4 = "its DSpark draft reads the output head's weight by hand, as floats"
-_NOT_VERIFIED = (
-    "it is no family served by mlx-lm's own code that oMLX proves it does not "
-    "patch, nor one verified with quant formats end to end"
-)
+_NOT_VERIFIED = "it is no family verified with quant formats end to end"
 # The page quotes these of the same family, or of one of their kind.
 _PAGE_FAMILY = {"glm5_next_text": "glm5_next", "deepseek_v4_mtp": "deepseek_v4"}
 # The pages quote the refusals of these families.
@@ -898,233 +895,30 @@ def test_a_family_neither_stock_nor_verified_is_refused(
     assert not output.exists() and toy.offered == []
 
 
-@pytest.mark.parametrize(
-    "name, config, why",
-    [
-        (
-            "jina-code-embeddings-1.5b",
-            {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]},
-            "oMLX serves it with its embedding engine, not as an LLM of mlx-lm's "
-            "own code",
-        ),
-        (
-            "source",
-            {"model_type": "llama", "vision_config": {"model_type": "siglip"}},
-            "oMLX serves it with its vlm engine, not as an LLM of mlx-lm's own code",
-        ),
-        (
-            "source",
-            {"model_type": "llama", "dflash_config": {}},
-            "it is a draft model, which oMLX serves beside another",
-        ),
-        (
-            "source",
-            {"model_type": "qwen2", "model_file": "arch.py"},
-            "it builds its architecture from a file of its own (model_file)",
-        ),
-    ],
-    ids=["an embedding model", "a vision model", "a draft", "its own code"],
-)
-def test_a_stock_family_is_written_in_a_format_only_as_an_llm(
-    toy, tmp_path, name, config, why
-):
-    _refused_as_served(tmp_path, tmp_path / name, "refused", config, why)
-
-
-def test_a_stock_family_is_written_only_as_its_output_is_served(toy, tmp_path):
-    # Model discovery reads a directory's name: the output's is the served one.
-    config = {"model_type": "qwen2", "architectures": ["Qwen2ForCausalLM"]}
-    why = (
-        "oMLX serves it with its embedding engine, not as an LLM of mlx-lm's "
-        "own code"
-    )
-    output = "jina-code-embeddings-1.5b-oq4"
-    _refused_as_served(tmp_path, tmp_path / "source", output, config, why)
-    # One whose model discovery skips it (an architecture it does not serve).
-    unserved = ["Florence2ForConditionalGeneration"]
-    config = {"model_type": "qwen2", "architectures": unserved}
-    why = "oMLX's model discovery registers no model of it"
-    _refused_as_served(tmp_path, tmp_path / "skipped", "refused2", config, why)
-
-
-def _refused_as_served(tmp_path, source, output, config, why):
-    source.mkdir(exist_ok=True)
-    (source / "config.json").write_text(json.dumps(config))
-    (source / "model.safetensors").write_bytes(b"not a checkpoint")
-    output = tmp_path / output
-    with pytest.raises(formats.FormatRefusedError) as refusal:
-        oq.quantize_oq_streaming(
-            str(source), str(output), 4, enhanced=True, quant_format="toy"
-        )
-    assert refusal.value.reason == (
-        f"oQ writes no {config['model_type']} checkpoint in it: {why}; write it "
-        "without a quant format, or have the family verified"
-    )
-    assert not output.exists()
-
-
 def test_the_families_oq_writes_in_a_format(tmp_path):
-    stock = {"llama", "mistral", "qwen2", "phi3", "starcoder2", "olmo2"}
-    assert set(oq._QUANT_FORMAT_STOCK) == stock
-    # None is verified yet: Qwen3.8 Flash-Next enters with the run that
-    # verifies it.
-    assert not _VERIFIED
+    # Verified ones only, and none is yet: Qwen3.8 Flash-Next enters with the
+    # run that verifies it. Families mlx-lm's own code serves come back after
+    # the proof of concept (DEFERRED.md row 19).
+    assert not _VERIFIED and not hasattr(oq, "_QUANT_FORMAT_STOCK")
     source = tmp_path / "source"
     source.mkdir()
-    # Model discovery registers a directory with weights.
-    (source / "model.safetensors").write_bytes(b"not a checkpoint")
 
     def unverified(config):
-        (source / "config.json").write_text(json.dumps(config))
         return oq._unverified_family(source, config)
 
-    for model_type in ("llama", "Mistral", "qwen2", "PHI3", "starcoder2", "olmo2"):
-        assert unverified({"model_type": model_type}) is None
-    # A text model of a stock family under a stock top level.
-    text = {"model_type": "llama", "text_config": {"model_type": "mistral"}}
-    assert unverified(text) is None
-    # A verified family, top level or text model.
-    nested = {"model_type": "llama", "text_config": {"model_type": "qwen4_exp"}}
-    with testing.verified("Qwen4-Exp"):
+    # (This file's tests take llama as verified, for their tiny checkpoints.)
+    for model_type in ("Mistral", "qwen2", "PHI3", "starcoder2", "olmo2"):
+        assert unverified({"model_type": model_type})[1] == _NOT_VERIFIED
+    # A verified family, top level or text model, under any spelling.
+    nested = {"model_type": "mistral", "text_config": {"model_type": "qwen4_exp"}}
+    with testing.verified("Qwen4-Exp", "mistral"):
         assert unverified({"model_type": "qwen4_exp"}) is None
         assert unverified(nested) is None
-    # Not after the block.
-    assert unverified(nested)[0] == "qwen4_exp"
+    # Not after the block; nor a verified text model under another top level.
+    assert unverified(nested)[0] == "mistral"
+    with testing.verified("qwen4_exp"):
+        assert unverified(nested)[0] == "mistral"
     assert unverified({"model_type": "qwen3"}) == ("qwen3", _NOT_VERIFIED)
-
-
-# What every family oMLX serves runs of oMLX's patches, whichever it is:
-# the entry points applied at every load and the model-independent routes a
-# forward takes. A family's own patch is none of them.
-_EVERY_LOAD = {
-    "arrays_cache_extract.py:apply_arrays_cache_extract_guard",
-    "arrays_cache_metadata.py:apply_arrays_cache_metadata_patch",
-    "batched_decode_qmm.py:apply_batched_decode_qmm_patch",
-    "format_load.py:apply_format_load_patch",
-    "m5_gather_qmm.py:apply_m5_gather_qmm_workaround",
-    # These walk any model the engine loads, and fuse MoE switch layers only.
-    "moe_gate_up_fusion.py:apply_moe_gate_up_fusion",
-    "moe_gate_up_fusion.py:apply_switch_glu_gate_up_fusion",
-    "qwen35_moe_gate_up.py:apply_qwen35_moe_gate_up_fusion",
-    "qwen35_fa256_attention.py:apply_qwen35_fa256_attention_patch",
-    "qwen35_moe_router.py:apply_qwen35_moe_router_patch",
-    "qwen35_moe_weighted_sum.py:apply_qwen35_moe_weighted_sum_patch",
-    "qwen35_q4_mlp.py:apply_qwen35_q4_lm_prefill_linear_patch",
-    "qwen35_q4_mlp.py:apply_qwen35_q4_mlp_patch",
-    "qwen35_ragged_decode.py:apply_qwen35_ragged_decode_patch",
-    "qwen35_yarn.py:apply_qwen35_yarn_patch",
-    "sdpa256_attention.py:apply_sdpa256_attention_patch",
-}
-_EVERY_FORWARD = {
-    # Every MLX quantized layer's call, whatever the model.
-    "batched_decode_qmm.py:patched_call",
-    "sdpa256_attention.py:_over_vector_thread_limit",
-    "sdpa256_attention.py:_should_route",
-    "sdpa256_attention.py:patched_sdpa",
-}
-# The model type each stock family is served as, and what its tiny config
-# needs beside the common one.
-_STOCK = {
-    "llama": ("llama", {}),
-    "mistral": ("llama", {}),
-    "qwen2": ("qwen2", {}),
-    "phi3": ("phi3", {}),
-    "starcoder2": ("starcoder2", {}),
-    "olmo2": ("olmo2", {}),
-}
-
-
-# Run in a process of its own, as a server that starts and serves the
-# checkpoint: what another test applied (a family's loader patched into the
-# process) is not the family's.
-_SERVE = textwrap.dedent("""
-    import asyncio, json, sys, threading
-    from pathlib import Path
-    import mlx.core as mx
-    import omlx
-    from omlx.engine.batched import BatchedEngine
-
-    patches = str(Path(omlx.__file__).parent / "patches")
-    loads, forwards = set(), set()
-    seen = {"phase": loads}
-
-    def record(frame, event, arg):
-        code = frame.f_code
-        if seen["phase"] is forwards and (
-            threading.current_thread() is not threading.main_thread()
-        ):
-            # The engine's own threads, not the model's forward.
-            return
-        if event == "call" and code.co_filename.startswith(patches):
-            where = f"{code.co_filename[len(patches) + 1:]}:{code.co_name}"
-            if seen["phase"] is forwards or code.co_name.startswith(
-                ("apply_", "configure_", "install_", "enable_", "patch_")
-            ):
-                seen["phase"].add(where)
-
-    engine = BatchedEngine(sys.argv[1])
-    # This thread's, and the threads the engine loads on.
-    sys.setprofile(record)
-    threading.setprofile(record)
-    asyncio.run(engine.start())
-    seen["phase"] = forwards
-    mx.eval(engine._model(mx.array([[1, 2, 3]])))
-    sys.setprofile(None)
-    asyncio.run(engine.stop())
-    print(json.dumps({"loads": sorted(loads), "forwards": sorted(forwards)}))
-""")
-
-
-@pytest.mark.parametrize("quantized", [False, True], ids=["floats", "quantized"])
-@pytest.mark.parametrize("family", sorted(_STOCK))
-def test_omlx_patches_no_stock_family(tmp_path, family, quantized):
-    import importlib
-    import subprocess
-    import sys
-
-    from omlx.model_discovery import detect_model_type
-
-    assert set(_STOCK) == oq._QUANT_FORMAT_STOCK
-    module_name, extra = _STOCK[family]
-    config = {
-        "model_type": family,
-        "hidden_size": 64,
-        "num_hidden_layers": 2,
-        "intermediate_size": 128,
-        "num_attention_heads": 2,
-        "num_key_value_heads": 2,
-        "rms_norm_eps": 1e-5,
-        "vocab_size": 64,
-        "max_position_embeddings": 128,
-        "rope_theta": 10000.0,
-        "tie_word_embeddings": False,
-        **extra,
-    }
-    module = importlib.import_module(f"mlx_lm.models.{module_name}")
-    model = module.Model(module.ModelArgs.from_dict(config))
-    if quantized:
-        # As oQ writes it: MLX's affine layers, which oMLX's kernels serve.
-        nn.quantize(model, group_size=64, bits=4)
-        config["quantization"] = {"group_size": 64, "bits": 4}
-    weights = dict(tree_flatten(model.parameters()))
-    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    (tmp_path / "config.json").write_text(json.dumps(config))
-    _save_tokenizer(tmp_path, config["vocab_size"])
-    # oMLX serves it as an LLM, by its engine's own start.
-    assert detect_model_type(tmp_path) == "llm"
-    served = subprocess.run(
-        [sys.executable, "-c", _SERVE, str(tmp_path)],
-        capture_output=True,
-        text=True,
-        check=True,
-        cwd=Path(oq.__file__).parents[1],
-    )
-    ran = json.loads(served.stdout.strip().splitlines()[-1])
-    # No patch of oMLX's but those every family gets ran for it.
-    loads, forwards = set(ran["loads"]), set(ran["forwards"])
-    assert loads <= _EVERY_LOAD, sorted(loads - _EVERY_LOAD)
-    assert forwards <= _EVERY_FORWARD, sorted(forwards - _EVERY_FORWARD)
-    assert "format_load.py:apply_format_load_patch" in loads
 
 
 def test_a_verified_decision_family_is_written_whatever_its_backbone(tmp_path):
@@ -1219,11 +1013,8 @@ def llama_source(tmp_path_factory):
     return path
 
 
-def test_a_model_omlx_does_not_patch_is_written_in_a_format(
-    llama_source, toy, tmp_path
-):
-    # Written as a stock family, whatever is verified.
-    assert "llama" in oq._QUANT_FORMAT_STOCK
+@testing.verified("llama")
+def test_a_verified_model_is_written_in_a_format(llama_source, toy, tmp_path):
     output = tmp_path / "oqe-toy"
     _, config, applied = _quantize(llama_source, output, quant_format="toy")
     # Each layer's seven linears.
@@ -1530,36 +1321,18 @@ def _checkpoint(path, config, tensors=("model.embed_tokens.weight",)):
     "config, library",
     [
         ({"model_type": "llama"}, "mlx-lm"),
-        # mlx-vlm serves this one without a vision config, as a text-only
-        # run of it writes it.
-        ({"model_type": "lfm3_audio"}, "mlx-vlm"),
         ({"model_type": "qwen3_vl", "vision_config": {"depth": 1}}, "mlx-vlm"),
-        # A text-only Gemma 4 is served by mlx-lm, unless it has an MTP head.
-        ({"model_type": "gemma4_unified"}, "mlx-lm"),
-        (
-            {
-                "model_type": "gemma4",
-                "text_config": {"mtp_assistant_config": {"num_layers": 1}},
-            },
-            "mlx-vlm",
-        ),
     ],
-    ids=["llama", "lfm3_audio", "qwen3_vl", "gemma4_unified", "gemma4 with MTP"],
+    ids=["llama", "qwen3_vl"],
 )
-def test_the_walk_builds_the_model_with_the_library_that_serves_it(
+def test_the_walk_builds_the_model_with_the_library_of_the_calibration(
     tmp_path, monkeypatch, config, library
 ):
-    from omlx.model_discovery import _register_model
-
     calls, model = _stub_loaders(monkeypatch)
     source = _checkpoint(tmp_path / "source", config)
     walked = oq._module_classes(str(source), config)
     ((loaded, thread, kwargs, given, index),) = calls
-    # As oMLX's model discovery registers the checkpoint.
-    found = {}
-    _register_model(found, source, "source")
     assert loaded == library
-    assert found["source"].engine_type == ("vlm" if library == "mlx-vlm" else "batched")
     # Lazily, unchecked, on the thread the engines load models on; the
     # model is let go of.
     assert kwargs["lazy"] is True and kwargs["strict"] is False
@@ -1568,15 +1341,6 @@ def test_the_walk_builds_the_model_with_the_library_that_serves_it(
     # The view: the source's files but its weights and config, and an index
     # declaring the source's tensors.
     assert index == {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
-
-
-def test_the_walk_is_of_models_the_llm_and_vlm_engines_serve(tmp_path, monkeypatch):
-    calls, _ = _stub_loaders(monkeypatch)
-    config = {"model_type": "bert", "architectures": ["BertModel"]}
-    source = _checkpoint(tmp_path / "source", config)
-    with pytest.raises(ValueError, match="with 'embedding'"):
-        oq._module_classes(str(source), config)
-    assert calls == []
 
 
 def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
@@ -1600,31 +1364,6 @@ def test_the_walk_declares_the_source_s_tensors_whatever_its_files(
     oq._module_classes(str(source), config)
     assert calls[-1][4] == {"weight_map": {"model.norm.weight": "model.safetensors"}}
     assert json.loads((source / "model.safetensors.index.json").read_text()) == index
-
-
-def test_the_walk_s_view_is_named_as_served_with_a_decision_s_sidecars(
-    tmp_path, monkeypatch
-):
-    _stub_loaders(monkeypatch)
-    config = {"model_type": "llama"}
-    source = _checkpoint(tmp_path / "source", config)
-    (source / "joint_head.safetensors").write_bytes(b"")
-    views = []
-
-    def served_by_vlm(view):
-        views.append((view.name, sorted(item.name for item in view.iterdir())))
-        return False
-
-    monkeypatch.setattr(oq, "_served_by_vlm", served_by_vlm)
-    oq._module_classes(str(source), config, served_as="tiny-oq4")
-    oq._module_classes(str(source), config)
-    files = [
-        "config.json",
-        "joint_head.safetensors",
-        "model.safetensors",
-        "model.safetensors.index.json",
-    ]
-    assert views == [("tiny-oq4", files), ("source", files)]
 
 
 def test_one_mlx_executor_whoever_asks_first(monkeypatch):

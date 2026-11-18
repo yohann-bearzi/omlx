@@ -67,7 +67,6 @@ from omlx.model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
-    is_helper_model_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -6899,17 +6898,11 @@ def _row_chunks(t, max_elems):
         yield chunk
 
 
-# The families oQ writes in a quant format; every other is refused, under
-# any spelling (lower case, "-" for "_"): the gate fails closed.
-# STOCK: families oMLX serves with mlx-lm's own code and applies no patch of
-# its own to, each proven by a test that serves a tiny checkpoint of it and
-# records every patch that runs (tests/test_formats_oq.py).
-_QUANT_FORMAT_STOCK: frozenset[str] = frozenset(
-    {"llama", "mistral", "qwen2", "phi3", "starcoder2", "olmo2"}
-)
-# VERIFIED: families oMLX serves with code of its own (patches, its own
-# models, a decision model's) that quant formats are verified with end to
-# end; a family enters with the run that verifies it.
+# The families oQ writes, and oMLX loads, in a quant format: those verified
+# with quant formats end to end (a family enters with the run that verifies
+# it). Every other is refused, under any spelling (lower case, "-" for "_"):
+# the gate fails closed. Families served by mlx-lm's own code alone come back
+# after the proof of concept (DEFERRED.md row 19).
 _QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
 # The families tests take as verified (omlx.formats.testing.verified), while
 # one of their blocks is open, in any thread.
@@ -6993,18 +6986,12 @@ def _family(name: str) -> str:
     return name.lower().replace("-", "_")
 
 
-def _unverified_family(
-    source: Path, config: dict, served_as: str | None = None, *, served: bool = True
-) -> tuple[str, str] | None:
-    """(family, why) when oQ writes the checkpoint at ``source`` in no quant
-    format: one whose config names no model type; a decision model whose
-    family is not verified; a model whose type (or its text model's) is
-    neither a stock family nor a verified one, with what the audits found
-    its own code to read wrongly when they did; or one of a stock family
-    that oMLX does not serve as an LLM of mlx-lm's own code, from the source
-    or from a directory named ``served_as`` (the output's name: model
-    discovery reads a directory's name). Without ``served``, the family
-    alone (a load: the engine loading it is the one that serves it)."""
+def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
+    """(family, why) when the checkpoint at ``source`` takes no quant format:
+    one whose config names no model type; a decision model whose family is
+    not verified; or a model whose type (or its text model's) is not a
+    verified family, with what the audits found its own code to read
+    wrongly when they did."""
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
@@ -7028,58 +7015,12 @@ def _unverified_family(
         if family in _QUANT_FORMAT_MISREAD and family not in verified:
             return family, _QUANT_FORMAT_MISREAD[family]
     for family in families:
-        if family not in _QUANT_FORMAT_STOCK and family not in verified:
+        if family not in verified:
             return family, _NOT_VERIFIED
-    stock = [family for family in families if family not in verified]
-    if stock and served:
-        # A stock family is proven as an LLM that mlx-lm's own code builds,
-        # and only so.
-        why = None
-        if config.get("model_file") is not None:
-            why = "it builds its architecture from a file of its own (model_file)"
-        elif is_helper_model_config(config):
-            why = "it is a draft model, which oMLX serves beside another"
-        else:
-            engines = [_served_engine(source)]
-            if served_as not in (None, source.name):
-                engines.append(_served_engine(source, served_as))
-            engine = next((e for e in engines if e != "batched"), "batched")
-            if engine is None:
-                why = "oMLX's model discovery registers no model of it"
-            elif engine != "batched":
-                why = (
-                    f"oMLX serves it with its {engine} engine, not as an LLM of "
-                    "mlx-lm's own code"
-                )
-        if why is not None:
-            return stock[0], why
     return None
 
 
-def _served_engine(path: Path, name: str | None = None) -> str | None:
-    """The engine oMLX's model discovery registers the checkpoint at ``path``
-    for (``batched``, its LLM engine; ``vlm``; ``embedding``...), or None
-    when it registers none; under ``name``, a directory of links to its
-    files named so, when given."""
-    from omlx.model_discovery import _register_model
-
-    found = {}
-    if name is None:
-        _register_model(found, path, "served")
-    else:
-        with tempfile.TemporaryDirectory(prefix="omlx-oq-served-") as directory:
-            view = Path(directory) / name
-            view.mkdir()
-            for item in path.iterdir():
-                (view / item.name).symlink_to(item.absolute())
-            _register_model(found, view, "served")
-    return found["served"].engine_type if "served" in found else None
-
-
-_NOT_VERIFIED = (
-    "it is no family served by mlx-lm's own code that oMLX proves it does not "
-    "patch, nor one verified with quant formats end to end"
-)
+_NOT_VERIFIED = "it is no family verified with quant formats end to end"
 
 
 def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
@@ -7449,7 +7390,7 @@ def quantize_oq_streaming(
             "format"
         )
     if quant_fmt is not None:
-        refused = _unverified_family(source, config, Path(output_path).name)
+        refused = _unverified_family(source, config)
         if refused is not None:
             raise FormatRefusedError(
                 f"oQ writes no {refused[0]} checkpoint in it: {refused[1]}; write "
@@ -8074,7 +8015,6 @@ def quantize_oq_streaming(
         module_classes = _module_classes(
             model_path,
             written,
-            served_as=Path(output_path).name,
             trust_remote_code=trust_remote_code,
         )
     start_time = _time.monotonic()
@@ -11616,9 +11556,7 @@ def _written_layout(
     return written
 
 
-def _module_classes(
-    model_path, config, *, served_as=None, trust_remote_code=False
-) -> dict:
+def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
     """``(class, loads, shape)`` of each module of the model that a checkpoint
     written with ``config`` loads as, by its path, which is the name the
     checkpoint keeps its matrix under: the module's class (its module and
@@ -11630,7 +11568,8 @@ def _module_classes(
     file of weights, and an index declaring each tensor the source holds
     (mlx-vlm drops a module beside the language model that no weight is
     declared for, so a module the source holds, an MTP head, is kept). It is
-    built by the library of the engine oMLX serves the view with, with the
+    built by the library oQe's calibration loads the source with (a verified
+    family's verification proves it is the one that serves it), with the
     source's pre-load patches, on the thread the engines load on (see
     ``_walk_model``): no weight is read, no tokenizer loaded, and the
     process-wide state the patches set is kept as it was. With no weight
@@ -11641,14 +11580,10 @@ def _module_classes(
 
     source = Path(model_path)
     with tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory:
-        # Named as the checkpoint is served (model discovery reads a
-        # directory's name), with a decision model's sidecars.
-        view = Path(directory) / (served_as or source.name)
-        view.mkdir()
+        view = Path(directory)
         for item in source.iterdir():
-            if item.name in DECISION_SIDECAR_WEIGHTS or (
-                item.name != "config.json"
-                and not item.name.endswith((".safetensors", ".safetensors.index.json"))
+            if item.name != "config.json" and not item.name.endswith(
+                (".safetensors", ".safetensors.index.json")
             ):
                 (view / item.name).symlink_to(item.absolute())
         (view / "config.json").write_text(json.dumps(config))
@@ -11696,19 +11631,6 @@ def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool)
         # Without MiMo's MTP sidecar, which the model's sanitize would read.
         override = _sensitivity_lm_config_override(config)
         return lm_utils.load_model(view, model_config=override, **built)[0]
-
-
-def _served_by_vlm(view: Path) -> bool:
-    """Whether oMLX serves the checkpoint at ``view`` with its VLM engine
-    (mlx-vlm's model), as its model discovery registers it, rather than its
-    LLM engine (mlx-lm's)."""
-    engine = _served_engine(view)
-    if engine not in ("vlm", "batched"):
-        raise ValueError(
-            f"oQ writes a quant format's layers only for a model oMLX serves "
-            f"with its LLM or VLM engine; it serves this one with {engine!r}"
-        )
-    return engine == "vlm"
 
 
 def _on_mlx_thread(load):
@@ -11762,7 +11684,7 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
         maybe_apply_pre_load_patches,
     )
 
-    is_vlm = _is_vlm_load(config) if walk is None else _served_by_vlm(walk)
+    is_vlm = _is_vlm_load(config)
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
     calibration_settings = _calibration_model_settings(

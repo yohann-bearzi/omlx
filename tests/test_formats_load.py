@@ -147,6 +147,14 @@ def _loaders():
     return found
 
 
+@pytest.fixture(autouse=True)
+def verified():
+    """The tiny checkpoints' family taken as verified: oMLX loads a format's
+    checkpoint only of a verified family."""
+    with testing.verified("llama"):
+        yield
+
+
 @pytest.fixture
 def toy(unpatched, monkeypatch):
     """The load patch, over a registry with the toy format."""
@@ -389,8 +397,7 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
         (
             "brand-new",
             "brand_new",
-            "it is no family served by mlx-lm's own code that oMLX proves it does "
-            "not patch, nor one verified with quant formats end to end",
+            "it is no family verified with quant formats end to end",
         ),
     ],
 )
@@ -2396,6 +2403,7 @@ import json, sys
 from pathlib import Path
 
 from omlx import formats
+from omlx.formats import testing
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 from tests.test_formats_load import _gate_proj, _Levels
 
@@ -2403,7 +2411,9 @@ fmt = _Levels([0.0])
 fmt.reads = lambda record: _Levels(record["levels"])
 formats.register(fmt)
 maybe_apply_pre_load_patches(sys.argv[1])
-loaded = load_model(Path(sys.argv[1]))
+# The tiny checkpoint's family, taken as verified.
+with testing.verified("llama"):
+    loaded = load_model(Path(sys.argv[1]))
 model = loaded[0] if isinstance(loaded, tuple) else loaded
 print(json.dumps(_gate_proj(model).fmt.levels))
 """
