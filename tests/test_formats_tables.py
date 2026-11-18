@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from itertools import product
 from dataclasses import FrozenInstanceError, replace
+from itertools import product
 
 import mlx.core as mx
 import numpy as np
@@ -196,8 +196,9 @@ def _faces():
 
 
 def _builder_digest(monkeypatch) -> str:
-    """The digest of every Metal that the kernels over faces build for the
-    affine faces: each kernel's name, header and body, in one order."""
+    """The digest of every Metal that the served kernels over faces build
+    for the affine faces (the kit's own kernels left out): each kernel's
+    name, header and body, in one order."""
     recorded = []
 
     def record(**kwargs):
@@ -205,16 +206,17 @@ def _builder_digest(monkeypatch) -> str:
 
     monkeypatch.setattr(mx.fast, "metal_kernel", record)
     monkeypatch.setattr(nax, "_kernels", {})
+    # The served kernels' own text: MLX's headers, which the NAX kernels
+    # include, are MLX's to change.
+    monkeypatch.setattr(nax, "_read_mlx_headers", lambda names: "")
     faces = _faces()
     for face in faces:
         format_linear._kernel.__wrapped__(face, False)
         format_linear._kernel.__wrapped__(face, True)
         gather._kernel.__wrapped__(face)
         gather._ordered_kernel.__wrapped__(face)
-        testing._dot_rows_kernel.__wrapped__(face)
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
         tile = affine.tile_face(bits, group, dtype)
-        testing._tile_rows_kernel.__wrapped__(tile)
         nax._face_kernel(tile)
     shared, gate = affine.face(8, 128, True, mx.bfloat16), affine.face(
         8, 64, True, mx.bfloat16
@@ -236,7 +238,7 @@ def _builder_digest(monkeypatch) -> str:
 
 # The digest of the parent commit's kernels (699a215): what a face without
 # tables compiles is the same text, to the byte, so the same MLX library.
-_PARENT_DIGEST = "448 c5dcac9158d8f5cee71653d45cb31820f815db085d228decb50e9b6c59797dd4"
+_PARENT_DIGEST = "364 95c1d038a219f5048647899890be34d092ba7f95a46b064768dd0e1f8b30331f"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
@@ -350,14 +352,63 @@ def test_small_tables_are_values_read_by_selects_where_the_gpu_reads_them_so(
     assert four.staged_bytes == 0
 
 
-def test_a_gpu_with_tensor_units_stages_small_tables_and_one_without_selects(
-    monkeypatch,
-):
-    from omlx.custom_kernels.quant_matmul import fast
+def test_a_gpu_with_tensor_units_stages_small_tables_and_one_without_selects():
+    # The GPU's own generation, whatever MLX's kernels use: the M3 family
+    # (15) reads selects, the M5 family (17) stages, as does a GPU not named.
+    assert kernels._selects_for("applegpu_g15d")
+    assert kernels._selects_for("applegpu_g16s")
+    assert not kernels._selects_for("applegpu_g17s")
+    assert not kernels._selects_for("applegpu_g18p")
+    assert not kernels._selects_for("")
+    assert not kernels._selects_for("applegpu_g15")
+    architecture = mx.device_info()["architecture"]
+    assert kernels._small_tables_as_selects.__wrapped__() is kernels._selects_for(
+        architecture
+    )
 
-    for tensor_units in (True, False):
-        monkeypatch.setattr(fast, "is_nax_available", lambda t=tensor_units: t)
-        assert kernels._small_tables_as_selects() is (not tensor_units)
+
+def test_a_kernel_without_tables_does_not_ask_the_gpu(monkeypatch):
+    def asked():
+        raise AssertionError("asked")
+
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", asked)
+    matrices = kernels.Matrices()
+    matrices.add("p", _toy("none", ""))
+    assert "omlx_table<" not in matrices.header + matrices.declarations
+
+
+def test_the_values_form_is_defined_only_in_a_kernel_that_holds_one(form):
+    matrices = kernels.Matrices()
+    matrices.add("p", _toy("small3", "", Table("t", mx.float32, (1.0, 2.0, 3.0))))
+    assert ("struct omlx_table<T, N, true>" in matrices.header) is (form == "selects")
+
+
+@metal
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_an_index_past_a_small_table_reads_a_nan_as_values(monkeypatch, dtype):
+    """Selects read the index's two low bits: past a table of 3 values, a
+    floating-point table's fourth reads as a NaN, which a test sees."""
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: True)
+    tables = kernels.Tables()
+    at = tables.add(Table("t", dtype, (1.0, 2.0, 3.0)))
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_test_past_{dtype.size}_{str(dtype)[-4:]}",
+        input_names=["x"],
+        output_names=["y"],
+        header=tables.header,
+        source=tables.prologue
+        + f"    const auto t = {at};\n"
+        + "    y[thread_position_in_grid.x] = t[thread_position_in_grid.x] + x[0];\n",
+    )
+    (y,) = kernel(
+        inputs=[mx.zeros((8,), dtype=dtype)],
+        grid=(4, 1, 1),
+        threadgroup=(4, 1, 1),
+        output_shapes=[(4,)],
+        output_dtypes=[dtype],
+    )
+    assert y[:3].tolist() == [1.0, 2.0, 3.0]
+    assert mx.isnan(y[3]).item()
 
 
 def test_a_kernel_stages_at_most_4096_bytes_of_tables(staged):
@@ -376,13 +427,16 @@ def test_a_kernel_stages_at_most_4096_bytes_of_tables(staged):
     )
 
 
-@pytest.mark.parametrize("count,loop", [(32, False), (33, True)])
-def test_up_to_32_values_of_a_type_are_one_copy_a_thread(count, loop):
+@pytest.mark.parametrize("count,one", [(32, True), (33, False)])
+def test_up_to_32_values_of_a_type_are_one_copy_a_thread(count, one):
+    """Up to 32 values, a thread copies one, and a threadgroup of fewer
+    threads than values copies the rest in a loop that others skip."""
     matrices = kernels.Matrices()
     matrices.add("p", _toy("p", "", Table("a", mx.int16, (0,) * count)))
     body = matrices.declarations
-    assert ("for (uint i = thread_index_in_threadgroup" in body) == loop
-    assert (f"if (thread_index_in_threadgroup < {count}u)" in body) == (not loop)
+    assert (f"if (thread_index_in_threadgroup < {count}u)" in body) == one
+    assert ("for (uint i = thread_index_in_threadgroup;" in body) == (not one)
+    assert ("i = thread_index_in_threadgroup + threads_per" in body) == one
 
 
 # --- on the GPU -----------------------------------------------------------------
@@ -708,3 +762,125 @@ def test_a_four_value_table_gives_the_face_s_rows_in_either_form(form, k):
     assert _bits(
         testing.staged_tables(face, (codes, scales), mx.float32)["levels"]
     ) == (LEVELS4.bits)
+
+
+# --- the review of R1 (pre-rtables-90958cc) ------------------------------------
+
+
+def test_every_table_type_s_bits_and_metal_names():
+    assert Table("t", mx.uint8, (0, 255)).bits == (0, 0xFF)
+    assert Table("t", mx.uint32, (0, 2**32 - 1)).bits == (0, 0xFFFFFFFF)
+    assert Table("t", mx.int16, (-1, -32768, 32767)).bits == (0xFFFF, 0x8000, 0x7FFF)
+    assert Table("t", mx.int32, (-(2**31), 2**31 - 1)).bits == (0x80000000, 0x7FFFFFFF)
+    # bfloat16's normals start at 2^-126: just below, a subnormal's step.
+    below = Table("t", mx.bfloat16, (2.0**-127, 2.0**-127 + 3 * 2.0**-134))
+    assert below.bits == (0x0040, 0x0042)
+    names = {
+        mx.float32: ("float", "uint32_t"),
+        mx.float16: ("half", "uint16_t"),
+        mx.bfloat16: ("bfloat16_t", "uint16_t"),
+        mx.int8: ("int8_t", "uint8_t"),
+        mx.uint8: ("uint8_t", "uint8_t"),
+        mx.int16: ("int16_t", "uint16_t"),
+        mx.uint16: ("uint16_t", "uint16_t"),
+        mx.int32: ("int32_t", "uint32_t"),
+        mx.uint32: ("uint32_t", "uint32_t"),
+    }
+    tables = [Table(f"t{i}", dtype, (1,) * 5) for i, dtype in enumerate(names)]
+    matrices = kernels.Matrices()
+    matrices.add("p", _toy("types", "", *tables))
+    header, body = matrices.header, matrices.declarations
+    for metal, bits in names.values():
+        assert f"constant {bits} bits_{metal}[5] = {{" in header
+        assert f"threadgroup {metal} omlx_tg_{metal}[5];" in body
+
+
+@pytest.mark.parametrize("name", ["tâble", "x y", ""])
+def test_a_table_s_name_is_an_ascii_identifier(name):
+    with pytest.raises(ValueError, match="its name is not an identifier"):
+        Table(name, mx.float32, (1.0,))
+
+
+def test_tables_hold_at_most_4096_bytes_in_a_kernel():
+    tables = kernels.Tables()
+    tables.add(Table("a", mx.float32, (0.0,) * 1024))
+    tables.add(Table("a", mx.float32, (0,) * 1024))  # the same table
+    with pytest.raises(ValueError, match="'b': the kernel's tables would hold 4097"):
+        tables.add(Table("b", mx.int8, (1,)))
+    assert (
+        kernels.table_bytes(
+            _toy("x", "", Table("a", mx.float32, (0.0,) * 8)),
+            _toy(
+                "y", "", Table("a", mx.float32, (0.0,) * 8), Table("b", mx.int8, (1,))
+            ),
+        )
+        == 33
+    )
+
+
+def test_staged_tables_refuses_an_operand_of_7_elements():
+    face = _toy("seven", _MEMBERS, *_TABLES)
+    with pytest.raises(ValueError, match="scales has 7 elements"):
+        testing.staged_tables(face, (_operands()[0], mx.ones((7,))), mx.float32)
+
+
+# The row kit's tile kernel runs threadgroups of K threads up to 256: at K = 8
+# a threadgroup has fewer threads than the table entries, and at K = 264 the
+# grid's edge leaves a threadgroup of 8. The staging copies every entry.
+def _tile_table_source(n):
+    edits = (
+        (
+            "  const device float* row_scales;\n",
+            f"  const device float* row_scales;\n  omlx_table<float, {n}> off;\n",
+        ),
+        (
+            "      float s;  // the group's scale times the row's\n",
+            "      float s;  // the group's scale times the row's\n"
+            f"      omlx_table<float, {n}> t;\n",
+        ),
+        (
+            "    const device float* r;\n",
+            f"    const device float* r;\n    omlx_table<float, {n}> t;\n",
+        ),
+        (
+            "          r(m.row_scales + row) {}",
+            "          r(m.row_scales + row),\n          t(m.off) {}",
+        ),
+        ("      return {g[group] * r[0]};", "      return {g[group] * r[0], t};"),
+        (
+            "      return (float(code) - 128.0f) * p.s;",
+            f"      return (float(code) - p.t[code % {n}u]) * p.s;",
+        ),
+    )
+    from tests.test_formats_tile import _TOY
+
+    source = _TOY
+
+    for old, new in edits:
+        assert source.count(old) == 1, old
+        source = source.replace(old, new)
+    return source
+
+
+@metal
+@pytest.mark.parametrize("n", [16, 64])
+@pytest.mark.parametrize("k", [8, 264])
+def test_staging_fills_every_entry_in_a_threadgroup_of_fewer_threads(k, n):
+    from tests.test_formats_tile import _toy as tile_toy
+    from tests.test_formats_tile import _toy_matrix
+
+    # Entries that differ from each other and from the other cases' (a
+    # kernel's threadgroup memory may hold what an earlier launch left).
+    offsets = tuple(100.0 + i + k / 8 for i in range(n))
+    face = replace(
+        tile_toy(f"off{k}_{n}", _tile_table_source(n)),
+        tables=(Table("off", mx.float32, offsets),),
+    )
+    codes, group_scales, row_scales = _toy_matrix(16, k, seed=k + n)
+    got, _ = testing.tile_rows(
+        face, (codes, group_scales, row_scales), k, range(16), mx.bfloat16
+    )
+    levels = codes.astype(mx.float32) - mx.array(offsets)[codes.astype(mx.uint32) % n]
+    scales = group_scales * row_scales[..., None]
+    want = levels * scales[..., mx.arange(k) // 32]
+    assert _bits(got) == _bits(want)

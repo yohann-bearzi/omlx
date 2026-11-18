@@ -88,9 +88,7 @@ def _staged_tables_kernel(face: Dot | Tile):
     )
 
 
-def staged_tables(
-    face: Dot | Tile, operands, dtype: mx.Dtype
-) -> dict[str, mx.array]:
+def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.array]:
     """Each of ``face``'s tables as a kernel stages it, read back through the
     face's member of the table's name: one array of the table's dtype and
     length, by name. Its bits are the table's ``bits`` when the face

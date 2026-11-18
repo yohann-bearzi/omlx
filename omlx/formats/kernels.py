@@ -18,8 +18,10 @@ faster.
 from __future__ import annotations
 
 import math
+import re
 import threading
 from dataclasses import dataclass, field
+from functools import cache
 
 import mlx.core as mx
 
@@ -651,40 +653,57 @@ _ONE_COPY = 32
 _SELECT_VALUES = 4
 
 
+@cache
 def _small_tables_as_selects() -> bool:
     """Whether this GPU reads a table of up to 4 values as selects: on the
     GPUs without tensor units (the M3 family) selects measured up to 15%
     faster than a staged table, on the M5 family (tensor units) staging
     measured 0.6-3% faster (R-TABLES.md, run 3). A family not measured
-    follows its tensor units."""
-    from ..custom_kernels.quant_matmul.fast import is_nax_available
+    follows its tensor units: the GPU's own (generation 17 on), whatever
+    MLX's kernels use. A GPU it cannot name stages."""
+    return _selects_for(str(mx.device_info().get("architecture", "")))
 
-    return not is_nax_available()
+
+def _selects_for(architecture: str) -> bool:
+    match = re.fullmatch(r"applegpu_g(\d+)[a-z]", architecture)
+    return match is not None and int(match[1]) < 17
 
 
 # The member type of a face's table: a pointer to its staged copy or, for
 # a small table where this GPU reads one faster so, its values themselves
-# read by selects on the index's bits. SELECTS is this GPU's choice.
+# read by selects on the index's two low bits. SELECTS is this kernel's
+# choice; the second form is defined only in a kernel that holds one.
 _TABLE_TYPE = r"""
 template <typename T, int N, bool VALUES = (N <= 4 && SELECTS)>
 struct omlx_table {
   const threadgroup T* at;
   T operator[](uint i) const { return at[i]; }
 };
+"""
+_TABLE_VALUES = r"""
 template <typename T, int N>
 struct omlx_table<T, N, true> {
   T v0, v1, v2, v3;
   T operator[](uint i) const {
-    if constexpr (N == 1) {
-      return v0;
-    } else if constexpr (N == 2) {
-      return (i & 1u) ? v1 : v0;
-    } else {
-      return (i & 2u) ? ((i & 1u) ? v3 : v2) : ((i & 1u) ? v1 : v0);
-    }
+    return (i & 2u) ? ((i & 1u) ? v3 : v2) : ((i & 1u) ? v1 : v0);
   }
 };
 """
+# The values past a small table's last, as its selects hold them: a NaN for a
+# floating-point table, so that an index past the table reads as one in a
+# test (a staged table's neighbours are as wrong but not as plain).
+_PAST = {mx.float32: 0x7FC00000, mx.float16: 0x7E00, mx.bfloat16: 0x7FC0}
+
+
+def _bytes(tables) -> int:
+    """The bytes of the distinct ``tables``."""
+    return sum(len(table.values) * table.dtype.size for table in set(tables))
+
+
+def table_bytes(*faces) -> int:
+    """The bytes of the distinct tables of ``faces``: what a kernel over all
+    of them holds of tables (at most ``formats.TABLE_BYTES``)."""
+    return _bytes(table for face in faces for table in face.tables)
 
 
 class Tables:
@@ -701,7 +720,7 @@ class Tables:
     without them. ``add`` gives a table's member, as a Metal expression."""
 
     def __init__(self) -> None:
-        self._selects = _small_tables_as_selects()
+        self._values = False  # whether a table is held by value
         self._by_type: dict[str, list[Table]] = {}
         self._at: dict[Table, str] = {}
 
@@ -716,13 +735,22 @@ class Tables:
 
     def add(self, table: Table) -> str:
         """Take ``table`` (once, when an equal table was taken already): the
-        Metal expression of the face's member that reads it."""
+        Metal expression of the face's member that reads it. A kernel holds
+        at most ``formats.TABLE_BYTES`` of tables."""
         at = self._at.get(table)
         if at is None:
+            size = _bytes((*self._at, table))
+            if size > formats.TABLE_BYTES:
+                raise ValueError(
+                    f"table {table.name!r}: the kernel's tables would hold {size} "
+                    f"bytes; a kernel holds at most {formats.TABLE_BYTES}"
+                )
             metal, bits = _METAL[table.dtype]
             n = len(table.values)
-            if self._selects and n <= _SELECT_VALUES:
-                words = [*table.bits, *(0,) * (_SELECT_VALUES - n)]
+            if n <= _SELECT_VALUES and _small_tables_as_selects():
+                self._values = True
+                past = _PAST.get(table.dtype, 0)
+                words = [*table.bits, *(past,) * (_SELECT_VALUES - n)]
                 values = ", ".join(f"as_type<{metal}>({bits}({w:#x}u))" for w in words)
             else:
                 run = self._by_type.setdefault(metal, [])
@@ -743,8 +771,11 @@ class Tables:
             count = sum(len(table.values) for table in run)
             arrays.append(f"constant {bits} bits_{metal}[{count}] = {{{words}}};\n")
         staged = "namespace omlx_staged {\n" + "".join(arrays) + "}\n" if arrays else ""
-        selects = "true" if self._selects else "false"
-        return _named(_STAGED, _TABLE_TYPE.replace("SELECTS", selects) + staged)
+        if self._values:
+            types = _TABLE_TYPE.replace("SELECTS", "true") + _TABLE_VALUES
+        else:
+            types = _TABLE_TYPE.replace("SELECTS", "false")
+        return _named(_STAGED, types + staged)
 
     @property
     def prologue(self) -> str:
@@ -767,16 +798,25 @@ class Tables:
 # thread, or a loop over the threadgroup's own size (a smaller threadgroup
 # ends a grid that is not whole threadgroups).
 _COPY = "      omlx_tg_TYPE[i] = as_type<TYPE>(omlx_staged::bits_TYPE[i]);\n"
+# Every entry is copied whatever the threadgroup's size: a small threadgroup,
+# or one at the grid's edge, may have fewer threads than the table entries.
+# Up to 32 entries, a thread each, and a loop over what is left that a
+# threadgroup of COUNT threads or more skips.
+_THREADS = (
+    "threads_per_threadgroup.x * threads_per_threadgroup.y * threads_per_threadgroup.z"
+)
 _ONE_FILL = (
     "    threadgroup TYPE omlx_tg_TYPE[COUNT];\n"
     "    if (thread_index_in_threadgroup < COUNTu) {\n"
     "      const uint i = thread_index_in_threadgroup;\n" + _COPY + "    }\n"
+    f"    if ({_THREADS} < COUNTu) {{\n"
+    f"      for (uint i = thread_index_in_threadgroup + {_THREADS}; i < COUNTu;\n"
+    f"           i += {_THREADS}) {{\n  " + _COPY + "      }\n    }\n"
 )
 _LOOP_FILL = (
     "    threadgroup TYPE omlx_tg_TYPE[COUNT];\n"
     "    for (uint i = thread_index_in_threadgroup; i < COUNTu;\n"
-    "         i += threads_per_threadgroup.x * threads_per_threadgroup.y *\n"
-    "             threads_per_threadgroup.z) {\n" + _COPY + "    }\n"
+    f"         i += {_THREADS}) {{\n" + _COPY + "    }\n"
 )
 
 
@@ -807,8 +847,7 @@ class Matrices:
                 f"matrix {name!r}: {', '.join(repeated)} would repeat a name of "
                 "the kernel"
             )
-        tables = {*self._tables._at, *face.tables}
-        size = sum(len(table.values) * table.dtype.size for table in tables)
+        size = _bytes(t for f in (*self._faces.values(), face) for t in f.tables)
         if size > formats.TABLE_BYTES:
             raise ValueError(
                 f"matrix {name!r}: the kernel's tables would hold {size} "
@@ -868,11 +907,15 @@ class Matrices:
         The body's own lines follow as ``<kernel>``. A kernel's body starts
         with them: every thread of a threadgroup meets the staging's
         barrier."""
+        # Each distinct face's members are checked once.
+        checks = "".join(
+            _members_check(face) for face in dict.fromkeys(self._faces.values())
+        )
         return (
             self._tables.prologue
+            + checks
             + "".join(
-                _members_check(face)
-                + f"    const auto {name} = {face.type}"
+                f"    const auto {name} = {face.type}"
                 + f"{{{', '.join((_members(name, face), *self._staged[name]))}}};\n"
                 for name, face in self._faces.items()
             )

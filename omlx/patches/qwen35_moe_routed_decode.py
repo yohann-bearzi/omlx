@@ -648,6 +648,13 @@ def _build_plan(block) -> _Plan | None:
     gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
     shared = _shared_formats(block, hidden, dtype)
+    if shared is not None and (
+        kernels.table_bytes(gu_fmt, shared[1], shared[3]) > formats.TABLE_BYTES
+        or kernels.table_bytes(d_fmt, shared[2]) > formats.TABLE_BYTES
+    ):
+        # One launch would hold more tables than a kernel holds: the shared
+        # expert keeps its own launches.
+        shared = None
     gate = block.get("gate")
     router, experts, weight = None, block.num_experts, ()
     if (

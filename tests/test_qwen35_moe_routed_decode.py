@@ -2184,3 +2184,30 @@ def test_a_face_with_a_table_runs_the_fused_decode_to_the_bit(monkeypatch):
     assert _engaged()
     faces = {face for (_, face, *_) in kernels._PROOFS if hasattr(face, "key")}
     assert any(face.key.endswith("_lut") for face in faces)
+
+
+@pytest.mark.parametrize("launch", [3, 2])
+def test_faces_whose_tables_exceed_a_kernel_s_keep_the_shared_expert_apart(
+    monkeypatch, launch
+):
+    """The fused launches would hold the routed and the shared expert's
+    tables together (gate+up over 3 faces, down over 2): past a kernel's
+    bytes in either, the shared expert keeps its own launches, and the block
+    its bits."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    bytes_of = kernels.table_bytes
+    monkeypatch.setattr(
+        kernels,
+        "table_bytes",
+        lambda *faces: (
+            formats.TABLE_BYTES + 1 if len(faces) == launch else bytes_of(*faces)
+        ),
+    )
+    block = _block(1024, 320)
+    x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
+    assert _same_bits(*_pair(block, x))
+    assert not _plan(block, x).launches.fold
+    monkeypatch.setattr(kernels, "table_bytes", bytes_of)
+    assert _plan(_block(1024, 320, seed=1), x).launches.fold

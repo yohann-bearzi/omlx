@@ -116,12 +116,13 @@ def _table_entry(dtype: mx.Dtype, value) -> tuple:
             raise OverflowError("not a finite number")
         if packed is None:
             value = _bfloat16(value)
-            (word,) = struct.unpack("<I", struct.pack("<f", value))
-            return value, word >> 16
-        # struct rounds to nearest even, and raises OverflowError past the
-        # type's range.
-        data = struct.pack(packed, value)
-        (value,) = struct.unpack(packed, data)
+            # A bfloat16 is the high half of the float32 of its value.
+            data = struct.pack("<f", value)[2:]
+        else:
+            # struct rounds to nearest even, and raises OverflowError past
+            # the type's range.
+            data = struct.pack(packed, value)
+            (value,) = struct.unpack(packed, data)
     else:
         if value != int(value):
             raise OverflowError("not a whole number")
