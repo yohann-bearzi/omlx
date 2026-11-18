@@ -662,9 +662,10 @@ def test_a_source_need_not_end_with_a_newline():
     matrices = kernels.Matrices()
     matrices.add("m", replace(face, source=face.source.rstrip("\n") + "  // the end"))
     marked = [line for line in matrices.header.splitlines() if "#" in line]
-    # Four #line, the two revisions and their two ends, each on a line of
-    # its own.
-    assert len(marked) == 8 and all(line.startswith("#") for line in marked)
+    # Five #line (the index packs, the source, the revisions and the checks,
+    # the row skeleton, the kernel's header), the two revisions and their two
+    # ends, each on a line of its own.
+    assert len(marked) == 9 and all(line.startswith("#") for line in marked)
 
 
 # K as whole blocks of 256 inputs (512, 768), whole blocks then a last one
@@ -802,6 +803,44 @@ def test_a_shared_rows_launch_is_sized_by_the_face_s_vpt():
     assert kernels.unrolled_tile_ok(20, 1, 4) and not kernels.unrolled_tile_ok(16, 1, 6)
 
 
+def test_a_kernel_carries_the_skeletons_it_calls_and_no_other():
+    """MLX hashes a kernel's whole source at every launch: a kernel whose
+    matrices all share has the checks and the shared-rows skeleton, and no
+    row skeleton; one that reads a matrix plainly too has both. Each
+    skeleton stays at its own lines."""
+    face = _toy("carried")
+    shared, both = kernels.Matrices(), kernels.Matrices()
+    shared.add("m", face, shared=True)
+    both.add("m", face, shared=True)
+    both.add("n", face)
+    assert "void qmv_rows(" not in shared.header and "void qmv_shared(" in shared.header
+    assert "void qmv_rows(" in both.header and "void qmv_shared(" in both.header
+    assert "struct omlx_revision" in shared.header
+    lines = (kernels._revisions() + kernels._CHECKS + kernels._QMV_ROWS).count("\n")
+    start = (
+        kernels._INDEX_PACKS.count("\n") + 1 + lines + kernels._TILE_FACE.count("\n")
+    )
+    for header in (shared.header, both.header):
+        assert f'\n#line {start} "{kernels._SKELETONS}"\n' in header
+
+
+def test_the_skeletons_are_carried_compact():
+    """No indentation and no comment line in the Metal a kernel carries; the
+    lines stay, so that the compiler cites them where the source has them."""
+    for skeleton in (
+        kernels._INDEX_PACKS,
+        kernels._CHECKS,
+        kernels._QMV_ROWS,
+        kernels._TILE_FACE,
+        kernels._QMV_SHARED,
+        kernels.STORE_ROWS,
+    ):
+        lines = skeleton.split("\n")
+        assert all(line == line.strip() for line in lines)
+        assert not any(line.startswith("//") for line in lines)
+    assert kernels._compact("  a;\n  // b\n    c; // d\n") == "a;\n\nc; // d\n"
+
+
 def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     face = _toy("unroll")
     rolled, unrolled = kernels.Matrices(), kernels.Matrices(unrolled=True)
@@ -810,7 +849,7 @@ def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     pragma = '_Pragma("clang loop unroll(full)")'
     assert pragma not in rolled.header and pragma in unrolled.header
     # The skeleton's block walk stays a loop.
-    assert "  for (int k = 0; k < WHOLE; k += L::BLOCK) {" in unrolled.header
+    assert "\nfor (int k = 0; k < WHOLE; k += L::BLOCK) {\n" in unrolled.header
 
 
 def test_shared_rows_launch_a_partial_pack_where_n_is_not_whole_packs(monkeypatch):

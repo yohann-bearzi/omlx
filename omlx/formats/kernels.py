@@ -31,10 +31,22 @@ from . import Dot, Table, Tile
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
 
+
+def _compact(metal: str) -> str:
+    """``metal`` as a kernel carries it: each line without its indentation,
+    a comment line left empty. MLX hashes a kernel's whole source at every
+    launch (about 0.05 us a KB); the lines stay where they are, so the
+    compiler cites them at the numbers they have here."""
+    return "\n".join(
+        "" if line.lstrip().startswith("//") else line.strip()
+        for line in metal.split("\n")
+    )
+
+
 # Compile-time index packs, for folds over a fixed count (a kernel's rows, a
 # lane's values): omlx_iota<N>() is omlx_ints<0, ..., N - 1>. Formats' sources
 # may use them.
-_INDEX_PACKS = r"""
+_INDEX_PACKS = _compact(r"""
 template <int... I>
 struct omlx_ints {};
 template <int N, int... I>
@@ -47,7 +59,28 @@ struct omlx_iota_<0, I...> {
 };
 template <int N>
 using omlx_iota = typename omlx_iota_<N>::type;
-"""
+""")
+
+# What both dot skeletons check of a face and of x, ahead of them: the face's
+# revision against the ones oMLX runs (FACE is a template parameter so that
+# a failed assert prints both numbers), and that x is the T inputs, in
+# device memory or in threadgroup memory where a kernel stages them.
+_CHECKS = _compact(r"""
+template <int FACE>
+struct omlx_revision {
+  static_assert(
+      FACE <= OMLX_CONTRACT,
+      "dot face: written for a later revision of the contract than this oMLX runs");
+  static_assert(
+      FACE >= OMLX_OLDEST_CONTRACT,
+      "dot face: written for a revision of the contract this oMLX no longer runs");
+};
+
+template <typename T>
+METAL_FUNC void omlx_inputs(const device T*) {}
+template <typename T>
+METAL_FUNC void omlx_inputs(const threadgroup T*) {}
+""")
 
 # Rows of one mat-vec over a dot face D: one input vector against rows
 # row_a.. of matrix ma (result rows [0, NA)) and rows row_b.. of matrix mb
@@ -67,7 +100,7 @@ using omlx_iota = typename omlx_iota_<N>::type;
 # inputs follows. x is the T inputs in device memory, or in threadgroup
 # memory where a kernel stages them (omlx_inputs checks it). Comments stay
 # out of the Metal: MLX hashes a kernel's whole source at every launch.
-_QMV_ROWS = r"""
+_QMV_ROWS = _compact(r"""
 // One block of a lane: its VPT inputs against each row's weights.
 template <typename L, typename XP, int... RA, int... RB>
 METAL_FUNC void omlx_qmv_block(
@@ -123,23 +156,6 @@ METAL_FUNC void omlx_qmv_rows(
   ((result[NA + RB] = b.finish(RB, metal::simd_sum(result[NA + RB]))), ...);
 }
 
-// The revision FACE that a face states, against the ones oMLX runs. FACE is
-// a template parameter so that a failed assert prints both numbers.
-template <int FACE>
-struct omlx_revision {
-  static_assert(
-      FACE <= OMLX_CONTRACT,
-      "dot face: written for a later revision of the contract than this oMLX runs");
-  static_assert(
-      FACE >= OMLX_OLDEST_CONTRACT,
-      "dot face: written for a revision of the contract this oMLX no longer runs");
-};
-
-template <typename T>
-METAL_FUNC void omlx_inputs(const device T*) {}
-template <typename T>
-METAL_FUNC void omlx_inputs(const threadgroup T*) {}
-
 template <typename T, int K, int NA, int NB, typename D, typename XP>
 METAL_FUNC void qmv_rows(
     D ma,
@@ -170,7 +186,7 @@ METAL_FUNC void qmv_rows(
     }
   }
 }
-"""
+""")
 
 # What a kernel asks of a tile face F at K inputs (docs/quant-formats.md, The
 # tile face), stated where the compiler can check it, so that a face that
@@ -191,7 +207,7 @@ METAL_FUNC void qmv_rows(
 # constants as int template arguments, so that one that is not static, or
 # not an integer, is its rule's error too. omlx_tile_face's FACE is a
 # template parameter so that a failed assert prints both numbers.
-_TILE_FACE = r"""
+_TILE_FACE = _compact(r"""
 template <typename...>
 using omlx_void = void;
 
@@ -376,7 +392,7 @@ struct omlx_tile_face<F, K, true, FACE, true> {
   static constant constexpr bool value =
       FOUND && RUN && GROUP && HELD && CURSOR && PARAMS && FETCH && WEIGHT;
 };
-"""
+""")
 
 # The shared-rows skeleton: ROWS input vectors (x, x + K, ...) against RPS
 # consecutive rows of a matrix from `row`, each block's weights decoded once
@@ -390,7 +406,7 @@ struct omlx_tile_face<F, K, true, FACE, true> {
 # calls qmv_shared, which asserts what the compiler would not report, as
 # qmv_rows does, and that the face's vpt is its Lanes<K>::VPT: a launch is
 # sized by it.
-_SHARED_LOOPED = r"""
+_SHARED_LOOPED = _compact(r"""
 template <int K, int ROWS, int RPS, bool PARTIAL, typename L, typename XP>
 METAL_FUNC void omlx_shared_block(
     thread const L& a, int valid, XP x, thread float* result) {
@@ -409,9 +425,9 @@ METAL_FUNC void omlx_shared_block(
     }
   }
 }
-"""
+""")
 
-_SHARED_FOLDED = r"""
+_SHARED_FOLDED = _compact(r"""
 template <int R, int RPS, bool PARTIAL, typename L, typename A, int... I>
 METAL_FUNC void omlx_shared_row(
     thread const L& a, int valid, thread float (*xs)[L::VPT],
@@ -439,9 +455,9 @@ METAL_FUNC void omlx_shared_block(
   omlx_shared_folded<K, RPS, PARTIAL>(
       a, valid, x, result, omlx_iota<ROWS>(), omlx_iota<RPS>());
 }
-"""
+""")
 
-_QMV_SHARED = r"""
+_QMV_SHARED = _compact(r"""
 template <int K, int ROWS, int RPS, bool PARTIAL, typename D, typename XP>
 METAL_FUNC void omlx_qmv_shared(
     D m, size_t row, int valid, XP x, uint simd_lid, thread float* result) {
@@ -510,7 +526,7 @@ METAL_FUNC void qmv_shared(
     }
   }
 }
-"""
+""")
 
 
 # Output rows a simdgroup of a shared-rows launch computes (qmv's own tile:
@@ -565,13 +581,13 @@ def _qmv_shared(unrolled: bool) -> str:
 
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
 # kernel that stores rows adds this to its header.
-STORE_ROWS = r"""
+STORE_ROWS = _compact(r"""
 // A simdgroup's rows, each rounded to T.
 template <typename T, int... R>
 METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T* y) {
   ((y[R] = static_cast<T>(result[R])), ...);
 }
-"""
+""")
 
 
 # MLX's shapes are int32: a buffer of zeros as one axis of bytes is smaller.
@@ -1034,6 +1050,7 @@ class Matrices:
         self._tables = Tables()
         self._staged: dict[str, tuple[str, ...]] = {}
         self._shared: set[Dot] = set()
+        self._shared_names: set[str] = set()
         self._unrolled = unrolled
 
     def add(self, name: str, face: Dot | Tile, shared: bool = False) -> list[str]:
@@ -1076,6 +1093,7 @@ class Matrices:
         self._names.update((name, *inputs))
         if shared:
             self._shared.add(face)
+            self._shared_names.add(name)
         return inputs
 
     @property
@@ -1087,9 +1105,12 @@ class Matrices:
     def header(self) -> str:
         """The Metal the kernel includes: the index packs, each distinct
         format source once (cited under the key of the first face that has
-        it), then the skeletons of the kinds of faces added, from the
-        contract revisions' macros to the macros' end. Each skeleton is
-        cited at its own lines, whichever others the kernel includes."""
+        it) and the shared sources of the faces it shares, then the
+        skeletons it calls, from the contract revisions' macros to the
+        macros' end: the checks for dot faces, the row skeleton for a dot
+        face read plainly, the tile skeleton for a tile face, the
+        shared-rows skeleton for a shared one. Each skeleton is cited at its
+        own lines, whichever others the kernel includes."""
         sources: dict[str, str] = {}
         for face in self._faces.values():
             sources.setdefault(face.source, face.key)
@@ -1097,41 +1118,36 @@ class Matrices:
         for face in self._faces.values():
             if face in self._shared and face.shared:
                 sources.setdefault(face.shared, f"{face.key} shared")
-        faces = self._faces.values()
-        # The row skeleton opens with a line break, as the tile skeleton's
-        # #line does; with neither, the macros' end is put on a line of its
-        # own.
-        return (
+        dots = any(isinstance(f, Dot) for f in self._faces.values())
+        rows = any(
+            isinstance(f, Dot) and name not in self._shared_names
+            for name, f in self._faces.items()
+        )
+        tiles = any(isinstance(f, Tile) for f in self._faces.values())
+        # Each skeleton the kernel calls, and no other, at the lines it has in
+        # the skeletons laid end to end: the index packs, the revisions and
+        # the checks, the row skeleton, the tile skeleton, the shared-rows
+        # skeleton. Each opens with a line break; with none after the
+        # revisions, the macros' end is put on a line of its own.
+        line = _REVISIONS_LINE
+        header = (
             _named(_SKELETONS, _INDEX_PACKS)
             + self._tables.header
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
-            + _named(
-                _SKELETONS,
-                _revisions()
-                + (_QMV_ROWS if any(isinstance(f, Dot) for f in faces) else ""),
-                line=_REVISIONS_LINE,
-            )
-            + (
-                _named(
-                    _SKELETONS,
-                    _TILE_FACE,
-                    line=_TILE_LINE,
-                )
-                if any(isinstance(f, Tile) for f in faces)
-                else "" if faces else "\n"
-            )
-            + (
-                _named(
-                    _SKELETONS,
-                    _qmv_shared(self._unrolled),
-                    line=_TILE_LINE + _TILE_FACE.count("\n"),
-                )
-                if self._shared
-                else ""
-            )
-            + _REVISIONS_END
-            + _named("<kernel header>", "")
         )
+        header += _named(_SKELETONS, _revisions() + (_CHECKS if dots else ""), line)
+        line += (_revisions() + _CHECKS).count("\n")
+        for piece, wanted in (
+            (_QMV_ROWS, rows),
+            (_TILE_FACE, tiles),
+            (_qmv_shared(self._unrolled), bool(self._shared)),
+        ):
+            if wanted:
+                header += _named(_SKELETONS, piece, line)
+            line += piece.count("\n")
+        if not (dots or tiles):
+            header += "\n"
+        return header + _REVISIONS_END + _named("<kernel header>", "")
 
     @property
     def declarations(self) -> str:
@@ -1173,7 +1189,6 @@ def _revisions() -> str:
 # after the index packs, the tile skeleton after the row skeleton. The
 # revisions are two lines whatever their numbers.
 _REVISIONS_LINE = _INDEX_PACKS.count("\n") + 1
-_TILE_LINE = _REVISIONS_LINE + 1 + _QMV_ROWS.count("\n")
 
 # The skeletons' asserts hold the numbers by now. What follows (a face's
 # type, a kernel's header and body) does not read the macros.

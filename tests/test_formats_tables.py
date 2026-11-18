@@ -236,11 +236,10 @@ def _builder_digest(monkeypatch) -> str:
     return f"{len(recorded)} {digest.hexdigest()}"
 
 
-# The digest of the served kernels over affine faces without tables, as a
-# face's load of any pointer type and its decode/apply declarations have
-# them: what a face without tables compiles is this text, to the byte, so
-# the same MLX library.
-_PARENT_DIGEST = "364 4b290fb1b9ad4c75450836c7180640be7c7d5180c88d7fa34d00846df7d24b80"
+# The digest of the served kernels over affine faces without tables, as they
+# are carried since the skeletons are compact: what a face without tables
+# compiles is this text, to the byte, so the same MLX library.
+_PARENT_DIGEST = "364 c0f1bbfccbdf6e1537662b42c0e84329b0d14907fac1cae9ed1d2db86c063bf4"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):

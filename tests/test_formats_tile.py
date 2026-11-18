@@ -158,28 +158,39 @@ def test_a_format_has_no_tile_face_until_it_gives_one():
 # --- What a kernel includes -----------------------------------------------
 
 
-def _tile_line() -> int:
-    """The line of the skeletons that the tile skeleton starts on: after the
-    index packs, the revisions and the row skeleton."""
+def _rows_line() -> int:
+    """The line of the skeletons that the row skeleton starts on: after the
+    index packs, the revisions and the checks."""
     return (
         kernels._INDEX_PACKS.count("\n")
         + 1
-        + (kernels._revisions() + kernels._QMV_ROWS).count("\n")
+        + (kernels._revisions() + kernels._CHECKS).count("\n")
     )
+
+
+def _tile_line() -> int:
+    """The line of the skeletons that the tile skeleton starts on: after the
+    row skeleton."""
+    return _rows_line() + kernels._QMV_ROWS.count("\n")
 
 
 def _header(*sources, rows=False) -> str:
     """The header of a kernel of faces of these ``(key, source)``, with the
-    row skeleton if ``rows``, and the tile skeleton: each skeleton at its own
-    lines of the skeletons."""
+    checks and the row skeleton if ``rows``, and the tile skeleton: each
+    skeleton at its own lines of the skeletons."""
     named = kernels._named
     return (
         named(kernels._SKELETONS, kernels._INDEX_PACKS)
         + "".join(named(f"<quant format {key}>", source) for key, source in sources)
         + named(
             kernels._SKELETONS,
-            kernels._revisions() + (kernels._QMV_ROWS if rows else ""),
+            kernels._revisions() + (kernels._CHECKS if rows else ""),
             line=kernels._INDEX_PACKS.count("\n") + 1,
+        )
+        + (
+            named(kernels._SKELETONS, kernels._QMV_ROWS, line=_rows_line())
+            if rows
+            else ""
         )
         + named(kernels._SKELETONS, kernels._TILE_FACE, line=_tile_line())
         + kernels._REVISIONS_END
@@ -231,10 +242,10 @@ def test_a_matrix_is_read_through_a_dot_or_a_tile():
 
 
 # The sha256 of the header and the declarations of a kernel of one affine dot
-# face, as oMLX's dot kernels have them since a face's load takes any pointer
-# type: tile faces leave a dot kernel's source as it is, to the byte, so that
-# every kernel a checkpoint runs is too.
-_DOT_KERNEL = "e30cd743d883b20aa2501e0be87b65888f0bb0571b48db1ab02ca86b4afbac02"
+# face, as oMLX's dot kernels have them since the skeletons are carried
+# compact: tile faces leave a dot kernel's source as it is, to the byte, so
+# that every kernel a checkpoint runs is too.
+_DOT_KERNEL = "2b9983b0f95476ee791920b95e06c5ef1d6b191036c82ccefdafc455874071c1"
 
 
 def test_a_kernel_of_dot_faces_is_written_as_before_tile_faces():

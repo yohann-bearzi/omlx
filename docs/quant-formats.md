@@ -568,7 +568,7 @@ The copy runs once in every threadgroup, before the kernel's own code, and ends 
 
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot` or a `Tile`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons of the kinds of faces the kernel reads, and no other) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
+A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot` or a `Tile`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons the kernel calls, and no other: MLX hashes a kernel's whole source at every launch, so the skeletons are also carried without indentation or comment lines) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
 
 ```python
 import mlx.core as mx
@@ -657,7 +657,7 @@ The messages quoted below are the compiler's for the example above with one mist
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:106:7: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:104:1: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
 <kernel>:5:5: note: in instantiation of function template specialization
@@ -665,7 +665,7 @@ each of a simdgroup's 32 lanes"
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:110:7: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:108:1: error: static_assert failed due to requirement
 '60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 
@@ -678,12 +678,12 @@ A mistake inside the format is cited in the format:
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:67:20: error: no member named 'finish' in
+<omlx skeletons, docs/quant-formats.md>:82:18: error: no member named 'finish' in
 'omlx_myformat_b8::Dot::Lanes<512>'
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:28:59: error: too many arguments to function call,
+<omlx skeletons, docs/quant-formats.md>:43:57: error: too many arguments to function call,
 expected 3, have 4
 <quant format myformat_b8>:38:18: note: 'madd' declared here
 ```
@@ -800,9 +800,9 @@ revision 1: update oMLX
 A face of another revision does not compile. The requirement that fails is the face's revision against oMLX's, here a face of revision 2 on an oMLX of revision 1. It is the only error: a kernel checks the revision first, and asks nothing else of a face whose revision it does not run.
 
 ```
-<omlx skeletons, docs/quant-formats.md>:75:3: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:18:1: error: static_assert failed due to requirement
 '2 <= 1' "dot face: written for a later revision of the contract than this oMLX runs"
-<omlx skeletons, docs/quant-formats.md>:99:9: note: in instantiation of template class
+<omlx skeletons, docs/quant-formats.md>:97:7: note: in instantiation of template class
 'omlx_revision<2>' requested here
 <kernel>:5:5: note: in instantiation of function template specialization
 'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot, const device float *>' requested here
