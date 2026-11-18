@@ -764,7 +764,10 @@ def down_row_groups(lowrank: int, inject: bool, rps: int) -> int:
 
 def two_launch_fits(rows, hc, hidden, lowrank, up_bits, inject, gpu_class) -> bool:
     """hc_fused's ``_decode_v2`` without its row limit and its switch: whether
-    the two-launch kernels take ``rows`` rows."""
+    the two-launch kernels take ``rows`` rows. It counts 2-byte activations
+    in threadgroup memory, as hc_fused does (its decode takes BF16 and FP16
+    rows); FP32 rows stage 4 bytes an element, so a shape that fits here may
+    not fit them."""
     rps = down_rps(rows, gpu_class)
     chunks = up_chunks(up_bits, lowrank)
     return (
@@ -909,9 +912,15 @@ def _norm_down(
     )
 
 
+def up_threads(bits: int, lowrank: int) -> int:
+    """The up tile's threads: the most whole chunk rows within
+    ``V2_UP_THREADS``."""
+    chunks = up_chunks(bits, lowrank)
+    return chunks * (V2_UP_THREADS // chunks)
+
+
 def _up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject, gpu_class):
-    chunks = up_chunks(up.bits, lowrank)
-    threads = chunks * (V2_UP_THREADS // chunks)
+    threads = up_threads(up.bits, lowrank)
     outputs = up_outputs(rows, gpu_class)
     return _kernel(
         "qwen4_hc_decode_up",

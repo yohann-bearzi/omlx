@@ -145,11 +145,25 @@ def _decode(monkeypatch, module, hyper, write, gpu_class):
     return live, oracle.decode(module, hyper, write, gpu_class=gpu_class)
 
 
+def _assert_fits_fp32(module, hidden, rows, gpu_class):
+    """two_launch_fits counts 2-byte rows, as hc_fused does: an FP32 shape of
+    these tests fits the two-launch kernels' threadgroup memory at 4 bytes."""
+    lowrank = module.hc_lowrank
+    chunks = oracle.up_chunks(module["input_mix_weight_up"].bits, lowrank)
+    outputs = oracle.up_outputs(rows, gpu_class)
+    assert hidden * 4 + 32 <= oracle.TG_MEMORY_BYTES
+    assert lowrank * 4 + outputs * (chunks + 1) * 4 <= oracle.TG_MEMORY_BYTES
+
+
 def _assert_decode(
     monkeypatch, modules, hidden, dtype, rows_list, gpu_class, seed, writes=True
 ):
     for module in modules:
         for rows in rows_list:
+            if rows > oracle.V2_MAX_ROWS and gpu_class != "d":
+                continue  # the three-launch kernels have one geometry
+            if dtype == mx.float32:
+                _assert_fits_fp32(module, hidden, rows, gpu_class)
             hyper, pending = _inputs(rows, hidden, dtype, seed + rows)
             for write in (None, pending) if writes else (None,):
                 what = ("decode", rows, "block_inject_weight" in module, write is None)
@@ -177,7 +191,7 @@ def test_decode_matches_the_oracle(bits, group_size, dtype, gpu_class, monkeypat
 # last 256-element strip is partial in both. Groups of 32 put a partial block's
 # lanes in more than one group; FP32 rows show its summation order.
 @pytest.mark.parametrize("gpu_class", ["d", "s"])
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
 @pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("hidden", [1152, 1344])
@@ -280,13 +294,15 @@ def test_the_two_decode_forms_give_a_row_the_same_bits(bits, group_size, dtype):
 
 # Shapes on each side of every clause of the two-launch fit: three streams;
 # a low rank of whole row groups or not (328); the norm's strips against the
-# row groups (5376, 5440); the stream in threadgroup memory (16320, 16384);
-# the up tile's threadgroup memory (a low rank of 512 at 8 bits, 2560).
+# row groups (5376, 5440); the stream in threadgroup memory (16320, 16384, and
+# 16368 exactly at the limit); the up tile's threadgroup memory (512 at 8 bits
+# over it; 960, over it only with its activations and the staging's padding
+# column; 3264 at 4 bits and 32 outputs, exactly at the limit; 2560).
 _FORM_SHAPES = [
     (hc, hidden, lowrank)
     for hc in (3, 4)
-    for hidden in (2560, 5376, 5440, 16320, 16384)
-    for lowrank in (320, 328, 512, 2560)
+    for hidden in (2560, 5376, 5440, 16320, 16368, 16384)
+    for lowrank in (320, 328, 384, 512, 960, 2560, 3264)
 ]
 
 
@@ -336,8 +352,12 @@ def test_the_oracle_s_geometry_is_hc_fused_s(monkeypatch):
             assert oracle.up_outputs(rows, gpu_class) == hc_fused._up_outputs(rows)
     for bits in (4, 5, 6, 8):
         assert oracle.pack_factor(bits) == hc_fused._pack_factor(bits)
-        for lowrank in (320, 512):
-            assert oracle.up_chunks(bits, lowrank) == hc_fused._up_chunks(bits, lowrank)
+        for lowrank in (320, 384, 512):
+            chunks = hc_fused._up_chunks(bits, lowrank)
+            assert oracle.up_chunks(bits, lowrank) == chunks
+            # hc_fused's _kernel_up_mix: whole chunk rows within its threads.
+            threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
+            assert oracle.up_threads(bits, lowrank) == threads
     for lowrank, inject, rps in ((320, True, 1), (320, False, 2), (512, True, 4)):
         assert oracle.down_row_groups(
             lowrank, inject, rps
@@ -360,11 +380,13 @@ def test_batched_and_strided_rows_match_the_oracle(bits, monkeypatch):
     logical elements. The oracle's kernels are its own, by name."""
     module, without = _modules(bits, 64, mx.bfloat16, seed=2200 + bits)
     module.hc_norm.weight = _strided(module.hc_norm.weight)
-    for m in (module, without):
-        for batch, seq in ((2, 3), (3, 5), (2, 9)):
-            hyper, pending = _inputs(seq, 2560, mx.bfloat16, 2200 + seq, batch=batch)
-            for rows_in in (hyper, _strided(hyper)):
-                for write in (None, pending):
+    for batch, seq in ((2, 3), (3, 5), (2, 9)):
+        hyper, pending = _inputs(seq, 2560, mx.bfloat16, 2200 + seq, batch=batch)
+        strided = _strided(hyper)
+        strided_pending = tuple(_strided(a) for a in pending)
+        for m in (module, without):
+            for rows_in in (hyper, strided):
+                for write in (None, pending, strided_pending):
                     what = ("batched", batch, seq, write is None)
                     if batch * seq <= oracle.MAX_ROWS:
                         for gpu_class in ("d", "s"):
@@ -409,3 +431,64 @@ def test_mixed_projections_match_the_oracle(down, up, inject, monkeypatch):
             _assert_bitwise(
                 live, oracle.prefill(module, hyper, write), ("prefill", rows)
             )
+
+
+def _low_rank(module, lowrank, bits, group_size=64):
+    """``module`` with down and up projections of another low rank."""
+    import mlx.nn as nn
+
+    width = module.hc_count * module.hidden_size
+    dtype = module.hc_norm.weight.dtype
+    module.hc_lowrank = lowrank
+    for name, (k, n) in (
+        ("input_mix_weight_down", (width, lowrank)),
+        ("input_mix_weight_up", (lowrank, width)),
+    ):
+        layer = nn.QuantizedLinear(k, n, bias=False, group_size=group_size, bits=bits)
+        scales = mx.abs(mx.random.normal(layer.scales.shape)) * 0.01 + 0.002
+        layer.scales = scales.astype(dtype)
+        layer.biases = (mx.random.normal(layer.biases.shape) * 0.005).astype(dtype)
+        setattr(module, name, layer)
+    mx.eval(module.parameters())
+    return module
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_a_low_rank_of_other_chunks_matches_the_oracle(bits, monkeypatch):
+    """A low rank of 384: 24 or 48 up chunks, which do not divide the up tile's
+    320 threads, so it takes whole chunk rows of them."""
+    mx.random.seed(2300 + bits)
+    module = _low_rank(_module(bits, True), 384, bits)
+    without = _module(bits, False)
+    without.hc_norm = module.hc_norm
+    without.hc_lowrank = 384
+    without.input_mix_weight_down = module.input_mix_weight_down
+    without.input_mix_weight_up = module.input_mix_weight_up
+    for gpu_class in ("d", "s"):
+        _assert_decode(
+            monkeypatch,
+            [module, without],
+            2560,
+            mx.bfloat16,
+            (1, 2, 4, 7),
+            gpu_class,
+            2300,
+        )
+
+
+def test_the_oracle_refuses_what_hc_fused_does_not_take():
+    mx.random.seed(2400)
+    module = _module(4, True)
+    hyper, (branch, gate) = _inputs(2, 2560, mx.bfloat16, 2400)
+    for rows in (0, oracle.MAX_ROWS + 1):
+        rows_in, _ = _inputs(rows, 2560, mx.bfloat16, 2400)
+        with pytest.raises(ValueError, match="1 to 16 rows"):
+            oracle.decode(module, rows_in, gpu_class="d")
+    for write in ((branch[..., :-64], gate), (branch, gate.astype(mx.float16))):
+        with pytest.raises(ValueError, match="no such pending write"):
+            oracle.decode(module, hyper, write, gpu_class="d")
+    # 5440: 22 norm strips a stream, 21 row groups from 3 rows.
+    wide = _module(4, True, hidden=5440)
+    rows_in, _ = _inputs(3, 5440, mx.bfloat16, 2401)
+    with pytest.raises(ValueError, match="do not take this call"):
+        oracle.decode(wide, rows_in, gpu_class="d", two_launch=True)
