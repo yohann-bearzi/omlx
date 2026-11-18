@@ -745,6 +745,30 @@ def test_a_format_s_matrices_stack_as_its_layout_says(caplog, dot_defects):
     dot_defects.clear()  # expected
 
 
+@pytest.mark.parametrize("checkpoint_copy", [False, True])
+def test_rows_stack_builds_each_layer_with_the_format_being_checked(
+    monkeypatch, checkpoint_copy
+):
+    seen = []
+
+    class Reader(_StackableToy):
+        def dot(self, layer, k, n):
+            seen.append((layer.fmt is self, n))
+            return super().dot(layer, k, n)
+
+    face = _toy("stack_reader")
+    registered = Reader(face)
+    fmt = Reader(face) if checkpoint_copy else registered
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", registered)
+    matrices = [
+        dict(zip(("weight", "scales"), _matrix(8, 320, seed)[0], strict=True))
+        for seed in (1, 2)
+    ]
+    testing.rows_stack(fmt, *matrices, 320, 8, 1, _ints((320,)))
+    assert seen == [(True, 16), (True, 8), (True, 8)]
+
+
 def test_rows_stack_checks_a_format_s_promise(toy, monkeypatch):
     """testing.rows_stack: two matrices stacked decode, and run their dot
     rows, as the two do apart. A format whose decode mixes rows fails it,

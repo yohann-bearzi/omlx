@@ -524,7 +524,7 @@ def rows_stack(
         return
     rows = []
     for tensors in (stacked, first, second):
-        layer = FormatLinear(fmt.mode, bits, group_size, k, tensors)
+        layer = FormatLinear(fmt, bits, group_size, k, tensors)
         face = fmt.dot(layer, k, layer.output_dims)
         if face is None:
             raise AssertionError(f"quant format {fmt.mode}: no dot face to compare")
