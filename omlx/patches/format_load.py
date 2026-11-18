@@ -394,20 +394,25 @@ def _snapshot(value):
 
 
 def _attributes(fmt) -> dict:
-    """``fmt``'s attributes: its ``__dict__``'s and its slots' (but the
-    instance dict's and the weak reference's slot a mixin may declare)."""
-    names = set(getattr(fmt, "__dict__", {}))
+    """``fmt``'s attributes: its ``__dict__``'s, and its slots', each read
+    through its own descriptor (a private slot by its mangled name; the
+    slot, not a property or a method a subclass shadows it with; not the
+    instance dict's and the weak reference's a mixin may declare), by the
+    names ``object.__setattr__`` takes."""
+    attributes = dict(getattr(fmt, "__dict__", {}))
     for cls in type(fmt).__mro__:
-        slots = getattr(cls, "__slots__", ())
-        names.update((slots,) if isinstance(slots, str) else slots)
-    names -= {"__dict__", "__weakref__"}
-    attributes = {}
-    for name in names:
-        try:
-            attributes[name] = object.__getattribute__(fmt, name)
-        except AttributeError:
-            # A slot never set.
-            continue
+        slots = cls.__dict__.get("__slots__", ())
+        for slot in (slots,) if isinstance(slots, str) else slots:
+            if slot.startswith("__") and not slot.endswith("__"):
+                slot = f"_{cls.__name__.lstrip('_')}{slot}"
+            descriptor = cls.__dict__.get(slot)
+            if not isinstance(descriptor, types.MemberDescriptorType):
+                continue
+            try:
+                attributes[slot] = descriptor.__get__(fmt, type(fmt))
+            except AttributeError:
+                # A slot never set.
+                continue
     return attributes
 
 
@@ -427,7 +432,7 @@ def _differs(value, held) -> bool:
     if isinstance(value, list):
         return len(value) != len(held) or any(map(operator.is_not, value, held))
     if isinstance(value, set):
-        return value != held
+        return not set.__eq__(set(value), held)
     return bytes(value) != held
 
 
@@ -453,12 +458,19 @@ def _restore(fmt, kept: dict, changed: list[str]) -> None:
             object.__delattr__(fmt, name)
             continue
         value, held = kept[name]
+        # Its contents first, and only when they changed, then the name; a
+        # dict and a set never empty meanwhile (a forward reads them).
+        if held is not None and _differs(value, held):
+            if isinstance(value, dict):
+                value.update(held)
+                for key in value.keys() - held.keys():
+                    del value[key]
+            elif isinstance(value, set):
+                value |= held
+                value -= value - held
+            else:
+                value[:] = held
         object.__setattr__(fmt, name, value)
-        if isinstance(value, (dict, set)):
-            value.clear()
-            value.update(held)
-        elif held is not None:
-            value[:] = held
 
 
 def check_loaded(model) -> None:
@@ -897,7 +909,7 @@ def _wrap(module) -> None:
                 _patch(module.SwitchLinear, FormatSwitchLinear)
         except AttributeError:
             # Not defined yet: its import is still running, and the end of
-            # it wraps the module.
+            # it wraps the module (or the next application of the patch).
             return
         _PENDING.discard(module.__name__)
 

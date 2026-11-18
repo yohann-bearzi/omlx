@@ -1243,6 +1243,32 @@ class _Weak(_WeakMixin, _Slotted):
     pass
 
 
+class _Private(_Loadable):
+    """A slot of its own name: Python keeps it as _Private__levels."""
+
+    __slots__ = ("__levels",)
+
+
+class _Shadowed(_Slotted):
+    """Its parent's slot read through a property: no attribute of it."""
+
+    @property
+    def level(self):
+        return [1]
+
+
+class _OddSet(set):
+    """A set that says it differs from any other."""
+
+    def __ne__(self, other):
+        return True
+
+    def __eq__(self, other):
+        return False
+
+    __hash__ = None
+
+
 class _Tagged(list):
     """A list whose constructor takes something else first."""
 
@@ -1280,14 +1306,23 @@ _ACCEPT_CHANGES = {
             setattr(fmt, "level", 2),
         ),
     ),
-    # A key a cache gained meanwhile is kept when the format is put back.
+    # A key added and one changed: both undone.
     "a key added and one changed": (
         "options",
         lambda fmt: fmt.options.update({"face": 1, "rows": 2}),
     ),
+    "a key added": ("options", lambda fmt: fmt.options.__setitem__("scale", 2.5)),
     # A record kept in a dict that was empty: the next checkpoint would read
     # with it.
-    "a key added": ("options", lambda fmt: fmt.options.__setitem__("scale", 2.5)),
+    "an empty dict filled": ("empty", lambda fmt: fmt.empty.__setitem__("a", 1)),
+    "a key swapped": (
+        "options",
+        lambda fmt: (fmt.options.pop("rows"), fmt.options.__setitem__("cols", 1)),
+    ),
+    "a private slot": (
+        "_Private__levels",
+        lambda fmt: fmt._Private__levels.__setitem__("scale", 2.5),
+    ),
     "a slot of the parent": ("level", lambda fmt: setattr(fmt, "level", 2)),
     "an entry replaced by an equal one": (
         "scales, table",
@@ -1300,6 +1335,8 @@ _ACCEPT_CHANGES = {
     # Held while accept returns: the mixin's slot holds it.
     "a weak reference": (None, lambda fmt: _REFERENCES.append(weakref.ref(fmt))),
     "a list of another constructor": (None, lambda fmt: None),
+    "a slot behind a property": (None, lambda fmt: None),
+    "a set of its own comparison": (None, lambda fmt: None),
 }
 
 
@@ -1312,11 +1349,20 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
         "a slot named alone": _OneSlot,
         "a slot of the parent": _SubSlotted,
         "a weak reference": _Weak,
+        "a private slot": _Private,
+        "a slot behind a property": _Shadowed,
     }
     fmt = classes.get(change, _Slotted)()
-    fmt.table, fmt.options, fmt.level = [0.5, 1.5], {"rows": 1}, 1
-    fmt.tagged = _Tagged("tag", [1, 2])
-    fmt.scales = {"s": 0.25}
+    fmt.table, fmt.options = [0.5, 1.5], {"rows": 1}
+    if change != "a slot behind a property":
+        fmt.level = 1
+    if change == "a list of another constructor":
+        fmt.tagged = _Tagged("tag", [1, 2])
+    if change == "a set of its own comparison":
+        fmt.odd = _OddSet({1})
+    if change == "a private slot":
+        fmt._Private__levels = {}
+    fmt.scales, fmt.empty = {"s": 0.25}, {}
     fmt.tags, fmt.raw = {1}, bytearray(b"ab")
     # What no copy takes: a face's dtypes, a lock.
     fmt.faces = {"dtypes": (mx.float16,), "lock": threading.Lock()}
@@ -1340,7 +1386,9 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
     named = _ACCEPT_CHANGES.get(change, ("",))[0]
     if named is None:
         load_model(tmp_path)
-        assert fmt.options == {"rows": 1} and fmt.tagged == [1, 2]
+        assert fmt.options == {"rows": 1}
+        if change == "a list of another constructor":
+            assert fmt.tagged == [1, 2]
         return
     # A format's defect is its own error; a refusal is oMLX's.
     error = KeyError if change == "then fails" else formats.FormatRefusedError
@@ -1349,6 +1397,9 @@ def test_what_accept_changes_of_the_registered_format_is_undone(
     if named:
         assert f"accept changed the registered format ({named})" in str(refusal.value)
     assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], {"rows": 1}, 1)
+    assert fmt.empty == {}
+    if change == "a private slot":
+        assert fmt._Private__levels == {}
     assert (fmt.tags, fmt.raw, fmt.faces) == ({1}, bytearray(b"ab"), faces)
     assert fmt.scales == {"s": 0.25}
     assert not hasattr(fmt, "extra")
