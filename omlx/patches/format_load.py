@@ -1017,6 +1017,12 @@ def _format_layer(layer, layer_cls, signature, arguments):
             f"{group_size}",
             mode,
         )
+    try:
+        # Against the matrix's own N, before a placeholder is made: a layout
+        # packed along N is refused here, not built over half its rows.
+        formats.check_layout(fmt, n, k, layout)
+    except ValueError as error:
+        raise _refused(str(error), mode) from error
     for name, value in arguments.items():
         if name not in _TAKEN and value != signature.parameters[name].default:
             raise _refused(

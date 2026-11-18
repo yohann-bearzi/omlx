@@ -474,18 +474,25 @@ def test_a_layout_packed_along_n_is_refused_where_the_layer_is_built(
     toy, by_hand, monkeypatch, switch
 ):
     """The load builds a layer over the layout's placeholders: one packed
-    along N would hold half the rows its matrix has, and is refused."""
+    along N would hold half the rows its matrix has, and is refused by the
+    matrix's own N, before a placeholder is made; so is one that packs no
+    row of a one-row matrix, and one that lays out even Ns alone."""
 
     def packed(k, n, bits, group_size):
         return {"weight": ((n // 2, 2 * k), mx.uint8), "scales": ((n,), mx.float32)}
 
-    monkeypatch.setattr(toy, "layout", packed)
-    if switch is None:
-        dense = nn.Linear(64, 16)
-    else:
-        dense = switch.SwitchLinear(64, 16, EXPERTS)
-    with pytest.raises(ValueError, match=re.escape("its first axis is N (8)")):
-        dense.to_quantized(**_TOY)
+    def even(k, n, bits, group_size):
+        return None if n % 2 else packed(k, n, bits, group_size)
+
+    for layout, n in ((packed, 16), (packed, 1), (even, 18)):
+        monkeypatch.setattr(toy, "layout", layout)
+        if switch is None:
+            dense = nn.Linear(64, n)
+        else:
+            dense = switch.SwitchLinear(64, n, EXPERTS)
+        words = f"its first axis is N ({n})"
+        with pytest.raises(formats.FormatRefusedError, match=re.escape(words)):
+            dense.to_quantized(**_TOY)
 
 
 def test_mlx_s_modes_load_as_mlx_s_layers(toy):
