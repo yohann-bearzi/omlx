@@ -450,7 +450,7 @@ class D3Model:
 
     def __init__(self, model_path: str, trust_remote_code: bool = False):
         self.model_path = model_path
-        self.backbone = DecisionBackbone(model_path, trust_remote_code)
+        self.backbone = DecisionBackbone(model_path, trust_remote_code, "d3")
         self.readout: mx.array | None = None
         self.codes: list[str] = []
         self.temperature = 1.0

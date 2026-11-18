@@ -27,7 +27,7 @@ from mlx_lm.models import llama
 from mlx_lm.models import switch_layers as lm_switch
 from mlx_vlm.models import switch_layers as vlm_switch
 
-from omlx import formats
+from omlx import formats, oq
 from omlx.formats import testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
@@ -473,21 +473,165 @@ def test_the_modes_a_config_names():
     assert format_load._named_modes(config) == ["oqel", "toy", "other"]
 
 
-def test_a_view_of_a_decision_model_is_refused_as_its_family(toy, tmp_path):
-    clef = tmp_path / "clef"
-    clef.mkdir()
+def test_a_config_alone_names_the_family(toy, tmp_path):
+    # A directory named as a decision model's, and a link to it: the config's
+    # model type decides, in any view.
+    openjev = tmp_path / "OpenJev-9B"
+    openjev.mkdir()
+    (openjev / "config.json").write_text(
+        json.dumps(_typed({"toy": {}}) | {"model_type": "qwen3_5"})
+    )
+    prod = tmp_path / "prod"
+    prod.symlink_to(openjev, target_is_directory=True)
+    for path in (openjev, prod, openjev / ".", prod / ".." / "OpenJev-9B"):
+        with pytest.raises(formats.FormatRefusedError, match="loads no qwen3_5"):
+            format_load._refuse_family(format_load._Checkpoint(path))
+        with testing.verified("qwen3_5"):
+            checkpoint = format_load._Checkpoint(path)
+            format_load._refuse_family(checkpoint)
+            assert checkpoint.verified
+
+
+@pytest.mark.parametrize("family", ["clef", "openjev", "d3", "d1"])
+def test_a_decision_model_s_loader_refuses_it_in_a_format(toy, tmp_path, family):
+    from omlx.models.d1 import D1Model
+    from omlx.models.decision import DecisionBackbone
+
+    path = tmp_path / "decision"
+    path.mkdir()
     config = _typed({"toy": {}}) | {"model_type": "qwen3_5"}
-    (clef / "config.json").write_text(json.dumps(config))
-    for name in ("joint_head.safetensors", "joint_head_config.json"):
-        (clef / name).write_text("{}")
-    view = tmp_path / "view"
-    view.mkdir()
-    (view / "config.json").symlink_to(clef / "config.json")
-    with (
-        testing.verified("qwen3_5"),
-        pytest.raises(formats.FormatRefusedError, match="loads no clef"),
+    (path / "config.json").write_text(json.dumps(config))
+    # Weights that no load reads: refused before any is.
+    (path / "model.safetensors").write_bytes(b"not a checkpoint")
+    model = (
+        D1Model(str(path))
+        if family == "d1"
+        else DecisionBackbone(str(path), False, family)
+    )
+    why = {
+        "clef": "it reads rows of its output head by hand, as MLX's quantized "
+        "layers or as floats",
+    }.get(family, "it is no family verified with quant formats end to end")
+    # Its backbone's family verified: served as a decision model, it is not.
+    with testing.verified("qwen3_5"), pytest.raises(formats.FormatRefusedError) as no:
+        model.load()
+    assert str(no.value) == _refusal(
+        f"oMLX loads no {family} checkpoint in a quant format: {why}; have the "
+        "family verified",
+        path,
+        written="an unknown writer",
+    )
+    if family == "clef":
+        quoted = str(no.value).replace(str(path), "/models/my-model")
+        for said in ("an unknown writer", "a format registered by hand"):
+            quoted = quoted.replace(said, "my-package 0.1.0")
+        assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    # Named in its quantization config alone, or a damaged record, too.
+    for named in (
+        {"model_type": "qwen3_5", "quantization": {"mode": "toy"}},
+        {"model_type": "qwen3_5", "omlx_quant_formats": None},
     ):
-        format_load._refuse_family(format_load._Checkpoint(view))
+        (path / "config.json").write_text(json.dumps(named))
+        with pytest.raises(formats.FormatRefusedError, match=f"loads no {family}"):
+            format_load.refuse_family(path, family)
+    # Of a verified decision family, or of no format: the loader goes on.
+    with testing.verified(family):
+        format_load.refuse_family(path, family)
+    (path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
+    format_load.refuse_family(path, family)
+    format_load.refuse_family(tmp_path / "none", family)
+
+
+def test_a_damaged_record_of_formats_is_refused_though_no_layer_reads_it(toy, tmp_path):
+    for written, said in ((None, "null"), ([], "an array"), ("toy", "a string")):
+        config = {"model_type": "raon1_mini", "omlx_quant_formats": written}
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        # Of a family not verified: refused before a weight is read.
+        with (
+            pytest.raises(formats.FormatRefusedError, match="loads no raon1_mini"),
+            format_load.loading(tmp_path),
+        ):
+            pass
+        # Of a verified one whose load built no format's layer: at its end.
+        config["model_type"] = "llama"
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        with (
+            format_load.loading(tmp_path) as checkpoint,
+            pytest.raises(formats.FormatRefusedError) as no,
+        ):
+            checkpoint.check(nn.Linear(2, 2))
+        assert no.value.reason == (
+            f"config.json['omlx_quant_formats'] is {said}, where oQ writes an "
+            "object: the checkpoint's config is damaged"
+        )
+        assert no.value.mode == "unknown"
+
+
+def _hand_built(kind):
+    """A toy layer of ``kind`` built by hand."""
+    stack = (2,) if kind is FormatSwitchLinear else ()
+    tensors = {
+        "weight": mx.zeros((*stack, 128, 64), mx.uint8),
+        "scales": mx.zeros((*stack, 128), mx.float32),
+    }
+    return kind("toy", 8, 1, 64, tensors)
+
+
+@pytest.mark.parametrize("kind", [FormatLinear, FormatSwitchLinear])
+def test_a_format_s_layer_is_built_only_in_a_load_that_passed_the_gate(
+    toy, tmp_path, monkeypatch, kind
+):
+    import contextvars
+
+    # No family verified, and no block open but this file's own.
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
+    monkeypatch.setattr(formats, "_TESTING", False)
+    said = (
+        "quant format 'toy': a format's layer is built only while oMLX loads a "
+        "checkpoint of a family verified with quant formats, and this one is "
+        "built outside such a load (by a family's own loader, or by hand): load "
+        "the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model"
+    )
+    with pytest.raises(formats.FormatRefusedError) as no:
+        _hand_built(kind)
+    assert str(no.value) == said and no.value.path is None
+    assert said.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    stock, named = tmp_path / "stock", tmp_path / "named"
+    configs = ((stock, {"model_type": "llama"}), (named, _typed({"toy": {}})))
+    for path, config in configs:
+        path.mkdir()
+        (path / "config.json").write_text(json.dumps(config))
+    # The load of a checkpoint the gate never passed (it names no format),
+    # one block outside a load, or a load the gate refused.
+    with format_load.loading(stock), pytest.raises(formats.FormatRefusedError):
+        _hand_built(kind)
+    with (
+        pytest.raises(formats.FormatRefusedError, match="loads no llama"),
+        format_load.loading(named),
+    ):
+        pass
+    # Verified for its block: the load of a checkpoint the gate passed.
+    with testing.verified("llama"), format_load.loading(named) as checkpoint:
+        assert checkpoint.verified
+        # Its own layer, on its thread and on one that copied its context.
+        monkeypatch.setattr(formats, "_TESTING", False)
+        assert type(_hand_built(kind)) is kind
+        context = contextvars.copy_context()
+        assert type(context.run(_hand_built, kind)) is kind
+        with format_load.outside_load(), pytest.raises(formats.FormatRefusedError):
+            _hand_built(kind)
+    # Once its load has ended, a thread that copied its context builds none.
+    monkeypatch.setattr(formats, "_TESTING", False)
+    with pytest.raises(formats.FormatRefusedError):
+        context.run(_hand_built, kind)
+    # In a test's block, by hand; not once the last is closed.
+    with monkeypatch.context() as blocks:
+        blocks.setattr(testing, "_VERIFYING", [])
+        with testing.verified("qwen3_5"):
+            assert type(_hand_built(kind)) is kind
+        assert formats._TESTING is False
+        with pytest.raises(formats.FormatRefusedError):
+            _hand_built(kind)
 
 
 @pytest.mark.parametrize(
@@ -2388,9 +2532,9 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
     mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
     model, _ = mlx_lm.utils.load_model(_tiny(tmp_path / "llama", [15.0]))
     assert _gate_proj(model).fmt.levels == (15.0,)
-    # It builds a DeepSeek V4 checkpoint's layers itself, outside any load:
-    # one of a format is refused, on every load (the patch never wraps the
-    # loader again).
+    # It loads a DeepSeek V4 checkpoint inside a checkpoint's load, and
+    # builds its layers outside it: one of a format is refused, on every load
+    # (the patch never wraps the loader again).
     v4 = _tiny(tmp_path / "v4", [16.0])
     config = json.loads((v4 / "config.json").read_text())
     (v4 / "config.json").write_text(json.dumps({**config, "model_type": "deepseek_v4"}))
@@ -2423,6 +2567,66 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
         k2, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
     )
     assert _gate_proj(model).fmt.levels == (17.0,)
+
+
+def test_a_deepseek_v4_checkpoint_of_a_format_is_refused_before_a_weight_is_read(
+    toy, tmp_path, monkeypatch
+):
+    import mlx_lm.utils
+
+    from omlx.patches.deepseek_v4 import utils_patch
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", mlx_lm.utils.load_model)
+    mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
+    # Weights that no load reads.
+    (tmp_path / "model.safetensors").write_bytes(b"not a checkpoint")
+    for named in (
+        _typed({"toy": {}}),
+        {"quantization_config": {"mode": "toy"}},
+        {"text_config": {"quantization": {"mode": "toy"}}},
+    ):
+        for model_type in ("deepseek_v4", "deepseek_v4_mtp"):
+            config = {**named, "model_type": model_type}
+            (tmp_path / "config.json").write_text(json.dumps(config))
+            with pytest.raises(formats.FormatRefusedError) as no:
+                load_model(tmp_path)
+            assert no.value.reason == (
+                f"oMLX loads no {model_type} checkpoint in a quant format: its "
+                "DSpark draft reads the output head's weight by hand, as floats; "
+                "have the family verified"
+            )
+
+
+@testing.verified("deepseek_v4")
+def test_deepseek_v4_s_own_load_is_checked_at_its_end(toy, tmp_path, monkeypatch):
+    import mlx_lm.utils
+
+    from omlx.patches.deepseek_v4 import utils_patch
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", mlx_lm.utils.load_model)
+    mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
+    config = {
+        "model_type": "deepseek_v4",
+        "hidden_size": 64,
+        "num_hidden_layers": 1,
+        "intermediate_size": 128,
+        "num_attention_heads": 2,
+        "rms_norm_eps": 1e-5,
+        "vocab_size": 32,
+    }
+    model = llama.Model(llama.ModelArgs.from_dict(config))
+    weights = dict(tree_flatten(model.parameters()))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
+    # A float checkpoint whose record of formats is damaged: no layer reads
+    # it, the end of the load refuses it.
+    (tmp_path / "config.json").write_text(
+        json.dumps({**config, "omlx_quant_formats": None})
+    )
+    damaged = r"\['omlx_quant_formats'\] is null"
+    with pytest.raises(formats.FormatRefusedError, match=damaged):
+        load_model(
+            tmp_path, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
+        )
 
 
 def test_a_module_half_imported_by_another_thread_is_wrapped_when_it_ends(
@@ -2510,7 +2714,7 @@ from {library}.utils import load_model
 import json, sys
 from pathlib import Path
 
-from omlx import formats
+from omlx import formats, oq
 from omlx.formats import testing
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 from tests.test_formats_load import _gate_proj, _Levels

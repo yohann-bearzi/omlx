@@ -166,6 +166,21 @@ def _build_patched_load_model() -> Callable:
                 trust_remote_code=trust_remote_code,
             )
 
+        from omlx.patches.format_load import loading
+
+        # Its own load of a DeepSeek V4 checkpoint, inside a checkpoint's
+        # load: the family gate refuses one of a quant format before a
+        # weight is read.
+        with loading(model_path, by_loader=True) as checkpoint:
+            loaded = _load_deepseek_v4(
+                model_path, config, lazy, strict, model_file, get_model_classes
+            )
+            checkpoint.check(loaded)
+        return loaded
+
+    def _load_deepseek_v4(
+        model_path, config, lazy, strict, model_file, get_model_classes
+    ):
         weight_files = glob.glob(str(model_path / "model*.safetensors"))
 
         if not weight_files and strict:
@@ -285,6 +300,8 @@ def _build_patched_load_model() -> Callable:
 
         return model, config
 
+    # The loader it goes over, as the families' loaders name it.
+    patched_load_model._omlx_original = original_load_model
     return patched_load_model
 
 

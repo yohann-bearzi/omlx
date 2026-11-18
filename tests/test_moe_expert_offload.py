@@ -609,9 +609,12 @@ class TestApplyAndForward:
         _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
         gate = glu.gate_proj
         names = ("weight", "scales", "biases")
-        glu.gate_proj = FormatSwitchLinear(
-            "affine", 4, GROUP, D, {name: gate[name] for name in names}
-        )
+        from omlx.formats import testing
+
+        with testing.verified("llama"):
+            glu.gate_proj = FormatSwitchLinear(
+                "affine", 4, GROUP, D, {name: gate[name] for name in names}
+            )
         with caplog.at_level(logging.INFO):
             assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
         assert "gate_proj is a layer of the 'affine' quant format" in caplog.text

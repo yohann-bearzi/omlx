@@ -6913,8 +6913,8 @@ _TEST_VERIFIED: frozenset[str] = frozenset()
 # for floats instead of called. oQ says it when it refuses the family; the
 # family leaves the table when a commit whose tests show each such reader
 # declining a format's layer verifies it. Keyed by model type (of the
-# checkpoint or of its text_config), or by the decision family
-# (model_discovery.decision_kind) of a decision model.
+# checkpoint or of its text_config), or by the decision family a decision
+# model's loader serves it as (format_load.refuse_family).
 _GLM5_NEXT_MISREAD = (
     # Glm5NextLinearAttention._fused_in_proj concatenates q, k, v, f_a, g_a
     # and b: as affine when the first has "scales", else as float weights
@@ -6986,22 +6986,17 @@ def _family(name: str) -> str:
     return name.strip().lower().replace("-", "_")
 
 
-def _unverified_family(source: Path, config: dict) -> tuple[str, str] | None:
-    """(family, why) when the checkpoint at ``source`` takes no quant format:
-    one whose config names no model type; a decision model whose family is
-    not verified; or a model whose type (or its text model's) is not a
-    verified family, with what the audits found its own code to read
-    wrongly when they did."""
+def _unverified_family(config: dict) -> tuple[str, str] | None:
+    """(family, why) when the checkpoint whose config is ``config`` takes no
+    quant format: one whose config names no model type, or whose type (or
+    its text model's) is not a verified family, with what the audits found
+    its own code to read wrongly when they did. The config alone decides,
+    never a directory's name: a decision model, served by a loader of its
+    own, is refused there (``refuse_family``)."""
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
     verified = _QUANT_FORMAT_VERIFIED | _TEST_VERIFIED
-    kind = decision_kind(source, {**config, "model_type": _family(model_type)})
-    if kind is not None:
-        if kind in verified:
-            return None
-        why = _QUANT_FORMAT_MISREAD.get(kind, _NOT_VERIFIED)
-        return kind, why
     text_config = config.get("text_config")
     families = [
         _family(name)
@@ -7397,11 +7392,7 @@ def quantize_oq_streaming(
             "format"
         )
     if quant_fmt is not None:
-        # The source and the output by their directories' names, which name
-        # a decision model's family (OpenJev's).
-        refused = _unverified_family(
-            Path(os.path.abspath(source)), config
-        ) or _unverified_family(Path(os.path.abspath(output_path)), config)
+        refused = _unverified_family(config)
         if refused is not None:
             fix = (
                 "name its model type in its config"

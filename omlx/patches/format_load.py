@@ -15,7 +15,8 @@ from a checkpoint's directory (``_LOADERS``) are wrapped: while one runs, the
 format layers built on its thread belong to its checkpoint, each is built
 with the object the format's ``accept`` returns for the record, and when it
 returns every one of them is in the model it returns. A format's layer built
-anywhere else is refused.
+anywhere else is refused: a format's layer is only built in the load of a
+checkpoint that passed the family gate (``formats._may_build``).
 
 Each library function is wrapped once, the first time this patch finds it:
 when the patch is applied, or when its module is imported after that (the
@@ -24,9 +25,10 @@ object itself: a name it was imported under before is wrapped too. A
 family's patch that replaces one of them afterwards keeps the wrapped
 function under it: DeepSeek V4's loader
 (``patches/deepseek_v4/utils_patch.py``, applied after this patch by
-``maybe_apply_pre_load_patches``) calls it for any other model and builds a
-DeepSeek V4 checkpoint's layers itself, outside any load, so that a
-DeepSeek V4 checkpoint of a format is refused on every load; K2 Horizon's
+``maybe_apply_pre_load_patches``) calls it for any other model and loads a
+DeepSeek V4 checkpoint itself inside a checkpoint's load (``loading``),
+whose family gate refuses one of a format, building its layers outside it;
+K2 Horizon's
 (``patches/k2_horizon/checkpoint.py``) calls it with a directory of links to
 the checkpoint's files, its config among them, whose record the layers read.
 """
@@ -110,6 +112,9 @@ class _Checkpoint:
         self.owner = threading.get_ident()
         self.active = True
         self.by_loader = by_loader
+        # Whether the family gate passed it for a format: only then may its
+        # load build a format's layer (formats._may_build).
+        self.verified = False
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
         self._config = _ABSENT
@@ -246,6 +251,13 @@ class _Checkpoint:
         entry of a format's mode in its quantization config that bound no
         layer. A layer it left wholly unfilled is a layer a partial load
         does not hold (a pipeline rank's, a prefill helper's)."""
+        try:
+            config = self._read_config()
+        except (OSError, ValueError):
+            config = None
+        if isinstance(config, dict) and _damaged(config):
+            # No layer read the record, which would have refused it.
+            self._record(self._recorded_top_mode() or "unknown")
         entries = self._format_entries()
         top = self._recorded_top_mode()
         if top is not None and not any(layer.mode == top for layer in self.built):
@@ -467,18 +479,21 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     try:
         config = checkpoint._read_config()
     except (OSError, ValueError):
-        # No checkpoint's directory, or the library's to refuse.
+        # No checkpoint's directory, or the library's to refuse: no format's
+        # layer is built for it.
         return
     if not isinstance(config, dict):
         return
     modes = [mode] if mode is not None else _named_modes(config)
+    if not modes and _damaged(config):
+        # A record of formats it keeps damaged: of modes no one knows.
+        modes = ["unknown"]
     if not modes:
         return
     from .. import oq
 
-    # The checkpoint a view of links is of: its sidecars and its name are
-    # the decision model's family.
-    refused = oq._unverified_family(checkpoint.shown, config)
+    # Its config alone names its family, wherever the load found it.
+    refused = oq._unverified_family(config)
     if refused is not None:
         family, why = refused
         fix = (
@@ -491,6 +506,43 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
             modes[0],
             checkpoint,
         )
+    checkpoint.verified = True
+
+
+def _damaged(config: dict) -> bool:
+    """Whether ``config`` keeps a record of formats that is no object."""
+    written = config.get("omlx_quant_formats", _ABSENT)
+    return written is not _ABSENT and not isinstance(written, dict)
+
+
+def refuse_family(path, family: str) -> None:
+    """Refuse the checkpoint at ``path`` when its config records or names a
+    quant format and a loader of oMLX's own serves it as ``family`` (a
+    decision model's, which its config's model type does not name) that is
+    not verified: that loader reads its layers by hand. Called before the
+    loader reads a weight."""
+    checkpoint = _Checkpoint(path)
+    try:
+        config = checkpoint._read_config()
+    except (OSError, ValueError):
+        # The loader's to refuse.
+        return
+    if not isinstance(config, dict):
+        return
+    modes = _named_modes(config) or (["unknown"] if _damaged(config) else [])
+    if not modes:
+        return
+    from .. import oq
+
+    if family in oq._QUANT_FORMAT_VERIFIED | oq._TEST_VERIFIED:
+        return
+    why = oq._QUANT_FORMAT_MISREAD.get(family, oq._NOT_VERIFIED)
+    raise _refused(
+        f"oMLX loads no {family} checkpoint in a quant format: {why}; have the "
+        "family verified",
+        modes[0],
+        checkpoint,
+    )
 
 
 def _current() -> _Checkpoint | None:
@@ -709,8 +761,9 @@ _LOADER_CODES: set = set()
 def _wrapped_already(load) -> bool:
     """Whether ``load``, or a function it wraps, is this patch's loader: by
     ``__wrapped__`` (functools.wraps, K2 Horizon's) or ``_omlx_original``
-    (MiniMax M3's). A function that only calls one (DeepSeek V4's loader)
-    runs its own body outside the load, and is wrapped by name."""
+    (MiniMax M3's, DeepSeek V4's, which loads its own checkpoints in a load
+    of its own). One over the library's own, unwrapped, is wrapped by
+    name."""
     seen, pending = set(), [load]
     while pending:
         load = pending.pop()

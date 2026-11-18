@@ -359,7 +359,7 @@ class ClefModel:
 
     def __init__(self, model_path: str, trust_remote_code: bool = False):
         self.model_path = model_path
-        self.backbone = DecisionBackbone(model_path, trust_remote_code)
+        self.backbone = DecisionBackbone(model_path, trust_remote_code, "clef")
         self.head: JointSchemaHead | None = None
 
     @property

@@ -237,7 +237,7 @@ class OpenJevModel:
 
     def __init__(self, model_path: str, trust_remote_code: bool = False):
         self.model_path = model_path
-        self.backbone = DecisionBackbone(model_path, trust_remote_code)
+        self.backbone = DecisionBackbone(model_path, trust_remote_code, "openjev")
         self._letter_ids: list[int] = []
         self._vision_end_id: int | None = None
 

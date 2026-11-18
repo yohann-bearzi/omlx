@@ -145,6 +145,7 @@ def _publish() -> None:
     from .. import oq
 
     oq._TEST_VERIFIED = frozenset().union(*_VERIFYING)
+    formats._TESTING = bool(_VERIFYING)
 
 
 @contextmanager

@@ -24,7 +24,7 @@ import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
 from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
-from ..patches.format_load import check_loaded
+from ..patches.format_load import check_loaded, refuse_family
 from ..utils.image import load_image
 from ..utils.model_loading import (
     lm_load_compat,
@@ -72,10 +72,12 @@ def _backbone_files(path: Path) -> Iterator[Path]:
 
 
 class DecisionBackbone:
-    """Qwen3.5 backbone that returns final normed hidden states."""
+    """Qwen3.5 backbone that returns final normed hidden states, of a decision
+    model of ``family``."""
 
-    def __init__(self, model_path: str, trust_remote_code: bool = False):
+    def __init__(self, model_path: str, trust_remote_code: bool, family: str):
         self.model_path = model_path
+        self.family = family
         self.trust_remote_code = trust_remote_code
         self.model: Any = None
         self.tokenizer: Any = None
@@ -96,6 +98,8 @@ class DecisionBackbone:
 
     def load(self) -> None:
         path = Path(self.model_path)
+        # Its head reads the backbone's output head by hand.
+        refuse_family(path, self.family)
         self.config = json.loads((path / "config.json").read_text())
         if _vision_weight_bytes(path) > 0:
             # Also installs the Qwen3.5 GatedDeltaNet q/k norm fix for mlx-vlm.

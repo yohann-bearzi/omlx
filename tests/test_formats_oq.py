@@ -764,7 +764,6 @@ _QUOTED_FAMILIES = {
     "deepseek_v4_mtp",
     "glm_moe_dsa",
     "step3p7",
-    "clef",
     "inkling2",
 }
 
@@ -814,18 +813,11 @@ _QUOTED_FAMILIES = {
             _NOT_VERIFIED,
         ),
         (
-            "d1",
-            # Its backbone is not verified either; it is refused as its decision
-            # family.
-            {"model_type": "lfm3_vl", "architectures": ["D1Model"]},
-            _NOT_VERIFIED,
-        ),
-        (
-            "clef",
-            # A Clef checkpoint is a Qwen3.5 one with Clef's joint head beside it.
+            # A decision model by its model type, whatever its sidecars:
+            # served as one, its loader refuses it (format_load.refuse_family).
+            "qwen3_5",
             {"model_type": "qwen3_5"},
-            "it reads rows of its output head by hand, as MLX's quantized "
-            "layers or as floats",
+            _NOT_VERIFIED,
         ),
         (
             "inkling2",
@@ -839,7 +831,7 @@ _QUOTED_FAMILIES = {
         ("untyped", {"model_type": " "}, "its config names no model type"),
         # A decision model's backbone under another spelling.
         (
-            "d1",
+            "lfm3_vl",
             {"model_type": "LFM3-VL", "architectures": ["D1Model"]},
             _NOT_VERIFIED,
         ),
@@ -863,7 +855,6 @@ _QUOTED_FAMILIES = {
         "unknown",
         "text model not verified",
         "decision model",
-        "decision family",
         "inkling2",
         "no model type",
         "a null model type",
@@ -874,7 +865,8 @@ _QUOTED_FAMILIES = {
 def test_a_family_not_verified_is_refused(toy, tmp_path, family, config, why):
     source = tmp_path / "source"
     source.mkdir()
-    if family == "clef":
+    if family == "qwen3_5":
+        # Clef's joint head beside it.
         for name in ("joint_head.safetensors", "joint_head_config.json"):
             (source / name).write_text("{}")
     (source / "config.json").write_text(json.dumps(config))
@@ -905,39 +897,13 @@ def test_no_family_is_verified_but_by_a_test(tmp_path, monkeypatch):
     # Outside every block (this file's tests take llama as verified).
     monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
     for model_type in ("llama", " Llama ", "qwen2"):
-        refused = oq._unverified_family(tmp_path, {"model_type": model_type})
+        refused = oq._unverified_family({"model_type": model_type})
         assert refused == (oq._family(model_type), _NOT_VERIFIED)
     # Spaces and a blank text model type: the family the audits read.
     blank = {"model_type": " raon1_mini ", "text_config": {"model_type": " "}}
-    assert oq._unverified_family(tmp_path, blank)[0] == "raon1_mini"
+    assert oq._unverified_family(blank)[0] == "raon1_mini"
     with testing.verified("raon1_mini"):
-        assert oq._unverified_family(tmp_path, blank) is None
-
-
-def test_a_decision_family_is_read_from_any_path_and_the_output(
-    toy, tmp_path, monkeypatch
-):
-    openjev = tmp_path / "openjev-1"
-    openjev.mkdir()
-    (openjev / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
-
-    def quantize(model_path, output):
-        oq.quantize_oq_streaming(
-            model_path, output, 4, enhanced=True, quant_format="toy"
-        )
-
-    with testing.verified("qwen3_5"):
-        # The source named ".", a relative path inside OpenJev's directory.
-        monkeypatch.chdir(openjev)
-        with pytest.raises(formats.FormatRefusedError, match="no openjev"):
-            quantize(".", str(tmp_path / "out"))
-        # An output named as OpenJev's is served as it.
-        monkeypatch.chdir(tmp_path)
-        with pytest.raises(formats.FormatRefusedError, match="no openjev"):
-            quantize(str(source), str(tmp_path / "openjev-oq4"))
+        assert oq._unverified_family(blank) is None
 
 
 @pytest.mark.parametrize("mode", ["affine", "mxfp4"])
@@ -956,11 +922,8 @@ def test_the_families_oq_writes_in_a_format(tmp_path):
     # run that verifies it. Families mlx-lm's own code serves come back after
     # the proof of concept (DEFERRED.md row 22).
     assert not _VERIFIED and not hasattr(oq, "_QUANT_FORMAT_STOCK")
-    source = tmp_path / "source"
-    source.mkdir()
-
     def unverified(config):
-        return oq._unverified_family(source, config)
+        return oq._unverified_family(config)
 
     # (This file's tests take llama as verified, for their tiny checkpoints.)
     for model_type in ("Mistral", "qwen2", "PHI3", "starcoder2", "olmo2"):
@@ -977,16 +940,6 @@ def test_the_families_oq_writes_in_a_format(tmp_path):
     assert unverified({"model_type": "qwen3"}) == ("qwen3", _NOT_VERIFIED)
 
 
-def test_a_verified_decision_family_is_written_whatever_its_backbone(tmp_path):
-    source = tmp_path / "d1"
-    source.mkdir()
-    config = {"model_type": "lfm3_vl", "architectures": ["D1Model"]}
-    (source / "config.json").write_text(json.dumps(config))
-    assert oq._unverified_family(source, config)[0] == "d1"
-    with testing.verified("d1"):
-        assert oq._unverified_family(source, config) is None
-
-
 def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
     import asyncio
 
@@ -995,12 +948,12 @@ def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
 
     @testing.verified("QWEN4-EXP")
     def written():
-        return oq._unverified_family(tmp_path, config)
+        return oq._unverified_family(config)
 
     @testing.verified("qwen4_exp")
     async def written_async():
         await asyncio.sleep(0)
-        return oq._unverified_family(tmp_path, config)
+        return oq._unverified_family(config)
 
     assert written() is None and asyncio.run(written_async()) is None
     assert before == oq._TEST_VERIFIED
@@ -1008,10 +961,10 @@ def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
         assert before | {"qwen4_exp", "d1"} == oq._TEST_VERIFIED
         raise RuntimeError
     assert before == oq._TEST_VERIFIED
-    assert oq._unverified_family(tmp_path, config)[0] == "qwen4_exp"
+    assert oq._unverified_family(config)[0] == "qwen4_exp"
     # A family the audits found misread is written too, when a test says so.
     with testing.verified("raon1_mini"):
-        assert oq._unverified_family(tmp_path, {"model_type": "raon1_mini"}) is None
+        assert oq._unverified_family({"model_type": "raon1_mini"}) is None
     # Not bare, and not over a fixture's generator.
     with pytest.raises(TypeError, match="not a bare @verified"):
         testing.verified(written)
@@ -1025,7 +978,7 @@ def test_blocks_of_verified_close_in_any_order_in_any_thread(tmp_path):
     opened, closed = threading.Event(), threading.Event()
 
     def written(model_type):
-        return oq._unverified_family(tmp_path, {"model_type": model_type}) is None
+        return oq._unverified_family({"model_type": model_type}) is None
 
     def other():
         with testing.verified("minimax_m3_vl"):
@@ -1060,10 +1013,10 @@ def test_verified_decorates_test_functions_only(monkeypatch, tmp_path):
     # What oMLX ships as verified stays so, inside a block and out.
     monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen4_exp"}))
     config = {"model_type": "qwen4_exp"}
-    assert oq._unverified_family(tmp_path, config) is None
+    assert oq._unverified_family(config) is None
     with testing.verified("qwen4_exp"):
-        assert oq._unverified_family(tmp_path, config) is None
-    assert oq._unverified_family(tmp_path, config) is None
+        assert oq._unverified_family(config) is None
+    assert oq._unverified_family(config) is None
 
 
 @pytest.fixture(scope="module")

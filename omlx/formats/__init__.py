@@ -398,11 +398,34 @@ class FormatRefusedError(ValueError):
 
 
 _FORMATS: dict[str, QuantFormat] = {}
+
+
+def _may_build(mode) -> None:
+    """Refuse a layer of ``mode``'s format built anywhere but in the load of
+    a checkpoint that passed the family gate (``format_load``), or in a block
+    of ``omlx.formats.testing.verified``: whatever builds it (a library's
+    loader, a family's own, a script by hand), a family whose code may read
+    the format's layers wrongly never holds one."""
+    checkpoint = _LOADING.get()
+    if checkpoint is not None and checkpoint.active and checkpoint.verified:
+        return
+    if _TESTING:
+        return
+    raise FormatRefusedError(
+        "a format's layer is built only while oMLX loads a checkpoint of a "
+        "family verified with quant formats, and this one is built outside "
+        "such a load (by a family's own loader, or by hand): load the "
+        "checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model",
+        mode=mode,
+    )
 # The checkpoint whose layers the calling thread is loading, if any: set by
 # omlx.patches.format_load around the libraries' loads, read by the layers.
 # Not None exactly while a load is active on the calling thread: a thread
 # starts with none, whatever another thread loads.
 _LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
+# Whether a block of omlx.formats.testing.verified is open, in any thread: a
+# test builds a format's layers by hand in it.
+_TESTING = False
 # The plugin that registered each mode: its distribution's name and version.
 _ORIGINS: dict[str, str] = {}
 # Each mode of an installed plugin that did not load: what is said of it.

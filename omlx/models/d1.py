@@ -26,7 +26,7 @@ from mlx_vlm.models.d1_lfm3_vl.prompt import (
 )
 from mlx_vlm.utils import load as vlm_load
 
-from ..patches.format_load import check_loaded
+from ..patches.format_load import check_loaded, refuse_family
 from ..utils.model_loading import materialize_lazy_state, maybe_apply_pre_load_patches
 from .decision import (
     ChunkSize,
@@ -74,6 +74,7 @@ class D1Model:
         self._requests: SystemOne | None = None
 
     def load(self) -> None:
+        refuse_family(self.model_path, "d1")
         maybe_apply_pre_load_patches(self.model_path, for_vlm=True)
         model, processor = vlm_load(
             self.model_path, trust_remote_code=self.trust_remote_code

@@ -459,6 +459,7 @@ class _FormatLayer(nn.Module):
         tensors: dict[str, mx.array],
         bias: mx.array | None = None,
     ) -> None:
+        formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
         super().__init__()
         if isinstance(fmt, str):
             # A layer built by hand, of a registered mode: its format.

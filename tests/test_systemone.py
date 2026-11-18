@@ -308,7 +308,7 @@ def tiny_backbone():
     )
     model = Model(config)
     mx.eval(model.parameters())
-    backbone = DecisionBackbone("tiny")
+    backbone = DecisionBackbone("tiny", False, "clef")
     backbone.model = model
     backbone.config = {"text_config": _TEXT_CONFIG}
     backbone.image_processor = SimpleNamespace(merge_size=2)
@@ -460,7 +460,7 @@ def test_text_backbone_matches_patched_mlx_lm_logits():
         ModelArgs.from_dict({"model_type": "qwen3_5", "text_config": _TEXT_CONFIG})
     )
     mx.eval(model.parameters())
-    backbone = DecisionBackbone("tiny-text")
+    backbone = DecisionBackbone("tiny-text", False, "clef")
     backbone.model = model
     backbone._text_model = model.language_model.model
     backbone._lm_head = model.language_model.lm_head
@@ -484,7 +484,7 @@ def test_openjev_requires_instructions():
 
 
 def test_lm_head_rows_are_dequantized():
-    backbone = DecisionBackbone("unused")
+    backbone = DecisionBackbone("unused", False, "clef")
     linear = nn.Linear(64, 32, bias=False)
     backbone._lm_head = nn.QuantizedLinear.from_linear(linear, group_size=32, bits=8)
     rows = backbone.output_rows(mx.array([3, 7]))

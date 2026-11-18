@@ -27,12 +27,20 @@ from mlx.utils import tree_flatten
 from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 
 from omlx import formats
-from omlx.formats import affine, kernels, linear
+from omlx.formats import affine, kernels, linear, testing
 from omlx.formats.linear import MAX_ROWS, FormatLinear, FormatSwitchLinear
 from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+
+
+@pytest.fixture(autouse=True)
+def by_hand():
+    """The tests build format layers by hand, as a verified family's load
+    would: a format's layer is built nowhere else."""
+    with testing.verified("llama"):
+        yield
 
 EXPERTS = 6
 _NAMES = ("weight", "scales", "biases")
