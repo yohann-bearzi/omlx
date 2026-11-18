@@ -244,13 +244,11 @@ def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> boo
 # qmv's ``qdot`` split in two: the weight terms of a full pack run are decoded
 # once per K block and output column, then every row accumulates them against
 # its own inputs. Each term and each accumulation step is qdot's, in qdot's
-# order (the 5/6-bit runs cover at most two packs, so qdot's cumulative
+# order (the 3/5/6-bit runs cover at most two packs, so qdot's cumulative
 # pointer steps are the 8i/5i and 4i/3i offsets used here). A tile holds the
 # branch of its own width.
 _DECODED_DOT = r"""
-constant constexpr int W_TERMS = (BITS == 3) ? 10 * VALUES_PER_THREAD / 8
-    : ((BITS == 5) ? 12 * VALUES_PER_THREAD / 8
-    : ((BITS == 6) ? 6 * VALUES_PER_THREAD / 4 : VALUES_PER_THREAD));
+constant constexpr int W_TERMS = __W_TERMS__;
 
 inline void decode_w(const device uint8_t* w, thread float* wq) {
 __DECODE__
@@ -379,11 +377,22 @@ _WDOT = {
 }
 
 
+# The weight terms a lane decodes of its VALUES_PER_THREAD inputs, by width:
+# a 3-, 5- or 6-bit run's packs hold more terms than values.
+_W_TERMS = {
+    3: "10 * VALUES_PER_THREAD / 8",
+    5: "12 * VALUES_PER_THREAD / 8",
+    6: "6 * VALUES_PER_THREAD / 4",
+}
+
+
 def decoded(bits: int) -> str:
     """``decode_w`` and ``wdot`` of ``bits``-bit weights: qmv's ``qdot`` split
     in two, after ``header``."""
-    return _DECODED_DOT.replace("__DECODE__", _DECODE[bits]).replace(
-        "__WDOT__", _WDOT[bits]
+    return (
+        _DECODED_DOT.replace("__W_TERMS__", _W_TERMS.get(bits, "VALUES_PER_THREAD"))
+        .replace("__DECODE__", _DECODE[bits])
+        .replace("__WDOT__", _WDOT[bits])
     )
 
 

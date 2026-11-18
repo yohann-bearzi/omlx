@@ -80,10 +80,11 @@ _SOURCE = r"""
 # Two to 16 rows of x in one launch, G of them a threadgroup: each block of
 # the matrix decoded once for the G rows (the shared-rows skeleton), each
 # row its one-row bits. RPS output rows a simdgroup, two simdgroups a tile
-# of 8, as the one-row kernel; the skeleton is unrolled (G rows within
-# kernels.ROW_VALUES_BUDGET, inside kernels.unrolled_tile_ok). Where N is not whole tiles (PARTIAL), the last
-# tile's simdgroups hold the rows that are left, or none, as MLX's qmv does
-# for its last tile.
+# of 8, as the one-row kernel. The skeleton is unrolled for a face whose one
+# row is inside kernels.unrolled_tile_ok (groups of G rows stay within
+# kernels.ROW_VALUES_BUDGET, inside it too), rolled for a wider face. Where N
+# is not whole tiles (PARTIAL), the last tile's simdgroups hold the rows that
+# are left, or none, as MLX's qmv does for its last tile.
 _SHARED_SOURCE = r"""
     constexpr int RPS = 4;
     constexpr bool PARTIAL = N_SIZE % (2 * RPS) != 0;
@@ -114,7 +115,7 @@ _SHARED_SOURCE = r"""
 
 @cache
 def _shared_kernel(face: Dot):
-    matrices = kernels.Matrices(unrolled=True)
+    matrices = kernels.Matrices(unrolled=kernels.unrolled_tile_ok(face.vpt, 4, 1))
     inputs = ["x", *matrices.add("m", face, shared=True)]
     return mx.fast.metal_kernel(
         name=f"omlx_format_linear_rows_{face.key}",
@@ -280,20 +281,30 @@ def _linear(plan: _Plan, x):
     array: it outlives the layers it is built for."""
     k, n = plan.k, plan.n
     pairs, shape = x.size // k, (*x.shape[:-1], n)
-    group = 1 if plan.shared is None else _group(pairs, plan.face.vpt)
-    if group > 1 or n % 8:
-        shared, vpt = plan.shared, plan.face.vpt
+    metal = _linear_metal(plan, x)
+    if isinstance(metal, tuple):
+        shared, vpt, group = plan.shared, plan.face.vpt, metal[1]
 
         def graph(x, *operands):
             return _shared_rows(shared, k, n, vpt, x, operands, pairs, group, shape)
 
-        return (x.dtype, group), graph
+        return metal, graph
     kernel = plan.kernel
 
     def graph(x, *operands):
         return _rows(kernel, k, n, x, operands, pairs, shape)
 
-    return _metal(x), graph
+    return metal, graph
+
+
+def _linear_metal(plan: _Plan, x):
+    """What a matrix's launch for ``x`` is instantiated with beside the
+    proof's key: x's type and the group of rows a threadgroup takes for the
+    shared launch, x's type alone for the one-row launch (``_linear``)."""
+    group = 1 if plan.shared is None else _group(x.size // plan.k, plan.face.vpt)
+    if group > 1 or plan.n % 8:
+        return x.dtype, group
+    return _metal(x)
 
 
 def _shared_rows(

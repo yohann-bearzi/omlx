@@ -243,9 +243,9 @@ def test_a_matrix_is_read_through_a_dot_or_a_tile():
 
 # The sha256 of the header and the declarations of a kernel of one affine dot
 # face, as oMLX's dot kernels have them since the skeletons are carried
-# compact: tile faces leave a dot kernel's source as it is, to the byte, so
+# compact and hold no comment: tile faces leave a dot kernel's source as it is, to the byte, so
 # that every kernel a checkpoint runs is too.
-_DOT_KERNEL = "2b9983b0f95476ee791920b95e06c5ef1d6b191036c82ccefdafc455874071c1"
+_DOT_KERNEL = "dfc152aecefa86618afb919b002f89cbbf74d306038bb0588bc0bed92b69124c"
 
 
 def test_a_kernel_of_dot_faces_is_written_as_before_tile_faces():

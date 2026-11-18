@@ -74,10 +74,11 @@ def test_a_block_records_a_linear_s_calls_and_the_face_each_ran(toy):
             assert np.array_equal(np.array(layer(x)), _want(layer, x))
         half = layer(one.astype(mx.float16))
         assert np.array_equal(np.array(half), _want(layer, one).astype(np.float16))
+    # The 16 rows run in the shared launch, 4 a threadgroup (vpt 8).
     assert calls == [
         _call(layer, face, mx.float32),
         _call(layer, face, mx.float32),
-        _call(layer, face, mx.float32),
+        _call(layer, face, (mx.float32, 4)),
         _call(layer),
         _call(layer, face, mx.float16),
     ]

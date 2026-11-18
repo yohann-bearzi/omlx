@@ -648,7 +648,7 @@ def _build_plan(block) -> _Plan | None:
     scores = gate.get("weight") if isinstance(gate, nn.Module) else None
     # The router scores the experts the stacks hold, and the block says so.
     if gate_up["weight"].shape[0] != experts or (
-        isinstance(scores, mx.array) and scores.shape[0] != experts
+        isinstance(scores, mx.array) and scores.shape[:1] != (experts,)
     ):
         return None
     dtype, top_k = gu_fmt.dtypes[0], block.top_k
@@ -1033,7 +1033,7 @@ def _window(launches: _Launches, folded: bool):
     no array."""
 
     def graph(x, operands):
-        x = x.reshape(-1, launches.hidden)
+        x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
         logits = launches.router(x, *operands[0])
         return _experts(launches, x, logits, operands, folded)
 
@@ -1059,13 +1059,14 @@ def _windows(plan: _Plan, x) -> bool:
 def _cached_plan(block) -> _Plan | None:
     """The block's plan, kept in the block: depth 2 keys it on the expert
     and shared-expert weight arrays, the flags on the block's attributes
-    that it is planned for."""
+    that it is planned for, with their types (8 and 8.0 differ)."""
+    top_k, experts = block.top_k, block.num_experts
     return cached_per_module(
         block,
         "_omlx_routed_decode_plan",
         _build_plan,
         depth=2,
-        flags=(block.top_k, block.num_experts),
+        flags=(type(top_k), top_k, type(experts), experts),
     )
 
 
@@ -1096,7 +1097,7 @@ def routed_verify_window(block, x):
     if x.size == x.shape[-1]:
         # One row runs the one-token launches: their proof and graph.
         y = _decode(block, plan, x, plan.proof.graphs.get(signature))
-        return None if y is None else y.reshape(1, -1)
+        return None if y is None else mx.reshape(y, (1, -1), stream=mx.gpu)
     # A verify step's block is the replay of the graph its thread kept.
     graph = plan.window.graphs.get(signature)
     if graph is not None:
@@ -1136,7 +1137,7 @@ def _ensure_verify_window_patch(cls) -> None:
         if is_row_exact_armed() and isinstance(feed_forward, cls):
             y = routed_verify_window(feed_forward, x)
             if y is not None:
-                return y.reshape(x.shape)
+                return mx.reshape(y, x.shape, stream=mx.gpu)
         return original(self, feed_forward, x)
 
     verify_window._omlx_routed_verify_window = True
@@ -1187,7 +1188,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
             # arithmetic of its own stream in the window launches.
             y = routed_verify_window(self, x)
             if y is not None:
-                return y.reshape(shape)
+                return mx.reshape(y, shape, stream=mx.gpu)
         return orig_call(self, x)
 
     patched_call._omlx_routed_decode_original = orig_call

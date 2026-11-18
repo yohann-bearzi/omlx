@@ -166,6 +166,21 @@ def test_rows_go_to_the_shared_launch_in_the_largest_group_of_the_budget():
     assert [linear._group(m, 32) for m in (2, 3, 4, 6)] == [1, 1, 1, 1]
 
 
+def test_a_face_past_the_unrolled_envelope_shares_rolled(monkeypatch):
+    """A face whose one row is past kernels.unrolled_tile_ok (a plugin's of
+    128 values a lane, at an N that is not whole tiles) gets the rolled
+    skeleton: the compiler was not measured to give unrolled tiles past it
+    their bits."""
+    made = []
+    monkeypatch.setattr(mx.fast, "metal_kernel", lambda **named: made.append(named))
+    for vpt in (8, 128):
+        source = _TOY.replace("VPT = 8;", f"VPT = {vpt};")
+        linear._shared_kernel.__wrapped__(_toy(f"envelope{vpt}", source, vpt))
+    pragma = '_Pragma("clang loop unroll(full)")'
+    assert pragma in made[0]["header"] and pragma not in made[1]["header"]
+    assert made[0]["name"] == "omlx_format_linear_rows_toy_envelope8"
+
+
 def test_rows_in_groups_are_one_launch_and_their_stand_in_is_one_group(monkeypatch):
     """Two to 16 rows that a group of 2 to 4 divides are one launch of the
     shared-rows skeleton, proven on a stand-in of one group of zeros over

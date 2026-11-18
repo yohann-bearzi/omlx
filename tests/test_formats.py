@@ -6,6 +6,7 @@ their mode through one door, and a plugin that fails to load is skipped.
 from __future__ import annotations
 
 import contextlib
+import inspect
 import logging
 import re
 import threading
@@ -76,6 +77,13 @@ def plugins(monkeypatch):
         lambda group: installed if group == formats.ENTRY_POINT_GROUP else [],
     )
     return installed
+
+
+def test_a_dot_s_shared_source_and_vpt_are_named():
+    """Dot.shared and Dot.vpt are keywords: a face written for the fields
+    before them keeps its meaning, and none is given by position."""
+    fields = inspect.signature(formats.Dot).parameters
+    assert fields["shared"].kind == fields["vpt"].kind == inspect.Parameter.KEYWORD_ONLY
 
 
 def test_the_load_may_register_under_its_own_lock():

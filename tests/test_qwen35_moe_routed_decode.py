@@ -2184,6 +2184,59 @@ def test_a_router_that_scores_other_experts_than_the_stacks_is_not_planned():
     assert routed._build_plan(_block(1024, 320, experts=128)) is not None
 
 
+def test_a_window_s_reshapes_take_the_gpu_s_stream(monkeypatch):
+    """A window traced under a CPU default stream keeps no CPU op in the
+    graph its thread replays: its reshapes are given the GPU's stream, as
+    the routing's ops are; its rows are the one-by-one call's."""
+    block = _block(512, 256, top_k=8, experts=128)
+    rows = _rows_of(block, 1, 3)
+    want = _one_by_one(block, rows)
+    reshape, streams = mx.reshape, []
+
+    def recorded(*args, **named):
+        streams.append(named.get("stream"))
+        return reshape(*args, **named)
+
+    monkeypatch.setattr(mx, "reshape", recorded)
+    with mx.stream(mx.cpu):
+        y = routed.routed_verify_window(block, rows)
+    assert streams and all(stream == mx.gpu for stream in streams)
+    assert _same_bits(want, y)
+
+
+def test_a_router_of_any_module_scores_the_stacks_experts():
+    """A router of the block's own module type is checked as a linear one,
+    and a weight of no axis declines the plan instead of raising."""
+
+    class Router(nn.Module):
+        def __init__(self, weight):
+            super().__init__()
+            self.weight = weight
+
+        def __call__(self, x):
+            return x @ self.weight.T
+
+    block = _block(1024, 320, experts=128)
+    block.gate = Router(mx.zeros((256, 1024), mx.bfloat16))
+    assert routed._build_plan(block) is None
+    block.gate = Router(mx.array(1.0))
+    assert routed._build_plan(block) is None
+
+
+def test_a_block_s_plan_is_kept_for_its_top_k_s_type(monkeypatch):
+    """8 and 8.0 are two plans: a top-k set again as a float is planned
+    again, not served the integer's."""
+    block = _block(512, 256, top_k=8, experts=128)
+    assert routed._cached_plan(block) is not None
+    built = []
+    monkeypatch.setattr(
+        routed, "_build_plan", lambda block: built.append(block.top_k)
+    )
+    block.top_k = 8.0
+    routed._cached_plan(block)
+    assert built == [8.0]
+
+
 def test_a_block_s_plan_follows_its_top_k_and_expert_count():
     """The plan is the block's top-k and expert count's: set again, the next
     call plans for them."""

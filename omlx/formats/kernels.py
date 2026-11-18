@@ -64,7 +64,8 @@ using omlx_iota = typename omlx_iota_<N>::type;
 # What both dot skeletons check of a face and of x, ahead of them: the face's
 # revision against the ones oMLX runs (FACE is a template parameter so that
 # a failed assert prints both numbers), and that x is the T inputs, in
-# device memory or in threadgroup memory where a kernel stages them.
+# device memory or in threadgroup memory where a kernel stages them: the
+# skeleton passes the face x as a const pointer, whatever the kernel's is.
 _CHECKS = _compact(r"""
 template <int FACE>
 struct omlx_revision {
@@ -77,9 +78,9 @@ struct omlx_revision {
 };
 
 template <typename T>
-METAL_FUNC void omlx_inputs(const device T*) {}
+METAL_FUNC const device T* omlx_inputs(const device T* x) { return x; }
 template <typename T>
-METAL_FUNC void omlx_inputs(const threadgroup T*) {}
+METAL_FUNC const threadgroup T* omlx_inputs(const threadgroup T* x) { return x; }
 """)
 
 # Rows of one mat-vec over a dot face D: one input vector against rows
@@ -98,8 +99,9 @@ METAL_FUNC void omlx_inputs(const threadgroup T*) {}
 # face of another one fails with that and nothing else. So for a lane of no
 # inputs (VPT): nothing that multiplies or divides by VPT or walks a lane's
 # inputs follows. x is the T inputs in device memory, or in threadgroup
-# memory where a kernel stages them (omlx_inputs checks it). Comments stay
-# out of the Metal: MLX hashes a kernel's whole source at every launch.
+# memory where a kernel stages them (omlx_inputs checks it); the sizeof of
+# omlx_revision instantiates it, so its asserts run. Comments stay out of
+# the Metal: MLX hashes a kernel's whole source at every launch.
 _QMV_ROWS = _compact(r"""
 // One block of a lane: its VPT inputs against each row's weights.
 template <typename L, typename XP, int... RA, int... RB>
@@ -165,9 +167,9 @@ METAL_FUNC void qmv_rows(
     XP x,
     uint simd_lid,
     thread float* result) {
-  omlx_inputs<T>(x);
+  const auto xc = omlx_inputs<T>(x);
   constexpr int FACE = D::CONTRACT;
-  (void)sizeof(omlx_revision<FACE>);  // instantiates it: its asserts run
+  (void)sizeof(omlx_revision<FACE>);
   if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
     using L = typename D::template Lanes<K>;
     static_assert(
@@ -182,7 +184,7 @@ METAL_FUNC void qmv_rows(
           K % L::VPT == 0,
           "dot face: K must be a whole number of a lane's VPT inputs");
       omlx_qmv_rows<K>(
-          omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, x, simd_lid, result);
+          omlx_iota<NA>(), omlx_iota<NB>(), ma, row_a, mb, row_b, xc, simd_lid, result);
     }
   }
 }
@@ -507,7 +509,7 @@ template <
     typename XP>
 METAL_FUNC void qmv_shared(
     D m, size_t row, int valid, XP x, uint simd_lid, thread float* result) {
-  omlx_inputs<T>(x);
+  const auto xc = omlx_inputs<T>(x);
   constexpr int FACE = D::CONTRACT;
   (void)sizeof(omlx_revision<FACE>);
   if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
@@ -526,7 +528,7 @@ METAL_FUNC void qmv_shared(
       static_assert(
           L::VPT == VPT,
           "dot face: Lanes<K>::VPT must be the face's vpt, which sizes the launch");
-      omlx_qmv_shared<K, ROWS, RPS, PARTIAL>(m, row, valid, x, simd_lid, result);
+      omlx_qmv_shared<K, ROWS, RPS, PARTIAL>(m, row, valid, xc, simd_lid, result);
     }
   }
 }
@@ -561,7 +563,8 @@ def shared_geometry(vpt: int, n: int, rows: int, pad: bool) -> tuple[int, int]:
     limit = ROW_VALUES_BUDGET // vpt
     per_group = next((d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1)
     if per_group == 1 and pad:
-        per_group = min(rows, limit)
+        # A face past the budget (vpt over 32) takes one input a group.
+        per_group = max(1, min(rows, limit))
     return per_group, SHARED_RPS
 
 
@@ -581,6 +584,10 @@ def _qmv_shared(unrolled: bool) -> str:
     else:
         block, unroll = _SHARED_LOOPED, ""
     return block + _QMV_SHARED.replace("OMLX_SHARED_UNROLL", unroll)
+
+
+# The shared-rows skeleton, rolled and unrolled, as a kernel carries it.
+_SHARED_SKELETONS = (_qmv_shared(False), _qmv_shared(True))
 
 
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
@@ -1134,22 +1141,21 @@ class Matrices:
         # the checks, the row skeleton, the tile skeleton, the shared-rows
         # skeleton. Each opens with a line break; with none after the
         # revisions, the macros' end is put on a line of its own.
-        line = _REVISIONS_LINE
         header = (
             _named(_SKELETONS, _INDEX_PACKS)
             + self._tables.header
             + "".join(_named(f"<quant format {key}>", s) for s, key in sources.items())
         )
-        header += _named(_SKELETONS, _revisions() + (_CHECKS if dots else ""), line)
-        line += (_revisions() + _CHECKS).count("\n")
-        for piece, wanted in (
-            (_QMV_ROWS, rows),
-            (_TILE_FACE, tiles),
-            (_qmv_shared(self._unrolled), bool(self._shared)),
+        header += _named(
+            _SKELETONS, _revisions() + (_CHECKS if dots else ""), _REVISIONS_LINE
+        )
+        for piece, line, wanted in (
+            (_QMV_ROWS, _ROWS_LINE, rows),
+            (_TILE_FACE, _TILE_LINE, tiles),
+            (_SHARED_SKELETONS[self._unrolled], _SHARED_LINE, bool(self._shared)),
         ):
             if wanted:
                 header += _named(_SKELETONS, piece, line)
-            line += piece.count("\n")
         if not (dots or tiles):
             header += "\n"
         return header + _REVISIONS_END + _named("<kernel header>", "")
@@ -1194,6 +1200,9 @@ def _revisions() -> str:
 # after the index packs, the tile skeleton after the row skeleton. The
 # revisions are two lines whatever their numbers.
 _REVISIONS_LINE = _INDEX_PACKS.count("\n") + 1
+_ROWS_LINE = _REVISIONS_LINE + 1 + _CHECKS.count("\n")
+_TILE_LINE = _ROWS_LINE + _QMV_ROWS.count("\n")
+_SHARED_LINE = _TILE_LINE + _TILE_FACE.count("\n")
 
 # The skeletons' asserts hold the numbers by now. What follows (a face's
 # type, a kernel's header and body) does not read the macros.

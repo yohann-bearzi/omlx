@@ -217,6 +217,7 @@ def _builder_digest(monkeypatch) -> str:
     for face in faces:
         format_linear._kernel.__wrapped__(face, False)
         format_linear._kernel.__wrapped__(face, True)
+        format_linear._shared_kernel.__wrapped__(face)
         gather._kernel.__wrapped__(face)
         gather._ordered_kernel.__wrapped__(face)
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
@@ -241,10 +242,11 @@ def _builder_digest(monkeypatch) -> str:
     return f"{len(recorded)} {digest.hexdigest()}"
 
 
-# B8's kernels on the compact skeletons (U3b), as served: 352 existing builders and
-# 36 plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
+# B8's kernels on the compact skeletons (U3b), as served: the existing
+# builders (the format linear's shared-rows kernels among them) and 36
+# plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
 # preserve their Metal byte for byte when the face declares none.
-_METAL_DIGEST = "388 c8324095bedae2bc68f5d7c5044506a8cf9ecf92893f7edd22fdedc4281fd33d"
+_METAL_DIGEST = "460 98edb02fd856202a0515edf9a9eb6f092c84b9701e276975dcc1c29adc717a12"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
@@ -729,6 +731,20 @@ def test_the_row_skeleton_runs_a_tabled_face_to_the_bit(fast, k):
     assert np.array_equal(np.array(got.view(mx.uint16)), np.array(want.view(mx.uint16)))
     staged = testing.staged_tables(tabled(face), operands, mx.bfloat16)
     assert _bits(staged["lut"]) == LUT.bits
+
+
+@metal
+def test_staged_inputs_fit_in_a_threadgroup_s_memory_with_the_tables(staged):
+    """dot_rows stages x beside the face's tables: 32 KiB of bfloat16 inputs
+    fit alone, not with a table of 64 floats."""
+    k = 16384
+    w = mx.zeros((8, k), mx.bfloat16)
+    operands = mx.quantize(w, group_size=64, bits=4)
+    x = mx.zeros((k,), mx.bfloat16)
+    face = affine.face(4, 64, True, mx.bfloat16)
+    testing.dot_rows(face, operands, x, 8, staged=True)
+    with pytest.raises(ValueError, match="staged tables of 256 do not fit"):
+        testing.dot_rows(tabled(face), operands, x, 8, staged=True)
 
 
 # The affine tile face whose 4-bit weights read their code's value from a

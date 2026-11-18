@@ -279,6 +279,25 @@ def test_a_stand_in_s_stack_has_the_fewest_experts_that_leave_each_tensor_8():
         assert gather._experts(projection._replace(operands=tensors)) == experts
 
 
+def test_a_stand_in_s_stacks_keep_8_elements_of_a_format_with_few_an_expert(
+    monkeypatch,
+):
+    """A plugin format may hold one value an expert (a stack of 16 experts
+    has 16 elements, and its face is taken): the stand-in's stacks have the
+    experts that leave each tensor 8 elements, so that MLX binds them as
+    buffers, as the call's, not as constants."""
+    k, n = 320, 64
+    whole = gather.projection(_experts(k, n), k)
+    weight, scales, _ = whole.operands
+    sparse = whole._replace(operands=(weight, scales[:, :1, :1]))
+    plan = gather._Plan(sparse, whole, None, k, 0)
+    made = []
+    monkeypatch.setattr(kernels, "zeros", lambda *specs: made.extend(specs) or [])
+    gather._stand_in(plan, (3, TOP_K, mx.bfloat16, mx.uint32))
+    # The pairs, x and the activation, then each stack's tensors.
+    assert [shape[0] for shape, _ in made[3:]] == [8, 8, 1, 1, 1]
+
+
 def test_a_launch_its_tiles_or_rows_do_not_cover_is_refused_in_words():
     """What ``projection`` and ``fused_switch`` rule out, for a caller of the
     launch itself: outputs no tile writes, pairs that are not whole rows, a

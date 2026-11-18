@@ -7,7 +7,10 @@ compile with a message that names the format's own source.
 from __future__ import annotations
 
 import logging
+import os
 import re
+import subprocess
+import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +19,7 @@ from functools import cache
 from itertools import takewhile
 from pathlib import Path
 from textwrap import indent
+from types import SimpleNamespace
 
 import mlx.core as mx
 import pytest
@@ -782,13 +786,16 @@ def test_an_unrolled_shared_rows_skeleton_gives_the_same_rows():
     operands, xs, want = _vectors(4, 512)
     face = _toy("unrolled")
     for rps in (1, 2, 4):
-        got = testing.shared_rows(face, operands, xs, 16, rps=rps, unrolled=True)
-        assert mx.array_equal(got, want).item()
+        for n in (16, 12, 10):
+            got = testing.shared_rows(face, operands, xs, n, rps=rps, unrolled=True)
+            assert mx.array_equal(got, want[:, :n]).item()
 
 
 def test_a_shared_rows_launch_is_sized_by_the_face_s_vpt():
-    # Fewer than 2048 tiles of 8 rows: one vector a threadgroup.
+    # Fewer than 2048 tiles of 8 rows: one vector a threadgroup. A last
+    # partial tile counts.
     assert kernels.shared_geometry(8, 16376, 6, pad=False) == (1, 4)
+    assert kernels.shared_geometry(8, 16377, 6, pad=False) == (3, 4)
     # From 2048: as many vectors as divide the count, within 32 values a lane.
     assert kernels.shared_geometry(8, 16384, 6, pad=False) == (3, 4)
     assert kernels.shared_geometry(16, 16384, 6, pad=False) == (2, 4)
@@ -797,6 +804,9 @@ def test_a_shared_rows_launch_is_sized_by_the_face_s_vpt():
     assert kernels.shared_geometry(8, 16384, 7, pad=False) == (1, 4)
     assert kernels.shared_geometry(8, 16384, 7, pad=True) == (4, 4)
     assert kernels.shared_geometry(8, 16384, 2, pad=True) == (2, 4)
+    # A face past the budget: one a group, padded or not.
+    assert kernels.shared_geometry(64, 16384, 7, pad=True) == (1, 4)
+    assert kernels.shared_geometry(64, 16384, 6, pad=False) == (1, 4)
     # The unrolled envelope: 16 accumulators, 80 values a lane.
     assert kernels.unrolled_tile_ok(16, 4, 4) and not kernels.unrolled_tile_ok(16, 4, 5)
     assert kernels.unrolled_tile_ok(16, 8, 2) and not kernels.unrolled_tile_ok(16, 8, 3)
@@ -816,6 +826,8 @@ def test_a_kernel_carries_the_skeletons_it_calls_and_no_other():
     assert "void qmv_rows(" not in shared.header and "void qmv_shared(" in shared.header
     assert "void qmv_rows(" in both.header and "void qmv_shared(" in both.header
     assert "struct omlx_revision" in shared.header
+    # A face of no shared source adds none.
+    assert "<quant format toy_carried shared>" not in shared.header
     lines = (kernels._revisions() + kernels._CHECKS + kernels._QMV_ROWS).count("\n")
     start = (
         kernels._INDEX_PACKS.count("\n") + 1 + lines + kernels._TILE_FACE.count("\n")
@@ -832,6 +844,8 @@ def test_the_skeletons_are_carried_compact():
         kernels._CHECKS,
         kernels._QMV_ROWS,
         kernels._TILE_FACE,
+        kernels._SHARED_LOOPED,
+        kernels._SHARED_FOLDED,
         kernels._QMV_SHARED,
         kernels.STORE_ROWS,
     ):
@@ -839,6 +853,7 @@ def test_the_skeletons_are_carried_compact():
         assert all(line == line.strip() for line in lines)
         assert not any(line.startswith("//") for line in lines)
     assert kernels._compact("  a;\n  // b\n    c; // d\n") == "a;\n\nc; // d\n"
+    assert kernels._compact("  a;  \n") == "a;\n"
 
 
 def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
@@ -848,8 +863,71 @@ def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     unrolled.add("m", face, shared=True)
     pragma = '_Pragma("clang loop unroll(full)")'
     assert pragma not in rolled.header and pragma in unrolled.header
-    # The skeleton's block walk stays a loop.
+    # The block is folds over the vectors and the rows when unrolled, loops
+    # otherwise; the walk over the blocks stays a loop.
+    assert "omlx_shared_folded" in unrolled.header
+    assert "omlx_shared_folded" not in rolled.header
+    assert "aux[i] = L::load" in rolled.header
+    assert "aux[i] = L::load" not in unrolled.header
     assert "\nfor (int k = 0; k < WHOLE; k += L::BLOCK) {\n" in unrolled.header
+
+
+# Matrices whose every tensor is whole pages of 16 KiB (MLX's buffer is the
+# tensor, the cache off), with rows a launch's last pack only partly holds:
+# the shared-rows skeleton over 4096 rows in packs of 3, rolled and unrolled
+# (the codes and the scales that finish reads), and a format linear of 4
+# outputs (two simdgroups a tile of 8: the second has no row).
+_PAST_THE_MATRIX = r"""
+import numpy as np
+import mlx.core as mx
+import mlx.nn as nn
+from omlx.formats import testing
+from omlx.formats.linear import FormatLinear
+from tests.test_formats_kernels import _toy
+
+mx.set_cache_limit(0)
+rng = np.random.default_rng(0)
+n, k = 4096, 1024
+codes = mx.array(rng.integers(0, 256, (n, k), dtype=np.uint8))
+scales = mx.array(np.ones(n, dtype=np.float32))
+xs = mx.array(rng.integers(-8, 9, (2, k)).astype(np.float32))
+want = (xs @ (codes.astype(mx.float32) - 128.0).T) * scales
+for unrolled in (False, True):
+    face = _toy(f"past_the_matrix_{unrolled}")
+    got = testing.shared_rows(face, (codes, scales), xs, n, rps=3, unrolled=unrolled)
+    print(mx.array_equal(got, want).item())
+dense = nn.Linear(8192, 4, bias=False)
+dense.set_dtype(mx.bfloat16)
+q = dense.to_quantized(group_size=64, bits=4)
+mx.eval(q.parameters())
+tensors = {t: q[t] for t in ("weight", "scales", "biases")}
+with testing.verified("llama"):
+    layer = FormatLinear("affine", 4, 64, 8192, tensors)
+x = mx.array(rng.standard_normal((1, 8192)).astype(np.float32)).astype(mx.bfloat16)
+print(mx.array_equal(layer(x), q(x)).item())
+"""
+
+
+@metal
+def test_a_partial_pack_reads_no_row_past_the_matrix():
+    """The rows a partial pack does not hold are neither read nor finished,
+    in the skeleton and in a format linear whose second simdgroup holds no
+    row: Metal's shader validation reports any load past a buffer."""
+    run = subprocess.run(
+        [sys.executable, "-c", _PAST_THE_MATRIX],
+        cwd=Path(__file__).resolve().parents[1],
+        env={
+            **os.environ,
+            "MTL_SHADER_VALIDATION": "1",
+            "MTL_SHADER_VALIDATION_REPORT_TO_STDERR": "1",
+        },
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.split() == ["True", "True", "True"], run.stderr
+    assert "Invalid Metal usage" not in run.stderr, run.stderr
 
 
 def test_shared_rows_launch_a_partial_pack_where_n_is_not_whole_packs(monkeypatch):
@@ -878,8 +956,155 @@ def test_shared_rows_take_1_to_16_vectors_of_a_face_with_a_vpt():
         testing.shared_rows(_toy("many"), operands, xs, 16)
     with pytest.raises(ValueError, match="1 to 16 vectors"):
         testing.shared_rows(_toy("many"), operands, xs[0], 16)
+    with pytest.raises(ValueError, match="1 to 16 vectors"):
+        testing.shared_rows(_toy("many"), operands, xs[:0], 16)
+    with pytest.raises(ValueError, match="one row or more"):
+        testing.shared_rows(_toy("many"), operands, xs[:2], 0)
+    with pytest.raises(ValueError, match="one row or more"):
+        testing.shared_rows(_toy("many"), operands, xs[:2], 16, rps=0)
+    for n in (1.5, True):
+        with pytest.raises(ValueError, match="one row or more"):
+            testing.shared_rows(_toy("many"), operands, xs[:2], n)
+        with pytest.raises(ValueError, match="one launch or more"):
+            testing.dot_rows(_toy("many"), operands, xs[0], n, packs=(1, 0))
+    tile = SimpleNamespace(key="tile")
+    with pytest.raises(ValueError, match="not a dot face"):
+        testing.shared_rows(tile, operands, xs[:2], 16)
+    with pytest.raises(ValueError, match="not a dot face"):
+        testing.dot_rows(tile, operands, xs[0], 16)
     with pytest.raises(ValueError, match="states no vpt"):
         testing.shared_rows(_toy("no_vpt", vpt=0), operands, xs[:2], 16)
+
+
+def _shared_error(face, k=512) -> str:
+    operands, xs, _ = _vectors(2, k)
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(testing.shared_rows(face, operands, xs, 16))
+    return " ".join(str(failure.value).split())
+
+
+@metal
+@pytest.mark.parametrize(
+    "case, edit, k, words",
+    [
+        (
+            "half_block",
+            ("BLOCK = 32 * VPT", "BLOCK = 16 * VPT"),
+            512,
+            "Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32",
+        ),
+        ("ragged", None, 60, "K must be a whole number of a lane's VPT inputs"),
+        ("no_inputs", ("VPT = 8;", "VPT = 0;"), 512, "VPT must be one input or more"),
+        (
+            "another",
+            ("CONTRACT = 1;", f"CONTRACT = {formats.CONTRACT + 1};"),
+            512,
+            "dot face: written for a",
+        ),
+    ],
+)
+def test_the_shared_rows_skeleton_refuses_what_the_row_skeleton_does(
+    case, edit, k, words
+):
+    """qmv_shared makes qmv_rows' checks, each in words and alone."""
+    source = _TOY.replace(*edit) if edit else _TOY
+    message = _shared_error(_toy(f"shared_{case}", source=source, vpt=8), k)
+    assert words in message
+    assert "<omlx skeletons, docs/quant-formats.md>:" in message
+    assert message.count("error:") == 1
+
+
+_CONST_LOAD = """    static float load(const device float* x, thread float* xt) {
+      copy(omlx_iota<VPT>(), x, xt);
+      return 0;
+    }
+    static float load(const threadgroup float* x, thread float* xt) {
+      copy(omlx_iota<VPT>(), x, xt);
+      return 0;
+    }
+    template <typename XP>
+    static float load(XP x, thread float* xt) = delete;
+"""
+
+
+@metal
+@pytest.mark.parametrize("skeleton", ["rows", "shared"])
+def test_a_face_s_load_is_given_const_inputs_whatever_the_kernel_s(skeleton):
+    """A kernel may hand a skeleton its staged inputs as they are
+    (threadgroup T xs[K], not const); the face's load is given them const,
+    as the guide says: a load of const pointers alone compiles."""
+    template = (
+        "    template <typename XP>\n    static float load(XP x, thread float* xt) {\n"
+    )
+    start = _TOY.index(template)
+    end = _TOY.index("    }\n", start) + len("    }\n")
+    face = _toy(f"const_{skeleton}", source=_TOY[:start] + _CONST_LOAD + _TOY[end:])
+    matrices = kernels.Matrices()
+    shared = skeleton == "shared"
+    call = (
+        "qmv_shared<float, K, 1, 1, 8, false>(m, 0, 1, xs, simd_lid, result);"
+        if shared
+        else "qmv_rows<float, K, 1, 0>(m, 0, m, 0, xs, simd_lid, result);"
+    )
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_test_const_inputs_{skeleton}",
+        input_names=["x", *matrices.add("m", face, shared=shared)],
+        output_names=["y"],
+        header=matrices.header,
+        source=matrices.declarations + f"""
+    const uint simd_lid = thread_index_in_simdgroup;
+    threadgroup float xs[K];
+    for (uint i = simd_lid; i < K; i += 32) {{
+      xs[i] = x[i];
+    }}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result[1];
+    {call}
+    if (simd_lid == 0) {{
+      y[0] = result[0];
+    }}
+""",
+    )
+    (codes, scales), x, want = _matrix(8, 512)
+    got = kernel(
+        inputs=[x, codes, scales],
+        template=[("K", 512)],
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(1,)],
+        output_dtypes=[mx.float32],
+    )[0]
+    assert mx.array_equal(got, want[:1]).item()
+
+
+@metal
+def test_the_shared_rows_skeleton_s_inputs_are_of_the_type_it_is_given():
+    face = _toy("shared_typed")
+    matrices = kernels.Matrices()
+    kernel = mx.fast.metal_kernel(
+        name="omlx_test_shared_typed_inputs",
+        input_names=["x", *matrices.add("m", face, shared=True)],
+        output_names=["y"],
+        header=matrices.header,
+        source=matrices.declarations + r"""
+    float result[1];
+    qmv_shared<half, K, 1, 1, 8, false>(m, 0, 1, x, thread_index_in_simdgroup, result);
+    y[0] = result[0];
+""",
+    )
+    (codes, scales), x, _ = _matrix(8, 512)
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(
+            kernel(
+                inputs=[x, codes, scales],
+                template=[("K", 512)],
+                grid=(32, 1, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.float32],
+            )[0]
+        )
+    assert "no matching function for call to 'omlx_inputs'" in str(failure.value)
 
 
 @metal
@@ -946,10 +1171,12 @@ def test_a_face_s_shared_source_is_in_the_kernels_that_share_alone():
 
 
 def test_staged_inputs_fit_in_a_threadgroup_s_memory():
-    operands, _, _ = _matrix(8, 512)
+    operands, _, _ = _matrix(8, 8192 + 8)
     x = mx.zeros((8192 + 8,), mx.float32)
     with pytest.raises(ValueError, match="32768 bytes of a threadgroup's memory"):
         testing.dot_rows(_toy("big"), operands, x, 8, staged=True)
+    # Inputs that are not staged take any size.
+    assert not mx.any(testing.dot_rows(_toy("big"), operands, x, 8)).item()
 
 
 # The toy's rows with the codes as stored, re-centred in madd with the sum of

@@ -183,7 +183,9 @@ def no_dot_defects():
 def _dot_rows_kernel(face: Dot, staged: bool):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("m", face)]
-    rows = _ROWS.replace("XS", "(const threadgroup T*)xs" if staged else "x")
+    # The staged inputs as a kernel has them, not const: the skeleton gives
+    # the face's load a const pointer.
+    rows = _ROWS.replace("XS", "xs" if staged else "x")
     return mx.fast.metal_kernel(
         name=f"omlx_format_dot_rows_{face.key}",
         input_names=inputs,
@@ -191,6 +193,14 @@ def _dot_rows_kernel(face: Dot, staged: bool):
         header=matrices.header + kernels.STORE_ROWS,
         source=matrices.declarations + (_STAGED if staged else "") + rows,
     )
+
+
+@cache
+def _staged_bytes(face: Dot) -> int:
+    """The threadgroup memory a kernel over ``face`` stages its tables in."""
+    matrices = kernels.Matrices()
+    matrices.add("m", face)
+    return matrices.staged_bytes
 
 
 @cache
@@ -252,10 +262,17 @@ def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.a
     return {table.name: got for table, got in zip(face.tables, tables, strict=True)}
 
 
+def _count(value) -> bool:
+    """Whether ``value`` is a count of one or more (an int, not a bool)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
 def _checked(face: Dot, operands, x: mx.array) -> tuple:
-    """``operands`` as a tuple, or a ``ValueError``: one vector ``x`` of a
-    dtype the face is exact for, the face's operands, each of 8 elements or
-    more."""
+    """``operands`` as a tuple, or a ``ValueError``: a dot face, one vector
+    ``x`` of a dtype the face is exact for, the face's operands, each of 8
+    elements or more."""
+    if not isinstance(face, Dot):
+        raise ValueError(f"{face!r} is not a dot face (formats.Dot)")
     if x.ndim != 1:
         raise ValueError(f"x is one vector of K activations, not of shape {x.shape}")
     operands, names = tuple(operands), ("weight", *face.tensors)
@@ -294,18 +311,20 @@ def dot_rows(
     and each operand have 8 elements or more. With ``staged``, the kernel
     copies ``x`` into threadgroup memory and the face loads it from there,
     as a kernel that stages its inputs does: the rows are the same, bit for
-    bit; ``x`` then fits in 32 KiB. Anything else is refused with a
+    bit; ``x`` then fits in 32 KiB with the face's staged tables. Anything
+    else is refused with a
     ``ValueError``. The kernel is compiled for ``face`` and K.
     """
     na, nb = packs
     if min(na, nb) < 0 or na + nb == 0:
         raise ValueError(f"packs={packs}: two counts of rows, one row or more in all")
-    if n <= 0 or n % (na + nb):
+    if not _count(n) or n % (na + nb):
         raise ValueError(f"n={n} is not one launch or more of {na + nb} rows")
     operands = _checked(face, operands, x)
-    if staged and x.nbytes > _THREADGROUP_BYTES:
+    if staged and x.nbytes + _staged_bytes(face) > _THREADGROUP_BYTES:
         raise ValueError(
-            f"x of {x.nbytes} bytes does not fit in the {_THREADGROUP_BYTES} bytes "
+            f"x of {x.nbytes} bytes and the face's staged tables of "
+            f"{_staged_bytes(face)} do not fit in the {_THREADGROUP_BYTES} bytes "
             "of a threadgroup's memory"
         )
     return _dot_rows_kernel(face, staged)(
@@ -350,7 +369,7 @@ def shared_rows(
     if x.ndim != 2 or not 1 <= x.shape[0] <= 16:
         raise ValueError(f"x is 1 to 16 vectors of K activations, not {x.shape}")
     operands = _checked(face, operands, x[0])
-    if n <= 0 or rps <= 0:
+    if not (_count(n) and _count(rps)):
         raise ValueError(f"n={n}, rps={rps}: one row or more of each")
     rows, k = x.shape
     return _shared_rows_kernel(face, unrolled)(
@@ -689,11 +708,13 @@ class LayerCall:
     """Rows of a format layer, as ``layer_calls`` records them where they
     ran: the layer, the face whose launch ran them (or the replay of the
     launch the layer kept), and what that launch's Metal is instantiated
-    with beside the face (``metal``: x's type; for a stack, the tuple of
-    x's type, the pairs of a row of x and whether there are fewer than 8
-    pairs). ``face`` and ``metal`` are None for rows of the format's decode.
-    Two are equal when they are of the same layer, with equal faces and
-    Metal; like the layer, a dict of its arrays, a record has no hash."""
+    with beside the face (``metal``: x's type, or for rows in the shared
+    launch the tuple of x's type and the rows a threadgroup takes; for a
+    stack, the tuple of x's type, the pairs of a row of x and whether there
+    are fewer than 8 pairs). ``face`` and ``metal`` are None for rows of
+    the format's decode. Two are equal when they are of the same layer, with
+    equal faces and Metal; like the layer, a dict of its arrays, a record has
+    no hash."""
 
     layer: Any
     face: Dot | None = None
@@ -765,7 +786,9 @@ def _described(linear, plan, arrays) -> Any:
     """What a launch's Metal is built for, by the helpers the launch itself
     describes it with: ``arrays`` are x, then a stack's indices."""
     x, *indices = arrays
-    return linear._metal(x, linear._pairs(plan.k, x, *indices) if indices else None)
+    if indices:
+        return linear._metal(x, linear._pairs(plan.k, x, *indices))
+    return linear._linear_metal(plan, x)
 
 
 class _Replays(Mapping):
