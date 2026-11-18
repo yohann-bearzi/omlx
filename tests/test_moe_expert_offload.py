@@ -615,20 +615,57 @@ class TestApplyAndForward:
         with caplog.at_level(logging.INFO):
             assert apply_moe_expert_offload(_MiniMoE([glu]), tmp_path, 0.25) == 0
         assert "gate_proj is a layer of the 'affine' quant format" in caplog.text
-        gate_path = "layers.0.experts.switch_glu.gate_proj"
-        config = {
-            "quantization": {
-                gate_path: {"group_size": GROUP, "bits": 4, "mode": "toy"}
-            },
-            "omlx_quant_formats": {"toy": {"plugin": "omlx-toy 0.3.1"}},
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
         full = 10**9
-        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) == full
-        # Named in a mode the checkpoint records no format of: MLX's.
-        config["omlx_quant_formats"] = {"other": {}}
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert estimate_offload_admission_bytes(tmp_path, full, 0.25) < full
+        container = "layers.0.experts.switch_glu"
+        gate = {"group_size": GROUP, "bits": 4}
+
+        def estimate(config, name="model.safetensors", tensors=None):
+            (tmp_path / "config.json").write_text(json.dumps(config))
+            if tensors is not None:
+                for old in tmp_path.glob("*.safetensors"):
+                    old.unlink()
+                mx.save_safetensors(str(tmp_path / name), tensors)
+            return estimate_offload_admission_bytes(tmp_path, full, 0.25)
+
+        recorded = {"toy": {"plugin": "omlx-toy 0.3.1"}}
+        named = {f"{container}.gate_proj": {**gate, "mode": "toy"}}
+        # A mode that is not MLX's, recorded or not, under any key, under
+        # language_model. or not, or as the config's own mode: in full.
+        for config in (
+            {"quantization": named},
+            {"quantization": named, "omlx_quant_formats": recorded},
+            {"quantization_config": named},
+            {"quantization": {**gate, "mode": "toy"}},
+            # A record that is no object: every mode is taken for a format's.
+            {"quantization": {f"{container}.gate_proj": gate}, "omlx_quant_formats": 1},
+        ):
+            assert estimate(config) == full, config
+        # One of MLX's modes the checkpoint records a format of: in full too.
+        affine = {f"{container}.gate_proj": {**gate, "mode": "affine"}}
+        both = {"quantization": affine, "omlx_quant_formats": {"affine": {}}}
+        assert estimate(both) == full
+        # MLX's, of no recorded format: discounted.
+        mlx_s = {"quantization": affine, "omlx_quant_formats": {"other": {}}}
+        assert estimate(mlx_s) < full
+        # A checkpoint under language_model.
+        prefixed = {
+            f"language_model.{name}": value
+            for name, value in _glu_tensors(glu, container).items()
+        }
+        toy = {"quantization": {f"{container}.gate_proj": {**gate, "mode": "toy"}}}
+        assert estimate(toy, tensors=prefixed) == full
+        # Experts one by one, stacked at load into the format's layer.
+        stacked = _glu_tensors(glu, container)
+        per_expert = {
+            f"layers.0.experts.experts.{e}.{proj}.{field}": stacked[
+                f"{container}.{proj}.{field}"
+            ][e]
+            for e in range(E)
+            for proj in ("gate_proj", "up_proj", "down_proj")
+            for field in ("weight", "scales", "biases")
+        }
+        assert estimate(toy, tensors=per_expert) == full
+        assert estimate({}, tensors=per_expert) < full
 
     def test_admission_estimate_unsupported_layouts(self, tmp_path):
         """Layouts the wrapper rejects must discount nothing: the estimate

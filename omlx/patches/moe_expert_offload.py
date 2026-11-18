@@ -50,6 +50,7 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
+from .. import formats
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
 from ..formats.linear import FormatSwitchLinear
@@ -82,11 +83,12 @@ _DTYPES = {
 }
 
 
-def _minimum_experts(model_dir):
+def _minimum_experts(model_dir, config=None):
     path = Path(model_dir) / "config.json"
-    if not path.exists():
-        return 8
-    config = json.loads(path.read_text())
+    if config is None:
+        if not path.exists():
+            return 8
+        config = json.loads(path.read_text())
     text = config.get("text_config", config)
     return max(
         8,
@@ -1202,10 +1204,12 @@ def estimate_offload_admission_bytes(
         model_dir = _resolve_model_dir(model_path)
         if model_dir is None:
             return full_size
-        minimum = _minimum_experts(model_dir)
         config_path = Path(model_dir) / "config.json"
+        # Read once, for every question asked of it below.
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        minimum = _minimum_experts(model_dir, config)
         if config_path.exists():
-            kind = json.loads(config_path.read_text()).get("model_type", "")
+            kind = config.get("model_type", "")
             if kind == "deepseek_v41":
                 # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
@@ -1226,7 +1230,9 @@ def estimate_offload_admission_bytes(
         nvfp4: set[str] = set()
         # The projections the checkpoint holds in a quant format: offload
         # keeps them resident (_resolve_store_view), so they count in full.
-        in_format = _format_projections(model_dir)
+        in_format, every = format_projections(config)
+        if every:
+            return full_size
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -1273,7 +1279,8 @@ def estimate_offload_admission_bytes(
         for container, b in stacked.items():
             if not required <= b["fields"] or container in nvfp4:
                 continue  # unquantized, partial or NVFP4: wraps nothing
-            if any(f"{container}.{proj}" in in_format for proj in _PROJS):
+            plain = container.removeprefix("language_model.")
+            if any(f"{plain}.{proj}" in in_format for proj in _PROJS):
                 continue  # a quant format's layer: resident
             if len(b["e"]) != 1:  # projections disagree on E
                 continue
@@ -1282,7 +1289,14 @@ def estimate_offload_admission_bytes(
                 continue
             capacity = min(n, max(minimum, round(n * resident_fraction)))
             saved += b["bytes"] * (1.0 - capacity / n)
-        for b in per_expert.values():
+        for parent, b in per_expert.items():
+            plain = parent.removeprefix("language_model.")
+            if any(
+                f"{plain}.{stack}.{proj}" in in_format
+                for stack in ("switch_mlp", "switch_glu")
+                for proj in _PROJS
+            ):
+                continue  # stacked at load into a quant format's layer
             per_e = b["per_e"]
             if not per_e or any(not required <= s for s in per_e.values()):
                 continue  # any incomplete expert: the wrapper rejects the layer
@@ -1297,22 +1311,35 @@ def estimate_offload_admission_bytes(
         return full_size
 
 
-def _format_projections(model_dir) -> set[str]:
-    """The paths the checkpoint at ``model_dir`` names in its quantization
-    config in a quant format it records (``omlx_quant_formats``)."""
-    config_path = Path(model_dir) / "config.json"
-    if not config_path.exists():
-        return set()
-    config = json.loads(config_path.read_text())
-    recorded = config.get("omlx_quant_formats")
-    quantization = config.get("quantization")
-    if not isinstance(recorded, dict) or not isinstance(quantization, dict):
-        return set()
-    return {
-        path
+def format_projections(config: dict) -> tuple[set[str], bool]:
+    """The projections a checkpoint's config holds in a quant format: the
+    paths its quantization config names in one (without language_model.),
+    and whether every quantized layer is in one (its own mode is). A mode
+    is a format's when it is not MLX's, or the checkpoint records a format
+    of it; a record that is no object takes every mode for one."""
+    recorded = config.get("omlx_quant_formats", {})
+    every = not isinstance(recorded, dict)
+    text = config.get("text_config")
+    quantization = (
+        config.get("quantization")
+        or config.get("quantization_config")
+        or (text.get("quantization") if isinstance(text, dict) else None)
+    )
+    if not isinstance(quantization, dict):
+        return set(), every
+
+    def in_format(mode) -> bool:
+        return isinstance(mode, str) and (
+            every or mode in recorded or not formats._mlx_runs(mode)
+        )
+
+    default = quantization.get("mode", "affine")
+    paths = {
+        path.removeprefix("language_model.")
         for path, entry in quantization.items()
-        if isinstance(entry, dict) and entry.get("mode") in recorded
+        if isinstance(entry, dict) and in_format(entry.get("mode", default))
     }
+    return paths, every or in_format(default)
 
 
 def materialize_offload_state(model) -> int:

@@ -115,6 +115,20 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
+def test_a_quant_format_s_experts_are_kept_resident_not_refused(tmp_path):
+    _checkpoint(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    stack = "language_model.model.layers.0.mlp.switch_mlp"
+    config["quantization"][f"{stack}.gate_proj"] = {
+        "bits": 4,
+        "group_size": 32,
+        "mode": "oqel",
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    # Its other layer is MLX's, and offloads.
+    assert moe_offload_compatibility(tmp_path) == (True, "")
+
+
 @pytest.mark.parametrize("kind", ["mixtral", "llama"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)
