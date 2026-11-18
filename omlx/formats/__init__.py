@@ -30,6 +30,9 @@ from dataclasses import dataclass
 from importlib.metadata import EntryPoint, entry_points
 
 import mlx.core as mx
+import mlx.nn as nn
+
+from ..patches.module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
 
@@ -321,11 +324,34 @@ def tile(layer, k: int, n: int) -> Tile | None:
 
 def _face(layer, k: int, n: int, kind: type, keeps: str):
     """The face of class ``kind`` that ``layer``'s format gives, from its
-    method of the class's name in lower case, or None."""
+    method of the class's name in lower case, or None.
+
+    A layer (an ``nn.Module``) asks its format once for each kind and
+    (k, n): the answer is kept on the layer (``module_cache``) until one of
+    its arrays is another, its bits or group size change, or its mode is
+    another format's. A kernel that asks at every call costs a lookup."""
     mode = getattr(layer, "mode", None)
     fmt = get(mode)
     if fmt is None:
         return None
+    if not isinstance(layer, nn.Module):
+        return _asked(fmt, layer, k, n, kind, keeps)
+    return cached_per_module(
+        layer,
+        f"_omlx_{kind.__name__.lower()}_face_{k}_{n}",
+        lambda layer: _asked(fmt, layer, k, n, kind, keeps),
+        depth=0,
+        flags=(
+            fmt,
+            getattr(layer, "bits", None),
+            getattr(layer, "group_size", None),
+        ),
+    )
+
+
+def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, keeps: str):
+    """The face ``_face`` keeps: ``fmt``'s answer, checked."""
+    mode = fmt.mode
     name = kind.__name__.lower()
     try:
         face = getattr(fmt, name)(layer, k, n)

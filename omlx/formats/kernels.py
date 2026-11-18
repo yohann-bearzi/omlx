@@ -563,6 +563,9 @@ MAX_GRAPHS = 64
 
 _PROOFS: dict[tuple, Proof] = {}
 
+# The kernels over faces built so far, by what their source is written from.
+_FACE_KERNELS: dict[tuple, object] = {}
+
 
 def proof(kernel: str, *key) -> Proof:
     """The proof of the launches that ``kernel`` compiles from ``key``: its
@@ -574,6 +577,47 @@ def proof(kernel: str, *key) -> Proof:
         # One step: of two threads that miss at once, both get one Proof.
         proof = _PROOFS.setdefault(key, Proof())
     return proof
+
+
+def face_kernel(
+    name: str,
+    inputs: tuple[str, ...],
+    matrices: dict[str, Dot | Tile],
+    outputs: tuple[str, ...],
+    header: str,
+    source: str,
+):
+    """The ``mx.fast.metal_kernel`` over the faces of ``matrices``, named
+    ``<name>_<face key>...``: its inputs are ``inputs`` in order, where a
+    matrix's name stands for its inputs (``Matrices.add``); its header is the
+    faces' Metal (``Matrices.header``), then ``header``; its source opens with
+    the matrices' declarations, then ``source``. Its source is written and
+    MLX's kernel made once for each name, inputs, faces, outputs, header and
+    source; every call after finds it. Threads: two that build one kernel at
+    once each build it, and the first kept is the one every call finds."""
+    key = (name, inputs, tuple(matrices.items()), outputs, header, source)
+    kernel = _FACE_KERNELS.get(key)
+    if kernel is not None:
+        return kernel
+    unread = sorted(set(matrices) - set(inputs))
+    if unread:
+        raise ValueError(
+            f"kernel {name!r}: matrices {', '.join(unread)} are not among its inputs"
+        )
+    built = Matrices()
+    names = [
+        n
+        for given in inputs
+        for n in (built.add(given, matrices[given]) if given in matrices else [given])
+    ]
+    kernel = mx.fast.metal_kernel(
+        name="_".join((name, *(face.key for face in matrices.values()))),
+        input_names=names,
+        output_names=list(outputs),
+        header=built.header + header,
+        source=built.declarations + source,
+    )
+    return _FACE_KERNELS.setdefault(key, kernel)
 
 
 class Matrices:

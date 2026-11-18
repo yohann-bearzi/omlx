@@ -1130,3 +1130,85 @@ def test_the_page_cites_the_lines_the_compiler_cites(phrase):
     cited = re.findall(f"{_LINE}|{_RULE}|{_REVISIONS}", sample)
     message = " ".join(_page_error(**_BREAKS[phrase]).split())
     assert cited and [c for c in cited if c not in message] == []
+
+
+def _counted(monkeypatch):
+    """The kernels mx.fast.metal_kernel builds, and the Matrices made."""
+    built, made = [], []
+    real_kernel, real_matrices = mx.fast.metal_kernel, kernels.Matrices
+
+    def kernel(**kwargs):
+        built.append(kwargs)
+        return real_kernel(**kwargs)
+
+    def matrices():
+        made.append(1)
+        return real_matrices()
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", kernel)
+    monkeypatch.setattr(kernels, "Matrices", matrices)
+    # A registry of this test's own: what another test built is not found.
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    return built, made
+
+
+def test_a_kernel_over_faces_is_written_once(monkeypatch):
+    built, made = _counted(monkeypatch)
+    face = _toy("written_once")
+    args = (
+        "two_rows",
+        ("x", "m", "rows"),
+        {"m": face},
+        ("y",),
+        "// header\n",
+        "y[0] = 0;",
+    )
+    first = kernels.face_kernel(*args)
+    assert kernels.face_kernel(*args) is first
+    assert (len(built), len(made)) == (1, 1)
+    (kwargs,) = built
+    assert kwargs["name"] == f"two_rows_{face.key}"
+    assert kwargs["input_names"] == [
+        "x",
+        "m_weight",
+        *(f"m_{t}" for t in face.tensors),
+        "rows",
+    ]
+    assert kwargs["output_names"] == ["y"]
+    assert kwargs["header"].endswith("// header\n")
+    assert kwargs["source"].endswith("y[0] = 0;")
+    assert "const auto m = " in kwargs["source"]
+
+
+@pytest.mark.parametrize(
+    "change", ["name", "inputs", "face", "outputs", "header", "source"]
+)
+def test_a_kernel_over_faces_is_written_again_for_anything_else(monkeypatch, change):
+    built, _ = _counted(monkeypatch)
+    face, other = _toy("written_a"), _toy("written_b")
+    args = {
+        "name": "two_rows",
+        "inputs": ("x", "m"),
+        "matrices": {"m": face},
+        "outputs": ("y",),
+        "header": "",
+        "source": "y[0] = 0;",
+    }
+    kernels.face_kernel(**args)
+    args.update(
+        {
+            "name": {"name": "three_rows"},
+            "inputs": {"inputs": ("m", "x")},
+            "face": {"matrices": {"m": other}},
+            "outputs": {"outputs": ("z",)},
+            "header": {"header": "// another\n"},
+            "source": {"source": "y[1] = 0;"},
+        }[change]
+    )
+    kernels.face_kernel(**args)
+    assert len(built) == 2
+
+
+def test_a_kernel_over_faces_reads_every_matrix_it_names():
+    with pytest.raises(ValueError, match="matrices m are not among its inputs"):
+        kernels.face_kernel("two_rows", ("x",), {"m": _toy("unread")}, ("y",), "", "")

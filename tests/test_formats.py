@@ -969,3 +969,96 @@ def test_a_format_without_a_layout_or_a_codec_keeps_no_matrix():
     # No layer of a checkpoint is then its to build, and oQ writes none in it.
     assert _Bare().layout(64, 8, 4, 64) is None
     assert _Bare().encode(mx.zeros((8, 64)), mx.ones((64,)), 4, 64) is None
+
+
+class _Counting(_Tiled):
+    """Counts what it is asked for."""
+
+    def __init__(self, mode="toy"):
+        super().__init__(mode)
+        self.dots = self.tiles = 0
+
+    def dot(self, layer, k, n):
+        self.dots += 1
+        return _FACE
+
+    def tile(self, layer, k, n):
+        self.tiles += 1
+        return _tile()
+
+
+def test_a_layer_asks_its_format_for_a_face_once(plugins):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    for _ in range(3):
+        assert formats.dot(layer, 64, 8) is _FACE
+        assert formats.tile(layer, 64, 8) is _tile()
+    assert (fmt.dots, fmt.tiles) == (1, 1)
+    # Another matrix shape is asked for.
+    assert formats.dot(layer, 128, 8) is _FACE
+    assert formats.dot(layer, 64, 16) is _FACE
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 3
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["another array", "an array removed and put back", "bits", "group size", "mode"],
+)
+def test_a_layer_asks_again_once_what_its_face_depends_on_changes(plugins, change):
+    fmt, other = _Counting(), _Counting("other")
+    formats.register(fmt)
+    formats.register(other)
+    layer = _layer()
+    layer.bits, layer.group_size = 4, 32
+    assert formats.dot(layer, 64, 8) is _FACE
+    if change == "another array":
+        layer["scales"] = mx.zeros((8,))
+    elif change == "an array removed and put back":
+        layer["scales"] = layer.pop("scales") + 0
+    elif change == "bits":
+        layer.bits = 8
+    elif change == "group size":
+        layer.group_size = 64
+    else:
+        layer.mode = "other"
+    for _ in range(2):
+        assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots + other.dots == 2
+
+
+def test_a_mode_given_to_another_format_is_asked_of_it(plugins, monkeypatch):
+    fmt, again = _Counting(), _Counting()
+    formats.register(fmt)
+    layer = _layer()
+    assert formats.dot(layer, 64, 8) is _FACE
+    monkeypatch.setitem(formats._FORMATS, "toy", again)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert (fmt.dots, again.dots) == (1, 1)
+
+
+def test_what_is_no_module_is_asked_at_every_call(plugins):
+    class Layer(dict):
+        mode = "toy"
+
+    fmt, layer = _Counting(), Layer(weight=mx.zeros((8,)), scales=mx.zeros((8,)))
+    formats.register(fmt)
+    for _ in range(2):
+        assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_a_defective_dot_is_asked_once(plugins, caplog, dot_defects):
+    class Defective(_Counting):
+        def dot(self, layer, k, n):
+            self.dots += 1
+            raise _DefectError("no face")
+
+    fmt, layer = Defective(), _layer()
+    formats.register(fmt)
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for _ in range(2):
+            assert formats.dot(layer, 64, 8) is None
+    assert fmt.dots == 1
+    assert len(caplog.records) == 1
+    dot_defects.clear()  # expected
