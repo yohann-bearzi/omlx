@@ -59,6 +59,13 @@ def verified():
         yield
 
 
+class _Log(SimpleNamespace):
+    """One log for a format and every copy of it a load accepts with."""
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 class _Codec(_ToyFormat):
     """The toy format with its codec: a byte for each weight and a scale for
     each row, which keep a weight to half a scale. ``answer`` stands in for
@@ -68,9 +75,8 @@ class _Codec(_ToyFormat):
         super().__init__()
         self.offered, self.encoded, self.lays_out = [], [], True
         self.answer = lambda tensors, w: tensors
-        # What the loads handed it, kept off its own state: a format that
-        # changes its state to accept a checkpoint is refused.
-        self.log = SimpleNamespace(accepted=[])
+        # What the loads handed it, and the copies they accepted with.
+        self.log = _Log(accepted=[])
 
     @property
     def accepted(self):
@@ -1127,7 +1133,9 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     model, _ = load_model(output, strict=True)
     assert toy.accepted == [record]
     layers = [m for _, m in model.named_modules() if isinstance(m, FormatLinear)]
-    assert layers and all(layer.fmt is toy for layer in layers)
+    # Read with the load's copy of the format, one for all of them.
+    (read,) = {id(layer.fmt): layer.fmt for layer in layers}.values()
+    assert read is not toy and type(read) is _Codec and read.log is toy.log
 
 
 _CYCLE: dict = {}

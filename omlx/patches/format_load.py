@@ -33,11 +33,11 @@ the checkpoint's files, its config among them, whose record the layers read.
 
 from __future__ import annotations
 
+import copy
 import importlib
 import importlib.abc
 import inspect
 import json
-import operator
 import os
 import sys
 import threading
@@ -74,11 +74,6 @@ _ABSENT = object()
 # Whether this process has built a format layer: until it has, no load
 # holds one to check.
 _BUILT_ANY = False
-
-# Held while a format accepts a checkpoint's record: a load's threads (one
-# that copied its context) accept it once, and no two accepts of a format
-# run at once.
-_ACCEPTING = threading.Lock()
 
 # A value of config.json by its JSON type.
 _JSON_TYPES = {
@@ -119,46 +114,44 @@ class _Checkpoint:
         # decision model's) is named by the checkpoint its config is.
         self._config = _ABSENT
         self._read: dict[str, formats.QuantFormat] = {}
+        # A load's threads (ones that copied its context) accept its record
+        # once.
+        self._accepting = threading.Lock()
         self.built: list[nn.Module] = []
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
-        what ``fmt.accept`` returns for the record oQ stored (None: ``fmt``
-        itself), asked once."""
-        with _ACCEPTING:
+        what ``accept`` of a copy of ``fmt`` returns for the record oQ stored
+        (None: that copy), asked once."""
+        with self._accepting:
             read = self._read.get(fmt.mode)
             return self._accepted(fmt) if read is None else read
 
     def _accepted(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
-        """``read`` the first time, under ``_ACCEPTING``."""
+        """``read`` the first time, under ``_accepting``."""
         # Whatever the config named: a format's layer is being built.
         _refuse_family(self, fmt.mode)
         plugin = formats.origin(fmt.mode) or "the plugin"
         record = self._record(fmt.mode)
-        kept = _state(fmt)
         try:
-            read = fmt.accept(record)
-        except ValueError as error:
-            # The format's own words, on the registered format as it was,
-            # with what oMLX knows of the checkpoint.
-            _restore(fmt, kept, _changed(fmt, kept))
-            said = error.reason if isinstance(error, FormatRefusedError) else error
-            raise _refused(str(said), fmt.mode, self) from error
-        except Exception:
-            _restore(fmt, kept, _changed(fmt, kept))
-            raise
-        changed = _changed(fmt, kept)
-        if changed:
-            # The registered format is left as it was for the next load.
-            _restore(fmt, kept, changed)
+            # The load's own copy: nothing accept does reaches the registered
+            # format, which other loads and forwards read.
+            own = copy.deepcopy(fmt)
+        except Exception as error:
             raise _refused(
-                f"accept changed the registered format ({', '.join(changed)})"
-                " to accept the checkpoint: accept returns a format "
-                f"configured from the record instead; report it to {plugin}",
+                f"the format cannot be copied for the load ({error}): accept runs "
+                "on a copy of the registered format, which holds no lock, dtype "
+                f"or other object that copy.deepcopy refuses; report it to {plugin}",
                 fmt.mode,
                 self,
-            )
-        read = fmt if read is None else read
+            ) from error
+        try:
+            read = own.accept(record)
+        except ValueError as error:
+            # The format's own words, with what oMLX knows of the checkpoint.
+            said = error.reason if isinstance(error, FormatRefusedError) else error
+            raise _refused(str(said), fmt.mode, self) from error
+        read = own if read is None else read
         if not (
             isinstance(read, formats.QuantFormat)
             and (read.mode, read.tensors, read.contract)
@@ -376,101 +369,6 @@ class _Checkpoint:
             if isinstance(mode, str)
             and (not formats._mlx_runs(mode) or self.records(mode))
         ]
-
-
-def _snapshot(value):
-    """What ``_changed`` compares a container attribute of a format with:
-    its contents, shallowly (the objects themselves, not copies, which a
-    face's dtypes or a lock would refuse); None for any other value."""
-    if isinstance(value, dict):
-        return dict(value)
-    if isinstance(value, list):
-        return list(value)
-    if isinstance(value, set):
-        return set(value)
-    if isinstance(value, bytearray):
-        return bytes(value)
-    return None
-
-
-def _attributes(fmt) -> dict:
-    """``fmt``'s attributes: its ``__dict__``'s, and its slots', each read
-    through its own descriptor (a private slot by its mangled name; the
-    slot, not a property or a method a subclass shadows it with; not the
-    instance dict's and the weak reference's a mixin may declare), by the
-    names ``object.__setattr__`` takes."""
-    attributes = dict(getattr(fmt, "__dict__", {}))
-    for cls in type(fmt).__mro__:
-        slots = cls.__dict__.get("__slots__", ())
-        for slot in (slots,) if isinstance(slots, str) else slots:
-            if slot.startswith("__") and not slot.endswith("__"):
-                slot = f"_{cls.__name__.lstrip('_')}{slot}"
-            descriptor = cls.__dict__.get(slot)
-            if not isinstance(descriptor, types.MemberDescriptorType):
-                continue
-            try:
-                attributes[slot] = descriptor.__get__(fmt, type(fmt))
-            except AttributeError:
-                # A slot never set.
-                continue
-    return attributes
-
-
-def _state(fmt) -> dict:
-    """``fmt``'s attributes, each with a ``_snapshot`` of it."""
-    return {name: (value, _snapshot(value)) for name, value in _attributes(fmt).items()}
-
-
-def _differs(value, held) -> bool:
-    """Whether the container ``value`` holds other than ``held``, its
-    ``_snapshot``: an entry added, removed or replaced (a list's and a dict's
-    by identity, a set's and a bytearray's by equality)."""
-    if isinstance(value, dict):
-        return len(value) != len(held) or any(
-            key not in value or value[key] is not old for key, old in held.items()
-        )
-    if isinstance(value, list):
-        return len(value) != len(held) or any(map(operator.is_not, value, held))
-    if isinstance(value, set):
-        return not set.__eq__(set(value), held)
-    return bytes(value) != held
-
-
-def _changed(fmt, kept: dict) -> list[str]:
-    """The attributes of ``fmt`` that are not as ``kept`` (by ``_state``)
-    has them: added, removed, rebound, or a container's contents."""
-    now = _attributes(fmt)
-    return sorted(
-        name
-        for name in kept.keys() | now.keys()
-        if name not in kept
-        or name not in now
-        or now[name] is not kept[name][0]
-        or (kept[name][1] is not None and _differs(now[name], kept[name][1]))
-    )
-
-
-def _restore(fmt, kept: dict, changed: list[str]) -> None:
-    """``fmt``'s ``changed`` attributes as ``kept`` (by ``_state``) has
-    them."""
-    for name in changed:
-        if name not in kept:
-            object.__delattr__(fmt, name)
-            continue
-        value, held = kept[name]
-        # Its contents first, and only when they changed, then the name; a
-        # dict and a set never empty meanwhile (a forward reads them).
-        if held is not None and _differs(value, held):
-            if isinstance(value, dict):
-                value.update(held)
-                for key in value.keys() - held.keys():
-                    del value[key]
-            elif isinstance(value, set):
-                value |= held
-                value -= value - held
-            else:
-                value[:] = held
-        object.__setattr__(fmt, name, value)
 
 
 def check_loaded(model) -> None:
@@ -725,16 +623,12 @@ def _format_layer(layer, layer_cls, signature, arguments):
     fmt = formats.get(mode)
     layout = None
     if fmt is not None and bits is not None and group_size is not None:
-        with _ACCEPTING:
-            # Not while another thread's load sees whether accept changed
-            # the format (a format that keeps what it laid out).
-            layout = fmt.layout(k, n, bits, group_size)
+        layout = fmt.layout(k, n, bits, group_size)
     if layout is not None:
         checkpoint = _reading(fmt)
         read = checkpoint.read(fmt)
         if read is not fmt:
-            with _ACCEPTING:
-                layout = read.layout(k, n, bits, group_size)
+            layout = read.layout(k, n, bits, group_size)
         fmt = read
     if layout is None:
         if not isinstance(mode, str):

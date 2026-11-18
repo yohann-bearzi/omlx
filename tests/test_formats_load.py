@@ -14,7 +14,6 @@ import re
 import sys
 import textwrap
 import threading
-import weakref
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,19 +41,25 @@ _PATCHED = (nn.Linear, lm_switch.SwitchLinear, vlm_switch.SwitchLinear)
 _TOY = {"bits": 8, "group_size": 1, "mode": "toy"}
 
 
+class _Log(SimpleNamespace):
+    """What a format was asked and handed: one log for it and every copy of
+    it a load accepts with."""
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 class _Loadable(_ToyFormat):
     """The toy format, with what its checkpoints keep of a matrix: a byte for
     each weight and a scale for each row. ``reads`` gives the object that
-    reads a checkpoint of a record (the format itself, unless a test says
-    otherwise)."""
+    reads a checkpoint of a record (None: the load's copy of the format,
+    unless a test says otherwise)."""
 
     def __init__(self, mode="toy"):
         super().__init__()
         self.mode, self.refusal = mode, None
-        # What it was asked and handed, kept off its own state: a format that
-        # changes its state to accept a checkpoint is refused.
-        self.log = SimpleNamespace(asked=[], accepted=[])
-        self.reads = lambda record: self
+        self.log = _Log(asked=[], accepted=[])
+        self.reads = None
 
     @property
     def asked(self):
@@ -69,7 +74,7 @@ class _Loadable(_ToyFormat):
         self.accepted.append((record, len(self.asked)))
         if self.refusal is not None:
             raise ValueError(self.refusal)
-        return self.reads(record)
+        return self if self.reads is None else self.reads(record)
 
     def layout(self, k, n, bits, group_size):
         self.asked.append((k, n, bits, group_size))
@@ -222,7 +227,9 @@ def test_a_named_linear_loads_as_the_formats_layer(by_hand, toy):
     assert type(layer) is FormatLinear and type(model.dense) is nn.Linear
     assert (layer.mode, layer.bits, layer.group_size) == ("toy", 8, 1)
     assert (layer.input_dims, layer.output_dims) == (k, n)
-    assert toy.asked == [(k, n, 8, 1)]
+    # The registered format said it lays the matrix out; the load's copy laid
+    # it out.
+    assert toy.asked == [(k, n, 8, 1)] * 2
     # Placeholders of the layout's shapes and dtypes, and the layer's bias.
     assert _kept(layer) == {
         "weight": ((n, k), mx.uint8),
@@ -254,7 +261,7 @@ def test_a_named_switch_layer_loads_as_the_formats_stack(by_hand, toy, switch):
     layer = dense.to_quantized(**_TOY)
     assert type(layer) is FormatSwitchLinear and layer.num_experts == EXPERTS
     assert (layer.mode, layer.bits, layer.group_size) == ("toy", 8, 1)
-    assert toy.asked == [(k, n, 8, 1)]
+    assert toy.asked == [(k, n, 8, 1)] * 2
     # The stack's axis is ahead of each tensor the layout gives.
     assert _kept(layer) == {
         "weight": ((EXPERTS, n, k), mx.uint8),
@@ -642,12 +649,10 @@ def test_a_format_s_refusals_outside_a_load_name_the_checkpoint(toy, tmp_path):
     def refuses(record):
         raise ValueError("written in layout 2")
 
-    def configures(record):
-        toy.levels = 1
-        return toy
-
-    for reads in (refuses, configures, lambda record: "a string"):
+    for reads in (refuses, lambda record: "a string", None):
         toy.reads = reads
+        # The last: a format no copy takes.
+        toy.faces = threading.Lock() if reads is None else None
         with pytest.raises(formats.FormatRefusedError) as refusal:
             format_load._Checkpoint(tmp_path).read(toy)
         assert refusal.value.path == tmp_path
@@ -994,8 +999,9 @@ def test_a_checkpoint_written_without_a_record_hands_an_empty_one(toy, tmp_path)
         # quantization alone.
         _llama(tmp_path, **written)
         model, _ = load_model(tmp_path)
-        assert model.model.layers[0].mlp.gate_proj.fmt is toy
-    assert toy.accepted == [({}, 1), ({}, 2)]
+        _the_load_s_copy(model.model.layers[0].mlp.gate_proj.fmt, toy)
+    # Asked by the registered format, and by the first load's copy, before.
+    assert toy.accepted == [({}, 1), ({}, 3)]
 
 
 def test_a_format_refuses_a_checkpoint_in_its_own_words(toy, tmp_path):
@@ -1188,221 +1194,96 @@ def test_what_accept_returns_is_a_format_of_the_same_kind(
         assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
 
 
-def test_accept_returning_none_reads_with_the_registered_format(toy, tmp_path):
+def _the_load_s_copy(read, fmt):
+    """``read`` is a copy of ``fmt`` that a load accepted with."""
+    assert read is not fmt and type(read) is type(fmt)
+    assert read.log is fmt.log
+
+
+def test_accept_returning_none_reads_with_the_load_s_copy(toy, tmp_path):
     # As the guide's example of revision 1 wrote accept.
     toy.reads = lambda record: None
     _llama(tmp_path, **_written({"layout": 1}))
     model, _ = load_model(tmp_path)
-    assert model.model.layers[0].mlp.gate_proj.fmt is toy
+    _the_load_s_copy(model.model.layers[0].mlp.gate_proj.fmt, toy)
 
 
-def test_a_format_that_configures_itself_to_accept_is_refused(toy, tmp_path):
-    def configure(record):
-        toy.levels = tuple(record["levels"])
-        return toy
+class _Configured(_Loadable):
+    """A format that configures itself from the record to accept it."""
 
-    toy.reads = configure
-    _llama(tmp_path, **_written({"levels": [1.0]}))
+    __slots__ = ("level", "__table")
+
+    def __init__(self):
+        super().__init__()
+        self.options, self.level, self.__table = {"rows": 1}, 1, [0.5]
+
+    def accept(self, record):
+        super().accept(record)
+        self.levels = tuple(record["levels"])
+        self.options["rows"] = len(self.levels)
+        self.level += 1
+        self.__table.append(self.levels[0])
+        del self.refusal
+        return self
+
+
+def test_what_accept_changes_of_its_format_never_reaches_the_registered_one(
+    tmp_path, monkeypatch, unpatched
+):
+    formats.load()
+    fmt = _Configured()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    format_load.apply_format_load_patch()
+    for name, levels in (("first", [1.0, 2.0]), ("second", [3.0])):
+        (tmp_path / name).mkdir()
+        _llama(tmp_path / name, **_written({"levels": levels}))
+    first, _ = load_model(tmp_path / "first")
+    second, _ = load_model(tmp_path / "second")
+    read = [model.model.layers[0].mlp.gate_proj.fmt for model in (first, second)]
+    for kept in read:
+        _the_load_s_copy(kept, fmt)
+    # Each load configured its own copy, attributes, slots and what they hold.
+    kept = [(fmt.levels, fmt.options, fmt.level) for fmt in read]
+    assert kept == [((1.0, 2.0), {"rows": 2}, 2), ((3.0,), {"rows": 1}, 2)]
+    assert read[0]._Configured__table == [0.5, 1.0]
+    assert read[1]._Configured__table == [0.5, 3.0]
+    assert not hasattr(read[0], "refusal")
+    # The registered format is as it was built.
+    assert not hasattr(fmt, "levels") and fmt.refusal is None
+    assert (fmt.options, fmt.level, fmt._Configured__table) == ({"rows": 1}, 1, [0.5])
+
+
+@pytest.mark.parametrize("held", ["a lock", "a dtype", "a copy that fails"])
+def test_a_format_no_copy_takes_is_refused(toy, tmp_path, monkeypatch, held):
+    class _Uncopyable:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("no copy of this")
+
+    value, said = {
+        "a lock": (threading.Lock(), "cannot pickle '_thread.lock' object"),
+        "a dtype": ((mx.float16,), "cannot pickle 'mlx.core.Dtype' object"),
+        "a copy that fails": (_Uncopyable(), "no copy of this"),
+    }[held]
+    toy.faces = value
+    _llama(tmp_path, **_written({"layout": 1}))
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
     assert str(refusal.value) == _refusal(
-        "accept changed the registered format (levels) to accept the checkpoint: "
-        "accept returns a format configured from the record instead; report it "
-        "to the plugin",
+        f"the format cannot be copied for the load ({said}): accept runs on a "
+        "copy of the registered format, which holds no lock, dtype or other "
+        "object that copy.deepcopy refuses; report it to the plugin",
         tmp_path,
     )
-    quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
-    for said in ("the plugin", "omlx-toy 0.3.1", "a format registered by hand"):
-        quoted = quoted.replace(said, "my-package 0.1.0")
-    assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
-    # The registered format is left as it was: the next load is refused too.
-    assert not hasattr(toy, "levels")
-    with pytest.raises(formats.FormatRefusedError, match=r"changed .*\(levels\)"):
+    assert toy.accepted == [] and toy.faces is value
+    if held == "a lock":
+        quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
+        for said in ("the plugin", "omlx-toy 0.3.1", "a format registered by hand"):
+            quoted = quoted.replace(said, "my-package 0.1.0")
+        assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    # Named by its distribution when a plugin's.
+    monkeypatch.setitem(formats._ORIGINS, "toy", "my-package 0.1.0")
+    with pytest.raises(formats.FormatRefusedError, match="to my-package 0.1.0$"):
         load_model(tmp_path)
-
-
-class _Slotted(_Loadable):
-    __slots__ = ("level",)
-
-
-class _OneSlot(_Loadable):
-    __slots__ = "level"
-
-
-class _SubSlotted(_Slotted):
-    """The slot is its parent's; one more is never set."""
-
-    __slots__ = ("unset",)
-
-
-class _WeakMixin:
-    __slots__ = ("__weakref__",)
-
-
-class _Weak(_WeakMixin, _Slotted):
-    pass
-
-
-class _Private(_Loadable):
-    """A slot of its own name: Python keeps it as _Private__levels."""
-
-    __slots__ = ("__levels",)
-
-
-class _Shadowed(_Slotted):
-    """Its parent's slot read through a property: no attribute of it."""
-
-    @property
-    def level(self):
-        return [1]
-
-
-class _OddSet(set):
-    """A set that says it differs from any other."""
-
-    def __ne__(self, other):
-        return True
-
-    def __eq__(self, other):
-        return False
-
-    __hash__ = None
-
-
-class _Tagged(list):
-    """A list whose constructor takes something else first."""
-
-    def __init__(self, tag, items=()):
-        super().__init__(items)
-        self.tag = tag
-
-
-# Weak references to a format, held for a test.
-_REFERENCES: list = []
-
-# What accept does to the registered format, and the attributes the refusal
-# names (none: the load goes on).
-_ACCEPT_CHANGES = {
-    "in place": ("table", lambda fmt: fmt.table.__setitem__(0, 2.0)),
-    "a dict in place": ("options", lambda fmt: fmt.options.__setitem__("rows", 2)),
-    "a key removed": ("options", lambda fmt: fmt.options.clear()),
-    "a slot": ("level", lambda fmt: setattr(fmt, "level", 2)),
-    "a slot named alone": ("level", lambda fmt: setattr(fmt, "level", 2)),
-    "a set": ("tags", lambda fmt: fmt.tags.add(2)),
-    "a bytearray": ("raw", lambda fmt: fmt.raw.__setitem__(0, 122)),
-    "deleted": ("table", lambda fmt: delattr(fmt, "table")),
-    "added": ("extra", lambda fmt: setattr(fmt, "extra", 1)),
-    "rebound to an equal list": (
-        "table",
-        lambda fmt: setattr(fmt, "table", list(fmt.table)),
-    ),
-    "several": (
-        "level, options, raw, table, tags",
-        lambda fmt: (
-            fmt.tags.add(2),
-            fmt.table.append(1.0),
-            fmt.raw.append(0),
-            fmt.options.__setitem__("rows", 2),
-            setattr(fmt, "level", 2),
-        ),
-    ),
-    # A key added and one changed: both undone.
-    "a key added and one changed": (
-        "options",
-        lambda fmt: fmt.options.update({"face": 1, "rows": 2}),
-    ),
-    "a key added": ("options", lambda fmt: fmt.options.__setitem__("scale", 2.5)),
-    # A record kept in a dict that was empty: the next checkpoint would read
-    # with it.
-    "an empty dict filled": ("empty", lambda fmt: fmt.empty.__setitem__("a", 1)),
-    "a key swapped": (
-        "options",
-        lambda fmt: (fmt.options.pop("rows"), fmt.options.__setitem__("cols", 1)),
-    ),
-    "a private slot": (
-        "_Private__levels",
-        lambda fmt: fmt._Private__levels.__setitem__("scale", 2.5),
-    ),
-    "a slot of the parent": ("level", lambda fmt: setattr(fmt, "level", 2)),
-    "an entry replaced by an equal one": (
-        "scales, table",
-        lambda fmt: (
-            fmt.table.__setitem__(0, float("0.5")),
-            fmt.scales.__setitem__("s", float("0.25")),
-        ),
-    ),
-    # What accept may do: none of it changes the format.
-    # Held while accept returns: the mixin's slot holds it.
-    "a weak reference": (None, lambda fmt: _REFERENCES.append(weakref.ref(fmt))),
-    "a list of another constructor": (None, lambda fmt: None),
-    "a slot behind a property": (None, lambda fmt: None),
-    "a set of its own comparison": (None, lambda fmt: None),
-}
-
-
-@pytest.mark.parametrize("change", [*_ACCEPT_CHANGES, "then raises", "then fails"])
-def test_what_accept_changes_of_the_registered_format_is_undone(
-    tmp_path, monkeypatch, unpatched, change
-):
-    formats.load()
-    classes = {
-        "a slot named alone": _OneSlot,
-        "a slot of the parent": _SubSlotted,
-        "a weak reference": _Weak,
-        "a private slot": _Private,
-        "a slot behind a property": _Shadowed,
-    }
-    fmt = classes.get(change, _Slotted)()
-    fmt.table, fmt.options = [0.5, 1.5], {"rows": 1}
-    if change != "a slot behind a property":
-        fmt.level = 1
-    if change == "a list of another constructor":
-        fmt.tagged = _Tagged("tag", [1, 2])
-    if change == "a set of its own comparison":
-        fmt.odd = _OddSet({1})
-    if change == "a private slot":
-        fmt._Private__levels = {}
-    fmt.scales, fmt.empty = {"s": 0.25}, {}
-    fmt.tags, fmt.raw = {1}, bytearray(b"ab")
-    # What no copy takes: a face's dtypes, a lock.
-    fmt.faces = {"dtypes": (mx.float16,), "lock": threading.Lock()}
-    faces = dict(fmt.faces)
-    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
-    format_load.apply_format_load_patch()
-
-    def configure(record):
-        if change in _ACCEPT_CHANGES:
-            _ACCEPT_CHANGES[change][1](fmt)
-        elif change == "then raises":
-            fmt.table.append(3.0)
-            raise ValueError("written in layout 2; this plugin reads layout 1")
-        else:
-            fmt.options.clear()
-            raise KeyError("layout")
-        return fmt
-
-    fmt.reads = configure
-    _llama(tmp_path, **_written({"levels": [1.0]}))
-    named = _ACCEPT_CHANGES.get(change, ("",))[0]
-    if named is None:
-        load_model(tmp_path)
-        assert fmt.options == {"rows": 1}
-        if change == "a list of another constructor":
-            assert fmt.tagged == [1, 2]
-        return
-    # A format's defect is its own error; a refusal is oMLX's.
-    error = KeyError if change == "then fails" else formats.FormatRefusedError
-    with pytest.raises(error) as refusal:
-        load_model(tmp_path)
-    if named:
-        assert f"accept changed the registered format ({named})" in str(refusal.value)
-    assert (fmt.table, fmt.options, fmt.level) == ([0.5, 1.5], {"rows": 1}, 1)
-    assert fmt.empty == {}
-    if change == "a private slot":
-        assert fmt._Private__levels == {}
-    assert (fmt.tags, fmt.raw, fmt.faces) == ({1}, bytearray(b"ab"), faces)
-    assert fmt.scales == {"s": 0.25}
-    assert not hasattr(fmt, "extra")
 
 
 def test_a_load_s_record_is_its_own_again_after_a_block_outside_it(toy, tmp_path):
@@ -1734,69 +1615,33 @@ def test_a_load_nested_in_another_checkpoint_s_checks_its_own(toy, tmp_path):
         load_model(partial, strict=False)
 
 
-def test_a_layout_is_asked_while_no_accept_runs(toy, tmp_path):
-    import time
-
+def test_loads_of_one_format_accept_on_copies_of_their_own(toy, tmp_path):
     paths = [tmp_path / name for name in ("first", "second")]
     for path in paths:
         path.mkdir()
         _llama(path, **_written({"levels": [1.0]}))
-    accepting, ended, laid_out = threading.Event(), [], []
+    both = threading.Barrier(2, timeout=30)
 
     def accept(record):
-        accepting.set()
-        time.sleep(0.3)
-        ended.append(time.monotonic())
-
-    real = toy.layout
-
-    def layout(k, n, bits, group_size):
-        if accepting.is_set():
-            laid_out.append(time.monotonic())
-        return real(k, n, bits, group_size)
-
-    toy.accept, toy.layout = accept, layout
-
-    def build(path):
-        with format_load.loading(path):
-            nn.Linear(64, 128).to_quantized(**_TOY)
-
-    first = threading.Thread(target=build, args=(paths[0],))
-    first.start()
-    assert accepting.wait(60)
-    build(paths[1])
-    first.join(60)
-    # The second load's layout waited for the first one's accept.
-    assert laid_out and laid_out[0] >= ended[0]
-
-
-def test_accepts_of_one_format_never_overlap(toy, tmp_path):
-    import time
-
-    paths = [tmp_path / name for name in ("first", "second")]
-    for path in paths:
-        path.mkdir()
-        _llama(path, **_written({"levels": [1.0]}))
-    running, most = [], []
-
-    def accept(record):
-        running.append(record)
-        most.append(len(running))
-        time.sleep(0.2)
-        running.pop()
+        # Each load's accept waits for the other's: no lock holds one back.
+        both.wait()
 
     toy.accept = accept
+    built = []
 
     def build(path):
         with format_load.loading(path):
-            nn.Linear(64, 128).to_quantized(**_TOY)
+            built.append(nn.Linear(64, 128).to_quantized(**_TOY))
 
     threads = [threading.Thread(target=build, args=(path,)) for path in paths]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(60)
-    assert most == [1, 1]
+    # Each layer reads with its own load's copy.
+    assert len(built) == 2 and built[0].fmt is not built[1].fmt
+    for layer in built:
+        assert layer.fmt is not toy and type(layer.fmt) is type(toy)
 
 
 def test_a_load_under_home_or_in_a_view_joins_the_checkpoint_s(
