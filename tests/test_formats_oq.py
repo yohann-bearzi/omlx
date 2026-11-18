@@ -906,15 +906,44 @@ def test_no_family_is_verified_but_by_a_test(tmp_path, monkeypatch):
         assert oq._unverified_family(blank) is None
 
 
+@pytest.mark.parametrize("error", ["refused", "unwrapped"])
+def test_oq_s_own_loads_let_a_refusal_through(tmp_path, monkeypatch, error):
+    import omlx.utils.model_loading as model_loading
+
+    raised = (
+        formats.FormatRefusedError("refused", mode="toy")
+        if error == "refused"
+        else formats.LoadHookError("mlx_lm.utils.load_model is no function")
+    )
+
+    def load(*args, **kwargs):
+        raise raised
+
+    monkeypatch.setattr(model_loading, "lm_load_compat", load)
+    config = {"model_type": "llama"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    # The calibration's load and both sensitivity measures': not a failure
+    # to measure, which they go on without.
+    for measure in (
+        lambda: oq._calibration_model(str(tmp_path), config),
+        lambda: oq._measure_sensitivity(str(tmp_path), config, 4),
+        lambda: oq._measure_sensitivity_from_quantized_model(str(tmp_path), config, 4),
+    ):
+        with pytest.raises(type(raised)) as caught:
+            measure()
+        assert caught.value is raised
+
+
 @pytest.mark.parametrize("mode", ["affine", "mxfp4"])
 def test_one_of_mlx_s_modes_is_written_without_a_quant_format(tmp_path, mode):
     source = tmp_path / "source"
     source.mkdir()
     (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    with pytest.raises(ValueError, match="is one of MLX's own modes"):
+    with pytest.raises(ValueError, match="is one of MLX's own modes") as refusal:
         oq.quantize_oq_streaming(
             str(source), str(tmp_path / "out"), 4, enhanced=True, quant_format=mode
         )
+    assert _quoted(str(refusal.value), name="no such name") is (mode == "mxfp4")
 
 
 def test_the_families_oq_writes_in_a_format(tmp_path):

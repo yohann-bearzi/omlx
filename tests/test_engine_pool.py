@@ -2085,6 +2085,52 @@ class TestEnginePoolAsync:
         engine.set_dflash_drafter.assert_called_once_with(load.return_value)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("drafter", ["dflash", "vlm_mtp"])
+    @pytest.mark.parametrize("refusal", ["format", "hook"])
+    async def test_a_refused_drafter_takes_its_engine_off_the_entry(
+        self, pool_with_mock_engines, refusal, drafter
+    ):
+        """A drafter of a quant format refused: the model is not served
+        without it, now or at the next request."""
+        from omlx.formats import FormatRefusedError, LoadHookError
+        from omlx.model_settings import ModelSettings
+
+        pool = pool_with_mock_engines
+        pool.get_entry("model-a").config_model_type = "qwen3"
+        pool._scheduler_config.max_num_seqs = 8
+        if drafter == "dflash":
+            settings = ModelSettings(dflash_enabled=True, dflash_draft_model="/draft")
+            loader = "omlx.engine_pool.load_dflash_drafter"
+        else:
+            settings = ModelSettings(
+                vlm_mtp_enabled=True, vlm_mtp_draft_model="/assistant"
+            )
+            loader = "omlx.speculative.vlm_mtp.load_vlm_mtp_drafter"
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        error = (
+            FormatRefusedError("refused", mode="toy")
+            if refusal == "format"
+            else LoadHookError("mlx_lm.utils.load_model is no function")
+        )
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch(loader, side_effect=error) as load,
+        ):
+            for _ in range(2):
+                with pytest.raises(Exception) as raised:
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                assert raised.value is not engine
+        entry = pool.get_entry("model-a")
+        load.assert_called_once()
+        engine.stop.assert_awaited_once()
+        engine.set_dflash_drafter.assert_not_called()
+        engine.set_vlm_mtp_drafter.assert_not_called()
+        assert entry.engine is None and entry.load_failed
+        assert pool.current_model_memory == 0
+
+    @pytest.mark.asyncio
     async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(
         self, pool_with_mock_engines
     ):

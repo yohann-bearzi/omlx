@@ -58,7 +58,7 @@ from mlx_vlm.speculative.utils import (  # noqa: E402, SLF001
     _mtp_rounds_batch,
 )
 
-from ..formats import FormatRefusedError  # noqa: E402
+from ..formats import FormatRefusedError, LoadHookError  # noqa: E402
 from ..patches.format_load import apply_format_load_patch, check_loaded  # noqa: E402
 from ..patches.mlx_vlm_mtp import apply_external_mtp_runtime_patch  # noqa: E402
 from ..utils.metal_sync import _sync_and_clear_cache  # noqa: E402
@@ -218,7 +218,7 @@ def load_vlm_mtp_drafter(path: str) -> Optional[VLMMTPDrafter]:
     try:
         drafter_model, resolved_kind = _vlm_load_drafter(path, kind=None)
         check_loaded(drafter_model)
-    except FormatRefusedError:
+    except (FormatRefusedError, LoadHookError):
         # A refusal is not a misconfigured toggle: it says what to fix.
         raise
     except Exception as e:

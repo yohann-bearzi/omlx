@@ -2869,8 +2869,10 @@ class VLMBatchedEngine(BaseEngine):
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
                     )
-                except FormatRefusedError:
-                    # A draft of a quant format refused: said, not ignored.
+                except (FormatRefusedError, LoadHookError):
+                    # A draft of a quant format refused: said, not ignored,
+                    # and the engine started for it stopped.
+                    await self.stop()
                     raise
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")

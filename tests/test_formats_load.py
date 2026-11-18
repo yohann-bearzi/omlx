@@ -2049,6 +2049,13 @@ def test_a_refusal_of_a_drafter_is_no_misconfigured_toggle(monkeypatch):
     monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", refused)
     with pytest.raises(formats.FormatRefusedError):
         vlm_mtp.load_vlm_mtp_drafter("/models/drafter")
+    # Nor is a loader the patch could not wrap.
+    def unwrapped(path, kind):
+        raise formats.LoadHookError("mlx_lm.utils.load_model is no function")
+
+    monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", unwrapped)
+    with pytest.raises(formats.LoadHookError):
+        vlm_mtp.load_vlm_mtp_drafter("/models/drafter")
     # Any other failure is one, logged.
     monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", lambda path, kind: 1 / 0)
     assert vlm_mtp.load_vlm_mtp_drafter("/models/drafter") is None
@@ -2085,11 +2092,18 @@ def test_a_drafter_or_draft_refused_is_never_skipped():
             if not fails_soft or "raise RuntimeError" in texts[fails_soft[0]]:
                 continue
             seen += 1
-            # A refusal is let through before the handler that goes on.
+            # A refusal, or a loader the patch could not wrap, is let through
+            # before the handler that goes on, once what was started for it
+            # is stopped: the pool's engine, or the engine itself.
             before = node.handlers[: fails_soft[0]]
+            pool = file == "engine_pool.py"
+            stops = "self._release_loaded_engine(" if pool else "self.stop()"
             assert any(
-                getattr(h.type, "id", None) == "FormatRefusedError"
+                isinstance(h.type, ast.Tuple)
+                and {getattr(name, "id", None) for name in h.type.elts}
+                == {"FormatRefusedError", "LoadHookError"}
                 and isinstance(h.body[-1], ast.Raise)
+                and stops in (ast.get_source_segment(source, h) or "")
                 for h in before
             ), (file, node.lineno)
     # The DFlash and VLM MTP drafters, and both engines' SpecPrefill drafts.
@@ -2119,6 +2133,7 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "prefill_helper/adapters/qwen3_5.py",
         "prefill_helper/adapters/glm5_next.py",
         "prefill_helper/adapters/minimax_m3.py",
+        "prefill_helper/adapters/inkling2.py",
     ):
         tree = ast.parse((root / file).read_text())
         checks = [
@@ -2171,6 +2186,8 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "prefill_helper/adapters/qwen3_5.py": 1,
         "prefill_helper/adapters/glm5_next.py": 1,
         "prefill_helper/adapters/minimax_m3.py": 1,
+        # Before anything it says of the layers, or evaluates.
+        "prefill_helper/adapters/inkling2.py": 1,
     }
 
 

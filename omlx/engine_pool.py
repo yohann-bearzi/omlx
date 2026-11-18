@@ -4111,6 +4111,18 @@ class EnginePool:
                 raise asyncio.CancelledError
         task.result()
 
+    async def _release_loaded_engine(
+        self, entry: EngineEntry, engine: BaseEngine, resident_size: int
+    ) -> None:
+        """Take ``engine``, loaded as ``entry``'s, off it and stop it: a part of
+        its load (a drafter) was refused after it was placed."""
+        entry.engine = None
+        self._current_model_memory = max(0, self._current_model_memory - resident_size)
+        try:
+            await engine.stop()
+        except Exception as e:
+            logger.warning(f"Error stopping refused engine for {entry.model_id}: {e}")
+
     async def _load_engine(
         self,
         model_id: str,
@@ -4525,8 +4537,11 @@ class EnginePool:
                     drafter = await loop.run_in_executor(
                         get_mlx_executor(), _load_dflash_sync
                     )
-                except FormatRefusedError:
-                    # A drafter of a quant format refused: said, not ignored.
+                except (FormatRefusedError, LoadHookError):
+                    # A drafter of a quant format refused: said, not ignored,
+                    # and the model is not served without it.
+                    load_completed = False
+                    await self._release_loaded_engine(entry, engine, resident_size)
                     raise
                 except Exception as e:
                     logger.warning(
@@ -4616,8 +4631,11 @@ class EnginePool:
                     drafter = await loop.run_in_executor(
                         get_mlx_executor(), _load_drafter_sync
                     )
-                except FormatRefusedError:
-                    # A drafter of a quant format refused: said, not ignored.
+                except (FormatRefusedError, LoadHookError):
+                    # A drafter of a quant format refused: said, not ignored,
+                    # and the model is not served without it.
+                    load_completed = False
+                    await self._release_loaded_engine(entry, engine, resident_size)
                     raise
                 except Exception as e:
                     logger.warning(

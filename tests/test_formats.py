@@ -69,6 +69,7 @@ def plugins(monkeypatch):
     monkeypatch.setattr(formats, "_loaded", False)
     monkeypatch.setattr(formats, "_loading", False)
     monkeypatch.setattr(formats, "BUILTIN", ())
+    monkeypatch.setattr(formats, "_BUILTIN_MODES", set())
     monkeypatch.setattr(
         formats,
         "entry_points",

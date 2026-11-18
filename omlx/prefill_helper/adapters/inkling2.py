@@ -20,6 +20,7 @@ import mlx.core as mx
 import mlx_lm.utils
 from mlx.utils import tree_flatten
 
+from ...patches.format_load import check_loaded
 from ...patches.inkling2 import model as inkling2
 from ...utils.model_loading import maybe_apply_pre_load_patches
 from ..adapter import Arrays, Capture, HostArrays, StageAdapter
@@ -157,6 +158,9 @@ class Inkling2Adapter(StageAdapter):
             strict=False,
             get_model_classes=lambda config: (First, inkling2.ModelArgs),
         )
+        # Its layers of a format refused before anything else is said of
+        # them, or evaluated.
+        check_loaded(lm)
         missing = [n for n, _ in tree_flatten(lm.parameters()) if n not in loaded]
         if missing:
             raise ValueError(
