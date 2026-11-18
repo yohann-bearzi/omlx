@@ -50,11 +50,11 @@ from mlx_lm.models.switch_layers import (
     _scatter_unsort,
 )
 
-from .. import formats
 from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
-from ..formats.linear import FormatSwitchLinear
+from ..formats.linear import _FormatLayer
 from ..scheduler import _sync_and_clear_cache
+from .moe_offload_compat import IN_QUANT_FORMAT, in_quant_format
 
 logger = logging.getLogger(__name__)
 
@@ -1004,13 +1004,6 @@ def _resolve_store_view(
     fields_of: dict[str, list[str]] = {}
     for proj in _PROJS:
         lin = getattr(glu, proj, None)
-        if isinstance(lin, FormatSwitchLinear):
-            # Its slots would hold the format's tensors, which the slot
-            # matmul does not read (DEFERRED row 14): resident, said so.
-            return None, (
-                f"{proj} is a layer of the {lin.mode!r} quant format, whose "
-                "experts offload does not stream yet: they stay resident"
-            )
         if lin is None or not _is_quantized_switch_linear(lin):
             return None, f"{proj} is not a QuantizedSwitchLinear"
         if "bias" in lin:
@@ -1074,13 +1067,18 @@ def apply_moe_expert_offload(
     model_dir = _resolve_model_dir(model_path)
     if model_dir is None:
         return 0
-    minimum = _minimum_experts(model_dir)
     config_path = Path(model_dir) / "config.json"
-    kind = (
-        json.loads(config_path.read_text()).get("model_type")
-        if config_path.exists()
-        else None
-    )
+    config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    if in_quant_format(config) or any(
+        isinstance(module, _FormatLayer) for module in model.modules()
+    ):
+        # Its slots would hold a format's tensors, which no slot matmul reads
+        # (DEFERRED row 14): the whole model stays resident, as admission
+        # counted it.
+        logger.warning("moe expert offload: %s", IN_QUANT_FORMAT)
+        return 0
+    minimum = _minimum_experts(model_dir, config)
+    kind = config.get("model_type")
     store = CheckpointExpertStore(model_dir)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
@@ -1207,6 +1205,9 @@ def estimate_offload_admission_bytes(
         config_path = Path(model_dir) / "config.json"
         # Read once, for every question asked of it below.
         config = json.loads(config_path.read_text()) if config_path.exists() else {}
+        if in_quant_format(config):
+            # Its load offloads none of its experts (apply_moe_expert_offload).
+            return full_size
         minimum = _minimum_experts(model_dir, config)
         if config_path.exists():
             kind = config.get("model_type", "")
@@ -1228,11 +1229,6 @@ def estimate_offload_admission_bytes(
         stacked: dict[str, dict] = {}
         per_expert: dict[str, dict] = {}
         nvfp4: set[str] = set()
-        # The projections the checkpoint holds in a quant format: offload
-        # keeps them resident (_resolve_store_view), so they count in full.
-        in_format, every = format_projections(config)
-        if every:
-            return full_size
 
         for shard in sorted(Path(model_dir).glob("*.safetensors")):
             with open(shard, "rb") as f:
@@ -1279,9 +1275,6 @@ def estimate_offload_admission_bytes(
         for container, b in stacked.items():
             if not required <= b["fields"] or container in nvfp4:
                 continue  # unquantized, partial or NVFP4: wraps nothing
-            plain = container.removeprefix("language_model.")
-            if any(f"{plain}.{proj}" in in_format for proj in _PROJS):
-                continue  # a quant format's layer: resident
             if len(b["e"]) != 1:  # projections disagree on E
                 continue
             n = next(iter(b["e"]))
@@ -1289,14 +1282,7 @@ def estimate_offload_admission_bytes(
                 continue
             capacity = min(n, max(minimum, round(n * resident_fraction)))
             saved += b["bytes"] * (1.0 - capacity / n)
-        for parent, b in per_expert.items():
-            plain = parent.removeprefix("language_model.")
-            if any(
-                f"{plain}.{stack}.{proj}" in in_format
-                for stack in ("switch_mlp", "switch_glu")
-                for proj in _PROJS
-            ):
-                continue  # stacked at load into a quant format's layer
+        for b in per_expert.values():
             per_e = b["per_e"]
             if not per_e or any(not required <= s for s in per_e.values()):
                 continue  # any incomplete expert: the wrapper rejects the layer
@@ -1309,37 +1295,6 @@ def estimate_offload_admission_bytes(
     except Exception:
         logger.debug("offload admission estimate failed", exc_info=True)
         return full_size
-
-
-def format_projections(config: dict) -> tuple[set[str], bool]:
-    """The projections a checkpoint's config holds in a quant format: the
-    paths its quantization config names in one (without language_model.),
-    and whether every quantized layer is in one (its own mode is). A mode
-    is a format's when it is not MLX's, or the checkpoint records a format
-    of it; a record that is no object takes every mode for one."""
-    recorded = config.get("omlx_quant_formats", {})
-    every = not isinstance(recorded, dict)
-    text = config.get("text_config")
-    quantization = (
-        config.get("quantization")
-        or config.get("quantization_config")
-        or (text.get("quantization") if isinstance(text, dict) else None)
-    )
-    if not isinstance(quantization, dict):
-        return set(), every
-
-    def in_format(mode) -> bool:
-        return isinstance(mode, str) and (
-            every or mode in recorded or not formats._mlx_runs(mode)
-        )
-
-    default = quantization.get("mode", "affine")
-    paths = {
-        path.removeprefix("language_model.")
-        for path, entry in quantization.items()
-        if isinstance(entry, dict) and in_format(entry.get("mode", default))
-    }
-    return paths, every or in_format(default)
 
 
 def materialize_offload_state(model) -> int:

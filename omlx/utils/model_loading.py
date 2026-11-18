@@ -590,10 +590,14 @@ def maybe_apply_pre_load_patches(
         )
 
     if getattr(model_settings, "moe_expert_offload_enabled", False):
-        from ..patches.moe_offload_compat import moe_offload_compatibility
+        from ..patches.moe_offload_compat import (
+            IN_QUANT_FORMAT,
+            moe_offload_compatibility,
+        )
 
         supported, reason = moe_offload_compatibility(model_name)
-        if not supported:
+        # A checkpoint in a quant format loads without offload, which says so.
+        if not supported and reason != IN_QUANT_FORMAT:
             raise ValueError(reason)
 
     # Reset the process-wide MTP flag so non-MTP-compatible models (or

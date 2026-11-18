@@ -115,18 +115,28 @@ def test_incompatible_checkpoint_is_hidden_and_api_rejected(tmp_path, change):
     assert error.value.status_code == 400
 
 
-def test_a_quant_format_s_experts_are_kept_resident_not_refused(tmp_path):
-    _checkpoint(tmp_path)
+def test_a_checkpoint_in_a_quant_format_loads_without_offload(tmp_path):
+    from omlx.patches.moe_offload_compat import IN_QUANT_FORMAT
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    _checkpoint(tmp_path, "olmoe")
     config = json.loads((tmp_path / "config.json").read_text())
-    stack = "language_model.model.layers.0.mlp.switch_mlp"
-    config["quantization"][f"{stack}.gate_proj"] = {
+    settings = SimpleNamespace(moe_expert_offload_enabled=True)
+    # One layer of a format among MLX's: none of its experts offloads.
+    config["quantization"]["model.layers.0.mlp.switch_mlp.gate_proj"] = {
         "bits": 4,
         "group_size": 32,
         "mode": "oqel",
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
-    # Its other layer is MLX's, and offloads.
-    assert moe_offload_compatibility(tmp_path) == (True, "")
+    assert moe_offload_compatibility(tmp_path) == (False, IN_QUANT_FORMAT)
+    # Its load goes on without offload; another refusal stops it.
+    maybe_apply_pre_load_patches(str(tmp_path), settings)
+    config["model_type"] = "mixtral"
+    del config["quantization"]["model.layers.0.mlp.switch_mlp.gate_proj"]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="not supported for this model type"):
+        maybe_apply_pre_load_patches(str(tmp_path), settings)
 
 
 @pytest.mark.parametrize("kind", ["mixtral", "llama"])

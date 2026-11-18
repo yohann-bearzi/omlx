@@ -22,12 +22,31 @@ _SUPPORTED_TYPES = frozenset(
 )
 
 
+# Why a checkpoint in a quant format offloads none of its experts: its
+# load goes on with every expert resident.
+IN_QUANT_FORMAT = (
+    "MoE expert offload serves no checkpoint in a quant format: it loads with "
+    "every expert resident."
+)
+
+
+def in_quant_format(config) -> bool:
+    """Whether a checkpoint's config records or names a quant format (its
+    text model's too), or keeps a damaged record of them: a model with any
+    format's layer offloads none of its experts."""
+    from .format_load import _damaged, _named_modes
+
+    return isinstance(config, dict) and bool(_named_modes(config) or _damaged(config))
+
+
 def moe_offload_compatibility(model_path):
     """Return eligibility and a reason without loading any model tensors."""
     try:
         path = Path(model_path).expanduser().resolve()
         config = path / "config.json"
         raw = json.loads(config.read_text())
+        if in_quant_format(raw):
+            return False, IN_QUANT_FORMAT
         if raw.get("model_type") not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
         files = [config, *path.glob("*.safetensors")]
@@ -53,11 +72,7 @@ def _inspect(path, signature):
             return True, ""
         return False, "The checkpoint has no offloadable routed experts."
 
-    from .moe_expert_offload import (
-        CheckpointExpertStore,
-        _qwen35_checkpoint_prefix,
-        format_projections,
-    )
+    from .moe_expert_offload import CheckpointExpertStore, _qwen35_checkpoint_prefix
 
     text = raw.get("text_config", raw)
     if kind in ("glm_moe_dsa", "deepseek_v4", "glm5_next"):
@@ -89,9 +104,6 @@ def _inspect(path, signature):
     quant = raw.get("quantization", text.get("quantization"))
     if not isinstance(quant, dict):
         return False, "Expert offload requires an MLX quantized checkpoint."
-    # A quant format's experts stay resident: offload keeps them, and says so
-    # when it loads (moe_expert_offload._resolve_store_view).
-    in_format, every = format_projections(raw)
     store = CheckpointExpertStore(path)
     if min(layers - first_moe, moe_freq) <= 0:
         return False, "The model does not have the supported MoE geometry."
@@ -130,10 +142,6 @@ def _inspect(path, signature):
                 f"Checkpoint is missing expert tensor: {prefix}.gate_proj.weight",
             )
         per_expert = not store.has(prefix + ".gate_proj.weight")
-        plain = prefix.removeprefix("language_model.")
-        projections = ("gate_proj", "up_proj", "down_proj")
-        if every or any(f"{plain}.{proj}" in in_format for proj in projections):
-            continue
         for proj in ("gate_proj", "up_proj", "down_proj"):
             key = prefix + "." + proj
             spec = quant.get(key, quant)
