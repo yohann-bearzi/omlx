@@ -378,6 +378,191 @@ struct omlx_tile_face<F, K, true, FACE, true> {
 };
 """
 
+# The shared-rows skeleton: ROWS input vectors (x, x + K, ...) against RPS
+# consecutive rows of a matrix from `row`, each block's weights decoded once
+# for all the inputs (decode, then apply). result[i * RPS + r] is input i's
+# product with row `row + r`; with PARTIAL the pack holds `valid` rows (the
+# last tile of an N that is not whole packs). Every vector's inputs of a
+# block are loaded ahead of the rows. A kernel that asks for a full unroll
+# (Matrices(unrolled=True)) folds the block over its inputs and its rows, and
+# unrolls the skeleton's other loops (OMLX_SHARED_UNROLL), each array then
+# living in registers; any other kernel keeps the block's loops. A kernel
+# calls qmv_shared, which asserts what the compiler would not report, as
+# qmv_rows does, and that the face's vpt is its Lanes<K>::VPT: a launch is
+# sized by it.
+_SHARED_LOOPED = r"""
+template <int K, int ROWS, int RPS, bool PARTIAL, typename L, typename XP>
+METAL_FUNC void omlx_shared_block(
+    thread const L& a, int valid, XP x, thread float* result) {
+  float xs[ROWS][L::VPT];
+  decltype(L::load(x, xs[0])) aux[ROWS];
+  for (int i = 0; i < ROWS; i++) {
+    aux[i] = L::load(x + i * K, xs[i]);
+  }
+  for (int r = 0; r < RPS; r++) {
+    if (PARTIAL && r >= valid) {
+      break;
+    }
+    const auto d = L::decode(a.row(r));
+    for (int i = 0; i < ROWS; i++) {
+      result[i * RPS + r] = L::apply(result[i * RPS + r], d, xs[i], aux[i]);
+    }
+  }
+}
+"""
+
+_SHARED_FOLDED = r"""
+template <int R, int RPS, bool PARTIAL, typename L, typename A, int... I>
+METAL_FUNC void omlx_shared_row(
+    thread const L& a, int valid, thread float (*xs)[L::VPT],
+    thread const A* aux, thread float* result, omlx_ints<I...>) {
+  if (PARTIAL && R >= valid) {
+    return;
+  }
+  const auto d = L::decode(a.row(R));
+  ((result[I * RPS + R] = L::apply(result[I * RPS + R], d, xs[I], aux[I])), ...);
+}
+
+template <int K, int RPS, bool PARTIAL, typename L, typename XP, int... I, int... R>
+METAL_FUNC void omlx_shared_folded(
+    thread const L& a, int valid, XP x, thread float* result, omlx_ints<I...> inputs,
+    omlx_ints<R...>) {
+  float xs[sizeof...(I)][L::VPT];
+  decltype(L::load(x, xs[0])) aux[sizeof...(I)];
+  ((aux[I] = L::load(x + I * K, xs[I])), ...);
+  (omlx_shared_row<R, RPS, PARTIAL>(a, valid, xs, aux, result, inputs), ...);
+}
+
+template <int K, int ROWS, int RPS, bool PARTIAL, typename L, typename XP>
+METAL_FUNC void omlx_shared_block(
+    thread const L& a, int valid, XP x, thread float* result) {
+  omlx_shared_folded<K, RPS, PARTIAL>(
+      a, valid, x, result, omlx_iota<ROWS>(), omlx_iota<RPS>());
+}
+"""
+
+_QMV_SHARED = r"""
+template <int K, int ROWS, int RPS, bool PARTIAL, typename D, typename XP>
+METAL_FUNC void omlx_qmv_shared(
+    D m, size_t row, int valid, XP x, uint simd_lid, thread float* result) {
+  using L = typename D::template Lanes<K>;
+  constexpr int WHOLE = K - K % L::BLOCK;
+  constexpr int LAST = K % L::BLOCK / L::VPT;
+  L a(m, row, simd_lid);
+  x += int(simd_lid) * L::VPT;
+  OMLX_SHARED_UNROLL
+  for (int j = 0; j < ROWS * RPS; j++) {
+    result[j] = 0;
+  }
+  for (int k = 0; k < WHOLE; k += L::BLOCK) {
+    omlx_shared_block<K, ROWS, RPS, PARTIAL>(a, valid, x, result);
+    a.step();
+    x += L::BLOCK;
+  }
+  if constexpr (LAST > 0) {
+    if (simd_lid < uint(LAST)) {
+      omlx_shared_block<K, ROWS, RPS, PARTIAL>(a, valid, x, result);
+    }
+  }
+  OMLX_SHARED_UNROLL
+  for (int r = 0; r < RPS; r++) {
+    if (PARTIAL && r >= valid) {
+      break;
+    }
+    OMLX_SHARED_UNROLL
+    for (int i = 0; i < ROWS; i++) {
+      result[i * RPS + r] = a.finish(r, metal::simd_sum(result[i * RPS + r]));
+    }
+  }
+}
+
+template <
+    typename T,
+    int K,
+    int ROWS,
+    int RPS,
+    int VPT,
+    bool PARTIAL,
+    typename D,
+    typename XP>
+METAL_FUNC void qmv_shared(
+    D m, size_t row, int valid, XP x, uint simd_lid, thread float* result) {
+  omlx_inputs<T>(x);
+  constexpr int FACE = D::CONTRACT;
+  (void)sizeof(omlx_revision<FACE>);
+  if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
+    using L = typename D::template Lanes<K>;
+    static_assert(
+        L::VPT >= 1,
+        "dot face: Lanes<K>::VPT must be one input or more");
+    if constexpr (L::VPT >= 1) {
+      static_assert(
+          L::BLOCK == 32 * L::VPT,
+          "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
+          "lanes");
+      static_assert(
+          K % L::VPT == 0,
+          "dot face: K must be a whole number of a lane's VPT inputs");
+      static_assert(
+          L::VPT == VPT,
+          "dot face: Lanes<K>::VPT must be the face's vpt, which sizes the launch");
+      omlx_qmv_shared<K, ROWS, RPS, PARTIAL>(m, row, valid, x, simd_lid, result);
+    }
+  }
+}
+"""
+
+
+# Output rows a simdgroup of a shared-rows launch computes (qmv's own tile:
+# a threadgroup of two simdgroups owns 8).
+SHARED_RPS = 4
+# Verify projections run in a dependent chain, so latency wins: below this
+# many tiles every input gets its own threadgroups (rows of a tile are
+# adjacent in the grid and hit cache); wider outputs (the vocabulary head)
+# share each weight pass between inputs, up to this many per-lane input
+# values.
+SHARED_ROWS_MIN_TILES = 2048
+ROW_VALUES_BUDGET = 32
+# Fully unrolled tiles hold every (input, row) accumulator and every input's
+# values in registers. On the M5 Ultra (MLX 0.32.2) compiler, tiles past this
+# envelope came out with wrong bits (32 or more accumulators; 7 or 8 inputs
+# of 16 values at 4 bits), so unrolled launches stay inside it.
+UNROLLED_ACCUMULATORS = 16
+UNROLLED_ROW_VALUES = 80
+
+
+def shared_geometry(vpt: int, n: int, rows: int, pad: bool) -> tuple[int, int]:
+    """(inputs per threadgroup, output rows per simdgroup) of a shared-rows
+    launch of ``rows`` inputs over N ``n``, for a face of ``vpt`` inputs a
+    lane. With ``pad``, a count of inputs that no divisor groups is padded to
+    the budget's group (the caller's rule: large 8-bit weight streams)."""
+    if (n + 2 * SHARED_RPS - 1) // (2 * SHARED_RPS) < SHARED_ROWS_MIN_TILES:
+        return 1, SHARED_RPS
+    limit = ROW_VALUES_BUDGET // vpt
+    per_group = next((d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1)
+    if per_group == 1 and pad:
+        per_group = min(rows, limit)
+    return per_group, SHARED_RPS
+
+
+def unrolled_tile_ok(vpt: int, rps: int, rows_per_group: int) -> bool:
+    """Whether an unrolled tile of ``rps`` output rows x ``rows_per_group``
+    inputs per simdgroup, ``vpt`` values a lane, is inside the envelope
+    above."""
+    return (
+        rps * rows_per_group <= UNROLLED_ACCUMULATORS
+        and rows_per_group * vpt <= UNROLLED_ROW_VALUES
+    )
+
+
+def _qmv_shared(unrolled: bool) -> str:
+    if unrolled:
+        block, unroll = _SHARED_FOLDED, '_Pragma("clang loop unroll(full)")'
+    else:
+        block, unroll = _SHARED_LOOPED, ""
+    return block + _QMV_SHARED.replace("OMLX_SHARED_UNROLL", unroll)
+
+
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
 # kernel that stores rows adds this to its header.
 STORE_ROWS = r"""
@@ -841,28 +1026,38 @@ _LOOP_FILL = (
 class Matrices:
     """The matrices a kernel reads, each under the name its body uses."""
 
-    def __init__(self) -> None:
+    def __init__(self, unrolled: bool = False) -> None:
+        """``unrolled``: the shared-rows skeleton's loops are unrolled in full,
+        where a kernel's arrays then live in registers."""
         self._faces: dict[str, Dot | Tile] = {}
         self._names: set[str] = set()
         self._tables = Tables()
         self._staged: dict[str, tuple[str, ...]] = {}
         self._shared: set[Dot] = set()
+        self._unrolled = unrolled
 
     def add(self, name: str, face: Dot | Tile, shared: bool = False) -> list[str]:
         """Add matrix ``name``, read through ``face``, a ``Dot`` or a
         ``Tile``. Returns its kernel inputs: the weight, then the face's
         tensors in order. With ``shared``, the kernel applies one block's
-        weights to several inputs (``decode`` and ``apply``) and includes
-        the dot face's shared source too. Refuses a name that is not an
-        identifier, a face of another type, a shared tile, and a matrix
-        whose name or inputs repeat those of a matrix added before: the
-        kernel's other names are the kernel's to keep apart."""
+        weights to several inputs (``decode`` and ``apply``, in the
+        shared-rows skeleton ``qmv_shared``, which the header then holds)
+        and includes the dot face's shared source too. Refuses a name that
+        is not an identifier, a face of another type, a shared tile or a
+        shared face of no ``vpt``, and a matrix whose name or inputs repeat
+        those of a matrix added before: the kernel's other names are the
+        kernel's to keep apart."""
         if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
             raise ValueError(f"matrix {name!r}: its name is not an identifier")
         if not isinstance(face, (Dot, Tile)):
             raise TypeError(f"matrix {name!r}: {face!r} is not a Dot or a Tile")
         if shared and not isinstance(face, Dot):
             raise TypeError(f"matrix {name!r}: a tile face has no shared source")
+        if shared and face.vpt < 1:
+            raise ValueError(
+                f"matrix {name!r}: face {face.key} states no vpt, which sizes a "
+                "shared-rows launch"
+            )
         inputs = _inputs(name, face)
         repeated = [n for n in (name, *inputs) if n in self._names]
         if repeated:
@@ -924,6 +1119,15 @@ class Matrices:
                 )
                 if any(isinstance(f, Tile) for f in faces)
                 else "" if faces else "\n"
+            )
+            + (
+                _named(
+                    _SKELETONS,
+                    _qmv_shared(self._unrolled),
+                    line=_TILE_LINE + _TILE_FACE.count("\n"),
+                )
+                if self._shared
+                else ""
             )
             + _REVISIONS_END
             + _named("<kernel header>", "")

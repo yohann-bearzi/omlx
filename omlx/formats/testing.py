@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks for a format's tests. ``dot_rows`` runs a face in the skeletons
-oMLX's kernels are built from, outside any model, ``decoded_rows`` runs its
-rows through ``decode`` and ``apply``, and ``tile_rows`` reads
+oMLX's kernels are built from, outside any model, ``shared_rows`` runs
+several vectors through ``decode`` and ``apply``, and ``tile_rows`` reads
 every weight of rows through a tile face. ``staged_tables`` reads a face's
 tables back as a kernel stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
@@ -47,39 +47,20 @@ _STAGED = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
 """
 
-# One row a simdgroup through decode and apply, the walk of qmv_rows: each
-# block's weights decoded, then applied to the lane's inputs.
-_DECODED_ROW = r"""
-template <typename T, int K, typename D>
-METAL_FUNC float omlx_decoded_row(D m, size_t row, const device T* x, uint lane) {
-  using L = typename D::template Lanes<K>;
-  constexpr int WHOLE = K - K % L::BLOCK;
-  constexpr int LAST = K % L::BLOCK / L::VPT;
-  L a(m, row, lane);
-  x += int(lane) * L::VPT;
-  float xt[L::VPT];
-  float acc = 0;
-  for (int k = 0; k < WHOLE; k += L::BLOCK) {
-    const auto aux = L::load(x, xt);
-    acc = L::apply(acc, L::decode(a.row(0)), xt, aux);
-    a.step();
-    x += L::BLOCK;
-  }
-  if constexpr (LAST > 0) {
-    if (lane < uint(LAST)) {
-      const auto aux = L::load(x, xt);
-      acc = L::apply(acc, L::decode(a.row(0)), xt, aux);
-    }
-  }
-  return a.finish(0, metal::simd_sum(acc));
-}
-"""
-
-_DECODED_ROWS = r"""
-    const size_t row = size_t(threadgroup_position_in_grid.y);
-    const float v = omlx_decoded_row<T, K>(m, row, x, thread_index_in_simdgroup);
+# The shared-rows skeleton over ROWS inputs: RPS output rows a simdgroup, the
+# last pack of `valid` rows where N is not whole packs.
+_SHARED_ROWS = r"""
+    const size_t row = size_t(threadgroup_position_in_grid.y) * RPS;
+    const int valid = min(RPS, N - int(row));
+    float result[ROWS * RPS];
+    qmv_shared<T, K, ROWS, RPS, VPT, PARTIAL>(
+        m, row, valid, x, thread_index_in_simdgroup, result);
     if (thread_index_in_simdgroup == 0) {
-      y[row] = static_cast<T>(v);
+      for (int i = 0; i < ROWS; i++) {
+        for (int r = 0; r < valid; r++) {
+          y[i * N + row + r] = static_cast<T>(result[i * RPS + r]);
+        }
+      }
     }
 """
 
@@ -249,32 +230,54 @@ def dot_rows(
 
 
 @cache
-def _decoded_rows_kernel(face: Dot):
-    matrices = kernels.Matrices()
+def _shared_rows_kernel(face: Dot, unrolled: bool):
+    matrices = kernels.Matrices(unrolled=unrolled)
     return mx.fast.metal_kernel(
-        name=f"omlx_format_decoded_rows_{face.key}",
+        name=f"omlx_format_shared_rows_{face.key}",
         input_names=["x", *matrices.add("m", face, shared=True)],
         output_names=["y"],
-        header=matrices.header + _DECODED_ROW,
-        source=matrices.declarations + _DECODED_ROWS,
+        header=matrices.header,
+        source=matrices.declarations + _SHARED_ROWS,
     )
 
 
-def decoded_rows(face: Dot, operands, x: mx.array, n: int) -> mx.array:
-    """The products of ``x`` with the first ``n`` rows of a matrix, each
-    block's weights through the face's ``decode`` and then ``apply``: what
-    ``dot_rows`` gives through ``madd``, bit for bit, for a face that keeps
-    the rule. The arguments are ``dot_rows``'s, and refused as it refuses
-    them."""
-    operands = _checked(face, operands, x)
-    if n <= 0:
-        raise ValueError(f"n={n} is not one row or more")
-    return _decoded_rows_kernel(face)(
+def shared_rows(
+    face: Dot,
+    operands,
+    x: mx.array,
+    n: int,
+    rps: int = 1,
+    unrolled: bool = False,
+) -> mx.array:
+    """The products of each of ``x``'s rows (one to 16 vectors of K
+    activations) with the first ``n`` rows of a matrix, through the
+    shared-rows skeleton (``kernels.qmv_shared``): each block's weights
+    decoded once for all the vectors, then applied to each. ``rps`` output
+    rows a simdgroup (the last pack holds the rest when ``n`` is not whole
+    packs); ``unrolled``: the skeleton's loops are unrolled in full. A face that
+    keeps the rule gives each vector's row ``dot_rows``' bits. ``n`` is one
+    or more and no more than the matrix's rows (not checked); the rest is
+    refused as ``dot_rows`` refuses it."""
+    if x.ndim != 2 or not 1 <= x.shape[0] <= 16:
+        raise ValueError(f"x is 1 to 16 vectors of K activations, not {x.shape}")
+    operands = _checked(face, operands, x[0])
+    if n <= 0 or rps <= 0:
+        raise ValueError(f"n={n}, rps={rps}: one row or more of each")
+    rows, k = x.shape
+    return _shared_rows_kernel(face, unrolled)(
         inputs=[x, *operands],
-        template=[("T", x.dtype), ("K", x.shape[-1])],
-        grid=(32, n, 1),
+        template=[
+            ("T", x.dtype),
+            ("K", k),
+            ("ROWS", rows),
+            ("RPS", rps),
+            ("VPT", face.vpt),
+            ("PARTIAL", n % rps != 0),
+            ("N", n),
+        ],
+        grid=(32, -(-n // rps), 1),
         threadgroup=(32, 1, 1),
-        output_shapes=[(n,)],
+        output_shapes=[(rows, n)],
         output_dtypes=[x.dtype],
     )[0]
 

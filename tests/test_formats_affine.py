@@ -13,7 +13,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx import formats
-from omlx.formats import affine, testing
+from omlx.formats import affine, kernels, testing
 
 metal = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -294,10 +294,47 @@ def test_decode_then_apply_gives_madd_s_rows(k, bits, dtype):
     face = replace(formats.dot(_linear(k, 16, bits, 32), k, 16), dtypes=(dtype,))
     x = mx.random.normal((k,)).astype(dtype)
     operands = _operands(face, layer)
-    decoded = testing.decoded_rows(face, operands, x, 16)
+    decoded = testing.shared_rows(face, operands, x[None], 16)[0]
     assert _bit_equal(decoded, testing.dot_rows(face, operands, x, 16, packs=(1, 0)))
     if dtype == mx.float32:
         assert _bit_equal(decoded, _mlx_rows(layer, x))
+
+
+@metal
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+@pytest.mark.parametrize("k", [512, 288])  # qmv_fast's whole blocks; qmv's last one
+def test_shared_rows_give_each_vector_its_one_row_bits(k, bits, dtype):
+    """Vectors through the shared-rows skeleton, each block's weights decoded
+    once: every vector's row is its one-row call's, bit for bit (in fp32,
+    MLX's), in packs of 1, 2 or 4 rows, N whole packs or not."""
+    layer = _linear(k, 16, bits, 32, dtype)
+    face = replace(formats.dot(_linear(k, 16, bits, 32), k, 16), dtypes=(dtype,))
+    assert face.vpt == affine.values_per_thread(bits, k % 512 == 0)
+    operands = _operands(face, layer)
+    xs = mx.random.normal((5, k)).astype(dtype)
+    one = [testing.dot_rows(face, operands, x, 16, packs=(1, 0)) for x in xs]
+    for rows, rps, n in ((1, 1, 16), (5, 4, 10), (5, 2, 16)):
+        got = testing.shared_rows(face, operands, xs[:rows], n, rps=rps)
+        for i in range(rows):
+            assert _bit_equal(got[i], one[i][:n])
+    if dtype == mx.float32:
+        assert all(_bit_equal(one[i], _mlx_rows(layer, xs[i])) for i in range(5))
+
+
+@metal
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_unrolled_shared_rows_inside_the_envelope_give_the_same_bits(bits):
+    layer = _linear(512, 16, bits, 64)
+    face = formats.dot(layer, 512, 16)
+    operands = _operands(face, layer)
+    xs = mx.random.normal((4, 512)).astype(mx.bfloat16)
+    one = [testing.dot_rows(face, operands, x, 16, packs=(1, 0)) for x in xs]
+    for rows, rps in ((1, 4), (2, 4), (4, 4), (4, 2)):
+        if not kernels.unrolled_tile_ok(face.vpt, rps, rows):
+            continue
+        got = testing.shared_rows(face, operands, xs[:rows], 16, rps=rps, unrolled=True)
+        assert all(_bit_equal(got[i], one[i]) for i in range(rows))
 
 
 @metal

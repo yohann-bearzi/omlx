@@ -30,7 +30,14 @@ from textwrap import indent
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..formats.affine import _GROUP_SIZES, decoded, header, qmv_fast_layout
+from ..formats import kernels
+from ..formats.affine import (
+    _GROUP_SIZES,
+    decoded,
+    header,
+    qmv_fast_layout,
+    values_per_thread,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,14 +45,6 @@ MAX_ROWS = 16
 # The affine widths whose weights the tile decodes (``affine.decoded``):
 # not 2 and 3 bits, which affine.py's faces take.
 _BITS = (4, 5, 6, 8)
-# Output columns per simdgroup (qmv's own tile: a threadgroup owns 8).
-_RPS = 4
-# Verify projections run in a dependent chain, so latency wins: below this
-# many tiles every row gets its own threadgroups (rows of a tile are adjacent
-# in the grid and hit cache); wider outputs (the vocabulary head) share each
-# weight pass between rows, up to this many per-lane input values.
-_SHARED_ROWS_MIN_TILES = 2048
-_ROW_VALUES_BUDGET = 32
 # Padding a partial row tile pays for large 8-bit weight streams. Smaller
 # matrices and 4/5/6-bit unpackers are faster with the existing divisor tile.
 _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
@@ -186,30 +185,14 @@ def _group_source(count: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-# Fully unrolled tiles hold every (row, column) accumulator and every row's
-# input values in registers. On the M5 Ultra (MLX 0.32.2) compiler, tiles
-# past this envelope came out with wrong bits (32 or more accumulators; 7 or
-# 8 rows of 16 values at 4 bits), so unrolled launches stay inside it.
-UNROLLED_ACCUMULATORS = 16
-UNROLLED_ROW_VALUES = 80
-
-
-def unrolled_tile_ok(bits: int, rps: int, rows_per_group: int) -> bool:
-    """Whether the unrolled ``qmv_fast`` tile runs ``rps`` columns x
-    ``rows_per_group`` rows per simdgroup inside the envelope above."""
-    return (
-        rps * rows_per_group <= UNROLLED_ACCUMULATORS
-        and rows_per_group * _values_per_thread(bits, True) <= UNROLLED_ROW_VALUES
-    )
-
-
-# The envelope above was measured on one GPU generation; another compiler or
-# GPU can still get a tile inside it wrong (an M3 Ultra did at 4-bit gs64:
-# whole rows off, not rounding). So the first launch of each unrolled shape
-# is checked on the running GPU against stock one-row ``quantized_matmul`` of
-# the same weights on a fixed input; a shape with any differing bit runs the
-# rolled tile (same arithmetic, same geometry) from then on. Verdicts are per
-# compiled shape: the bug is in code generation, not in the weight values.
+# The envelope of kernels.unrolled_tile_ok was measured on one GPU
+# generation; another compiler or GPU can still get a tile inside it wrong (an
+# M3 Ultra did at 4-bit gs64: whole rows off, not rounding). So the first
+# launch of each unrolled shape is checked on the running GPU against stock
+# one-row ``quantized_matmul`` of the same weights on a fixed input; a shape
+# with any differing bit runs the rolled tile (same arithmetic, same
+# geometry) from then on. Verdicts are per compiled shape: the bug is in code
+# generation, not in the weight values.
 _UNROLLED_VERDICTS: dict = {}
 
 
@@ -290,10 +273,6 @@ def _group_kernel(bits: int, group_size: int, fast: bool, count: int, unrolled: 
     )
 
 
-def _values_per_thread(bits: int, fast: bool) -> int:
-    return (8 if bits == 5 else (4 if bits == 6 else 32 // bits)) * (2 if fast else 1)
-
-
 def _kernel_supported(linear: nn.QuantizedLinear, x: mx.array) -> bool:
     bits, group_size = linear.bits, linear.group_size
     if (
@@ -312,7 +291,7 @@ def _kernel_supported(linear: nn.QuantizedLinear, x: mx.array) -> bool:
     return (
         x.shape[-1] == k
         and k % 8 == 0
-        and group_size % _values_per_thread(bits, fast) == 0
+        and group_size % values_per_thread(bits, fast) == 0
     )
 
 
@@ -320,20 +299,13 @@ def _launch_geometry(
     bits: int, fast: bool, n: int, rows: int, k: int
 ) -> tuple[int, int]:
     """(rows per threadgroup, output columns per simdgroup) for one launch."""
-    if (n + 2 * _RPS - 1) // (2 * _RPS) < _SHARED_ROWS_MIN_TILES:
-        return 1, _RPS
-    limit = _ROW_VALUES_BUDGET // _values_per_thread(bits, fast)
-    rows_per_group = next(
-        (d for d in range(min(rows, limit), 1, -1) if rows % d == 0), 1
-    )
-    if (
-        rows_per_group == 1
-        and bits == 8
-        and fast
-        and n * k >= _PADDED_ROWS_MIN_WEIGHT_BYTES
-    ):
-        rows_per_group = min(rows, limit)
-    return rows_per_group, _RPS
+    pad = bits == 8 and fast and n * k >= _PADDED_ROWS_MIN_WEIGHT_BYTES
+    return kernels.shared_geometry(values_per_thread(bits, fast), n, rows, pad)
+
+
+def _unrolled_ok(bits: int, rps: int, rows_per_group: int) -> bool:
+    """kernels.unrolled_tile_ok for the qmv_fast tile of ``bits``-bit weights."""
+    return kernels.unrolled_tile_ok(values_per_thread(bits, True), rps, rows_per_group)
 
 
 class _Plan:
@@ -506,7 +478,10 @@ def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _GroupPlan | 
             and (
                 geometry is None
                 or rows % geometry[0] == 0
-                and (not geometry[2] or unrolled_tile_ok(first.bits, geometry[1], geometry[0]))
+                and (
+                    not geometry[2]
+                    or _unrolled_ok(first.bits, geometry[1], geometry[0])
+                )
             )
         )
         plan = _GroupPlan(linears, x, rows, geometry) if grouped else None
@@ -547,7 +522,7 @@ def quantized_linears_tiled(
     """``quantized_linears`` in one launch for 1..MAX_ROWS rows on an explicit
     tile: each threadgroup applies ``2 * rps`` output columns to
     ``rows_per_group`` rows, on the unrolled tile if ``unrolled`` (inside
-    ``unrolled_tile_ok``). Every tile gives each row its one-row ``qmv`` bits
+    ``kernels.unrolled_tile_ok``). Every tile gives each row its one-row ``qmv`` bits
     (at one row, stock ``quantized_matmul``'s); None where the group kernel
     does not take these projections."""
     lead = x.shape[:-1]
@@ -643,7 +618,7 @@ class RowsQmv:
     simdgroup and the rows each threadgroup applies its decoded weight tile
     to (a divisor of ``rows``); launch parameters are kept per row count.
     ``unrolled`` runs the fully unrolled tile (same bits) on tiles inside
-    ``unrolled_tile_ok`` that this GPU computes bit-exactly (checked once per
+    ``kernels.unrolled_tile_ok`` that this GPU computes bit-exactly (checked once per
     tile shape), else the rolled tile."""
 
     __slots__ = ("_kernel", "_weights", "_k", "_n", "_dtype", "_geometry", "_launch", "_bits", "_group_size", "_unrolled")
@@ -669,7 +644,7 @@ class RowsQmv:
             if (
                 rows % per_group
                 or self._n % (2 * rps)
-                or (self._unrolled and not unrolled_tile_ok(self._bits, rps, per_group))
+                or (self._unrolled and not _unrolled_ok(self._bits, rps, per_group))
             ):
                 raise ValueError(f"no {rps}x{per_group} tile for {rows} rows of {self._n}")
             template = [
@@ -728,5 +703,4 @@ __all__ = [
     "quantized_linears",
     "quantized_linears_tiled",
     "rows_qmv",
-    "unrolled_tile_ok",
 ]

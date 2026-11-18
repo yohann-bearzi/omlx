@@ -82,12 +82,13 @@ struct Dot {
 """
 
 
-def _toy(key, source=_TOY) -> Dot:
+def _toy(key, source=_TOY, vpt=8) -> Dot:
     return Dot(
         key=f"toy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_toy_{key}::Dot",
         tensors=("scales",),
+        vpt=vpt,
     )
 
 
@@ -746,17 +747,113 @@ def test_staged_inputs_may_fill_a_threadgroup_s_memory():
     assert mx.array_equal(got, want).item()
 
 
+def _vectors(rows, k, seed=0):
+    """``rows`` vectors of small integer activations, and each one's toy
+    products with ``_matrix(16, k, seed)``'s rows."""
+    operands, _, _ = _matrix(16, k, seed)
+    codes, scales = operands
+    mx.random.seed(seed + 1000)
+    xs = mx.random.randint(-8, 9, (rows, k)).astype(mx.float32)
+    want = (xs @ (codes.astype(mx.float32) - 128.0).T) * scales
+    return operands, xs, want
+
+
 @metal
 @pytest.mark.parametrize("k", [512, 384, 248, 8])
-def test_a_face_s_decode_then_apply_is_its_madd(k):
-    operands, x, want = _matrix(16, k, seed=k)
-    face = _toy("decoded")
-    assert mx.array_equal(testing.decoded_rows(face, operands, x, 16), want).item()
+@pytest.mark.parametrize(
+    "rows, rps",
+    [(1, 1), (3, 2), (16, 4), (5, 4), (16, 1)],
+)
+def test_the_shared_rows_skeleton_gives_each_vector_its_rows(k, rows, rps):
+    """Each vector's products with the rows, every block's weights decoded
+    once for all the vectors: the toy's at K of whole blocks, of a last
+    block of 16 or 31 lanes, of one lane; packs of 1, 2, 4 rows; N not
+    whole packs (10 rows of packs of 4: the last pack holds 2)."""
+    operands, xs, want = _vectors(rows, k, seed=k + rows)
+    face = _toy("shared_rows")
+    for n in (16, 12, 10):
+        got = testing.shared_rows(face, operands, xs, n, rps=rps)
+        assert mx.array_equal(got, want[:, :n]).item()
+
+
+@metal
+def test_an_unrolled_shared_rows_skeleton_gives_the_same_rows():
+    operands, xs, want = _vectors(4, 512)
+    face = _toy("unrolled")
+    for rps in (1, 2, 4):
+        got = testing.shared_rows(face, operands, xs, 16, rps=rps, unrolled=True)
+        assert mx.array_equal(got, want).item()
+
+
+def test_a_shared_rows_launch_is_sized_by_the_face_s_vpt():
+    # Fewer than 2048 tiles of 8 rows: one vector a threadgroup.
+    assert kernels.shared_geometry(8, 16376, 6, pad=False) == (1, 4)
+    # From 2048: as many vectors as divide the count, within 32 values a lane.
+    assert kernels.shared_geometry(8, 16384, 6, pad=False) == (3, 4)
+    assert kernels.shared_geometry(16, 16384, 6, pad=False) == (2, 4)
+    assert kernels.shared_geometry(4, 16384, 16, pad=False) == (8, 4)
+    # A count no divisor groups stays one a group, or is padded to the budget.
+    assert kernels.shared_geometry(8, 16384, 7, pad=False) == (1, 4)
+    assert kernels.shared_geometry(8, 16384, 7, pad=True) == (4, 4)
+    assert kernels.shared_geometry(8, 16384, 2, pad=True) == (2, 4)
+    # The unrolled envelope: 16 accumulators, 80 values a lane.
+    assert kernels.unrolled_tile_ok(16, 4, 4) and not kernels.unrolled_tile_ok(16, 4, 5)
+    assert kernels.unrolled_tile_ok(16, 8, 2) and not kernels.unrolled_tile_ok(16, 8, 3)
+    assert kernels.unrolled_tile_ok(20, 1, 4) and not kernels.unrolled_tile_ok(16, 1, 6)
+
+
+def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
+    face = _toy("unroll")
+    rolled, unrolled = kernels.Matrices(), kernels.Matrices(unrolled=True)
+    rolled.add("m", face, shared=True)
+    unrolled.add("m", face, shared=True)
+    pragma = '_Pragma("clang loop unroll(full)")'
+    assert pragma not in rolled.header and pragma in unrolled.header
+    # The skeleton's block walk stays a loop.
+    assert "  for (int k = 0; k < WHOLE; k += L::BLOCK) {" in unrolled.header
+
+
+def test_shared_rows_launch_a_partial_pack_where_n_is_not_whole_packs(monkeypatch):
+    operands, xs, _ = _vectors(2, 512)
+    face = _toy("partial")
+    kernel, asked = testing._shared_rows_kernel(face, False), []
+
+    def recorded(**named):
+        asked.append(dict(named["template"]))
+        return kernel(**named)
+
+    monkeypatch.setattr(testing, "_shared_rows_kernel", lambda *key: recorded)
+    for n, rps in ((16, 4), (10, 4), (10, 2), (7, 1)):
+        testing.shared_rows(face, operands, xs, n, rps=rps)
+    assert [(t["N"], t["RPS"], t["PARTIAL"]) for t in asked] == [
+        (16, 4, False),
+        (10, 4, True),
+        (10, 2, False),
+        (7, 1, False),
+    ]
+
+
+def test_shared_rows_take_1_to_16_vectors_of_a_face_with_a_vpt():
+    operands, xs, _ = _vectors(17, 512)
+    with pytest.raises(ValueError, match="1 to 16 vectors"):
+        testing.shared_rows(_toy("many"), operands, xs, 16)
+    with pytest.raises(ValueError, match="1 to 16 vectors"):
+        testing.shared_rows(_toy("many"), operands, xs[0], 16)
+    with pytest.raises(ValueError, match="states no vpt"):
+        testing.shared_rows(_toy("no_vpt", vpt=0), operands, xs[:2], 16)
+
+
+@metal
+def test_a_vpt_that_is_not_the_struct_s_is_refused_in_words():
+    operands, xs, _ = _vectors(2, 512)
+    with pytest.raises(RuntimeError) as failure:
+        mx.eval(testing.shared_rows(_toy("vpt4", vpt=4), operands, xs, 16))
+    assert "dot face: Lanes<K>::VPT must be the face's vpt" in str(failure.value)
 
 
 @metal
 def test_an_apply_that_is_not_madd_is_told_apart():
-    """The rule a format's tests check: decoded_rows against dot_rows."""
+    """The rule a format's tests check: shared_rows against dot_rows."""
     other = _TOY.replace(
         "      return madd(acc, d, xt, aux);",
         "      return madd(acc, d, xt, aux) + 1.0f;",
@@ -765,7 +862,8 @@ def test_an_apply_that_is_not_madd_is_told_apart():
     face = _toy("other_apply", source=other)
     operands, x, want = _matrix(16, 512)
     assert mx.array_equal(testing.dot_rows(face, operands, x, 16), want).item()
-    assert not mx.array_equal(testing.decoded_rows(face, operands, x, 16), want).item()
+    got = testing.shared_rows(face, operands, x[None], 16)[0]
+    assert not mx.array_equal(got, want).item()
 
 
 @metal
@@ -777,12 +875,14 @@ def test_a_face_without_decode_is_told_which_member_it_lacks():
     # The row skeleton needs none: madd is the row's product there.
     assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want).item()
     with pytest.raises(RuntimeError) as failure:
-        mx.eval(testing.decoded_rows(face, operands, x, 8))
+        mx.eval(testing.shared_rows(face, operands, x[None], 8))
     assert "no member named 'decode'" in str(failure.value)
 
 
 def test_a_face_s_shared_source_is_in_the_kernels_that_share_alone():
     face = replace(_toy("shared"), shared="// the shared source\n")
+    with pytest.raises(ValueError, match="states no vpt"):
+        kernels.Matrices().add("m", replace(face, vpt=0), shared=True)
     plain = kernels.Matrices()
     plain.add("m", face)
     assert "// the shared source" not in plain.header
@@ -799,6 +899,11 @@ def test_a_face_s_shared_source_is_in_the_kernels_that_share_alone():
         kernels.Matrices().add("t", tile, shared=True)
     with pytest.raises(ValueError, match="shared is Metal"):
         replace(face, shared=3)
+    for vpt in (-1, 1.0, True):
+        with pytest.raises(ValueError, match="vpt is a count of inputs"):
+            replace(face, vpt=vpt)
+    # Only a kernel that shares includes the skeleton that does.
+    assert "qmv_shared" not in plain.header and "qmv_shared" in header
 
 
 def test_staged_inputs_fit_in_a_threadgroup_s_memory():

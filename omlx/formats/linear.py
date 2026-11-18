@@ -64,6 +64,65 @@ _SOURCE = r"""
 """
 
 
+# Two to 16 rows of x in one launch, G of them a threadgroup: each block of
+# the matrix decoded once for the G rows (the shared-rows skeleton), each
+# row its one-row bits. RPS output rows a simdgroup, two simdgroups a tile
+# of 8, as the one-row kernel; the skeleton is unrolled (G rows within
+# kernels.ROW_VALUES_BUDGET, inside kernels.unrolled_tile_ok). Where N is not whole tiles (PARTIAL), the last
+# tile's simdgroups hold the rows that are left, or none, as MLX's qmv does
+# for its last tile.
+_SHARED_SOURCE = r"""
+    constexpr int RPS = 4;
+    constexpr bool PARTIAL = N_SIZE % (2 * RPS) != 0;
+    const size_t row0 = size_t(threadgroup_position_in_grid.y) * ROWS;
+    const int out_row = int(threadgroup_position_in_grid.z) * (2 * RPS) +
+        int(simdgroup_index_in_threadgroup) * RPS;
+    if (PARTIAL && out_row >= N_SIZE) {
+      return;
+    }
+    const int valid = PARTIAL ? min(RPS, N_SIZE - out_row) : RPS;
+    float result[ROWS * RPS];
+    qmv_shared<T, K_SIZE, ROWS, RPS, VPT, PARTIAL>(
+        m, size_t(out_row), valid, x + row0 * K_SIZE, thread_index_in_simdgroup, result);
+    if (thread_index_in_simdgroup == 0) {
+      for (int i = 0; i < ROWS; i++) {
+        device T* out = y + (row0 + i) * N_SIZE + out_row;
+        if (PARTIAL) {
+          for (int r = 0; r < valid; r++) {
+            out[r] = static_cast<T>(result[i * RPS + r]);
+          }
+        } else {
+          store_rows(omlx_iota<RPS>(), result + i * RPS, out);
+        }
+      }
+    }
+"""
+
+
+@cache
+def _shared_kernel(face: Dot):
+    matrices = kernels.Matrices(unrolled=True)
+    inputs = ["x", *matrices.add("m", face, shared=True)]
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_linear_rows_{face.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations + _SHARED_SOURCE,
+    )
+
+
+def _group(rows: int, vpt: int) -> int:
+    """The rows of x a threadgroup of the shared launch takes: the most, up
+    to 4, that divide ``rows`` and keep a lane's inputs of the group within
+    kernels.ROW_VALUES_BUDGET (which keeps the unrolled tile in its
+    envelope); 1 where none does (the one-row launch then runs each row).
+    Measured (u7 spike, both Macs): at 16 values a lane, groups of 3 and 4
+    ran 1.15-1.70 of the one-row launch where groups of 2 ran 0.76-0.98."""
+    limit = kernels.ROW_VALUES_BUDGET // vpt
+    return next((g for g in (4, 3, 2) if g <= limit and rows % g == 0), 1)
+
+
 @cache
 def _kernel(face: Dot, stacked: bool):
     matrices = kernels.Matrices()
@@ -87,6 +146,7 @@ def _kernel(face: Dot, stacked: bool):
 class _Plan(NamedTuple):
     face: Dot
     kernel: Any
+    shared: Any  # 2 to 16 rows of a matrix in one launch; None for a stack
     operands: tuple  # the weight, then the face's tensors
     proof: kernels.Proof
     k: int
@@ -98,14 +158,18 @@ def _plan(layer) -> _Plan | None:
     """How ``layer``'s rows run through its format's dot face, or None: the
     format has no face for the matrix, or a launch could not take it."""
     k, n = layer.input_dims, layer.output_dims
-    # MLX binds x as a buffer from 8 elements; a launch is whole tiles.
-    if k < 8 or n % 8:
+    # MLX binds x as a buffer from 8 elements.
+    if k < 8:
         return None
     face = formats.dot(layer, k, n)
     if face is None:
         return None
     operands = tuple(layer[name] for name in ("weight", *face.tensors))
     stacked = layer["weight"].ndim == 3
+    # The one-row and the stack's launches are whole tiles of 8 outputs; a
+    # matrix's N that is not runs in the shared-rows launch alone.
+    if n % 8 and (stacked or face.vpt < 1):
+        return None
     # What a launch is compiled from, beside what the layer keeps in ran.
     proof = kernels.proof(
         "format_switch_linear" if stacked else "format_linear",
@@ -114,7 +178,9 @@ def _plan(layer) -> _Plan | None:
         k,
         n,
     )
-    return _Plan(face, _kernel(face, stacked), operands, proof, k, n, _said(face.key))
+    shared = None if stacked or face.vpt < 1 else _shared_kernel(face)
+    kernel = _kernel(face, stacked)
+    return _Plan(face, kernel, shared, operands, proof, k, n, _said(face.key))
 
 
 @cache
@@ -188,16 +254,52 @@ def _metal(x, pairs: _Pairs | None = None):
     return x.dtype if pairs is None else (x.dtype, pairs.per_row, pairs.pairs < 8)
 
 
-def _linear(kernel, k: int, n: int, x):
+def _linear(plan: _Plan, x):
     """A matrix's launch for ``x``: what its Metal is instantiated with
     beside the proof's key, and its graph, from ``x`` and the operands.
-    The graph holds no array: it outlives the layers it is built for."""
+    Rows of x that a group of 2 to 4 divides run in the shared launch (x's
+    type and the group), every other count in the one-row launch (x's
+    type); a matrix whose N is not whole tiles of 8 runs every count in the
+    shared launch (a group of 1 where none divides). The graph holds no
+    array: it outlives the layers it is built for."""
+    k, n = plan.k, plan.n
     pairs, shape = x.size // k, (*x.shape[:-1], n)
+    group = 1 if plan.shared is None else _group(pairs, plan.face.vpt)
+    if group > 1 or n % 8:
+        shared, vpt = plan.shared, plan.face.vpt
+
+        def graph(x, *operands):
+            return _shared_rows(shared, k, n, vpt, x, operands, pairs, group, shape)
+
+        return (x.dtype, group), graph
+    kernel = plan.kernel
 
     def graph(x, *operands):
         return _rows(kernel, k, n, x, operands, pairs, shape)
 
     return _metal(x), graph
+
+
+def _shared_rows(
+    kernel, k: int, n: int, vpt: int, x, operands, rows, group, shape, tiles=None
+):
+    """``rows`` rows of ``x`` with the matrix, ``group`` of them a
+    threadgroup, as ``shape``; ``tiles`` tiles of 8 outputs from the first,
+    or all of them."""
+    return kernel(
+        inputs=[x, *operands],
+        template=[
+            ("T", x.dtype),
+            ("K_SIZE", k),
+            ("N_SIZE", n),
+            ("ROWS", group),
+            ("VPT", vpt),
+        ],
+        grid=(32, 2 * (rows // group), -(-n // 8) if tiles is None else tiles),
+        threadgroup=(32, 2, 1),
+        output_shapes=[shape],
+        output_dtypes=[x.dtype],
+    )[0]
 
 
 def _linear_stand_in(plan: _Plan, metal):
@@ -206,6 +308,19 @@ def _linear_stand_in(plan: _Plan, metal):
     tensor. What follows the rows in a matrix's tensors is the format's
     own, so no part of a tensor is known to be all that a row reads."""
     operands = ((a.shape, a.dtype) for a in plan.operands)
+    if isinstance(metal, tuple):
+        # The shared launch: one group of rows.
+        dtype, group = metal
+        k, n, vpt = plan.k, plan.n, plan.face.vpt
+
+        def launch(x, *tensors):
+            # Its first tile of outputs.
+            shape = (group, n)
+            return _shared_rows(
+                plan.shared, k, n, vpt, x, tensors, group, group, shape, 1
+            )
+
+        return kernels.zeros(((group, k), dtype), *operands), launch
 
     def launch(x, *tensors):
         # Its first tile of outputs.
@@ -214,11 +329,12 @@ def _linear_stand_in(plan: _Plan, metal):
     return kernels.zeros(((plan.k,), metal), *operands), launch
 
 
-def _switch(kernel, k: int, n: int, x, indices):
+def _switch(plan: _Plan, x, indices):
     """A stack's launch for ``x`` and ``indices``, as ``_linear`` gives a
     matrix's, with the indices ahead of the operands; None when there is no
     pair to launch, or more than a grid takes. A negative index counts from
     the stack's end, as MLX's indexing does."""
+    kernel, k, n = plan.kernel, plan.k, plan.n
     paired = _pairs(k, x, indices)
     # MLX's grid is int32, of 2 rows of threadgroups a pair.
     if paired is None or paired.pairs >= 2**30:
@@ -296,7 +412,7 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     the result."""
     if plan is None or plan.proof.failed or not plan.face.exact_for(arrays[0].dtype):
         return None
-    launch = describe(plan.kernel, plan.k, plan.n, *arrays)
+    launch = describe(plan, *arrays)
     if launch is None:
         return None
     metal, graph = launch

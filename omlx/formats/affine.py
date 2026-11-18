@@ -473,7 +473,7 @@ struct Dot<T>::Lanes<K>::Decoded {
 
 template <typename T>
 template <int K>
-typename Dot<T>::template Lanes<K>::Decoded Dot<T>::Lanes<K>::decode(Row r) {
+METAL_FUNC typename Dot<T>::template Lanes<K>::Decoded Dot<T>::Lanes<K>::decode(Row r) {
   Decoded d;
   decode_w(r.w, d.wq);
   d.s = r.s;
@@ -483,11 +483,18 @@ typename Dot<T>::template Lanes<K>::Decoded Dot<T>::Lanes<K>::decode(Row r) {
 
 template <typename T>
 template <int K>
-float Dot<T>::Lanes<K>::apply(
+METAL_FUNC float Dot<T>::Lanes<K>::apply(
     float acc, thread const Decoded& d, const thread float* x_thread, float sum) {
   return acc + (d.s * wdot(d.wq, x_thread) + sum * d.b);
 }
 """
+
+
+def values_per_thread(bits: int, fast: bool) -> int:
+    """VALUES_PER_THREAD of ``bits``-bit weights on the ``qmv_fast`` (``fast``)
+    or ``qmv`` traversal: MLX's pack factor times the packs a lane reads."""
+    pack_factor = 8 if bits in (3, 5) else (4 if bits == 6 else 32 // bits)
+    return pack_factor * (2 if fast and bits != 2 else 1)
 
 
 @cache
@@ -508,6 +515,7 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
             f"namespace omlx_{key} {{\n{decoded(bits)}{_SHARED}}}"
             f"  // namespace omlx_{key}\n"
         ),
+        vpt=values_per_thread(bits, fast),
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
         dtypes=(dtype,),

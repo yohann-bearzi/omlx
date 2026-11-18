@@ -342,7 +342,7 @@ def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
         (rps, per_group)
         for rps in (1, 2, 4, 8)
         for per_group in range(1, rows + 1)
-        if rows % per_group == 0 and row_exact_qmv.unrolled_tile_ok(bits, rps, per_group)
+        if rows % per_group == 0 and row_exact_qmv._unrolled_ok(bits, rps, per_group)
     ]
     for tile in tiles:
         launch = row_exact_qmv.rows_qmv(

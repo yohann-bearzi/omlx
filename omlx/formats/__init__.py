@@ -261,17 +261,22 @@ class Dot(_Face):
     ``shared`` is Metal that a kernel which applies one block's weights to
     several inputs includes after ``source``, and no other kernel: where the
     face defines ``decode`` and ``apply`` out of its struct. Empty for a
-    face whose struct defines them.
+    face whose struct defines them. ``vpt`` is ``Lanes<K>::VPT``: such a
+    kernel sizes its launch by it, and asserts it.
     """
 
     shared: str = field(default="", kw_only=True)
+    # The inputs a lane reads a block (Lanes<K>::VPT), which sizes a
+    # shared-rows launch; 0 for a face that no such kernel reads.
+    vpt: int = field(default=0, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        owner = f"quant format face {self.key!r}"
         if not isinstance(self.shared, str):
-            raise ValueError(
-                f"quant format face {self.key!r}: shared is Metal, not {self.shared!r}"
-            )
+            raise ValueError(f"{owner}: shared is Metal, not {self.shared!r}")
+        if type(self.vpt) is not int or self.vpt < 0:
+            raise ValueError(f"{owner}: vpt is a count of inputs, not {self.vpt!r}")
 
 
 @dataclass(frozen=True)
