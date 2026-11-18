@@ -70,6 +70,11 @@ _LOADERS = (
     ("mlx_embeddings.utils", "load_model"),
 )
 
+# The parts of a model a load may leave out, whose layers its checkpoint's
+# quantization config names all the same: an MTP head left off (mtp_enabled
+# false), a text-only load's vision and audio towers.
+_OPTIONAL_PARTS = frozenset(("mtp", "vision_tower", "visual", "audio_tower"))
+
 # What a config holds nothing at (a key it has not), apart from a null.
 _ABSENT = object()
 
@@ -182,10 +187,12 @@ class _Checkpoint:
             try:
                 self._config = json.loads((self.path / "config.json").read_text())
             except (OSError, ValueError) as error:
-                self._config = error
+                # Kept with no traceback: it would hold the read's frames.
+                self._config = error.with_traceback(None)
         if isinstance(self._config, Exception):
-            # Raised again, with no traceback piled on it by earlier raises.
-            raise self._config.with_traceback(None)
+            # A copy raised, with no traceback piled on it by earlier raises
+            # (another thread of the load may raise it meanwhile).
+            raise copy.copy(self._config).with_traceback(None)
         return self._config
 
     def _written(self, mode: str):
@@ -203,6 +210,9 @@ class _Checkpoint:
         (or keeps its formats' record damaged): never for no checkpoint's
         directory, nor for a config that is no object (the library's to
         refuse)."""
+        if isinstance(self._config, Exception):
+            # Asked for each layer of a load: no raise for each.
+            return False
         try:
             config = self._read_config()
         except (OSError, ValueError):
@@ -247,9 +257,11 @@ class _Checkpoint:
         """Refuse, whatever ``strict`` the load had, a load that returns
         ``loaded`` without each format layer built under it (another
         checkpoint's, built here); with a layer it filled in part, or with
-        a tensor of another shape or dtype than the layout's; or with an
-        entry of a format's mode in its quantization config that bound no
-        layer. A layer it left wholly unfilled is a layer a partial load
+        a tensor of another shape or dtype than the layout's; with an entry
+        of its quantization config in a format's mode (one that is not MLX's,
+        or that the checkpoint records) that bound no layer of its own, in a
+        part of the model the load built; or with a record of formats that is
+        no object. A layer it left wholly unfilled is a layer a partial load
         does not hold (a pipeline rank's, a prefill helper's)."""
         try:
             config = self._read_config()
@@ -263,9 +275,9 @@ class _Checkpoint:
         if top is not None and not any(layer.mode == top for layer in self.built):
             # Its layers are named by the config's mode, not each by an entry.
             raise _refused(
-                f"its quantization config's mode is {top}, a format the "
-                "checkpoint records, and the load built no layer of it: the "
-                "model has no such layer, or its family's loader renames them",
+                f"its quantization config's mode is {top}, a format's, and the "
+                "load built no layer of it: the model has no such layer, or its "
+                "family's loader renames them",
                 top,
                 self,
             )
@@ -288,8 +300,14 @@ class _Checkpoint:
                 stray[0].mode,
                 self,
             )
+        # Each layer at each path its model holds it under, in its mode, for
+        # one entry each.
+        bound: dict[tuple[str, str], int] = {}
         for layer in self.built:
             path = paths[id(layer)][0]
+            for held in paths[id(layer)]:
+                key = (held, layer.mode)
+                bound[key] = bound.get(key, 0) + 1
             placeholders = layer._placeholders[0]
             left = [name for name, held in placeholders.items() if layer[name] is held]
             if left and len(left) < len(placeholders):
@@ -318,20 +336,15 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-        # Each layer at each path its model holds it under, in its mode.
-        bound = {
-            (path, layer.mode) for layer in self.built for path in paths[id(layer)]
-        }
+        present = {path for held in paths.values() for path in held}
         for path, mode in entries:
-            # mlx-vlm builds a language model's checkpoint inside a model of
-            # its own, under language_model., and mlx-lm a VLM's text model
-            # without it.
-            names = (
-                path,
-                f"language_model.{path}",
-                path.removeprefix("language_model."),
-            )
-            if not any((name, mode) in bound for name in names):
+            names = _entry_names(path)
+            if _left_out(path, present):
+                # Of a part this load does not build (an MTP head left off,
+                # a text-only load's vision tower): no layer of it to serve.
+                continue
+            name = next((name for name in names if bound.get((name, mode))), None)
+            if name is None:
                 raise _refused(
                     f"its quantization config names {path}, and the load built "
                     "no layer of the format there: the model has no such "
@@ -339,48 +352,54 @@ class _Checkpoint:
                     mode,
                     self,
                 )
+            bound[(name, mode)] -= 1
         # Checked: the layers are the model's to keep, not this checkpoint's.
         self.built.clear()
 
-    def _recorded_top_mode(self) -> str | None:
-        """The mode of the quantization config itself, when the checkpoint
-        records a format of it."""
+    def _quantizations(self) -> list[dict]:
+        """The quantization configs a library builds the checkpoint's layers
+        from: its config's own, under either key (oQ writes both), or else
+        its text model's."""
         try:
             config = self._read_config()
         except (OSError, ValueError):
-            return None
-        quantization = config.get("quantization") if isinstance(config, dict) else None
-        mode = quantization.get("mode") if isinstance(quantization, dict) else None
-        return mode if isinstance(mode, str) and self.records(mode) else None
-
-    def _format_entries(self) -> list[tuple[str, str]]:
-        """The layers the checkpoint's quantization config names in a mode
-        that is not MLX's, with that mode."""
-        try:
-            config = self._read_config()
-        except OSError:
-            # A loader handed what is no checkpoint's directory: it names
-            # no entry.
             return []
         if not isinstance(config, dict):
-            # The library refuses it, when it reads it.
             return []
-        quantization = config.get("quantization") or config.get("quantization_config")
-        if not isinstance(quantization, dict):
-            return []
-        # An entry without a mode takes the config's (MLX's default, affine).
-        default = quantization.get("mode", "affine")
-        entries = [
-            (path, entry.get("mode", default))
+        text = config.get("text_config")
+        for holder in (config, text if isinstance(text, dict) else {}):
+            found = _quantizations(holder, text=False)
+            if found:
+                return found
+        return []
+
+    def _in_format(self, mode) -> bool:
+        """Whether a layer of ``mode`` is a format's: a mode that is not
+        MLX's, or that the checkpoint records a format of."""
+        return isinstance(mode, str) and (
+            not formats._mlx_runs(mode) or self.records(mode)
+        )
+
+    def _recorded_top_mode(self) -> str | None:
+        """The mode of a quantization config itself (MLX's affine when it
+        names none), when it is a format's."""
+        for quantization in self._quantizations():
+            mode = quantization.get("mode", "affine")
+            if self._in_format(mode):
+                return mode
+        return None
+
+    def _format_entries(self) -> list[tuple[str, str]]:
+        """The layers the checkpoint's quantization configs name in a mode
+        that is a format's, with that mode. An entry without a mode is
+        MLX's affine, whatever its config's mode (MLX builds it so)."""
+        entries = {
+            (path, entry.get("mode", "affine"))
+            for quantization in self._quantizations()
             for path, entry in quantization.items()
             if isinstance(entry, dict)
-        ]
-        return [
-            (path, mode)
-            for path, mode in entries
-            if isinstance(mode, str)
-            and (not formats._mlx_runs(mode) or self.records(mode))
-        ]
+        }
+        return sorted((path, mode) for path, mode in entries if self._in_format(mode))
 
 
 def check_loaded(model) -> None:
@@ -406,9 +425,10 @@ def check_loaded(model) -> None:
                 "checkpoint holds no such tensor, or holds it under another name"
             )
             raise _refused(reason, module.mode, checkpoint)
-        if checkpoint is not _current():
-            # Filled, and its load has ended (a load still running, a
-            # library's loader around oMLX's, checks it when it returns).
+        if not checkpoint.active and not checkpoint.built:
+            # Filled, and its load has ended and been checked (a load still
+            # running, a library's loader around oMLX's, checks it when it
+            # returns).
             module.__dict__.pop("_placeholders", None)
 
 
@@ -430,6 +450,7 @@ def _shown(path: Path) -> Path:
     to a checkpoint's files (a family's loader's, a decision model's) by the
     checkpoint its config is, link by link while each link is to a config
     file (a Hugging Face snapshot's is to a blob of content, not one)."""
+    path = Path(os.path.abspath(path))
     config, seen = path / "config.json", set()
     while config.is_symlink():
         stat = os.lstat(config)
@@ -437,7 +458,9 @@ def _shown(path: Path) -> Path:
             # A cycle of links.
             break
         seen.add((stat.st_dev, stat.st_ino))
-        target = Path(os.path.normpath(config.parent / os.readlink(config)))
+        # Relative to the directory the link is in, not to a link to it.
+        parent = os.path.realpath(config.parent)
+        target = Path(os.path.normpath(os.path.join(parent, os.readlink(config))))
         if target.name != "config.json":
             break
         path, config = target.parent, target
@@ -445,29 +468,26 @@ def _shown(path: Path) -> Path:
 
 
 def _named_modes(config: dict) -> list[str]:
-    """The modes a checkpoint's config records a format of, or names in its
-    quantization config (its text model's too) that are not MLX's."""
-    modes = []
+    """The modes a checkpoint's config records a format of, or else names in
+    its quantization configs (its text model's too) that are not MLX's."""
     written = config.get("omlx_quant_formats")
-    if isinstance(written, dict):
-        modes += sorted(written)
-    text = config.get("text_config")
-    for holder in (config, text if isinstance(text, dict) else {}):
-        for key in ("quantization", "quantization_config"):
-            quantization = holder.get(key)
-            if not isinstance(quantization, dict):
-                continue
-            named = [quantization.get("mode")] + [
+    if isinstance(written, dict) and written:
+        return sorted(written)
+    named = [
+        mode
+        for quantization in _quantizations(config)
+        for mode in (
+            quantization.get("mode"),
+            *(
                 entry.get("mode")
                 for entry in quantization.values()
                 if isinstance(entry, dict)
-            ]
-            modes += [
-                mode
-                for mode in named
-                if isinstance(mode, str) and not formats._mlx_runs(mode)
-            ]
-    return modes
+            ),
+        )
+    ]
+    return [
+        mode for mode in named if isinstance(mode, str) and not formats._mlx_runs(mode)
+    ]
 
 
 def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
@@ -507,6 +527,42 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
             checkpoint,
         )
     checkpoint.verified = True
+
+
+def _quantizations(config: dict, *, text: bool = True) -> list[dict]:
+    """The quantization configs of ``config``, under either key, and (with
+    ``text``) its text model's."""
+    inner = config.get("text_config") if text else None
+    return [
+        quantization
+        for holder in (config, inner if isinstance(inner, dict) else {})
+        for key in ("quantization", "quantization_config")
+        if isinstance(quantization := holder.get(key), dict)
+    ]
+
+
+def _entry_names(path: str) -> tuple[str, ...]:
+    """The paths a layer an entry names is built at: mlx-vlm builds a
+    language model's checkpoint under language_model., mlx-lm a VLM's text
+    model without it, and a Hugging Face config names model.language_model.
+    what mlx-vlm builds at language_model.model."""
+    plain = path.removeprefix("language_model.")
+    names = [path, f"language_model.{path}", plain]
+    if path.startswith("model.language_model."):
+        inner = path.removeprefix("model.language_model.")
+        names += [f"language_model.model.{inner}", f"model.{inner}"]
+    return tuple(dict.fromkeys(names))
+
+
+def _left_out(path: str, present: set[str]) -> bool:
+    """Whether a layer an entry names at ``path`` is in a part of a model
+    that a load may leave out (``_OPTIONAL_PARTS``), its own or its language
+    model's, and that the model whose modules are at ``present`` does not
+    hold."""
+    root = path.removeprefix("language_model.").split(".", 1)[0]
+    return root in _OPTIONAL_PARTS and not (
+        root in present or f"language_model.{root}" in present
+    )
 
 
 def _damaged(config: dict) -> bool:

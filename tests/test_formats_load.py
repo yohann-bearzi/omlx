@@ -470,7 +470,11 @@ def test_the_modes_a_config_names():
         "quantization": {"mode": "affine", "a": {"mode": "toy"}, "b": {}},
         "text_config": {"quantization_config": {"mode": "other"}},
     }
-    assert format_load._named_modes(config) == ["oqel", "toy", "other"]
+    # Those it records, or else those it names that are not MLX's.
+    assert format_load._named_modes(config) == ["oqel"]
+    for empty in ({}, None):
+        config["omlx_quant_formats"] = empty
+        assert format_load._named_modes(config) == ["toy", "other"]
 
 
 def test_a_config_alone_names_the_family(toy, tmp_path):
@@ -725,6 +729,28 @@ def test_a_refusal_names_the_checkpoint_through_any_links(toy, tmp_path):
         assert format_load._shown(path) in (alone, first, second)
 
 
+def test_a_view_is_named_by_its_checkpoint_from_any_path(toy, tmp_path, monkeypatch):
+    real = tmp_path / "models" / "real"
+    (tmp_path / "models" / "views" / "v1").mkdir(parents=True)
+    real.mkdir()
+    (real / "config.json").write_text(json.dumps(_typed({})))
+    view = tmp_path / "models" / "views" / "v1"
+    (view / "config.json").symlink_to(Path("../../real/config.json"))
+    # A link to the view's directory: its link is relative to where it is.
+    shortcut = tmp_path / "shortcut"
+    shortcut.symlink_to(view, target_is_directory=True)
+    for path in (view, shortcut):
+        assert format_load._shown(path).resolve() == real.resolve()
+    # A relative path, with "..", names the same checkpoint as its whole one.
+    monkeypatch.chdir(tmp_path / "models")
+    assert format_load._shown(Path("views/../real")) == real
+    with (
+        format_load.loading(real, by_loader=True) as outer,
+        format_load.loading("views/../real") as inner,
+    ):
+        assert inner is outer
+
+
 def test_a_config_that_is_no_object_records_no_format(toy, tmp_path):
     (tmp_path / "config.json").write_text("[]")
     with format_load.loading(tmp_path):
@@ -739,15 +765,96 @@ def test_a_recorded_mode_that_bound_nothing_is_refused(toy, tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config))
     with pytest.raises(formats.FormatRefusedError, match="config's mode is toy"):
         format_load._Checkpoint(tmp_path).check(nn.Module())
-    # An entry without a mode is of the config's.
-    quantization.update({"b": {"group_size": 1, "bits": 8}, "a": _TOY})
+    # An entry without a mode is MLX's affine, whatever the config's mode
+    # (MLX builds it so): no format's layer to bind.
+    quantization.update({"b": {"group_size": 64, "bits": 4}, "a": _TOY})
     (tmp_path / "config.json").write_text(json.dumps(config))
     with format_load.loading(tmp_path) as checkpoint:
         layer = nn.Linear(64, 128).to_quantized(**_TOY)
     model = nn.Module()
     model.a = layer
+    checkpoint.check(model)
+    # The config's own mode a format's under either key, or its text model's
+    # alone; one it does not name, MLX's affine, when the checkpoint records
+    # a format of affine; one that is not MLX's, recorded or not.
+    for config in (
+        {**_typed({"toy": {}}), "quantization_config": {"bits": 8, "mode": "toy"}},
+        {**_typed({}), "text_config": {"quantization": {"mode": "toy"}}},
+        {**_typed({"affine": {}}), "quantization": {"bits": 4}},
+        {**_typed({}), "quantization": {"bits": 8, "mode": "toy"}},
+    ):
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        with pytest.raises(formats.FormatRefusedError, match="config's mode is"):
+            format_load._Checkpoint(tmp_path).check(nn.Module())
+
+
+def _checked(tmp_path, quantization, held, **config):
+    """Check a load of a checkpoint whose quantization config is
+    ``quantization`` (and whose config holds ``config`` too), whose model
+    holds one toy layer at each path of ``held``, and modules at the others
+    ``held`` maps to False; no quantization config of its own for None."""
+    whole = {**_typed({"toy": {}}), **config}
+    if quantization is not None:
+        whole["quantization"] = quantization
+    (tmp_path / "config.json").write_text(json.dumps(whole))
+    with format_load.loading(tmp_path) as checkpoint:
+        layers = {
+            path: nn.Linear(64, 128).to_quantized(**_TOY) if kept else nn.Module()
+            for path, kept in held.items()
+        }
+    model = nn.Module()
+    for path, layer in sorted(layers.items(), key=lambda item: item[0].count(".")):
+        *parents, name = path.split(".")
+        module = model
+        for parent in parents:
+            if parent not in module:
+                module[parent] = nn.Module()
+            module = module[parent]
+        module[name] = layer
+    checkpoint.check(model)
+
+
+def test_an_entry_binds_one_layer_and_a_layer_one_entry(toy, tmp_path):
+    # One layer under language_model.: one of the two entries it would
+    # stand for binds it, the other none.
+    entries = {"a": _TOY, "language_model.a": _TOY}
+    with pytest.raises(formats.FormatRefusedError, match="the load built no layer"):
+        _checked(tmp_path, entries, {"language_model.a": True})
+    _checked(tmp_path, entries, {"language_model.a": True, "a": True})
+    # A Hugging Face config's name of a layer mlx-vlm builds at
+    # language_model.model., and mlx-lm at model.
+    for held in ("language_model.model.a", "model.a"):
+        _checked(tmp_path, {"model.language_model.a": _TOY}, {held: True})
+
+
+@pytest.mark.parametrize("part", ["mtp", "vision_tower", "visual", "audio_tower"])
+def test_an_entry_of_a_part_the_load_left_out_binds_nothing(toy, tmp_path, part):
+    for entry in (f"{part}.layers.0.a", f"language_model.{part}.layers.0.a"):
+        # The model has no such part (an MTP head left off, a text-only
+        # load): the entry has no layer to bind.
+        _checked(tmp_path, {entry: _TOY}, {"model.a": False})
+        # It has the part: the entry binds a layer of it, or is refused.
+        for holder in (part, f"language_model.{part}"):
+            with pytest.raises(formats.FormatRefusedError, match=f"names {entry},"):
+                _checked(tmp_path, {entry: _TOY}, {holder: False})
+    # Any other part is the model's.
+    with pytest.raises(formats.FormatRefusedError, match="names draft.a,"):
+        _checked(tmp_path, {"draft.a": _TOY}, {"model.a": False})
+
+
+def test_entries_are_those_the_library_builds_from(toy, tmp_path):
+    # Under either key.
     with pytest.raises(formats.FormatRefusedError, match="names b,"):
-        checkpoint.check(model)
+        _checked(tmp_path, {"a": _TOY}, {"a": True}, quantization_config={"b": _TOY})
+    # Its text model's, when the config has none of its own.
+    for key in ("quantization", "quantization_config"):
+        with pytest.raises(formats.FormatRefusedError, match="names b,"):
+            text = {key: {"a": _TOY, "b": _TOY}}
+            _checked(tmp_path, None, {"a": True}, text_config=text)
+    # The text model's when the config has its own: not the library's.
+    _checked(
+        tmp_path, {"a": _TOY}, {"a": True}, text_config={"quantization": {"b": _TOY}}
+    )
 
 
 def test_a_failure_to_read_the_config_is_raised_bare_each_time(tmp_path):
@@ -760,6 +867,11 @@ def test_a_failure_to_read_the_config_is_raised_bare_each_time(tmp_path):
             checkpoint._read_config()
         depths.append(len(traceback.extract_tb(error.value.__traceback__)))
     assert depths[0] == depths[1] == depths[2]
+    # Each raise is a copy: the kept error never gathers a traceback.
+    with pytest.raises(OSError) as again:
+        checkpoint._read_config()
+    assert again.value is not error.value
+    assert checkpoint._config.__traceback__ is None
 
 
 def test_a_checkpoint_s_config_is_read_once_whatever_it_holds(tmp_path, monkeypatch):
@@ -1601,10 +1713,19 @@ def test_an_entry_binds_a_layer_of_its_own_mode_only(toy, tmp_path):
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path, strict=False)
     assert refusal.value.mode == "uninstalled"
-    # In its own mode, it is (a VLM's checkpoint loaded by mlx-lm).
+    # In its own mode, it binds the layer (a VLM's checkpoint loaded by
+    # mlx-lm), which then binds no other entry.
     config["quantization"][f"language_model.{_GATE}"] = _TOY
     (tmp_path / "config.json").write_text(json.dumps(config))
-    load_model(tmp_path, strict=False)
+    with pytest.raises(formats.FormatRefusedError, match="the load built no layer"):
+        load_model(tmp_path, strict=False)
+    # The checkpoint's own entry, under language_model., binds the layer
+    # mlx-lm builds from the names it is handed (oMLX's text-only load hands
+    # it the text model's).
+    del config["quantization"][_GATE]
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    named = {"quantization": {**config["quantization"], _GATE: _TOY}}
+    load_model(tmp_path, strict=False, model_config=named)
 
 
 def test_an_entry_binds_a_layer_at_any_path_its_model_holds_it(toy, tmp_path):
@@ -1675,6 +1796,17 @@ def test_a_load_joined_to_an_outer_one_leaves_it_the_check(toy, tmp_path):
         own = nn.Linear(64, 128).to_quantized(**_TOY)
         model, _ = load_model(tmp_path, strict=True)
     assert own in outer.built and _gate_proj(model) in outer.built
+    # oMLX's exit check inside it, or after it ended, before its own check:
+    # the layers keep their placeholders for it.
+    with format_load.loading(tmp_path, by_loader=True) as outer:
+        model, _ = load_model(tmp_path, strict=True)
+        format_load.check_loaded(model)
+    format_load.check_loaded(model)
+    outer.check(model)
+    assert "_placeholders" in _gate_proj(model).__dict__
+    # Checked: the next exit check lets them go.
+    format_load.check_loaded(model)
+    assert "_placeholders" not in _gate_proj(model).__dict__
 
 
 def test_a_load_joins_only_a_running_loader_s_load_on_its_thread(toy, tmp_path):
