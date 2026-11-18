@@ -36,6 +36,8 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx.utils import tree_flatten, tree_unflatten
 
+from .format_load import refuse_format_checkpoint
+
 logger = logging.getLogger(__name__)
 
 _FP8_TARGETS = (
@@ -382,6 +384,7 @@ def load(model_name: str | Path):
 
     model_path = Path(model_name)
     config = json.loads((model_path / "config.json").read_text())
+    refuse_format_checkpoint(model_path, "ModelOpt", config=config)
     rules = _rules_from_config(config)
     _patch_qwen35_model_class()
 

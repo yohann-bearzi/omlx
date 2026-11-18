@@ -34,9 +34,9 @@ def in_quant_format(config) -> bool:
     """Whether a checkpoint's config records or names a quant format (its
     text model's too), or keeps a damaged record of them: a model with any
     format's layer offloads none of its experts."""
-    from .format_load import _damaged, _named_modes
+    from .format_load import _format_mode
 
-    return isinstance(config, dict) and bool(_named_modes(config) or _damaged(config))
+    return isinstance(config, dict) and _format_mode(config) is not None
 
 
 def moe_offload_compatibility(model_path):

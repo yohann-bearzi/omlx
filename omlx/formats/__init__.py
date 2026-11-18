@@ -415,13 +415,12 @@ def _may_build(mode) -> None:
         "a format's layer is built only while oMLX loads a checkpoint of a "
         "family verified with quant formats, and this one is built outside "
         "such a load (by a family's own loader, or by hand): load the "
-        "checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model",
+        "checkpoint with mlx-lm's or mlx-vlm's load_model",
         mode=mode,
     )
 # The checkpoint whose layers the calling thread is loading, if any: set by
 # omlx.patches.format_load around the libraries' loads, read by the layers.
-# Not None exactly while a load is active on the calling thread: a thread
-# starts with none, whatever another thread loads.
+# A copied context can keep an ended checkpoint. Only an active one owns layers.
 _LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
 # Whether a block of omlx.formats.testing.verified is open, in any thread: a
 # test builds a format's layers by hand in it.

@@ -2128,6 +2128,8 @@ class TestEnginePoolAsync:
         engine.set_dflash_drafter.assert_not_called()
         engine.set_vlm_mtp_drafter.assert_not_called()
         assert entry.engine is None and entry.load_failed
+        assert entry.runtime_estimated_size is None
+        assert entry.runtime_settle_size is None
         assert pool.current_model_memory == 0
 
     @pytest.mark.asyncio

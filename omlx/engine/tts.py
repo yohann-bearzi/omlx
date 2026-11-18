@@ -19,6 +19,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.format_load import refuse_format_checkpoint
 from ..patches.mlx_audio_compat import ensure_ming_post_load_skips_campplus_conversion
 from ..patches.mlx_audio_ming3 import (
     apply_ming3_patches,
@@ -211,6 +212,7 @@ class TTSEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
+        refuse_format_checkpoint(self._model_name, "audio_tts")
         logger.info(f"Starting TTS engine: {self._model_name}")
 
         try:

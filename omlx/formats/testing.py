@@ -78,10 +78,11 @@ _VERIFYING_LOCK = threading.Lock()
 def verified(*families: str) -> _Verified:
     """While a block of it is open, in any thread, oQ writes and oMLX loads
     checkpoints of ``families`` in a quant format as it does those verified
-    with them: model types in any spelling (a decision model's family, a
-    text model's type). A test's checkpoint of a family oMLX patches (a tiny
-    one, to test a format with) is written so. A decorator of a test (async
-    too) holds for the test; in a fixture, ``with verified(...): yield``.
+    with them. Name the top-level and nested text model types. A test can
+    also construct format layers by hand within this block. Loader admission
+    still applies to embedding, reranking and other dedicated readers.
+    The decorator covers the whole test, including async tests. In a
+    fixture, use ``with verified(...): yield``.
     Blocks of several threads open and close in any order."""
     return _Verified(*families)
 

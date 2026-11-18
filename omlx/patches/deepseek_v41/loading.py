@@ -15,6 +15,7 @@ from transformers import PreTrainedTokenizerFast
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
+from ..format_load import refuse_format_checkpoint
 from ..mlx_lm_mtp import get_mtp_depth
 from .a8 import MIN_TOKENS_FLOOR, tag_dense_a8
 from .config import ModelConfig
@@ -108,6 +109,7 @@ def load(
     if (path / "conversion.inprogress.json").exists():
         raise ValueError("DeepSeek V4.1 checkpoint conversion is still in progress")
     raw = json.loads((path / "config.json").read_text())
+    refuse_format_checkpoint(path, "DeepSeek V4.1", config=raw)
     mapping = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]

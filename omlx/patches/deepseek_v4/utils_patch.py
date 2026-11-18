@@ -142,9 +142,8 @@ def _build_patched_load_model() -> Callable:
         get_model_classes: Callable = default_get_classes,
         trust_remote_code: bool = False,
     ) -> tuple[nn.Module, dict]:
-        config = _utils.load_config(model_path)
-        if model_config is not None:
-            config.update(model_config)
+        disk_config = _utils.load_config(model_path)
+        config = disk_config if model_config is None else disk_config | model_config
 
         if (
             (model_file := config.get("model_file")) is not None
@@ -166,15 +165,19 @@ def _build_patched_load_model() -> Callable:
                 trust_remote_code=trust_remote_code,
             )
 
-        from omlx.patches.format_load import loading
+        from omlx.patches.format_load import _current, loading, refuse_format_checkpoint
 
-        # Its own load of a DeepSeek V4 checkpoint, inside a checkpoint's
-        # load: the family gate refuses one of a quant format before a
-        # weight is read.
+        outer = _current()
         with loading(model_path, by_loader=True) as checkpoint:
+            # Neither an on-disk format nor one introduced by an override
+            # can be read by the native DeepSeek safetensors loader.
+            if model_config is not None:
+                refuse_format_checkpoint(model_path, "DeepSeek V4", config=disk_config)
+            refuse_format_checkpoint(model_path, "DeepSeek V4", config=config)
             loaded = _load_deepseek_v4(
                 model_path, config, lazy, strict, model_file, get_model_classes
             )
+        if checkpoint is not outer:
             checkpoint.check(loaded)
         return loaded
 

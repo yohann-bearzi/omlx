@@ -27,7 +27,11 @@ from ..model_discovery import (
     SUPPORTED_RERANKER_ARCHITECTURES,
     _is_causal_lm_reranker,
 )
-from ..patches.format_load import apply_format_load_patch, check_loaded
+from ..patches.format_load import (
+    apply_format_load_patch,
+    check_loaded,
+    refuse_format_checkpoint,
+)
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..patches.qwen3_sliding_window import apply_qwen3_sliding_window_patch
 from ..utils.image import load_image
@@ -803,7 +807,8 @@ class MLXRerankerModel:
         if self._loaded:
             return
 
-        # A checkpoint's layers of a quant format load as the format's layers.
+        refuse_format_checkpoint(self.model_name, "reranker")
+        # Wrap library entry points too, including paths resolved from Hub IDs.
         apply_format_load_patch()
 
         # Check architecture before loading

@@ -538,9 +538,12 @@ def test_a_decision_model_s_loader_refuses_it_in_a_format(toy, tmp_path, family)
         (path / "config.json").write_text(json.dumps(named))
         with pytest.raises(formats.FormatRefusedError, match=f"loads no {family}"):
             format_load.refuse_family(path, family)
-    # Of a verified decision family, or of no format: the loader goes on.
-    with testing.verified(family):
-        format_load.refuse_family(path, family)
+    # Verifying both families cannot grant the decision reader a format load.
+    with (
+        testing.verified(family, "qwen3_5"),
+        pytest.raises(formats.FormatRefusedError, match=f"loads no {family}"),
+    ):
+        model.load()
     (path / "config.json").write_text(json.dumps({"model_type": "qwen3_5"}))
     format_load.refuse_family(path, family)
     format_load.refuse_family(tmp_path / "none", family)
@@ -594,7 +597,7 @@ def test_a_format_s_layer_is_built_only_in_a_load_that_passed_the_gate(
         "quant format 'toy': a format's layer is built only while oMLX loads a "
         "checkpoint of a family verified with quant formats, and this one is "
         "built outside such a load (by a family's own loader, or by hand): load "
-        "the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model"
+        "the checkpoint with mlx-lm's or mlx-vlm's load_model"
     )
     with pytest.raises(formats.FormatRefusedError) as no:
         _hand_built(kind)
@@ -779,9 +782,9 @@ def test_a_recorded_mode_that_bound_nothing_is_refused(toy, tmp_path):
     # a format of affine; one that is not MLX's, recorded or not.
     for config in (
         {**_typed({"toy": {}}), "quantization_config": {"bits": 8, "mode": "toy"}},
-        {**_typed({}), "text_config": {"quantization": {"mode": "toy"}}},
+        {"model_type": "llama", "text_config": {"quantization": {"mode": "toy"}}},
         {**_typed({"affine": {}}), "quantization": {"bits": 4}},
-        {**_typed({}), "quantization": {"bits": 8, "mode": "toy"}},
+        {"model_type": "llama", "quantization": {"bits": 8, "mode": "toy"}},
     ):
         (tmp_path / "config.json").write_text(json.dumps(config))
         with pytest.raises(formats.FormatRefusedError, match="config's mode is"):
@@ -1596,7 +1599,7 @@ def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(
         assert type(stranger) is FormatLinear
         return load(path, **kwargs)
 
-    module = types.ModuleType("stranger")
+    module = types.ModuleType("mlx_lm.utils")
     module.load_model = with_a_stranger
     format_load._wrap_loader(module, "load_model")
     with pytest.raises(formats.FormatRefusedError) as refusal:
@@ -1697,6 +1700,15 @@ def test_a_format_entry_that_binds_no_layer_is_refused(toy, tmp_path, entry):
         "loader renames it",
         tmp_path,
     )
+
+
+def test_a_checked_loader_accepts_copies_of_its_disk_format_config(toy, tmp_path):
+    record = {"levels": [1.0, None], "layout": 2}
+    _llama(tmp_path, **_written(record))
+    config = json.loads((tmp_path / "config.json").read_text())
+    model, _ = load_model(tmp_path, model_config=config)
+    assert type(model.model.layers[0].mlp.gate_proj) is FormatLinear
+    assert [seen for seen, _ in toy.accepted] == [record]
 
 
 def test_an_entry_binds_a_layer_of_its_own_mode_only(toy, tmp_path):
@@ -2197,7 +2209,7 @@ def test_a_loader_wrapped_over_the_wrapped_one_is_one_load(toy, tmp_path):
     # A family's loader that calls the libraries' (wrapped) loader, wrapped
     # in its turn: the layers built belong to the one load of the checkpoint.
     _llama(tmp_path, **_written({}))
-    module = types.ModuleType("family")
+    module = types.ModuleType("mlx_lm.utils")
     module.load_model = lambda path, **kwargs: load_model(path, **kwargs)
     format_load._wrap_loader(module, "load_model")
     model, _ = module.load_model(tmp_path, strict=False)
@@ -2249,8 +2261,7 @@ def test_a_format_s_layer_is_built_in_a_checkpoint_s_load_only(unpatched, monkey
         load_model()
     assert str(refusal.value) == _refusal(
         "a layer is built outside a checkpoint's load, which gives it the record "
-        "to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or "
-        "mlx-embeddings' load_model"
+        "to be read with: load the checkpoint with mlx-lm's or mlx-vlm's load_model"
     )
     assert refusal.value.path is None
     # MLX's layers need none.
@@ -2563,22 +2574,26 @@ def _registered(monkeypatch):
     return toy
 
 
-def test_a_causal_lm_reranker_installs_the_patch_and_reads_its_record(
+def test_a_causal_lm_reranker_refuses_a_verified_backbone(
     unpatched, tmp_path, monkeypatch
 ):
     from omlx.models.reranker import MLXRerankerModel
 
-    _registered(monkeypatch)
+    toy = _registered(monkeypatch)
     path = _tiny(tmp_path / "tiny-reranker", [9.0])
     config = json.loads((path / "config.json").read_text())
     config["architectures"] = ["Qwen3ForCausalLM"]
     (path / "config.json").write_text(json.dumps(config))
     reranker = MLXRerankerModel(str(path))
-    reranker.load()
-    assert _gate_proj(reranker.model).fmt.levels == (9.0,)
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        reranker.load()
+    assert refused.value.reason == (
+        "the reranker loader cannot read a quant format checkpoint"
+    )
+    assert not toy.accepted
 
 
-def test_an_embedding_model_installs_the_patch_and_reads_its_record(
+def test_an_embedding_model_refuses_a_verified_backbone(
     unpatched, tmp_path, monkeypatch
 ):
     from omlx.models import embedding
@@ -2587,14 +2602,12 @@ def test_an_embedding_model_installs_the_patch_and_reads_its_record(
     # Through mlx-vlm's encoder loader, as its embedding models load.
     monkeypatch.setitem(embedding._MLX_VLM_EMBEDDING_CONTEXT, "llama", 512)
     path = _tiny(tmp_path / "embedding", [10.0])
-    try:
+    with pytest.raises(formats.FormatRefusedError) as refused:
         embedding.MLXEmbeddingModel(str(path)).load()
-    except Exception as error:  # a Llama is no embedding model: what follows
-        failed = error  # its load fails
-    else:
-        failed = None
-    accepted = [tuple(record["levels"]) for record, _ in toy.accepted]
-    assert accepted == [(10.0,)], failed
+    assert refused.value.reason == (
+        "the embedding loader cannot read a quant format checkpoint"
+    )
+    assert not toy.accepted
 
 
 def test_the_cluster_s_loads_read_their_records(levels, tmp_path):
@@ -2681,27 +2694,25 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
     mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
     model, _ = mlx_lm.utils.load_model(_tiny(tmp_path / "llama", [15.0]))
     assert _gate_proj(model).fmt.levels == (15.0,)
-    # It loads a DeepSeek V4 checkpoint inside a checkpoint's load, and
-    # builds its layers outside it: one of a format is refused, on every load
-    # (the patch never wraps the loader again).
+    # The custom DeepSeek reader refuses before opening its weights in
+    # either patch order, even with a test-verified family.
     v4 = _tiny(tmp_path / "v4", [16.0])
     config = json.loads((v4 / "config.json").read_text())
     (v4 / "config.json").write_text(json.dumps({**config, "model_type": "deepseek_v4"}))
     for _ in range(2):
         format_load.apply_format_load_patch()
         assert not getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
-        with pytest.raises(ValueError, match="built outside a checkpoint's load"):
+        with pytest.raises(formats.FormatRefusedError, match="DeepSeek V4 loader"):
             mlx_lm.utils.load_model(
                 v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
             )
-    # Applied before this patch, it is under the wrapped loader: its own
-    # quantize still runs outside any load.
+    # The same refusal when installed underneath the wrapped loader.
     mlx_lm.utils.load_model = wrapped.__wrapped__
     mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
     monkeypatch.setattr(format_load, "_PENDING", {"mlx_lm.utils"})
     format_load.apply_format_load_patch()
     assert getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
-    with pytest.raises(ValueError, match="built outside a checkpoint's load"):
+    with pytest.raises(formats.FormatRefusedError, match="DeepSeek V4 loader"):
         mlx_lm.utils.load_model(
             v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
         )
@@ -2747,7 +2758,9 @@ def test_a_deepseek_v4_checkpoint_of_a_format_is_refused_before_a_weight_is_read
 
 
 @testing.verified("deepseek_v4")
-def test_deepseek_v4_s_own_load_is_checked_at_its_end(toy, tmp_path, monkeypatch):
+def test_deepseek_v4_s_native_reader_refuses_a_damaged_record(
+    toy, tmp_path, monkeypatch
+):
     import mlx_lm.utils
 
     from omlx.patches.deepseek_v4 import utils_patch
@@ -2766,13 +2779,11 @@ def test_deepseek_v4_s_own_load_is_checked_at_its_end(toy, tmp_path, monkeypatch
     model = llama.Model(llama.ModelArgs.from_dict(config))
     weights = dict(tree_flatten(model.parameters()))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
-    # A float checkpoint whose record of formats is damaged: no layer reads
-    # it, the end of the load refuses it.
+    # Even float weights cannot go through this reader with a format record.
     (tmp_path / "config.json").write_text(
         json.dumps({**config, "omlx_quant_formats": None})
     )
-    damaged = r"\['omlx_quant_formats'\] is null"
-    with pytest.raises(formats.FormatRefusedError, match=damaged):
+    with pytest.raises(formats.FormatRefusedError, match="DeepSeek V4 loader"):
         load_model(
             tmp_path, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
         )
@@ -2915,7 +2926,7 @@ def test_a_drafter_s_loader_installs_the_patch(
 
 # Of a family oMLX serves with mlx-embeddings' code: taken as verified.
 @testing.verified("bert")
-def test_mlx_embeddings_loads_a_checkpoint_of_the_format(levels, tmp_path):
+def test_mlx_embeddings_refuses_at_the_resolved_checkpoint(levels, tmp_path):
     from mlx_embeddings.models import bert
     from mlx_embeddings.utils import load_model as embeddings_load_model
 
@@ -2941,10 +2952,9 @@ def test_mlx_embeddings_loads_a_checkpoint_of_the_format(levels, tmp_path):
     config["quantization"] = {"group_size": 64, "bits": 4, name: _TOY}
     config["omlx_quant_formats"] = _written({"levels": [19.0]})
     (tmp_path / "config.json").write_text(json.dumps(config))
-    loaded = embeddings_load_model(tmp_path, lazy=True)
-    layer = dict(loaded.named_modules())[name]
-    assert type(layer) is FormatLinear and layer.fmt.levels == (19.0,)
-    assert levels() == [(19.0,)]
+    with pytest.raises(formats.FormatRefusedError, match="mlx_embeddings.utils"):
+        embeddings_load_model(tmp_path, lazy=True)
+    assert not levels()
 
 
 def test_the_patch_imports_none_of_the_libraries_and_wraps_them_on_import():

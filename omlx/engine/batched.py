@@ -324,6 +324,9 @@ class BatchedEngine(BaseEngine):
         from ..engine_core import get_mlx_executor
 
         def _load_model_sync():
+            from ..patches.format_load import check_engine_loader
+
+            check_engine_loader(self._model_name, "batched")
             # Apply pre-load patches that need to register modules into
             # sys.modules before mlx_lm.load() runs (e.g. DeepSeek V4 PR 1192,
             # native MTP PR 990 / PR 15). Gated on model_type and per-model

@@ -11575,9 +11575,8 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
     file of weights, and an index declaring each tensor the source holds
     (mlx-vlm drops a module beside the language model that no weight is
     declared for, so a module the source holds, an MTP head, is kept). It is
-    built by the library oQe's calibration loads the source with (a verified
-    family's verification proves it is the one that serves it), with the
-    source's pre-load patches, on the thread the engines load on (see
+    built by the library that serves the written layout, with the source's
+    pre-load patches, on the thread the engines load on (see
     ``_walk_model``): no weight is read, no tokenizer loaded, and the
     process-wide state the patches set is kept as it was. With no weight
     given, the loader quantizes only the layers ``config``'s quantization
@@ -11637,7 +11636,28 @@ def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool)
 
         # Without MiMo's MTP sidecar, which the model's sanitize would read.
         override = _sensitivity_lm_config_override(config)
-        return lm_utils.load_model(view, model_config=override, **built)[0]
+        return lm_utils.load_model(
+            view,
+            model_config=override,
+            get_model_classes=_walk_lm_classes,
+            **built,
+        )[0]
+
+
+def _walk_lm_classes(config):
+    """Construct the real mlx-lm model without sanitizing an empty weight file."""
+    from mlx_lm.utils import _get_classes
+
+    model_class, args_class = _get_classes(config)
+
+    def build(args):
+        model = model_class(args)
+        # Weight sanitizers such as Qwen3-VL's unpack a nonempty tensor tree.
+        # This instance exists only in the walk, which supplies no tensors.
+        object.__setattr__(model, "sanitize", lambda weights: weights)
+        return model
+
+    return build, args_class
 
 
 def _on_mlx_thread(load):
@@ -11687,20 +11707,34 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
     has one; yields whether mlx-vlm loads it.
 
     For the walk over the checkpoint a run writes (``walk``, its directory):
-    the library is the calibration's (by the source's config: a text-only
-    run's written one has lost its vision config), the dispatch reads the
-    written config, the runtime MTP patch is the model type's, and
-    Qwen4-Exp's tables are resident."""
+    the written layout selects the serving library and the runtime MTP
+    patch. Qwen4-Exp's tables stay resident."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
         maybe_apply_pre_load_patches,
     )
 
-    source_config = config
-    if walk is not None:
-        source_config = json.loads((Path(model_path) / "config.json").read_text())
-    is_vlm = _is_vlm_load(source_config)
+    if walk is None:
+        is_vlm = _is_vlm_load(config)
+    else:
+        from omlx.model_discovery import (
+            _gemma4_text_only_prefers_llm_engine,
+            _gemma4_text_only_wants_vlm_engine,
+            detect_model_type,
+        )
+
+        # Inkling 2's VLM engine uses mlx-lm's model. Flash-Next's text
+        # tower and a Gemma 4 merged MTP head are implemented in mlx-vlm.
+        is_vlm = (
+            _is_qwen4_exp_config(config)
+            or _gemma4_text_only_wants_vlm_engine(config)
+            or (
+                not inkling2_layout.is_inkling2(config)
+                and not _gemma4_text_only_prefers_llm_engine(config)
+                and detect_model_type(walk) == "vlm"
+            )
+        )
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
     has_mtp_heads = _has_mtp_heads(config)
     calibration_settings = _calibration_model_settings(

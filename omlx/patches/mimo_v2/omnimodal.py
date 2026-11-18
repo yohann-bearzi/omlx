@@ -13,6 +13,7 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..format_load import refuse_format_checkpoint
 from .audio import MiMoAudioBridge, MiMoAudioProcessor
 from .vision import VisionConfig, VisionModel
 
@@ -340,6 +341,7 @@ def load(
 ):
     """Load the text checkpoint, vision sidecar, and Qwen-compatible processor."""
     root = Path(model_path)
+    refuse_format_checkpoint(root, "MiMo omnimodal")
     if not has_vision_sidecar(root):
         raise FileNotFoundError(
             f"MiMo vision sidecar not found below {root / 'omnimodal'}"

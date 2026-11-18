@@ -89,13 +89,17 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 `omlx.formats.linear` has the layers that hold a format's tensors. `FormatLinear` is to a format what `nn.QuantizedLinear` is to MLX's modes, and `FormatSwitchLinear` what mlx-vlm's `QuantizedSwitchLinear` is: a stack of matrices (a switch layer's experts), called with the indices of the ones to run.
 
 ```python
+from omlx.formats import testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 
-linear = FormatLinear("myformat", bits, group_size, k, {"weight": codes, "scales": scales})
-y = linear(x)  # x @ W.T, plus the bias if the layer is given one
+with testing.verified("llama"):
+    linear = FormatLinear(
+        "myformat", bits, group_size, k, {"weight": codes, "scales": scales}
+    )
+    y = linear(x)
 
-experts = FormatSwitchLinear("myformat", bits, group_size, k, stacked, bias=bias)
-y = experts(x, indices)  # as mlx-vlm calls a switch layer
+    experts = FormatSwitchLinear("myformat", bits, group_size, k, stacked, bias=bias)
+    y = experts(x, indices)
 ```
 
 A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), and the format that reads them (`fmt`: what the checkpoint's [`accept`](#load-a-checkpoint) returned, or the registered format of a mode the layer is built with by hand), whose `dot` reads the rest. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
@@ -163,14 +167,54 @@ A checkpoint's layers of a format are read with the record oQ stored for it (`om
 
 The record is that of the checkpoint the load reads. oMLX wraps the libraries' functions that build a model from a checkpoint's directory (mlx-lm's, mlx-vlm's and mlx-embeddings' `load_model`, and the encoder loader of mlx-vlm's embedding models), each the first time it finds it, imported or as it is imported, and in place: a script that imported one before oMLX's patches were applied (`from mlx_lm.utils import load_model`) calls the wrapped function too:
 
+- A format checkpoint enters the checked model loader in mlx-lm or mlx-vlm. Embedding,
+  reranking, decision, audio, external engines and custom weight readers refuse it
+  before reading its tensors. The encoder and embedding library hooks also check the
+  resolved model directory when a caller supplies a Hub ID.
 - In place means the function object itself: its `__code__` becomes that of a short function that calls oMLX's loader, which runs a copy of the function (its own code, globals and defaults). The object, its name, module, docstring, annotations and `inspect.signature` (through `__wrapped__`, the copy) are those of the library's function; `functools.wraps` over it copies them. It is wrapped once, under a lock: two threads applying the patch at once, or a module found again, leave it wrapped once. A call on another thread meanwhile runs the function whole, its own code or the wrapped one. A library version whose loader is not a plain Python function makes every load fail with `omlx.formats.LoadHookError` (a TypeError) that names it, which no engine or fallback load swallows (a test runs each installed library's loader through the hook); a family's loader that took the module's name first, a closure, is wrapped by that name, and the library's function under it is refused by name when it builds a format's layer: `mlx_lm.utils.load_model was imported before oMLX's patches were applied and runs unwrapped (a family's loader took its name in its module first): call mlx_lm.utils.load_model through its module, or apply the patches first (maybe_apply_pre_load_patches)`.
 - A checkpoint that records a quant format, or names one in its quantization config (its text model's too), and is of a family oQ writes in none (one that is not verified, see [Quantize a checkpoint](#quantize-a-checkpoint)) is refused before the library reads a weight, whoever wrote it (a plugin's own writer, a config edited by hand): `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): oMLX loads no raon1_mini checkpoint in a quant format: its merged gate and up projection is sliced by hand on a prefill, as MLX's quantized layer or as floats; have the family verified`. The family is the model type its config.json names (and its text model's), wherever the load finds it: a directory's name never decides. A decision model (Clef, OpenJev, d1, d3) is refused as its decision family by the loader that serves it as one, whatever its backbone's type: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): oMLX loads no clef checkpoint in a quant format: it reads rows of its output head by hand, as MLX's quantized layers or as floats; have the family verified`. A record of formats that is no JSON object is refused the same way, as a damaged config.
-- A format's layer (`FormatLinear`, `FormatSwitchLinear`) is built only in the load of a checkpoint the family gate passed, on its thread or on one that copied its context while the load runs, or in a block of `omlx.formats.testing.verified` (see [Test a format](#test-a-format)): built anywhere else (a family's own loader, a script by hand), it is refused: `quant format 'myformat': a format's layer is built only while oMLX loads a checkpoint of a family verified with quant formats, and this one is built outside such a load (by a family's own loader, or by hand): load the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model`.
+- A format's layer (`FormatLinear`, `FormatSwitchLinear`) is built only in the load of a
+  checkpoint the family gate passed, on its thread or on one that copied its context
+  while the load runs, or in a block of `omlx.formats.testing.verified` (see
+  [Test a format](#test-a-format)): built anywhere else (a family's own loader, a script
+  by hand), it is refused: `quant format 'myformat': a format's layer is built only
+  while oMLX loads a checkpoint of a family verified with quant formats, and this one is
+  built outside such a load (by a family's own loader, or by hand): load the checkpoint
+  with mlx-lm's or mlx-vlm's load_model`.
 - MoE expert offload offloads no expert of a model with any format's layer (one its config records or names, or that its load built), and says so once: the model loads with every expert resident, and admission counts them in full.
 - The format layers built on a thread while one runs (or on a thread that copied its context, while it runs) belong to its checkpoint, and a load nested in another reads its own; a load of the same checkpoint (a view of links to it) on the same thread inside a library's loader is that loader's load, which checks it when it returns.
-- A format's layer built anywhere else is refused: `quant format 'myformat': a layer is built outside a checkpoint's load, which gives it the record to be read with: load the checkpoint with mlx-lm's, mlx-vlm's or mlx-embeddings' load_model`. So is a load that returns a model without a format layer built under it (another checkpoint's, built inside this one's load).
-- A family's loader that replaces one of them afterwards runs around it: DeepSeek V4's builds its own checkpoints' layers outside any load, so a DeepSeek V4 checkpoint of a format is refused.
+- A format's layer built anywhere else is refused: `quant format 'myformat': a layer is
+  built outside a checkpoint's load, which gives it the record to be read with: load the
+  checkpoint with mlx-lm's or mlx-vlm's load_model`. So is a load that returns a model
+  without a format layer built under it (another checkpoint's, built inside this one's
+  load).
+- A family's loader that replaces one of them afterwards runs around it: DeepSeek V4
+  opens a checkpoint load around its own reader. The family gate checks the checkpoint.
+  The native reader refuses a format in either the disk config or a load override before
+  opening weights.
 - When the load returns, whatever its `strict`, a layer it filled in part is refused (a tensor of the checkpoint renamed, or missing): `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): the load filled model.layers.0.mlp.gate_proj but its scales: the checkpoint holds no such tensor, or holds it under another name`. So is a tensor of another shape or dtype than the layout's, or no array at all (tensors nested under its name), and an entry of the quantization config (its own, under either key, or else its text model's) in a format's mode (one that is not MLX's, or one the checkpoint records; an entry without a mode is MLX's affine) where the load built no layer of that mode, one layer for each entry, at the entry's whole path (or under `language_model.`, where mlx-vlm builds a language model's checkpoint, or without it, where mlx-lm builds a VLM's text model; a Hugging Face name under `model.language_model.` at `language_model.model.` or `model.`): a family's loader that renames the module, an entry that names the end of a path. An entry in a part of the model the load leaves out (an MTP head left off, a text-only load's vision or audio tower) binds nothing. So is the quantization config's own mode, a format's, when the load built no layer of it, and a record of formats that is no object. A layer the load left wholly unfilled is one a partial load does not hold (a pipeline rank's, a prefill helper's), and is not refused there: oMLX refuses it at the end of its own load, once what the process does not hold is dropped (`format_load.check_loaded`: the LLM and VLM engines' loads, the cluster's (a rank's, a pipeline stage's, the progressive ones'), a prefill helper's right after it keeps its first layers (or, for a family that keeps them before the load, after it), the drafters' and SpecPrefill's, the embedding and reranker models' before their compile's warm-up, the decision models', oQ's calibration and sensitivity loads; a refusal there is never a drafter or draft skipped): `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): the loaded model holds model.layers.0.mlp.gate_proj without its weight, scales: the checkpoint holds no such tensor, or holds it under another name`.
+
+When a caller supplies `model_config` to mlx-lm, oMLX checks both the
+on-disk family and the family selected by the override before opening
+weights. A format record supplied by the caller also has to account for
+layers in the loaded model. When the checkpoint already names a format,
+the override must preserve its record and quantization settings. It may
+copy a layer's settings to the runtime spelling of that same layer.
+
+The quantization config of a format checkpoint uses a flat map. Its defaults
+are `bits`, `group_size` and `mode`. Each per-layer value is an object with
+fields from that same set. A refusal identifies the field containing an
+unknown layout. Each recorded mode must account for a built layer or name
+layers that all belong to omitted heads or towers. A head stored as a list
+or dictionary of blocks counts as present.
+
+oQ writes `omlx_quant_formats` at the top level of `config.json`, with an
+entry for each format it used. Each entry may name the `plugin` (a string,
+or null for a format registered by hand), the supported integer `contract`
+revision, and a `record` object whose contents belong to the plugin. An
+older entry can omit these fields. An empty format map, one nested under
+`text_config`, or an unknown entry field raises a refusal that names its
+location.
 
 Every refusal of a format's checkpoint at load is one exception, `omlx.formats.FormatRefusedError` (a ValueError), which names the mode, the checkpoint, the plugin its record says wrote it and the one installed (`mode`, `path`, `written`, `installed`, and the `reason`). oMLX lets it through as it is: a model that mlx-vlm refuses is not loaded again with mlx-lm, nor the other way, since either would build the same layers.
 
@@ -205,7 +249,22 @@ quantize_oq_streaming(source, output, 4, enhanced=True, quant_format="myformat")
 What oQ offers a format:
 
 - The matrices that oQe has an importance for: the linears and the switch layers its calibration ran through. A format is therefore written with oQe only (`enhanced=True`), and a tensor oQe has no importance for (a table of embeddings, for one) is written as without the format.
-- A matrix that loads as a format's layer: one held, at its path and shape, by a module of exactly one of the classes the [load hook](#load-a-checkpoint) wraps (`nn.Linear`, the `SwitchLinear` of mlx-lm and of mlx-vlm; a subclass of one is not one of them). At every run with a format oQ builds the model the checkpoint loads as from the config the run writes (its own changes to the source's included, such as MiniMax's shared-expert layout), with the library oQe's calibration loads the source with (a verified family's verification proves it is the one that serves it) and the source's pre-load patches, reading no weight and declaring every tensor the source holds (so that mlx-vlm keeps a vision tower or an MTP head); so one imatrix cache serves runs with and without a format. A matrix of another class (a family's own switch layer, MLA's `MultiLinear`) is written in oQ's affine, and a warning counts them: `oQ4: 6 matrices stay oQ's affine: a quant format's layer is not built for their class (omlx.patches.deepseek_v4.switch_layers.SwitchLinear)`. So is a matrix that no module holds at its path and shape (a family whose loader renames, joins or splits the checkpoint's tensors), and the warning names them: `paths that no module of the model it loads as holds at their shape: model.layers.0.mlp.experts.0.gate_proj`, the first twenty and then how many more.
+- A matrix that loads as a format's layer: one held, at its path and shape, by a module
+  of exactly one of the classes the [load hook](#load-a-checkpoint) wraps (`nn.Linear`,
+  the `SwitchLinear` of mlx-lm and of mlx-vlm; a subclass of one is not one of them). At
+  every run with a format oQ builds the model the checkpoint loads as from the config
+  the run writes (its own changes to the source's included, such as MiniMax's
+  shared-expert layout), with the library that serves the written config and the
+  source's pre-load patches, reading no weight and declaring every tensor the source
+  holds (so that mlx-vlm keeps a vision tower or an MTP head); so one imatrix cache
+  serves runs with and without a format. A matrix of another class (a family's own
+  switch layer, MLA's `MultiLinear`) is written in oQ's affine, and a warning counts
+  them: `oQ4: 6 matrices stay oQ's affine: a quant format's layer is not built for their
+  class (omlx.patches.deepseek_v4.switch_layers.SwitchLinear)`. So is a matrix that no
+  module holds at its path and shape (a family whose loader renames, joins or splits the
+  checkpoint's tensors), and the warning names them: `paths that no module of the model
+  it loads as holds at their shape: model.layers.0.mlp.experts.0.gate_proj`, the first
+  twenty and then how many more.
 - A matrix, or a stack of matrices, that `layout` returns a layout for at the layer's bits and group size. `layout` is asked first, and `encode` is not called for a matrix it returns None for. That includes a matrix whose K the group size does not divide, which oQ's affine keeps in floats.
 - A matrix that fits one launch: up to 2^30 weights, fewer on a Mac whose largest Metal buffer is small. A stack that does not fit one is offered in runs of whole matrices, in several calls, and oQ joins their tensors along the stack's axis. A format therefore encodes each matrix by itself: its tensors do not depend on the matrices beside it in a call. A format that encodes a stack's first runs and returns None for a later one is refused.
 - Nothing that oQ does not quantize itself: a tensor the source already keeps at the level's bits or fewer (experts their lab ships in 4 bits, at a level of 4 bits or more) is written as the source has it, and so is a table kept with `preserve_ngram_table`.
@@ -747,7 +806,16 @@ def test_rows_are_the_dequantized_products():
 
 `operands` are the weight, then the face's tensors in order. `x` holds K activations. `packs=(NA, NB)` are the rows a simdgroup computes: `NA` rows as the first pack, the `NB` after them as the second. A kernel puts such adjacent rows in one pack; `dot_rows` splits them to run both. `n` is one or more times `NA + NB`, and no more than the matrix's rows (which `dot_rows` does not check). `x` and each operand have 8 elements or more: MLX binds a smaller input as constants. With `staged=True` the kernel copies `x` into threadgroup memory first and the face's `load` reads it there, as in a kernel that stages its inputs; `x` then fits in a threadgroup's 32 KiB. A `load` that takes only a device pointer fails to compile there: `no matching function for call to 'load'`.
 
-oQ writes, and oMLX loads, a checkpoint in a format only for a family verified with formats (see [Quantize a checkpoint](#quantize-a-checkpoint)). A test that writes or loads a tiny checkpoint of any family (Llama's too), to test a format with, takes it as verified for the test with `omlx.formats.testing.verified(*model_types)` (any spelling; a decision model's family or a text model's type too): while one of its blocks is open, in any thread, oQ writes and oMLX loads the family as a verified one. Blocks of several threads open and close in any order. It decorates a test, async too, and a fixture opens a block of it (a bare `@verified` is refused):
+oQ writes, and oMLX loads, a checkpoint in a format only for a family verified with
+formats (see [Quantize a checkpoint](#quantize-a-checkpoint)). A test that writes or
+loads a tiny checkpoint of any family (Llama's too), to test a format with, takes it as
+verified for the test with `omlx.formats.testing.verified(*model_types)` (include the
+top-level backbone type and its nested text model type). Tests that build layers by hand
+use the same block. Dedicated decision and embedding readers still refuse format
+checkpoints. During verification, while one of its blocks is open, in any thread, oQ
+writes and oMLX loads the family as a verified one. Blocks of several threads open and
+close in any order. It decorates a test, async too, and a fixture opens a block of it (a
+bare `@verified` is refused):
 
 ```python
 import pytest

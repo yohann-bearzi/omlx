@@ -21,6 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.format_load import refuse_format_checkpoint
 from ..patches.mlx_audio_compat import ensure_qwen3_asr_audio_quantization
 from .base import BaseNonStreamingEngine
 
@@ -641,6 +642,7 @@ class STTEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
+        refuse_format_checkpoint(self._model_name, "audio_stt")
         logger.info(f"Starting STT engine: {self._model_name}")
 
         try:

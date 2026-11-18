@@ -131,6 +131,9 @@ def progressive_sharded_load(
     own_format = sys.modules.get(f"mlx_lm.models.{metadata_config.get('model_type')}")
     stage_loader = getattr(own_format, "load_pipeline_stage", None)
     if stage_loader is not None:
+        from ..patches.format_load import refuse_format_checkpoint
+
+        refuse_format_checkpoint(model_path, "custom shard", config=metadata_config)
         if tensor_group is not None:
             tensor_loader = getattr(own_format, "load_tensor_shard", None)
             if tensor_loader is None:

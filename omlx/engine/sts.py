@@ -26,6 +26,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..patches.format_load import refuse_format_checkpoint
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -298,6 +299,7 @@ class STSEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
+        refuse_format_checkpoint(self._model_name, "audio_sts")
         family = self._family
         logger.info(f"Starting STS engine: {self._model_name} (family={family})")
 

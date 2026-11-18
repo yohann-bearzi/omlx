@@ -1994,6 +1994,9 @@ class VLMBatchedEngine(BaseEngine):
         from ..utils.model_loading import maybe_load_custom_quantization
 
         def _load_vlm_sync():
+            from ..patches.format_load import check_engine_loader
+
+            check_engine_loader(self._model_name, "vlm")
             # Apply pre-load patches (MTP runtime patch, etc.) before the model
             # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
             # is a no-op when the model is incompatible. On the thread that

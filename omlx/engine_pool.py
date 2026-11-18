@@ -83,6 +83,7 @@ from .model_settings import (
     ane_prefill_fraction,
     validate_ane_prefill,
 )
+from .patches.format_load import check_engine_loader
 from .patches.inkling2.dspark import (
     bundled_inkling2_dspark_path,
     load_inkling2_dspark_drafter,
@@ -4165,6 +4166,10 @@ class EnginePool:
             model_settings = runtime_settings
             if model_settings is None and self._settings_manager is not None:
                 model_settings = self._settings_manager.get_settings(model_id)
+            external = self.external_engine_id(model_id, model_settings)
+            check_engine_loader(
+                entry.model_path, "external" if external else effective_type
+            )
             # A status read may have logged a forced offload long before this
             # load. Log it again next to the load.
             for kind in ("qwen4_ple_ssd_offload", "deepseek_v41_engram_ssd_offload"):

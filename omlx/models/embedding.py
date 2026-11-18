@@ -22,7 +22,11 @@ from mlx.utils import tree_flatten, tree_map
 from mlx_vlm.embedding_loader import load_embedding_model
 from mlx_vlm.utils import load_audio, load_config, load_processor
 
-from ..patches.format_load import apply_format_load_patch, check_loaded
+from ..patches.format_load import (
+    apply_format_load_patch,
+    check_loaded,
+    refuse_format_checkpoint,
+)
 from ..patches.modernbert_attention import patch_modernbert_attention
 from ..utils.image import _decode_input_audio_data, load_image, validate_image_data_uri
 from .base_model import (
@@ -511,7 +515,8 @@ class MLXEmbeddingModel:
         if self._loaded:
             return
 
-        # A checkpoint's layers of a quant format load as the format's layers.
+        refuse_format_checkpoint(self.model_name, "embedding")
+        # Wrap library entry points too, including paths resolved from Hub IDs.
         apply_format_load_patch()
 
         # mlx-vlm embedding models pool inside their forward and return

@@ -45,6 +45,7 @@ from transformers import AutoTokenizer
 from ..api.utils import _consolidate_system_messages
 from ..exceptions import InvalidRequestError
 from ..gguf import SPLIT_VARIANT
+from ..patches.format_load import refuse_format_checkpoint
 from ..request import DecodeMarks, add_decode_mark, live_decode_rate
 from ..utils.hardware import get_chip_name, parse_chip_info
 from ..utils.proc_memory import get_phys_footprint, list_process_group_pids
@@ -1380,6 +1381,7 @@ class SplashEngine(BaseEngine):
             if self._process.poll() is None:
                 return
             raise RuntimeError(self.runtime_failed_reason)
+        refuse_format_checkpoint(self._path, "Splash")
         await asyncio.to_thread(self._load_tokenizer)
         await asyncio.to_thread(stage_model, self._path, self._repo_id, self._hub_dir)
         port = _free_port()

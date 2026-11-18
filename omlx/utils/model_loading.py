@@ -1754,6 +1754,9 @@ def maybe_load_custom_quantization(
     if not quant_method:
         return None
 
+    from ..patches.format_load import refuse_format_checkpoint
+
+    refuse_format_checkpoint(model_name, quant_method, config=config)
     if quant_method.lower() == "compressed-tensors":
         from ..patches import qwen38_modelopt_mixed
 

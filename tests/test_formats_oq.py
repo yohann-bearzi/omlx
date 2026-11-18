@@ -1406,14 +1406,16 @@ def test_the_walk_builds_the_model_with_the_library_of_the_calibration(
     assert index == {"weight_map": {"model.embed_tokens.weight": "model.safetensors"}}
 
 
-def test_a_text_only_walk_builds_with_the_source_s_library(tmp_path, monkeypatch):
+def test_a_text_only_walk_builds_with_the_written_checkpoints_library(
+    tmp_path, monkeypatch
+):
     calls, _ = _stub_loaders(monkeypatch)
     source = _checkpoint(
         tmp_path / "source", {"model_type": "qwen3_vl", "vision_config": {"depth": 1}}
     )
     # A text-only run writes no vision config.
     oq._module_classes(str(source), {"model_type": "qwen3_vl"})
-    assert calls[-1][0] == "mlx-vlm"
+    assert calls[-1][0] == "mlx-lm"
 
 
 def test_the_walk_declares_the_source_s_tensors_whatever_its_files(

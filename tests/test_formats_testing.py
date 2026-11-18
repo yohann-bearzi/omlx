@@ -42,6 +42,12 @@ from tests.test_formats_linear import (
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
 
+@pytest.fixture(autouse=True)
+def by_hand():
+    with testing.verified("llama"):
+        yield
+
+
 @pytest.fixture
 def toy(monkeypatch):
     """Registers the toy format of the kernel tests, with a face or none."""
@@ -448,7 +454,7 @@ def test_a_layer_s_calls_through_two_faces_are_told_apart(toy):
     layer, x, want = _toy_linear(40, 320)
     with testing.layer_calls() as calls:
         assert _equal(layer(x), want)
-        toy(second)
+        layer.fmt.face = second
         layer["scales"] = layer["scales"] * 1  # a new tensor: a new plan
         assert _equal(layer(x), want)
     assert calls == [_call(layer, first, mx.float32), _call(layer, second, mx.float32)]

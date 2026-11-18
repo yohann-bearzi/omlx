@@ -63,9 +63,12 @@ _SWITCH_MODULES = ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers"
 # The functions that build a model from a checkpoint's directory, their
 # first argument, quantizing its layers, by the module that defines them:
 # oMLX's loads build a format's layers inside one of them.
-_LOADERS = (
+_CHECKED_LOADERS = (
     ("mlx_lm.utils", "load_model"),
     ("mlx_vlm.utils", "load_model"),
+)
+_LOADERS = (
+    *_CHECKED_LOADERS,
     ("mlx_vlm.encoder_loader", "load_encoder_model"),
     ("mlx_embeddings.utils", "load_model"),
 )
@@ -110,7 +113,7 @@ class _Checkpoint:
     are built, its config, the object that reads each of its formats and
     the layers built."""
 
-    def __init__(self, path, *, by_loader: bool = False) -> None:
+    def __init__(self, path, *, by_loader: bool = False, config=_ABSENT) -> None:
         self.path = Path(path).expanduser()
         # A load of it joins the outer one only on the thread that runs it,
         # while it runs, and when a library's loader opened it.
@@ -122,11 +125,12 @@ class _Checkpoint:
         self.verified = False
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
-        self._config = _ABSENT
+        self._config = config
         self._read: dict[str, formats.QuantFormat] = {}
+        self._layouts = {}
         # A load's threads (ones that copied its context) accept its record
         # once.
-        self._accepting = threading.Lock()
+        self._accepting = threading.RLock()
         self.built: list[nn.Module] = []
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
@@ -134,11 +138,30 @@ class _Checkpoint:
         what ``accept`` of a copy of ``fmt`` returns for the record oQ stored
         (None: that copy), asked once."""
         with self._accepting:
-            read = self._read.get(fmt.mode)
-            return self._accepted(fmt) if read is None else read
+            return self._accepted(fmt)
+
+    def layout(self, fmt, geometry):
+        """The registered and accepted formats must both support this geometry."""
+        key = (fmt.mode, *geometry)
+        result = self._layouts.get(key)
+        if result is not None:
+            return result
+        with self._accepting:
+            if key not in self._layouts:
+                layout = fmt.layout(*geometry)
+                read = fmt
+                if layout is not None:
+                    read = self.read(fmt)
+                    if read is not fmt:
+                        layout = read.layout(*geometry)
+                self._layouts[key] = (read, layout)
+            return self._layouts[key]
 
     def _accepted(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
-        """``read`` the first time, under ``_accepting``."""
+        """The checkpoint's reader of this mode, under ``_accepting``."""
+        read = self._read.get(fmt.mode)
+        if read is not None:
+            return read
         # Whatever the config named: a format's layer is being built.
         _refuse_family(self, fmt.mode)
         plugin = formats.origin(fmt.mode) or "the plugin"
@@ -195,6 +218,54 @@ class _Checkpoint:
             raise copy.copy(self._config).with_traceback(None)
         return self._config
 
+    def apply_model_config(self, override: dict) -> None:
+        """Check mlx-lm's shallow config update before it opens a weight file."""
+
+        disk = self._read_config()
+        effective = disk | override
+        recorded = _format_mode(disk)
+        mode = recorded or _format_mode(effective)
+        if mode is None:
+            return
+        supplied = _Checkpoint(self.path, config=effective)
+        _refuse_family(supplied, mode)
+        if recorded is None:
+            # A format introduced by the caller also has to belong to the
+            # on-disk family. Its record must reach accept and the outer check.
+            _refuse_family(self, mode)
+            self._config = effective
+            return
+
+        # The loader may spell a layer under its runtime path as well. Keep the
+        # disk config for accept and for counting the original entries once.
+        for prefix, before, after in (
+            ("", disk, effective),
+            (
+                "text_config.",
+                disk.get("text_config", {}),
+                effective.get("text_config", {}),
+            ),
+        ):
+            if before is after:
+                continue
+            if not isinstance(before, dict) or not isinstance(after, dict):
+                raise _refused("unknown quantization layout at text_config", mode, self)
+            for field in ("omlx_quant_formats", "quantization", "quantization_config"):
+                old = before.get(field, _ABSENT)
+                new = after.get(field, _ABSENT)
+                if old is new:
+                    continue
+                if field == "omlx_quant_formats":
+                    kept = _same_json(old, new)
+                else:
+                    kept = _keeps_layer_map(old, new)
+                if not kept:
+                    raise _refused(
+                        f"model_config changes the checkpoint's {prefix}{field}",
+                        mode,
+                        self,
+                    )
+
     def _written(self, mode: str):
         """What the checkpoint's config keeps of ``mode``'s format, as it is
         (``_ABSENT`` for nothing), and the JSON path to it."""
@@ -229,6 +300,20 @@ class _Checkpoint:
         if written is _ABSENT:
             return {}
         if isinstance(written, dict):
+            for field, value in written.items():
+                if field == "record":
+                    continue  # Checked below; the format owns the object's contents.
+                if field == "plugin" and (value is None or isinstance(value, str)):
+                    continue
+                if (
+                    field == "contract"
+                    and type(value) is int
+                    and formats.OLDEST_CONTRACT <= value <= formats.CONTRACT
+                ):
+                    continue
+                raise _refused(
+                    f"unknown format record layout at {where}[{field!r}]", mode, self
+                )
             written, where = written.get("record", {}), f"{where}['record']"
         if not isinstance(written, dict):
             raise _refused(
@@ -267,18 +352,39 @@ class _Checkpoint:
             config = self._read_config()
         except (OSError, ValueError):
             config = None
-        if isinstance(config, dict) and _damaged(config):
-            # No layer read the record, which would have refused it.
+        config = config if isinstance(config, dict) else {}
+        mode = _format_mode(config)
+        if mode is None and not self.built:
+            return
+        if _damaged(config):
             self._record(self._recorded_top_mode() or "unknown")
+        recorded = config.get("omlx_quant_formats", {})
+        modes = {layer.mode for layer in self.built}
+        if mode is None:
+            mode = min(modes)
+        self._check_layout(config, mode)
+        for mode in recorded:
+            self._record(mode)
         entries = self._format_entries()
         top = self._recorded_top_mode()
-        if top is not None and not any(layer.mode == top for layer in self.built):
+        if top is not None and top not in modes:
             # Its layers are named by the config's mode, not each by an entry.
             raise _refused(
                 f"its quantization config's mode is {top}, a format's, and the "
                 "load built no layer of it: the model has no such layer, or its "
                 "family's loader renames them",
                 top,
+                self,
+            )
+        # A record with no built layer is accounted for only by named
+        # entries. Each of those must still bind or belong to an absent part.
+        accounted = modes.union(mode for _, mode in entries)
+        for mode in recorded:
+            if mode in accounted:
+                continue
+            raise _refused(
+                "its config records the format but the load built no layer of it",
+                mode,
                 self,
             )
         if not self.built and not entries:
@@ -336,10 +442,15 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-        present = {path for held in paths.values() for path in held}
+        # A list or dict of modules has named children but no module at
+        # the container's own path (e.g. mtp.0 exists without mtp).
+        present_parts = {
+            _optional_root(path) for held in paths.values() for path in held
+        }
         for path, mode in entries:
             names = _entry_names(path)
-            if _left_out(path, present):
+            part = _optional_root(path)
+            if part and part not in present_parts:
                 # Of a part this load does not build (an MTP head left off,
                 # a text-only load's vision tower): no layer of it to serve.
                 continue
@@ -355,6 +466,47 @@ class _Checkpoint:
             bound[(name, mode)] -= 1
         # Checked: the layers are the model's to keep, not this checkpoint's.
         self.built.clear()
+
+    def _check_layout(self, config: dict, mode: str) -> None:
+        """Accept the flat per-layer quantization maps shipped by oQ and MLX."""
+        recorded = config.get("omlx_quant_formats", _ABSENT)
+        if isinstance(recorded, dict) and not (
+            recorded and all(isinstance(k, str) and k.strip() for k in recorded)
+        ):
+            raise _refused("unknown format layout at omlx_quant_formats", mode, self)
+        text = config.get("text_config", {})
+        if not isinstance(text, dict):
+            raise _refused("unknown quantization layout at text_config", mode, self)
+        if "omlx_quant_formats" in text:
+            raise _refused(
+                "unknown format layout at text_config.omlx_quant_formats", mode, self
+            )
+        for prefix, holder in (("", config), ("text_config.", text)):
+            for key in ("quantization", "quantization_config"):
+                if key not in holder:
+                    continue
+                quant = holder[key]
+                where = prefix + key
+                if not isinstance(quant, dict):
+                    raise _refused(
+                        f"unknown quantization layout at {where}", mode, self
+                    )
+                for path, entry in quant.items():
+                    field = f"{where}.{path}"
+                    if path in ("group_size", "bits", "mode"):
+                        valid = _layout_field(path, entry)
+                    else:
+                        valid = (
+                            bool(path)
+                            and all(path.split("."))
+                            and isinstance(entry, dict)
+                            and bool(entry)
+                            and all(_layout_field(k, v) for k, v in entry.items())
+                        )
+                    if not valid:
+                        raise _refused(
+                            f"unknown quantization layout at {field}", mode, self
+                        )
 
     def _quantizations(self) -> list[dict]:
         """The quantization configs a library builds the checkpoint's layers
@@ -397,9 +549,9 @@ class _Checkpoint:
             (path, entry.get("mode", "affine"))
             for quantization in self._quantizations()
             for path, entry in quantization.items()
-            if isinstance(entry, dict)
+            if isinstance(entry, dict) and self._in_format(entry.get("mode", "affine"))
         }
-        return sorted((path, mode) for path, mode in entries if self._in_format(mode))
+        return sorted(entries)
 
 
 def check_loaded(model) -> None:
@@ -472,7 +624,7 @@ def _named_modes(config: dict) -> list[str]:
     its quantization configs (its text model's too) that are not MLX's."""
     written = config.get("omlx_quant_formats")
     if isinstance(written, dict) and written:
-        return sorted(written)
+        return sorted(k for k in written if isinstance(k, str) and k.strip())
     named = [
         mode
         for quantization in _quantizations(config)
@@ -490,6 +642,19 @@ def _named_modes(config: dict) -> list[str]:
     ]
 
 
+def _format_mode(config: dict) -> str | None:
+    """Name a format for admission, including a misplaced or damaged record."""
+    modes = _named_modes(config)
+    if modes:
+        return modes[0] if modes[0].strip() else "unknown"
+    if "omlx_quant_formats" in config:
+        return "unknown"
+    text = config.get("text_config")
+    if isinstance(text, dict) and "omlx_quant_formats" in text:
+        return next(iter(_named_modes(text)), "unknown")
+    return None
+
+
 def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     """Refuse a checkpoint of a quant format (one it records, or names in its
     quantization config, or ``mode``, a format's layer being built for it)
@@ -504,11 +669,9 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
         return
     if not isinstance(config, dict):
         return
-    modes = [mode] if mode is not None else _named_modes(config)
-    if not modes and _damaged(config):
-        # A record of formats it keeps damaged: of modes no one knows.
-        modes = ["unknown"]
-    if not modes:
+    if mode is None:
+        mode = _format_mode(config)
+    if mode is None:
         return
     from .. import oq
 
@@ -523,7 +686,7 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
         )
         raise _refused(
             f"oMLX loads no {family} checkpoint in a quant format: {why}; {fix}",
-            modes[0],
+            mode,
             checkpoint,
         )
     checkpoint.verified = True
@@ -541,6 +704,64 @@ def _quantizations(config: dict, *, text: bool = True) -> list[dict]:
     ]
 
 
+def _same_json(left, right) -> bool:
+    """Compare on-disk JSON values, including the types of plugin metadata."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_json(value, right[key]) for key, value in left.items()
+        )
+    if isinstance(left, list):
+        return len(left) == len(right) and all(map(_same_json, left, right))
+    return left == right
+
+
+def _keeps_layer_map(before, after) -> bool:
+    """Only a second spelling of an existing layer may be added by mlx-lm."""
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    extra = after.keys() - before.keys()
+    for path, entry in before.items():
+        if not _same_json(entry, after.get(path, _ABSENT)):
+            return False
+        if extra and isinstance(entry, dict):
+            for alias in extra.intersection(_entry_names(path)):
+                if _same_json(entry, after[alias]):
+                    extra.remove(alias)
+    return not extra
+
+
+def _layout_field(key, value) -> bool:
+    if key == "mode":
+        return isinstance(value, str) and bool(value.strip())
+    return key in ("bits", "group_size") and type(value) is int and value > 0
+
+
+# Spellings used in HF checkpoints, mlx-lm text models, and mlx-vlm.
+_OPTIONAL_PREFIXES = (
+    "model.language_model.",
+    "language_model.model.",
+    "language_model.",
+    "model.",
+    "",
+)
+
+
+def _optional_path(path: str) -> str:
+    for prefix in _OPTIONAL_PREFIXES[:-1]:
+        if path.startswith(prefix):
+            return path[len(prefix) :]
+    return path
+
+
+def _optional_root(path: str) -> str:
+    root = _optional_path(path).partition(".")[0]
+    if root == "visual":
+        return "vision_tower"
+    return root if root in _OPTIONAL_PARTS else ""
+
+
 def _entry_names(path: str) -> tuple[str, ...]:
     """The paths a layer an entry names is built at: mlx-vlm builds a
     language model's checkpoint under language_model., mlx-lm a VLM's text
@@ -551,18 +772,20 @@ def _entry_names(path: str) -> tuple[str, ...]:
     if path.startswith("model.language_model."):
         inner = path.removeprefix("model.language_model.")
         names += [f"language_model.model.{inner}", f"model.{inner}"]
+    if _optional_root(path):
+        inner = _optional_path(path)
+        root, dot, rest = inner.partition(".")
+        roots = (
+            ("visual", "vision_tower")
+            if root in ("visual", "vision_tower")
+            else (root,)
+        )
+        names += [
+            f"{prefix}{root}{dot}{rest}"
+            for root in roots
+            for prefix in _OPTIONAL_PREFIXES
+        ]
     return tuple(dict.fromkeys(names))
-
-
-def _left_out(path: str, present: set[str]) -> bool:
-    """Whether a layer an entry names at ``path`` is in a part of a model
-    that a load may leave out (``_OPTIONAL_PARTS``), its own or its language
-    model's, and that the model whose modules are at ``present`` does not
-    hold."""
-    root = path.removeprefix("language_model.").split(".", 1)[0]
-    return root in _OPTIONAL_PARTS and not (
-        root in present or f"language_model.{root}" in present
-    )
 
 
 def _damaged(config: dict) -> bool:
@@ -571,33 +794,42 @@ def _damaged(config: dict) -> bool:
     return written is not _ABSENT and not isinstance(written, dict)
 
 
-def refuse_family(path, family: str) -> None:
-    """Refuse the checkpoint at ``path`` when its config records or names a
-    quant format and a loader of oMLX's own serves it as ``family`` (a
-    decision model's, which its config's model type does not name) that is
-    not verified: that loader reads its layers by hand. Called before the
-    loader reads a weight."""
-    checkpoint = _Checkpoint(path)
+def refuse_format_checkpoint(path, loader: str, *, config=_ABSENT, reason=None) -> None:
+    """Reject format weights before a reader outside the checked path opens them."""
+    checkpoint = _Checkpoint(path, config=config)
     try:
         config = checkpoint._read_config()
     except (OSError, ValueError):
-        # The loader's to refuse.
         return
     if not isinstance(config, dict):
         return
-    modes = _named_modes(config) or (["unknown"] if _damaged(config) else [])
-    if not modes:
-        return
+    mode = _format_mode(config)
+    if mode is not None:
+        raise _refused(
+            reason or f"the {loader} loader cannot read a quant format checkpoint",
+            mode,
+            checkpoint,
+        )
+
+
+def check_engine_loader(path, loader: str) -> None:
+    """Only the in-process text and VLM loaders can serve a verified checkpoint."""
+    if loader in ("batched", "vlm"):
+        _refuse_family(_Checkpoint(path))
+    else:
+        refuse_format_checkpoint(path, loader)
+
+
+def refuse_family(path, family: str) -> None:
+    """Decision models read their output heads directly, outside the checked load."""
     from .. import oq
 
-    if family in oq._QUANT_FORMAT_VERIFIED | oq._TEST_VERIFIED:
-        return
     why = oq._QUANT_FORMAT_MISREAD.get(family, oq._NOT_VERIFIED)
-    raise _refused(
-        f"oMLX loads no {family} checkpoint in a quant format: {why}; have the "
-        "family verified",
-        modes[0],
-        checkpoint,
+    refuse_format_checkpoint(
+        path,
+        family,
+        reason=f"oMLX loads no {family} checkpoint in a quant format: {why}; "
+        "have the family verified",
     )
 
 
@@ -700,26 +932,23 @@ def _unwrapped_loader() -> str | None:
     return None
 
 
-def _reading(fmt: formats.QuantFormat) -> _Checkpoint:
-    """The checkpoint a layer of ``fmt`` built now belongs to."""
-    checkpoint = _current()
-    if checkpoint is None:
-        loader = _unwrapped_loader()
-        if loader is not None:
-            raise FormatRefusedError(
-                f"{loader} was imported before oMLX's patches were applied "
-                "and runs unwrapped (a family's loader took its name in its "
-                f"module first): call {loader} through its module, or apply "
-                "the patches first (maybe_apply_pre_load_patches)",
-                mode=fmt.mode,
-            )
+def _outside_checkpoint(fmt: formats.QuantFormat) -> None:
+    """Refuse building a supported format outside a library checkpoint load."""
+    loader = _unwrapped_loader()
+    if loader is not None:
         raise FormatRefusedError(
-            "a layer is built outside a checkpoint's load, which gives it the "
-            "record to be read with: load the checkpoint with mlx-lm's, "
-            "mlx-vlm's or mlx-embeddings' load_model",
+            f"{loader} was imported before oMLX's patches were applied "
+            "and runs unwrapped (a family's loader took its name in its "
+            f"module first): call {loader} through its module, or apply "
+            "the patches first (maybe_apply_pre_load_patches)",
             mode=fmt.mode,
         )
-    return checkpoint
+    raise FormatRefusedError(
+        "a layer is built outside a checkpoint's load, which gives it the "
+        "record to be read with: load the checkpoint with mlx-lm's or "
+        "mlx-vlm's load_model",
+        mode=fmt.mode,
+    )
 
 
 def _format_layer(layer, layer_cls, signature, arguments):
@@ -731,13 +960,12 @@ def _format_layer(layer, layer_cls, signature, arguments):
     fmt = formats.get(mode)
     layout = None
     if fmt is not None and bits is not None and group_size is not None:
-        layout = fmt.layout(k, n, bits, group_size)
-    if layout is not None:
-        checkpoint = _reading(fmt)
-        read = checkpoint.read(fmt)
-        if read is not fmt:
-            layout = read.layout(k, n, bits, group_size)
-        fmt = read
+        checkpoint = _current()
+        geometry = (k, n, bits, group_size)
+        if checkpoint is not None:
+            fmt, layout = checkpoint.layout(fmt, geometry)
+        elif fmt.layout(*geometry) is not None:
+            _outside_checkpoint(fmt)
     if layout is None:
         if not isinstance(mode, str):
             # MLX's to refuse.
@@ -864,12 +1092,30 @@ def _wrap_loader(module, name: str) -> None:
         # Its name, text and attributes, and none of the patch's marks.
         update_wrapper(own, load, updated=())
         own.__dict__ = dict(load.__dict__)
-    first = next(iter(inspect.signature(own).parameters))
+    signature = inspect.signature(own)
+    first = next(iter(signature.parameters))
+    checked = (module.__name__, name) in _CHECKED_LOADERS
 
     def loader(*args, **kwargs):
         outer = _current()
         path = args[0] if args else kwargs[first]
+        if not checked:
+            role = f"{module.__name__}.{name}"
+            refuse_format_checkpoint(path, role)
+            # Embeddings accepts model_config positionally. The encoder can
+            # replace the disk config and then apply a separate override.
+            supplied = signature.bind_partial(*args, **kwargs).arguments
+            for key in ("model_config", "config", "config_overrides"):
+                override = supplied.get(key, kwargs.get(key))
+                if override is not None:
+                    refuse_format_checkpoint(path, role, config=override)
+            return own(*args, **kwargs)
         with loading(path, by_loader=True) as checkpoint:
+            if module.__name__ == "mlx_lm.utils":
+                supplied = signature.bind_partial(*args, **kwargs).arguments
+                override = supplied.get("model_config", kwargs.get("model_config"))
+                if override:
+                    checkpoint.apply_model_config(override)
             loaded = own(*args, **kwargs)
         if checkpoint is not outer:
             # A load joined to an outer one of the checkpoint is checked by
