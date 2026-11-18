@@ -58,6 +58,7 @@ _SOURCES = {
     "NDNW_SOURCE": ("fused", "_NDNW_SOURCE"),
     "U2_SOURCE": ("fused", "_U2_SOURCE"),
     "TI_SOURCE": ("fused", "_TI_SOURCE"),
+    "V2_HEADER": ("fused", "_V2_HEADER"),
 }
 
 
@@ -79,7 +80,7 @@ def test_oracle_sources_are_literals():
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
     }
-    derived = {"NP_SOURCE", "WND_SOURCE", "NDN_SOURCE", "NDNW_SOURCE"}
+    derived = {"NP_SOURCE", "WND_SOURCE", "NDN_SOURCE", "NDNW_SOURCE", "V2_HEADER"}
     pieces = {"NDN_SOURCE_TEMPLATE", "NDN_LOAD", "NDN_WRITE_LOAD"}
     assert set(_SOURCES) - derived | pieces <= literals
     imported = {
@@ -110,15 +111,15 @@ def _assert_bitwise(live, expected, what):
         assert mx.array_equal(a.view(view), b.view(view)).item(), (what, i)
 
 
-def _inputs(rows, hidden, dtype, seed, zero=None):
+def _inputs(rows, hidden, dtype, seed, zero=None, batch=1):
     mx.random.seed(seed)
-    shape = (1, rows, HC * hidden)
+    shape = (batch, rows, HC * hidden)
     if zero is None:
         hyper = (mx.random.normal(shape) * 2).astype(dtype)
     else:
         hyper = mx.full(shape, zero, dtype=dtype)
-    branch = mx.random.normal((1, rows, hidden)).astype(dtype)
-    gate = (2 * mx.sigmoid(mx.random.normal((1, rows, HC)))).astype(dtype)
+    branch = mx.random.normal((batch, rows, hidden)).astype(dtype)
+    gate = (2 * mx.sigmoid(mx.random.normal((batch, rows, HC)))).astype(dtype)
     if zero is not None:
         branch, gate = mx.full(branch.shape, zero, dtype=dtype), mx.zeros_like(gate)
     mx.eval(hyper, branch, gate)
@@ -162,26 +163,33 @@ def _assert_decode(
 @pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 def test_decode_matches_the_oracle(bits, group_size, dtype, gpu_class, monkeypatch):
-    """1 to 6 rows take the two-launch kernels, 7 to 16 the three-launch ones."""
+    """1 to 6 rows take the two-launch kernels, 7 to 16 the three-launch ones.
+    The rows are those of each geometry: down rows per simdgroup and up rows
+    per threadgroup change at 2, 3 and 4 rows, and not above 7."""
     seed = 1500 + 10 * bits + group_size
     modules = _modules(bits, group_size, dtype, seed=seed)
-    rows = range(1, oracle.MAX_ROWS + 1)
+    rows = (1, 2, 3, 4, 5, 6, 7, 16)
     _assert_decode(monkeypatch, modules, 2560, dtype, rows, gpu_class, seed)
 
 
 # 1152: every K slice's last down block is partial (128 of 512 or 256 values),
 # and the inject's at 4 and 5 bits; 1344: 320 or 64 down, 64 inject; the norm's
-# last 256-element strip is partial in both.
+# last 256-element strip is partial in both. Groups of 32 put a partial block's
+# lanes in more than one group; FP32 rows show its summation order.
 @pytest.mark.parametrize("gpu_class", ["d", "s"])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
+@pytest.mark.parametrize("group_size", [32, 64])
 @pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("hidden", [1152, 1344])
 def test_decode_with_partial_blocks_matches_the_oracle(
-    hidden, bits, gpu_class, monkeypatch
+    hidden, bits, group_size, dtype, gpu_class, monkeypatch
 ):
-    seed = 1600 + hidden + bits
-    modules = _modules(bits, 64, mx.bfloat16, hidden=hidden, seed=seed)
+    seed = 1600 + hidden + bits + group_size
+    modules = _modules(bits, group_size, dtype, hidden=hidden, seed=seed)
     rows = (1, 2, 3, 4, 6, 7, 16)
-    _assert_decode(monkeypatch, modules, hidden, mx.bfloat16, rows, gpu_class, seed)
+    # hc_fused takes no pending write of FP32 rows.
+    writes = dtype != mx.float32
+    _assert_decode(monkeypatch, modules, hidden, dtype, rows, gpu_class, seed, writes)
 
 
 @pytest.mark.parametrize("group_size", [32, 64])
@@ -198,7 +206,7 @@ def test_float32_decode_matches_the_oracle(bits, group_size, monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
 @pytest.mark.parametrize("zero", [0.0, -0.0])
 def test_zero_rows_match_the_oracle(zero, bits, dtype, monkeypatch):
     """All-zero rows (and pending writes of zeros): each sum is of zeros, whose
@@ -270,22 +278,106 @@ def test_the_two_decode_forms_give_a_row_the_same_bits(bits, group_size, dtype):
                     )
 
 
+# Shapes on each side of every clause of the two-launch fit: three streams;
+# a low rank of whole row groups or not (328); the norm's strips against the
+# row groups (5376, 5440); the stream in threadgroup memory (16320, 16384);
+# the up tile's threadgroup memory (a low rank of 512 at 8 bits, 2560).
+_FORM_SHAPES = [
+    (hc, hidden, lowrank)
+    for hc in (3, 4)
+    for hidden in (2560, 5376, 5440, 16320, 16384)
+    for lowrank in (320, 328, 512, 2560)
+]
+
+
 def test_the_oracle_takes_hc_fused_s_form(monkeypatch):
     """The oracle's choice of form is hc_fused's: two launches to 6 rows where
     they fit, three above, and three where the two do not fit."""
     hc_fused = _live()
+    seen = set()
     for gpu_class in ("d", "s"):
         monkeypatch.setattr(hc_fused, "_gpu_class", lambda c=gpu_class: c)
-        for hidden in (2560, 5376, 5440):
+        for hc, hidden, lowrank in _FORM_SHAPES:
             for rows in range(1, oracle.MAX_ROWS + 1):
                 for bits in (4, 5, 6, 8):
                     for inject in (True, False):
                         live = hc_fused._decode_v2(
-                            rows, HC, hidden, LOWRANK, bits, inject
+                            rows, hc, hidden, lowrank, bits, inject
                         )
+                        fits = oracle.two_launch_fits(
+                            rows, hc, hidden, lowrank, bits, inject, gpu_class
+                        )
+                        seen.add((rows <= oracle.V2_MAX_ROWS, fits))
                         assert live == oracle.takes_two_launches(
-                            rows, HC, hidden, LOWRANK, bits, inject, gpu_class
-                        )
+                            rows, hc, hidden, lowrank, bits, inject, gpu_class
+                        ), (gpu_class, hc, hidden, lowrank, rows, bits, inject)
+    assert seen == {(True, True), (True, False), (False, True), (False, False)}
+
+
+def test_the_oracle_s_geometry_is_hc_fused_s(monkeypatch):
+    """Geometry changes no output bit, so no output comparison can see it: the
+    oracle's constants and launch shapes are compared with hc_fused's."""
+    hc_fused = _live()
+    assert (
+        oracle.MAX_ROWS,
+        oracle.V2_MAX_ROWS,
+        oracle.V2_UP_THREADS,
+        oracle.TG_MEMORY_BYTES,
+    ) == (
+        hc_fused.MAX_ROWS,
+        hc_fused._V2_MAX_ROWS,
+        hc_fused._V2_UP_THREADS,
+        hc_fused._TG_MEMORY_BYTES,
+    )
+    for gpu_class in ("d", "s"):
+        monkeypatch.setattr(hc_fused, "_gpu_class", lambda c=gpu_class: c)
+        for rows in range(1, oracle.MAX_ROWS + 1):
+            assert oracle.down_rps(rows, gpu_class) == hc_fused._down_rps(rows)
+            assert oracle.up_outputs(rows, gpu_class) == hc_fused._up_outputs(rows)
+    for bits in (4, 5, 6, 8):
+        assert oracle.pack_factor(bits) == hc_fused._pack_factor(bits)
+        for lowrank in (320, 512):
+            assert oracle.up_chunks(bits, lowrank) == hc_fused._up_chunks(bits, lowrank)
+    for lowrank, inject, rps in ((320, True, 1), (320, False, 2), (512, True, 4)):
+        assert oracle.down_row_groups(
+            lowrank, inject, rps
+        ) == hc_fused._down_row_groups(lowrank, inject, rps)
+
+
+def _strided(array):
+    """``array`` as a view of every other element of a buffer twice its size:
+    a kernel input that is not row-contiguous."""
+    doubled = mx.stack([array, mx.zeros_like(array)], axis=-1)
+    view = doubled.reshape(*array.shape[:-1], 2 * array.shape[-1])[..., ::2]
+    mx.eval(view)
+    return view
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_batched_and_strided_rows_match_the_oracle(bits, monkeypatch):
+    """Rows of several sequences (batch above 1), and a norm weight and rows
+    that are views of every other element: what a kernel reads must be the
+    logical elements. The oracle's kernels are its own, by name."""
+    module, without = _modules(bits, 64, mx.bfloat16, seed=2200 + bits)
+    module.hc_norm.weight = _strided(module.hc_norm.weight)
+    for m in (module, without):
+        for batch, seq in ((2, 3), (3, 5), (2, 9)):
+            hyper, pending = _inputs(seq, 2560, mx.bfloat16, 2200 + seq, batch=batch)
+            for rows_in in (hyper, _strided(hyper)):
+                for write in (None, pending):
+                    what = ("batched", batch, seq, write is None)
+                    if batch * seq <= oracle.MAX_ROWS:
+                        for gpu_class in ("d", "s"):
+                            _assert_bitwise(
+                                *_decode(monkeypatch, m, rows_in, write, gpu_class),
+                                what,
+                            )
+                    else:
+                        live = _live().prefill_forward(m, rows_in, write, nax=False)
+                        assert live is not None
+                        _assert_bitwise(live, oracle.prefill(m, rows_in, write), what)
+    assert oracle._KERNELS
+    assert all(name.startswith("omlx_oracle_") for name in oracle._KERNELS)
 
 
 # Each projection's width and group size are its own template values.

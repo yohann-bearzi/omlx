@@ -12,8 +12,9 @@ the three-launch decode and the prefill launch beside them, and their launch
 code (geometry, templates, the choice of form). The prefill's projections are
 MLX's ``quantized_matmul``, as the MLX layers compute them.
 
-The launches name their kernels ``omlx_oracle_*``: MLX keeps a kernel's
-library by its name, so an oracle kernel never shares one with a live kernel.
+The launches name their kernels ``omlx_oracle_*``: MLX keys a kernel's
+library by its name, source and options, and an oracle kernel's own name keeps
+it apart from a live kernel whatever the live sources become.
 ``tests/test_qwen4_hc_oracle.py`` compares the live kernels with these, bit for
 bit. A port that deletes a live source drops its byte comparison there and
 keeps the output comparisons.
@@ -1006,7 +1007,9 @@ def decode(module, hyper_input, write=None, *, gpu_class, two_launch=None):
     Qwen4ExpGatedResidual) and ``hyper_input`` of at most 16 rows, on a GPU
     of class ``gpu_class`` (the last letter of its architecture). The form
     is hc_fused's choice, or the two-launch (``two_launch`` True, at any row
-    count where it fits) or the three-launch kernels (False)."""
+    count where it fits) or the three-launch kernels (False). For FP32 rows
+    with a pending write, which hc_fused declines (None), it computes the
+    kernels' outputs all the same."""
     hc, hidden, lowrank = module.hc_count, module.hidden_size, module.hc_lowrank
     batch, seq, _ = hyper_input.shape
     rows = batch * seq
