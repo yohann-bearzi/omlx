@@ -471,10 +471,12 @@ def test_the_modes_a_config_names():
         "text_config": {"quantization_config": {"mode": "other"}},
     }
     # Those it records, or else those it names that are not MLX's.
-    assert format_load._named_modes(config) == ["oqel"]
+    assert format_load._format_mode(config) == "oqel"
     for empty in ({}, None):
         config["omlx_quant_formats"] = empty
-        assert format_load._named_modes(config) == ["toy", "other"]
+        assert format_load._format_mode(config) == "toy"
+    del config["quantization"]["a"]
+    assert format_load._format_mode(config) == "other"
 
 
 def test_a_config_alone_names_the_family(toy, tmp_path):
@@ -854,9 +856,16 @@ def test_entries_are_those_the_library_builds_from(toy, tmp_path):
         with pytest.raises(formats.FormatRefusedError, match="names b,"):
             text = {key: {"a": _TOY, "b": _TOY}}
             _checked(tmp_path, None, {"a": True}, text_config=text)
-    # The text model's when the config has its own: not the library's.
+    # A top-level map never hides an unbound declaration in the text model.
+    with pytest.raises(formats.FormatRefusedError, match="names b,"):
+        _checked(
+            tmp_path,
+            {"a": _TOY},
+            {"a": True},
+            text_config={"quantization": {"b": _TOY}},
+        )
     _checked(
-        tmp_path, {"a": _TOY}, {"a": True}, text_config={"quantization": {"b": _TOY}}
+        tmp_path, {"a": _TOY}, {"a": True}, text_config={"quantization": {"a": _TOY}}
     )
 
 
@@ -893,7 +902,7 @@ def test_a_checkpoint_s_config_is_read_once_whatever_it_holds(tmp_path, monkeypa
         checkpoint = format_load._Checkpoint(tmp_path)
         # What is no object names no entry; what is not read is read once.
         if text == "null":
-            assert checkpoint._format_entries() == []
+            checkpoint.check(nn.Module())
         for _ in range(2):
             with contextlib.suppress(OSError, ValueError):
                 checkpoint.records("toy")
@@ -2090,36 +2099,73 @@ def test_a_drafter_or_draft_refused_is_never_skipped():
     from pathlib import Path
 
     root = Path(format_load.__file__).parents[1]
-    soft = ("toggle ignored", "SpecPrefill: draft model load failed")
-    seen = 0
-    for file in ("engine_pool.py", "engine/batched.py", "engine/vlm.py"):
-        source = (root / file).read_text()
-        for node in ast.walk(ast.parse(source)):
-            if not isinstance(node, ast.Try):
-                continue
-            texts = [ast.get_source_segment(source, h) or "" for h in node.handlers]
-            fails_soft = [
-                i for i, text in enumerate(texts) if any(s in text for s in soft)
-            ]
-            if not fails_soft or "raise RuntimeError" in texts[fails_soft[0]]:
-                continue
-            seen += 1
-            # A refusal, or a loader the patch could not wrap, is let through
-            # before the handler that goes on, once what was started for it
-            # is stopped: the pool's engine, or the engine itself.
-            before = node.handlers[: fails_soft[0]]
-            pool = file == "engine_pool.py"
-            stops = "self._release_loaded_engine(" if pool else "self.stop()"
-            assert any(
-                isinstance(h.type, ast.Tuple)
-                and {getattr(name, "id", None) for name in h.type.elts}
-                == {"FormatRefusedError", "LoadHookError"}
-                and isinstance(h.body[-1], ast.Raise)
-                and stops in (ast.get_source_segment(source, h) or "")
-                for h in before
-            ), (file, node.lineno)
-    # The DFlash and VLM MTP drafters, and both engines' SpecPrefill drafts.
-    assert seen == 4
+    soft = (
+        "toggle ignored",
+        "Lightning MTP stays off",
+        "SpecPrefill: draft model load failed",
+    )
+
+    def rethrows_refusal(handler):
+        return (
+            isinstance(handler.type, ast.Tuple)
+            and {getattr(name, "id", None) for name in handler.type.elts}
+            == {"FormatRefusedError", "LoadHookError"}
+            and isinstance(handler.body[-1], ast.Raise)
+            and handler.body[-1].exc is None
+        )
+
+    def awaits(handler, method):
+        return any(
+            isinstance(node, ast.Await)
+            and isinstance(node.value, ast.Call)
+            and getattr(node.value.func, "attr", None) == method
+            for node in ast.walk(handler)
+        )
+
+    for file, expected in (
+        ("engine_pool.py", 4),
+        ("engine/batched.py", 1),
+        ("engine/vlm.py", 1),
+    ):
+        tree = ast.parse((root / file).read_text())
+        blocks = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+        # Pool drafters share a typed outer handler that releases the loaded target.
+        guarded = set()
+        for block in blocks:
+            if any(
+                rethrows_refusal(h) and awaits(h, "_release_loaded_engine")
+                for h in block.handlers
+            ):
+                guarded.update(node for stmt in block.body for node in ast.walk(stmt))
+        seen = 0
+        for block in blocks:
+            for index, handler in enumerate(block.handlers):
+                if not any(
+                    isinstance(n, ast.Constant)
+                    and isinstance(n.value, str)
+                    and any(s in n.value for s in soft)
+                    for n in ast.walk(handler)
+                ):
+                    continue
+                # The engine's fail-fast variant wraps a non-format error.
+                if any(
+                    isinstance(n, ast.Raise)
+                    and isinstance(n.exc, ast.Call)
+                    and getattr(n.exc.func, "id", None) == "RuntimeError"
+                    for n in ast.walk(handler)
+                ):
+                    continue
+                seen += 1
+                assert any(
+                    rethrows_refusal(h)
+                    and (
+                        block in guarded
+                        if file == "engine_pool.py"
+                        else awaits(h, "stop")
+                    )
+                    for h in block.handlers[:index]
+                ), (file, block.lineno)
+        assert seen == expected, file
 
 
 def test_each_of_omlx_s_own_loads_checks_what_it_loaded():

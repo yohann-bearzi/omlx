@@ -9,7 +9,7 @@ import mlx.core as mx
 import pytest
 
 from omlx import formats
-from omlx.engine_pool import EngineEntry, EnginePool, ModelUnavailableError
+from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.formats import testing
 from omlx.model_discovery import EngineType
 from omlx.model_settings import ModelSettings
@@ -107,10 +107,9 @@ async def test_only_checked_engine_routes_start_a_format_checkpoint(
             with pytest.raises(Started):
                 await pool._load_engine("tiny", runtime_settings=settings)
         else:
-            with pytest.raises(ModelUnavailableError) as err:
+            with pytest.raises(formats.FormatRefusedError) as err:
                 await pool._load_engine("tiny", runtime_settings=settings)
-            refusal = err.value.__cause__
-            assert isinstance(refusal, formats.FormatRefusedError)
+            refusal = err.value
             assert refusal.mode == "toy"
             assert refusal.path == tmp_path
 
@@ -136,10 +135,9 @@ async def test_an_unverified_target_refuses_before_family_specific_readers(
         pytest.fail(f"unverified model reached {type(engine).__name__}")
 
     monkeypatch.setattr(pool, "_start_engine", opened)
-    with pytest.raises(ModelUnavailableError) as raised:
+    with pytest.raises(formats.FormatRefusedError) as raised:
         await pool._load_engine("tiny")
-    refusal = raised.value.__cause__
-    assert isinstance(refusal, formats.FormatRefusedError)
+    refusal = raised.value
     assert refusal.mode == "toy" and "deepseek_v41" in refusal.reason
 
 

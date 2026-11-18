@@ -20,8 +20,10 @@ import json
 import logging
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -416,6 +418,8 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+    # Recreate a typed refusal on cached retries without retaining loader frames.
+    load_refusal: Callable[[], Exception] | None = None
 
 
 class EnginePool:
@@ -1932,11 +1936,25 @@ class EnginePool:
         entry.load_failed = False
         entry.load_failure_message = None
         entry.load_failure_at = None
+        entry.load_refusal = None
 
     def _mark_load_failure(self, entry: EngineEntry, exc: BaseException) -> None:
         entry.load_failed = True
         entry.load_failure_message = str(exc) or type(exc).__name__
         entry.load_failure_at = time.time()
+        if isinstance(exc, FormatRefusedError):
+            entry.load_refusal = partial(
+                FormatRefusedError,
+                exc.reason,
+                mode=exc.mode,
+                path=exc.path,
+                written=exc.written,
+                installed=exc.installed,
+            )
+        elif isinstance(exc, LoadHookError):
+            entry.load_refusal = partial(LoadHookError, entry.load_failure_message)
+        else:
+            entry.load_refusal = None
 
     def _raise_if_model_path_missing_locked(
         self, model_id: str, entry: EngineEntry
@@ -1959,6 +1977,8 @@ class EnginePool:
     def _raise_if_load_failed(self, model_id: str, entry: EngineEntry) -> None:
         if not entry.load_failed:
             return
+        if entry.load_refusal is not None:
+            raise entry.load_refusal()
         detail = entry.load_failure_message or "previous load attempt failed"
         logger.warning(
             "Skipping load retry for '%s' after cached failure: %s",
@@ -4543,10 +4563,6 @@ class EnginePool:
                         get_mlx_executor(), _load_dflash_sync
                     )
                 except (FormatRefusedError, LoadHookError):
-                    # A drafter of a quant format refused: said, not ignored,
-                    # and the model is not served without it.
-                    load_completed = False
-                    await self._release_loaded_engine(entry, engine, resident_size)
                     raise
                 except Exception as e:
                     logger.warning(
@@ -4578,6 +4594,8 @@ class EnginePool:
                             depth,
                             bool(fixed),
                         )
+                    except (FormatRefusedError, LoadHookError):
+                        raise
                     except Exception as e:
                         logger.warning(
                             f"MiniMax DSpark drafter load raised for {model_id}: "
@@ -4606,6 +4624,8 @@ class EnginePool:
                             depth,
                             bool(fixed),
                         )
+                    except (FormatRefusedError, LoadHookError):
+                        raise
                     except Exception as e:
                         logger.warning(
                             f"Inkling 2 DSpark drafter load raised for {model_id}: "
@@ -4637,10 +4657,6 @@ class EnginePool:
                         get_mlx_executor(), _load_drafter_sync
                     )
                 except (FormatRefusedError, LoadHookError):
-                    # A drafter of a quant format refused: said, not ignored,
-                    # and the model is not served without it.
-                    load_completed = False
-                    await self._release_loaded_engine(entry, engine, resident_size)
                     raise
                 except Exception as e:
                     logger.warning(
@@ -4734,6 +4750,14 @@ class EnginePool:
         except asyncio.CancelledError:
             if not load_completed:
                 self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            raise
+        except (FormatRefusedError, LoadHookError) as exc:
+            if load_completed:
+                load_completed = False
+                await self._release_loaded_engine(entry, engine, resident_size)
+            self._schedule_failed_load_reclaim(model_id, pre_load_memory)
+            if not entry.abort_loading and not entry_detached:
+                self._mark_load_failure(entry, exc)
             raise
         except Exception as exc:
             # A failed load can leave tens of GB of just-loaded weights

@@ -506,7 +506,9 @@ def _is_d3_decision_config(path: Path) -> bool:
         return False
 
 
-def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind | None:
+def decision_kind(
+    model_path: Path, config: dict | None = None, *, use_name_hint: bool = True
+) -> DecisionKind | None:
     """Return the decision-model family of a checkpoint, or None.
 
     Clef is identified by its joint head files and Decision 3.0 by its
@@ -537,8 +539,8 @@ def decision_kind(model_path: Path, config: dict | None = None) -> DecisionKind 
         return "d1"
     if model_type != "qwen3_5":
         return None
-    if (model_path / _OPENJEV_HELPER).is_file() or "openjev" in _model_name_hint(
-        model_path
+    if (model_path / _OPENJEV_HELPER).is_file() or (
+        use_name_hint and "openjev" in _model_name_hint(model_path)
     ):
         return "openjev"
     return None

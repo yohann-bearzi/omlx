@@ -7,6 +7,7 @@ import json
 import logging
 import shutil
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1566,13 +1567,13 @@ class TestVLMFallback:
         with (
             patch("omlx.engine_pool.BatchedEngine", engines["BatchedEngine"]),
             patch("omlx.engine_pool.VLMBatchedEngine", engines["VLMBatchedEngine"]),
-            pytest.raises(ModelUnavailableError) as excinfo,
+            pytest.raises(FormatRefusedError) as excinfo,
         ):
             await pool._load_engine("model-a", force_lm=force_lm)
 
         other = engines["VLMBatchedEngine" if force_lm else "BatchedEngine"]
         other.assert_not_called()
-        assert excinfo.value.__cause__ is refusal
+        assert excinfo.value is refusal
         assert str(refusal) in str(excinfo.value)
         assert "fallback" not in str(excinfo.value)
 
@@ -1601,11 +1602,11 @@ class TestVLMFallback:
         with (
             patch(f"omlx.engine_pool.{first_cls}", return_value=first),
             patch(f"omlx.engine_pool.{second_cls}", return_value=second),
-            pytest.raises(ModelUnavailableError) as excinfo,
+            pytest.raises(FormatRefusedError) as excinfo,
         ):
             await pool._load_engine("model-a", force_lm=force_lm)
 
-        assert excinfo.value.__cause__ is refusal
+        assert excinfo.value is refusal
 
 
     @pytest.mark.asyncio
@@ -1635,11 +1636,11 @@ class TestVLMFallback:
         with (
             patch(f"omlx.engine_pool.{first_cls}", return_value=first),
             patch(f"omlx.engine_pool.{second_cls}", return_value=second),
-            pytest.raises(ModelUnavailableError) as excinfo,
+            pytest.raises(LoadHookError) as excinfo,
         ):
             await pool._load_engine("model-a", force_lm=force_lm)
 
-        assert excinfo.value.__cause__ is error
+        assert excinfo.value is error
         assert second.start.await_count == (0 if first_fails else 1)
 
 
@@ -2083,6 +2084,82 @@ class TestEnginePoolAsync:
         assert load.call_args.args[0] == draft_path
         assert load.call_args.args[2:] == (3, False)
         engine.set_dflash_drafter.assert_called_once_with(load.return_value)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("family", ["minimax_m3_vl", "inkling2"])
+    @pytest.mark.parametrize("failure", ["format", "hook", "ordinary"])
+    async def test_bundled_draft_failure_preserves_the_reader_error(
+        self, pool_with_mock_engines, family, failure, monkeypatch
+    ):
+        from omlx.formats import FormatRefusedError, LoadHookError
+
+        pool = pool_with_mock_engines
+        entry = pool.get_entry("model-a")
+        entry.config_model_type = family
+        pool._scheduler_config.max_num_seqs = 1
+        path = Path(entry.model_path)
+        if family == "inkling2":
+            draft, lookup, read = path, "bundled_inkling2_dspark_path", "inkling2"
+        else:
+            draft, lookup, read = path / "dspark", "bundled_dspark_path", "minimax"
+            draft.mkdir()
+            (draft / "config.json").write_text(
+                json.dumps(
+                    {
+                        "text_config": {
+                            "hidden_size": 64,
+                            "num_hidden_layers": 1,
+                            "head_dim": 16,
+                            "num_key_value_heads": 2,
+                            "sliding_window": 32,
+                        }
+                    }
+                )
+            )
+        monkeypatch.setattr("omlx.engine_pool." + lookup, lambda _: draft)
+        error = {
+            "format": FormatRefusedError(
+                "unreadable", mode="toy", path=draft, written="old", installed="new"
+            ),
+            "hook": LoadHookError("loader has no hook"),
+            "ordinary": ValueError("missing optional draft"),
+        }[failure]
+        engine = MagicMock()
+        engine.start = AsyncMock()
+        engine.stop = AsyncMock()
+        settings = ModelSettings(mtp_enabled=True)
+        with (
+            patch("omlx.engine_pool.BatchedEngine", return_value=engine),
+            patch.object(pool, "_schedule_failed_load_reclaim") as reclaim,
+            patch(
+                f"omlx.engine_pool.load_{read}_dspark_drafter", side_effect=error
+            ) as loader,
+        ):
+            if failure == "ordinary":
+                assert (
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                    is engine
+                )
+                engine.stop.assert_not_awaited()
+                reclaim.assert_not_called()
+            else:
+                with pytest.raises(type(error)) as first:
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                assert first.value is error
+                with pytest.raises(type(error)) as cached:
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                assert str(cached.value) == str(error)
+                assert cached.value is not error
+                assert entry.engine is None and entry.load_failed
+                assert entry.runtime_estimated_size is None
+                assert pool.current_model_memory == 0
+                engine.stop.assert_awaited_once()
+                reclaim.assert_called_once()
+                assert pool._load_time_observations == 0
+                await pool.prepare_cluster_reload("model-a", local_only=True)
+                assert not entry.load_failed and entry.load_refusal is None
+            loader.assert_called_once()
+            engine.set_dflash_drafter.assert_not_called()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("drafter", ["dflash", "vlm_mtp"])

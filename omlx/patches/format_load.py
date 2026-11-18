@@ -218,22 +218,38 @@ class _Checkpoint:
             raise copy.copy(self._config).with_traceback(None)
         return self._config
 
+    @cached_property
+    def _declaration(self):
+        try:
+            config = self._read_config()
+        except (OSError, ValueError):
+            return None, None
+        return _format_declaration(config)
+
+    def _marked_mode(self) -> str | None:
+        mode, misplaced = self._declaration
+        if misplaced:
+            raise _refused(f"unknown format layout at {misplaced}", mode, self)
+        return mode
+
     def apply_model_config(self, override: dict) -> None:
         """Check mlx-lm's shallow config update before it opens a weight file."""
 
         disk = self._read_config()
         effective = disk | override
-        recorded = _format_mode(disk)
-        mode = recorded or _format_mode(effective)
+        recorded = self._marked_mode()
+        supplied = _Checkpoint(self.path, config=effective)
+        supplied_mode = supplied._marked_mode()
+        mode = recorded or supplied_mode
         if mode is None:
             return
-        supplied = _Checkpoint(self.path, config=effective)
         _refuse_family(supplied, mode)
         if recorded is None:
             # A format introduced by the caller also has to belong to the
             # on-disk family. Its record must reach accept and the outer check.
             _refuse_family(self, mode)
             self._config = effective
+            self._declaration = supplied._declaration
             return
 
         # The loader may spell a layer under its runtime path as well. Keep the
@@ -353,21 +369,23 @@ class _Checkpoint:
         except (OSError, ValueError):
             config = None
         config = config if isinstance(config, dict) else {}
-        mode = _format_mode(config)
+        mode = self._marked_mode()
         if mode is None and not self.built:
             return
+        quants = _quantizations(config)
         if _damaged(config):
-            self._record(self._recorded_top_mode() or "unknown")
+            self._record(mode or "unknown")
+        if mode is not None:
+            self._check_layout(config, mode)
         recorded = config.get("omlx_quant_formats", {})
         modes = {layer.mode for layer in self.built}
-        if mode is None:
-            mode = min(modes)
-        self._check_layout(config, mode)
         for mode in recorded:
             self._record(mode)
-        entries = self._format_entries()
-        top = self._recorded_top_mode()
-        if top is not None and top not in modes:
+        entries = self._format_entries(quants)
+        for quant in quants:
+            top = quant.get("mode", "affine")
+            if not self._in_format(top) or top in modes:
+                continue
             # Its layers are named by the config's mode, not each by an entry.
             raise _refused(
                 f"its quantization config's mode is {top}, a format's, and the "
@@ -468,7 +486,7 @@ class _Checkpoint:
         self.built.clear()
 
     def _check_layout(self, config: dict, mode: str) -> None:
-        """Accept the flat per-layer quantization maps shipped by oQ and MLX."""
+        """Validate the flat per-layer maps of a checkpoint declaring a format."""
         recorded = config.get("omlx_quant_formats", _ABSENT)
         if isinstance(recorded, dict) and not (
             recorded and all(isinstance(k, str) and k.strip() for k in recorded)
@@ -477,10 +495,6 @@ class _Checkpoint:
         text = config.get("text_config", {})
         if not isinstance(text, dict):
             raise _refused("unknown quantization layout at text_config", mode, self)
-        if "omlx_quant_formats" in text:
-            raise _refused(
-                "unknown format layout at text_config.omlx_quant_formats", mode, self
-            )
         for prefix, holder in (("", config), ("text_config.", text)):
             for key in ("quantization", "quantization_config"):
                 if key not in holder:
@@ -497,8 +511,7 @@ class _Checkpoint:
                         valid = _layout_field(path, entry)
                     else:
                         valid = (
-                            bool(path)
-                            and all(path.split("."))
+                            all(path.split("."))
                             and isinstance(entry, dict)
                             and bool(entry)
                             and all(_layout_field(k, v) for k, v in entry.items())
@@ -508,23 +521,6 @@ class _Checkpoint:
                             f"unknown quantization layout at {field}", mode, self
                         )
 
-    def _quantizations(self) -> list[dict]:
-        """The quantization configs a library builds the checkpoint's layers
-        from: its config's own, under either key (oQ writes both), or else
-        its text model's."""
-        try:
-            config = self._read_config()
-        except (OSError, ValueError):
-            return []
-        if not isinstance(config, dict):
-            return []
-        text = config.get("text_config")
-        for holder in (config, text if isinstance(text, dict) else {}):
-            found = _quantizations(holder, text=False)
-            if found:
-                return found
-        return []
-
     def _in_format(self, mode) -> bool:
         """Whether a layer of ``mode`` is a format's: a mode that is not
         MLX's, or that the checkpoint records a format of."""
@@ -532,22 +528,13 @@ class _Checkpoint:
             not formats._mlx_runs(mode) or self.records(mode)
         )
 
-    def _recorded_top_mode(self) -> str | None:
-        """The mode of a quantization config itself (MLX's affine when it
-        names none), when it is a format's."""
-        for quantization in self._quantizations():
-            mode = quantization.get("mode", "affine")
-            if self._in_format(mode):
-                return mode
-        return None
-
-    def _format_entries(self) -> list[tuple[str, str]]:
+    def _format_entries(self, quants: list[dict]) -> list[tuple[str, str]]:
         """The layers the checkpoint's quantization configs name in a mode
         that is a format's, with that mode. An entry without a mode is
         MLX's affine, whatever its config's mode (MLX builds it so)."""
         entries = {
             (path, entry.get("mode", "affine"))
-            for quantization in self._quantizations()
+            for quantization in quants
             for path, entry in quantization.items()
             if isinstance(entry, dict) and self._in_format(entry.get("mode", "affine"))
         }
@@ -619,40 +606,58 @@ def _shown(path: Path) -> Path:
     return path
 
 
-def _named_modes(config: dict) -> list[str]:
-    """The modes a checkpoint's config records a format of, or else names in
-    its quantization configs (its text model's too) that are not MLX's."""
-    written = config.get("omlx_quant_formats")
-    if isinstance(written, dict) and written:
-        return sorted(k for k in written if isinstance(k, str) and k.strip())
-    named = [
-        mode
-        for quantization in _quantizations(config)
-        for mode in (
-            quantization.get("mode"),
-            *(
-                entry.get("mode")
-                for entry in quantization.values()
-                if isinstance(entry, dict)
-            ),
-        )
-    ]
-    return [
-        mode for mode in named if isinstance(mode, str) and not formats._mlx_runs(mode)
-    ]
+_QUANT_KEYS = ("quantization", "quantization_config")
 
 
-def _format_mode(config: dict) -> str | None:
-    """Name a format for admission, including a misplaced or damaged record."""
-    modes = _named_modes(config)
-    if modes:
-        return modes[0] if modes[0].strip() else "unknown"
-    if "omlx_quant_formats" in config:
-        return "unknown"
-    text = config.get("text_config")
-    if isinstance(text, dict) and "omlx_quant_formats" in text:
-        return next(iter(_named_modes(text)), "unknown")
-    return None
+def _format_markers(value, path=(), in_quant=False):
+    """Yield JSON locations of format records and non-MLX quantization modes."""
+    fields = value.items() if isinstance(value, dict) else enumerate(value)
+    for key, child in fields:
+        if key == "omlx_quant_formats":
+            names = (
+                sorted(k for k in child if isinstance(k, str) and k.strip())
+                if isinstance(child, dict)
+                else []
+            )
+            yield (*path, key), names[0] if names else None
+            # The format owns its record, including any similarly named fields.
+        elif in_quant and key == "mode" and isinstance(child, str):
+            if not formats._mlx_runs(child):
+                yield (*path, key), child if child.strip() else "unknown"
+        elif isinstance(child, (dict, list)):
+            yield from _format_markers(
+                child, (*path, key), in_quant or key in _QUANT_KEYS
+            )
+
+
+def _format_declaration(config) -> tuple[str | None, str | None]:
+    """Return the declared mode and the first unsupported declaration location."""
+    if not isinstance(config, (dict, list)):
+        return None, None
+    explicit = implicit = None
+    for path, mode in _format_markers(config):
+        if path == ("omlx_quant_formats",):
+            explicit = mode
+            continue
+        relative = path[1:] if path[0] == "text_config" else path
+        if (
+            relative[0] in _QUANT_KEYS
+            and relative[-1] == "mode"
+            and len(relative) in (2, 3)
+            and isinstance(relative[-2], str)
+        ):
+            implicit = implicit or mode
+        else:
+            return mode or "unknown", ".".join(map(str, path))
+    name = explicit or implicit
+    if name is None and isinstance(config, dict) and "omlx_quant_formats" in config:
+        name = "unknown"
+    return name, None
+
+
+def _format_mode(config) -> str | None:
+    """Admission to native readers depends only on the presence of a format."""
+    return _format_declaration(config)[0]
 
 
 def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
@@ -667,10 +672,11 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
         # No checkpoint's directory, or the library's to refuse: no format's
         # layer is built for it.
         return
+    declared = checkpoint._marked_mode()
     if not isinstance(config, dict):
         return
     if mode is None:
-        mode = _format_mode(config)
+        mode = declared
     if mode is None:
         return
     from .. import oq
@@ -692,14 +698,13 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     checkpoint.verified = True
 
 
-def _quantizations(config: dict, *, text: bool = True) -> list[dict]:
-    """The quantization configs of ``config``, under either key, and (with
-    ``text``) its text model's."""
-    inner = config.get("text_config") if text else None
+def _quantizations(config: dict) -> list[dict]:
+    """Account for declarations under both spellings in both supported holders."""
+    inner = config.get("text_config")
     return [
         quantization
         for holder in (config, inner if isinstance(inner, dict) else {})
-        for key in ("quantization", "quantization_config")
+        for key in _QUANT_KEYS
         if isinstance(quantization := holder.get(key), dict)
     ]
 
@@ -797,13 +802,7 @@ def _damaged(config: dict) -> bool:
 def refuse_format_checkpoint(path, loader: str, *, config=_ABSENT, reason=None) -> None:
     """Reject format weights before a reader outside the checked path opens them."""
     checkpoint = _Checkpoint(path, config=config)
-    try:
-        config = checkpoint._read_config()
-    except (OSError, ValueError):
-        return
-    if not isinstance(config, dict):
-        return
-    mode = _format_mode(config)
+    mode, _ = checkpoint._declaration
     if mode is not None:
         raise _refused(
             reason or f"the {loader} loader cannot read a quant format checkpoint",

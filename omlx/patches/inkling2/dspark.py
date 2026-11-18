@@ -317,10 +317,12 @@ _DRAFT_QUANT = {"group_size": 64, "bits": 8}
 
 
 def load_inkling2_dspark_model(model_path: str | Path) -> Inkling2DSparkModel:
+    from ..format_load import refuse_format_checkpoint
+
     path = Path(model_path)
-    config = Inkling2DSparkConfig.from_target_config(
-        json.loads((path / "config.json").read_text())
-    )
+    raw = json.loads((path / "config.json").read_text())
+    refuse_format_checkpoint(path, "Inkling 2 DSpark", config=raw)
+    config = Inkling2DSparkConfig.from_target_config(raw)
     model = Inkling2DSparkModel(config)
     weights = mx.load(str(path / DRAFT_FILENAME))
     model.load_weights(list(weights.items()), strict=True)

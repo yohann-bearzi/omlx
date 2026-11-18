@@ -36,7 +36,7 @@ def in_quant_format(config) -> bool:
     format's layer offloads none of its experts."""
     from .format_load import _format_mode
 
-    return isinstance(config, dict) and _format_mode(config) is not None
+    return _format_mode(config) is not None
 
 
 def moe_offload_compatibility(model_path):

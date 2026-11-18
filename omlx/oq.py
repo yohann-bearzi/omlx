@@ -7404,6 +7404,17 @@ def quantize_oq_streaming(
                 f"it without a quant format, or {fix}",
                 mode=quant_format,
             )
+        # Some checkpoints declare the native reader as their model type;
+        # others declare its ordinary backbone and ship the decision head.
+        native = normalized_model_type
+        if native not in {"mimo_v2", "mimo_v2_flash", "clef", "d1", "d3", "openjev"}:
+            native = decision_kind(source, config, use_name_hint=False)
+        if native:
+            raise FormatRefusedError(
+                f"oQ writes no {native} checkpoint in a quant format: its native "
+                "reader cannot load format layers; write it without a quant format",
+                mode=quant_format,
+            )
     if inkling2_layout.is_inkling2(config):
         # The model class is needed before any calibration load registers it.
         apply_inkling2_patch()

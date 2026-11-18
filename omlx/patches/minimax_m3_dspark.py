@@ -247,10 +247,12 @@ def sanitize_dspark_weights(weights: dict) -> dict:
 
 
 def load_minimax_dspark_model(path: str | Path) -> MiniMaxDSparkDraftModel:
+    from .format_load import refuse_format_checkpoint
+
     path = Path(path)
-    config = MiniMaxDSparkConfig.from_dict(
-        json.loads((path / "config.json").read_text())
-    )
+    raw = json.loads((path / "config.json").read_text())
+    refuse_format_checkpoint(path, "MiniMax DSpark", config=raw)
+    config = MiniMaxDSparkConfig.from_dict(raw)
     model = MiniMaxDSparkDraftModel(config)
     weights = {}
     for shard in sorted(path.glob("*.safetensors")):
