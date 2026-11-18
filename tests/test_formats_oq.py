@@ -880,9 +880,10 @@ def test_a_family_neither_stock_nor_verified_is_refused(
         oq.quantize_oq_streaming(
             str(source), str(output), 4, enhanced=True, quant_format="toy"
         )
+    fix = "name its model type in its config" if family == "untyped" else None
     assert str(refusal.value) == (
         f"quant format 'toy': oQ writes no {family} checkpoint in it: {why}; "
-        "write it without a quant format, or have the family verified"
+        f"write it without a quant format, or {fix or 'have the family verified'}"
     )
     assert refusal.value.mode == "toy" and refusal.value.path is None
     # The page quotes it, of the same family or one of its kind.
@@ -974,28 +975,51 @@ def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
         testing.verified("d1")(lambda: (yield))
 
 
-def test_blocks_of_verified_close_in_any_order_in_any_thread():
-    import threading
+def test_blocks_of_verified_close_in_any_order_in_any_thread(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
 
-    before = oq._TEST_VERIFIED
     opened, closed = threading.Event(), threading.Event()
+
+    def written(model_type):
+        return oq._unverified_family(tmp_path, {"model_type": model_type}) is None
 
     def other():
         with testing.verified("minimax_m3_vl"):
             opened.set()
             assert closed.wait(60)
             # The other thread's block closed first: this one's holds.
-            assert "minimax_m3_vl" in oq._TEST_VERIFIED
-            assert "qwen4_exp" not in oq._TEST_VERIFIED
+            return written("minimax_m3_vl"), written("qwen4_exp")
 
-    thread = threading.Thread(target=other)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        try:
+            with testing.verified("qwen4_exp"):
+                running = pool.submit(other)
+                assert opened.wait(60)
+                assert written("qwen4_exp") and written("minimax_m3_vl")
+        finally:
+            closed.set()
+        assert running.result(timeout=60) == (True, False)
+    assert not written("qwen4_exp") and not written("minimax_m3_vl")
+
+
+def test_verified_decorates_test_functions_only(monkeypatch, tmp_path):
+    with pytest.raises(TypeError, match="decorates a test function"):
+
+        @testing.verified("qwen4_exp")
+        class TestToyFormat:
+            pass
+
+    with pytest.raises(TypeError, match="decorates a test function"):
+        testing.verified("qwen4_exp")(pytest.fixture(lambda: None))
+    with pytest.raises(TypeError, match="not a bare"):
+        testing.verified(" ")
+    # What oMLX ships as verified stays so, inside a block and out.
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen4_exp"}))
+    config = {"model_type": "qwen4_exp"}
+    assert oq._unverified_family(tmp_path, config) is None
     with testing.verified("qwen4_exp"):
-        thread.start()
-        assert opened.wait(60)
-        assert {"qwen4_exp", "minimax_m3_vl"} <= oq._TEST_VERIFIED
-    closed.set()
-    thread.join(60)
-    assert before == oq._TEST_VERIFIED
+        assert oq._unverified_family(tmp_path, config) is None
+    assert oq._unverified_family(tmp_path, config) is None
 
 
 @pytest.fixture(scope="module")

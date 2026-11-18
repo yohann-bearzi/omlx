@@ -131,6 +131,8 @@ class _Checkpoint:
 
     def _accepted(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """``read`` the first time, under ``_ACCEPTING``."""
+        # Whatever the config named: a format's layer is being built.
+        _refuse_family(self, fmt.mode)
         plugin = formats.origin(fmt.mode) or "the plugin"
         record = self._record(fmt.mode)
         kept = _state(fmt)
@@ -520,28 +522,63 @@ def _shown(path: Path) -> Path:
     return path
 
 
-def _refuse_family(checkpoint: _Checkpoint) -> None:
-    """Refuse, before the library reads a weight, a checkpoint that records a
-    quant format and is of a family oQ writes in none (neither stock nor
-    verified): whoever wrote it (a plugin's own writer, a config edited by
-    hand), the family's own code would read the format's layers wrongly."""
+def _named_modes(config: dict) -> list[str]:
+    """The modes a checkpoint's config records a format of, or names in its
+    quantization config (its text model's too) that are not MLX's."""
+    modes = []
+    written = config.get("omlx_quant_formats")
+    if isinstance(written, dict):
+        modes += sorted(written)
+    text = config.get("text_config")
+    for holder in (config, text if isinstance(text, dict) else {}):
+        for key in ("quantization", "quantization_config"):
+            quantization = holder.get(key)
+            if not isinstance(quantization, dict):
+                continue
+            named = [quantization.get("mode")] + [
+                entry.get("mode")
+                for entry in quantization.values()
+                if isinstance(entry, dict)
+            ]
+            modes += [
+                mode
+                for mode in named
+                if isinstance(mode, str) and not formats._mlx_runs(mode)
+            ]
+    return modes
+
+
+def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
+    """Refuse a checkpoint of a quant format (one it records, or names in its
+    quantization config, or ``mode``, a format's layer being built for it)
+    whose family is not verified: whoever wrote it (a plugin's own writer, a
+    config edited by hand), the family's own code would read the format's
+    layers wrongly. A load asks before the library reads a weight."""
     try:
         config = checkpoint._read_config()
     except (OSError, ValueError):
         # No checkpoint's directory, or the library's to refuse.
         return
-    written = config.get("omlx_quant_formats") if isinstance(config, dict) else None
-    if not isinstance(written, dict) or not written:
+    if not isinstance(config, dict):
+        return
+    modes = [mode] if mode is not None else _named_modes(config)
+    if not modes:
         return
     from .. import oq
 
-    refused = oq._unverified_family(checkpoint.path, config)
+    # The checkpoint a view of links is of: its sidecars and its name are
+    # the decision model's family.
+    refused = oq._unverified_family(checkpoint.shown, config)
     if refused is not None:
         family, why = refused
+        fix = (
+            "name its model type in its config"
+            if family == "untyped"
+            else "have the family verified"
+        )
         raise _refused(
-            f"oMLX loads no {family} checkpoint in a quant format: {why}; have "
-            "the family verified",
-            sorted(written)[0],
+            f"oMLX loads no {family} checkpoint in a quant format: {why}; {fix}",
+            modes[0],
             checkpoint,
         )
 
@@ -634,10 +671,12 @@ def _unwrapped_loader() -> str | None:
         found = (frame.f_globals.get("__name__"), frame.f_code.co_name)
         if found in _LOADERS:
             caller = frame.f_back
-            if caller is not None and caller.f_code in _LOADER_CODES:
-                # The wrapped one, run by this patch's loader: the layer was
-                # built outside its load (a family's outside_load).
-                return None
+            while caller is not None:
+                if caller.f_code in _LOADER_CODES:
+                    # Under this patch's loader (a family's loader between):
+                    # the layer was built outside its load (outside_load).
+                    return None
+                caller = caller.f_back
             return ".".join(found)
         frame = frame.f_back
     return None
@@ -762,15 +801,23 @@ _LOADER_CODES: set = set()
 
 
 def _wrapped_already(load) -> bool:
-    """Whether ``load``, or a function it wraps (``__wrapped__``), is this
-    patch's loader."""
-    seen = set()
-    while load is not None and id(load) not in seen:
+    """Whether ``load``, or a function it wraps, is this patch's loader: by
+    ``__wrapped__`` (functools.wraps, K2 Horizon's) or ``_omlx_original``
+    (MiniMax M3's). A function that only calls one (DeepSeek V4's loader)
+    runs its own body outside the load, and is wrapped by name."""
+    seen, pending = set(), [load]
+    while pending:
+        load = pending.pop()
+        if load is None or id(load) in seen:
+            continue
         seen.add(id(load))
         code = getattr(load, "__code__", None)
         if code is _through.__code__ or code in _LOADER_CODES:
             return True
-        load = getattr(load, "__wrapped__", None)
+        pending += [
+            getattr(load, "__wrapped__", None),
+            getattr(load, "_omlx_original", None),
+        ]
     return False
 
 

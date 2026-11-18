@@ -170,7 +170,7 @@ def by_hand(toy, tmp_path_factory):
     """The test builds layers by hand as the load of a checkpoint with no
     record would."""
     bare = tmp_path_factory.mktemp("bare")
-    (bare / "config.json").write_text("{}")
+    (bare / "config.json").write_text(json.dumps({"model_type": "llama"}))
     with format_load.loading(bare):
         yield toy
 
@@ -421,13 +421,65 @@ def test_a_checkpoint_of_a_family_oq_writes_no_format_of_is_refused_at_load(
         "family verified",
         tmp_path,
     )
-    # One without a format's record is the library's.
-    del config["omlx_quant_formats"]
+    # One that records and names no format is the library's.
+    del config["omlx_quant_formats"], config["quantization"][_GATE]
     typed = {**config, "model_type": model_type}
     (tmp_path / "config.json").write_text(json.dumps(typed))
     with pytest.raises(Exception) as other:
         load_model(tmp_path)
     assert not isinstance(other.value, formats.FormatRefusedError)
+
+
+def test_a_format_of_an_unverified_family_is_refused_however_it_is_named(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    config = json.loads((tmp_path / "config.json").read_text())
+    # No record: its quantization config names the format.
+    del config["omlx_quant_formats"]
+    raon = {**config, "model_type": "raon1_mini"}
+    (tmp_path / "config.json").write_text(json.dumps(raon))
+    with pytest.raises(formats.FormatRefusedError, match="loads no raon1_mini"):
+        load_model(tmp_path)
+    # Nor does its config: the load is handed it (a model_config).
+    del raon["quantization"][_GATE]
+    (tmp_path / "config.json").write_text(json.dumps(raon))
+    named = {"quantization": {**raon["quantization"], _GATE: _TOY}}
+    with pytest.raises(formats.FormatRefusedError, match="loads no raon1_mini"):
+        load_model(
+            tmp_path,
+            model_config=named,
+            get_model_classes=lambda config: (llama.Model, llama.ModelArgs),
+        )
+    # One that names no model type is told to name it.
+    untyped = _typed({"toy": {}}) | {"model_type": ""}
+    (tmp_path / "config.json").write_text(json.dumps(untyped))
+    with pytest.raises(formats.FormatRefusedError, match="; name its model type"):
+        format_load._refuse_family(format_load._Checkpoint(tmp_path))
+
+
+def test_the_modes_a_config_names():
+    config = {
+        "omlx_quant_formats": {"oqel": {}},
+        "quantization": {"mode": "affine", "a": {"mode": "toy"}, "b": {}},
+        "text_config": {"quantization_config": {"mode": "other"}},
+    }
+    assert format_load._named_modes(config) == ["oqel", "toy", "other"]
+
+
+def test_a_view_of_a_decision_model_is_refused_as_its_family(toy, tmp_path):
+    clef = tmp_path / "clef"
+    clef.mkdir()
+    config = _typed({"toy": {}}) | {"model_type": "qwen3_5"}
+    (clef / "config.json").write_text(json.dumps(config))
+    for name in ("joint_head.safetensors", "joint_head_config.json"):
+        (clef / name).write_text("{}")
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").symlink_to(clef / "config.json")
+    with (
+        testing.verified("qwen3_5"),
+        pytest.raises(formats.FormatRefusedError, match="loads no clef"),
+    ):
+        format_load._refuse_family(format_load._Checkpoint(view))
 
 
 @pytest.mark.parametrize(
@@ -794,9 +846,7 @@ def test_a_loader_is_wrapped_once_whoever_applies_the_patch(unpatched, monkeypat
     assert [loader.__wrapped__ for loader in loaders] == owns
 
 
-def test_a_library_loader_that_is_no_function_fails_every_load(
-    unpatched, monkeypatch
-):
+def test_a_library_loader_that_is_no_function_fails_every_load(unpatched, monkeypatch):
     import functools
     import types
 
@@ -807,8 +857,17 @@ def test_a_library_loader_that_is_no_function_fails_every_load(
         format_load, "_LOADERS", (*format_load._LOADERS, ("changed", "load_model"))
     )
     format_load._PENDING.add("changed")
-    with pytest.raises(TypeError, match=r"changed\.load_model is a partial, not a"):
+    partial = r"changed\.load_model is a partial"
+    with pytest.raises(formats.LoadHookError, match=partial):
         format_load.apply_format_load_patch()
+    # The VLM engine's load lets it through.
+    import asyncio
+
+    from omlx.engine.vlm import VLMBatchedEngine
+
+    format_load._PENDING.add("changed")
+    with pytest.raises(formats.LoadHookError):
+        asyncio.run(VLMBatchedEngine("/models/none").start())
 
 
 def test_a_model_load_applies_the_patch(unpatched, tmp_path):
@@ -2064,6 +2123,45 @@ def test_a_family_s_loader_over_the_wrapped_one_is_left_as_it_is(
     format_load._PENDING.add("mlx_lm.utils")
     format_load.apply_format_load_patch()
     assert mlx_lm.utils.load_model is family_s
+
+
+def test_a_family_s_loader_that_keeps_the_wrapped_one_is_left(
+    toy, tmp_path, monkeypatch
+):
+    # MiniMax M3's keeps the library's (wrapped in place) as _omlx_original.
+    def kept(*args, **kwargs):
+        return None
+
+    kept._omlx_original = mlx_lm.utils.load_model
+    monkeypatch.setattr(mlx_lm.utils, "load_model", kept)
+    format_load._PENDING.add("mlx_lm.utils")
+    format_load.apply_format_load_patch()
+    # Neither by its name nor in place.
+    assert mlx_lm.utils.load_model is kept and not _wrapped(kept)
+
+
+def test_a_layer_built_outside_a_load_under_a_family_s_loader_is_not_blamed(
+    unpatched, tmp_path, monkeypatch
+):
+    early = mlx_lm.utils.load_model
+
+    def family_s(*args, **kwargs):
+        return early(*args, **kwargs)
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", family_s)
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
+    format_load.apply_format_load_patch()
+    _llama(tmp_path, **_written({}))
+
+    def classes(config):
+        with format_load.outside_load():
+            nn.Linear(64, 128).to_quantized(**_TOY)
+        return llama.Model, llama.ModelArgs
+
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        mlx_lm.utils.load_model(tmp_path, get_model_classes=classes)
+    assert refusal.value.reason.startswith("a layer is built outside a checkpoint's")
 
 
 def test_a_layer_built_outside_a_wrapped_load_is_not_blamed_on_an_import(toy, tmp_path):

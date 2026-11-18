@@ -90,7 +90,9 @@ class _Verified:
     """A block of ``verified``, and the decorator it is."""
 
     def __init__(self, *families: str):
-        if not families or not all(isinstance(family, str) for family in families):
+        if not families or not all(
+            isinstance(family, str) and family.strip() for family in families
+        ):
             raise TypeError(
                 "testing.verified takes the model types it verifies: "
                 "@verified('qwen3_5_moe_text'), not a bare @verified"
@@ -111,6 +113,11 @@ class _Verified:
             _publish()
 
     def __call__(self, test):
+        if not inspect.isfunction(test) or hasattr(test, "_pytestfixturefunction"):
+            raise TypeError(
+                "testing.verified decorates a test function: a class's tests "
+                "and a fixture open a block of it (with verified(...):)"
+            )
         if inspect.isgeneratorfunction(test) or inspect.isasyncgenfunction(test):
             raise TypeError(
                 "testing.verified decorates a test; a fixture opens a block of "

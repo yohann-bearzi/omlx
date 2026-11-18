@@ -1609,9 +1609,10 @@ class TestVLMFallback:
 
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("first_fails", [False, True], ids=["first", "fallback"])
+    @pytest.mark.parametrize("force_lm", [False, True], ids=["vlm", "force_lm"])
+    @pytest.mark.parametrize("first_fails", [False, True], ids=["fallback", "first"])
     async def test_a_load_hook_that_cannot_wrap_fails_every_load(
-        self, small_mock_model_dir, first_fails
+        self, small_mock_model_dir, first_fails, force_lm
     ):
         """oMLX's load hook unable to wrap a library's loader: no other
         library's load runs after it."""
@@ -1629,12 +1630,14 @@ class TestVLMFallback:
         )
         first.stop = AsyncMock()
         second.start = AsyncMock(side_effect=error)
+        first_cls = "BatchedEngine" if force_lm else "VLMBatchedEngine"
+        second_cls = "VLMBatchedEngine" if force_lm else "BatchedEngine"
         with (
-            patch("omlx.engine_pool.VLMBatchedEngine", return_value=first),
-            patch("omlx.engine_pool.BatchedEngine", return_value=second),
+            patch(f"omlx.engine_pool.{first_cls}", return_value=first),
+            patch(f"omlx.engine_pool.{second_cls}", return_value=second),
             pytest.raises(ModelUnavailableError) as excinfo,
         ):
-            await pool._load_engine("model-a")
+            await pool._load_engine("model-a", force_lm=force_lm)
 
         assert excinfo.value.__cause__ is error
         assert second.start.await_count == (0 if first_fails else 1)

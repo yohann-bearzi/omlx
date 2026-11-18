@@ -4354,8 +4354,9 @@ class EnginePool:
                     # tail of the Splash log. There is no MLX fallback.
                     raise
                 if isinstance(start_error, (FormatRefusedError, LoadHookError)):
-                    # A checkpoint's quant format refused: the other library
-                    # would load the same layers and meet the same refusal.
+                    # A checkpoint's quant format refused, or oMLX's load hook
+                    # unable to wrap a library's loader: the other library
+                    # would meet the same.
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
@@ -4389,7 +4390,8 @@ class EnginePool:
                         if isinstance(
                             fallback_error, (FormatRefusedError, LoadHookError)
                         ):
-                            # The other library's load of it was refused.
+                            # The other library's load of it was refused, or
+                            # could not be wrapped.
                             raise
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -4430,7 +4432,8 @@ class EnginePool:
                         if isinstance(
                             fallback_error, (FormatRefusedError, LoadHookError)
                         ):
-                            # The other library's load of it was refused.
+                            # The other library's load of it was refused, or
+                            # could not be wrapped.
                             raise
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "

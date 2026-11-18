@@ -39,7 +39,7 @@ try:
     from mlx_lm.models.base import create_attention_mask
     from mlx_lm.utils import _get_classes
 
-    from omlx.formats import FormatRefusedError
+    from omlx.formats import FormatRefusedError, LoadHookError
     from omlx.patches import minimax_m3_dspark as minimax_dspark
     from omlx.patches.format_load import check_loaded
     from omlx.patches.inkling2 import apply_inkling2_patch
@@ -7399,9 +7399,14 @@ def quantize_oq_streaming(
     if quant_fmt is not None:
         refused = _unverified_family(source, config)
         if refused is not None:
+            fix = (
+                "name its model type in its config"
+                if refused[0] == "untyped"
+                else "have the family verified"
+            )
             raise FormatRefusedError(
                 f"oQ writes no {refused[0]} checkpoint in it: {refused[1]}; write "
-                "it without a quant format, or have the family verified",
+                f"it without a quant format, or {fix}",
                 mode=quant_format,
             )
     if inkling2_layout.is_inkling2(config):
@@ -7807,7 +7812,7 @@ def quantize_oq_streaming(
                     seq_length=256,
                     trust_remote_code=trust_remote_code,
                 )
-            except FormatRefusedError:
+            except (FormatRefusedError, LoadHookError):
                 raise
             except Exception as e:
                 raise RuntimeError(
@@ -11778,7 +11783,7 @@ def _calibration_model(model_path, config, *, trust_remote_code=False):
                     trust_remote_code=trust_remote_code,
                     model_config=_sensitivity_lm_config_override(config, model_path),
                 )
-        except FormatRefusedError:
+        except (FormatRefusedError, LoadHookError):
             raise
         except Exception as e:
             logger.error("oQe imatrix: model load failed (%s)", e)
@@ -12163,7 +12168,7 @@ def _measure_sensitivity(
                 trust_remote_code=trust_remote_code,
                 model_config=_sensitivity_lm_config_override(config, model_path),
             )
-    except FormatRefusedError:
+    except (FormatRefusedError, LoadHookError):
         raise
     except Exception as e:
         logger.error(f"Sensitivity measurement: model load failed ({e})")
@@ -12665,7 +12670,7 @@ def _measure_sensitivity_from_quantized_model(
                 lazy=True,
                 trust_remote_code=trust_remote_code,
             )
-    except FormatRefusedError:
+    except (FormatRefusedError, LoadHookError):
         raise
     except Exception as e:
         logger.error(f"Sensitivity proxy load failed ({e})")
