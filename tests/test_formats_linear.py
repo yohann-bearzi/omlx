@@ -654,6 +654,130 @@ def test_a_tensor_of_float64_is_no_face_and_the_layer_runs_composed(
     dot_defects.clear()  # expected
 
 
+class _StackableToy(_ToyFormat):
+    """The toy with its layout: codes (n, k), one float32 scale a row."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+
+
+class _ColumnScaled(_StackableToy):
+    """Scales of each column: not a row's alone."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n, k), mx.uint8), "scales": ((k,), mx.float32)}
+
+
+class _GlobalScaled(_StackableToy):
+    """One scale for the matrix, kept as a row of one: its first axis is not N
+    once stacked."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n, k), mx.uint8), "scales": ((1,), mx.float32)}
+
+
+class _RowsLeak(_StackableToy):
+    """A layout of rows and a decode that is not: each row scaled by the
+    matrix's largest scale."""
+
+    def decode(self, tensors, bits, group_size):
+        codes = tensors["weight"].astype(mx.float32) - 128.0
+        return codes * mx.max(tensors["scales"])
+
+
+class _PaddedScales(_StackableToy):
+    """Scales padded to 100 rows: doubled, the layout reads as a stack."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n, k), mx.uint8), "scales": ((max(n, 100),), mx.float32)}
+
+
+class _SquareScales(_StackableToy):
+    """Scales (n, n): N first, and not the same with 2N."""
+
+    def layout(self, k, n, bits, group_size):
+        return {"weight": ((n, k), mx.uint8), "scales": ((n, n), mx.float32)}
+
+
+class _HalfScalesWhenStacked(_StackableToy):
+    def layout(self, k, n, bits, group_size):
+        dtype = mx.float16 if n > 100 else mx.float32
+        return {"weight": ((n, k), mx.uint8), "scales": ((n,), dtype)}
+
+
+class _OneMoreWhenStacked(_StackableToy):
+    def layout(self, k, n, bits, group_size):
+        layout = super().layout(k, n, bits, group_size)
+        return {**layout, "gains": ((n,), mx.float32)} if n > 100 else layout
+
+
+class _EmptyLayout(_StackableToy):
+    def layout(self, k, n, bits, group_size):
+        return {}
+
+
+class _LayoutRaises(_StackableToy):
+    def layout(self, k, n, bits, group_size):
+        raise _OwnError("no layout")
+
+
+def test_a_format_s_matrices_stack_as_its_layout_says(caplog, dot_defects):
+    """formats.stackable reads the layout: every tensor's first axis is N,
+    and the layout of 2N is the same with 2N. No layout, or one that
+    raises (logged once), is no stacking."""
+    assert formats.stackable(_StackableToy(), 320, 72, 8, 1)
+    assert not formats.stackable(_ToyFormat(), 320, 72, 8, 1)  # no layout
+    assert not formats.stackable(_ColumnScaled(), 320, 72, 8, 1)
+    assert not formats.stackable(_GlobalScaled(), 320, 72, 8, 1)
+    for fmt in (
+        _PaddedScales(),  # not N first
+        _SquareScales(),  # not the same with 2N
+        _HalfScalesWhenStacked(),  # another dtype
+        _OneMoreWhenStacked(),  # another tensor
+        _EmptyLayout(),  # no tensor at all
+    ):
+        assert not formats.stackable(fmt, 320, 72, 8, 1), type(fmt).__name__
+    with caplog.at_level(logging.ERROR, logger=formats.__name__):
+        for _ in range(2):
+            assert not formats.stackable(_LayoutRaises(), 320, 72, 8, 1)
+    assert len(caplog.records) == 1
+    assert dot_defects == {("toy", "_OwnError('no layout')")}
+    dot_defects.clear()  # expected
+
+
+def test_rows_stack_checks_a_format_s_promise(toy, monkeypatch):
+    """testing.rows_stack: two matrices stacked decode, and run their dot
+    rows, as the two do apart. A format whose decode mixes rows fails it,
+    and so does one its layout does not let stack."""
+    face = _toy("stack")
+    first, second = (
+        dict(zip(("weight", "scales"), _matrix(8, 320, seed)[0], strict=True))
+        for seed in (1, 2)
+    )
+    second["scales"] = second["scales"] * 4  # another largest scale
+    x = _ints((320,))
+    toy(face)
+    fmt = _StackableToy(face)
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    testing.rows_stack(fmt, first, second, 320, 8, 1, x)
+    leak = _RowsLeak(face)
+    monkeypatch.setitem(formats._FORMATS, "toy", leak)
+    with pytest.raises(AssertionError, match="decode of two stacked matrices"):
+        testing.rows_stack(leak, first, second, 320, 8, 1)
+    with pytest.raises(AssertionError, match="not stackable at n=8, k=320"):
+        testing.rows_stack(_ToyFormat(face), first, second, 320, 8, 1)
+    # A face that scales every row by its matrix's first scale: its decode
+    # keeps the rows apart, its dot rows do not.
+    first_scale = _toy(
+        "first_scale", source=_TOY.replace("s(m.scales + row)", "s(m.scales)")
+    )
+    fmt = _StackableToy(first_scale)
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    testing.rows_stack(fmt, first, second, 320, 8, 1)
+    with pytest.raises(AssertionError, match="dot rows of two stacked matrices"):
+        testing.rows_stack(fmt, first, second, 320, 8, 1, x)
+
+
 def test_a_format_oMLX_does_not_know_runs_in_a_linear(toy, monkeypatch):  # noqa: N802
     toy(_toy("linear"))
     # K = 320: one whole block of the toy face, then a last block of 8 lanes.

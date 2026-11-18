@@ -476,3 +476,30 @@ def test_the_fast_face_refuses_a_k_that_is_not_whole_blocks():
     )
     with pytest.raises(RuntimeError, match="affine qmv_fast face: K must be whole"):
         mx.eval(rows)
+
+
+@metal
+@pytest.mark.parametrize(
+    "bits,group_size,k",
+    [(4, 64, 1024), (4, 64, 640), (8, 64, 512), (5, 32, 640), (6, 128, 1024)],
+)
+def test_affine_cursors_may_be_placed_at_any_lane_index(bits, group_size, k):
+    """Its scale pointer is the lane's group, by integer division: a cursor
+    at any lane index, inside a group too, reads the stepped one's bits."""
+    linear = _linear(k, 16, bits, group_size)
+    face = formats.dot(linear, k, 16)
+    x = (mx.random.normal((k,)) * 0.5).astype(mx.bfloat16)
+    stepped, placed = testing.lane_parts(face, _operands(face, linear), x, 16)
+    assert _bit_equal(stepped, placed) and placed.any().item()
+
+
+@metal
+@pytest.mark.parametrize(
+    "bits,group_size,k", [(4, 64, 1024), (4, 64, 640), (8, 32, 512)]
+)
+def test_affine_s_finish_is_the_sum(bits, group_size, k):
+    linear = _linear(k, 16, bits, group_size)
+    face = formats.dot(linear, k, 16)
+    sums = mx.array([0.0, 1.0, -1.0, 2.0, 4.0, 0.5, 2.0**-20, 1024.0])
+    got = testing.finish_rows(face, _operands(face, linear), k, 16, sums, mx.bfloat16)
+    assert mx.array_equal(got, mx.broadcast_to(sums, got.shape)).item()

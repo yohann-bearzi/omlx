@@ -591,6 +591,46 @@ _DOT_DEFECTS: set[tuple[str, str]] = set()
 _NOTING = threading.Lock()
 
 
+def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> bool:
+    """Whether ``fmt``'s ``(n, k)`` matrices may be stacked along N: one
+    matrix of 2N rows over two of N, as a fused gate and up projection is.
+    The rows rule (docs/quant-formats.md): it holds for a format whose
+    ``layout(k, n, ...)`` has N as the first axis of every tensor, and whose
+    ``layout(k, 2n, ...)`` is the same with 2N; such a format promises that
+    a row of the decoded matrix depends on that row of each tensor alone
+    (``testing.rows_stack`` checks it). A format with no layout, or whose
+    ``layout`` raises (logged once), is not stackable."""
+    try:
+        one = fmt.layout(k, n, bits, group_size)
+        two = fmt.layout(k, 2 * n, bits, group_size)
+        return (
+            bool(one)
+            and isinstance(two, dict)
+            and two.keys() == one.keys()
+            and all(
+                len(shape) >= 1
+                and shape[0] == n
+                and tuple(two[name][0]) == (2 * n, *shape[1:])
+                and two[name][1] == dtype
+                for name, (shape, dtype) in one.items()
+            )
+        )
+    except Exception as error:
+        defect = (fmt.mode, repr(error))
+        with _NOTING:
+            defects = _DOT_DEFECTS
+            new = defect not in defects
+            defects.add(defect)
+        if new:
+            logger.exception(
+                "quant format %s gave no usable layout for (n=%s, k=%s); not stacked",
+                fmt.mode,
+                n,
+                k,
+            )
+        return False
+
+
 def dot(layer, k: int, n: int) -> Dot | None:
     """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None when
     its format (``layer.mode``) is unknown or has none for it.

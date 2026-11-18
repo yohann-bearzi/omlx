@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checks for a format's tests. ``dot_rows`` runs a face in the skeletons
 oMLX's kernels are built from, outside any model, ``shared_rows`` runs
-several vectors through ``decode`` and ``apply``, and ``tile_rows`` reads
-every weight of rows through a tile face. ``staged_tables`` reads a face's
-tables back as a kernel stages them. ``no_dot_defects`` fails a test in
+several vectors through ``decode`` and ``apply``, ``lane_parts`` reads each
+lane's part of rows through cursors stepped and placed, ``finish_rows``
+gives ``finish`` sums to scale, ``rows_stack`` checks the rows rule's
+promise of a format, and ``tile_rows`` reads every weight of rows through
+a tile face. ``staged_tables`` reads a face's tables back as a kernel
+stages them. ``no_dot_defects`` fails a test in
 which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
 where format layers' rows ran: their face's launch, or the format's decode.
 ``fresh_proofs`` gives a test proofs of its own. ``verified`` has oQ take model families
@@ -27,6 +30,7 @@ import mlx.core as mx
 
 from .. import formats
 from . import Dot, Tile, kernels
+from .linear import FormatLinear
 
 # One threadgroup of one simdgroup per NA + NB rows. The rows read x where
 # the kernel has it (XS): in device memory, or staged in threadgroup memory.
@@ -361,6 +365,186 @@ def shared_rows(
         output_shapes=[(rows, n)],
         output_dtypes=[x.dtype],
     )[0]
+
+
+# Each lane's part of rows: madd(0, row(0)) over the VPT inputs of lane
+# index j = 32 * b + l. STEPPED: lane l's cursor, stepped b blocks, as the
+# row skeleton walks it. Else: a cursor built at j, in thread j, as a kernel
+# that splits K or walks a row in one thread builds it.
+_LANE_PARTS_HEADER = r"""
+template <typename T, int K, bool STEPPED, typename D>
+METAL_FUNC void omlx_lane_parts(
+    D m, size_t row, uint at, const device T* x, device float* parts) {
+  using L = typename D::template Lanes<K>;
+  constexpr int J = K / L::VPT;
+  float xt[L::VPT];
+  parts += row * K;
+  if constexpr (STEPPED) {
+    L a(m, row, at);
+    for (int j = int(at); j < J; j += 32) {
+      const auto aux = L::load(x + j * L::VPT, xt);
+      parts[j] = L::madd(0.0f, a.row(0), xt, aux);
+      a.step();
+    }
+  } else if (int(at) < J) {
+    const L c(m, row, at);
+    const auto aux = L::load(x + int(at) * L::VPT, xt);
+    parts[at] = L::madd(0.0f, c.row(0), xt, aux);
+  }
+}
+"""
+
+
+@cache
+def _lane_parts_kernel(face: Dot, stepped: bool):
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("m", face)]
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_lane_parts_{face.key}",
+        input_names=inputs,
+        output_names=["parts"],
+        header=matrices.header + _LANE_PARTS_HEADER,
+        source=matrices.declarations
+        + "omlx_lane_parts<T, K, STEPPED>(m, size_t(thread_position_in_grid.y), "
+        "thread_position_in_grid.x, x, parts);\n",
+    )
+
+
+def lane_parts(face: Dot, operands, x: mx.array, n: int) -> tuple[mx.array, mx.array]:
+    """Each lane's part of the first ``n`` rows of a matrix, read twice:
+    ``madd(0, row(0), xt, aux)`` over the ``VPT`` inputs of each lane index
+    ``j = 32 * b + l``, by lane ``l``'s cursor stepped ``b`` blocks, as the
+    row skeleton walks it, and by a cursor built at ``j``, in a thread of
+    its own. A face that keeps the cursor rule gives the two the same bits.
+
+    Returns two float32 arrays of shape ``(n, K)``: column ``j`` holds lane
+    index ``j``'s part for ``j`` below ``K / VPT``, zeros after.
+    ``operands`` and ``x`` are as ``dot_rows`` takes them; ``n`` is one or
+    more and no more than the matrix's rows (not checked)."""
+    operands = _checked(face, operands, x)
+    if n <= 0:
+        raise ValueError(f"n={n}: one row or more")
+    k = x.shape[-1]
+    return tuple(
+        _lane_parts_kernel(face, stepped)(
+            inputs=[x, *operands],
+            template=[("T", x.dtype), ("K", k), ("STEPPED", stepped)],
+            grid=(32 if stepped else k, n, 1),
+            threadgroup=(32, 1, 1),
+            output_shapes=[(n, k)],
+            output_dtypes=[mx.float32],
+            init_value=0,
+        )[0]
+        for stepped in (True, False)
+    )
+
+
+# finish(0, sums[i]) of row `row`, in each lane. finish reads nothing that
+# step() moves, so the cursor is where the lane starts.
+_FINISH_ROWS_HEADER = r"""
+template <typename T, int K, int S, typename D>
+METAL_FUNC void omlx_finish_rows(
+    D m, size_t row, uint lane, const device float* sums, device float* out) {
+  using L = typename D::template Lanes<K>;
+  const L a(m, row, lane);
+  out += (row * 32 + lane) * S;
+  for (int i = 0; i < S; i++) {
+    out[i] = a.finish(0, sums[i]);
+  }
+}
+"""
+
+
+@cache
+def _finish_rows_kernel(face: Dot):
+    matrices = kernels.Matrices()
+    inputs = ["sums", *matrices.add("m", face)]
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_finish_rows_{face.key}",
+        input_names=inputs,
+        output_names=["out"],
+        header=matrices.header + _FINISH_ROWS_HEADER,
+        source=matrices.declarations
+        + "omlx_finish_rows<T, K, S>(m, size_t(thread_position_in_grid.y), "
+        "thread_position_in_grid.x, sums, out);\n",
+    )
+
+
+def finish_rows(
+    face: Dot, operands, k: int, n: int, sums: mx.array, dtype: mx.Dtype
+) -> mx.array:
+    """``finish(0, s)`` of each of the first ``n`` rows of a matrix of K
+    inputs, for each sum ``s`` in ``sums`` (8 or more float32 values), in
+    each of a simdgroup's 32 lanes: a float32 array of shape ``(n, 32,
+    len(sums))``. ``finish`` is
+    a scale: ``finish(r, s)`` is ``s`` times a value of the row alone, the
+    same in every lane. The kernel is compiled for ``face``, ``dtype`` (a
+    dtype the face is exact for), K and the count of sums; ``operands`` are
+    as ``dot_rows`` takes them."""
+    if sums.ndim != 1 or sums.dtype != mx.float32 or sums.size < 8:
+        raise ValueError(
+            f"sums are 8 or more float32 values, not {sums.dtype} {sums.shape}"
+        )
+    operands = _checked(face, operands, mx.zeros((max(k, 8),), dtype))
+    if k <= 0 or n <= 0:
+        raise ValueError(f"k={k}, n={n}: one input and one row or more")
+    return _finish_rows_kernel(face)(
+        inputs=[sums, *operands],
+        template=[("T", dtype), ("K", k), ("S", sums.size)],
+        grid=(32, n, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(n, 32, sums.size)],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
+def rows_stack(
+    fmt, first: dict, second: dict, k: int, bits: int, group_size: int, x=None
+) -> None:
+    """Checks the rows rule's promise for two ``(n, k)`` matrices of ``fmt``
+    (their ``weight`` and the format's tensors, by name, as ``layout`` gives
+    them): stacked along N, their decode is the two decodes one after the
+    other, bit for bit, and with ``x`` (K activations of a dtype the face is
+    exact for) so are their dot face's rows. Raises an ``AssertionError``
+    that names what differs, or that the format is not ``stackable``."""
+    n = first["weight"].shape[0]
+    if not formats.stackable(fmt, k, n, bits, group_size):
+        raise AssertionError(f"quant format {fmt.mode}: not stackable at n={n}, k={k}")
+    stacked = {
+        name: mx.concatenate([first[name], second[name]], axis=0) for name in first
+    }
+    whole = fmt.decode(stacked, bits, group_size)
+    parts = [fmt.decode(m, bits, group_size) for m in (first, second)]
+    if not _same_bits(whole, mx.concatenate(parts)):
+        raise AssertionError(
+            f"quant format {fmt.mode}: the decode of two stacked matrices is not "
+            "their two decodes"
+        )
+    if x is None:
+        return
+    rows = []
+    for tensors in (stacked, first, second):
+        layer = FormatLinear(fmt.mode, bits, group_size, k, tensors)
+        face = fmt.dot(layer, k, layer.output_dims)
+        if face is None:
+            raise AssertionError(f"quant format {fmt.mode}: no dot face to compare")
+        operands = [layer[name] for name in ("weight", *face.tensors)]
+        rows.append(dot_rows(face, operands, x, layer.output_dims, (1, 0)))
+    if not _same_bits(rows[0], mx.concatenate(rows[1:])):
+        raise AssertionError(
+            f"quant format {fmt.mode}: the dot rows of two stacked matrices are not "
+            "their two matrices' rows"
+        )
+
+
+def _same_bits(a: mx.array, b: mx.array) -> bool:
+    """Equal shapes, dtypes and bits (a NaN equals a NaN of its bits)."""
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if mx.issubdtype(a.dtype, mx.floating):
+        bits = {2: mx.uint16, 4: mx.uint32}[a.dtype.size]
+        a, b = a.view(bits), b.view(bits)
+    return mx.array_equal(a, b).item()
 
 
 # Each weight of the rows, one a thread: weight w of row rows[r], of the

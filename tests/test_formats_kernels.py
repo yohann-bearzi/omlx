@@ -1544,3 +1544,115 @@ def test_a_kernel_over_faces_takes_no_string_of_names(which):
         kernels.face_kernel(
             "two_rows", args["inputs"], {"m": _toy("string")}, args["outputs"], "", ""
         )
+
+
+def _parts_equal(stepped, placed):
+    """Bit for bit, and some part is not zero: the check shows something."""
+    bits = (stepped.view(mx.uint32) == placed.view(mx.uint32)).all().item()
+    return bits and (placed != 0).any().item()
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 320, 64, 8])
+def test_a_cursor_placed_at_a_lane_index_reads_what_a_stepped_one_reads(k):
+    """The toy's lanes: whole blocks, a partial last one, one lane."""
+    (codes, scales), x, _ = _matrix(16, k)
+    stepped, placed = testing.lane_parts(_toy("lanes"), (codes, scales), x, 16)
+    assert stepped.shape == placed.shape == (16, k)
+    assert _parts_equal(stepped, placed)
+    # Each part is the lane's: madd from 0 over its VPT inputs.
+    want = (codes.astype(mx.float32) - 128.0) * x
+    want = want.reshape(16, k // 8, 8).sum(axis=-1)
+    assert mx.array_equal(placed[:, : k // 8], want).item()
+    assert not placed[:, k // 8 :].any().item()
+
+
+@metal
+def test_a_cursor_that_ignores_its_block_reads_another_lane_s_inputs():
+    # Placed by lane % 32: right in block 0 alone.
+    old = "lane * VPT), s("
+    assert _TOY.count(old) == 1
+    face = _toy("lane_mod", _TOY.replace(old, "(lane % 32) * VPT), s("))
+    (codes, scales), x, _ = _matrix(16, 512)
+    stepped, placed = testing.lane_parts(face, (codes, scales), x, 16)
+    assert mx.array_equal(stepped[:, :32], placed[:, :32]).item()
+    assert not _parts_equal(stepped, placed)
+
+
+def test_lane_parts_refuses_what_dot_rows_refuses():
+    (codes, scales), x, _ = _matrix(16, 64)
+    face = _toy("lanes")
+    with pytest.raises(ValueError, match="n=0: one row or more"):
+        testing.lane_parts(face, (codes, scales), x, 0)
+    with pytest.raises(ValueError, match="x is one vector"):
+        testing.lane_parts(face, (codes, scales), x[None], 16)
+    with pytest.raises(ValueError, match="operands given: 1"):
+        testing.lane_parts(face, (codes,), x, 16)
+
+
+_SUMS = mx.array([0.0, 1.0, -1.0, 2.0, 4.0, 0.5, 2.0**-20, 1024.0])
+
+
+def _a_scale(got):
+    """finish_rows' values are each row's value times the sums, in every
+    lane: 0 to 0, -1 to minus 1's, a power of two to its multiple of 1's."""
+    one = got[:, :, 1:2]
+    return (
+        mx.array_equal(got, mx.broadcast_to(got[:, :1], got.shape)).item()
+        and not got[:, :, 0].any().item()
+        and mx.array_equal(got[:, :, 2:3], -one).item()
+        and mx.array_equal(got[:, :, 3:], one * _SUMS[3:]).item()
+    )
+
+
+@metal
+@pytest.mark.parametrize("k", [512, 320, 64])
+def test_the_toy_s_finish_is_a_scale(k):
+    """Its row scale, wherever the walk leaves the cursor."""
+    (codes, scales), _, _ = _matrix(16, k)
+    face = _toy("finish")
+    got = testing.finish_rows(face, (codes, scales), k, 16, _SUMS, mx.float32)
+    assert got.shape == (16, 32, 8) and _a_scale(got)
+    assert mx.array_equal(got[:, 0, 1], scales).item()
+
+
+@metal
+@pytest.mark.parametrize(
+    "broken",
+    [
+        "return sum * s[r] + 1.0f;",  # a constant added
+        "return sum * s[r] * (sum < 0 ? 2.0f : 1.0f);",  # a sign's own scale
+        "return sum * sum * s[r];",  # not linear
+    ],
+)
+def test_a_finish_that_is_no_scale_is_told(broken):
+    old = "return sum * s[r];"
+    assert _TOY.count(old) == 1
+    face = _toy("no_scale", _TOY.replace(old, broken))
+    (codes, scales), _, _ = _matrix(16, 64)
+    got = testing.finish_rows(face, (codes, scales), 64, 16, _SUMS, mx.float32)
+    assert not _a_scale(got)
+
+
+@metal
+def test_a_finish_of_the_lane_is_told():
+    old = "return sum * s[r];"
+    lane = "return sum * s[r] * (metal::simd_is_first() ? 1.0f : 2.0f);"
+    face = _toy("lane_finish", _TOY.replace(old, lane))
+    (codes, scales), _, _ = _matrix(16, 64)
+    got = testing.finish_rows(face, (codes, scales), 64, 16, _SUMS, mx.float32)
+    assert not _a_scale(got)
+
+
+def test_finish_rows_refuses_sums_it_cannot_bind_and_no_rows():
+    (codes, scales), _, _ = _matrix(16, 64)
+    face = _toy("finish")
+    with pytest.raises(ValueError, match="8 or more float32 values"):
+        testing.finish_rows(face, (codes, scales), 64, 16, _SUMS[:7], mx.float32)
+    with pytest.raises(ValueError, match="8 or more float32 values"):
+        testing.finish_rows(face, (codes, scales), 64, 16, _SUMS[None], mx.float32)
+    with pytest.raises(ValueError, match="8 or more float32 values"):
+        half = _SUMS.astype(mx.float16)
+        testing.finish_rows(face, (codes, scales), 64, 16, half, mx.float32)
+    with pytest.raises(ValueError, match="k=64, n=0"):
+        testing.finish_rows(face, (codes, scales), 64, 0, _SUMS, mx.float32)
