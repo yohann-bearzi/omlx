@@ -1219,9 +1219,9 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
 ):
     """What a layer evaluates is the stand-in of a Metal that is not proven:
     the smallest launch that MLX builds the same Metal for, over zeros in
-    the place of x, of the indices and of the layer's tensors. The zeros as
-    the stand-in is built, then its launch. Nothing of the call is
-    evaluated: not x, not a tensor, not the result."""
+    the place of x, of the indices and of the layer's tensors. The proof
+    evaluates the zeros, then the launch. Nothing of the call is evaluated:
+    not x, not a tensor, not the result."""
     quantized, layer = _pair(320, 72)
     switched, switch = _switch_pair(320, 72)
     x, more = _x((3, 320)), _x((5, 320))
@@ -1741,6 +1741,29 @@ def test_a_face_that_does_not_compile_in_a_function_that_mlx_compiles_is_the_dec
     assert len(kernels._PROOFS) == 2
     for proof in kernels._PROOFS.values():
         assert proof.failed and not proof.ran and not proof.graphs
+
+
+def test_a_kept_plan_follows_tensors_a_compiled_function_writes_back():
+    """A function compiled over a layer's state writes the state back after
+    each call, with every leaf a new array, and not through the layer's
+    __setitem__: the weight the layer keeps its plan for is then not the
+    layer's, and the next call plans again. A plan kept inside the function
+    over its scales is never read with stale ones."""
+    quantized, layer = _pair(320, 72)
+    x = _x((1, 320))
+    mx.eval(layer(x))
+
+    def doubled(x):
+        layer["scales"] = layer["scales"] * 2
+        return layer(x)
+
+    step = mx.compile(doubled, inputs=layer.state, outputs=layer.state)
+    for _ in range(3):
+        weight = layer["weight"]
+        mx.eval(step(x))
+        assert layer["weight"] is not weight
+        quantized.scales = quantized.scales * 2
+        assert _same_bits(layer(x), quantized(x))
 
 
 def test_a_launch_is_proven_and_kept_in_a_function_compiled_over_the_layer_s_state(

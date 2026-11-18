@@ -471,6 +471,14 @@ def test_a_stand_in_left_lazy_is_evaluated_by_the_proof_ahead_of_its_launch(
     assert proof.ran == {"metal"} and not proof.failed
 
 
+def test_a_stand_in_s_inputs_may_be_given_once_through(caplog):
+    """The proof reads the inputs a stand-in gives once: it evaluates them,
+    then launches over them, whatever iterable holds them."""
+    proof = kernels.Proof()
+    inputs = (a for a in [mx.zeros((8,)), mx.ones((8,))])
+    assert _proves(proof, "metal", lambda: (inputs, lambda x, y: x + y)) is True
+
+
 def test_an_allocation_that_fails_in_a_stand_in_is_raised_and_proven_again(caplog):
     """MLX allocates a stand-in's zeros when the proof evaluates them, ahead
     of the guard: an allocation that fails is raised, the proof has neither

@@ -19,7 +19,6 @@ from mlx.utils import tree_flatten
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
 from omlx.formats import affine, kernels
-from omlx.patches.module_cache import cached_per_module
 from tests.test_formats_affine import uncalled
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -127,9 +126,7 @@ def _plan(block, x):
     it, or None."""
     if x.size != x.shape[-1]:
         return None
-    plan = cached_per_module(
-        block, "_omlx_routed_decode_plan", routed._build_plan, depth=2
-    )
+    plan = routed._cached_plan(block)
     return plan if plan is not None and routed._routes(plan, x) else None
 
 
@@ -2080,11 +2077,13 @@ def test_what_fails_in_a_block_s_stand_in_zeros_is_raised_and_fails_no_proof(
     assert plan.proof.ran and plan.window.ran
 
 
-def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
+@pytest.mark.parametrize("experts", [128, 32])  # routing folded or not
+def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch, experts):
     """Under a caller's CPU stream, the stand-in's logits and zeros are made
     on the GPU's stream and evaluated, and the stream is synchronized, before
-    the launch is evaluated: one buffer of zeros for all of them."""
-    block = _block(1024, 320, experts=128)
+    the launch is evaluated: one buffer of zeros for all of them. The launch
+    is the GPU's too: a routing that does not fold takes the softmax there."""
+    block = _block(1024, 320, experts=experts)
     x = _token_of(block)
     want = type(block).__call__._omlx_routed_decode_original(block, x)
     mx.eval(want)
@@ -2114,7 +2113,7 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(mx, "eval", evaluated)
         patch.setattr(mx, "synchronize", synchronized)
-        for name in ("zeros", "arange", "subtract", "astype"):
+        for name in ("zeros", "arange", "subtract", "astype", "softmax"):
             patch.setattr(mx, name, on_the_gpu(getattr(mx, name), name))
         patch.setattr(kernels, "zeros", made)
         with mx.stream(mx.cpu):
@@ -2122,14 +2121,18 @@ def test_a_block_s_stand_in_is_made_and_waited_for_on_the_gpu(monkeypatch):
     # The zeros made, then the proof's evaluation of them with the logits,
     # the synchronize, and the launch's.
     assert events == ["zeros", "eval", ("synchronize", mx.gpu), "eval"]
-    # The logits' four ops and the buffer of zeros, each given the GPU's
-    # stream, the caller's default device left as it is.
+    # The logits' four ops and the buffer of zeros, then the softmax, each
+    # given the GPU's stream, the caller's default device left as it is.
+    # The softmax of a routing that does not fold: the stand-in's launch,
+    # then the kept graph's trace.
+    softmax = ["softmax"] * 2 if experts % 128 else []
     assert [name for name, *_ in streams] == [
         "zeros",
         "arange",
         "subtract",
         "astype",
         "zeros",
+        *softmax,
     ]
     for _, device, stream in streams:
         assert (device, stream) == (mx.cpu, mx.gpu)
@@ -2179,6 +2182,22 @@ def test_a_router_that_scores_other_experts_than_the_stacks_is_not_planned():
         block.gate = gate
         assert routed._build_plan(block) is None
     assert routed._build_plan(_block(1024, 320, experts=128)) is not None
+
+
+def test_a_block_s_plan_follows_its_top_k_and_expert_count():
+    """The plan is the block's top-k and expert count's: set again, the next
+    call plans for them."""
+    block = _block(512, 256, top_k=8, experts=128)
+    x, rows = _token_of(block), _rows_of(block, 1, 3)
+    assert _same_bits(*_pair(block, x))
+    assert routed._cached_plan(block).launches.top_k == 8
+    block.top_k = 10
+    assert _same_bits(*_pair(block, x))
+    assert routed._cached_plan(block).launches.top_k == 10
+    block.num_experts = 64  # not what the stacks hold: no plan
+    assert routed._cached_plan(block) is None
+    assert routed.routed_verify_window(block, rows) is None
+    assert _same_bits(*_pair(block, x))
 
 
 def test_a_kept_window_follows_the_block_s_replaced_weights():

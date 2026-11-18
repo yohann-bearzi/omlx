@@ -838,7 +838,9 @@ def _routing(logits, top_k: int):
     launch where ``softmax_topk_rows`` takes the rows."""
     routing = softmax_topk_rows(logits, top_k, WINDOW_MAX_ROWS)
     if routing is None:
-        routing = fused_router_topk(mx.softmax(logits, axis=-1, precise=True), top_k)
+        # On the GPU's stream, as every launch: whatever the caller's device.
+        scores = mx.softmax(logits, axis=-1, precise=True, stream=mx.gpu)
+        routing = fused_router_topk(scores, top_k)
     return routing
 
 
@@ -915,7 +917,7 @@ def _ranked(rows: int, experts: int, dtype) -> mx.array:
     return mx.astype(ranked, dtype, stream=gpu)
 
 
-def _stand_in(launches: _Launches, logits, folded: bool, outside, operands) -> list:
+def _stand_in(launches: _Launches, logits, folded: bool, outside, operands):
     """The smallest launches of a block's rows that MLX generates the Metal
     of the call's for, over zeros: the rows, the router's weight, the whole
     of each shared matrix, what the block computes outside the launches,
@@ -1054,6 +1056,19 @@ def _windows(plan: _Plan, x) -> bool:
     )
 
 
+def _cached_plan(block) -> _Plan | None:
+    """The block's plan, kept in the block: depth 2 keys it on the expert
+    and shared-expert weight arrays, the flags on the block's attributes
+    that it is planned for."""
+    return cached_per_module(
+        block,
+        "_omlx_routed_decode_plan",
+        _build_plan,
+        depth=2,
+        flags=(block.top_k, block.num_experts),
+    )
+
+
 def routed_verify_window(block, x):
     """The block's output for a row-exact verify window ``x`` ([B, L, hidden],
     1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
@@ -1074,7 +1089,7 @@ def routed_verify_window(block, x):
     too."""
     if x.ndim != 3:
         return None
-    plan = cached_per_module(block, "_omlx_routed_decode_plan", _build_plan, depth=2)
+    plan = _cached_plan(block)
     if plan is None or plan.window is None or plan.proof.failed:
         return None
     signature = (x.shape, x.dtype, plan.experts)
@@ -1158,10 +1173,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     def patched_call(self, x):
         shape = x.shape
         if shape and x.size == shape[-1]:
-            # Depth 2 keys the plan on the expert and shared-expert weight arrays.
-            plan = cached_per_module(
-                self, "_omlx_routed_decode_plan", _build_plan, depth=2
-            )
+            plan = _cached_plan(self)
             if plan is not None:
                 # A decode step is the replay of the graph its thread kept.
                 graph = plan.proof.graphs.get((shape, x.dtype, plan.experts))

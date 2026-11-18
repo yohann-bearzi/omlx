@@ -511,6 +511,7 @@ class Proof:
         if metal in self.ran:
             return True
         inputs, launch = build()
+        inputs = tuple(inputs)  # evaluated, then launched: read twice
         mx.eval(*inputs)
         mx.synchronize(mx.gpu)
         launched = launch(*inputs)

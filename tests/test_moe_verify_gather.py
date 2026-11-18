@@ -710,8 +710,10 @@ def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
     assert [a.shape for a in stand_in] == [(3 * TOP_K, 2 * INTER), (3 * TOP_K, HIDDEN)]
     zeros = launched[:2]
     assert [(len(z[2]), z[3]) for z in zeros] == [(3 * TOP_K, TOP_K), (3 * TOP_K, 1)]
-    for operands, x_in, rhs, _ in zeros:
-        assert [a.shape[0] for a in operands] == [1, 1, 1]
+    for (operands, x_in, rhs, _), call in zip(zeros, launched[2:], strict=True):
+        # One expert of each of the call's stacks, in their dtypes.
+        assert [a.shape for a in operands] == [(1, *a.shape[1:]) for a in call[0]]
+        assert [a.dtype for a in operands] == [a.dtype for a in call[0]]
         assert rhs.dtype == mx.uint32
         for a in (*operands, x_in, rhs):
             assert not mx.any(a).item()
