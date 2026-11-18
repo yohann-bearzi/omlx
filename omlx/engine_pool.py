@@ -4522,6 +4522,9 @@ class EnginePool:
                     drafter = await loop.run_in_executor(
                         get_mlx_executor(), _load_dflash_sync
                     )
+                except FormatRefusedError:
+                    # A drafter of a quant format refused: said, not ignored.
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"DFlash drafter load raised for {model_id} "
@@ -4610,6 +4613,9 @@ class EnginePool:
                     drafter = await loop.run_in_executor(
                         get_mlx_executor(), _load_drafter_sync
                     )
+                except FormatRefusedError:
+                    # A drafter of a quant format refused: said, not ignored.
+                    raise
                 except Exception as e:
                     logger.warning(
                         f"VLM MTP drafter load raised for {model_id} "

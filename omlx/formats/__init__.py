@@ -411,6 +411,8 @@ _SKIPPED: dict[str, str] = {}
 # on the thread that loads an installed plugin, the modes it registers.
 _REGISTERING_BUILTINS = threading.local()
 _PLUGIN_MODES = threading.local()
+# The modes of oMLX's built-in formats.
+_BUILTIN_MODES: set[str] = set()
 # Held for the whole load. Reentrant: the load registers through register(),
 # which loads first.
 _LOCK = threading.RLock()
@@ -439,7 +441,8 @@ def register(fmt: QuantFormat) -> None:
             f"contract it is written for, an int, not {contract!r} "
             f"({type(contract).__name__})"
         )
-    if _mlx_runs(mode) and not getattr(_REGISTERING_BUILTINS, "registering", False):
+    builtin = getattr(_REGISTERING_BUILTINS, "registering", False)
+    if _mlx_runs(mode) and not builtin:
         raise ValueError(
             f"quant format {mode!r}: {mode!r} is one of MLX's own modes, which "
             "only oMLX's built-in formats take: register the format under a "
@@ -457,6 +460,8 @@ def register(fmt: QuantFormat) -> None:
             f"{'oMLX' if contract > CONTRACT else 'the format'}"
         )
     load()
+    if builtin:
+        _BUILTIN_MODES.add(mode)
     if _FORMATS.setdefault(mode, fmt) is not fmt:
         raise ValueError(f"quant format {mode!r} is already registered")
 

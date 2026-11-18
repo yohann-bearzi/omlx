@@ -17,6 +17,7 @@ from typing import Any
 from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..formats import FormatRefusedError
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -848,6 +849,9 @@ class BatchedEngine(BaseEngine):
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
                     )
+                except FormatRefusedError:
+                    # A draft of a quant format refused: said, not ignored.
+                    raise
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
 

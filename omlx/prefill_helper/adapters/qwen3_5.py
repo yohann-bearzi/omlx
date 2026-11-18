@@ -28,6 +28,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.models.cache import ArraysCache
 
 from ...patches import qwen38_modelopt_mixed
+from ...patches.format_load import check_loaded
 from ...patches.mlx_lm_mtp import prompt_priming
 from ...patches.qwen35_fa256_attention import apply_qwen35_fa256_attention_patch
 from ...patches.qwen35_gdn_chunked import apply_qwen35_gdn_prefill_patch
@@ -214,6 +215,8 @@ class Qwen35Adapter(StageAdapter):
             vlm_utils.load_config = load_config
         lm = model.language_model
         self.keep_first(lm, k)
+        # Its first layers, filled, before anything evaluates or fuses them.
+        check_loaded(lm)
         missing = _missing(lm, path, self.resident)
         if missing:
             raise ValueError(

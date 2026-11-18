@@ -44,7 +44,7 @@ import threading
 import types
 from collections.abc import Iterator
 from contextlib import contextmanager
-from functools import update_wrapper, wraps
+from functools import cached_property, update_wrapper, wraps
 from importlib import _bootstrap
 from pathlib import Path
 
@@ -117,7 +117,6 @@ class _Checkpoint:
         self.by_loader = by_loader
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
-        self.shown = _shown(self.path)
         self._config = _ABSENT
         self._read: dict[str, formats.QuantFormat] = {}
         self.built: list[nn.Module] = []
@@ -172,6 +171,11 @@ class _Checkpoint:
         self._read[fmt.mode] = read
         return read
 
+    @cached_property
+    def shown(self) -> Path:
+        """The checkpoint a refusal names (``_shown``), found when one is."""
+        return _shown(self.path)
+
     def _read_config(self):
         """The checkpoint's config.json, read once (and its failure kept)."""
         if self._config is _ABSENT:
@@ -180,7 +184,8 @@ class _Checkpoint:
             except (OSError, ValueError) as error:
                 self._config = error
         if isinstance(self._config, Exception):
-            raise self._config
+            # Raised again, with no traceback piled on it by earlier raises.
+            raise self._config.with_traceback(None)
         return self._config
 
     def _written(self, mode: str):
@@ -194,8 +199,18 @@ class _Checkpoint:
         return kept, where
 
     def records(self, mode: str) -> bool:
-        """Whether the checkpoint's config keeps anything of ``mode``'s format."""
-        return self._written(mode)[0] is not _ABSENT
+        """Whether the checkpoint's config keeps anything of ``mode``'s format
+        (or keeps its formats' record damaged): never for no checkpoint's
+        directory, nor for a config that is no object (the library's to
+        refuse)."""
+        try:
+            config = self._read_config()
+        except (OSError, ValueError):
+            return False
+        if not isinstance(config, dict) or "omlx_quant_formats" not in config:
+            return False
+        written = config["omlx_quant_formats"]
+        return not isinstance(written, dict) or mode in written
 
     def _record(self, mode: str) -> dict:
         """The record oQ stored for ``mode``; an empty one for a checkpoint
@@ -237,6 +252,16 @@ class _Checkpoint:
         layer. A layer it left wholly unfilled is a layer a partial load
         does not hold (a pipeline rank's, a prefill helper's)."""
         entries = self._format_entries()
+        top = self._recorded_top_mode()
+        if top is not None and not any(layer.mode == top for layer in self.built):
+            # Its layers are named by the config's mode, not each by an entry.
+            raise _refused(
+                f"its quantization config's mode is {top}, a format the "
+                "checkpoint records, and the load built no layer of it: the "
+                "model has no such layer, or its family's loader renames them",
+                top,
+                self,
+            )
         if not self.built and not entries:
             # A load of no format's layers: a stock checkpoint's.
             return
@@ -307,6 +332,19 @@ class _Checkpoint:
                     mode,
                     self,
                 )
+        # Checked: the layers are the model's to keep, not this checkpoint's.
+        self.built.clear()
+
+    def _recorded_top_mode(self) -> str | None:
+        """The mode of the quantization config itself, when the checkpoint
+        records a format of it."""
+        try:
+            config = self._read_config()
+        except (OSError, ValueError):
+            return None
+        quantization = config.get("quantization") if isinstance(config, dict) else None
+        mode = quantization.get("mode") if isinstance(quantization, dict) else None
+        return mode if isinstance(mode, str) and self.records(mode) else None
 
     def _format_entries(self) -> list[tuple[str, str]]:
         """The layers the checkpoint's quantization config names in a mode
@@ -323,12 +361,18 @@ class _Checkpoint:
         quantization = config.get("quantization") or config.get("quantization_config")
         if not isinstance(quantization, dict):
             return []
-        return [
-            (path, entry["mode"])
+        # An entry without a mode takes the config's (MLX's default, affine).
+        default = quantization.get("mode", "affine")
+        entries = [
+            (path, entry.get("mode", default))
             for path, entry in quantization.items()
             if isinstance(entry, dict)
-            and isinstance(entry.get("mode"), str)
-            and (not formats._mlx_runs(entry["mode"]) or self.records(entry["mode"]))
+        ]
+        return [
+            (path, mode)
+            for path, mode in entries
+            if isinstance(mode, str)
+            and (not formats._mlx_runs(mode) or self.records(mode))
         ]
 
 
@@ -419,23 +463,29 @@ def check_loaded(model) -> None:
     """At the end of oMLX's own load of ``model``, once what this process does
     not hold is dropped (a pipeline rank's other layers, a prefill helper's
     later ones): refuse a format layer it still holds with a placeholder,
-    which no tensor of its checkpoint filled. The layers let their
-    placeholders go, each once (two threads checking one model)."""
+    which no tensor of its checkpoint filled. A filled layer lets its
+    placeholders go once its load has ended."""
     if not _BUILT_ANY or not isinstance(model, nn.Module):
         # No process that built no format layer walks a model.
         return
     for name, module in model.named_modules():
-        held = module.__dict__.pop("_placeholders", None)
+        held = module.__dict__.get("_placeholders")
         if held is None:
             continue
         tensors, checkpoint = held
         left = [tensor for tensor, kept in tensors.items() if module[tensor] is kept]
         if left:
+            # Kept: a check of it again (another thread's, a later caller's)
+            # refuses it again.
             reason = (
                 f"the loaded model holds {name} without its {', '.join(left)}: the "
                 "checkpoint holds no such tensor, or holds it under another name"
             )
             raise _refused(reason, module.mode, checkpoint)
+        if checkpoint is not _current():
+            # Filled, and its load has ended (a load still running, a
+            # library's loader around oMLX's, checks it when it returns).
+            module.__dict__.pop("_placeholders", None)
 
 
 @contextmanager
@@ -456,9 +506,14 @@ def _shown(path: Path) -> Path:
     to a checkpoint's files (a family's loader's, a decision model's) by the
     checkpoint its config is, link by link while each link is to a config
     file (a Hugging Face snapshot's is to a blob of content, not one)."""
-    config = path / "config.json"
+    config, seen = path / "config.json", set()
     while config.is_symlink():
-        target = config.parent / os.readlink(config)
+        stat = os.lstat(config)
+        if (stat.st_dev, stat.st_ino) in seen:
+            # A cycle of links.
+            break
+        seen.add((stat.st_dev, stat.st_ino))
+        target = Path(os.path.normpath(config.parent / os.readlink(config)))
         if target.name != "config.json":
             break
         path, config = target.parent, target
@@ -532,9 +587,15 @@ def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
         checkpoint = _current()
     if checkpoint is None:
         return FormatRefusedError(reason, mode=mode)
-    installed = formats.origin(mode) or (
-        "a format registered by hand" if formats.get(mode) is not None else "none"
-    )
+    installed = formats.origin(mode)
+    if installed is None:
+        registered = formats.get(mode)
+        if registered is None:
+            installed = "none"
+        elif mode in formats._BUILTIN_MODES:
+            installed = "built-in"
+        else:
+            installed = "a format registered by hand"
     return FormatRefusedError(
         reason,
         mode=mode,
@@ -548,13 +609,7 @@ def _recorded(mode) -> bool:
     """Whether the checkpoint loading on this thread records a format of
     ``mode`` in its config."""
     checkpoint = _current()
-    if checkpoint is None:
-        return False
-    try:
-        return checkpoint.records(mode)
-    except OSError:
-        # A loader handed what is no checkpoint's directory.
-        return False
+    return checkpoint is not None and checkpoint.records(mode)
 
 
 def _not_installed(mode) -> str:

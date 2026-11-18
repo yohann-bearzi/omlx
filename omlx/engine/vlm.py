@@ -50,7 +50,7 @@ from ..api.utils import (
 from ..cache.paged_ssd_cache import numerics_revision_for_model
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
 from ..exceptions import InvalidRequestError
-from ..formats import LoadHookError
+from ..formats import FormatRefusedError, LoadHookError
 from ..model_settings import (
     a8_prefill_on,
     ane_prefill_backend,
@@ -2869,6 +2869,9 @@ class VLMBatchedEngine(BaseEngine):
                     logger.info(
                         f"SpecPrefill: draft model loaded ({specprefill_draft})"
                     )
+                except FormatRefusedError:
+                    # A draft of a quant format refused: said, not ignored.
+                    raise
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
 

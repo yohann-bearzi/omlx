@@ -19,6 +19,7 @@ import mlx.core as mx
 import mlx_vlm.utils as vlm_utils
 from mlx_vlm.models.base import create_attention_mask, create_ssm_mask
 
+from ...patches.format_load import check_loaded
 from ...patches.mlx_lm_mtp import prompt_priming
 from ...patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
 from ...utils.layer_pipeline import LayerPipeline
@@ -150,6 +151,8 @@ class Glm5NextAdapter(StageAdapter):
             vlm_utils.load_config = load_config
         lm = model.language_model
         self.keep_first(lm, k)
+        # Its first layers, filled, before anything evaluates or fuses them.
+        check_loaded(lm)
         apply_moe_gate_up_fusion(lm)
         mx.eval(lm.parameters())
         return lm

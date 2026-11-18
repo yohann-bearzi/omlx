@@ -7328,6 +7328,13 @@ def quantize_oq_streaming(
                 f"quant format {quant_format!r} encodes with oQe's importance: "
                 "pass enhanced=True"
             )
+        if formats._mlx_runs(quant_format):
+            # Its checkpoint would record a format of a mode MLX's layers
+            # take, which a load refuses: MLX's modes are written as MLX's.
+            raise ValueError(
+                f"quant format {quant_format!r} is one of MLX's own modes: oQ "
+                "writes it without a quant format"
+            )
         quant_fmt = formats.get(quant_format)
         if quant_fmt is None:
             raise ValueError(

@@ -24,6 +24,7 @@ import mlx.nn as nn
 import mlx_vlm.utils as vlm_utils
 import numpy as np
 
+from ...patches.format_load import check_loaded
 from ...patches.mlx_lm_mtp import prompt_priming
 from ...patches.mlx_vlm_qwen4_exp_compat import configure_qwen4_exp_runtime
 from ...patches.moe_gate_up_fusion import apply_moe_gate_up_fusion
@@ -295,6 +296,8 @@ class Qwen4ExpAdapter(StageAdapter):
             vlm_utils.load_config = load_config
         lm = model.language_model
         self.keep_first(lm, k)
+        # Its first layers, filled, before anything evaluates or fuses them.
+        check_loaded(lm)
         apply_moe_gate_up_fusion(lm)
         # The server's engine start installs these prefill kernels.
         apply_sdpa256_attention_patch()

@@ -466,6 +466,8 @@ def test_a_record_of_one_of_mlx_s_modes_is_never_read_as_mlx_s(
     ):
         nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode=mode)
     assert refusal.value.reason == reason
+    # The built-in format is named so.
+    assert refusal.value.installed == ("built-in" if mode == "affine" else "none")
 
 
 def test_an_entry_of_a_recorded_mlx_mode_that_binds_no_layer_is_refused(toy, tmp_path):
@@ -498,6 +500,62 @@ def test_a_refusal_names_a_hub_snapshot_not_its_blob(toy, tmp_path):
         with format_load.loading(path), pytest.raises(formats.FormatRefusedError) as no:
             nn.Linear(64, 128).to_quantized(**_TOY)
         assert no.value.path == snapshot
+
+
+def test_a_refusal_names_the_checkpoint_through_any_links(toy, tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "config.json").write_text(json.dumps(_typed({"toy": None})))
+    view = tmp_path / "view"
+    view.mkdir()
+    (view / "config.json").symlink_to(Path("../real/config.json"))
+    # Links in a cycle, to themselves or to each other.
+    alone, first, second = (tmp_path / name for name in ("alone", "a", "b"))
+    for path in (alone, first, second):
+        path.mkdir()
+    (alone / "config.json").symlink_to(Path("config.json"))
+    (first / "config.json").symlink_to(Path("../b/config.json"))
+    (second / "config.json").symlink_to(Path("../a/config.json"))
+    assert format_load._shown(view) == real
+    for path in (alone, first):
+        assert format_load._shown(path) in (alone, first, second)
+
+
+def test_a_config_that_is_no_object_records_no_format(toy, tmp_path):
+    (tmp_path / "config.json").write_text("[]")
+    with format_load.loading(tmp_path):
+        layer = nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode="mxfp4")
+    assert type(layer) is nn.QuantizedLinear
+
+
+def test_a_recorded_mode_that_bound_nothing_is_refused(toy, tmp_path):
+    # The config's own mode, which no entry names.
+    quantization = {"group_size": 1, "bits": 8, "mode": "toy"}
+    config = {**_typed({"toy": {}}), "quantization": quantization}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with pytest.raises(formats.FormatRefusedError, match="config's mode is toy"):
+        format_load._Checkpoint(tmp_path).check(nn.Module())
+    # An entry without a mode is of the config's.
+    quantization.update({"b": {"group_size": 1, "bits": 8}, "a": _TOY})
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with format_load.loading(tmp_path) as checkpoint:
+        layer = nn.Linear(64, 128).to_quantized(**_TOY)
+    model = nn.Module()
+    model.a = layer
+    with pytest.raises(formats.FormatRefusedError, match="names b,"):
+        checkpoint.check(model)
+
+
+def test_a_failure_to_read_the_config_is_raised_bare_each_time(tmp_path):
+    import traceback
+
+    checkpoint = format_load._Checkpoint(tmp_path)
+    depths = []
+    for _ in range(3):
+        with pytest.raises(OSError) as error:
+            checkpoint._read_config()
+        depths.append(len(traceback.extract_tb(error.value.__traceback__)))
+    assert depths[0] == depths[1] == depths[2]
 
 
 def test_a_checkpoint_s_config_is_read_once_whatever_it_holds(tmp_path, monkeypatch):
@@ -1721,6 +1779,9 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
         format_load.check_loaded(model)
     # Named by the checkpoint the layer was built for.
     assert (no.value.path, no.value.written) == (path, "omlx-toy 0.3.1")
+    # A check of it again (another thread's, a later caller's) refuses again.
+    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+        format_load.check_loaded(model)
     # What this process does not hold is dropped before (a prefill helper's
     # later layers, a pipeline rank's others): no refusal.
     model.model.layers[0].mlp.gate_proj = nn.Linear(64, 128)
@@ -1761,6 +1822,48 @@ def test_a_refusal_of_a_drafter_is_no_misconfigured_toggle(monkeypatch):
     assert vlm_mtp.load_vlm_mtp_drafter("/models/drafter") is None
 
 
+def test_omlx_s_own_check_inside_a_library_load_leaves_it_the_layers(toy, tmp_path):
+    _llama(tmp_path, **_written({}))
+    with format_load.loading(tmp_path, by_loader=True) as outer:
+        model, _ = load_model(tmp_path)
+        # oMLX's helper inside a library's loader: the load still runs.
+        format_load.check_loaded(model)
+        assert hasattr(_gate_proj(model), "_placeholders")
+    outer.check(model)
+    format_load.check_loaded(model)
+    assert not hasattr(_gate_proj(model), "_placeholders") and outer.built == []
+
+
+def test_a_drafter_or_draft_refused_is_never_skipped():
+    import ast
+    from pathlib import Path
+
+    root = Path(format_load.__file__).parents[1]
+    soft = ("toggle ignored", "SpecPrefill: draft model load failed")
+    seen = 0
+    for file in ("engine_pool.py", "engine/batched.py", "engine/vlm.py"):
+        source = (root / file).read_text()
+        for node in ast.walk(ast.parse(source)):
+            if not isinstance(node, ast.Try):
+                continue
+            texts = [ast.get_source_segment(source, h) or "" for h in node.handlers]
+            fails_soft = [
+                i for i, text in enumerate(texts) if any(s in text for s in soft)
+            ]
+            if not fails_soft or "raise RuntimeError" in texts[fails_soft[0]]:
+                continue
+            seen += 1
+            # A refusal is let through before the handler that goes on.
+            before = node.handlers[: fails_soft[0]]
+            assert any(
+                getattr(h.type, "id", None) == "FormatRefusedError"
+                and isinstance(h.body[-1], ast.Raise)
+                for h in before
+            ), (file, node.lineno)
+    # The DFlash and VLM MTP drafters, and both engines' SpecPrefill drafts.
+    assert seen == 4
+
+
 def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
     import ast
     from pathlib import Path
@@ -1780,6 +1883,10 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "models/d1.py",
         "models/decision.py",
         "oq.py",
+        "prefill_helper/adapters/qwen4_exp.py",
+        "prefill_helper/adapters/qwen3_5.py",
+        "prefill_helper/adapters/glm5_next.py",
+        "prefill_helper/adapters/minimax_m3.py",
     ):
         tree = ast.parse((root / file).read_text())
         checks = [
@@ -1826,6 +1933,12 @@ def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
         "models/d1.py": 1,
         "models/decision.py": 1,
         "oq.py": 4,
+        # Right after keep_first, before a fusion or an evaluation; the
+        # worker checks the families whose keep_first runs before the load.
+        "prefill_helper/adapters/qwen4_exp.py": 1,
+        "prefill_helper/adapters/qwen3_5.py": 1,
+        "prefill_helper/adapters/glm5_next.py": 1,
+        "prefill_helper/adapters/minimax_m3.py": 1,
     }
 
 

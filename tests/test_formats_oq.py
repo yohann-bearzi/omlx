@@ -895,6 +895,17 @@ def test_a_family_neither_stock_nor_verified_is_refused(
     assert not output.exists() and toy.offered == []
 
 
+@pytest.mark.parametrize("mode", ["affine", "mxfp4"])
+def test_one_of_mlx_s_modes_is_written_without_a_quant_format(tmp_path, mode):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    with pytest.raises(ValueError, match="is one of MLX's own modes"):
+        oq.quantize_oq_streaming(
+            str(source), str(tmp_path / "out"), 4, enhanced=True, quant_format=mode
+        )
+
+
 def test_the_families_oq_writes_in_a_format(tmp_path):
     # Verified ones only, and none is yet: Qwen3.8 Flash-Next enters with the
     # run that verifies it. Families mlx-lm's own code serves come back after

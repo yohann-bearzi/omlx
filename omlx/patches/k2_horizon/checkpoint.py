@@ -67,7 +67,9 @@ def apply_checkpoint_patch() -> None:
                     source.suffix != ".safetensors"
                     and source.name != "model.safetensors.index.json"
                 ):
-                    (view / source.name).symlink_to(source.resolve())
+                    # By its path, not resolved: a snapshot's config is a
+                    # link to a blob, and the view names the checkpoint.
+                    (view / source.name).symlink_to(source.absolute())
             remapping = {}
             for i, shard in enumerate(shards):
                 name = f"model-{i:05d}-of-{len(shards):05d}.safetensors"
