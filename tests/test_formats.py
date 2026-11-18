@@ -1048,7 +1048,9 @@ def test_what_is_no_module_is_asked_at_every_call(plugins):
     assert fmt.dots == 2
 
 
-def test_a_defective_dot_is_asked_once(plugins, caplog, dot_defects):
+def test_a_defect_is_asked_again_at_each_call_and_logged_once(
+    plugins, caplog, dot_defects
+):
     class Defective(_Counting):
         def dot(self, layer, k, n):
             self.dots += 1
@@ -1059,6 +1061,63 @@ def test_a_defective_dot_is_asked_once(plugins, caplog, dot_defects):
     with caplog.at_level(logging.ERROR, logger=formats.__name__):
         for _ in range(2):
             assert formats.dot(layer, 64, 8) is None
-    assert fmt.dots == 1
+    assert fmt.dots == 2
     assert len(caplog.records) == 1
     dot_defects.clear()  # expected
+    # A block that admits no defect, opened later, meets it on the same layer.
+    with pytest.raises(AssertionError, match="no face"), testing.no_dot_defects():
+        formats.dot(layer, 64, 8)
+    dot_defects.clear()
+
+
+def test_a_layer_asks_again_when_a_tensor_is_kept_under_another_name(
+    plugins, dot_defects
+):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    # The same array, under another name: the face's tensor is gone.
+    layer["other"] = layer.pop("scales")
+    assert formats.dot(layer, 64, 8) is None
+    assert fmt.dots == 2
+    dot_defects.clear()  # expected: the layer has no array scales
+
+
+def test_a_layer_asks_again_when_its_tensors_swap_names(plugins):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    weight, scales = layer.pop("weight"), layer.pop("scales")
+    layer["scales"], layer["weight"] = weight, scales
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+@pytest.mark.parametrize(
+    "before, after", [((4.0, 32), (4, 32)), ((4, 32.0), (4, 32)), (None, (0, 0))]
+)
+def test_a_layer_asks_again_when_its_widths_change_in_type(plugins, before, after):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    if before is not None:
+        layer.bits, layer.group_size = before
+    assert formats.dot(layer, 64, 8) is _FACE
+    layer.bits, layer.group_size = after
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_equal_formats_are_two(plugins, monkeypatch):
+    class Equal(_Counting):
+        def __eq__(self, other):
+            return isinstance(other, Equal)
+
+        __hash__ = object.__hash__
+
+    fmt, again = Equal(), Equal()
+    formats.register(fmt)
+    layer = _layer()
+    assert formats.dot(layer, 64, 8) is _FACE
+    monkeypatch.setitem(formats._FORMATS, "toy", again)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert (fmt.dots, again.dots) == (1, 1)

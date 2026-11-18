@@ -449,7 +449,7 @@ def dot(layer, k: int, n: int) -> Dot | None:
     elements or more), has no face
     for the layer either, and the model keeps its composed path there. Each
     defect of a format is logged once."""
-    return _face(layer, k, n, Dot, "the layer keeps its composed path")
+    return _face(layer, k, n, Dot, "dot", "the layer keeps its composed path")
 
 
 def tile(layer, k: int, n: int) -> Tile | None:
@@ -459,44 +459,60 @@ def tile(layer, k: int, n: int) -> Tile | None:
     tile face for the layer, which keeps its other kernels. Each defect is
     logged once, a defect being the format's mode and the error: the same
     error from the format's ``dot`` is the same defect."""
-    return _face(layer, k, n, Tile, "the layer keeps its other kernels")
+    return _face(layer, k, n, Tile, "tile", "the layer keeps its other kernels")
 
 
-def _face(layer, k: int, n: int, kind: type, keeps: str):
+def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
     """The face of class ``kind`` that ``layer``'s format gives, from its
-    method of the class's name in lower case, or None.
+    method ``name``, or None.
 
     A layer (an ``nn.Module``) asks its format once for each kind and
     (k, n): the answer is kept on the layer (``module_cache``) until one of
-    its arrays is another, its bits or group size change, or its mode is
-    another format's. A kernel that asks at every call costs a lookup."""
+    its arrays is another or is kept under another name, its bits or group
+    size change (in value or in type), or its mode is another format's. That
+    is what a format's face is a function of (docs/quant-formats.md, Faces).
+    A defect is not kept: the format is asked again at the next call, which
+    notes it again in a block of ``testing.no_dot_defects``. A kernel that
+    asks at every call costs a lookup."""
     mode = getattr(layer, "mode", None)
     fmt = get(mode)
     if fmt is None:
         return None
     if not isinstance(layer, nn.Module):
-        return _asked(fmt, layer, k, n, kind, keeps)
-    return cached_per_module(
+        return _asked(fmt, layer, k, n, kind, name, keeps)[0]
+    slot = f"_omlx_{name}_face_{k}_{n}"
+    bits = getattr(layer, "bits", None)
+    group_size = getattr(layer, "group_size", None)
+    face, defective = cached_per_module(
         layer,
-        f"_omlx_{kind.__name__.lower()}_face_{k}_{n}",
-        lambda layer: _asked(fmt, layer, k, n, kind, keeps),
+        slot,
+        lambda layer: _asked(fmt, layer, k, n, kind, name, keeps),
         depth=0,
+        # The format object and its identity (equal formats are two), the
+        # widths with their types (4 == 4.0), and the tensors' names (the
+        # module cache keys their arrays alone).
         flags=(
+            id(fmt),
             fmt,
-            getattr(layer, "bits", None),
-            getattr(layer, "group_size", None),
+            type(bits),
+            bits,
+            type(group_size),
+            group_size,
+            tuple(dict.keys(layer)),
         ),
     )
+    if defective:
+        layer.__dict__.pop(slot, None)
+    return face
 
 
-def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, keeps: str):
-    """The face ``_face`` keeps: ``fmt``'s answer, checked."""
+def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str, keeps):
+    """``(face, defective)``: ``fmt``'s answer, checked, for ``_face``."""
     mode = fmt.mode
-    name = kind.__name__.lower()
     try:
         face = getattr(fmt, name)(layer, k, n)
         if face is None:
-            return None
+            return None, False
         if not isinstance(face, kind):
             raise TypeError(
                 f"{name}() returned a {type(face)!r}, not a {kind.__name__}"
@@ -538,5 +554,5 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, keeps: str):
                 k,
                 keeps,
             )
-        return None
-    return face
+        return None, True
+    return face, False

@@ -585,29 +585,38 @@ def proof(kernel: str, *key) -> Proof:
 
 def face_kernel(
     name: str,
-    inputs: tuple[str, ...],
+    inputs,
     matrices: dict[str, Dot | Tile],
-    outputs: tuple[str, ...],
+    outputs,
     header: str,
     source: str,
 ):
     """The ``mx.fast.metal_kernel`` over the faces of ``matrices``, named
-    ``<name>_<face key>...``: its inputs are ``inputs`` in order, where a
-    matrix's name stands for its inputs (``Matrices.add``); its header is the
-    faces' Metal (``Matrices.header``), then ``header``; its source opens with
-    the matrices' declarations, then ``source``. Its source is written and
-    MLX's kernel made once for each name, inputs, faces, outputs, header and
+    ``<name>``, then each face's key, ``_``-joined in the order of
+    ``inputs``: its inputs are ``inputs`` (a sequence of names) in order,
+    where a matrix's name stands for its inputs (``Matrices.add``); its
+    outputs are ``outputs``; its header is the faces' Metal
+    (``Matrices.header``), then ``header``; its source opens with the
+    matrices' declarations, then ``source``. Its source is written and MLX's
+    kernel made once for each name, inputs, faces, outputs, header and
     source; every call after finds it. Threads: two that build one kernel at
     once each build it, and the first kept is the one every call finds."""
-    key = (name, inputs, tuple(matrices.items()), outputs, header, source)
-    kernel = _FACE_KERNELS.get(key)
-    if kernel is not None:
-        return kernel
-    unread = sorted(set(matrices) - set(inputs))
-    if unread:
+    if isinstance(inputs, str) or isinstance(outputs, str):
+        raise TypeError(
+            f"kernel {name!r}: inputs and outputs are sequences of names, not a "
+            "string"
+        )
+    inputs, outputs = tuple(inputs), tuple(outputs)
+    faces = tuple((given, matrices[given]) for given in inputs if given in matrices)
+    if len(faces) != len(matrices):
+        unread = sorted(set(matrices) - set(inputs))
         raise ValueError(
             f"kernel {name!r}: matrices {', '.join(unread)} are not among its inputs"
         )
+    key = (name, inputs, faces, outputs, header, source)
+    kernel = _FACE_KERNELS.get(key)
+    if kernel is not None:
+        return kernel
     built = Matrices()
     names = [
         n
@@ -615,7 +624,7 @@ def face_kernel(
         for n in (built.add(given, matrices[given]) if given in matrices else [given])
     ]
     kernel = mx.fast.metal_kernel(
-        name="_".join((name, *(face.key for face in matrices.values()))),
+        name="_".join((name, *(face.key for _, face in faces))),
         input_names=names,
         output_names=list(outputs),
         header=built.header + header,

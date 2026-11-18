@@ -1175,9 +1175,10 @@ def test_a_kernel_over_faces_is_written_once(monkeypatch):
         "rows",
     ]
     assert kwargs["output_names"] == ["y"]
-    assert kwargs["header"].endswith("// header\n")
-    assert kwargs["source"].endswith("y[0] = 0;")
-    assert "const auto m = " in kwargs["source"]
+    expected = kernels.Matrices()
+    expected.add("m", face)
+    assert kwargs["header"] == expected.header + "// header\n"
+    assert kwargs["source"] == expected.declarations + "y[0] = 0;"
 
 
 @pytest.mark.parametrize(
@@ -1212,3 +1213,45 @@ def test_a_kernel_over_faces_is_written_again_for_anything_else(monkeypatch, cha
 def test_a_kernel_over_faces_reads_every_matrix_it_names():
     with pytest.raises(ValueError, match="matrices m are not among its inputs"):
         kernels.face_kernel("two_rows", ("x",), {"m": _toy("unread")}, ("y",), "", "")
+    unread = {"b": _toy("unread_b"), "a": _toy("unread_a")}
+    with pytest.raises(ValueError, match="matrices a, b are not among its inputs"):
+        kernels.face_kernel("two_rows", ("x",), unread, ("y",), "", "")
+
+
+def test_a_kernel_over_two_faces_takes_them_in_the_order_of_its_inputs(
+    monkeypatch,
+):
+    built, _ = _counted(monkeypatch)
+    fa, fb = _toy("order_a"), _toy("order_b")
+    inputs = ["x", "b", "a"]  # any sequence of names
+    first = kernels.face_kernel("pair", inputs, {"a": fa, "b": fb}, ["y"], "", "")
+    again = kernels.face_kernel(
+        "pair", tuple(inputs), {"b": fb, "a": fa}, ("y",), "", ""
+    )
+    assert first is again and len(built) == 1
+    (kwargs,) = built
+    assert kwargs["name"] == f"pair_{fb.key}_{fa.key}"
+    assert kwargs["input_names"] == [
+        "x",
+        "b_weight",
+        *(f"b_{t}" for t in fb.tensors),
+        "a_weight",
+        *(f"a_{t}" for t in fa.tensors),
+    ]
+    expected = kernels.Matrices()
+    expected.add("b", fb)
+    expected.add("a", fa)
+    assert kwargs["header"] == expected.header
+    # Another matrix under each name is another kernel.
+    kernels.face_kernel("pair", inputs, {"a": fb, "b": fa}, ["y"], "", "")
+    assert len(built) == 2
+
+
+@pytest.mark.parametrize("which", ["inputs", "outputs"])
+def test_a_kernel_over_faces_takes_no_string_of_names(which):
+    args = {"inputs": ("x", "m"), "outputs": ("y",)}
+    args[which] = "xm"
+    with pytest.raises(TypeError, match="sequences of names, not a string"):
+        kernels.face_kernel(
+            "two_rows", args["inputs"], {"m": _toy("string")}, args["outputs"], "", ""
+        )
