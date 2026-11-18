@@ -9,6 +9,7 @@ import inspect
 from functools import cache
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from omlx.patches import qwen35_verify_qmm as live
@@ -41,37 +42,48 @@ _CONSTANTS = (
 
 
 def test_the_oracle_is_the_live_code_verbatim():
+    frozen = oracle.legacy
     for name in _FUNCTIONS:
-        assert inspect.getsource(getattr(oracle, name)) == inspect.getsource(
+        assert inspect.getsource(getattr(frozen, name)) == inspect.getsource(
             getattr(live, name)
         ), name
     for name in _CONSTANTS:
-        assert getattr(oracle, name) == getattr(live, name), name
+        assert getattr(frozen, name) == getattr(live, name), name
     # Kernels of its own: the live cache never holds the oracle's.
-    assert oracle._KERNEL_CACHE is not live._KERNEL_CACHE
+    assert frozen._KERNEL_CACHE is not live._KERNEL_CACHE
     # And the Metal it generates, for every form a kernel takes.
     for mats in (1, 2):
         for half in (False, True):
-            source = oracle._sg8_source(mats, half)
+            source = frozen._sg8_source(mats, half)
             assert source == live._sg8_source(mats, half)
-            assert oracle._with_group_sums(source) == live._with_group_sums(source)
+            assert frozen._with_group_sums(source) == live._with_group_sums(source)
     for ns, bits in (((1024,), (4,)), ((4096, 512, 1024), (4, 5, 4))):
         for half in (False, True):
-            group = oracle._sg8_group_source(ns, bits, half)
+            group = frozen._sg8_group_source(ns, bits, half)
             assert group == live._sg8_group_source(ns, bits, half)
-            assert oracle._with_group_sums(group) == live._with_group_sums(group)
+            assert frozen._with_group_sums(group) == live._with_group_sums(group)
 
 
-@cache
+def _weights(n, k, bits, group_size, dtype, seed):
+    w = mx.random.normal((n, k), dtype=dtype, scale=0.05, key=mx.random.key(seed))
+    tensors = mx.quantize(w, group_size=group_size, bits=bits)
+    mx.eval(*tensors)
+    return tensors
+
+
+_cached_weights = cache(_weights)
+
+
 def _linear(n, k, bits, group_size, dtype, seed):
-    """An affine matrix as MLX quantizes it, with what sg8 reads of a layer."""
-    mx.random.seed(seed)
-    w = mx.random.normal((n, k), dtype=dtype, scale=0.05)
-    weight, scales, biases = mx.quantize(w, group_size=group_size, bits=bits)
-    layer = type("Quantized", (), {})()
-    layer.weight, layer.bits, layer.group_size = weight, bits, group_size
-    layer.scales, layer.biases = scales.astype(dtype), biases.astype(dtype)
-    mx.eval(layer.weight, layer.scales, layer.biases)
+    # The two large geometries run once each. Only common tensors are kept.
+    weights = _cached_weights if k == 1024 else _weights
+    layer = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+    nn.Module.__init__(layer)
+    layer.bits, layer.group_size, layer.mode = bits, group_size, "affine"
+    layer.weight, layer.scales, layer.biases = weights(
+        n, k, bits, group_size, dtype, seed
+    )
+    layer.freeze()
     return layer
 
 
@@ -100,21 +112,6 @@ def test_rows_are_compared_by_their_bits():
     assert not _same(zero, mx.array([0.0, 0.0], mx.bfloat16))
 
 
-def _valid_group(rows, k, n, bits, group_size):
-    """What the oracle's group kernel is a reference for, as the live
-    group's eligibility states it (without the routing's floors)."""
-    assert 1 <= rows <= 8 and bits in (4, 5) and group_size in (32, 64, 128)
-    assert k % (group_size * oracle._SG8_GROUP_NSG) == 0 and n % 8 == 0
-
-
-def _valid(rows, k, n, bits, group_size):
-    """What the oracle is a reference for, as the live kernels' eligibility
-    states it (without the routing's row and N floors): no shape outside."""
-    nsg, ct = oracle._sg8_geometry(k, n)
-    assert 1 <= rows <= 8 and bits in (2, 3, 4, 5, 6) and group_size in (32, 64, 128)
-    assert k % (group_size * nsg) == 0 and n % (8 * ct) == 0
-
-
 def _sums_of(x):
     """No sums, and the per-64 sums a producer writes, which the kernels read
     at a group size of 64 and drop at any other, as the live callers pass
@@ -129,9 +126,15 @@ def _sums_of(x):
     return (None, sums)
 
 
-def _single_and_pair(x, layer, gate, up, bits, group_size):
+@cache
+def _input(rows, dtype):
+    x = _x(rows, 1024, dtype, seed=rows)
+    return x, _sums_of(x)
+
+
+def _single_and_pair(x, variants, layer, gate, up, bits, group_size):
     """A matrix, then the gate/up pair, against the oracle."""
-    for sums in _sums_of(x):
+    for sums in variants:
         args = (layer.weight, layer.scales, layer.biases)
         kw = dict(group_size=group_size, bits=bits, sums=sums)
         assert _same(live.vk_qmm_sg8(x, *args, **kw), oracle.vk_qmm_sg8(x, *args, **kw))
@@ -145,18 +148,16 @@ def _single_and_pair(x, layer, gate, up, bits, group_size):
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [2, 3, 4, 5, 6])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
-@pytest.mark.parametrize("rows", [1, 3, 4, 6, 7, 8])
+@pytest.mark.parametrize("rows", range(1, 9))
 def test_a_matrix_and_a_gate_up_pair_are_the_oracle_s_rows(
     dtype, bits, group_size, rows
 ):
     k = 1024
-    _valid(rows, k, 1024, bits, group_size)
-    _valid(rows, k, 2048, bits, group_size)
-    x = _x(rows, k, dtype, seed=rows)
+    x, variants = _input(rows, dtype)
     layer = _linear(1024, k, bits, group_size, dtype, seed=bits)
     gate = _linear(2048, k, bits, group_size, dtype, seed=bits + 10)
     up = _linear(2048, k, bits, group_size, dtype, seed=bits + 20)
-    _single_and_pair(x, layer, gate, up, bits, group_size)
+    _single_and_pair(x, variants, layer, gate, up, bits, group_size)
 
 
 # The geometries: eight K parts of one tile, of two tiles (K from 16384),
@@ -165,29 +166,26 @@ def test_a_matrix_and_a_gate_up_pair_are_the_oracle_s_rows(
 @_GPU
 @pytest.mark.parametrize("k,n", [(16384, 1024), (512, 65536)])
 def test_every_geometry_is_the_oracle_s(k, n):
-    _valid(8, k, n, 4, 64)
     x = _x(8, k, mx.bfloat16, seed=k)
     layer = _linear(n, k, 4, 64, mx.bfloat16, seed=n)
     gate = _linear(n, k, 4, 64, mx.bfloat16, seed=n + 1)
     up = _linear(n, k, 4, 64, mx.bfloat16, seed=n + 2)
-    _single_and_pair(x, layer, gate, up, 4, 64)
+    _single_and_pair(x, _sums_of(x), layer, gate, up, 4, 64)
 
 
 @_GPU
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
-@pytest.mark.parametrize("rows", [1, 4, 6, 7, 8])
+@pytest.mark.parametrize("rows", range(1, 9))
 def test_a_group_of_matrices_is_the_oracle_s(dtype, group_size, rows):
     """4- and 5-bit matrices of one input in one launch."""
     k = 1024
-    x = _x(rows, k, dtype, seed=rows + group_size)
+    x, variants = _input(rows, dtype)
     group = [
         _linear(n, k, bits, group_size, dtype, seed=n + bits)
-        for n, bits in ((4096, 4), (512, 5), (1024, 4))
+        for n, bits in ((512, 5), (4096, 4), (1024, 4))
     ]
-    for linear in group:
-        _valid_group(rows, k, linear.scales.shape[0], linear.bits, group_size)
-    for sums in _sums_of(x):
+    for sums in variants:
         got = live.vk_group_sg8(x, group, sums)
         want = oracle.vk_group_sg8(x, group, sums)
         assert len(got) == len(want) == 3
@@ -199,13 +197,10 @@ def test_a_group_of_matrices_is_the_oracle_s(dtype, group_size, rows):
 def test_a_gate_of_zeros_gives_rows_of_negative_zeros_as_the_oracle(dtype):
     """silu(+0) times a negative up row is -0.0: the pair keeps the sign."""
     k, rows = 1024, 8
-    _valid(rows, k, 2048, 4, 64)
     x = _x(rows, k, dtype, seed=5)
-    gate = _linear(2048, k, 4, 64, dtype, seed=30)
-    zeros = type("Quantized", (), {})()
-    zeros.weight, zeros.bits, zeros.group_size = gate.weight, 4, 64
-    zeros.scales = mx.zeros_like(gate.scales)
-    zeros.biases = mx.zeros_like(gate.biases)
+    zeros = _linear(2048, k, 4, 64, dtype, seed=30)
+    zeros.scales = mx.zeros_like(zeros.scales)
+    zeros.biases = mx.zeros_like(zeros.biases)
     up = _linear(2048, k, 4, 64, dtype, seed=31)
     for sums in _sums_of(x):
         want = oracle.vk_swiglu_sg8(x, zeros, up, sums)
@@ -217,4 +212,163 @@ def test_a_gate_of_zeros_gives_rows_of_negative_zeros_as_the_oracle(dtype):
 def _layers_end_with_the_module():
     """The quantized layers the tests share live as long as this file's."""
     yield
-    _linear.cache_clear()
+    _cached_weights.cache_clear()
+    _input.cache_clear()
+
+
+def test_shared_weights_do_not_share_a_mutable_layer():
+    first = _linear(1024, 1024, 4, 64, mx.float16, seed=4)
+    second = _linear(1024, 1024, 4, 64, mx.float16, seed=4)
+    assert isinstance(first, nn.QuantizedLinear) and first is not second
+    assert first.weight is second.weight
+    first.scales = mx.zeros_like(first.scales)
+    assert first.scales is not second.scales
+
+
+def _no_kernel(*args, **kwargs):
+    pytest.fail("an invalid oracle input reached Metal")
+
+
+@pytest.mark.parametrize(
+    "rows,k,n,bits,group",
+    [
+        (0, 512, 16, 4, 64),
+        (9, 512, 16, 4, 64),
+        (1, 0, 16, 4, 64),
+        (5, 256, 0, 4, 32),
+        (5, 256, 9, 4, 32),
+        (5, 256, 16, 4, 64),
+        (5, 512, 16, 8, 64),
+        (5, 512, 16, 4, 16),
+    ],
+)
+def test_oracle_refuses_invalid_single_geometry(monkeypatch, rows, k, n, bits, group):
+    monkeypatch.setattr(mx.fast, "metal_kernel", _no_kernel)
+    x = mx.zeros((rows, k), mx.float16)
+    w = mx.zeros((n, k * bits // 32), mx.uint32)
+    s = mx.zeros((n, k // group), mx.float16)
+    with pytest.raises(ValueError):
+        oracle.vk_qmm_sg8(x, w, s, s, bits=bits, group_size=group)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["single", "group", "width", "scale_type", "bias_type", "empty_n", "k", "n"],
+)
+def test_oracle_refuses_invalid_group_members(monkeypatch, defect):
+    from types import SimpleNamespace
+
+    def layer(n, k=512, bits=4, group=64):
+        return SimpleNamespace(
+            group_size=group,
+            bits=bits,
+            weight=mx.zeros((n, k * bits // 32), mx.uint32),
+            scales=mx.zeros((n, k // group), mx.float16),
+            biases=mx.zeros((n, k // group), mx.float16),
+        )
+
+    projections = [layer(16), layer(8, bits=5)]
+    if defect == "single":
+        projections.pop()
+    elif defect == "group":
+        projections[1] = layer(8, group=32)
+    elif defect == "width":
+        projections[1] = layer(8, bits=6)
+    elif defect == "scale_type":
+        projections[1].scales = projections[1].scales.astype(mx.float32)
+    elif defect == "bias_type":
+        projections[1].biases = projections[1].biases.astype(mx.bfloat16)
+    elif defect == "empty_n":
+        projections[1] = layer(0)
+    elif defect == "n":
+        projections[1] = layer(9)
+    else:
+        projections[1] = layer(8, k=256)
+    x = mx.zeros((5, 512), mx.float16)
+    monkeypatch.setattr(mx.fast, "metal_kernel", _no_kernel)
+    with pytest.raises(ValueError):
+        oracle.vk_group_sg8(x, projections)
+
+
+@pytest.mark.parametrize(
+    "which", ["gate/up", "sums", "x", "packed", "scales", "biases"]
+)
+def test_oracle_refuses_incompatible_operands(monkeypatch, which):
+    from types import SimpleNamespace
+
+    w = mx.zeros((16, 64), mx.uint32)
+    s = mx.zeros((16, 8), mx.float16)
+    x = mx.zeros((4, 512), mx.float16)
+    gate = SimpleNamespace(weight=w, scales=s, biases=s, bits=4, group_size=64)
+    monkeypatch.setattr(mx.fast, "metal_kernel", _no_kernel)
+    with pytest.raises(ValueError):
+        if which == "gate/up":
+            up = SimpleNamespace(**{**vars(gate), "bits": 5})
+            oracle.vk_swiglu_sg8(x, gate, up)
+        elif which == "sums":
+            oracle.vk_qmm_sg8(x, w, s, s, group_size=64, sums=mx.zeros((4, 7)))
+        elif which == "x":
+            oracle.vk_qmm_sg8(x.astype(mx.float32), w, s, s, group_size=64)
+        else:
+            oracle.vk_qmm_sg8(
+                x,
+                w[:, :-1] if which == "packed" else w,
+                s[:-1] if which == "scales" else s,
+                s[:, 1:] if which == "biases" else s,
+                group_size=64,
+            )
+
+
+@pytest.mark.parametrize("shape", [(0, 64), (2, 0), (2, 65), ()])
+def test_oracle_group_sums_refuses_incomplete_rows(monkeypatch, shape):
+    monkeypatch.setattr(mx.fast, "metal_kernel", _no_kernel)
+    with pytest.raises(ValueError):
+        oracle.group_sums(mx.zeros(shape, mx.float16))
+
+
+@pytest.mark.parametrize(
+    "which",
+    [
+        "packed dtype",
+        "packed rank",
+        "activation rank",
+        "sum dtype",
+        "gate sum",
+        "group sum",
+        "up shape",
+        "up groups",
+        "up bias",
+    ],
+)
+def test_oracle_validates_each_bound_tensor(monkeypatch, which):
+    from types import SimpleNamespace
+
+    x = mx.zeros((4, 512), mx.float16)
+    w = mx.zeros((16, 64), mx.uint32)
+    s = mx.zeros((16, 8), mx.float16)
+    gate = SimpleNamespace(weight=w, scales=s, biases=s, bits=4, group_size=64)
+    up = SimpleNamespace(**vars(gate))
+    monkeypatch.setattr(mx.fast, "metal_kernel", _no_kernel)
+    with pytest.raises(ValueError):
+        if which == "gate sum":
+            oracle.vk_swiglu_sg8(x, gate, up, sums=mx.ones((4, 7)))
+        elif which == "group sum":
+            oracle.vk_group_sg8(x, (gate, up), sums=mx.ones((4, 7)))
+        elif which.startswith("up"):
+            if which == "up shape":
+                up.weight, up.scales, up.biases = w[:8], s[:8], s[:8]
+            if which == "up groups":
+                up.group_size = 32
+                up.scales = up.biases = mx.zeros((16, 16), mx.float16)
+            if which == "up bias":
+                up.biases = s[:, 1:]
+            oracle.vk_swiglu_sg8(x, gate, up)
+        else:
+            if which == "packed dtype":
+                w = w.astype(mx.int32)
+            if which == "packed rank":
+                w = w[..., None]
+            if which == "activation rank":
+                x = x[None]
+            sums = mx.zeros((4, 8), mx.float16) if which == "sum dtype" else None
+            oracle.vk_qmm_sg8(x, w, s, s, group_size=64, sums=sums)
