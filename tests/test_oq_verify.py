@@ -305,18 +305,19 @@ def test_streamed_decoder_releases_custom_format_declared_tensors(monkeypatch):
 
 def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
-    from threading import Event, current_thread, main_thread
+    from threading import Event, current_thread
 
     from omlx.patches import module_cache
 
     mod = nn.Linear(16, 8, bias=False)
     slot = "_test_first_cache"
+    caller = current_thread()
     ready, resume = Event(), Event()
     lock = module_cache._SLOTS_LOCK
 
     class PauseRegistration:
         def __enter__(self):
-            if current_thread() is not main_thread():
+            if current_thread() is not caller:
                 ready.set()
                 assert resume.wait(10)
             lock.acquire()
@@ -356,6 +357,23 @@ def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
         )
         assert rebuild.result(timeout=10) is mod.weight
         assert not ready.is_set()
+        assert slot in mod.__dict__
+
+
+def test_failed_cache_build_does_not_register_or_publish_a_slot(monkeypatch):
+    from omlx.patches import module_cache
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set())
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_failed_build"
+
+    def fail(module):
+        raise RuntimeError("failed to build the cache value")
+
+    with pytest.raises(RuntimeError, match="failed to build the cache value"):
+        module_cache.cached_per_module(mod, slot, fail)
+    assert slot not in module_cache._SLOTS
+    assert slot not in mod.__dict__
 
 
 def test_clear_cached_is_thread_safe(monkeypatch):

@@ -11,7 +11,6 @@ forward.
 from __future__ import annotations
 
 import copy
-import re
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -164,8 +163,19 @@ def test_a_model_with_a_format_layer_is_refused_with_the_layer_and_its_mode(
     model = Model()
     words = (
         "tensor parallelism cannot shard layers.0.experts: a layer of quant "
-        "format 'toy'"
+        "format 'toy', which no strategy splits; serve this model on one machine"
     )
-    with pytest.raises(RuntimeError, match=re.escape(words)):
+    with pytest.raises(RuntimeError) as refusal:
         apply_tensor_strategy(model, SimpleNamespace(), mx_module=mx)
+    assert str(refusal.value) == words
     assert not shards and model.layers[0].experts is layer
+
+
+def test_noncallable_named_modules_reaches_the_unsupported_strategy_refusal():
+    model = SimpleNamespace(model_type="no_adapter", named_modules=())
+    with pytest.raises(RuntimeError) as refusal:
+        apply_tensor_strategy(model, SimpleNamespace(), mx_module=mx)
+    assert str(refusal.value) == (
+        "tensor parallelism is unsupported for model type 'no_adapter': "
+        "no registered strategy and no native shard method"
+    )
