@@ -1644,6 +1644,24 @@ def test_a_finish_of_the_lane_is_told():
     assert not _a_scale(got)
 
 
+@metal
+def test_rows_stack_with_activations_observes_the_family_gate():
+    from tests.test_formats_linear import _ints, _StackableToy
+
+    class Reader(_StackableToy):
+        mode = "unregistered_stack_reader"
+
+    fmt = Reader(_toy("unregistered_stack"))
+    arrays = _matrix(8, 320)[0]
+    matrix = dict(zip(("weight", "scales"), arrays, strict=True))
+    x = _ints((320,))
+    testing.rows_stack(fmt, matrix, matrix, 320, 8, 1)
+    with pytest.raises(formats.FormatRefusedError, match="outside such a load"):
+        testing.rows_stack(fmt, matrix, matrix, 320, 8, 1, x)
+    with testing.verified("llama"):
+        testing.rows_stack(fmt, matrix, matrix, 320, 8, 1, x)
+
+
 def test_finish_rows_refuses_sums_it_cannot_bind_and_no_rows():
     (codes, scales), _, _ = _matrix(16, 64)
     face = _toy("finish")

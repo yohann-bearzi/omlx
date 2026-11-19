@@ -721,6 +721,33 @@ class _LayoutRaises(_StackableToy):
         raise _OwnError("no layout")
 
 
+@pytest.mark.parametrize("n", [0, -1])
+def test_stackable_refuses_nonpositive_rows_without_asking_layout(n):
+    calls = []
+
+    class Reader(_StackableToy):
+        def layout(self, k, n, bits, group_size):
+            calls.append(n)
+            return super().layout(k, n, bits, group_size)
+
+    assert not formats.stackable(Reader(), 320, n, 8, 1)
+    assert calls == []
+
+
+@pytest.mark.parametrize("mismatch", ["weight", "scales", "undeclared"])
+def test_stackable_requires_the_declared_matrix_tensors(mismatch):
+    class Reader(_StackableToy):
+        def layout(self, k, n, bits, group_size):
+            layout = super().layout(k, n, bits, group_size)
+            if mismatch == "undeclared":
+                layout["extra"] = ((n,), mx.float32)
+            else:
+                del layout[mismatch]
+            return layout
+
+    assert not formats.stackable(Reader(), 320, 8, 8, 1)
+
+
 def test_a_format_s_matrices_stack_as_its_layout_says(caplog, dot_defects):
     """formats.stackable reads the layout: every tensor's first axis is N,
     and the layout of 2N is the same with 2N. No layout, or one that

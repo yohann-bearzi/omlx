@@ -594,18 +594,22 @@ _NOTING = threading.Lock()
 def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> bool:
     """Whether ``fmt``'s ``(n, k)`` matrices may be stacked along N: one
     matrix of 2N rows over two of N, as a fused gate and up projection is.
-    The rows rule (docs/quant-formats.md): it holds for a format whose
-    ``layout(k, n, ...)`` has N as the first axis of every tensor, and whose
+    For positive N, the layout must cover the weight and every declared
+    side tensor. The rows rule (docs/quant-formats.md) holds for a format
+    whose ``layout(k, n, ...)`` has N as their first axis, and whose
     ``layout(k, 2n, ...)`` is the same with 2N; such a format promises that
     a row of the decoded matrix depends on that row of each tensor alone
     (``testing.rows_stack`` checks it). A format with no layout, or whose
     ``layout`` raises (logged once), is not stackable."""
+    if n <= 0:
+        return False
     try:
         one = fmt.layout(k, n, bits, group_size)
+        if not isinstance(one, dict) or one.keys() != {"weight", *fmt.tensors}:
+            return False
         two = fmt.layout(k, 2 * n, bits, group_size)
         return (
-            bool(one)
-            and isinstance(two, dict)
+            isinstance(two, dict)
             and two.keys() == one.keys()
             and all(
                 len(shape) >= 1

@@ -505,8 +505,11 @@ def rows_stack(
     (their ``weight`` and the format's tensors, by name, as ``layout`` gives
     them): stacked along N, their decode is the two decodes one after the
     other, bit for bit, and with ``x`` (K activations of a dtype the face is
-    exact for) so are their dot face's rows. Raises an ``AssertionError``
-    that names what differs, or that the format is not ``stackable``."""
+    exact for) so are their dot face's rows. With ``x`` the helper builds
+    format layers, so call it inside ``testing.verified(...)`` in a format
+    test. With ``x=None`` it only calls the format's decode after checking
+    the layout. Raises an ``AssertionError`` that names what differs, or
+    that the format is not ``stackable``."""
     n = first["weight"].shape[0]
     if not formats.stackable(fmt, k, n, bits, group_size):
         raise AssertionError(f"quant format {fmt.mode}: not stackable at n={n}, k={k}")
