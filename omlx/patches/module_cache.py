@@ -23,11 +23,15 @@ tensors), so the entry creates no reference cycle through the module.
 
 from __future__ import annotations
 
+import threading
 from itertools import chain
 from operator import is_
 from typing import Any, Callable
 
 import mlx.nn as nn
+
+_SLOTS_LOCK = threading.Lock()
+_SLOTS: set[str] = set()
 
 
 def _children(module: nn.Module, depth: int) -> list:
@@ -65,7 +69,19 @@ def cached_per_module(
     children = _children(module, depth)
     refs = tuple(chain(dict.values(module), *map(dict.values, children)))
     module.__dict__[slot] = (children, refs, state, value)
+    if slot not in _SLOTS:
+        with _SLOTS_LOCK:
+            _SLOTS.add(slot)
     return value
 
 
-__all__ = ["cached_per_module"]
+def clear_cached(module: nn.Module) -> None:
+    """Drop all ``cached_per_module`` entries stored on ``module``."""
+    with _SLOTS_LOCK:
+        slots = tuple(_SLOTS)
+    d = module.__dict__
+    for slot in slots:
+        d.pop(slot, None)
+
+
+__all__ = ["cached_per_module", "clear_cached"]

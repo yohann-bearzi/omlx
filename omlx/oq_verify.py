@@ -57,6 +57,9 @@ def layer_by_layer(layers) -> Iterator[None]:
     holds one decoder layer's weights at a time. A layer that runs again in
     the block is refused (its weights are gone). Other modules of the same
     classes run as they do."""
+    from .formats.linear import _FormatLayer
+    from .patches.module_cache import clear_cached
+
     ours = {id(layer): layer for layer in layers}
     ran: set[int] = set()
     classes = {type(layer) for layer in ours.values()}
@@ -76,7 +79,16 @@ def layer_by_layer(layers) -> Iterator[None]:
                 [leaf for _, leaf in tree_flatten(out) if isinstance(leaf, mx.array)]
             )
             ran.add(id(self))
-            self.update(tree_map(lambda _: mx.zeros((0,)), self.parameters()))
+            empty = mx.zeros((0,))
+            self.update(tree_map(lambda _: empty, self.parameters()))
+            # Format tensors reject a change of shape while the original is
+            # present, and per-module caches hold strong references to them.
+            for module in self.modules():
+                clear_cached(module)
+                if isinstance(module, _FormatLayer):
+                    for name in module.keys() & module._tensors:
+                        del module[name]
+                        module[name] = empty
             return out
 
         return call

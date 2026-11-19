@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import sys
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -198,3 +199,130 @@ def test_a_class_without_its_own_call_gets_none_back():
         assert "__call__" in Layer.__dict__
         layer(mx.array(1))
     assert "__call__" not in Layer.__dict__
+
+
+@pytest.mark.parametrize("stacked", [False, True], ids=["linear", "switch"])
+def test_streamed_decoder_releases_a_nested_format_projection(stacked):
+    from omlx.formats import testing
+    from tests.test_formats_linear import _experts, _pair, _switch_pair, _x
+
+    class Block(nn.Module):
+        def __call__(self, *args):
+            return self.proj(*args)
+
+    class Decoder(nn.Module):
+        def __call__(self, *args):
+            return self.mlp(*args)
+
+    decoder = Decoder()
+    decoder.mlp = Block()
+    with testing.verified("llama"):
+        resident, decoder.mlp.proj = (_switch_pair if stacked else _pair)(
+            320, 72, bias=True
+        )
+    args = (_x((2, 1, 320)), _experts((2,))) if stacked else (_x((2, 320)),)
+    expected = resident(*args)
+    mx.eval(expected)
+    del resident
+    names = ("weight", "scales", "biases", "bias")
+    orig = {name: decoder.mlp.proj[name] for name in names}
+    assert all(orig[name].size > 0 for name in names)
+    with oq_verify.layer_by_layer([decoder]):
+        actual = decoder(*args)
+        assert mx.array_equal(actual, expected).item()
+        assert {name: decoder.mlp.proj[name].size for name in names} == dict.fromkeys(
+            names, 0
+        )
+        assert {name: sys.getrefcount(orig[name]) for name in names} == dict.fromkeys(
+            names, 2
+        )
+
+
+def test_streamed_decoder_releases_custom_format_declared_tensors(monkeypatch):
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatLinear
+
+    class _StreamToy(formats.QuantFormat):
+        mode, tensors, contract = "toy_stream", ("lut",), formats.CONTRACT
+
+        def decode(self, tensors, bits, group_size):
+            return tensors["weight"].astype(mx.float32) * mx.expand_dims(
+                tensors["lut"], -1
+            )
+
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy_stream", _StreamToy())
+
+    class Block(nn.Module):
+        def __call__(self, x):
+            return self.proj(x)
+
+    class Decoder(nn.Module):
+        def __call__(self, x):
+            return self.mlp(x)
+
+    mx.random.seed(0)
+    weight = mx.random.randint(0, 16, (16, 32), dtype=mx.uint8)
+    lut = mx.random.normal((16,)).astype(mx.float32)
+    mx.eval(weight, lut)
+    with testing.verified("llama"):
+        proj = FormatLinear("toy_stream", 4, 32, 32, {"weight": weight, "lut": lut})
+        partial = FormatLinear(
+            "toy_stream",
+            4,
+            32,
+            32,
+            {"weight": mx.zeros((16, 32), dtype=mx.uint8), "lut": mx.zeros((16,))},
+        )
+    del partial["lut"]
+    aux = nn.Module()
+    proj.aux = aux
+    decoder = Decoder()
+    decoder.mlp = Block()
+    decoder.mlp.proj = proj
+    decoder.mlp.partial = partial
+    orig_w, orig_lut = proj["weight"], proj["lut"]
+    del weight, lut
+    with oq_verify.layer_by_layer([decoder]):
+        out = decoder(mx.ones((2, 32), dtype=mx.float32))
+        mx.eval(out)
+        assert proj["weight"].size == 0
+        assert proj["lut"].size == 0
+        assert "lut" not in partial
+        assert partial["weight"].size == 0
+        assert proj.aux is aux
+        assert sys.getrefcount(orig_w) == 2
+        assert sys.getrefcount(orig_lut) == 2
+
+
+def test_clear_cached_is_thread_safe():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.patches.module_cache import cached_per_module, clear_cached
+
+    def worker(idx: int) -> int:
+        mod = nn.Linear(16, 8, bias=False)
+        orig = mod.weight
+        cached_per_module(mod, f"_omlx_test_clear_{idx}", lambda m: m.weight, depth=0)
+        clear_cached(mod)
+        mod.weight = mx.zeros((0,))
+        return sys.getrefcount(orig)
+
+    with ThreadPoolExecutor(4) as pool:
+        refs = list(pool.map(worker, range(16)))
+    assert refs == [2] * 16
+
+
+def test_streamed_forward_accepts_a_one_shot_layer_iterator():
+    layer = nn.Linear(32, 16)
+    with oq_verify.layer_by_layer(iter([layer])):
+        layer(mx.ones((1, 32)))
+        assert layer.weight.size == 0
+
+
+def test_a_reference_cache_replaced_by_a_file_is_refused(tmp_path):
+    cache = tmp_path / "cache"
+    cache.write_bytes(b"replaced directory")
+    with pytest.raises(NotADirectoryError):
+        oq_verify._take_reference(cache / "reference.npz", {}, None)
