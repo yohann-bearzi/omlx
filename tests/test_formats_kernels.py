@@ -1582,8 +1582,9 @@ def test_a_cursor_that_ignores_its_block_reads_another_lane_s_inputs():
 def test_lane_parts_refuses_what_dot_rows_refuses():
     (codes, scales), x, _ = _matrix(16, 64)
     face = _toy("lanes")
-    with pytest.raises(ValueError, match="n=0: one row or more"):
-        testing.lane_parts(face, (codes, scales), x, 0)
+    for n in (0, -1):
+        with pytest.raises(ValueError, match=f"n={n}: one row or more"):
+            testing.lane_parts(face, (codes, scales), x, n)
     with pytest.raises(ValueError, match="x is one vector"):
         testing.lane_parts(face, (codes, scales), x[None], 16)
     with pytest.raises(ValueError, match="operands given: 1"):
@@ -1660,6 +1661,8 @@ def test_rows_stack_with_activations_observes_the_family_gate():
         testing.rows_stack(fmt, matrix, matrix, 320, 8, 1, x)
     with testing.verified("llama"):
         testing.rows_stack(fmt, matrix, matrix, 320, 8, 1, x)
+    with pytest.raises(formats.FormatRefusedError, match="outside such a load"):
+        testing.rows_stack(fmt, matrix, matrix, 320, 8, 1, x)
 
 
 def test_finish_rows_refuses_sums_it_cannot_bind_and_no_rows():
@@ -1672,5 +1675,6 @@ def test_finish_rows_refuses_sums_it_cannot_bind_and_no_rows():
     with pytest.raises(ValueError, match="8 or more float32 values"):
         half = _SUMS.astype(mx.float16)
         testing.finish_rows(face, (codes, scales), 64, 16, half, mx.float32)
-    with pytest.raises(ValueError, match="k=64, n=0"):
-        testing.finish_rows(face, (codes, scales), 64, 0, _SUMS, mx.float32)
+    for k, n in ((64, 0), (64, -1), (0, 16), (-1, 16)):
+        with pytest.raises(ValueError, match=f"k={k}, n={n}"):
+            testing.finish_rows(face, (codes, scales), k, n, _SUMS, mx.float32)

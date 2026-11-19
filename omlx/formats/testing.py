@@ -512,11 +512,27 @@ def rows_stack(
     exact for) so are their dot face's rows. With ``x`` the helper builds
     format layers, so call it inside ``testing.verified(...)`` in a format
     test. With ``x=None`` it only calls the format's decode after checking
-    the layout. Raises an ``AssertionError`` that names what differs, or
-    that the format is not ``stackable``."""
-    n = first["weight"].shape[0]
-    if not formats.stackable(fmt, k, n, bits, group_size):
+    both matrices against the declared tensor names, shapes and dtypes.
+    Raises an ``AssertionError`` that names what differs, or that the
+    format is not ``stackable``."""
+    weight = first.get("weight")
+    if not isinstance(weight, mx.array) or not weight.ndim:
+        raise AssertionError(f"quant format {fmt.mode}: first matrix needs weight rows")
+    n = weight.shape[0]
+    layout = formats._stackable_layout(fmt, k, n, bits, group_size)
+    if layout is None:
         raise AssertionError(f"quant format {fmt.mode}: not stackable at n={n}, k={k}")
+    expected = {name: (tuple(shape), dtype) for name, (shape, dtype) in layout.items()}
+    for side, matrix in (("first", first), ("second", second)):
+        actual = {
+            name: (t.shape, t.dtype) if isinstance(t, mx.array) else type(t).__name__
+            for name, t in matrix.items()
+        }
+        if actual != expected:
+            raise AssertionError(
+                f"quant format {fmt.mode}: {side} matrix has {actual}, "
+                f"expected {expected}"
+            )
     stacked = {
         name: mx.concatenate([first[name], second[name]], axis=0) for name in first
     }

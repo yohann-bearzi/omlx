@@ -631,14 +631,19 @@ def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> b
     a row of the decoded matrix depends on that row of each tensor alone
     (``testing.rows_stack`` checks it). A format with no layout, or whose
     ``layout`` raises (logged once), is not stackable."""
+    return _stackable_layout(fmt, k, n, bits, group_size) is not None
+
+
+def _stackable_layout(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int):
+    """The declared N-row layout when two such matrices can stack along N."""
     if n <= 0:
-        return False
+        return None
     try:
         one = fmt.layout(k, n, bits, group_size)
         if not isinstance(one, dict) or one.keys() != {"weight", *fmt.tensors}:
-            return False
+            return None
         two = fmt.layout(k, 2 * n, bits, group_size)
-        return (
+        if (
             isinstance(two, dict)
             and two.keys() == one.keys()
             and all(
@@ -648,7 +653,8 @@ def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> b
                 and two[name][1] == dtype
                 for name, (shape, dtype) in one.items()
             )
-        )
+        ):
+            return one
     except Exception as error:
         defect = (fmt.mode, repr(error))
         with _NOTING:
@@ -662,7 +668,7 @@ def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> b
                 n,
                 k,
             )
-        return False
+    return None
 
 
 def dot(layer, k: int, n: int) -> Dot | None:

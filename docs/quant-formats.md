@@ -951,7 +951,7 @@ Worth testing for every layout a format gives a face for:
 - the same rows with different `packs`, with `staged=True`, and through `testing.shared_rows(face, operands, xs, n, rps=...)` (1 to 16 vectors `xs`, each block's weights by `decode` once, then `apply` for each vector; `rps` rows a simdgroup, `unrolled` the unrolled skeleton): no vector's row may change by a bit,
 - a K of whole blocks and a K that ends in a partial block, if the face takes both,
 - the face's tables, with `testing.staged_tables(face, operands, dtype)`: one launch over the face's operands, compiled for activations of `dtype`, that reads each table back through the face's member of its name, as a kernel stages it. Each array it returns has the table's dtype, length and bits (`table.bits`) when the members are declared as [Tables](#tables) says,
-- for a stackable format, compare two matrices with `testing.rows_stack` (for checkpoint tensors, pass `layer.fmt`). With `x`, the helper builds three format layers to check dot rows. In a format test, run that check inside the family's verification block. Omitting `x` checks the decoded rows directly.
+- for a stackable format, compare two matrices with `testing.rows_stack` (for checkpoint tensors, pass `layer.fmt`). With `x`, the helper builds three format layers to check dot rows. In a format test, run that check inside the family's verification block. Both input dictionaries must match the same declared layout, including tensor names, shapes and dtypes. Omitting `x` checks the decoded rows directly.
 
   ```python
   with testing.verified("qwen3_5_moe_text"):

@@ -759,6 +759,89 @@ def test_stackable_requires_the_declared_matrix_tensors(mismatch):
     assert not formats.stackable(Reader(), 320, 8, 8, 1)
 
 
+@pytest.mark.parametrize("sides", [(0,), (1,), (0, 1)], ids=["first", "second", "both"])
+@pytest.mark.parametrize(
+    "change",
+    [
+        pytest.param(lambda m: {"scales": m["scales"]}, id="missing-weight"),
+        pytest.param(lambda m: {"weight": m["weight"]}, id="missing-side"),
+        pytest.param(lambda m: {**m, "extra": m["scales"]}, id="extra"),
+        pytest.param(lambda m: {**m, "weight": m["weight"][:, :4]}, id="width"),
+        pytest.param(lambda m: {**m, "scales": m["scales"][:1]}, id="side-shape"),
+        pytest.param(
+            lambda m: {**m, "scales": m["scales"].astype(mx.float16)}, id="dtype"
+        ),
+        pytest.param(lambda m: {**m, "weight": mx.array(0)}, id="scalar-weight"),
+        pytest.param(lambda m: {**m, "scales": None}, id="non-array"),
+    ],
+)
+def test_rows_stack_checks_both_inputs_against_the_declared_layout(sides, change):
+    matrix = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    matrices = [matrix, matrix]
+    for side in sides:
+        matrices[side] = change(matrix)
+    with pytest.raises(AssertionError, match="quant format toy: (first|second) matrix"):
+        testing.rows_stack(_StackableToy(), *matrices, 8, 8, 1)
+
+
+def test_rows_stack_requires_two_matrices_with_the_same_row_count():
+    first = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    second = {k: v[:1] for k, v in first.items()}
+    with pytest.raises(AssertionError, match="quant format toy: second matrix"):
+        testing.rows_stack(_StackableToy(), first, second, 8, 8, 1)
+
+
+def test_rows_stack_accepts_a_single_row_and_list_shapes():
+    class Reader(_StackableToy):
+        def layout(self, k, n, bits, group_size):
+            return {"weight": ([n, k], mx.uint8), "scales": ([n], mx.float32)}
+
+    matrix = {"weight": mx.ones((1, 8), mx.uint8), "scales": mx.ones((1,))}
+    testing.rows_stack(Reader(), matrix, matrix, 8, 8, 1)
+
+
+def test_rows_stack_with_activations_requires_a_dot_face():
+    matrix = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    with pytest.raises(AssertionError, match="no dot face to compare"):
+        testing.rows_stack(_StackableToy(), matrix, matrix, 8, 8, 1, mx.ones((8,)))
+
+
+@pytest.mark.parametrize("kind", ["scalar", "nondict", "lists"])
+def test_stackable_compares_declared_tensor_shapes_without_a_defect(kind):
+    class Reader(_StackableToy):
+        def layout(self, k, n, bits, group_size):
+            layout = super().layout(k, n, bits, group_size)
+            if kind == "nondict" and n == 16:
+                return None
+            if kind == "scalar":
+                layout["scales"] = ((), mx.float32)
+            if kind == "lists":
+                layout = {key: (list(shape), dt) for key, (shape, dt) in layout.items()}
+            return layout
+
+    with testing.no_dot_defects():
+        assert formats.stackable(Reader(), 320, 8, 8, 1) is (kind == "lists")
+
+
+@pytest.mark.parametrize("kind", ["nan", "signed_zero", "dtype"])
+def test_rows_stack_compares_the_bits_and_dtype_of_decoded_rows(kind):
+    class Reader(_StackableToy):
+        def decode(self, tensors, bits, group_size):
+            n, k = tensors["weight"].shape
+            if kind == "dtype":
+                return mx.zeros((n, k), mx.uint8 if n == 16 else mx.int8)
+            value = float("nan") if kind == "nan" else (-0.0 if n == 16 else 0.0)
+            return mx.full((n, k), value, mx.float32)
+
+    arrays = _matrix(8, 320)[0]
+    matrix = dict(zip(("weight", "scales"), arrays, strict=True))
+    if kind == "nan":
+        testing.rows_stack(Reader(), matrix, matrix, 320, 8, 1)
+    else:
+        with pytest.raises(AssertionError, match="decode of two stacked matrices"):
+            testing.rows_stack(Reader(), matrix, matrix, 320, 8, 1)
+
+
 def test_a_format_s_matrices_stack_as_its_layout_says(caplog, dot_defects):
     """formats.stackable reads the layout: every tensor's first axis is N,
     and the layout of 2N is the same with 2N. No layout, or one that
