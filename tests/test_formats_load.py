@@ -2862,6 +2862,38 @@ def test_a_record_that_does_not_say_verified_is_refused(levels, tmp_path):
     assert str(refusal.value) == _refusal("not verified: its checks failed", path)
 
 
+@pytest.mark.parametrize("reader", ["load", "dedicated", "override"])
+@pytest.mark.parametrize(
+    "record,reason",
+    [
+        (
+            {"verified": False, "mode": "toy", "reason": "checks failed"},
+            "checks failed",
+        ),
+        ({"verified": False, "mode": [], "reason": "checks failed"}, "checks failed"),
+        ({"verified": 1, "reason": "flag must be true"}, "flag must be true"),
+        ([], "verification record"),
+        (None, "verification record"),
+    ],
+)
+def test_unverified_output_without_format_layers_is_refused(
+    tmp_path, reader, record, reason
+):
+    path = tmp_path / "model"
+    path.mkdir()
+    config = {"model_type": "llama"}
+    marked = {"omlx_verification": record}
+    on_disk = config if reader == "override" else {**config, **marked}
+    (path / "config.json").write_text(json.dumps(on_disk))
+    with pytest.raises(formats.FormatRefusedError, match=reason):
+        if reader == "dedicated":
+            format_load.refuse_format_checkpoint(path, "embedding")
+        else:
+            with format_load.loading(path) as checkpoint:
+                if reader == "override":
+                    checkpoint.apply_model_config(marked)
+
+
 def test_a_verified_checkpoint_loads(levels, tmp_path):
     path = _verification(
         _tiny(tmp_path / "toy", [3.0]), verified=True, mode="toy", verify_version=0

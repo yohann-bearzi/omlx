@@ -1020,6 +1020,14 @@ class TestEstimateModelSize:
         assert size == int(1000 * 1.05)
 
 
+@pytest.mark.parametrize("record", [None, []])
+def test_discovery_skips_a_present_invalid_verification_record(tmp_path, record):
+    from omlx.model_discovery import unverified
+
+    (tmp_path / "config.json").write_text(json.dumps({"omlx_verification": record}))
+    assert unverified(tmp_path)
+
+
 class TestDiscoverModels:
     """Tests for discover_models function."""
 

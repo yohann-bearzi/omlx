@@ -56,7 +56,7 @@ import mlx.nn as nn
 from .. import formats
 from ..formats import FormatRefusedError, LoadHookError
 from ..formats.linear import FormatLinear, FormatSwitchLinear
-from ..model_discovery import VERIFICATION
+from ..model_discovery import VERIFICATION, unverified_reason
 
 # The modules whose SwitchLinear holds a stack of matrices, (E, N, K).
 _SWITCH_MODULES = ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")
@@ -240,6 +240,7 @@ class _Checkpoint:
         effective = disk | override
         recorded = self._marked_mode()
         supplied = _Checkpoint(self.path, config=effective)
+        supplied.refuse_unverified()
         supplied_mode = supplied._marked_mode()
         mode = recorded or supplied_mode
         if mode is None:
@@ -346,16 +347,16 @@ class _Checkpoint:
         quant format wrote it and its verification did not pass: the run
         did not complete, or its checks failed."""
         try:
-            if self._config is None:
-                self._config = json.loads((self.path / "config.json").read_text())
-        except OSError:
-            # A loader handed what is no checkpoint's directory.
+            config = self._read_config()
+        except (OSError, ValueError):
+            # The loader handles an absent or unreadable config.
             return
-        config = self._config
-        record = config.get(VERIFICATION) if isinstance(config, dict) else None
-        if isinstance(record, dict) and record.get("verified") is not True:
+        reason = unverified_reason(config)
+        if reason is not None:
+            record = config[VERIFICATION]
+            mode = record.get("mode") if isinstance(record, dict) else None
             raise _refused(
-                f"not verified: {record.get('reason')}", record.get("mode"), self
+                f"not verified: {reason}", mode if isinstance(mode, str) else None, self
             )
 
     def writer(self, mode: str) -> str:
@@ -839,6 +840,7 @@ def _damaged(config: dict) -> bool:
 def refuse_format_checkpoint(path, loader: str, *, config=_ABSENT, reason=None) -> None:
     """Reject format weights before a reader outside the checked path opens them."""
     checkpoint = _Checkpoint(path, config=config)
+    checkpoint.refuse_unverified()
     mode, _ = checkpoint._declaration
     if mode is not None:
         raise _refused(

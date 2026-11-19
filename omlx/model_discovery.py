@@ -1477,6 +1477,18 @@ VERIFICATION = "omlx_verification"
 SOURCE_RECORDS = ("omlx_quant_formats", VERIFICATION)
 
 
+def unverified_reason(config) -> str | None:
+    """The reason a present verification record refuses this checkpoint."""
+    if not isinstance(config, dict) or VERIFICATION not in config:
+        return None
+    record = config[VERIFICATION]
+    if not isinstance(record, dict):
+        return "its verification record is not an object"
+    if record.get("verified") is True:
+        return None
+    return str(record.get("reason", "its verification record does not say verified"))
+
+
 def unverified(path: Path) -> bool:
     """A checkpoint a run in a quant format wrote and did not verify: in
     its <output>.unverified folder, or with a config whose record does not
@@ -1487,8 +1499,7 @@ def unverified(path: Path) -> bool:
         config = json.loads((path / "config.json").read_text())
     except (OSError, ValueError):
         return False
-    record = config.get(VERIFICATION) if isinstance(config, dict) else None
-    return isinstance(record, dict) and record.get("verified") is not True
+    return unverified_reason(config) is not None
 
 
 def _skipped_entry(path: Path) -> bool:
