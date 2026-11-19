@@ -300,8 +300,10 @@ class STSEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
-        local = Path(self._model_name).expanduser()
-        if local.exists() or local.is_absolute():
+        model_name = self._model_name
+        local = Path(model_name).expanduser()
+        is_local = local.exists() or local.is_absolute()
+        if is_local:
             refuse_format_checkpoint(local, "audio_sts")
         family = self._family
         logger.info(f"Starting STS engine: {self._model_name} (family={family})")
@@ -314,9 +316,10 @@ class STSEngine(BaseNonStreamingEngine):
             )
 
         try:
-            model_name = await asyncio.to_thread(
-                checked_audio_path, self._model_name, "audio_sts"
-            )
+            if not is_local:
+                model_name = await asyncio.to_thread(
+                    checked_audio_path, model_name, "audio_sts"
+                )
             loop = asyncio.get_running_loop()
             self._model = await loop.run_in_executor(
                 get_mlx_executor(), loader, model_name

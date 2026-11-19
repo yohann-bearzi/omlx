@@ -3711,10 +3711,10 @@ def test_the_hub_drafter_reads_only_weights_of_its_checked_revision(
     monkeypatch.setattr(drafters, "get_mtp_splitter", select)
     if recorded == "stock":
         with pytest.raises(StockSelectionError):
-            drafters.load_drafter("org/drafter")
+            drafters.load_drafter("org/drafter", revision="model-option")
     else:
         with pytest.raises(formats.FormatRefusedError) as refused:
-            drafters.load_drafter("org/drafter")
+            drafters.load_drafter("org/drafter", revision="model-option")
         assert (refused.value.path, refused.value.mode) == (snapshot, "toy")
     expected = [(None, ["config.json"])]
     if recorded != "metadata":
@@ -4694,9 +4694,10 @@ def test_drafter_download_uses_the_callers_revision_and_force_flag(
     assert result == (snapshot, "out", "v2", True)
 
 
+@pytest.mark.parametrize("container", ["direct", "wrapped", "raw-first"])
 @pytest.mark.parametrize("held", [True, False], ids=["held", "pruned"])
 def test_an_adapter_cannot_shard_the_language_model_of_a_recorded_vlm(
-    toy, tmp_path, monkeypatch, held
+    toy, tmp_path, monkeypatch, held, container
 ):
     from omlx.cluster import tensor_strategies
 
@@ -4717,10 +4718,22 @@ def test_an_adapter_cannot_shard_the_language_model_of_a_recorded_vlm(
 
     adapter._omlx_tensor_strategy = SimpleNamespace(name="test")
     monkeypatch.setitem(tensor_strategies._ADAPTERS, "llama", adapter)
-    with pytest.raises(formats.FormatRefusedError) as refusal:
-        tensor_strategies.apply_tensor_strategy(
-            root.language_model, object(), mx_module=mx
+    target = root.language_model
+    if container == "wrapped":
+        target = nn.Module()
+        target.model_type = "llama"
+        target.text = root.language_model
+    elif container == "raw-first":
+        (weight, scales), _, _ = _matrix(8, 64)
+        with testing.verified("llama"):
+            bare = FormatLinear(toy, 8, 1, 64, {"weight": weight, "scales": scales})
+        modules = [("bare", bare), ("text", root.language_model)]
+        target = SimpleNamespace(
+            model_type="llama", named_modules=lambda: iter(modules)
         )
+        assert tensor_strategies.format_layer(target) == ("bare", bare)
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        tensor_strategies.apply_tensor_strategy(target, object(), mx_module=mx)
     assert (refusal.value.path, refusal.value.mode) == (tmp_path, "toy")
 
 

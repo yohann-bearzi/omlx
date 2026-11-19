@@ -3,6 +3,7 @@
 
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -218,3 +219,73 @@ def test_relative_audio_directory_is_checked_locally(checkpoint, monkeypatch):
     with pytest.raises(formats.FormatRefusedError) as refused:
         checked_audio_path(checkpoint.name, "audio_stt")
     assert (refused.value.path, refused.value.mode) == (checkpoint, "toy")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exists", [False, True], ids=["missing", "present"])
+async def test_local_sts_checks_the_stock_config_once_before_loading(
+    tmp_path, monkeypatch, exists
+):
+    import mlx_audio.utils
+
+    source = tmp_path / "deepfilternet"
+    config = source / "config.json"
+    if exists:
+        source.mkdir()
+        config.write_text('{"model_type":"deepfilternet"}')
+    engine = sts.STSEngine(str(source))
+    events = []
+    read = Path.read_text
+    resolve = sts.checked_audio_path
+
+    def observe_resolver(*args):
+        events.append("resolve")
+        return resolve(*args)
+
+    def observe(path, *args, **kwargs):
+        if path == config:
+            events.append("config")
+        return read(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", observe)
+    monkeypatch.setattr(sts, "checked_audio_path", observe_resolver)
+    monkeypatch.setattr(mlx_audio.utils, "get_model_path", entered)
+    monkeypatch.setattr(sts, "get_mlx_executor", lambda: None)
+    monkeypatch.setitem(sts._FAMILY_LOADERS, "deepfilternet", events.append)
+    await engine.start()
+    assert events == ["config", str(source)]
+
+
+def test_a_missing_absolute_audio_source_stays_local(tmp_path, monkeypatch):
+    import mlx_audio.utils
+
+    from omlx.patches.format_load import checked_audio_path
+
+    source = str(tmp_path / "absent")
+    monkeypatch.setattr(mlx_audio.utils, "get_model_path", entered)
+    assert checked_audio_path(source, "audio_tts") == source
+
+
+@pytest.mark.asyncio
+async def test_stock_audio_hub_reads_weights_from_the_checked_snapshot(
+    tmp_path, monkeypatch
+):
+    import mlx_audio.utils
+
+    snapshot = tmp_path / ("a" * 40)
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text('{"model_type":"deepfilternet"}')
+    source = "test-org/deepfilternet"
+    calls = []
+
+    def resolve(repo, *, allow_patterns=None, revision=None):
+        calls.append((repo, allow_patterns, revision))
+        return snapshot
+
+    seen = []
+    monkeypatch.setattr(mlx_audio.utils, "get_model_path", resolve)
+    monkeypatch.setattr(sts, "get_mlx_executor", lambda: None)
+    monkeypatch.setitem(sts._FAMILY_LOADERS, "deepfilternet", seen.append)
+    await sts.STSEngine(source).start()
+    assert calls == [(source, ["config.json"], None), (source, None, snapshot.name)]
+    assert seen == [str(snapshot)]

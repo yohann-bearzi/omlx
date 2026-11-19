@@ -883,27 +883,39 @@ def _shard_muse_spark(
     _shard_layers(list(model.layers), shard_layer, mx, progress, MUSE_SPARK)
 
 
-def format_layer(model: Any) -> tuple[str, Any] | None:
+def _refuse_recorded_module(module: Any) -> None:
+    refuse = getattr(module, "__dict__", {}).get("_omlx_refuse_sharding")
+    if refuse is not None:
+        refuse()
+
+
+def format_layer(
+    model: Any, *, refuse_recorded: bool = False
+) -> tuple[str, Any] | None:
     """A quant format's layer that ``model`` holds, with its path, or None:
     no strategy splits a format's tensors. A model is walked through its
-    ``named_modules`` (an ``nn.Module``'s)."""
+    ``named_modules`` (an ``nn.Module``'s). During sharding, a checkpoint
+    refusal from any submodule takes precedence over a bare format layer."""
     named_modules = getattr(model, "named_modules", None)
     if not callable(named_modules):
         return None
     from ..formats.linear import FormatLinear, FormatSwitchLinear
 
+    first = None
     for name, module in named_modules():
-        if isinstance(module, (FormatLinear, FormatSwitchLinear)):
-            return name, module
-    return None
+        if refuse_recorded:
+            _refuse_recorded_module(module)
+        if first is None and isinstance(module, (FormatLinear, FormatSwitchLinear)):
+            first = name, module
+            if not refuse_recorded:
+                return first
+    return first
 
 
 def _refuse_format_layers(model: Any, *, operation: str = "tensor parallelism") -> None:
     """Refuse a model that holds a quant format's layer, naming one."""
-    refuse = getattr(model, "__dict__", {}).get("_omlx_refuse_sharding")
-    if refuse is not None:
-        refuse()
-    held = format_layer(model)
+    _refuse_recorded_module(model)
+    held = format_layer(model, refuse_recorded=True)
     if held is not None:
         name, module = held
         raise RuntimeError(
