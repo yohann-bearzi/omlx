@@ -477,7 +477,7 @@ def test_a_stack_s_join_is_evaluated_once_the_writer_lets_its_source_go(
     # Runs of one matrix: every stack of experts is joined.
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 16)
     encode, evaluate, joins, evaluated = oq._encode_in_format, mx.eval, {}, []
-    synchronize, events = mx.synchronize, []
+    synchronize, clear_cache, events = mx.synchronize, mx.clear_cache, []
     # What is evaluated while the format encodes; held for that call alone,
     # so that nothing here keeps the source alive.
     window = []
@@ -497,25 +497,36 @@ def test_a_stack_s_join_is_evaluated_once_the_writer_lets_its_source_go(
         events.append("synchronize")
         return synchronize(*args, **kwargs)
 
+    def cleared():
+        events.append("clear cache")
+        return clear_cache()
+
     def encoding(fmt, tensor_name, w, *args):
         window.append([])
         runs = len(toy.encoded)
         tensors = encode(fmt, tensor_name, w, *args)
         during = window.pop()
         if tensors is not None and len(toy.encoded) - runs > 1:
+            released = weakref.ref(w, lambda _: events.append("source released"))
             for tensor in tensors.values():
                 # Not evaluated while the source is held.
                 assert not any(tensor is a for arrays in during for a in arrays)
-                joins[id(tensor)] = (tensor, weakref.ref(w))
+                joins[id(tensor)] = (tensor, released)
         return tensors
 
     monkeypatch.setattr(oq, "_encode_in_format", encoding)
     monkeypatch.setattr(mx, "eval", watched)
     monkeypatch.setattr(mx, "synchronize", synchronized)
+    monkeypatch.setattr(mx, "clear_cache", cleared)
     _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
     # Each alone, each once the source stack is gone, each once.
     assert evaluated and set(evaluated) == {(1, True)}
     assert len(evaluated) == len(joins)
+    # Drain the work and release the source buffer before allocating the first join.
+    releases = [i for i, event in enumerate(events) if event == "source released"]
+    assert releases
+    for i in releases:
+        assert events[i + 1 : i + 4] == ["synchronize", "clear cache", "join"]
     # A join's runs are let go before anything else is evaluated.
     after = [events[i + 1] for i, event in enumerate(events) if event == "join"]
     assert after == ["synchronize"] * len(joins)
@@ -1824,6 +1835,11 @@ def test_a_record_a_source_carries_is_not_kept_without_its_layers(
         (carried / path.name).symlink_to(path)
     config = json.loads((source / "config.json").read_text())
     config[_RECORD] = {"toy": {"plugin": None, "contract": 1, "record": {}}}
+    config["quantization"] = {
+        "group_size": 64,
+        "bits": 4,
+        "mtp.0.proj": {"mode": "toy", "group_size": 1, "bits": 8},
+    }
     (carried / "config.json").unlink()
     (carried / "config.json").write_text(json.dumps(config))
     _, written, _ = _quantize(carried, tmp_path / "oqe")
@@ -1879,6 +1895,26 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
     assert sampled == [] and len(toy.encoded) == len(applied) > 0
     report = json.loads((tmp_path / "oqe-toy" / "oq_imatrix_report.json").read_text())
     assert report["cache_reused"] is True
+
+
+def test_an_interrupted_imatrix_write_preserves_the_previous_cache(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "imatrix"
+    entry = oq.OQImatrixEntry(np.ones(4), np.ones(1))
+    oq._save_oqe_imatrix(path, {"a": entry}, {"source": "first"})
+    before = {file.name: file.read_bytes() for file in tmp_path.iterdir()}
+
+    def interrupted(file, **arrays):
+        file.write(b"incomplete")
+        file.flush()
+        assert path.read_bytes() == before[path.name]
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(np, "savez_compressed", interrupted)
+    with pytest.raises(OSError, match="interrupted"):
+        oq._save_oqe_imatrix(path, {"b": entry}, {"source": "second"})
+    assert {file.name: file.read_bytes() for file in tmp_path.iterdir()} == before
 
 
 def test_a_cache_is_written_and_read_at_the_name_given(source, toy, tmp_path):
@@ -2072,6 +2108,27 @@ def test_fitted_widths_match_the_written_quantization_after_memory_pressure(
     written = _in_format(json.loads((output / "config.json").read_text()))
     assert {name: entry["bits"] for name, entry in written.items()} == offered
     assert [bits for _, _, bits, _ in writer.encoded] == list(offered.values())
+
+
+def test_fitting_skips_matrices_larger_than_the_writer_can_offer(
+    source, toy, tmp_path, monkeypatch
+):
+    cache = str(tmp_path / "imatrix.npz")
+    all_offers = _offers(source, cache)
+    sizes = {offer.shape[-1] * offer.shape[-2] for offer in all_offers}
+    limit = min(sizes)
+    assert max(sizes) > limit
+    monkeypatch.setattr(oq, "_LAUNCH_WEIGHTS", limit)
+    expected = [
+        offer.name for offer in all_offers if offer.shape[-1] * offer.shape[-2] <= limit
+    ]
+    assert [offer.name for offer in _offers(source, cache)] == expected
+    _, config, _ = _quantize(
+        source, tmp_path / "written", quant_format="toy", imatrix_cache_path=cache
+    )
+    assert set(_in_format(config)) == {
+        name.removesuffix(".weight") for name in expected
+    }
 
 
 def test_fitted_widths_respect_an_explicit_sensitivity_source(
@@ -2858,6 +2915,11 @@ def test_the_walk_is_of_the_config_the_run_writes(source, toy, tmp_path, monkeyp
     extra = {"torch_dtype": "bfloat16", "n_mtp_layers": 1}
     # And the records of the run that wrote it, which the walk does not read.
     carried = {
+        "quantization": {
+            "group_size": 64,
+            "bits": 4,
+            "vision_tower.proj": {"mode": "lloyd", "group_size": 1, "bits": 8},
+        },
         _RECORD: {"lloyd": {"plugin": None, "contract": 1, "record": {}}},
         _VERIFICATION: {"verified": True, "mode": "lloyd", "verify_version": 0},
     }
