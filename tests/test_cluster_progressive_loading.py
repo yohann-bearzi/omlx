@@ -127,6 +127,41 @@ def test_a_checkpoint_with_layers_of_a_quant_format_is_offered_no_tensors():
     assert _supports_tensor_parallel({"model_type": "qwen3", **whole}) is False
 
 
+@pytest.mark.parametrize("holder", ["root", "text_config"])
+@pytest.mark.parametrize(
+    "field", ["omlx_quant_formats", "quantization", "quantization_config"]
+)
+@pytest.mark.parametrize("strategy", ["tensor", "pipeline"])
+def test_distributed_planner_recognizes_a_checkpoint_format(
+    monkeypatch, holder, field, strategy
+):
+    from mlx_lm.models import qwen3
+
+    from omlx.cluster.planner import _supports_pipeline
+
+    monkeypatch.setattr(qwen3, "SUPPORTS_PIPELINE", True, raising=False)
+    supports = _supports_tensor_parallel if strategy == "tensor" else _supports_pipeline
+
+    def capable(declaration):
+        config = {"model_type": "qwen3"}
+        if holder == "root":
+            config.update(declaration)
+        else:
+            config[holder] = declaration
+        return supports(config)
+
+    if field == "omlx_quant_formats":
+        assert capable({})
+        assert not capable({field: {"toy": {"contract": 1}}})
+    else:
+
+        def declaration(mode):
+            return {field: {"model.layers.0.mlp.gate_proj": {"bits": 4, "mode": mode}}}
+
+        assert capable(declaration("affine"))
+        assert not capable(declaration("toy"))
+
+
 def test_qwen_next_moe_inplace_shards_are_wrapped_with_an_all_sum(monkeypatch):
     from mlx_lm.models import qwen3_next
 

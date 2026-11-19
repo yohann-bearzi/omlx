@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from ..model_discovery import _VISION_WEIGHT_PREFIXES
+from ..patches.moe_offload_compat import in_quant_format
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python
@@ -670,25 +671,6 @@ def _config_nonnegative_int(config: dict[str, Any], key: str) -> int | None:
     )
 
 
-def _names_format_layers(config: dict[str, Any]) -> bool:
-    """Whether a checkpoint's config names layers of a quant format, not of
-    one of MLX's modes: no tensor strategy splits them, so such a
-    checkpoint is offered pipelining only."""
-    from ..formats import _mlx_runs
-
-    if config.get("omlx_quant_formats"):
-        return True
-    for key in ("quantization", "quantization_config"):
-        quantization = config.get(key)
-        if not isinstance(quantization, dict):
-            continue
-        for entry in (quantization, *quantization.values()):
-            mode = entry.get("mode") if isinstance(entry, dict) else None
-            if isinstance(mode, str) and not _mlx_runs(mode):
-                return True
-    return False
-
-
 def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """Whether this architecture has a runtime-safe tensor strategy.
 
@@ -699,7 +681,7 @@ def _supports_tensor_parallel(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
-    if not isinstance(model_type, str) or _names_format_layers(config):
+    if not isinstance(model_type, str) or in_quant_format(config):
         return False
     if supports_model_type(model_type):
         return True
@@ -950,7 +932,7 @@ def _supports_pipeline(config: dict[str, Any]) -> bool:
     """
 
     model_type = config.get("model_type")
-    if not isinstance(model_type, str):
+    if not isinstance(model_type, str) or in_quant_format(config):
         return False
     # An architecture oMLX explicitly vouches for wins, even a VLM: the
     # minimax_m3_vl patch ships its own ``pipeline()`` and sets
