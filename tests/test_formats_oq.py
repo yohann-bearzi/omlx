@@ -1981,6 +1981,186 @@ def test_the_offers_are_the_matrices_a_run_offers_its_format(
         assert _same({"i": offer.importance}, {"i": importance})
 
 
+@pytest.mark.parametrize("named_cache", [True, False])
+def test_fitted_widths_match_the_written_quantization_after_memory_pressure(
+    source, toy, tmp_path, monkeypatch, named_cache
+):
+    _calibration(monkeypatch)
+    monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "settings"))
+    budget = oq._calibration_memory_budget
+    pressure = False
+
+    def live_budget(*args, **kwargs):
+        return {**budget(*args, **kwargs), "requires_proxy": pressure}
+
+    monkeypatch.setattr(oq, "_calibration_memory_budget", live_budget)
+    # The two measurement routes disagree on which layer merits the next bit.
+    # Fitting and writing use the actual imatrix, plan, encoder and shards.
+    monkeypatch.setattr(oq, "_measure_sensitivity", lambda *a, **kw: {0: 1, 1: 0.01})
+    monkeypatch.setattr(
+        oq,
+        "_measure_sensitivity_from_quantized_model",
+        lambda *a, **kw: {0: 0.01, 1: 1},
+    )
+    settings = dict(
+        imatrix_num_samples=4,
+        imatrix_seq_length=16,
+        stream_calibration=False,
+        target_bpw=5.6,
+        hard_cap_bpw=5.6,
+    )
+    if named_cache:
+        settings["imatrix_cache_path"] = str(tmp_path / "imatrix.npz")
+    offered = {
+        offer.name.removesuffix(".weight"): offer.bits
+        for offer in oq.iter_format_offers(str(source), 4, toy, **settings)
+    }
+    assert len(set(offered.values())) > 1
+    pressure = True
+    output = tmp_path / "oqe"
+    writer = _Codec()
+    oq.quantize_oq_streaming(
+        str(source), str(output), 4, enhanced=True, quant_format=writer, **settings
+    )
+    written = _in_format(json.loads((output / "config.json").read_text()))
+    assert {name: entry["bits"] for name, entry in written.items()} == offered
+    assert [bits for _, _, bits, _ in writer.encoded] == list(offered.values())
+
+
+def test_fitted_widths_respect_an_explicit_sensitivity_source(
+    source, toy, tmp_path, monkeypatch
+):
+    _calibration(monkeypatch)
+    cache = str(tmp_path / "imatrix.npz")
+    source = shutil.copytree(source, tmp_path / "source")
+    first, second = {0: 1, 1: 0.01}, {0: 0.01, 1: 1}
+    monkeypatch.setattr(oq, "_measure_sensitivity", lambda *a, **kw: first)
+    monkeypatch.setattr(
+        oq, "_measure_sensitivity_from_quantized_model", lambda *a, **kw: second
+    )
+
+    def widths(**kwargs):
+        offers = oq.iter_format_offers(
+            str(source),
+            4,
+            toy,
+            imatrix_cache_path=cache,
+            stream_calibration=False,
+            target_bpw=5.6,
+            hard_cap_bpw=5.6,
+            imatrix_num_samples=4,
+            imatrix_seq_length=16,
+            **kwargs,
+        )
+        return {offer.name: offer.bits for offer in offers}
+
+    fitted = widths()
+    expected = widths(sensitivity_map_override=second)
+    assert expected != fitted
+    assert widths(sensitivity_model_path=str(source)) == expected
+    scores = source / "oq_sensitivity_map.json"
+    scores.write_text(json.dumps(second))
+    assert widths() == expected
+    assert widths(sensitivity_map_override=first) == fitted
+    scores.unlink()
+    assert widths() == fitted
+
+
+def test_fitted_sensitivity_reuses_only_compatible_measurements(tmp_path):
+    metadata = {"source_hash": "first", "calib_data_hash": "corpus"}
+    run = oq._OQRun(
+        source=tmp_path / "model",
+        oq_level=4,
+        requested_imatrix_cache=str(tmp_path / "calibration.npz"),
+        imatrix_data=SimpleNamespace(metadata=metadata),
+        dtype="bfloat16",
+        preserve_mtp=False,
+        stream_calibration=None,
+        imatrix_num_samples=4,
+        imatrix_seq_length=16,
+        auto_proxy_sensitivity=True,
+        trust_remote_code=False,
+    )
+    calls = []
+
+    def measure():
+        calls.append(1)
+        return {"0": len(calls)}
+
+    def scores():
+        return oq._fitted_sensitivity(run, measure)
+
+    assert scores() == scores() == {"0": 1}
+    metadata["source_hash"] = "second"
+    assert scores() == {"0": 2}
+    metadata["source_hash"] = "first"
+    for key, other in {
+        "source": tmp_path / "different-model",
+        "oq_level": 3,
+        "dtype": "float16",
+        "preserve_mtp": True,
+        "stream_calibration": False,
+        "imatrix_num_samples": 8,
+        "imatrix_seq_length": 32,
+        "auto_proxy_sensitivity": False,
+        "trust_remote_code": True,
+    }.items():
+        previous = run[key]
+        run[key] = other
+        expected = len(calls) + 1
+        assert scores() == scores() == {"0": expected}, key
+        run[key] = previous
+    assert scores() == {"0": 1}
+    metadata["calib_data_hash"] = "new corpus"
+    assert scores() == {"0": len(calls)}
+    assert scores() != {"0": 1}
+
+    # Two measurements must never publish different priorities for the same
+    # fit. Hold the first inside measurement while the second enters the cache.
+    from concurrent.futures import ThreadPoolExecutor
+
+    run["oq_level"] = 5
+    entered, waiting, release = (threading.Event() for _ in range(3))
+
+    def first():
+        entered.set()
+        assert release.wait(10)
+        return {"0": 0.25}
+
+    def second():
+        waiting.set()
+        return oq._fitted_sensitivity(run, lambda: {"0": 0.75})
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        winner = pool.submit(oq._fitted_sensitivity, run, first)
+        assert entered.wait(10)
+        # A separate reader cannot take even a shared lock while the first
+        # measurement is pending.
+        import fcntl
+
+        locks = list(tmp_path.glob(".oqe-sensitivity/*.lock"))
+        held = 0
+        for lock in locks:
+            with lock.open() as other:
+                try:
+                    fcntl.flock(other, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    held += 1
+        assert held == 1
+        contender = pool.submit(second)
+        try:
+            assert waiting.wait(10)
+            assert not contender.done()
+        finally:
+            release.set()
+        assert winner.result() == contender.result() == {"0": 0.25}
+    assert scores() == {"0": 0.25}
+
+    run["oq_level"] = 6
+    assert oq._fitted_sensitivity(run, dict) == {}
+    assert scores()
+
+
 def test_the_contract_page_shows_the_offers():
     assert "iter_format_offers(source, 4, fmt" in _QUOTED
 

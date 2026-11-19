@@ -7432,9 +7432,9 @@ def iter_format_offers(model_path: str, oq_level: float, quant_format, **setting
     format, in the order it writes them, as a FormatOffer: decided by the
     writer's own code after the same calibration and plan, and nothing else
     (a matrix the format's layout or encode would then decline is offered
-    all the same). Reads no weight but the calibration's; writes nothing but
-    the imatrix cache (``imatrix_cache_path`` in ``settings`` keeps it for
-    the run that follows). A plugin fits its format from these, then hands
+    all the same). Reads the calibration weights and retains the measured
+    priorities used to assign bits. Naming ``imatrix_cache_path`` also keeps
+    the imatrix for the writer. A plugin fits its format from these, then hands
     oQ the fitted object (docs/quant-formats.md)."""
     if quant_format is None:
         raise ValueError(
@@ -7974,6 +7974,7 @@ def _calibrate_oq_run(run: _OQRun) -> None:
     stream_imatrix = False
     streamed_sensitivity_map: dict | None = None
     if enhanced:
+        requested_imatrix_cache = imatrix_cache_path
         if imatrix_num_samples < 1:
             raise ValueError("imatrix_num_samples must be >= 1")
         if imatrix_seq_length < 1:
@@ -8072,6 +8073,50 @@ def _calibrate_oq_run(run: _OQRun) -> None:
     run.update((k, v) for k, v in locals().items() if k != "run")
 
 
+def _fitted_sensitivity(run: _OQRun, measure: Callable[[], dict]) -> dict:
+    """Use one measured priority map for a fit and the corresponding write.
+
+    Live capacity can select a different measurement route between the two.
+    The first measurement for this source, level and calibration policy
+    determines their widths. Their requested bit budgets still apply afresh.
+    """
+    import fcntl
+
+    from .settings import resolve_default_base_path
+
+    cache = run["requested_imatrix_cache"]
+    parent = Path(cache).parent if cache else resolve_default_base_path() / "cache"
+    directory = parent / ".oqe-sensitivity"
+    metadata = run["imatrix_data"].metadata
+    signature = {
+        "version": 1,
+        "source_path": str(run["source"].resolve()),
+        "source": metadata["source_hash"],
+        "corpus": metadata["calib_data_hash"],
+        "level": float(run["oq_level"]),
+        "dtype": run["dtype"],
+        "preserve_mtp": run["preserve_mtp"],
+        "stream": run["stream_calibration"],
+        "auto_proxy": run["auto_proxy_sensitivity"],
+        "trust_remote_code": run["trust_remote_code"],
+        "samples": run["imatrix_num_samples"],
+        "length": run["imatrix_seq_length"],
+    }
+    key = hashlib.sha256(json.dumps(signature, sort_keys=True).encode()).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{key}.json"
+    # Lock a stable inode. A failed measurement leaves the next caller free
+    # to retry; a concurrent writer cannot replace the fit's winning map.
+    with (directory / f"{key}.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if path.is_file():
+            return json.loads(path.read_text())
+        scores = measure()
+        if scores:
+            _atomic_write_json(path, scores)
+        return scores
+
+
 def _plan_oq_run(run: _OQRun) -> None:
     """The sensitivity of each layer, the plan of bits, and with a quant
     format the class of the module that holds each matrix in the model the
@@ -8102,17 +8147,8 @@ def _plan_oq_run(run: _OQRun) -> None:
     target_bpw = run.get("target_bpw")
     text_only = run.get("text_only")
     trust_remote_code = run.get("trust_remote_code")
-    if static_sensitivity_map is not None:
-        sensitivity_map = static_sensitivity_map
-        logger.info(
-            "oQ%s: static sensitivity override applied to layers %s",
-            f"{oq_level:g}",
-            ",".join(str(idx) for idx in sensitivity_map),
-        )
-    elif sensitivity_map_path.exists():
-        sensitivity_map = json.loads(sensitivity_map_path.read_text(encoding="utf-8"))
-        logger.info(f"{sensitivity_map_path} found, skipping measuring.")
-    else:
+
+    def measure():
         # --- Sensitivity measurement (before sanitize-plan discovery) ---------
         # Must run before _build_model_sanitizer + _discover_sanitize_plan,
         # because the discovery pass feeds _TrackedTensor proxies through
@@ -8221,22 +8257,39 @@ def _plan_oq_run(run: _OQRun) -> None:
                 seq_length=256,
                 trust_remote_code=trust_remote_code,
             )
-    # Single enforcement point. Inner measurement helpers may return {} on
-    # load / calibration / layer-discovery failure; treat that as a hard
-    # error here so the rest of quantize_oq_streaming never runs without a
-    # data-driven sensitivity map.
-    if not sensitivity_map:
+        return sensitivity_map
+
+    try:
+        if static_sensitivity_map is not None:
+            sensitivity_map = static_sensitivity_map
+            logger.info(
+                "oQ%s: static sensitivity override applied to layers %s",
+                f"{oq_level:g}",
+                ",".join(str(idx) for idx in sensitivity_map),
+            )
+        elif sensitivity_map_path.exists():
+            sensitivity_map = json.loads(
+                sensitivity_map_path.read_text(encoding="utf-8")
+            )
+            logger.info(f"{sensitivity_map_path} found, skipping measuring.")
+        elif quant_fmt is not None and not sensitivity_model_path:
+            sensitivity_map = _fitted_sensitivity(run, measure)
+        else:
+            sensitivity_map = measure()
+        # Single enforcement point. Inner measurement helpers may return {} on
+        # load / calibration / layer-discovery failure; treat that as a hard
+        # error here so the rest of quantize_oq_streaming never runs without a
+        # data-driven sensitivity map.
+        if not sensitivity_map:
+            raise RuntimeError(
+                f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
+                "Check the preceding log lines for the root cause (model load, "
+                "calibration data, or layer discovery), and either fix it or "
+                "pass an explicit sensitivity_model_path."
+            )
+    finally:
         _cleanup_ram_safe_proxy()
-        raise RuntimeError(
-            f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
-            "Check the preceding log lines for the root cause (model load, "
-            "calibration data, or layer discovery), and either fix it or "
-            "pass an explicit sensitivity_model_path."
-        )
-    # Calibration passes are done — drop the RAM-safe proxy (built when the
-    # source exceeds live calibration capacity; a cached sensitivity map plus
-    # an imatrix cache hit means it was never built at all).
-    _cleanup_ram_safe_proxy()
+    del measure
     cb(
         "loading",
         19.0 if enhanced else 15.0,
