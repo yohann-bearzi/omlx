@@ -138,9 +138,10 @@ def _table_entry(dtype: mx.Dtype, value) -> tuple:
 
 @dataclass(frozen=True)
 class Table:
-    """A lookup table that a face reads at per-lane indices: kernels built
-    on the face stage it in threadgroup memory at their start, and the face
-    reads it through a member ``omlx_table<type, N> name``.
+    """A lookup table that a face reads at per-lane indices through an
+    ``omlx_table<type, N>`` member. Kernels stage the table in threadgroup
+    memory or hold up to four values directly in the member, depending on
+    the GPU.
 
     ``values`` are numbers, each rounded to ``dtype`` when the table is
     made (a float table) or taken exactly (an integer table). Two tables are
@@ -257,8 +258,9 @@ class Dot(_Face):
     kernel body, where ``T`` names the activations' float type. The struct it
     names is the matrix: an aggregate of the weight codes as bytes, then one
     device pointer per name in ``tensors`` (the linear's parameters beside
-    ``weight``, which become kernel inputs in this order), with the member
-    template ``Lanes<K>`` that ``docs/quant-formats.md`` specifies.
+    ``weight``, which become kernel inputs in this order) and one
+    ``omlx_table<T, N>`` per entry in ``tables``, in each tuple's order, with
+    the member template ``Lanes<K>`` that ``docs/quant-formats.md`` specifies.
 
     ``shared`` is Metal that a kernel which applies one block's weights to
     several inputs includes after ``source``, and no other kernel: where the

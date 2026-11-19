@@ -847,9 +847,7 @@ def face_kernel(
     return _FACE_KERNELS.setdefault(key, kernel)
 
 
-# What the Metal compiler calls the tables a kernel stages. Only this module
-# writes it: tests/test_metal_tables.py checks that, and skips this section
-# of a kernel's source when it looks for tables written by hand.
+# The source name used in Metal diagnostics for the generated table section.
 _STAGED = "<omlx staged tables>"
 
 # A table's Metal element type (MLX's names), and the unsigned type of the
@@ -882,14 +880,16 @@ def _small_tables_as_selects() -> bool:
     GPUs without tensor units (the M3 family) selects measured up to 15%
     faster than a staged table, on the M5 family (tensor units) staging
     measured 0.6-3% faster (R-TABLES.md, run 3). A family not measured
-    follows its tensor units: the GPU's own (generation 17 on), whatever
-    MLX's kernels use. A GPU it cannot name stages."""
-    return _selects_for(str(mx.device_info().get("architecture", "")))
+    follows the GPU's hardware generation. An unavailable or unrecognized
+    GPU uses the staged form."""
+    if not mx.is_available(mx.gpu):
+        return False
+    return _selects_for(str(mx.device_info(mx.gpu).get("architecture", "")))
 
 
 def _selects_for(architecture: str) -> bool:
-    match = re.fullmatch(r"applegpu_g(\d+)[a-z]", architecture)
-    return match is not None and int(match[1]) < 17
+    match = re.fullmatch(r"applegpu_g(\d+)([a-z])", architecture)
+    return match is not None and int(match[1]) < (18 if match[2] == "p" else 17)
 
 
 # The member type of a face's table: a pointer to its staged copy or, for
@@ -912,9 +912,8 @@ struct omlx_table<T, N, true> {
   }
 };
 """
-# The values past a small table's last, as its selects hold them: a NaN for a
-# floating-point table, so that an index past the table reads as one in a
-# test (a staged table's neighbours are as wrong but not as plain).
+# The unused slots of a four-way select hold a NaN for floating-point
+# tables and zero for integer tables.
 _PAST = {mx.float32: 0x7FC00000, mx.float16: 0x7E00, mx.bfloat16: 0x7FC0}
 
 
@@ -960,6 +959,8 @@ class Tables:
         """Take ``table`` (once, when an equal table was taken already): the
         Metal expression of the face's member that reads it. A kernel holds
         at most ``formats.TABLE_BYTES`` of tables."""
+        if not isinstance(table, Table):
+            raise TypeError(f"expected a Table, got {type(table).__name__}")
         at = self._at.get(table)
         if at is None:
             size = _bytes((*self._at, table))
@@ -998,7 +999,7 @@ class Tables:
             types = _TABLE_TYPE.replace("SELECTS", "true") + _TABLE_VALUES
         else:
             types = _TABLE_TYPE.replace("SELECTS", "false")
-        return _named(_STAGED, types + staged)
+        return _named(_STAGED, types + staged) + _named("<kernel header>", "")
 
     @property
     def prologue(self) -> str:

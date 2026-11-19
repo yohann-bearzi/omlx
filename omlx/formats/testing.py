@@ -224,6 +224,10 @@ def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.a
     ``operands`` are a matrix's weight and the face's tensors, as for
     ``dot_rows`` (the face is declared over them), and ``dtype`` the
     activations' type ``T`` the face is compiled for."""
+    if not isinstance(face, (Dot, Tile)):
+        raise ValueError(f"{face!r} is not a Dot or a Tile")
+    if dtype not in formats.FLOATS:
+        raise ValueError(f"dtype={dtype} is not a float type of the GPU")
     if not face.tables:
         raise ValueError(f"face {face.key} has no tables")
     operands, names = tuple(operands), ("weight", *face.tensors)

@@ -195,6 +195,13 @@ def _faces():
     ]
 
 
+def _capture_nax_without_mlx_headers(monkeypatch):
+    """Capture oMLX's source even if an earlier NAX build found no MLX headers."""
+    monkeypatch.setattr(nax, "_kernels", {})
+    monkeypatch.setattr(nax, "_header_failed", False)
+    monkeypatch.setattr(nax, "_read_mlx_headers", lambda names: "")
+
+
 def _builder_digest(monkeypatch) -> str:
     """The digest of every Metal that the served kernels over faces build
     for the affine faces (the kit's own kernels left out): each kernel's
@@ -205,10 +212,7 @@ def _builder_digest(monkeypatch) -> str:
         recorded.append((kwargs["name"], kwargs.get("header", ""), kwargs["source"]))
 
     monkeypatch.setattr(mx.fast, "metal_kernel", record)
-    monkeypatch.setattr(nax, "_kernels", {})
-    # The served kernels' own text: MLX's headers, which the NAX kernels
-    # include, are MLX's to change.
-    monkeypatch.setattr(nax, "_read_mlx_headers", lambda names: "")
+    _capture_nax_without_mlx_headers(monkeypatch)
     faces = _faces()
     for face in faces:
         format_linear._kernel.__wrapped__(face, False)
@@ -293,6 +297,7 @@ def test_a_kernel_stages_each_table_once_by_element_type(staged):
     matrices = kernels.Matrices()
     matrices.add("p", one)
     matrices.add("q", two)
+    matrices.add("r", one)
     header = matrices.header
     assert header.count('#line 1 "<omlx staged tables>"') == 1
     assert (
@@ -318,7 +323,7 @@ def test_a_kernel_stages_each_table_once_by_element_type(staged):
         "q_scales, omlx_table<float, 1>{omlx_tg_float + 2}, "
         "omlx_table<float, 2>{omlx_tg_float + 0}};" in body
     )
-    assert "decltype(omlx_tables_one::Dot::b), omlx_table<int8_t, 3>>" in body
+    assert body.count("decltype(omlx_tables_one::Dot::b), omlx_table<int8_t, 3>>") == 1
     assert "table 'b' is 3 values of int8" in body
     assert "bool VALUES = (N <= 4 && false)>" in header
 
@@ -360,13 +365,88 @@ def test_a_gpu_with_tensor_units_stages_small_tables_and_one_without_selects():
     assert kernels._selects_for("applegpu_g15d")
     assert kernels._selects_for("applegpu_g16s")
     assert not kernels._selects_for("applegpu_g17s")
+    assert kernels._selects_for("applegpu_g17p")
     assert not kernels._selects_for("applegpu_g18p")
     assert not kernels._selects_for("")
     assert not kernels._selects_for("applegpu_g15")
-    architecture = mx.device_info()["architecture"]
+    architecture = (
+        mx.device_info(mx.gpu).get("architecture", "")
+        if mx.is_available(mx.gpu)
+        else ""
+    )
     assert kernels._small_tables_as_selects.__wrapped__() is kernels._selects_for(
         architecture
     )
+
+
+@pytest.mark.parametrize("available", [False, True])
+def test_small_tables_probe_the_gpu_on_first_use_from_a_cpu_stream(
+    monkeypatch, available
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    def is_available(device):
+        assert device == mx.gpu
+        return available
+
+    def device_info(device=None):
+        assert available, "queried device info without a GPU"
+        assert device is not None and device == mx.gpu, "queried the default device"
+        return {"architecture": "applegpu_g15d"}
+
+    monkeypatch.setattr(mx, "is_available", is_available)
+    monkeypatch.setattr(mx, "device_info", device_info)
+    probe = kernels._small_tables_as_selects
+    probe.cache_clear()
+
+    def first_use():
+        with mx.stream(mx.cpu):
+            return probe()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            assert worker.submit(first_use).result() is available
+        assert probe() is available
+    finally:
+        probe.cache_clear()
+
+
+def test_standalone_table_header_resumes_the_callers_source(form):
+    tables = kernels.Tables()
+    assert tables.header == ""
+    tables.add(Table("t", mx.float32, (1.0,)))
+    assert tables.header.splitlines()[-1] == '#line 1 "<kernel header>"'
+
+
+@pytest.mark.parametrize("invalid", [None, []])
+def test_standalone_tables_require_a_table_before_lookup(invalid):
+    with pytest.raises(TypeError, match="expected a Table"):
+        kernels.Tables().add(invalid)
+
+
+@metal
+def test_a_standalone_table_expression_indexes_the_second_staged_table():
+    tables = kernels.Tables()
+    tables.add(Table("first", mx.int32, (101,) * 8))
+    second = Table("second", mx.int32, tuple(range(20, 28)))
+    at = tables.add(second)
+    kernel = mx.fast.metal_kernel(
+        name="omlx_test_standalone_table_offset",
+        input_names=["x"],
+        output_names=["y"],
+        header=tables.header,
+        source=tables.prologue
+        + "    const uint i = thread_position_in_grid.x;\n"
+        + f"    y[i] = {at}[i] + x[i];\n",
+    )
+    (result,) = kernel(
+        inputs=[mx.zeros((8,), mx.int32)],
+        grid=(8, 1, 1),
+        threadgroup=(8, 1, 1),
+        output_shapes=[(8,)],
+        output_dtypes=[mx.int32],
+    )
+    assert tuple(result.tolist()) == second.values
 
 
 def test_a_kernel_without_tables_does_not_ask_the_gpu(monkeypatch):
@@ -386,10 +466,8 @@ def test_the_values_form_is_defined_only_in_a_kernel_that_holds_one(form):
 
 
 @metal
-@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
-def test_an_index_past_a_small_table_reads_a_nan_as_values(monkeypatch, dtype):
-    """Selects read the index's two low bits: past a table of 3 values, a
-    floating-point table's fourth reads as a NaN, which a test sees."""
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16, mx.int8])
+def test_selects_read_the_low_two_bits_including_unused_slots(monkeypatch, dtype):
     monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: True)
     tables = kernels.Tables()
     at = tables.add(Table("t", dtype, (1.0, 2.0, 3.0)))
@@ -404,13 +482,17 @@ def test_an_index_past_a_small_table_reads_a_nan_as_values(monkeypatch, dtype):
     )
     (y,) = kernel(
         inputs=[mx.zeros((8,), dtype=dtype)],
-        grid=(4, 1, 1),
-        threadgroup=(4, 1, 1),
-        output_shapes=[(4,)],
+        grid=(8, 1, 1),
+        threadgroup=(8, 1, 1),
+        output_shapes=[(8,)],
         output_dtypes=[dtype],
     )
-    assert y[:3].tolist() == [1.0, 2.0, 3.0]
-    assert mx.isnan(y[3]).item()
+    for start in (0, 4):
+        assert y[start : start + 3].tolist() == [1, 2, 3]
+        if dtype == mx.int8:
+            assert y[start + 3].item() == 0
+        else:
+            assert mx.isnan(y[start + 3]).item()
 
 
 def test_a_kernel_stages_at_most_4096_bytes_of_tables(staged):
@@ -439,6 +521,10 @@ def test_up_to_32_values_of_a_type_are_one_copy_a_thread(count, one):
     assert (f"if (thread_index_in_threadgroup < {count}u)" in body) == one
     assert ("for (uint i = thread_index_in_threadgroup;" in body) == (not one)
     assert ("i = thread_index_in_threadgroup + threads_per" in body) == one
+    assert (
+        "i += threads_per_threadgroup.x * threads_per_threadgroup.y"
+        " * threads_per_threadgroup.z)" in body
+    )
 
 
 # --- on the GPU -----------------------------------------------------------------
@@ -511,6 +597,19 @@ def test_staged_tables_refuses_what_it_cannot_launch():
         testing.staged_tables(face, _operands()[:1], mx.float32)
     with pytest.raises(ValueError, match="scales has 4 elements"):
         testing.staged_tables(face, (_operands()[0], mx.ones((4,))), mx.float32)
+
+
+def test_staged_tables_checks_the_face_before_reading_it():
+    with pytest.raises(ValueError, match="is not a Dot or a Tile"):
+        testing.staged_tables(object(), (), mx.float32)
+
+
+@pytest.mark.parametrize("dtype", [mx.int32, mx.float64])
+def test_staged_tables_checks_the_activation_dtype_before_building(monkeypatch, dtype):
+    face = _toy("bad_activation", _MEMBERS, *_TABLES)
+    monkeypatch.setattr(testing, "_staged_tables_kernel", lambda face: pytest.fail())
+    with pytest.raises(ValueError, match="is not a float type of the GPU"):
+        testing.staged_tables(face, _operands(), dtype)
 
 
 @metal
@@ -701,7 +800,7 @@ def test_a_tile_face_with_a_table_gives_its_weights_to_the_bit(dtype):
 def test_a_tile_kernel_gives_its_pad_the_staged_bytes_back(monkeypatch):
     recorded = []
     monkeypatch.setattr(mx.fast, "metal_kernel", lambda **kw: recorded.append(kw))
-    monkeypatch.setattr(nax, "_kernels", {})
+    _capture_nax_without_mlx_headers(monkeypatch)
     face = affine.tile_face(4, 64, mx.bfloat16)
     nax._face_kernel(face)
     nax._face_kernel(tabled_tile(face))
@@ -821,6 +920,32 @@ def test_tables_hold_at_most_4096_bytes_in_a_kernel():
     )
 
 
+def test_routed_fold_counts_the_faces_of_each_launch_at_the_limit(monkeypatch):
+    from tests.test_qwen35_moe_routed_decode import _block
+
+    block = _block(1024, 320, experts=16)
+    shared = block.shared_expert
+    gate_up_faces = (
+        formats.dot(block.switch_mlp.gate_up_proj, 1024, 640),
+        formats.dot(shared.gate_proj, 1024, 320),
+        formats.dot(block.shared_expert_gate, 1024, 1),
+    )
+    down_faces = (
+        formats.dot(block.switch_mlp.down_proj, 320, 1024),
+        formats.dot(shared.down_proj, 320, 1024),
+    )
+    assert gate_up_faces[1] != down_faces[1]
+    launches = []
+
+    def bytes_at_limit(*faces):
+        launches.append(faces)
+        return formats.TABLE_BYTES
+
+    monkeypatch.setattr(kernels, "table_bytes", bytes_at_limit)
+    assert routed._build_plan(block).launches.fold
+    assert launches == [gate_up_faces, down_faces]
+
+
 def test_staged_tables_refuses_an_operand_of_7_elements():
     face = _toy("seven", _MEMBERS, *_TABLES)
     with pytest.raises(ValueError, match="scales has 7 elements"):
@@ -866,7 +991,7 @@ def _tile_table_source(n):
 
 
 @metal
-@pytest.mark.parametrize("n", [16, 64])
+@pytest.mark.parametrize("n", [16, 24, 64])
 @pytest.mark.parametrize("k", [8, 264])
 def test_staging_fills_every_entry_in_a_threadgroup_of_fewer_threads(k, n):
     from tests.test_formats_tile import _toy as tile_toy

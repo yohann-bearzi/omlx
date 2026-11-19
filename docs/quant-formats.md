@@ -407,7 +407,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 
 ## The dot face
 
-The struct named by `type` is the matrix. It is an aggregate: the weight as bytes, then one device pointer per name in `tensors`, in order. Each pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
+The struct named by `type` holds the matrix. Its aggregate members are the weight as bytes, one device pointer per name in `tensors`, then one `omlx_table<T, N>` per entry in `tables`. Both tuples set the order of their members. Each tensor pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
 
 ```cpp
 struct Dot {
@@ -541,7 +541,7 @@ Dot(
 
 A kernel that multiplies many rows of activations by a matrix (a prompt's prefill, a switch layer's experts over a prompt) decodes a tile of the weights, some rows by some inputs, into threadgroup memory once, and every row of activations it computes reads them there. The tile face is how it decodes them: the matrix of the dot face, read in runs of 8 codes and given weight by weight. A format gives it with `QuantFormat.tile(layer, k, n)` (see [Faces](#faces)).
 
-The struct named by `type` is the matrix, an aggregate as a dot face's: `CONTRACT`, the weight as bytes, then one device pointer per name in `tensors`, in order. Its member template `Runs<K>` is the cursor of one row of K inputs:
+The tile struct declares the static constant `CONTRACT`. Its aggregate members follow the dot face's order. The weight as bytes comes first, followed by the device pointers in `tensors` order and the `omlx_table<T, N>` members in `tables` order. Its member template `Runs<K>` is the cursor of one row of K inputs.
 
 ```cpp
 struct Tile {
@@ -736,7 +736,7 @@ struct Dot {
 };
 ```
 
-oMLX defines `omlx_table` when it builds a kernel, for the GPU it runs on, so one source of the face serves every GPU. On a GPU without tensor units (the M3 family), a table of up to 4 values holds the values themselves and reads them by selects on the index's bits: measured up to 15% faster there than a staged copy, on the 2-bit levels of a mixture of experts' layers. On a GPU with tensor units (the M5 family) every table is staged: there a staged copy measured 0.6 to 3% faster than selects. A family not measured follows its GPU's tensor units (the GPU's own, whatever MLX's kernels use), and a GPU oMLX cannot name stages. Larger tables are always staged. The face cannot tell which form it has, and needs not. Selects read the index's two low bits: an index past a floating-point table of 3 values or fewer reads a NaN, so that a test sees it on every GPU (an integer table's reads past it are 0).
+oMLX defines `omlx_table` when it builds a kernel, for the GPU it runs on, so one source of the face serves every GPU. On a GPU without tensor units (the M3 family), a table of up to 4 values holds the values themselves and reads them by selects on the index's bits: measured up to 15% faster there than a staged copy, on the 2-bit levels of a mixture of experts' layers. On a GPU with tensor units (the M5 family) every table is staged: there a staged copy measured 0.6 to 3% faster than selects. A family not measured follows its GPU's tensor units (the GPU's own, whatever MLX's kernels use), and a GPU oMLX cannot name stages. Larger tables are always staged. The face cannot tell which form it has, and needs not. A face must index its table within `0 <= i < N`. The select form reads slot `i % 4`. Unused slots from `N` through 3 hold NaN for floats and zero for integers. For example, index 4 selects slot 0.
 
 A face's tables are part of the face: two faces are equal when their tables' names, dtypes and bits are, and a kernel is compiled once for each. A format whose tables come from a checkpoint (a level table fitted to it) makes the checkpoint's faces with its tables, and puts what tells them apart in the faces' keys, so that a log line names the face that ran.
 
