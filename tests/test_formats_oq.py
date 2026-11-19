@@ -2297,11 +2297,21 @@ def test_the_offers_are_the_matrices_a_run_offers_its_format(
         assert _same({"i": offer.importance}, {"i": importance})
 
 
-@pytest.mark.parametrize("named_cache", [True, False])
+@pytest.mark.parametrize(
+    ("named_cache", "reuse_cache"), [(True, True), (False, True), (True, False)]
+)
 def test_fitted_widths_match_the_written_quantization_after_memory_pressure(
-    source, toy, tmp_path, monkeypatch, named_cache
+    source, toy, tmp_path, monkeypatch, named_cache, reuse_cache
 ):
     _calibration(monkeypatch)
+    saved = []
+    save = oq._save_oqe_imatrix
+
+    def save_imatrix(path, *args, **kwargs):
+        saved.append(path)
+        return save(path, *args, **kwargs)
+
+    monkeypatch.setattr(oq, "_save_oqe_imatrix", save_imatrix)
     monkeypatch.setenv("OMLX_BASE_PATH", str(tmp_path / "settings"))
     budget = oq._calibration_memory_budget
     pressure = False
@@ -2325,6 +2335,7 @@ def test_fitted_widths_match_the_written_quantization_after_memory_pressure(
         target_bpw=5.6,
         hard_cap_bpw=5.6,
     )
+    settings["imatrix_reuse_cache"] = reuse_cache
     if named_cache:
         settings["imatrix_cache_path"] = str(tmp_path / "imatrix.npz")
     offered = {
@@ -2341,6 +2352,11 @@ def test_fitted_widths_match_the_written_quantization_after_memory_pressure(
     written = _in_format(json.loads((output / "config.json").read_text()))
     assert {name: entry["bits"] for name, entry in written.items()} == offered
     assert [bits for _, _, bits, _ in writer.encoded] == list(offered.values())
+    if named_cache:
+        cache = tmp_path / "imatrix.npz"
+        assert saved == ([cache] if reuse_cache else [cache, cache])
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert report["cache_reused"] is reuse_cache
 
 
 def test_fitting_skips_matrices_larger_than_the_writer_can_offer(
