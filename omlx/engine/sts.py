@@ -20,13 +20,14 @@ import gc
 import logging
 import os
 import tempfile
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..patches.format_load import refuse_format_checkpoint
+from ..patches.format_load import checked_audio_path, refuse_format_checkpoint
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -299,7 +300,9 @@ class STSEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
-        refuse_format_checkpoint(self._model_name, "audio_sts")
+        local = Path(self._model_name).expanduser()
+        if local.exists() or local.is_absolute():
+            refuse_format_checkpoint(local, "audio_sts")
         family = self._family
         logger.info(f"Starting STS engine: {self._model_name} (family={family})")
 
@@ -310,19 +313,19 @@ class STSEngine(BaseNonStreamingEngine):
                 f"Supported: {sorted(_FAMILY_LOADERS)}"
             )
 
-        model_name = self._model_name
-
-        def _load_sync():
-            try:
-                return loader(model_name)
-            except ImportError as exc:
-                raise ImportError(
-                    "mlx-audio is required for STS inference. "
-                    "Install it with: pip install 'omlx[audio]'"
-                ) from exc
-
-        loop = asyncio.get_running_loop()
-        self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
+        try:
+            model_name = await asyncio.to_thread(
+                checked_audio_path, self._model_name, "audio_sts"
+            )
+            loop = asyncio.get_running_loop()
+            self._model = await loop.run_in_executor(
+                get_mlx_executor(), loader, model_name
+            )
+        except ImportError as exc:
+            raise ImportError(
+                "mlx-audio is required for STS inference. "
+                "Install it with: pip install 'omlx[audio]'"
+            ) from exc
         logger.info(f"STS engine started: {self._model_name}")
 
     async def stop(self) -> None:

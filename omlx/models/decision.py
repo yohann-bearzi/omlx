@@ -75,7 +75,9 @@ class DecisionBackbone:
     """Qwen3.5 backbone that returns final normed hidden states, of a decision
     model of ``family``."""
 
-    def __init__(self, model_path: str, trust_remote_code: bool, family: str):
+    def __init__(
+        self, model_path: str, trust_remote_code: bool = False, family: str = "decision"
+    ):
         self.model_path = model_path
         self.family = family
         self.trust_remote_code = trust_remote_code

@@ -39,7 +39,10 @@ def _local_sharded_load(
     import mlx.core as mx
     from mlx_lm.utils import load_model, load_tokenizer
 
+    from omlx.patches.format_load import check_loaded, refuse_format_checkpoint
+
     model_path = Path(repo)
+    refuse_format_checkpoint(model_path, "local sharded_load")
     model, config = load_model(
         model_path, lazy=True, strict=False, trust_remote_code=trust_remote_code
     )
@@ -55,8 +58,6 @@ def _local_sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-    from omlx.patches.format_load import check_loaded
-
     # What this rank holds of the model, filled.
     check_loaded(model)
     # Lazy load plus a post-slice eval materialises only this rank's shard.
@@ -71,19 +72,23 @@ def _local_sharded_load(
 def _wrap(original: Any) -> Any:
     @functools.wraps(original)
     def sharded_load_with_local_fallback(repo: Any, *args: Any, **kwargs: Any) -> Any:
-        try:
-            loaded = original(repo, *args, **kwargs)
-        except ValueError as error:
-            if "MLX converted models" not in str(error) or not Path(repo).is_dir():
-                raise
-            logger.info(
-                "sharded_load rejected local checkpoint %s (sanitize-fused "
-                "parameter names); loading the shard from the local path",
-                repo,
-            )
-            return _local_sharded_load(repo, *args, **kwargs)
-        from omlx.patches.format_load import check_loaded
+        from omlx.formats import FormatRefusedError
+        from omlx.patches.format_load import check_loaded, sharded_loading
 
+        with sharded_loading(repo, "sharded_load") as repo:
+            try:
+                loaded = original(repo, *args, **kwargs)
+            except FormatRefusedError:
+                raise
+            except ValueError as error:
+                if "MLX converted models" not in str(error) or not Path(repo).is_dir():
+                    raise
+                logger.info(
+                    "sharded_load rejected local checkpoint %s (sanitize-fused "
+                    "parameter names); loading the shard from the local path",
+                    repo,
+                )
+                return _local_sharded_load(repo, *args, **kwargs)
         # What this rank holds of the model, filled (mlx-lm's own load).
         check_loaded(loaded[0])
         return loaded
@@ -105,7 +110,9 @@ def install_local_sharded_load_fallback() -> bool:
     original = utils_module.sharded_load
     if getattr(original, "_omlx_local_fallback", False):
         return False
-    wrapped = _wrap(original)
+    from omlx.patches.format_load import guarded_sharded_loader
+
+    wrapped = _wrap(guarded_sharded_loader(utils_module))
     utils_module.sharded_load = wrapped
     # The server binds the name at import time, so rebind it there as well.
     if getattr(server_module, "sharded_load", None) is original:

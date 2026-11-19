@@ -63,6 +63,7 @@ from ..exceptions import (
     ModelTooLargeError,
     ModelUnavailableError,
 )
+from ..formats import FormatRefusedError, LoadHookError
 from ..logging_config import console_log_level, is_console_handler
 from ..model_discovery import (
     REASONING_EFFORT_LEVELS,
@@ -2875,7 +2876,13 @@ async def load_model(
         # Both mean "cannot fit": too large for the ceiling, or no room even
         # after eviction. Same mapping as the inference path in server.py.
         raise HTTPException(status_code=507, detail=str(e))
-    except (ModelUnavailableError, ModelLoadingError, ModelBusyError) as e:
+    except (
+        ModelUnavailableError,
+        ModelLoadingError,
+        ModelBusyError,
+        FormatRefusedError,
+        LoadHookError,
+    ) as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         # Some load failures are not EnginePoolError; keep their reason.

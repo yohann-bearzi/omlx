@@ -837,11 +837,13 @@ class OffloadedExpert(nn.Module):
         return [mx.concatenate(outputs, axis=0)[mx.array(back)]]
 
 
-def _plan(path, fraction, mtp_resident=False):
+def _plan(path, fraction, mtp_resident=False, *, config=None):
     from .config import ModelConfig
 
     path = Path(path)
-    raw = json.loads((path / "config.json").read_text())
+    raw = (
+        config if config is not None else json.loads((path / "config.json").read_text())
+    )
     mapping = json.loads((path / "model.safetensors.index.json").read_text())[
         "weight_map"
     ]
@@ -863,7 +865,12 @@ def estimate_expert_savings(path, fraction, *, mtp_resident=False):
 
 @lru_cache(maxsize=32)
 def _estimate_expert_savings(path, fraction, signature, mtp_resident):
-    plan = _plan(path, fraction, mtp_resident)
+    from ..moe_offload_compat import in_quant_format
+
+    config = json.loads((Path(path) / "config.json").read_text())
+    if in_quant_format(config):
+        return 0
+    plan = _plan(path, fraction, mtp_resident, config=config)
     # Keep the existing residency estimator's 5% nonexpert safety allowance.
     # The draft head only counts as savings when offload strips it.
     draft = 0 if plan.mtp_resident else plan.draft_bytes

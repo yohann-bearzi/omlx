@@ -1493,6 +1493,9 @@ def run_worker(args: argparse.Namespace) -> int:
 
     preserve_failure_marker = False
     try:
+        from omlx.patches.format_load import refuse_sharded_checkpoint
+
+        refuse_sharded_checkpoint(args.model, "cluster worker")
         # Register oMLX's model classes before MLX-LM resolves the
         # architecture. Several types oMLX serves — glm_moe_dsa, deepseek_v4,
         # minimax_m3, step3p7, llama4 — do not exist in stock MLX-LM; oMLX

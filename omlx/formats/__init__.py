@@ -24,11 +24,16 @@ is written for.
 
 from __future__ import annotations
 
+import copy
+import gc
 import logging
 import math
 import numbers
 import struct
+import sys
 import threading
+import types
+import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import cache
@@ -136,6 +141,20 @@ def _table_entry(dtype: mx.Dtype, value) -> tuple:
     return value, struct.unpack(bits, data)[0]
 
 
+def _copy_descriptor(value, dtypes, memo):
+    """Copy descriptor instance data while retaining MLX's immutable dtypes."""
+    clone = object.__new__(type(value))
+    memo[id(value)] = clone
+    memo.update((id(dtype), dtype) for dtype in dtypes)
+    state = copy.deepcopy(object.__getstate__(value), memo)
+    attrs, slots = state if isinstance(state, tuple) else (state, {})
+    if attrs is not None:
+        object.__setattr__(clone, "__dict__", attrs)
+    for name, item in slots.items():
+        object.__setattr__(clone, name, item)
+    return clone
+
+
 @dataclass(frozen=True)
 class Table:
     """A lookup table that a face reads at per-lane indices through an
@@ -151,6 +170,9 @@ class Table:
     dtype: mx.Dtype
     values: tuple = field(compare=False)
     bits: tuple = field(init=False, repr=False)
+
+    def __deepcopy__(self, memo):
+        return _copy_descriptor(self, (self.dtype,), memo)
 
     def __post_init__(self) -> None:
         if not (
@@ -201,6 +223,9 @@ class _Face:
     dtypes: tuple[mx.Dtype, ...] = ()
     # Tables the face reads, staged by the kernel (docs/quant-formats.md, Tables).
     tables: tuple[Table, ...] = field(default=(), kw_only=True)
+
+    def __deepcopy__(self, memo):
+        return _copy_descriptor(self, self.dtypes, memo)
 
     def __post_init__(self) -> None:
         owner = f"quant format face {self.key!r}"
@@ -355,9 +380,9 @@ class QuantFormat:
         A checkpoint's load calls it once for each of its modes, when the
         format lays out the first of its layers, with the ``record`` it was
         written with: an empty one for a checkpoint written before formats
-        had records. Every layer of that checkpoint is built with, and
-        keeps, the object returned: the format itself by default (or for
-        None), or one configured from the record, of the same mode,
+        had records. The receiver is the load's private copy of the registered
+        format. Every layer keeps the returned reader (the copy by default or
+        for None), with its own mutable state and the registered format's mode,
         tensors and contract, immutable and holding no unevaluated arrays
         (the layers of several checkpoints and threads may run at once).
         The registered format is left as it is."""
@@ -427,6 +452,159 @@ def check_layout(fmt: QuantFormat, n: int, k: int, layout: dict) -> None:
         )
 
 
+def _array_objects(array):
+    """The Python references in an object array, including structured fields."""
+    if array.dtype.hasobject:
+        if array.dtype.names:
+            for name in array.dtype.names:
+                yield from _array_objects(array[name])
+        else:
+            yield from array.flat
+
+
+def _reader_state(root, arrays):
+    """Yield mutable object identities and collect arrays with native storage."""
+    atomic = (
+        type(None),
+        bool,
+        int,
+        float,
+        complex,
+        str,
+        bytes,
+        range,
+        mx.Dtype,
+        type(Ellipsis),
+        type(NotImplemented),
+    )
+    ndarray = getattr(sys.modules.get("numpy"), "ndarray", ())
+    seen = set()
+    pending = [root]
+    while pending:
+        value = pending.pop()
+        ident = id(value)
+        kind = type(value)
+        if ident in seen or kind in atomic:
+            continue
+        seen.add(ident)
+        if kind not in (tuple, frozenset, slice):
+            yield ident
+        # A function's defaults and closure can be instance data. Its global
+        # namespace and the class defining a method belong to the implementation.
+        if isinstance(value, types.FunctionType):
+            pending.extend(
+                (
+                    vars(value),
+                    value.__defaults__,
+                    value.__kwdefaults__,
+                    value.__closure__,
+                )
+            )
+        elif isinstance(value, types.MethodType):
+            pending.append(value.__self__)
+        elif isinstance(value, weakref.ReferenceType):
+            pending.append(value())
+        elif isinstance(value, mx.array):
+            arrays.append(value)
+        elif isinstance(value, memoryview):
+            pending.append(value.obj)
+        elif not isinstance(value, (type, types.ModuleType)):
+            # CPython's traversal includes container members, private slots and
+            # the instance dictionary without evaluating plugin properties.
+            pending.extend(
+                child for child in gc.get_referents(value) if child is not kind
+            )
+            if isinstance(value, ndarray):
+                array = ndarray.view(value, ndarray)
+                arrays.append(array)
+                pending.append(ndarray.base.__get__(value))
+                if array.dtype.hasobject:
+                    pending.extend(_array_objects(array))
+
+
+def _reader_array_views(arrays):
+    """Expose the original bytes for comparisons across native array types."""
+    import numpy as np
+
+    for array in arrays:
+        if isinstance(array, mx.array):
+            buffer = memoryview(array)
+            if buffer.c_contiguous:
+                # Includes bfloat16, which NumPy cannot interpret as a dtype.
+                yield np.frombuffer(buffer, dtype=np.uint8)
+            else:
+                if array.dtype == mx.bfloat16:
+                    # NumPy can interpret the strides of an equal-width uint16
+                    # view. Only use it if it kept the original MLX storage.
+                    raw = array.view(mx.uint16)
+                    mx.eval(raw)
+                    size = mx.get_array_buffer_size
+                    if size(array, raw) != size(array):
+                        raise BufferError("the bfloat16 view is a copy")
+                    buffer = memoryview(raw)
+                view = np.asarray(buffer)
+                if view.flags.owndata:
+                    raise BufferError("the exported array is a copy")
+                yield view
+        else:
+            yield array
+
+
+def _shares_reader_storage(originals, copies):
+    """Check MLX allocations and the byte ranges exposed by NumPy views."""
+    import numpy as np
+
+    native = [array for array in originals if isinstance(array, mx.array)]
+    native_copies = [array for array in copies if isinstance(array, mx.array)]
+    if native or native_copies:
+        mx.eval(native, native_copies)
+    if native and native_copies:
+        size = mx.get_array_buffer_size
+        if size(native, native_copies) < size(native) + size(native_copies):
+            return True
+
+    # Distinct DLPack capsules can expose the same memory. Keep the exact
+    # strided-overlap test bounded for adversarial NumPy shapes.
+    left = list(_reader_array_views(originals))
+    return any(
+        np.shares_memory(a, b, max_work=1024)
+        for b in _reader_array_views(copies)
+        for a in left
+    )
+
+
+def _check_reader_isolation(registered: QuantFormat, reader, *, stage: str) -> None:
+    """Refuse an alias before accept can modify it or a checkpoint can keep it."""
+    if reader is registered:
+        reason = "the registered format"
+    else:
+        reason = "a reader sharing mutable state with the registered format"
+        originals, copies = [], []
+        original = set(_reader_state(registered, originals))
+        if original.isdisjoint(_reader_state(reader, copies)):
+            if not originals or not copies:
+                return
+            import numpy as np
+
+            try:
+                if not _shares_reader_storage(originals, copies):
+                    return
+            except (
+                BufferError,
+                TypeError,
+                ValueError,
+                getattr(np, "exceptions", np).TooHardError,
+            ):
+                reason = "a reader whose storage cannot be verified as independent"
+    mode = registered.mode
+    plugin = origin(mode)
+    raise FormatRefusedError(
+        f"{stage} returned {reason}; report it to {plugin or 'the plugin'}",
+        mode=mode,
+        installed=plugin,
+    )
+
+
 _FORMATS: dict[str, QuantFormat] = {}
 
 
@@ -439,7 +617,7 @@ def _may_build(mode) -> None:
     checkpoint = _LOADING.get()
     if checkpoint is not None and checkpoint.active and checkpoint.verified:
         return
-    if _TESTING:
+    if _TESTING and checkpoint is None:
         return
     raise FormatRefusedError(
         "a format's layer is built only while oMLX loads a checkpoint of a "
@@ -539,6 +717,10 @@ def load() -> None:
     with _LOCK:
         if _loaded or _loading:
             return
+        saved = [
+            (registry, registry.copy())
+            for registry in (_FORMATS, _ORIGINS, _SKIPPED, _BUILTIN_MODES)
+        ]
         _loading = True
         try:
             _REGISTERING_BUILTINS.registering = True
@@ -580,18 +762,28 @@ def load() -> None:
                         plugin,
                         ", ".join(modes),
                     )
+                finally:
+                    del _PLUGIN_MODES.modes
             _loaded = True
+        except BaseException:
+            # A retry starts with the caller's original registrations.
+            for registry, before in saved:
+                registry.clear()
+                registry.update(before)
+            raise
         finally:
             _loading = False
 
 
-@cache
 def _mlx_runs(mode) -> bool:
     """Whether ``mode`` is one of MLX's own: one ``mx.quantize`` does not
     call invalid, whatever else it finds wrong with a one-weight matrix (on
     the CPU: no GPU state is made for it)."""
-    if not isinstance(mode, str):
-        return False
+    return isinstance(mode, str) and _probe_mlx_mode(mode)
+
+
+@cache
+def _probe_mlx_mode(mode: str) -> bool:
     try:
         mx.quantize(mx.zeros((1, 1), stream=mx.cpu), mode=mode, stream=mx.cpu)
     except ValueError as error:
@@ -713,7 +905,7 @@ def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
     mode = getattr(layer, "mode", None)
     # A format's layer keeps the object that reads it; MLX's have a mode.
     fmt = getattr(layer, "fmt", None)
-    if fmt is None:
+    if not isinstance(fmt, QuantFormat):
         fmt = get(mode)
     if fmt is None:
         return None

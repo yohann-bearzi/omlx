@@ -589,6 +589,23 @@ def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(
     assert not proof.ran and not proof.failed
 
 
+class _FormatLog:
+    """The test observes each copy of a format without sharing its instance state."""
+
+    __slots__ = ("__weakref__",)
+    _logs = weakref.WeakKeyDictionary()
+
+    def __init__(self, calls):
+        self._logs[self] = calls
+
+    @property
+    def calls(self):
+        return self._logs[self]
+
+    def __deepcopy__(self, memo):
+        return type(self)(self.calls)
+
+
 class _ToyFormat(formats.QuantFormat):
     mode, tensors, contract = "toy", ("scales",), formats.CONTRACT
 
@@ -2829,6 +2846,9 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(
 def a_load(tmp_path):
     """The test runs as a checkpoint's load on its thread: what is assigned
     to a format layer is the load's."""
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "llama", "omlx_quant_formats": {"toy": {}}}'
+    )
     with format_load.loading(tmp_path):
         yield
 

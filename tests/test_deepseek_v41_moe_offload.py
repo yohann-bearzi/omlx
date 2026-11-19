@@ -916,6 +916,18 @@ def test_offloaded_dspark_verify_matches_resident(tmp_path, monkeypatch):
         resident.close()
 
 
+def test_admission_counts_no_expert_savings_for_a_recorded_checkpoint(tmp_path):
+    from omlx.patches.deepseek_v41.moe_offload import estimate_expert_savings
+
+    target = _mtp_checkpoint(tmp_path)
+    assert estimate_expert_savings(target, 0.5) > 0
+    cfg = target / "config.json"
+    raw = json.loads(cfg.read_text())
+    raw["omlx_quant_formats"] = {"toy": {}}
+    cfg.write_text(json.dumps(raw))
+    assert estimate_expert_savings(target, 0.5) == 0
+
+
 def test_mtp_resident_savings_excludes_draft_bytes(tmp_path, monkeypatch):
     from omlx.patches import mlx_lm_mtp
     from omlx.patches.deepseek_v41.config import ModelConfig
@@ -961,12 +973,12 @@ def _stub_checkpoint(tmp_path, model_type):
 
 def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
     from omlx.utils.model_loading import (
-        _config_model_type,
+        _offload_config,
         maybe_apply_pre_load_patches,
     )
 
     v41 = _stub_checkpoint(tmp_path / "v41", "deepseek_v41")
-    assert _config_model_type(v41) == "deepseek_v41"
+    assert _offload_config(v41).get("model_type") == "deepseek_v41"
     other = _stub_checkpoint(tmp_path / "qwen", "qwen3_5_moe")
 
     class Settings:
@@ -984,7 +996,7 @@ def test_load_time_gate_allows_v41_rejects_other_lightning_family(tmp_path):
             "moe_expert_offload_resident_fraction": 0.5,
             "mtp_enabled": True,
         },
-        model_type=_config_model_type(v41),
+        model_type=_offload_config(v41).get("model_type"),
     )
     with pytest.raises(ValueError, match="MoE expert offload cannot"):
         maybe_apply_pre_load_patches(other, Settings())

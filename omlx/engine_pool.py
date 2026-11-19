@@ -420,6 +420,7 @@ class EngineEntry:
     load_failure_at: float | None = None
     # Recreate a typed refusal on cached retries without retaining loader frames.
     load_refusal: Callable[[], Exception] | None = None
+    load_refusal_variant: tuple | None = None
 
 
 class EnginePool:
@@ -1937,6 +1938,7 @@ class EnginePool:
         entry.load_failure_message = None
         entry.load_failure_at = None
         entry.load_refusal = None
+        entry.load_refusal_variant = None
 
     def _mark_load_failure(self, entry: EngineEntry, exc: BaseException) -> None:
         entry.load_failed = True
@@ -2871,6 +2873,12 @@ class EnginePool:
                     return entry.engine
 
             self._raise_if_model_path_missing_locked(model_id, entry)
+            requested_variant = (force_lm, expected_signature)
+            if (
+                entry.load_refusal is not None
+                and entry.load_refusal_variant != requested_variant
+            ):
+                self._clear_load_failure(entry)
             self._raise_if_load_failed(model_id, entry)
 
             # Pre-load admission against the memory ceiling from the
@@ -3090,11 +3098,16 @@ class EnginePool:
                     )
 
             # Now load the model
-            await self._load_engine(
-                model_id,
-                force_lm=force_lm,
-                runtime_settings=runtime_load_settings,
-            )
+            try:
+                await self._load_engine(
+                    model_id,
+                    force_lm=force_lm,
+                    runtime_settings=runtime_load_settings,
+                )
+            except (FormatRefusedError, LoadHookError):
+                if entry.load_refusal is not None:
+                    entry.load_refusal_variant = requested_variant
+                raise
 
             loaded = self._entries[model_id]
             if ngram_admission_override and expected_signature is not None:

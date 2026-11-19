@@ -186,6 +186,9 @@ def load_pipeline_stage(
 ) -> Model:
     """This rank's stage of a converted checkpoint, text model only."""
 
+    from omlx.patches.format_load import refuse_format_checkpoint
+
+    refuse_format_checkpoint(model_path, "DeepSeek V4.1 pipeline stage")
     model, _ = load(
         model_path,
         stage=lambda language_model: language_model.pipeline(group),
@@ -205,6 +208,9 @@ def load_tensor_shard(
 ) -> Model:
     """This rank's tensor-parallel slice of a converted checkpoint, text model only."""
 
+    from omlx.patches.format_load import refuse_format_checkpoint
+
+    refuse_format_checkpoint(model_path, "DeepSeek V4.1 tensor shard")
     if a8_prefill:
         # Replicated projections (wq_a, wkv, the indexer) must give every rank
         # the same state, so A8 runs only when every rank has INT8 tensor units.

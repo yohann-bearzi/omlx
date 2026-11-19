@@ -29,15 +29,38 @@ def test_the_gate_error_on_a_local_directory_falls_back(tmp_path, monkeypatch):
     assert _wrap(original)(str(tmp_path)) is sentinel
 
 
-def test_the_gate_error_on_a_remote_repo_still_raises(monkeypatch):
+def test_the_gate_error_on_a_remote_repo_still_raises(monkeypatch, tmp_path):
     def original(repo, *a, **k):
         raise GATE_ERROR
 
     monkeypatch.setattr(
         patch_module, "_local_sharded_load", lambda *a, **k: pytest.fail("fell back")
     )
+    (tmp_path / "config.json").write_text('{"model_type": "llama"}')
+    monkeypatch.setattr("mlx_lm.utils._download", lambda *args, **kwargs: tmp_path)
     with pytest.raises(ValueError, match="MLX converted"):
         _wrap(original)("mlx-community/some-remote-model")
+
+
+def test_a_format_refusal_mentioning_the_pipeline_gate_never_retries(
+    tmp_path, monkeypatch
+):
+    from omlx.formats import FormatRefusedError
+
+    refusal = FormatRefusedError(
+        "MLX converted models cannot read this layout", mode="toy", path=tmp_path
+    )
+
+    def original(repo):
+        raise refusal
+
+    def retry(repo):
+        pytest.fail("retried a checkpoint whose format refused it")
+
+    monkeypatch.setattr(patch_module, "_local_sharded_load", retry)
+    with pytest.raises(FormatRefusedError) as caught:
+        _wrap(original)(tmp_path)
+    assert caught.value is refusal
 
 
 def test_other_errors_are_not_swallowed(tmp_path, monkeypatch):

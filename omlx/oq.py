@@ -70,6 +70,7 @@ from omlx.model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
     _has_vision_subconfig,
     decision_kind,
+    detect_model_type,
 )
 
 logger = logging.getLogger(__name__)
@@ -7033,6 +7034,11 @@ def _unverified_family(config: dict) -> tuple[str, str] | None:
         )
         if isinstance(name, str) and name.strip()
     ]
+    if any(
+        isinstance(section, dict) and section.get("model_file") is not None
+        for section in (config, text_config)
+    ):
+        return families[0], "its model_file selects a custom model implementation"
     for family in families:
         if family in _QUANT_FORMAT_MISREAD and family not in verified:
             return family, _QUANT_FORMAT_MISREAD[family]
@@ -7052,17 +7058,23 @@ def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
     model the checkpoint loads as holds at its shape (a family's loader
     renames, joins or splits it, so what it would load as is not known):
     those are named."""
-    classes = set(unloaded) | ({"no module holds them"} if unwalked else set())
+    count = len(unloaded) + len(unwalked)
+    matrices = "1 matrix stays" if count == 1 else f"{count} matrices stay"
+    whose = "its" if count == 1 else "their"
+    absent = "no module holds it" if len(unwalked) == 1 else "no module holds them"
+    classes = set(unloaded) | ({absent} if unwalked else set())
     said = (
-        f"oQ{level}: {len(unloaded) + len(unwalked)} matrices stay oQ's affine: "
-        "a quant format's layer is not built for their class "
+        f"oQ{level}: {matrices} oQ's affine: "
+        f"a quant format's layer is not built for {whose} class "
         f"({', '.join(sorted(classes))})"
     )
     if unwalked:
         paths = sorted(unwalked)
         more = f" and {len(paths) - 20} more" if len(paths) > 20 else ""
+        path_word, shape = ("path", "its") if len(paths) == 1 else ("paths", "their")
         said += (
-            "\npaths that no module of the model it loads as holds at their shape: "
+            f"\n{path_word} that no module of the model it loads as "
+            f"holds at {shape} shape: "
             f"{', '.join(paths[:20])}{more}"
         )
     return said
@@ -7750,7 +7762,18 @@ def _open_oq_run(
         # others declare its ordinary backbone and ship the decision head.
         native = normalized_model_type
         if native not in {"mimo_v2", "mimo_v2_flash", "clef", "d1", "d3", "openjev"}:
-            native = decision_kind(source, config, use_name_hint=False)
+            normalized = {**config, "model_type": normalized_model_type}
+            native = decision_kind(source, normalized, use_name_hint=False)
+            if native is None:
+                route = detect_model_type(source)
+                if route in {
+                    "embedding",
+                    "reranker",
+                    "audio_stt",
+                    "audio_tts",
+                    "audio_sts",
+                }:
+                    native = route
         if native:
             raise FormatRefusedError(
                 f"oQ writes no {native} checkpoint in a quant format: its native "
@@ -12191,8 +12214,6 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
     given, the loader quantizes only the layers ``config``'s quantization
     names (a run's has none yet): the others are the modules whose
     ``to_quantized`` builds the checkpoint's layers."""
-    from .patches.format_load import loads_in_format
-
     source = Path(model_path)
     with tempfile.TemporaryDirectory(prefix="omlx-oq-walk-") as directory:
         view = Path(directory)
@@ -12208,30 +12229,15 @@ def _module_classes(model_path, config, *, trust_remote_code=False) -> dict:
         weight_map = dict.fromkeys(_source_tensors(source), "model.safetensors")
         index = view / "model.safetensors.index.json"
         index.write_text(json.dumps({"weight_map": weight_map}))
-        model = _on_mlx_thread(
+        return _on_mlx_thread(
             lambda: _walk_model(source, view, config, trust_remote_code)
         )
-    loads = {}
-    walked = {}
-    for name, module in model.named_modules():
-        cls = f"{type(module).__module__}.{type(module).__qualname__}"
-        if cls not in loads:
-            loads[cls] = loads_in_format(cls)
-        weight = module.get("weight")
-        shape = tuple(weight.shape) if isinstance(weight, mx.array) else None
-        walked[name] = (cls, loads[cls], shape)
-    # A model that holds files or threads open (Qwen4-Exp's tables on the
-    # SSD) lets them go.
-    close = getattr(model, "close", None)
-    if callable(close):
-        close()
-    return walked
 
 
 def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool):
-    """The model built over ``view`` by the library that serves it, with the
-    pre-load patches of the source's calibration, the process-wide state they
-    set kept as it was."""
+    """Build, visit and close the model on its loader thread while the view exists."""
+    from .patches.format_load import loads_in_format
+
     with (
         _load_globals_kept(config),
         _calibration_patches(source, config, walk=view) as is_vlm,
@@ -12240,17 +12246,32 @@ def _walk_model(source: Path, view: Path, config: dict, trust_remote_code: bool)
         if is_vlm:
             from mlx_vlm import utils as vlm_utils
 
-            return vlm_utils.load_model(view, **built)
-        import mlx_lm.utils as lm_utils
+            model = vlm_utils.load_model(view, **built)
+        else:
+            import mlx_lm.utils as lm_utils
 
-        # Without MiMo's MTP sidecar, which the model's sanitize would read.
-        override = _sensitivity_lm_config_override(config)
-        return lm_utils.load_model(
-            view,
-            model_config=override,
-            get_model_classes=_walk_lm_classes,
-            **built,
-        )[0]
+            # Without MiMo's MTP sidecar, which the model's sanitize would read.
+            model = lm_utils.load_model(
+                view,
+                model_config=_sensitivity_lm_config_override(config),
+                get_model_classes=_walk_lm_classes,
+                **built,
+            )[0]
+        try:
+            loads = {}
+            walked = {}
+            for name, module in model.named_modules():
+                cls = f"{type(module).__module__}.{type(module).__qualname__}"
+                if cls not in loads:
+                    loads[cls] = loads_in_format(cls)
+                weight = module.get("weight")
+                shape = tuple(weight.shape) if isinstance(weight, mx.array) else None
+                walked[name] = (cls, loads[cls], shape)
+            return walked
+        finally:
+            close = getattr(model, "close", None)
+            if callable(close):
+                close()
 
 
 def _walk_lm_classes(config):

@@ -243,6 +243,7 @@ from .exceptions import (
     RequestAbortedError,
     SchedulerQueueFullError,
 )
+from .formats import FormatRefusedError, LoadHookError
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
 from .models.decision import DecisionContextLengthError, DecisionRequestError
 from .prefill_helper.routes import router as prefill_helper_router
@@ -1568,6 +1569,8 @@ async def get_engine(
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
                 return fb_engine
+            except (FormatRefusedError, LoadHookError) as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             except Exception:
                 pass  # Fall through to original 404
 
@@ -1589,7 +1592,7 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
-    except ModelUnavailableError as e:
+    except (ModelUnavailableError, FormatRefusedError, LoadHookError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -4080,7 +4083,7 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=507, detail=str(e)) from e
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e)) from e
-    except ModelUnavailableError as e:
+    except (ModelUnavailableError, FormatRefusedError, LoadHookError) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e

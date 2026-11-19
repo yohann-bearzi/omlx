@@ -2,7 +2,9 @@
 """Cover the load-time bfloat16 -> float16 activation recast."""
 
 import json
+import logging
 import struct
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -10,7 +12,12 @@ import pytest
 from mlx.utils import tree_flatten
 
 from omlx.cache.paged_ssd_cache import numerics_revision_for_model
+from omlx.formats import testing
+from omlx.formats.affine import AffineFormat
+from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    apply_activation_fp16,
     cast_bf16_params_to_fp16,
     checkpoint_has_bf16_leaves,
 )
@@ -127,3 +134,76 @@ def test_checkpoint_has_bf16_leaves_reads_safetensors_headers(tmp_path):
 
     assert checkpoint_has_bf16_leaves("") is False
     assert checkpoint_has_bf16_leaves(str(tmp_path / "missing")) is False
+
+
+def _format_model(layer_kind: str) -> nn.Module:
+    class TestFormat(AffineFormat):
+        mode = "recast-test"
+
+    dense = nn.Linear(64, 128, bias=False)
+    dense.set_dtype(mx.bfloat16)
+    quantized = dense.to_quantized(group_size=64, bits=4)
+    tensors = {name: quantized[name] for name in ("weight", "scales", "biases")}
+    if layer_kind == "switch":
+        tensors = {name: mx.stack([arr, arr]) for name, arr in tensors.items()}
+    with testing.verified("llama"):
+        cls = FormatLinear if layer_kind == "linear" else FormatSwitchLinear
+        fmt = TestFormat()
+        first = cls(fmt, 4, 64, 64, tensors)
+        second = cls(fmt, 4, 64, 64, tensors)
+    norm = nn.RMSNorm(128)
+    norm.set_dtype(mx.bfloat16)
+    model = nn.Sequential(first, norm, second)
+    mx.eval(model.parameters())
+    return model
+
+
+@pytest.mark.parametrize("layer_kind", ["linear", "switch"])
+def test_apply_activation_fp16_skips_models_with_format_layers(
+    layer_kind, monkeypatch, caplog
+):
+    model = _format_model(layer_kind)
+    before = {key: value.dtype for key, value in tree_flatten(model.parameters())}
+    assert mx.bfloat16 in before.values()
+
+    called = False
+
+    def track_cast(target):
+        nonlocal called
+        called = True
+        return cast_bf16_params_to_fp16(target)
+
+    monkeypatch.setattr(model_loading, "cast_bf16_params_to_fp16", track_cast)
+
+    with caplog.at_level(logging.WARNING, logger="omlx.utils.model_loading"):
+        apply_activation_fp16(model, SimpleNamespace(activation_fp16_enabled=True))
+
+    assert called is False
+    after = {key: value.dtype for key, value in tree_flatten(model.parameters())}
+    assert after == before
+    assert numerics_revision_for_model(model) is None
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == model_loading.__name__ and record.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "format" in warnings[0].lower()
+
+
+def test_apply_activation_fp16_keeps_stock_recast_and_disabled_noop(caplog):
+    stock = _toy_quantized_model()
+    apply_activation_fp16(stock, SimpleNamespace(activation_fp16_enabled=True))
+    dtypes = {value.dtype for _, value in tree_flatten(stock.parameters())}
+    assert mx.bfloat16 not in dtypes
+    assert mx.float16 in dtypes
+    assert numerics_revision_for_model(stock) == "fp16-recast"
+
+    fmt_model = _format_model("linear")
+    with caplog.at_level(logging.WARNING, logger="omlx.utils.model_loading"):
+        apply_activation_fp16(fmt_model, SimpleNamespace(activation_fp16_enabled=False))
+    assert not any(
+        record.name == model_loading.__name__ and record.levelno == logging.WARNING
+        for record in caplog.records
+    )
+    assert numerics_revision_for_model(fmt_model) is None

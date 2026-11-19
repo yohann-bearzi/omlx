@@ -139,6 +139,39 @@ def test_a_checkpoint_in_a_quant_format_loads_without_offload(tmp_path):
         maybe_apply_pre_load_patches(str(tmp_path), settings)
 
 
+@pytest.mark.parametrize(
+    ("kind", "feature"),
+    [
+        ("qwen4_exp", "dflash_enabled"),
+        ("qwen4_exp", "vlm_mtp_enabled"),
+        ("olmoe", "mtp_enabled"),
+    ],
+)
+def test_load_validates_speculation_against_actual_expert_offload(
+    tmp_path, monkeypatch, kind, feature
+):
+    from omlx.patches import mlx_lm_mtp
+    from omlx.utils.model_loading import maybe_apply_pre_load_patches
+
+    class ValidationFinishedError(Exception):
+        pass
+
+    def after_validation(active):
+        raise ValidationFinishedError()
+
+    monkeypatch.setattr(mlx_lm_mtp, "set_mtp_active", after_validation)
+    path = tmp_path / "config.json"
+    config = {"model_type": kind}
+    settings = SimpleNamespace(moe_expert_offload_enabled=True, **{feature: True})
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValueError, match="MoE expert offload cannot be combined"):
+        maybe_apply_pre_load_patches(str(tmp_path), settings)
+    config["omlx_quant_formats"] = {"toy": {}}
+    path.write_text(json.dumps(config))
+    with pytest.raises(ValidationFinishedError):
+        maybe_apply_pre_load_patches(str(tmp_path), settings)
+
+
 @pytest.mark.parametrize("kind", ["mixtral", "llama"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):
     _checkpoint(tmp_path, kind)

@@ -898,13 +898,16 @@ def format_layer(model: Any) -> tuple[str, Any] | None:
     return None
 
 
-def _refuse_format_layers(model: Any) -> None:
+def _refuse_format_layers(model: Any, *, operation: str = "tensor parallelism") -> None:
     """Refuse a model that holds a quant format's layer, naming one."""
+    refuse = getattr(model, "__dict__", {}).get("_omlx_refuse_sharding")
+    if refuse is not None:
+        refuse()
     held = format_layer(model)
     if held is not None:
         name, module = held
         raise RuntimeError(
-            f"tensor parallelism cannot shard {name}: a layer of quant "
+            f"{operation} cannot shard {name}: a layer of quant "
             f"format {module.mode!r}, which no strategy splits; serve this "
             "model on one machine"
         )

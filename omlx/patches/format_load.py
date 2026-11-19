@@ -44,6 +44,7 @@ import os
 import sys
 import threading
 import types
+import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cached_property, update_wrapper, wraps
@@ -68,11 +69,27 @@ _CHECKED_LOADERS = (
     ("mlx_lm.utils", "load_model"),
     ("mlx_vlm.utils", "load_model"),
 )
+_SHARDED_LOADERS = (
+    ("mlx_lm.utils", "sharded_load"),
+    ("mlx_lm.utils", "pipeline_load"),
+)
 _LOADERS = (
     *_CHECKED_LOADERS,
+    *_SHARDED_LOADERS,
     ("mlx_vlm.encoder_loader", "load_encoder_model"),
     ("mlx_embeddings.utils", "load_model"),
+    ("mlx_vlm.speculative.drafters", "load_drafter"),
 )
+_SPLITTERS = {
+    "mlx_vlm.speculative.drafters.mtp_split": (
+        "MTPSplitter",
+        ("load", "prepare", "split"),
+    ),
+    "mlx_vlm.speculative.drafters.deepseek_v4_dspark.split": (
+        "DeepseekV4DsparkSplitter",
+        ("split",),
+    ),
+}
 
 # The parts of a model a load may leave out, whose layers its checkpoint's
 # quantization config names all the same: an MTP head left off (mtp_enabled
@@ -85,6 +102,7 @@ _ABSENT = object()
 # Whether this process has built a format layer: until it has, no load
 # holds one to check.
 _BUILT_ANY = False
+_SHARDED = threading.local()
 
 # A value of config.json by its JSON type.
 _JSON_TYPES = {
@@ -133,6 +151,7 @@ class _Checkpoint:
         # once.
         self._accepting = threading.RLock()
         self.built: list[nn.Module] = []
+        self._pruned = []
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
@@ -151,9 +170,9 @@ class _Checkpoint:
             if key not in self._layouts:
                 layout = fmt.layout(*geometry)
                 read = fmt
-                if layout is not None:
+                if layout is not None or self.records(fmt.mode):
                     read = self.read(fmt)
-                    if read is not fmt:
+                    if layout is not None and read is not fmt:
                         layout = read.layout(*geometry)
                 self._layouts[key] = (read, layout)
             return self._layouts[key]
@@ -180,12 +199,14 @@ class _Checkpoint:
                 self,
             ) from error
         try:
+            formats._check_reader_isolation(fmt, own, stage="deepcopy")
             read = own.accept(record)
+            read = own if read is None else read
+            formats._check_reader_isolation(fmt, read, stage="accept")
         except ValueError as error:
             # The format's own words, with what oMLX knows of the checkpoint.
             said = error.reason if isinstance(error, FormatRefusedError) else error
             raise _refused(str(said), fmt.mode, self) from error
-        read = own if read is None else read
         if not (
             isinstance(read, formats.QuantFormat)
             and (read.mode, read.tensors, read.contract)
@@ -397,10 +418,35 @@ class _Checkpoint:
         if mode is not None:
             self._check_layout(config, mode)
         recorded = config.get("omlx_quant_formats", {})
-        modes = {layer.mode for layer in self.built}
         for mode in recorded:
             self._record(mode)
         entries = self._format_entries(quants)
+        paths: dict[int, list[str]] = {}
+        loaded_modules = []
+        if self.built or entries:
+            models = loaded if isinstance(loaded, tuple) else (loaded,)
+            for model in models:
+                if isinstance(model, nn.Module):
+                    for path, module in model.named_modules():
+                        paths.setdefault(id(module), []).append(path)
+                        loaded_modules.append(module)
+        omitted = set()
+        for owner_ref, name, branch in self._pruned:
+            owner = owner_ref()
+            if (
+                owner is not None
+                and id(owner) in paths
+                and getattr(owner, name, None) is None
+            ):
+                omitted.update(branch)
+        built = self.built
+        if omitted:
+            built = [
+                layer
+                for layer in built
+                if id(layer) in paths or id(layer) not in omitted
+            ]
+        modes = {layer.mode for layer in built}
         for quant in quants:
             top = quant.get("mode", "affine")
             if not self._in_format(top) or top in modes:
@@ -415,7 +461,7 @@ class _Checkpoint:
             )
         # A record with no built layer is accounted for only by named
         # entries. Each of those must still bind or belong to an absent part.
-        accounted = modes.union(mode for _, mode in entries)
+        accounted = modes.union(entry["mode"] for _, _, entry in entries)
         for mode in recorded:
             if mode in accounted:
                 continue
@@ -427,13 +473,7 @@ class _Checkpoint:
         if not self.built and not entries:
             # A load of no format's layers: an MLX checkpoint's.
             return
-        models = loaded if isinstance(loaded, tuple) else (loaded,)
-        paths: dict[int, list[str]] = {}
-        for model in models:
-            if isinstance(model, nn.Module):
-                for path, module in model.named_modules():
-                    paths.setdefault(id(module), []).append(path)
-        stray = [layer for layer in self.built if id(layer) not in paths]
+        stray = [layer for layer in built if id(layer) not in paths]
         if stray:
             raise _refused(
                 f"{len(stray)} layers were built while the checkpoint loaded, "
@@ -443,18 +483,17 @@ class _Checkpoint:
                 stray[0].mode,
                 self,
             )
-        # Each layer at each path its model holds it under, in its mode, for
-        # one entry each.
-        bound: dict[tuple[str, str], int] = {}
-        for layer in self.built:
+        # A physical module can be exposed under several Python attributes.
+        bound = {}
+        for layer in built:
             path = paths[id(layer)][0]
             for held in paths[id(layer)]:
-                key = (held, layer.mode)
-                bound[key] = bound.get(key, 0) + 1
+                bound[(held, layer.mode)] = id(layer)
             placeholders = layer._load_origin[0]
             # A tensor of another shape or dtype is not taken (the layer keeps
             # its placeholder) and recorded as offered: named as it was.
             pending = getattr(layer, "_placeholders", {})
+            left = _unfilled(layer, placeholders, pending, path, self)
             for name, offered in pending.items():
                 if offered is not None:
                     if offered[0] is None:
@@ -472,11 +511,6 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-            left = [
-                name
-                for name, held in placeholders.items()
-                if layer[name] is held or name in pending
-            ]
             if left and len(left) < len(placeholders):
                 raise _refused(
                     f"the load filled {path} but its {', '.join(left)}: the "
@@ -508,15 +542,29 @@ class _Checkpoint:
         present_parts = {
             _optional_root(path) for held in paths.values() for path in held
         }
-        for path, mode in entries:
-            names = _entry_names(path)
+        claims = {}
+        for mapping, path, recipe in entries:
+            mode = recipe["mode"]
             part = _optional_root(path)
             if part and part not in present_parts:
-                # Of a part this load does not build (an MTP head left off,
-                # a text-only load's vision tower): no layer of it to serve.
                 continue
-            name = next((name for name in names if bound.get((name, mode))), None)
-            if name is None:
+            for name in _entry_names(path):
+                identity = bound.get((name, mode))
+                if identity is None:
+                    continue
+                previous = claims.setdefault(identity, {})
+                if mapping in previous:
+                    continue
+                # Distinct quantization maps may repeat a language-model
+                # declaration under its documented runtime spelling.
+                if all(
+                    (other in _entry_names(path) or path in _entry_names(other))
+                    and _same_json(recipe, other_recipe)
+                    for other, other_recipe in previous.values()
+                ):
+                    previous[mapping] = (path, recipe)
+                    break
+            else:
                 raise _refused(
                     f"its quantization config names {path}, and the load built "
                     "no layer of the format there: the model has no such "
@@ -524,9 +572,20 @@ class _Checkpoint:
                     mode,
                     self,
                 )
-            bound[(name, mode)] -= 1
+        mode = self._marked_mode() or self.built[0].mode
+        error = _refused(
+            "distributed loading cannot shard a quant format checkpoint", mode, self
+        )
+        refuse = _shard_refusal(error)
+        # An adapter can take a submodule even if it has no native shard method.
+        for module in loaded_modules:
+            object.__setattr__(module, "_omlx_refuse_sharding", refuse)
+            for method in ("shard", "pipeline"):
+                if callable(getattr(module, method, None)):
+                    object.__setattr__(module, method, refuse)
         # Checked: the layers are the model's to keep, not this checkpoint's.
         self.built.clear()
+        self._pruned.clear()
 
     def _check_layout(self, config: dict, mode: str) -> None:
         """Validate the flat per-layer maps of a checkpoint declaring a format."""
@@ -571,17 +630,51 @@ class _Checkpoint:
             not formats._mlx_runs(mode) or self.records(mode)
         )
 
-    def _format_entries(self, quants: list[dict]) -> list[tuple[str, str]]:
-        """The layers the checkpoint's quantization configs name in a mode
-        that is a format's, with that mode. An entry without a mode is
-        MLX's affine, whatever its config's mode (MLX builds it so)."""
-        entries = {
-            (path, entry.get("mode", "affine"))
-            for quantization in quants
-            for path, entry in quantization.items()
-            if isinstance(entry, dict) and self._in_format(entry.get("mode", "affine"))
-        }
-        return sorted(entries)
+    def _format_entries(self, quants):
+        """Each named format layer with the map and recipe that declare it."""
+        entries = []
+        for mapping, quant in enumerate(quants):
+            for path, entry in quant.items():
+                if not isinstance(entry, dict) or not self._in_format(
+                    entry.get("mode", "affine")
+                ):
+                    continue
+                recipe = {
+                    key: quant[key] for key in ("bits", "group_size") if key in quant
+                }
+                entries.append((mapping, path, {"mode": "affine"} | recipe | entry))
+        return entries
+
+
+def _shard_refusal(error):
+    """Keep the diagnostic after load without retaining the checkpoint or its layers."""
+
+    def refuse(*args, **kwargs):
+        raise FormatRefusedError(
+            error.reason,
+            mode=error.mode,
+            path=error.path,
+            written=error.written,
+            installed=error.installed,
+        )
+
+    return refuse
+
+
+def _unfilled(layer, placeholders, pending, path, checkpoint):
+    """Return the remaining placeholders. A deleted tensor is invalid at either exit."""
+    left = []
+    for name, held in placeholders.items():
+        tensor = layer.get(name, _ABSENT)
+        if tensor is _ABSENT:
+            raise _refused(
+                f"the loaded model is missing {path}.{name}, which its format requires",
+                layer.mode,
+                checkpoint,
+            )
+        if tensor is held or name in pending:
+            left.append(name)
+    return left
 
 
 def check_loaded(model) -> None:
@@ -599,11 +692,7 @@ def check_loaded(model) -> None:
             continue
         tensors, checkpoint = held
         pending = getattr(module, "_placeholders", {})
-        left = [
-            tensor
-            for tensor, kept in tensors.items()
-            if module[tensor] is kept or tensor in pending
-        ]
+        left = _unfilled(module, tensors, pending, name, checkpoint)
         if left:
             # Kept: a check of it again (another thread's, a later caller's)
             # refuses it again.
@@ -637,7 +726,7 @@ def _shown(path: Path) -> Path:
     to a checkpoint's files (a family's loader's, a decision model's) by the
     checkpoint its config is, link by link while each link is to a config
     file (a Hugging Face snapshot's is to a blob of content, not one)."""
-    path = Path(os.path.abspath(path))
+    path = Path(os.path.realpath(path))
     config, seen = path / "config.json", set()
     while config.is_symlink():
         stat = os.lstat(config)
@@ -647,10 +736,11 @@ def _shown(path: Path) -> Path:
         seen.add((stat.st_dev, stat.st_ino))
         # Relative to the directory the link is in, not to a link to it.
         parent = os.path.realpath(config.parent)
-        target = Path(os.path.normpath(os.path.join(parent, os.readlink(config))))
+        target = Path(parent) / os.readlink(config)
         if target.name != "config.json":
             break
-        path, config = target.parent, target
+        path = Path(os.path.realpath(target.parent))
+        config = path / "config.json"
     return path
 
 
@@ -674,7 +764,13 @@ def _format_markers(value, path=(), in_quant=False):
                 yield (*path, key), child if child.strip() else "unknown"
         elif isinstance(child, (dict, list)):
             yield from _format_markers(
-                child, (*path, key), in_quant or key in _QUANT_KEYS
+                child,
+                (*path, key),
+                (
+                    (not isinstance(child, dict) or "quant_method" not in child)
+                    if key in _QUANT_KEYS
+                    else in_quant
+                ),
             )
 
 
@@ -682,7 +778,7 @@ def _format_declaration(config) -> tuple[str | None, str | None]:
     """Return the declared mode and the first unsupported declaration location."""
     if not isinstance(config, (dict, list)):
         return None, None
-    explicit = implicit = None
+    explicit = implicit = misplaced = misplaced_mode = None
     for path, mode in _format_markers(config):
         if path == ("omlx_quant_formats",):
             explicit = mode
@@ -695,8 +791,11 @@ def _format_declaration(config) -> tuple[str | None, str | None]:
             and isinstance(relative[-2], str)
         ):
             implicit = implicit or mode
-        else:
-            return mode or "unknown", ".".join(map(str, path))
+        elif misplaced is None:
+            misplaced = ".".join(map(str, path))
+            misplaced_mode = mode
+    if misplaced is not None:
+        return misplaced_mode or explicit or implicit or "unknown", misplaced
     name = explicit or implicit
     if name is None and isinstance(config, dict) and "omlx_quant_formats" in config:
         name = "unknown"
@@ -727,6 +826,15 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
         mode = declared
     if mode is None:
         return
+    sharded = getattr(_SHARDED, "entry", None)
+    if sharded is not None:
+        # A Hub branch can change between metadata preflight and the library's
+        # own resolution. Check the directory actually passed to load_model too.
+        raise _refused(
+            f"the {sharded[1]} loader cannot read a quant format checkpoint",
+            mode,
+            checkpoint,
+        )
     from .. import oq
 
     # Its config alone names its family, wherever the load found it.
@@ -860,6 +968,48 @@ def refuse_format_checkpoint(path, loader: str, *, config=_ABSENT, reason=None) 
         )
 
 
+def checked_audio_path(repo, loader: str):
+    """Resolve a Hub audio source at the revision whose config we inspected."""
+    local = Path(repo).expanduser()
+    if local.exists() or local.is_absolute():
+        refuse_format_checkpoint(local, loader)
+        return repo
+    get_model_path = importlib.import_module("mlx_audio.utils").get_model_path
+
+    snapshot = get_model_path(repo, allow_patterns=["config.json"])
+    refuse_format_checkpoint(snapshot, loader)
+    return str(get_model_path(repo, revision=snapshot.name))
+
+
+def refuse_sharded_checkpoint(repo, loader: str) -> None:
+    """Inspect only metadata when a distributed entry accepts a Hub identifier."""
+    path = Path(repo).expanduser()
+    if not path.is_absolute() and not path.exists():
+        from mlx_lm.utils import _download
+
+        path = _download(repo, allow_patterns=["config.json"])
+    refuse_format_checkpoint(path, loader)
+
+
+@contextmanager
+def sharded_loading(repo, loader: str):
+    """Keep the original repository ID for the library's rank-specific downloads."""
+    previous = getattr(_SHARDED, "entry", None)
+    name = os.fspath(repo)
+    if name.startswith("~"):
+        repo = Path(repo).expanduser()
+        name = os.fspath(repo)
+    if previous is not None and previous[0] == name:
+        yield repo
+        return
+    refuse_sharded_checkpoint(repo, loader)
+    _SHARDED.entry = (name, loader)
+    try:
+        yield repo
+    finally:
+        _SHARDED.entry = previous
+
+
 def check_engine_loader(path, loader: str) -> None:
     """Only the in-process text and VLM loaders can serve a verified checkpoint."""
     if loader in ("batched", "vlm"):
@@ -902,6 +1052,7 @@ def loading(path, *, by_loader: bool = False) -> Iterator[_Checkpoint]:
         and outer.by_loader
         and outer.owner == threading.get_ident()
         and outer.shown == _shown(Path(path).expanduser())
+        and getattr(_SHARDED, "entry", None) is None
     ):
         yield outer
         return
@@ -1128,7 +1279,39 @@ def _wrapped_already(load) -> bool:
     return False
 
 
-def _wrap_loader(module, name: str) -> None:
+def _call_drafter(own, signature, source, args, kwargs):
+    """Check a native drafter or splitter source before it can select weights."""
+    supplied = signature.bind_partial(*args, **kwargs)
+    if source not in supplied.arguments:
+        return own(*args, **kwargs)
+    path = supplied.arguments[source]
+    local = Path(path).expanduser()
+    if local != Path(path):
+        path = supplied.arguments[source] = local
+    config = supplied.arguments.get("source_config", kwargs.get("source_config"))
+    if config is not None:
+        refuse_format_checkpoint(path, "external drafter", config=config)
+    if source != "source_path" and not local.is_absolute() and not local.exists():
+        get_model_path = importlib.import_module("mlx_vlm.utils").get_model_path
+
+        force = supplied.arguments.get(
+            "force_download", kwargs.get("force_download", False)
+        )
+        revision = supplied.arguments.get("revision", kwargs.get("revision"))
+        snapshot = get_model_path(
+            path,
+            revision=revision if source == "source" else None,
+            force_download=force,
+            allow_patterns=["config.json"],
+        )
+        refuse_format_checkpoint(snapshot, "external drafter")
+        path = get_model_path(path, revision=snapshot.name, force_download=force)
+        supplied.arguments[source] = path
+    refuse_format_checkpoint(path, "external drafter")
+    return own(*supplied.args, **supplied.kwargs)
+
+
+def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> None:
     """Wrap the function ``module.name``. The library's own is wrapped in
     place: the function object takes ``_through``'s code, so that a name it
     was imported under before the patch (``from mlx_lm.utils import
@@ -1157,12 +1340,36 @@ def _wrap_loader(module, name: str) -> None:
         update_wrapper(own, load, updated=())
         own.__dict__ = dict(load.__dict__)
     signature = inspect.signature(own)
-    first = next(iter(signature.parameters))
+    parameter = next(iter(signature.parameters.values()))
     checked = (module.__name__, name) in _CHECKED_LOADERS
+    sharded = (module.__name__, name) in _SHARDED_LOADERS
+    variadic = parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+    first = ("repo" if sharded else "model_path") if variadic else parameter.name
+    if (module.__name__, name) == ("mlx_vlm.speculative.drafters", "load_drafter"):
+        drafter_source = "path_or_repo"
+    if drafter_source is not None and drafter_source not in signature.parameters:
+        raise LoadHookError(
+            f"{module.__name__}.{name} has no {drafter_source} argument"
+        )
 
     def loader(*args, **kwargs):
+        if drafter_source is not None:
+            return _call_drafter(own, signature, drafter_source, args, kwargs)
         outer = _current()
-        path = args[0] if args else kwargs[first]
+        path = args[0] if args else kwargs.get(first, parameter.default)
+        if path is inspect.Parameter.empty:
+            if variadic:
+                raise TypeError(f"{name}() missing required argument: {first!r}")
+            # Preserve the library's own missing-argument exception.
+            return own(*args, **kwargs)
+        if sharded:
+            with sharded_loading(path, name) as repo:
+                if repo is not path:
+                    if args:
+                        args = (repo, *args[1:])
+                    else:
+                        kwargs[first] = repo
+                return own(*args, **kwargs)
         if not checked:
             role = f"{module.__name__}.{name}"
             refuse_format_checkpoint(path, role)
@@ -1176,10 +1383,34 @@ def _wrap_loader(module, name: str) -> None:
             return own(*args, **kwargs)
         with loading(path, by_loader=True) as checkpoint:
             if module.__name__ == "mlx_lm.utils":
-                supplied = signature.bind_partial(*args, **kwargs).arguments
+                bound = signature.bind_partial(*args, **kwargs)
+                supplied = bound.arguments
                 override = supplied.get("model_config", kwargs.get("model_config"))
-                if override:
-                    checkpoint.apply_model_config(override)
+                if override is not None:
+                    # dict.update also accepts one-shot iterables of pairs. Give
+                    # the underlying loader the same values we inspect.
+                    if not isinstance(override, dict):
+                        override = dict(override)
+                        if "model_config" in supplied:
+                            supplied["model_config"] = override
+                            args, kwargs = bound.args, bound.kwargs
+                        else:
+                            kwargs["model_config"] = override
+                    if override:
+                        checkpoint.apply_model_config(override)
+                resolver = supplied.get(
+                    "get_model_classes", kwargs.get("get_model_classes", _ABSENT)
+                )
+                if resolver is not _ABSENT and resolver is not getattr(
+                    module, "_get_classes", _ABSENT
+                ):
+                    mode = checkpoint._marked_mode()
+                    if mode is not None:
+                        raise _refused(
+                            "get_model_classes selects a custom model implementation",
+                            mode,
+                            checkpoint,
+                        )
             loaded = own(*args, **kwargs)
         if checkpoint is not outer:
             # A load joined to an outer one of the checkpoint is checked by
@@ -1206,8 +1437,48 @@ def _wrap_loader(module, name: str) -> None:
 
 # The modules whose functions or classes this patch wraps, by name; each is
 # wrapped once, when this patch first finds it imported.
-_PENDING = {name for name, _ in _LOADERS} | set(_SWITCH_MODULES)
+_WRAPPED_MODULES = (
+    {name for name, _ in _LOADERS} | set(_SWITCH_MODULES) | set(_SPLITTERS)
+)
+_PENDING = set(_WRAPPED_MODULES)
 _LOCK = threading.RLock()
+
+
+def guarded_sharded_loader(module):
+    """Guard existing imports before the local fallback replaces sharded_load."""
+    with _LOCK:
+        _wrap_loader(module, "sharded_load")
+        return module.sharded_load
+
+
+def _wrap_vlm_pruning(module) -> None:
+    drop = getattr(module, "_drop_modules_without_weights", None)
+    if drop is None or getattr(drop, "_omlx_format_pruning", False):
+        return
+
+    @wraps(drop)
+    def prune(model, *args, **kwargs):
+        checkpoint = _current()
+        if checkpoint is None or not checkpoint.built:
+            return drop(model, *args, **kwargs)
+        optional = {
+            name: child
+            for name, child in model.items()
+            if name in _OPTIONAL_PARTS and isinstance(child, nn.Module)
+        }
+        result = drop(model, *args, **kwargs)
+        for name, child in optional.items():
+            if getattr(model, name, None) is None:
+                # Only modules from the branch the library actually discarded.
+                members = {id(layer) for _, layer in child.named_modules()}
+                branch = {
+                    id(layer) for layer in checkpoint.built if id(layer) in members
+                }
+                checkpoint._pruned.append((weakref.ref(model), name, branch))
+        return result
+
+    prune._omlx_format_pruning = True
+    module._drop_modules_without_weights = prune
 
 
 def _wrap(module) -> None:
@@ -1220,6 +1491,16 @@ def _wrap(module) -> None:
                     _wrap_loader(module, name)
             if module.__name__ in _SWITCH_MODULES:
                 _patch(module.SwitchLinear, FormatSwitchLinear)
+            if module.__name__ == "mlx_vlm.utils":
+                _wrap_vlm_pruning(module)
+            if module.__name__ in _SPLITTERS:
+                cls, methods = _SPLITTERS[module.__name__]
+                for method in methods:
+                    _wrap_loader(
+                        getattr(module, cls),
+                        method,
+                        drafter_source="source" if method == "split" else "source_path",
+                    )
         except AttributeError:
             # Not defined yet: its import is still running, and the end of
             # it wraps the module (or the next application of the patch).
@@ -1248,6 +1529,10 @@ class _OnImport(importlib.abc.MetaPathFinder):
     """Has the modules this patch wraps wrapped when they are imported."""
 
     def find_spec(self, name, path, target=None):
+        if target is not None and name in _WRAPPED_MODULES:
+            # reload redefines the original functions on the same module.
+            with _LOCK:
+                _PENDING.add(name)
         if name not in _PENDING:
             return None
         for finder in sys.meta_path:

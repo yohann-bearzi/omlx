@@ -855,7 +855,12 @@ class BatchedEngine(BaseEngine):
                 except (FormatRefusedError, LoadHookError):
                     # A draft of a quant format refused: said, not ignored,
                     # and the engine started for it stopped.
-                    await self.stop()
+                    try:
+                        await self.stop()
+                    except Exception:
+                        logger.warning(
+                            "Error stopping engine after drafter refusal", exc_info=True
+                        )
                     raise
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")

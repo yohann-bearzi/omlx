@@ -88,6 +88,33 @@ async def test_direct_engine_start_refuses_before_audio_or_external_loading(
     assert error.value.path == checkpoint and error.value.mode == "toy"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("module", "engine_type"),
+    [(stt, stt.STTEngine), (sts, sts.STSEngine), (tts, tts.TTSEngine)],
+)
+async def test_audio_hub_readers_check_the_resolved_config_before_weights(
+    checkpoint, monkeypatch, module, engine_type
+):
+    import mlx_audio.utils
+
+    repo = "test-org/deepfilternet"
+    downloads = []
+
+    def snapshot(repo_id, *, allow_patterns=None, **kwargs):
+        assert repo_id == repo
+        assert set(allow_patterns or ()) == {"config.json"}
+        downloads.append(repo_id)
+        return str(checkpoint)
+
+    monkeypatch.setattr(mlx_audio.utils, "snapshot_download", snapshot)
+    monkeypatch.setattr(module, "get_mlx_executor", entered)
+    with pytest.raises(formats.FormatRefusedError) as error:
+        await engine_type(repo).start()
+    assert downloads == [repo]
+    assert error.value.path == checkpoint and error.value.mode == "toy"
+
+
 @pytest.mark.parametrize(
     "reader", [deepseek_v41.load, omnimodal.load, qwen38_modelopt_mixed.load]
 )
@@ -167,3 +194,27 @@ def test_expert_offload_refuses_before_opening_its_weight_store(
         False,
         moe_offload_compat.IN_QUANT_FORMAT,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("engine_type", [stt.STTEngine, tts.TTSEngine, sts.STSEngine])
+async def test_audio_hub_readers_name_the_missing_audio_extra(monkeypatch, engine_type):
+    for name in tuple(sys.modules):
+        if name.startswith("mlx_audio."):
+            monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, "mlx_audio", None)
+    message = r"Install it with: pip install .*omlx\[audio\]"
+    with pytest.raises(ImportError, match=message):
+        await engine_type("test-org/deepfilternet").start()
+
+
+def test_relative_audio_directory_is_checked_locally(checkpoint, monkeypatch):
+    import mlx_audio.utils
+
+    from omlx.patches.format_load import checked_audio_path
+
+    monkeypatch.chdir(checkpoint.parent)
+    monkeypatch.setattr(mlx_audio.utils, "get_model_path", entered)
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        checked_audio_path(checkpoint.name, "audio_stt")
+    assert (refused.value.path, refused.value.mode) == (checkpoint, "toy")

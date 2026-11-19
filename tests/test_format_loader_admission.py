@@ -230,11 +230,16 @@ def test_checked_lm_loader_uses_the_effective_family_before_weight_io(
     assert error.value.mode == "toy" and "qwen2" in error.value.reason
 
 
-def test_checked_lm_loader_accounts_for_a_format_declared_by_override(tmp_path):
+@pytest.mark.parametrize("form", ["mapping", "pairs", "iterator"])
+@pytest.mark.parametrize("deepseek_wrapper", [False, True], ids=["checked", "deepseek"])
+def test_checked_lm_loader_accounts_for_a_format_declared_by_override(
+    tmp_path, form, deepseek_wrapper
+):
     import mlx_lm.utils
     from mlx.utils import tree_flatten
     from mlx_lm.models import llama
 
+    from omlx.patches.deepseek_v4.utils_patch import _build_patched_load_model
     from omlx.patches.format_load import apply_format_load_patch
 
     config = dict(
@@ -252,9 +257,26 @@ def test_checked_lm_loader_accounts_for_a_format_declared_by_override(tmp_path):
         str(tmp_path / "model.safetensors"), dict(tree_flatten(model.parameters()))
     )
     apply_format_load_patch()
+    read_model = (
+        _build_patched_load_model() if deepseek_wrapper else mlx_lm.utils.load_model
+    )
+
+    def override(fields):
+        if form == "pairs":
+            return list(fields.items())
+        if form == "iterator":
+            return iter(fields.items())
+        return fields
+
+    _, effective = read_model(
+        tmp_path, lazy=True, model_config=override({"probe": "from override"})
+    )
+    assert effective["probe"] == "from override"
     with testing.verified("llama"), pytest.raises(formats.FormatRefusedError) as error:
-        mlx_lm.utils.load_model(
-            tmp_path, lazy=True, model_config={"omlx_quant_formats": {"orphan": {}}}
+        read_model(
+            tmp_path,
+            lazy=True,
+            model_config=override({"omlx_quant_formats": {"orphan": {}}}),
         )
     assert error.value.mode == "orphan" and "no layer" in error.value.reason
 

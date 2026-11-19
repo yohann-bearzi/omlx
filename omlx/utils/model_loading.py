@@ -511,14 +511,13 @@ def _checkpoint_has_t5_weights(model_path: str | Path) -> bool:
     return False
 
 
-def _config_model_type(model_path: str | Path) -> str | None:
-    """The checkpoint's declared ``model_type``, or None when unreadable."""
+def _offload_config(model_path: str | Path) -> dict:
+    """The checkpoint metadata used to validate expert-offload settings."""
     try:
         config = json.loads((Path(model_path) / "config.json").read_text())
     except (OSError, ValueError):
-        return None
-    value = config.get("model_type") if isinstance(config, dict) else None
-    return value if isinstance(value, str) else None
+        return {}
+    return config if isinstance(config, dict) else {}
 
 
 def maybe_apply_pre_load_patches(
@@ -570,26 +569,33 @@ def maybe_apply_pre_load_patches(
     """
     from ..model_settings import validate_moe_expert_offload
 
+    offload = getattr(model_settings, "moe_expert_offload_enabled", False)
     if model_settings is not None:
+        config = _offload_config(model_name)
+        if offload:
+            from ..patches.moe_offload_compat import in_quant_format
+
+            offload = not in_quant_format(config)
+        model_type = config.get("model_type")
         validate_moe_expert_offload(
             {
+                "moe_expert_offload_enabled": offload,
                 "moe_expert_offload_resident_fraction": getattr(
                     model_settings, "moe_expert_offload_resident_fraction", 0.25
                 ),
                 **{
                     key: getattr(model_settings, key, False)
                     for key in (
-                        "moe_expert_offload_enabled",
                         "mtp_enabled",
                         "vlm_mtp_enabled",
                         "dflash_enabled",
                     )
                 },
             },
-            model_type=_config_model_type(model_name),
+            model_type=model_type if isinstance(model_type, str) else None,
         )
 
-    if getattr(model_settings, "moe_expert_offload_enabled", False):
+    if offload:
         from ..patches.moe_offload_compat import (
             IN_QUANT_FORMAT,
             moe_offload_compatibility,
@@ -1677,6 +1683,16 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
 def apply_activation_fp16(model: Any, model_settings: Any = None) -> None:
     """Run the float16 recast when the model settings enable it."""
     if not getattr(model_settings, "activation_fp16_enabled", False):
+        return
+    import mlx.nn as nn
+
+    from ..formats.linear import FormatLinear, FormatSwitchLinear
+
+    if isinstance(model, nn.Module) and any(
+        isinstance(module, (FormatLinear, FormatSwitchLinear))
+        for _, module in model.named_modules()
+    ):
+        logger.warning("Skipping activation_fp16 because the model has format layers")
         return
     try:
         recast = cast_bf16_params_to_fp16(model)

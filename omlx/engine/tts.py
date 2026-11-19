@@ -19,7 +19,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..patches.format_load import refuse_format_checkpoint
+from ..patches.format_load import checked_audio_path
 from ..patches.mlx_audio_compat import ensure_ming_post_load_skips_campplus_conversion
 from ..patches.mlx_audio_ming3 import (
     apply_ming3_patches,
@@ -212,10 +212,11 @@ class TTSEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
-        refuse_format_checkpoint(self._model_name, "audio_tts")
         logger.info(f"Starting TTS engine: {self._model_name}")
-
         try:
+            model_name = await asyncio.to_thread(
+                checked_audio_path, self._model_name, "audio_tts"
+            )
             from mlx_audio.tts.utils import load_model as _load_model
         except ImportError as exc:
             raise ImportError(
@@ -225,8 +226,6 @@ class TTSEngine(BaseNonStreamingEngine):
 
         ensure_ming_post_load_skips_campplus_conversion()
         apply_ming3_patches()
-
-        model_name = self._model_name
 
         def _load_sync():
             try:

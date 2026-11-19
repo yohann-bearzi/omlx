@@ -13,7 +13,6 @@ from typing import Any
 from .tensor_strategies import (
     _refuse_format_layers,
     apply_tensor_strategy,
-    format_layer,
     supports_model_type,
 )
 
@@ -115,9 +114,13 @@ def progressive_sharded_load(
             "*.jinja",
         ],
     )
+    from ..patches.format_load import refuse_format_checkpoint
     from ..utils.model_loading import ensure_model_code_trusted
 
     metadata_config = utils_module.load_config(model_path)
+    refuse_format_checkpoint(
+        model_path, "progressive sharded_load", config=metadata_config
+    )
     ensure_model_code_trusted(
         metadata_config,
         model_path=model_path,
@@ -136,9 +139,6 @@ def progressive_sharded_load(
     own_format = sys.modules.get(f"mlx_lm.models.{metadata_config.get('model_type')}")
     stage_loader = getattr(own_format, "load_pipeline_stage", None)
     if stage_loader is not None:
-        from ..patches.format_load import refuse_format_checkpoint
-
-        refuse_format_checkpoint(model_path, "custom shard", config=metadata_config)
         if tensor_group is not None:
             tensor_loader = getattr(own_format, "load_tensor_shard", None)
             if tensor_loader is None:
@@ -172,6 +172,7 @@ def progressive_sharded_load(
         trust_remote_code=trust_remote_code,
         **load_kwargs,
     )
+    _refuse_format_layers(model, operation="progressive loading")
     has_pipeline = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_native_tensor = callable(getattr(model, "shard", None))
     model_type = str(
@@ -181,18 +182,12 @@ def progressive_sharded_load(
             getattr(getattr(model, "args", None), "model_type", ""),
         )
     )
-    # A quant format's layers are split by no strategy: such a model
-    # pipelines, and a tensor group is refused before anything is staged.
-    has_tensor = (
-        supports_model_type(model_type, native_shard=has_native_tensor)
-        and format_layer(model) is None
-    )
+    has_tensor = supports_model_type(model_type, native_shard=has_native_tensor)
     if pipeline_group is not None and not has_pipeline:
         raise ValueError(
             "The model does not support pipelining but a pipeline_group was provided"
         )
     if tensor_group is not None and not has_tensor:
-        _refuse_format_layers(model)
         raise ValueError(
             "The model does not support tensor parallelism but a tensor_group "
             "was provided"
@@ -234,6 +229,7 @@ def progressive_sharded_load(
     )
     from ..patches.format_load import check_loaded
 
+    _refuse_format_layers(model, operation="progressive loading")
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
         # What this rank holds of the model, filled.

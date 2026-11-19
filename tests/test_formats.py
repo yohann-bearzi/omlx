@@ -396,6 +396,29 @@ def test_an_interrupt_inside_a_plugins_load_is_not_a_failed_plugin(plugins, capl
     assert plugins[0].loaded == 2
 
 
+def test_retrying_discovery_keeps_only_the_completed_attempt(plugins):
+    def incomplete():
+        formats.register(_Format("partial"))
+        raise ImportError("the plugin did not finish")
+
+    def interrupt():
+        raise KeyboardInterrupt
+
+    first = _Entry("first", _Format("first"))
+    partial = _Entry("partial", incomplete)
+    last = _Entry("stop", interrupt)
+    plugins.extend([first, partial, last])
+    with pytest.raises(KeyboardInterrupt):
+        formats.load()
+
+    first.loads = _Format("first")
+    partial.loads = _Format("ready")
+    last.loads = _Format("last")
+    assert formats.get("first") is first.loads
+    assert formats.get("ready") is partial.loads and formats.get("last") is last.loads
+    assert formats.get("partial") is None and "partial" not in formats._SKIPPED
+
+
 def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
     good = _Format("good")
 
@@ -410,6 +433,25 @@ def test_a_plugin_that_fails_takes_what_it_registered_with_it(plugins, caplog):
     assert [r.getMessage() for r in caplog.records] == [
         "quant format plugin toy (toy:FORMAT) failed to load"
     ]
+
+
+@pytest.mark.parametrize("failure", [None, ValueError, KeyboardInterrupt])
+def test_plugin_discovery_releases_its_registration_log(plugins, monkeypatch, failure):
+    local = threading.local()
+    monkeypatch.setattr(formats, "_PLUGIN_MODES", local)
+
+    def plugin():
+        if failure:
+            raise failure
+        return _Format("first")
+
+    plugins.append(_Entry("first", plugin))
+    if failure is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            formats.load()
+    else:
+        formats.load()
+    assert getattr(local, "modes", None) is None
 
 
 def test_what_a_checkpoint_of_a_plugin_that_did_not_load_is_told(plugins, caplog):
@@ -487,8 +529,28 @@ def test_only_the_thread_that_loads_the_builtins_takes_an_mlx_mode(plugins):
 def test_what_is_one_of_mlx_s_modes():
     for mode in ("affine", "mxfp4", "mxfp8", "nvfp4"):
         assert formats._mlx_runs(mode)
-    for mode in ("oqel", "", None, 4):
+    for mode in ("oqel", "", None, 4, ["bad"], {"mode": "bad"}):
         assert not formats._mlx_runs(mode)
+
+
+def test_a_mode_is_probed_on_the_cpu_only_once(monkeypatch, tmp_path):
+    mode = f"test-format-{tmp_path}"
+    calls = []
+    quantize, zeros = mx.quantize, mx.zeros
+
+    def allocate(*args, **kwargs):
+        calls.append(("zeros", kwargs["stream"]))
+        return zeros(*args, **kwargs)
+
+    def counted(*args, **kwargs):
+        calls.append((kwargs["mode"], kwargs["stream"]))
+        return quantize(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "zeros", allocate)
+    monkeypatch.setattr(mx, "quantize", counted)
+    for _ in range(2):
+        assert not formats._mlx_runs(mode)
+    assert calls == [("zeros", mx.cpu), (mode, mx.cpu)]
 
 
 @pytest.mark.parametrize("mode", ["affine", "mxfp4", "mxfp8", "nvfp4"])
@@ -627,6 +689,13 @@ def test_dot_asks_the_format_of_the_layers_mode(plugins, caplog):
         assert formats.dot(_layer("other"), 64, 8) is None
         assert formats.dot(nn.Module(), 64, 8) is None  # not quantized
     assert not caplog.records
+
+
+@pytest.mark.parametrize("face", [formats.dot, formats.tile], ids=["dot", "tile"])
+def test_a_foreign_modules_fmt_attribute_is_not_a_quant_format(plugins, face):
+    layer = nn.Module()
+    layer.fmt = "channels_last"
+    assert face(layer, 64, 8) is None
 
 
 class _NoFace(_Format):

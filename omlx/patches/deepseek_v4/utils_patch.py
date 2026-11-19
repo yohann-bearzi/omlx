@@ -143,6 +143,8 @@ def _build_patched_load_model() -> Callable:
         trust_remote_code: bool = False,
     ) -> tuple[nn.Module, dict]:
         disk_config = _utils.load_config(model_path)
+        if model_config is not None and not isinstance(model_config, dict):
+            model_config = dict(model_config)
         config = disk_config if model_config is None else disk_config | model_config
 
         if (

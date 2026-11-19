@@ -30,7 +30,11 @@ from mlx_vlm.utils import get_model_path
 
 from ...model_settings import MAX_LIGHTNING_MTP_DRAFT_TOKENS
 from ...patches import qwen35_packed_linear
-from ...patches.format_load import apply_format_load_patch, check_loaded
+from ...patches.format_load import (
+    apply_format_load_patch,
+    check_loaded,
+    refuse_format_checkpoint,
+)
 from .drafter import DFlashDrafter
 from .variants import apply_partial_rope, load_mask_embedding
 
@@ -177,7 +181,7 @@ def load_dflash_drafter(
     embeddings and lm_head the drafter borrows. ``window_size`` overrides the
     checkpoint's context window.
     """
-    # A drafter's layers of a quant format load as the format's layers.
+    refuse_format_checkpoint(path, "external DFlash drafter")
     apply_format_load_patch()
     adaptive = resolve_verify_mode(verify_mode)
     model, kind = load_drafter(path, kind="dflash")

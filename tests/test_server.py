@@ -928,23 +928,35 @@ class TestModelFallback:
         assert exc_info.value.status_code == 404
 
     @pytest.mark.asyncio
-    async def test_model_unavailable_returns_409(self):
+    @pytest.mark.parametrize("route", ["inference", "explicit"])
+    @pytest.mark.parametrize("failure", ["cached", "format", "hook"])
+    async def test_model_unavailable_returns_409(self, route, failure):
         """Cached model load failures return 409 instead of an unhandled 500."""
+        from omlx.formats import FormatRefusedError, LoadHookError
+
         self._state.global_settings = GlobalSettings()
         self._state.global_settings.model.model_fallback = False
         self._state.default_model = "default-model"
 
         pool = MagicMock()
         pool.resolve_model_id.side_effect = lambda mid, _sm: mid
-        pool.get_engine = AsyncMock(
-            side_effect=ModelUnavailableError("broken-model", "cached failure")
-        )
+        error = {
+            "cached": ModelUnavailableError("broken-model", "cached failure"),
+            "format": FormatRefusedError("checkpoint refused", mode="toy"),
+            "hook": LoadHookError("loader is incompatible"),
+        }[failure]
+        pool.get_entry.return_value.engine = None
+        pool.get_engine = AsyncMock(side_effect=error)
         self._state.engine_pool = pool
 
         with pytest.raises(HTTPException) as exc_info:
-            await get_engine("broken-model", EngineType.LLM)
+            if route == "inference":
+                await get_engine("broken-model", EngineType.LLM)
+            else:
+                await srv.load_model_public("broken-model")
 
         assert exc_info.value.status_code == 409
+        assert str(error) in exc_info.value.detail
 
 
 class TestGetEngineLLMTypeValidation:

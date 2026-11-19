@@ -21,7 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..patches.format_load import refuse_format_checkpoint
+from ..patches.format_load import checked_audio_path
 from ..patches.mlx_audio_compat import ensure_qwen3_asr_audio_quantization
 from .base import BaseNonStreamingEngine
 
@@ -642,18 +642,17 @@ class STTEngine(BaseNonStreamingEngine):
         if self._model is not None:
             return
 
-        refuse_format_checkpoint(self._model_name, "audio_stt")
         logger.info(f"Starting STT engine: {self._model_name}")
-
         try:
+            model_name = await asyncio.to_thread(
+                checked_audio_path, self._model_name, "audio_stt"
+            )
             from mlx_audio.stt.utils import load_model as _load_model
         except ImportError as exc:
             raise ImportError(
                 "mlx-audio is required for STT inference. "
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
-
-        model_name = self._model_name
 
         def _load_sync():
             ensure_qwen3_asr_audio_quantization()

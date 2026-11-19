@@ -637,6 +637,8 @@ class _FormatLayer(nn.Module):
         placeholders: bool = False,
         _load_layout: dict | None = None,
     ) -> None:
+        if not isinstance(fmt, (str, formats.QuantFormat)):
+            raise TypeError("a format layer needs a mode name or a QuantFormat")
         formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
         if isinstance(fmt, str):
             # A layer built by hand, of a registered mode: its format.

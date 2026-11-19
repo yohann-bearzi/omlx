@@ -100,18 +100,25 @@ def test_auto_proxy_sensitivity_returns_the_checkpoint_refusal_unchanged(
 
 
 @pytest.mark.parametrize("engine_type", [BatchedEngine, VLMBatchedEngine])
-def test_refused_specprefill_draft_releases_the_started_engine(tmp_path, engine_type):
+@pytest.mark.parametrize("stop_fails", [False, True])
+def test_refused_specprefill_draft_releases_the_started_engine(
+    tmp_path, engine_type, stop_fails
+):
     # Engine startup installs attention and MLP patches for the process lifetime.
     with multiprocessing.get_context("spawn").Pool(1) as worker:
-        worker.apply_async(_run_refused_draft, (tmp_path, engine_type)).get(timeout=90)
+        worker.apply_async(_run_refused_draft, (tmp_path, engine_type, stop_fails)).get(
+            timeout=90
+        )
 
 
-def _run_refused_draft(tmp_path, engine_type):
+def _run_refused_draft(tmp_path, engine_type, stop_fails):
     with pytest.MonkeyPatch.context() as monkeypatch:
-        asyncio.run(_check_refused_draft(tmp_path, monkeypatch, engine_type))
+        asyncio.run(
+            _check_refused_draft(tmp_path, monkeypatch, engine_type, stop_fails)
+        )
 
 
-async def _check_refused_draft(tmp_path, monkeypatch, engine_type):
+async def _check_refused_draft(tmp_path, monkeypatch, engine_type, stop_fails):
     path = tmp_path / "target"
     path.mkdir()
     config = {
@@ -162,10 +169,21 @@ async def _check_refused_draft(tmp_path, monkeypatch, engine_type):
             specprefill_enabled=True, specprefill_draft_model=str(draft)
         ),
     )
+    stop = engine.stop
+    calls = []
+
+    async def stop_after_refusal():
+        calls.append(True)
+        await stop()
+        if stop_fails:
+            raise RuntimeError("teardown failed")
+
+    monkeypatch.setattr(engine, "stop", stop_after_refusal)
     try:
         with pytest.raises(formats.FormatRefusedError) as err:
             await engine.start()
         assert err.value is want
+        assert calls == [True]
         assert engine._engine is None
     finally:
-        await engine.stop()
+        await stop()

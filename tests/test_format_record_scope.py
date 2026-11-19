@@ -2,6 +2,7 @@
 """Stock checkpoints retain their loader. Plugin declarations must be accounted for."""
 
 import json
+from pathlib import Path
 from unittest.mock import Mock
 
 import mlx.core as mx
@@ -70,6 +71,39 @@ def test_deep_declarations_refuse_unchecked_and_unverified_readers(
         check.check(nn.Module())
 
 
+@pytest.mark.parametrize("marked", [False, True])
+def test_vendor_mode_metadata_preserves_stock_admission(tmp_path, marked):
+    vendor = {"quant_method": "paroquant", "settings": {"mode": "int4"}}
+    if marked:
+        vendor["settings"]["omlx_quant_formats"] = {"toy": {}}
+    _write(tmp_path, {"model_type": "llama", "quantization_config": vendor})
+    if marked:
+        with pytest.raises(formats.FormatRefusedError) as caught:
+            format_load.check_engine_loader(tmp_path, "embedding")
+        assert caught.value.mode == "toy"
+    else:
+        format_load.check_engine_loader(tmp_path, "embedding")
+
+
+def test_an_index_in_a_quantization_list_is_not_a_layer_name(tmp_path):
+    _write(tmp_path, {"model_type": "llama", "quantization": [{"mode": "toy"}]})
+    with testing.verified("llama"), pytest.raises(formats.FormatRefusedError) as caught:
+        format_load.check_engine_loader(tmp_path, "batched")
+    assert "quantization.0.mode" in caught.value.reason
+
+
+@pytest.mark.parametrize("nested_first", [False, True])
+def test_misplaced_empty_record_keeps_a_known_writer_mode(tmp_path, nested_first):
+    record = {"omlx_quant_formats": {"toy": {}}}
+    bad = {"vision_config": {"omlx_quant_formats": None}}
+    fields = bad | record if nested_first else record | bad
+    _write(tmp_path, {"model_type": "llama", **fields})
+    with pytest.raises(formats.FormatRefusedError) as caught:
+        format_load.check_engine_loader(tmp_path, "batched")
+    assert caught.value.mode == "toy"
+    assert "vision_config.omlx_quant_formats" in caught.value.reason
+
+
 @pytest.mark.parametrize("bits", [0, True])
 def test_marked_quantization_accepts_only_positive_integer_widths(tmp_path, bits):
     _write(
@@ -122,12 +156,22 @@ def test_bundled_draft_readers_refuse_before_loading_weights(
         monkeypatch.setattr(config, "from_target_config", Mock())
     _write(tmp_path, {"model_type": "llama", "omlx_quant_formats": {"toy": {}}})
     (tmp_path / "mtp.safetensors").touch()
+    read_text = Path.read_text
+    reads = []
+
+    def track_config(path, *args, **kwargs):
+        if path == tmp_path / "config.json":
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", track_config)
     monkeypatch.setattr(module, model, Mock())
     monkeypatch.setattr(mx, "load", lambda *a: pytest.fail("opened draft weights"))
     with testing.verified("llama"), pytest.raises(formats.FormatRefusedError) as caught:
         read(tmp_path)
     assert caught.value.mode == "toy" and caught.value.path == tmp_path
     assert "dspark" in caught.value.reason.lower()
+    assert reads == [tmp_path / "config.json"]
 
 
 @pytest.mark.parametrize(
@@ -138,8 +182,13 @@ def test_bundled_draft_readers_refuse_before_loading_weights(
         ("clef", "clef"),
         ("clef", "qwen3_5"),
         ("d1", "lfm3_vl"),
+        ("d1", "LFM3-VL"),
         ("d3", "qwen3_5"),
         ("openjev", "qwen3_5"),
+        ("openjev", "Qwen3-5"),
+        ("embedding", "bert"),
+        ("reranker", "xlm-roberta"),
+        ("reranker", "jina"),
         ("d1", "d1"),
         ("d3", "d3"),
         ("openjev", "openjev"),
@@ -153,7 +202,14 @@ def test_format_writer_refuses_families_served_by_an_unchecked_reader(
     source = tmp_path / "source"
     source.mkdir()
     config = {"model_type": backbone}
-    if family == "clef" and backbone != family:
+    if family in {"embedding", "reranker"}:
+        architectures = {
+            "bert": "BertModel",
+            "jina": "JinaForRanking",
+            "xlm-roberta": "XLMRobertaForSequenceClassification",
+        }
+        config["architectures"] = [architectures[backbone]]
+    elif family == "clef" and backbone != family:
         (source / "joint_head.safetensors").touch()
         (source / "joint_head_config.json").write_text("{}")
     elif family == "d1" and backbone != family:

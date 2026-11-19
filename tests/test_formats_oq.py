@@ -36,7 +36,7 @@ from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches.format_load import loads_in_format
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 from tests.test_formats_kernels import _BLOCKS, _PAGE
-from tests.test_formats_linear import _ToyFormat
+from tests.test_formats_linear import _FormatLog, _ToyFormat
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -63,13 +63,6 @@ def verified():
         yield
 
 
-class _Log(SimpleNamespace):
-    """One log for a format and every copy of it a load accepts with."""
-
-    def __deepcopy__(self, memo):
-        return self
-
-
 class _Codec(_ToyFormat):
     """The toy format with its codec: a byte for each weight and a scale for
     each row, which keep a weight to half a scale. ``answer`` stands in for
@@ -77,14 +70,26 @@ class _Codec(_ToyFormat):
 
     def __init__(self):
         super().__init__()
-        self.offered, self.encoded, self.lays_out = [], [], True
-        self.answer = lambda tensors, w: tensors
-        # What the loads handed it, and the copies they accepted with.
-        self.log = _Log(accepted=[])
+        self.offered, self.lays_out = [], True
+        self.log = _FormatLog(
+            SimpleNamespace(accepted=[], encoded=[], answer=lambda tensors, w: tensors)
+        )
+
+    @property
+    def encoded(self):
+        return self.log.calls.encoded
+
+    @property
+    def answer(self):
+        return self.log.calls.answer
+
+    @answer.setter
+    def answer(self, callback):
+        self.log.calls.answer = callback
 
     @property
     def accepted(self):
-        return self.log.accepted
+        return self.log.calls.accepted
 
     def layout(self, k, n, bits, group_size):
         self.offered.append((k, n, bits, group_size))
@@ -1556,6 +1561,25 @@ def test_a_family_not_verified_is_refused(toy, tmp_path, family, config, why):
     assert not output.exists() and toy.offered == []
 
 
+def test_a_verified_type_with_an_alternate_model_file_cannot_be_written_in_a_format(
+    toy, tmp_path
+):
+    source = _checkpoint(
+        tmp_path / "source", {"model_type": "llama", "model_file": "alternate.py"}
+    )
+    output = tmp_path / "alternate-output"
+    with pytest.raises(formats.FormatRefusedError, match="model_file"):
+        oq.quantize_oq_streaming(
+            str(source),
+            str(output),
+            4,
+            enhanced=True,
+            quant_format="toy",
+            trust_remote_code=True,
+        )
+    assert not output.exists()
+
+
 def test_no_family_is_verified_but_by_a_test(tmp_path, monkeypatch):
     # Outside every block (this file's tests take llama as verified).
     monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
@@ -1768,7 +1792,7 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     source, toy, tmp_path, monkeypatch
 ):
     record = {"layout": 2, "levels": [-1.5, 0.25, 3], "name": "lloyd"}
-    monkeypatch.setattr(toy, "record", lambda: dict(record))
+    monkeypatch.setattr(type(toy), "record", lambda self: dict(record))
     output = tmp_path / "oqe-toy"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": record}}
@@ -1781,7 +1805,8 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     layers = [m for _, m in model.named_modules() if isinstance(m, FormatLinear)]
     # Read with the load's copy of the format, one for all of them.
     (read,) = {id(layer.fmt): layer.fmt for layer in layers}.values()
-    assert read is not toy and type(read) is _Codec and read.log is toy.log
+    assert read is not toy and type(read) is _Codec
+    assert read.log is not toy.log and read.accepted is toy.accepted
 
 
 def test_the_record_names_the_contract_the_format_states(
@@ -2589,9 +2614,9 @@ def test_a_matrix_of_no_module_of_its_path_stays_affine_and_is_named(
         if record.levelno == logging.WARNING
     ]
     said = (
-        "oQ4: 1 matrices stay oQ's affine: a quant format's layer is not built for "
-        "their class (no module holds them)\npaths that no module of the model it "
-        f"loads as holds at their shape: {lost}"
+        "oQ4: 1 matrix stays oQ's affine: a quant format's layer is not built for "
+        "its class (no module holds it)\npath that no module of the model it "
+        f"loads as holds at its shape: {lost}"
     )
     assert warnings == [said]
     # The page quotes the line that names them.
@@ -2613,9 +2638,12 @@ def test_the_warning_names_twenty_paths_and_counts_the_others():
         head.replace("25", "20").replace(f", {cls}", "") + ", ".join(paths[:20])
     )
     assert oq._left_affine("4", [cls], []) == (
-        "oQ4: 1 matrices stay oQ's affine: a quant format's layer is not built for "
-        f"their class ({cls})"
+        "oQ4: 1 matrix stays oQ's affine: a quant format's layer is not built for "
+        f"its class ({cls})"
     )
+    classes = [f"model.block_{i}.Linear" for i in reversed(range(12))]
+    message = oq._left_affine("4", classes + classes, [])
+    assert message.endswith(f"their class ({', '.join(sorted(classes))})")
 
 
 def test_a_matrix_of_another_shape_than_its_module_s_stays_affine(
@@ -2634,7 +2662,7 @@ def test_a_matrix_of_another_shape_than_its_module_s_stays_affine(
     _, config, applied = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
     assert other in applied and other not in _in_format(config)
     assert sorted(_in_format(config)) == sorted(set(applied) - {other})
-    assert f"at their shape: {other}" in caplog.text
+    assert f"at its shape: {other}" in caplog.text
 
 
 def test_the_walk_builds_the_written_model_from_its_config_alone(
@@ -2751,6 +2779,40 @@ def _stub_loaders(monkeypatch):
     monkeypatch.setattr(mlx_lm.utils, "load_model", loader("mlx-lm"))
     monkeypatch.setattr(vlm_utils, "load_model", loader("mlx-vlm"))
     return calls, model
+
+
+@pytest.mark.parametrize("fail_walk", [False, True], ids=["complete", "interrupted"])
+def test_walk_closes_its_model_on_the_loading_thread_with_the_view_open(
+    tmp_path, monkeypatch, fail_walk
+):
+    config = {"model_type": "llama"}
+    source = _checkpoint(tmp_path / "source", config)
+    closed = []
+    error = RuntimeError("cannot visit the model's modules")
+
+    def load(path, **kwargs):
+        loader_thread = threading.current_thread()
+
+        class Model:
+            def named_modules(self):
+                if fail_walk:
+                    raise error
+                return []
+
+            def close(self):
+                on_loader = threading.current_thread() is loader_thread
+                closed.append((Path(path).is_dir(), on_loader))
+
+        return Model(), config
+
+    monkeypatch.setattr(mlx_lm.utils, "load_model", load)
+    if fail_walk:
+        with pytest.raises(RuntimeError) as raised:
+            oq._module_classes(str(source), config)
+        assert raised.value is error
+    else:
+        assert oq._module_classes(str(source), config) == {}
+    assert closed == [(True, True)]
 
 
 def _checkpoint(path, config, tensors=("model.embed_tokens.weight",)):
@@ -3012,6 +3074,18 @@ def test_the_walk_runs_on_the_engines_load_thread_too(tmp_path, monkeypatch):
     walk = get_mlx_executor().submit(oq._module_classes, str(source), config)
     assert walk.result(timeout=60)["proj"][2] == (16, 64)
     assert calls[0][1].startswith("mlx-global")
+
+
+def test_a_different_mlx_worker_dispatches_to_the_engine_executor():
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.engine_core import get_mlx_executor
+
+    engine = get_mlx_executor()
+    engine_thread = engine.submit(threading.current_thread).result(timeout=10)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="mlx-other") as worker:
+        walk = worker.submit(oq._on_mlx_thread, threading.current_thread)
+        assert walk.result(timeout=10) is engine_thread
 
 
 def test_the_walk_restores_what_a_module_it_imports_holds(tmp_path, monkeypatch):

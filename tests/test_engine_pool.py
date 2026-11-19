@@ -2087,7 +2087,7 @@ class TestEnginePoolAsync:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("family", ["minimax_m3_vl", "inkling2"])
-    @pytest.mark.parametrize("failure", ["format", "hook", "ordinary"])
+    @pytest.mark.parametrize("failure", ["format", "hook", "ordinary", "aborted"])
     async def test_bundled_draft_failure_preserves_the_reader_error(
         self, pool_with_mock_engines, family, failure, monkeypatch
     ):
@@ -2123,7 +2123,14 @@ class TestEnginePoolAsync:
             ),
             "hook": LoadHookError("loader has no hook"),
             "ordinary": ValueError("missing optional draft"),
+            "aborted": FormatRefusedError("aborted load", mode="toy", path=draft),
         }[failure]
+
+        def refuse_draft(*args, **kwargs):
+            if failure == "aborted":
+                entry.abort_loading = True
+            raise error
+
         engine = MagicMock()
         engine.start = AsyncMock()
         engine.stop = AsyncMock()
@@ -2132,7 +2139,7 @@ class TestEnginePoolAsync:
             patch("omlx.engine_pool.BatchedEngine", return_value=engine),
             patch.object(pool, "_schedule_failed_load_reclaim") as reclaim,
             patch(
-                f"omlx.engine_pool.load_{read}_dspark_drafter", side_effect=error
+                f"omlx.engine_pool.load_{read}_dspark_drafter", side_effect=refuse_draft
             ) as loader,
         ):
             if failure == "ordinary":
@@ -2142,6 +2149,13 @@ class TestEnginePoolAsync:
                 )
                 engine.stop.assert_not_awaited()
                 reclaim.assert_not_called()
+            elif failure == "aborted":
+                with pytest.raises(type(error)) as aborted:
+                    await pool.get_engine("model-a", runtime_settings=settings)
+                assert aborted.value is error
+                assert not entry.load_failed and entry.load_refusal is None
+                engine.stop.assert_awaited_once()
+                reclaim.assert_called_once()
             else:
                 with pytest.raises(type(error)) as first:
                     await pool.get_engine("model-a", runtime_settings=settings)
@@ -2175,6 +2189,13 @@ class TestEnginePoolAsync:
         pool = pool_with_mock_engines
         pool.get_entry("model-a").config_model_type = "qwen3"
         pool._scheduler_config.max_num_seqs = 8
+        resident = MagicMock()
+        resident.start = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=resident):
+            assert await pool.get_engine("model-b") is resident
+        charged = pool.current_model_memory
+        observations = pool._load_time_observations
+        assert charged > 0
         if drafter == "dflash":
             settings = ModelSettings(dflash_enabled=True, dflash_draft_model="/draft")
             loader = "omlx.engine_pool.load_dflash_drafter"
@@ -2185,7 +2206,9 @@ class TestEnginePoolAsync:
             loader = "omlx.speculative.vlm_mtp.load_vlm_mtp_drafter"
         engine = MagicMock()
         engine.start = AsyncMock()
-        engine.stop = AsyncMock()
+        engine.stop = AsyncMock(
+            side_effect=RuntimeError("teardown failed") if refusal == "hook" else None
+        )
         error = (
             FormatRefusedError("refused", mode="toy")
             if refusal == "format"
@@ -2195,10 +2218,12 @@ class TestEnginePoolAsync:
             patch("omlx.engine_pool.BatchedEngine", return_value=engine),
             patch(loader, side_effect=error) as load,
         ):
-            for _ in range(2):
-                with pytest.raises(Exception) as raised:
+            for attempt in range(2):
+                with pytest.raises(type(error)) as raised:
                     await pool.get_engine("model-a", runtime_settings=settings)
-                assert raised.value is not engine
+                assert str(raised.value) == str(error)
+                if attempt == 0:
+                    assert raised.value is error
         entry = pool.get_entry("model-a")
         load.assert_called_once()
         engine.stop.assert_awaited_once()
@@ -2207,7 +2232,14 @@ class TestEnginePoolAsync:
         assert entry.engine is None and entry.load_failed
         assert entry.runtime_estimated_size is None
         assert entry.runtime_settle_size is None
-        assert pool.current_model_memory == 0
+        assert pool.current_model_memory == charged
+        assert pool.get_entry("model-b").engine is resident
+        assert pool._load_time_observations == observations
+        # The failed optional drafter does not poison a plain target load.
+        plain = MagicMock()
+        plain.start = AsyncMock()
+        with patch("omlx.engine_pool.BatchedEngine", return_value=plain):
+            assert await pool.get_engine("model-a") is plain
 
     @pytest.mark.asyncio
     async def test_dflash_drafter_failure_reuses_requested_variant_while_leased(

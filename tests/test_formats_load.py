@@ -41,6 +41,7 @@ from tests.test_formats_linear import (
     EXPERTS,
     _equal,
     _experts,
+    _FormatLog,
     _ints,
     _ToyFormat,
     _want,
@@ -52,14 +53,6 @@ _PATCHED = (nn.Linear, lm_switch.SwitchLinear, vlm_switch.SwitchLinear)
 _TOY = {"bits": 8, "group_size": 1, "mode": "toy"}
 
 
-class _Log(SimpleNamespace):
-    """What a format was asked and handed: one log for it and every copy of
-    it a load accepts with."""
-
-    def __deepcopy__(self, memo):
-        return self
-
-
 class _Loadable(_ToyFormat):
     """The toy format, with what its checkpoints keep of a matrix: a byte for
     each weight and a scale for each row. ``reads`` gives the object that
@@ -69,16 +62,23 @@ class _Loadable(_ToyFormat):
     def __init__(self, mode="toy"):
         super().__init__()
         self.mode, self.refusal = mode, None
-        self.log = _Log(asked=[], accepted=[])
-        self.reads = None
+        self.log = _FormatLog(SimpleNamespace(asked=[], accepted=[], reads=None))
+
+    @property
+    def reads(self):
+        return self.log.calls.reads
+
+    @reads.setter
+    def reads(self, callback):
+        self.log.calls.reads = callback
 
     @property
     def asked(self):
-        return self.log.asked
+        return self.log.calls.asked
 
     @property
     def accepted(self):
-        return self.log.accepted
+        return self.log.calls.accepted
 
     def accept(self, record):
         # What it was handed, and whether a layer had been built before.
@@ -121,7 +121,11 @@ def unpatched(monkeypatch):
     # wraps then, as a process starts.
     pending = {name for name, _ in format_load._LOADERS}
     monkeypatch.setattr(
-        format_load, "_PENDING", pending | set(format_load._SWITCH_MODULES)
+        format_load,
+        "_PENDING",
+        pending
+        | set(format_load._SWITCH_MODULES)
+        | set(getattr(format_load, "_SPLITTERS", {})),
     )
     yield
     # A loader the test's patch wrapped in place is the library's own again.
@@ -485,7 +489,7 @@ def test_a_layout_packed_along_n_is_refused_where_the_layer_is_built(
         return None if n % 2 else packed(k, n, bits, group_size)
 
     for layout, n in ((packed, 16), (packed, 1), (even, 18)):
-        monkeypatch.setattr(toy, "layout", layout)
+        monkeypatch.setattr(type(toy), "layout", staticmethod(layout))
         if switch is None:
             dense = nn.Linear(64, n)
         else:
@@ -598,10 +602,14 @@ def test_a_format_s_checkpoint_under_one_of_mlx_s_modes_is_refused(toy, tmp_path
         with format_load.loading(path):
             layer = nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode="mxfp4")
         assert type(layer) is nn.QuantizedLinear
-    # So is a mode that is no string: MLX refuses it in its own words.
-    with pytest.raises(ValueError) as mlx_s:
-        nn.Linear(64, 16).to_quantized(mode=None)
-    assert type(mlx_s.value) is not formats.FormatRefusedError
+    # MLX itself diagnoses a malformed mode on a stock checkpoint.
+    for mode in (None, ["bad"], {"mode": "bad"}):
+        layer = nn.Linear(64, 16)
+        with pytest.raises((ValueError, TypeError)) as original:
+            nn.Linear.to_quantized.__wrapped__(layer, mode=mode)
+        with pytest.raises(type(original.value)) as patched:
+            layer.to_quantized(mode=mode)
+        assert str(patched.value) == str(original.value)
 
 
 @pytest.mark.parametrize(
@@ -717,8 +725,10 @@ def test_a_config_alone_names_the_family(toy, tmp_path):
 
 @pytest.mark.parametrize("family", ["clef", "openjev", "d3", "d1"])
 def test_a_decision_model_s_loader_refuses_it_in_a_format(toy, tmp_path, family):
+    from omlx.models.clef import ClefModel
     from omlx.models.d1 import D1Model
-    from omlx.models.decision import DecisionBackbone
+    from omlx.models.d3 import D3_DECISION_CONFIG, D3_FORMAT_ID, D3Model
+    from omlx.models.openjev import OpenJevModel
 
     path = tmp_path / "decision"
     path.mkdir()
@@ -726,11 +736,17 @@ def test_a_decision_model_s_loader_refuses_it_in_a_format(toy, tmp_path, family)
     (path / "config.json").write_text(json.dumps(config))
     # Weights that no load reads: refused before any is.
     (path / "model.safetensors").write_bytes(b"not a checkpoint")
-    model = (
-        D1Model(str(path))
-        if family == "d1"
-        else DecisionBackbone(str(path), False, family)
-    )
+    if family == "d3":
+        (path / D3_DECISION_CONFIG).write_text(
+            json.dumps({"format_id": D3_FORMAT_ID, "format_version": 1})
+        )
+    model_type = {
+        "clef": ClefModel,
+        "openjev": OpenJevModel,
+        "d3": D3Model,
+        "d1": D1Model,
+    }[family]
+    model = model_type(str(path))
     why = {
         "clef": "it reads rows of its output head by hand, as MLX's quantized "
         "layers or as floats",
@@ -768,6 +784,14 @@ def test_a_decision_model_s_loader_refuses_it_in_a_format(toy, tmp_path, family)
     format_load.refuse_family(tmp_path / "none", family)
 
 
+def test_a_stock_decision_backbone_preserves_its_constructor(tmp_path):
+    from omlx.models.decision import DecisionBackbone
+
+    backbone = DecisionBackbone(str(tmp_path))
+    assert backbone.model_path == str(tmp_path) and not backbone.trust_remote_code
+    assert DecisionBackbone(str(tmp_path), True).trust_remote_code
+
+
 def test_a_damaged_record_of_formats_is_refused_though_no_layer_reads_it(toy, tmp_path):
     for written, said in ((None, "null"), ([], "an array"), ("toy", "a string")):
         config = {"model_type": "raon1_mini", "omlx_quant_formats": written}
@@ -793,14 +817,43 @@ def test_a_damaged_record_of_formats_is_refused_though_no_layer_reads_it(toy, tm
         assert no.value.mode == "unknown"
 
 
-def _hand_built(kind):
+def _hand_built(kind, fmt="toy"):
     """A toy layer of ``kind`` built by hand."""
     stack = (2,) if kind is FormatSwitchLinear else ()
     tensors = {
         "weight": mx.zeros((*stack, 128, 64), mx.uint8),
         "scales": mx.zeros((*stack, 128), mx.float32),
     }
-    return kind("toy", 8, 1, 64, tensors)
+    return kind(fmt, 8, 1, 64, tensors)
+
+
+@pytest.mark.parametrize("kind", [FormatLinear, FormatSwitchLinear])
+@pytest.mark.parametrize(
+    "fmt", [None, SimpleNamespace(mode="toy", tensors=("scales",))]
+)
+def test_a_hand_built_layer_requires_a_mode_or_quant_format(toy, kind, fmt):
+    assert _hand_built(kind, toy).fmt is toy
+    with pytest.raises(TypeError, match="QuantFormat"):
+        _hand_built(kind, fmt)
+
+
+@pytest.mark.parametrize("kind", [FormatLinear, FormatSwitchLinear])
+def test_a_verification_block_does_not_admit_another_threads_unverified_load(
+    toy, tmp_path, kind
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "raon1_mini"}))
+
+    def build_in_load():
+        with format_load.loading(tmp_path) as checkpoint:
+            assert checkpoint.active and not checkpoint.verified
+            return _hand_built(kind)
+
+    with testing.verified("llama"), ThreadPoolExecutor(1) as worker:
+        assert type(_hand_built(kind)) is kind
+        with pytest.raises(formats.FormatRefusedError):
+            worker.submit(build_in_load).result()
 
 
 @pytest.mark.parametrize("kind", [FormatLinear, FormatSwitchLinear])
@@ -1049,6 +1102,104 @@ def test_an_entry_binds_one_layer_and_a_layer_one_entry(toy, tmp_path):
         _checked(tmp_path, {"model.language_model.a": _TOY}, {held: True})
 
 
+def test_a_recorded_affine_layer_without_a_mode_still_binds(toy, tmp_path):
+    config = _typed({"affine": {}})
+    config["quantization"] = {"mode": "mxfp4", "proj": {"bits": 4}}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with (
+        format_load.loading(tmp_path) as checkpoint,
+        pytest.raises(formats.FormatRefusedError) as caught,
+    ):
+        checkpoint.check(nn.Module())
+    assert caught.value.mode == "affine" and "names proj" in caught.value.reason
+
+
+@pytest.mark.parametrize("entries", [("a",), ("a", "b")])
+def test_two_paths_to_one_layer_bind_only_one_declared_entry(toy, tmp_path, entries):
+    config = _typed({"toy": {}})
+    config["quantization"] = {path: _TOY for path in entries}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model = nn.Module()
+    with format_load.loading(tmp_path) as checkpoint:
+        model.a = nn.Linear(64, 128).to_quantized(**_TOY)
+        model.b = model.a
+    if len(entries) == 1:
+        checkpoint.check(model)
+    else:
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            checkpoint.check(model)
+        assert refusal.value.path == tmp_path and refusal.value.mode == "toy"
+
+
+@pytest.mark.parametrize("same_spec", [True, False])
+def test_a_text_config_and_its_outer_config_can_describe_the_same_layer(
+    toy, tmp_path, same_spec
+):
+    outer = {"language_model.model.proj": _TOY}
+    inner = _TOY if same_spec else {**_TOY, "bits": 4}
+    text = {"quantization": {"model.proj": inner}}
+    held = {"language_model.model.proj": True}
+    if same_spec:
+        _checked(tmp_path, outer, held, text_config=text)
+    else:
+        with pytest.raises(formats.FormatRefusedError):
+            _checked(tmp_path, outer, held, text_config=text)
+
+
+@pytest.mark.parametrize(
+    ("tower", "after_drop"),
+    [
+        pytest.param("vision_tower", None, id="vision_tower"),
+        pytest.param("vision_tower", "delete", id="deleted_attribute"),
+        pytest.param("required_block", None, id="required_block"),
+        pytest.param("vision_tower", "extra", id="unrelated_layer"),
+        pytest.param("vision_tower", "before", id="unrelated_layer_before_pruning"),
+        pytest.param("vision_tower", "replace", id="replaced_tower"),
+        pytest.param("vision_tower", "different_model", id="different_model"),
+    ],
+)
+def test_vlm_pruning_after_quantization_exempts_only_an_absent_optional_tower(
+    toy, tmp_path, tower, after_drop
+):
+    from mlx_vlm import utils as vlm_utils
+
+    entry = f"{tower}.proj"
+    config = {
+        **_typed({"toy": {}}),
+        "quantization": {"bits": 4, "group_size": 64, entry: _TOY},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    model = nn.Module()
+    model.language_model = nn.Linear(64, 16, bias=False)
+    branch = nn.Module()
+    branch.proj = nn.Linear(64, 16, bias=False)
+    setattr(model, tower, branch)
+    weights = {"language_model.weight": model.language_model.weight}
+
+    with format_load.loading(tmp_path) as checkpoint:
+        if after_drop == "before":
+            nn.Linear(64, 16, bias=False).to_quantized(**_TOY)
+        loaded = vlm_utils.load_model_weights(
+            model, config, weights, tmp_path, declared_keys=set(weights), lazy=True
+        )
+        assert loaded is model and getattr(model, tower) is None
+        assert isinstance(branch.proj, FormatLinear)
+        if after_drop == "delete":
+            delattr(loaded, tower)
+        elif after_drop == "extra":
+            nn.Linear(64, 16, bias=False).to_quantized(**_TOY)
+        elif after_drop == "replace":
+            loaded.vision_tower = nn.Module()
+            loaded.vision_tower.proj = nn.Linear(64, 16).to_quantized(**_TOY)
+        elif after_drop == "different_model":
+            loaded = nn.Module()
+        if tower == "vision_tower" and after_drop in (None, "delete"):
+            checkpoint.check(loaded)
+        else:
+            with pytest.raises(formats.FormatRefusedError, match="not in its model"):
+                checkpoint.check(loaded)
+
+
 @pytest.mark.parametrize("part", ["mtp", "vision_tower", "visual", "audio_tower"])
 def test_an_entry_of_a_part_the_load_left_out_binds_nothing(toy, tmp_path, part):
     for entry in (f"{part}.layers.0.a", f"language_model.{part}.layers.0.a"):
@@ -1086,19 +1237,34 @@ def test_entries_are_those_the_library_builds_from(toy, tmp_path):
     )
 
 
-def test_a_failure_to_read_the_config_is_raised_bare_each_time(tmp_path):
+@pytest.mark.parametrize("denied", [False, True], ids=["missing", "unreadable"])
+def test_a_failure_to_read_the_config_is_raised_bare_each_time(
+    tmp_path, monkeypatch, denied
+):
     import traceback
 
+    read_text = Path.read_text
+    reads = []
+
+    def read(path, *args, **kwargs):
+        reads.append(path)
+        if denied:
+            raise PermissionError("config is unreadable")
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read)
+    expected = PermissionError if denied else FileNotFoundError
     checkpoint = format_load._Checkpoint(tmp_path)
     depths = []
     for _ in range(3):
-        with pytest.raises(OSError) as error:
+        with pytest.raises(expected) as error:
             checkpoint._read_config()
         depths.append(len(traceback.extract_tb(error.value.__traceback__)))
     assert depths[0] == depths[1] == depths[2]
     # Each raise is a copy: the kept error never gathers a traceback.
-    with pytest.raises(OSError) as again:
+    with pytest.raises(expected) as again:
         checkpoint._read_config()
+    assert reads == [tmp_path / "config.json"]
     assert again.value is not error.value
     assert checkpoint._config.__traceback__ is None
 
@@ -1291,29 +1457,55 @@ def test_what_a_loader_s_callers_read_of_it_is_the_library_s(unpatched, monkeypa
 
 _ALL_EARLY = """
 from mlx_lm.utils import load_model as lm
+from mlx_lm.utils import pipeline_load, sharded_load
+from mlx_lm.server import sharded_load as server_sharded_load
 from mlx_vlm.utils import load_model as vlm
 from mlx_vlm.encoder_loader import load_encoder_model as encoder
 from mlx_embeddings.utils import load_model as embeddings
-import json
+import json, sys, tempfile
+from pathlib import Path
+from omlx.formats import FormatRefusedError
 from omlx.patches import format_load
 
+if sys.argv[1] == "fallback-first":
+    from omlx.patches.mlx_lm_sharded_load import install_local_sharded_load_fallback
+    install_local_sharded_load_fallback()
 format_load.apply_format_load_patch()
 through = format_load._through.__code__
-print(json.dumps([f.__code__ is through for f in (lm, vlm, encoder, embeddings)]))
+aliases = (lm, vlm, encoder, embeddings, pipeline_load, sharded_load,
+           server_sharded_load)
+with tempfile.TemporaryDirectory() as directory:
+    path = Path(directory).resolve()
+    (path / "config.json").write_text(json.dumps({
+        "model_type": "llama", "omlx_quant_formats": {"toy": {}},
+    }))
+    def read_weights(*args, **kwargs):
+        raise AssertionError("a saved sharded loader reached its weight reader")
+    import mlx_lm.utils
+    mlx_lm.utils.load_model = read_weights
+    for load in (sharded_load, server_sharded_load, pipeline_load):
+        try:
+            load(str(path))
+        except FormatRefusedError as error:
+            assert error.path == path and error.mode == "toy"
+        else:
+            raise AssertionError("recorded checkpoint was admitted")
+print(json.dumps([f.__code__ is through for f in aliases]))
 """
 
 
-def test_each_library_loader_imported_before_the_patch_is_wrapped():
+@pytest.mark.parametrize("order", ["normal", "fallback-first"])
+def test_each_library_loader_imported_before_the_patch_is_wrapped(order):
     import subprocess
 
     run = subprocess.run(
-        [sys.executable, "-c", _ALL_EARLY],
+        [sys.executable, "-c", _ALL_EARLY, order],
         capture_output=True,
         text=True,
         cwd=Path(__file__).parent.parent,
     )
     assert run.returncode == 0, run.stderr[-2000:]
-    assert json.loads(run.stdout.splitlines()[-1]) == [True] * 4
+    assert json.loads(run.stdout.splitlines()[-1]) == [True] * 7
 
 
 def test_a_loader_is_wrapped_once_whoever_applies_the_patch(unpatched, monkeypatch):
@@ -1449,6 +1641,38 @@ def _written(record=None, plugin="omlx-toy 0.3.1"):
     return {"toy": entry}
 
 
+def test_one_checkpoint_accepts_each_formats_own_record(toy, tmp_path, monkeypatch):
+    second = _Loadable("other")
+    monkeypatch.setitem(formats._FORMATS, second.mode, second)
+    first_record, second_record = {"revision": 1}, {"revision": 2}
+    written = _written(first_record)
+    written[second.mode] = {"record": second_record, "contract": 1}
+    _, codes, scales = _llama(tmp_path, **written)
+    name = "model.layers.0.mlp.up_proj"
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"][name] = {**_TOY, "mode": second.mode}
+    config_path.write_text(json.dumps(config))
+    weights_path = tmp_path / "model.safetensors"
+    weights = mx.load(str(weights_path))
+    weights[name + ".weight"] = codes
+    weights[name + ".scales"] = scales * 2
+    out = tmp_path / "two-modes.safetensors"
+    mx.save_safetensors(str(out), weights)
+    out.replace(weights_path)
+
+    model, _ = load_model(tmp_path)
+    mlp = model.model.layers[0].mlp
+    for registered, record, layer, expected in (
+        (toy, first_record, mlp.gate_proj, scales),
+        (second, second_record, mlp.up_proj, scales * 2),
+    ):
+        assert [value for value, _ in registered.accepted] == [record]
+        assert layer.mode == registered.mode and layer.fmt is not registered
+        assert mx.array_equal(layer.scales, expected)
+    assert mlp.gate_proj.fmt is not mlp.up_proj.fmt
+
+
 def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_path):
     record = {"layout": 1, "levels": [0.5, 1.5]}
     toy.reads = lambda record: _Levels(record["levels"])
@@ -1470,11 +1694,14 @@ def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_pat
     asked = []
     layer.fmt.dot = lambda layer, k, n: asked.append((k, n))
     assert formats.dot(layer, 64, 128) is None and asked == [(64, 128)]
+    tiles = []
+    layer.fmt.tile = lambda layer, k, n: tiles.append((k, n))
+    assert formats.tile(layer, 64, 128) is None and tiles == [(64, 128)]
     # Two checkpoints of the format, two records: each keeps its own.
     other = tmp_path / "other"
     other.mkdir()
     _llama(other, **_written({"layout": 1, "levels": [2.0]}))
-    second, _ = load_model(other)
+    second, _ = mlx_lm.utils.load_model(model_path=other)
     kept = second.model.layers[0].mlp.gate_proj.fmt
     assert kept.levels == (2.0,) and layer.fmt.levels == (0.5, 1.5)
 
@@ -1517,6 +1744,18 @@ def test_a_format_refuses_a_checkpoint_in_its_own_words(toy, tmp_path):
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
     assert refusal.value.written == "an unknown writer"
+
+
+def test_a_record_with_an_unsupported_revision_gives_the_plugins_reason(
+    toy, tmp_path, monkeypatch
+):
+    _llama(tmp_path, **_written({"revision": 2}))
+    monkeypatch.setattr(type(toy), "layout", lambda self, *args: None)
+    toy.refusal = "this plugin reads revision 1"
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        load_model(tmp_path)
+    assert refused.value.reason == toy.refusal
+    assert refused.value.path == tmp_path and refused.value.mode == toy.mode
 
 
 _ENTRY = "['omlx_quant_formats']['toy']"
@@ -1683,7 +1922,7 @@ def test_what_accept_returns_is_a_format_of_the_same_kind(
 def _the_load_s_copy(read, fmt):
     """``read`` is a copy of ``fmt`` that a load accepted with."""
     assert read is not fmt and type(read) is type(fmt)
-    assert read.log is fmt.log
+    assert read.log is not fmt.log and read.accepted is fmt.accepted
 
 
 def test_accept_returning_none_reads_with_the_load_s_copy(toy, tmp_path):
@@ -1692,6 +1931,234 @@ def test_accept_returning_none_reads_with_the_load_s_copy(toy, tmp_path):
     _llama(tmp_path, **_written({"layout": 1}))
     model, _ = load_model(tmp_path)
     _the_load_s_copy(model.model.layers[0].mlp.gate_proj.fmt, toy)
+
+
+@pytest.mark.parametrize("descriptor", ["table", "dot", "tile"])
+def test_a_load_can_copy_a_format_holding_its_contract_descriptors(
+    toy, tmp_path, monkeypatch, descriptor
+):
+    table = formats.Table("levels", mx.float16, (-1, 1))
+    if descriptor == "table":
+        face = table
+    elif descriptor == "dot":
+        face = formats.Dot("fixed", "struct Fixed {};", "Fixed", (), (mx.bfloat16,))
+    else:
+        face = formats.Tile("fixed", "struct Fixed {};", "Fixed", (), tables=(table,))
+    fmt = _ToyFormat(face)
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    reader = format_load._Checkpoint(tmp_path).read(fmt)
+    assert reader is not fmt and reader.face == face
+    if descriptor == "dot":
+        assert reader.face.dtypes[0] is mx.bfloat16
+    elif descriptor == "table":
+        assert reader.face.dtype is mx.float16
+    else:
+        assert reader.face.tables[0].dtype is mx.float16
+
+
+@pytest.mark.parametrize("returns_singleton", ["deepcopy", "accept"])
+def test_a_checkpoint_refuses_a_reader_that_is_the_registered_singleton(
+    toy, tmp_path, monkeypatch, returns_singleton
+):
+    accepted = []
+
+    class Reader(_ToyFormat):
+        def accept(self, record):
+            accepted.append(self)
+            return registered
+
+    registered = Reader()
+    monkeypatch.setitem(formats._FORMATS, "toy", registered)
+    monkeypatch.setitem(formats._ORIGINS, "toy", "omlx-toy 0.3.1")
+    if returns_singleton == "deepcopy":
+        monkeypatch.setattr(
+            Reader, "__deepcopy__", lambda self, memo: self, raising=False
+        )
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        format_load._Checkpoint(tmp_path).read(registered)
+    assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
+    assert "omlx-toy 0.3.1" in refusal.value.reason
+    assert len(accepted) == (0 if returns_singleton == "deepcopy" else 1)
+
+
+@pytest.mark.parametrize("aliases_at", ["deepcopy", "accept"])
+def test_a_reader_must_own_its_nested_mutable_state(
+    toy, tmp_path, monkeypatch, aliases_at
+):
+    accepted = []
+
+    class Reader(_ToyFormat):
+        def __init__(self):
+            super().__init__()
+            self.levels = {"table": ([-1, 1],)}
+
+        def __deepcopy__(self, memo):
+            own = type(self)()
+            if aliases_at == "deepcopy":
+                own.levels["table"] = (self.levels["table"][0],)
+            return own
+
+        def accept(self, record):
+            accepted.append(self)
+            if aliases_at == "accept":
+                self.levels["table"] = (registered.levels["table"][0],)
+            return self
+
+    registered = Reader()
+    monkeypatch.setitem(formats._FORMATS, "toy", registered)
+    monkeypatch.setitem(formats._ORIGINS, "toy", "omlx-toy 0.3.1")
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        format_load._Checkpoint(tmp_path).read(registered)
+    assert "omlx-toy 0.3.1" in refusal.value.reason
+    assert refusal.value.path == tmp_path and refusal.value.mode == "toy"
+    assert len(accepted) == (0 if aliases_at == "deepcopy" else 1)
+
+
+def test_accept_compares_the_readers_contract_with_the_registered_format(
+    toy, tmp_path, monkeypatch
+):
+    def change_mode(reader, record):
+        reader.mode = "another"
+        return reader
+
+    monkeypatch.setattr(type(toy), "accept", change_mode)
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(
+        formats.FormatRefusedError, match="its mode, tensors and contract"
+    ):
+        format_load._Checkpoint(tmp_path).read(toy)
+    assert toy.mode == "toy"
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_reader_copies_own_the_python_objects_in_their_numpy_tables(toy, structured):
+    import copy
+
+    dtype = [("row", [("level", object, (2,))])] if structured else object
+    table = np.empty(1, dtype)
+    entries = table["row"]["level"] if structured else table
+    entries.flat[0] = [-1, 1]
+    toy.table = table
+    reader = copy.deepcopy(toy)
+    copied = reader.table["row"]["level"] if structured else reader.table
+    copied.flat[0] = list(entries.flat[0])
+    assert copied.flat[0] is not entries.flat[0]
+    formats._check_reader_isolation(toy, reader, stage="deepcopy")
+    reader.table = table.copy()
+    with pytest.raises(formats.FormatRefusedError, match="mutable state"):
+        formats._check_reader_isolation(toy, reader, stage="accept")
+
+
+@pytest.mark.parametrize("storage", ["mlx", "numpy"])
+@pytest.mark.parametrize("stage", ["deepcopy", "accept", "independent"])
+def test_a_checkpoint_reader_owns_its_arrays_backing_storage(
+    monkeypatch, toy, tmp_path, storage, stage
+):
+    import copy
+
+    accepted = []
+    table = mx.arange(8, dtype=mx.float32) if storage == "mlx" else np.arange(8)
+
+    def view(array):
+        if storage == "mlx":
+            return copy.deepcopy(array)[1:]
+        return np.from_dlpack(array)[1:]
+
+    def independent(array):
+        return mx.array(array) if storage == "mlx" else array.copy()
+
+    class Reader(_ToyFormat):
+        def __deepcopy__(self, memo):
+            reader = type(self)()
+            reader.table = (
+                view(self.table) if stage == "deepcopy" else independent(self.table)
+            )
+            return reader
+
+        def accept(self, record):
+            accepted.append(self)
+            if stage == "accept":
+                self.table = view(table)
+            return self
+
+    registered = Reader()
+    registered.table = table
+    monkeypatch.setitem(formats._FORMATS, "toy", registered)
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    checkpoint = format_load._Checkpoint(tmp_path)
+    if stage == "independent":
+        reader = checkpoint.read(registered)
+        assert accepted == [reader]
+        assert not np.shares_memory(np.asarray(table), np.asarray(reader.table))
+    else:
+        assert np.shares_memory(np.asarray(table), np.asarray(view(table)))
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            checkpoint.read(registered)
+        assert stage in refusal.value.reason and refusal.value.path == tmp_path
+        assert len(accepted) == (0 if stage == "deepcopy" else 1)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.bfloat16])
+@pytest.mark.parametrize("reader_kind", ["transposed MLX", "NumPy buffer"])
+def test_a_reader_owns_its_mlx_storage_across_views(toy, dtype, reader_kind):
+    import copy
+
+    reader = copy.deepcopy(toy)
+    toy.table = mx.arange(12, dtype=dtype).reshape(3, 4)
+    mx.eval(toy.table)
+    if reader_kind == "transposed MLX":
+        alias = toy.table.T
+        independent = mx.array(alias)
+        mx.eval(alias, independent)
+        size = mx.get_array_buffer_size
+        assert size(toy.table, alias) == size(toy.table)
+        assert size(toy.table, independent) == size(toy.table) + size(independent)
+    else:
+        # DLPack retains the bytes while hiding the MLX owner behind a capsule.
+        raw = np.frombuffer(memoryview(toy.table), dtype=np.uint8)
+        alias = np.from_dlpack(raw)[1:]
+        independent = alias.copy()
+        assert np.shares_memory(raw, alias) and not np.shares_memory(raw, independent)
+    reader.table = independent
+    formats._check_reader_isolation(toy, reader, stage="accept")
+    reader.table = alias
+    with pytest.raises(formats.FormatRefusedError, match="mutable state"):
+        formats._check_reader_isolation(toy, reader, stage="accept")
+
+
+def test_separate_numpy_reader_views_can_own_disjoint_strides(toy, monkeypatch):
+    import copy
+
+    reader = copy.deepcopy(toy)
+    values = np.arange(8)
+    toy.table = np.from_dlpack(values[::2])
+    reader.table = np.from_dlpack(values[1::2])
+    assert not np.shares_memory(toy.table, reader.table)
+    formats._check_reader_isolation(toy, reader, stage="accept")
+
+    def indeterminate(left, right, *, max_work):
+        assert max_work >= 0
+        raise getattr(np, "exceptions", np).TooHardError
+
+    monkeypatch.setattr(np, "shares_memory", indeterminate)
+    with pytest.raises(formats.FormatRefusedError, match="cannot be verified"):
+        formats._check_reader_isolation(toy, reader, stage="accept")
+
+
+def test_an_unexpected_error_in_accept_propagates(toy, tmp_path):
+    error = KeyError("missing plugin state")
+
+    def fail(record):
+        raise error
+
+    toy.reads = fail
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(KeyError) as caught:
+        format_load._Checkpoint(tmp_path).read(toy)
+    assert caught.value is error
 
 
 class _Configured(_Loadable):
@@ -1761,6 +2228,7 @@ def test_a_format_no_copy_takes_is_refused(toy, tmp_path, monkeypatch, held):
         tmp_path,
     )
     assert toy.accepted == [] and toy.faces is value
+    assert str(refusal.value.__cause__) == said
     if held == "a lock":
         quoted = str(refusal.value).replace(str(tmp_path), "/models/my-model")
         for said in ("the plugin", "omlx-toy 0.3.1", "a format registered by hand"):
@@ -1799,14 +2267,24 @@ def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
     assert toy.asked == [(64, 128, 8, 1)]
     assert wide.asked == [(64, 128, 8, 1)]
     assert layer.fmt is wide and _kept(layer)["scales"] == ((128, 2), mx.float32)
-    # One the registered format lays out none of is refused before the record
-    # is read.
+    # One the registered format lays out none of is refused before an
+    # unrecorded checkpoint's record is read, while a recorded checkpoint
+    # still validates its record once per load.
+    unrecorded = tmp_path / "unrecorded"
+    unrecorded.mkdir()
+    _llama(unrecorded)
+    with (
+        format_load.loading(unrecorded),
+        pytest.raises(ValueError, match="lays out no"),
+    ):
+        nn.Linear(64, 128).to_quantized(group_size=1, bits=4, mode="toy")
+    assert len(toy.accepted) == 1
     with (
         format_load.loading(tmp_path),
         pytest.raises(ValueError, match="lays out no"),
     ):
         nn.Linear(64, 128).to_quantized(group_size=1, bits=4, mode="toy")
-    assert len(toy.accepted) == 1
+    assert len(toy.accepted) == 2
 
 
 def test_a_layer_built_in_a_load_and_not_in_its_model_is_refused(
@@ -1971,7 +2449,7 @@ def test_an_entry_binds_a_layer_of_its_own_mode_only(toy, tmp_path):
 def test_an_entry_binds_a_layer_at_any_path_its_model_holds_it(toy, tmp_path):
     config = {
         "model_type": "llama",
-        "quantization": {"a": _TOY, "b": _TOY},
+        "quantization": {"b": _TOY},
         "omlx_quant_formats": {"toy": {}},
     }
     (tmp_path / "config.json").write_text(json.dumps(config))
@@ -1980,6 +2458,17 @@ def test_an_entry_binds_a_layer_at_any_path_its_model_holds_it(toy, tmp_path):
     model = nn.Module()
     model.a = model.b = layer
     checkpoint.check(model)
+    # Two declared entries cannot bind to the same single layer instance.
+    both = tmp_path / "both"
+    both.mkdir()
+    config["quantization"] = {"a": _TOY, "b": _TOY}
+    (both / "config.json").write_text(json.dumps(config))
+    with format_load.loading(both) as checkpoint:
+        shared = nn.Linear(64, 128).to_quantized(**_TOY)
+    aliased = nn.Module()
+    aliased.a = aliased.b = shared
+    with pytest.raises(formats.FormatRefusedError, match="names b,"):
+        checkpoint.check(aliased)
 
 
 def test_a_format_entry_of_a_load_that_built_no_layer_is_refused(toy, tmp_path):
@@ -2012,6 +2501,24 @@ def test_a_load_that_leaves_no_array_where_the_layout_has_one_is_refused(toy, tm
         "the checkpoint holds tensors under that name"
     )
     assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
+
+
+@pytest.mark.parametrize("exit_check", [False, True], ids=["library", "omlx"])
+@pytest.mark.parametrize("removed", [("scales",), ("weight", "scales")])
+def test_a_layer_that_loses_a_declared_tensor_names_it_in_the_refusal(
+    toy, tmp_path, exit_check, removed
+):
+    _llama(tmp_path, **_written({}))
+    with format_load.loading(tmp_path, by_loader=True) as checkpoint:
+        model, _ = load_model(tmp_path)
+        for tensor in removed:
+            del _gate_proj(model)[tensor]
+    check = format_load.check_loaded if exit_check else checkpoint.check
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        check(model)
+    assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
+    assert any(f"{_GATE}.{tensor}" in refusal.value.reason for tensor in removed)
+    assert refusal.value.written == "omlx-toy 0.3.1"
 
 
 def test_a_stock_load_is_not_walked(toy, tmp_path, monkeypatch):
@@ -2047,6 +2554,107 @@ def test_a_load_joined_to_an_outer_one_leaves_it_the_check(toy, tmp_path):
     # Checked: the next exit check lets them go.
     format_load.check_loaded(model)
     assert "_load_origin" not in _gate_proj(model).__dict__
+
+
+def test_a_dir_symlink_in_the_path_joins_the_same_running_load(toy, tmp_path):
+    parent = tmp_path / "source"
+    path = parent / "checkpoint"
+    path.mkdir(parents=True)
+    _llama(path, **_written({}))
+    alias = tmp_path / "link"
+    alias.symlink_to(parent, target_is_directory=True)
+    with format_load.loading(path, by_loader=True) as outer:
+        model, _ = load_model(alias / "checkpoint")
+    assert any(layer is _gate_proj(model) for layer in outer.built)
+    outer.check(model)
+
+
+def test_a_wrapped_loader_preserves_its_missing_path_error(toy):
+    with pytest.raises(TypeError, match="model_path"):
+        mlx_lm.utils.load_model()
+
+
+def test_a_family_wrapper_checks_its_keyword_or_default_path(toy, tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({**_typed(_written({})), "model_type": "unverified"})
+    )
+    calls = []
+
+    def generic(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    def with_default(model_path=tmp_path):
+        calls.append(model_path)
+
+    for original, keywords in ((generic, {"model_path": tmp_path}), (with_default, {})):
+        module = SimpleNamespace(__name__="mlx_lm.utils", load_model=original)
+        format_load._wrap_loader(module, "load_model")
+        with pytest.raises(formats.FormatRefusedError):
+            module.load_model(**keywords)
+        if original is generic:
+            with pytest.raises(TypeError, match="model_path"):
+                module.load_model()
+    assert not calls
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["disk", "model_config"])
+def test_an_alternate_model_file_refuses_a_verified_format_before_weights(
+    toy, tmp_path, monkeypatch, override
+):
+    config = _typed(_written({}))
+    alternate = {"model_file": "alternate.py"}
+    if not override:
+        config.update(alternate)
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    (tmp_path / "model.safetensors").touch()
+
+    def read(*args, **kwargs):
+        pytest.fail("opened weights for a format with an unverified model_file")
+
+    monkeypatch.setattr(mx, "load", read)
+    options = {"model_config": alternate} if override else {}
+    with pytest.raises(formats.FormatRefusedError, match="model_file") as refused:
+        load_model(tmp_path, trust_remote_code=True, **options)
+    assert refused.value.path == tmp_path and refused.value.mode == "toy"
+
+
+def test_a_model_class_override_cannot_load_a_verified_formats_weights(
+    toy, tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    (tmp_path / "model.safetensors").touch()
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("read weights or called a custom model class resolver")
+
+    monkeypatch.setattr(mx, "load", unexpected)
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        load_model(tmp_path, get_model_classes=unexpected)
+    assert (refused.value.path, refused.value.mode) == (tmp_path, "toy")
+
+
+def test_standard_resolver_and_stock_custom_implementations_reach_the_library(
+    toy, tmp_path, monkeypatch
+):
+    class LibraryWeightReadError(Exception):
+        pass
+
+    def read(*args, **kwargs):
+        raise LibraryWeightReadError
+
+    monkeypatch.setattr(mx, "load", read)
+    (tmp_path / "model.safetensors").touch()
+    for config, options in (
+        (_typed(_written({})), {"get_model_classes": mlx_lm.utils._get_classes}),
+        ({"model_type": "llama"}, {"get_model_classes": lambda config: None}),
+        (
+            {"model_type": "llama", "model_file": "alternate.py"},
+            {"trust_remote_code": True},
+        ),
+    ):
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        with pytest.raises(LibraryWeightReadError):
+            load_model(tmp_path, **options)
 
 
 def test_a_load_joins_only_a_running_loader_s_load_on_its_thread(toy, tmp_path):
@@ -2131,29 +2739,33 @@ def test_a_load_nested_in_another_checkpoint_s_checks_its_own(toy, tmp_path):
         load_model(partial, strict=False)
 
 
-def test_loads_of_one_format_accept_on_copies_of_their_own(toy, tmp_path):
+def test_loads_of_one_format_accept_on_copies_of_their_own(toy, tmp_path, monkeypatch):
     paths = [tmp_path / name for name in ("first", "second")]
     for path in paths:
         path.mkdir()
         _llama(path, **_written({"levels": [1.0]}))
     both = threading.Barrier(2, timeout=30)
 
-    def accept(record):
+    def accept(self, record):
         # Each load's accept waits for the other's: no lock holds one back.
         both.wait()
 
-    toy.accept = accept
-    built = []
+    monkeypatch.setattr(type(toy), "accept", accept)
+    built, errors = [], []
 
     def build(path):
-        with format_load.loading(path):
-            built.append(nn.Linear(64, 128).to_quantized(**_TOY))
+        try:
+            with format_load.loading(path):
+                built.append(nn.Linear(64, 128).to_quantized(**_TOY))
+        except BaseException as exc:
+            errors.append(exc)
 
     threads = [threading.Thread(target=build, args=(path,)) for path in paths]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(60)
+    assert not errors
     # Each layer reads with its own load's copy.
     assert len(built) == 2 and built[0].fmt is not built[1].fmt
     for layer in built:
@@ -2177,26 +2789,33 @@ def test_a_load_under_home_or_in_a_view_joins_the_checkpoint_s(
     assert format_load._Checkpoint("~/tiny").path == home / "tiny"
 
 
-def test_a_load_s_threads_accept_its_record_once(toy, tmp_path):
+def test_a_load_s_threads_accept_its_record_once(toy, tmp_path, monkeypatch):
     import contextvars
     import time
 
     _llama(tmp_path, **_written({"levels": [1.0]}))
     accepted = []
 
-    def accept(record):
+    def accept(self, record):
         accepted.append(record)
         # Long enough for the other thread to ask meanwhile.
         time.sleep(0.2)
 
-    toy.accept = accept
-    built = []
+    monkeypatch.setattr(type(toy), "accept", accept)
+    built, errors = [], []
+
+    def build():
+        try:
+            built.append(nn.Linear(64, 128).to_quantized(**_TOY))
+        except BaseException as exc:
+            errors.append(exc)
+
     with format_load.loading(tmp_path):
         # Threads that copied the load's context (asyncio.to_thread's).
         threads = [
             threading.Thread(
                 target=contextvars.copy_context().run,
-                args=(lambda: built.append(nn.Linear(64, 128).to_quantized(**_TOY)),),
+                args=(build,),
             )
             for _ in range(2)
         ]
@@ -2204,6 +2823,7 @@ def test_a_load_s_threads_accept_its_record_once(toy, tmp_path):
             thread.start()
         for thread in threads:
             thread.join(60)
+    assert not errors
     assert len(built) == 2 and accepted == [{"levels": [1.0]}]
 
 
@@ -2218,6 +2838,21 @@ def _without_gate(tmp_path):
     return tmp_path
 
 
+def test_a_partial_load_keeps_its_source_after_the_temporary_view_closes(toy, tmp_path):
+    import tempfile
+
+    source = _without_gate(tmp_path / "source")
+    with tempfile.TemporaryDirectory(dir=tmp_path) as directory:
+        view = Path(directory)
+        for file in source.iterdir():
+            (view / file.name).symlink_to(file)
+        model, _ = load_model(view, lazy=True, strict=False)
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        format_load.check_loaded(model)
+    assert refused.value.path == source
+    assert refused.value.written == "omlx-toy 0.3.1"
+
+
 def test_omlx_s_own_load_refuses_a_layer_the_checkpoint_does_not_hold(
     toy, tmp_path
 ):
@@ -2230,14 +2865,16 @@ def test_omlx_s_own_load_refuses_a_layer_the_checkpoint_does_not_hold(
         "checkpoint holds no such tensor, or holds it under another name",
         path,
     )
-    # A load that drops nothing: the cluster's for one rank.
+    model, _ = load_model(path, lazy=True, strict=False)
     with pytest.raises(formats.FormatRefusedError) as refusal:
-        _local_sharded_load(str(path))
+        format_load.check_loaded(model)
     assert str(refusal.value) == said
     quoted = said.replace(str(path), "/models/my-model")
     for plugin in ("omlx-toy 0.3.1", "a format registered by hand"):
         quoted = quoted.replace(plugin, "my-package 0.1.0")
     assert quoted.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
+    with pytest.raises(formats.FormatRefusedError, match="local sharded_load"):
+        _local_sharded_load(str(path))
     # The libraries' strict load says it first.
     with pytest.raises(ValueError, match="Missing"):
         lm_load_compat(str(path))
@@ -2647,7 +3284,8 @@ def test_a_layer_built_outside_a_load_under_a_family_s_loader_is_not_blamed(
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _Loadable())
     format_load.apply_format_load_patch()
-    _llama(tmp_path, **_written({}))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": mx.zeros((1,))})
 
     def classes(config):
         with format_load.outside_load():
@@ -2660,7 +3298,8 @@ def test_a_layer_built_outside_a_load_under_a_family_s_loader_is_not_blamed(
 
 
 def test_a_layer_built_outside_a_wrapped_load_is_not_blamed_on_an_import(toy, tmp_path):
-    _llama(tmp_path, **_written({}))
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": mx.zeros((1,))})
 
     def classes(config):
         # A family's loader that builds a layer of its own outside the load.
@@ -2932,21 +3571,155 @@ def test_a_verified_checkpoint_loads(levels, tmp_path):
 
 
 @pytest.mark.parametrize("drafter", ["DFlash", "VLM-MTP"])
-def test_a_drafter_reads_its_record(levels, tmp_path, drafter):
+def test_a_written_drafter_is_refused_before_its_record_is_accepted(
+    levels, tmp_path, drafter
+):
     path = str(_tiny(tmp_path / "drafter", [8.0]))
     if drafter == "DFlash":
         from omlx.speculative.dflash import load_dflash_drafter
 
-        # The tiny checkpoint is no DFlash drafter: it fails once loaded,
-        # where the drafter meets its target (None here).
-        with pytest.raises(TypeError):
+        with pytest.raises(formats.FormatRefusedError, match="external DFlash drafter"):
             load_dflash_drafter(path, target_model=None)
     else:
         from omlx.speculative.vlm_mtp import load_vlm_mtp_drafter
 
-        # Nor an MTP one: it is logged and dropped once loaded.
-        assert load_vlm_mtp_drafter(path) is None
-    assert levels() == [(8.0,)]
+        with pytest.raises(formats.FormatRefusedError, match="external MTP drafter"):
+            load_vlm_mtp_drafter(path)
+    assert not levels()
+
+
+@pytest.mark.parametrize("reader", ["DFlash", "VLM-MTP"])
+def test_an_external_drafter_refuses_a_format_before_selecting_its_splitter(
+    reader, toy, tmp_path, monkeypatch
+):
+    from omlx.speculative import dflash, vlm_mtp
+
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+
+    def select_splitter(*args, **kwargs):
+        pytest.fail("external drafter selected its reader for a recorded checkpoint")
+
+    if reader == "DFlash":
+        monkeypatch.setattr(dflash, "load_drafter", select_splitter)
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            dflash.load_dflash_drafter(str(tmp_path), target_model=None)
+    else:
+        monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", select_splitter)
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            vlm_mtp.load_vlm_mtp_drafter(str(tmp_path))
+    assert refused.value.path == tmp_path and refused.value.mode == "toy"
+    assert not toy.accepted
+
+
+@pytest.mark.parametrize("reader", ["mlx-vlm drafter", "MTP splitter"])
+def test_native_drafter_readers_check_the_record_before_preparing_weights(
+    reader, toy, tmp_path, monkeypatch
+):
+    from mlx_vlm.speculative import drafters
+    from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
+
+    class StockDrafterReachedError(Exception):
+        pass
+
+    def prepare(*args, **kwargs):
+        raise StockDrafterReachedError
+
+    monkeypatch.setattr(drafters, "get_mtp_splitter", prepare)
+    monkeypatch.setattr(MTPSplitter, "prepare", prepare)
+    load = drafters.load_drafter if reader == "mlx-vlm drafter" else MTPSplitter().load
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        load(tmp_path)
+    assert (refused.value.path, refused.value.mode) == (tmp_path, "toy")
+    config_path.write_text(json.dumps({"model_type": "llama"}))
+    with pytest.raises(StockDrafterReachedError):
+        load(tmp_path)
+    if reader == "MTP splitter":
+        with pytest.raises(formats.FormatRefusedError) as supplied:
+            load(tmp_path, source_config=_typed(_written({})))
+        assert (supplied.value.path, supplied.value.mode) == (tmp_path, "toy")
+
+
+@pytest.mark.parametrize("entry", ["prepare", "split", "DSpark split"])
+def test_a_native_splitter_checks_its_source_before_output_or_weight_selection(
+    toy, tmp_path, monkeypatch, entry
+):
+    from mlx_vlm.speculative.drafters.deepseek_v4_dspark.split import (
+        DeepseekV4DsparkSplitter,
+    )
+    from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
+
+    class StockSelectionError(Exception):
+        pass
+
+    def select(*args, **kwargs):
+        raise StockSelectionError
+
+    cls = DeepseekV4DsparkSplitter if entry == "DSpark split" else MTPSplitter
+    splitter = cls()
+    output = tmp_path / "split"
+
+    def start():
+        if entry == "prepare":
+            return splitter.prepare(source_path=tmp_path)
+        return splitter.split(source=str(tmp_path), output=str(output))
+
+    monkeypatch.setattr(cls, "read_text_config", select)
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(_typed(_written({}))))
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        start()
+    assert not output.exists()
+    assert (refused.value.path, refused.value.mode) == (tmp_path, "toy")
+    path.write_text(json.dumps({"model_type": "llama"}))
+    with pytest.raises(StockSelectionError):
+        start()
+
+
+@pytest.mark.parametrize("recorded", ["metadata", "weights", "stock"])
+def test_the_hub_drafter_reads_only_weights_of_its_checked_revision(
+    toy, tmp_path, monkeypatch, recorded
+):
+    from mlx_vlm import utils
+    from mlx_vlm.speculative import drafters
+
+    snapshot = tmp_path / ("a" * 40)
+    snapshot.mkdir()
+    config = snapshot / "config.json"
+    stock = {"model_type": "llama"}
+    marked = _typed(_written({}))
+    config.write_text(json.dumps(marked if recorded == "metadata" else stock))
+    calls = []
+
+    def download(source, *, revision=None, allow_patterns=None, force_download=False):
+        if source != "org/drafter":
+            assert source == snapshot
+            return source
+        calls.append((revision, allow_patterns))
+        if allow_patterns is None and recorded == "weights":
+            config.write_text(json.dumps(marked))
+        return snapshot
+
+    class StockSelectionError(Exception):
+        pass
+
+    def select(**kwargs):
+        raise StockSelectionError
+
+    monkeypatch.setattr(utils, "get_model_path", download)
+    monkeypatch.setattr(drafters, "get_mtp_splitter", select)
+    if recorded == "stock":
+        with pytest.raises(StockSelectionError):
+            drafters.load_drafter("org/drafter")
+    else:
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            drafters.load_drafter("org/drafter")
+        assert (refused.value.path, refused.value.mode) == (snapshot, "toy")
+    expected = [(None, ["config.json"])]
+    if recorded != "metadata":
+        expected.append((snapshot.name, None))
+    assert calls == expected
 
 
 def _registered(monkeypatch):
@@ -2995,17 +3768,330 @@ def test_an_embedding_model_refuses_a_verified_backbone(
     assert not toy.accepted
 
 
-def test_the_cluster_s_loads_read_their_records(levels, tmp_path):
+def test_the_cluster_loads_stock_weights_and_refuses_format_records(levels, tmp_path):
     from omlx.cluster.progressive_loading import progressive_sharded_load
     from omlx.patches.mlx_lm_sharded_load import _local_sharded_load
 
-    model, _ = _local_sharded_load(str(_tiny(tmp_path / "rank", [11.0])))
-    assert _gate_proj(model).fmt.levels == (11.0,)
-    # Whether a tiny Llama shards or not (tensor parallelism refuses a
-    # model with a format layer): its layers were read.
-    with contextlib.suppress(ValueError, RuntimeError):
-        progressive_sharded_load(str(_tiny(tmp_path / "progressive", [12.0])))
-    assert levels()[1] == (12.0,)
+    path = _tiny(tmp_path / "rank", [11.0])
+    for load in (_local_sharded_load, progressive_sharded_load):
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            load(str(path))
+        assert refused.value.path == path and refused.value.mode == "toy"
+    assert levels() == []
+
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    del config["quantization"], config["omlx_quant_formats"]
+    config_path.write_text(json.dumps(config))
+    stock = llama.Model(llama.ModelArgs.from_dict(config))
+    mx.save_safetensors(
+        str(path / "model.safetensors"), dict(tree_flatten(stock.parameters()))
+    )
+    model, _ = _local_sharded_load(str(path))
+    tokens = mx.array([[1, 2]])
+    assert mx.array_equal(model(tokens), stock(tokens))
+
+
+def test_the_libraries_sharded_load_refuses_a_format_before_tensor_sharding(
+    levels, tmp_path, monkeypatch
+):
+    from omlx.patches.mlx_lm_sharded_load import _wrap
+
+    path = _tiny(tmp_path / "rank", [11.0])
+
+    def unexpected_shard(model, group):
+        assert _gate_proj(model).fmt.levels == (11.0,)
+        pytest.fail("mlx-lm reached tensor sharding with a format layer")
+
+    monkeypatch.setattr(llama.Model, "shard", unexpected_shard, raising=False)
+    load = _wrap(inspect.unwrap(mlx_lm.utils.sharded_load))
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        load(str(path), tensor_group=object())
+    assert (refused.value.mode, refused.value.path) == ("toy", path)
+    assert levels() == []
+
+
+@pytest.mark.parametrize("layout", ["record", "nested", "stock"])
+@pytest.mark.parametrize(
+    "reader",
+    [
+        "mlx_lm.utils.sharded_load",
+        "mlx_lm.server.sharded_load",
+        "mlx_lm.utils.pipeline_load",
+        "wrapped_sharded_load",
+        "local_sharded_load",
+        "progressive_sharded_load",
+        "server_progressive_load",
+        "load_pipeline_stage",
+        "load_tensor_shard",
+        "load_tensor_shard_a8",
+    ],
+)
+def test_distributed_readers_refuse_recorded_checkpoints_before_reading_weights(
+    reader, layout, toy, tmp_path, monkeypatch
+):
+    from mlx_lm import server, utils
+
+    from omlx.cluster.progressive_loading import (
+        install_progressive_loader,
+        progressive_sharded_load,
+    )
+    from omlx.patches import mlx_lm_sharded_load as fallback
+    from omlx.patches.deepseek_v41_mlx_lm import model as ds
+
+    class StockLoadReachedError(Exception):
+        pass
+
+    def stock_load(*args, **kwargs):
+        raise StockLoadReachedError
+
+    config = {"model_type": "llama", "quantization": {"mode": "affine"}}
+    if layout == "record":
+        config["omlx_quant_formats"] = _written({})
+    elif layout == "nested":
+        config["text_config"] = _typed(_written({}))
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    monkeypatch.setattr(utils, "load_model", stock_load)
+    monkeypatch.setattr(utils, "load_tokenizer", lambda *args, **kwargs: object())
+    group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+
+    def init(*args, **kwargs):
+        if layout != "stock":
+            pytest.fail("distributed initialization preceded the format refusal")
+        return group
+
+    monkeypatch.setattr(mx.distributed, "init", init)
+    # Stop at native dispatch or the first A8 probe.
+    monkeypatch.setattr(ds.quant_fast, "oq_a8_available", stock_load)
+    monkeypatch.setattr(ds, "load", stock_load)
+    with contextlib.ExitStack() as stack:
+        loaders = {
+            "mlx_lm.utils.sharded_load": utils.sharded_load,
+            "mlx_lm.server.sharded_load": server.sharded_load,
+            "mlx_lm.utils.pipeline_load": utils.pipeline_load,
+            "wrapped_sharded_load": fallback._wrap(stock_load),
+            "local_sharded_load": fallback._local_sharded_load,
+            "progressive_sharded_load": progressive_sharded_load,
+            "load_pipeline_stage": lambda path: ds.load_pipeline_stage(path, group),
+            "load_tensor_shard": lambda path: ds.load_tensor_shard(path, group),
+            "load_tensor_shard_a8": lambda path: ds.load_tensor_shard(
+                path, group, a8_prefill=True
+            ),
+        }
+        if reader == "server_progressive_load":
+            stack.enter_context(install_progressive_loader(server))
+            load = server.sharded_load
+        else:
+            load = loaders[reader]
+        if layout != "stock":
+            with pytest.raises(formats.FormatRefusedError) as refused:
+                load(str(tmp_path))
+            assert (refused.value.mode, refused.value.path) == ("toy", tmp_path)
+            assert toy.accepted == []
+        else:
+            with pytest.raises(StockLoadReachedError):
+                load(str(tmp_path))
+
+
+def test_a_sharded_hub_load_refuses_the_resolved_record_before_weight_download(
+    toy, tmp_path, monkeypatch
+):
+    from mlx_lm import utils
+
+    from omlx.patches.mlx_lm_sharded_load import _wrap
+
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+
+    def download(repo, *, allow_patterns=None):
+        if Path(repo) != tmp_path:
+            assert repo == "org/sharded-format"
+            assert allow_patterns
+            assert not any(p.endswith(".safetensors") for p in allow_patterns)
+        return tmp_path
+
+    def weights(*args, **kwargs):
+        pytest.fail("sharded reader tried loading the resolved checkpoint's weights")
+
+    monkeypatch.setattr(utils, "_download", download)
+    monkeypatch.setattr(utils, "load_model", weights)
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        _wrap(utils.sharded_load)("org/sharded-format")
+    assert (refused.value.path, refused.value.mode) == (tmp_path, "toy")
+
+
+@pytest.mark.parametrize("already_loading", [False, True])
+def test_a_sharded_hub_rechecks_the_snapshot_passed_to_the_weight_loader(
+    levels, tmp_path, monkeypatch, already_loading
+):
+    from mlx_lm import utils
+
+    from omlx.patches.mlx_lm_sharded_load import _wrap
+
+    first = tmp_path / "first"
+    first.mkdir()
+    (first / "config.json").write_text('{"model_type": "llama"}')
+    second = _tiny(tmp_path / "second", [12.0])
+    monkeypatch.setattr(utils, "_download", lambda *a, **kw: first)
+
+    def load_new_revision(repo):
+        return utils.load_model(second)
+
+    outer = (
+        format_load.loading(second, by_loader=True)
+        if already_loading
+        else contextlib.nullcontext()
+    )
+    with outer, monkeypatch.context() as guarded:
+        guarded.setattr(mx, "load", lambda *a, **kw: pytest.fail("opened weights"))
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            _wrap(load_new_revision)("org/model")
+    assert refused.value.path == second and refused.value.mode == "toy"
+    assert levels() == []
+    assert _gate_proj(load_model(second)[0]).fmt.levels == (12.0,)
+
+
+def test_a_stock_sharded_hub_load_fetches_only_the_requested_ranks_weights(
+    tmp_path, monkeypatch
+):
+    from mlx_lm import utils
+
+    from omlx.patches.mlx_lm_sharded_load import _wrap
+
+    repo = "org/stock-pipeline"
+    config = {"model_type": "llama"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    weights = {
+        f"model.layers.{i}.proj.weight": f"rank{i}.safetensors" for i in range(2)
+    }
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": weights})
+    )
+    fetched, loads = [], []
+
+    def download(source, *, allow_patterns=None, revision=None):
+        assert allow_patterns is not None, "requested the entire repository"
+        if str(source) == repo:
+            requested = sorted(p for p in allow_patterns if p.endswith(".safetensors"))
+            if requested:
+                fetched.append(requested)
+        return tmp_path
+
+    class Pipeline(nn.Module):
+        def pipeline(self, group):
+            self.start_idx, self.end_idx = 0, 1
+
+    def load(path, **kwargs):
+        assert path == tmp_path and kwargs["lazy"] is True
+        loads.append(len(fetched))
+        model = nn.Module()
+        model.model = Pipeline()
+        model.model.layers = [nn.Linear(2, 2), nn.Linear(2, 2)]
+        return model, config
+
+    monkeypatch.setattr(utils, "_download", download)
+    monkeypatch.setattr(utils, "load_model", load)
+    monkeypatch.setattr(utils, "load_tokenizer", lambda *a, **kw: "tokenizer")
+    monkeypatch.setattr(mx.distributed, "all_sum", lambda x, **kw: x)
+    load_shard = _wrap(inspect.unwrap(utils.sharded_load))
+    _, tokenizer, loaded = load_shard(repo, pipeline_group=object(), return_config=True)
+    assert (tokenizer, loaded) == ("tokenizer", config)
+    assert loads == [0, 1] and fetched == [["rank0.safetensors"]]
+
+
+@pytest.mark.parametrize(
+    "entry", ["model.shard", "model.model.pipeline", "native strategy", "adapter"]
+)
+@pytest.mark.parametrize("recorded", [True, False], ids=["format", "stock"])
+def test_a_loaded_model_cannot_start_tensor_sharding_its_format(
+    entry, recorded, toy, tmp_path, monkeypatch
+):
+    from omlx.cluster import tensor_strategies
+
+    calls = []
+
+    def record(name):
+        def called(*args, **kwargs):
+            calls.append(name)
+
+        return called
+
+    monkeypatch.setattr(llama.Model, "shard", record("model.shard"))
+    monkeypatch.setattr(
+        llama.LlamaModel, "pipeline", record("model.model.pipeline"), raising=False
+    )
+    monkeypatch.setattr(
+        tensor_strategies, "_native_layerwise_shard", record("native strategy")
+    )
+    if entry == "adapter":
+        adapter = record("adapter")
+        adapter._omlx_tensor_strategy = SimpleNamespace(name="test")
+        monkeypatch.setitem(tensor_strategies._ADAPTERS, "llama", adapter)
+    reference, _, _ = _llama(tmp_path, **_written({}))
+    if not recorded:
+        config_path = tmp_path / "config.json"
+        config = json.loads(config_path.read_text())
+        del config["omlx_quant_formats"], config["quantization"]
+        config_path.write_text(json.dumps(config))
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            dict(tree_flatten(reference.parameters())),
+        )
+    model, _ = load_model(tmp_path)
+    format_load.check_loaded(model)
+
+    def start(target):
+        if entry == "model.shard":
+            target.shard(object())
+        elif entry == "model.model.pipeline":
+            target.model.pipeline(object())
+        else:
+            tensor_strategies.apply_tensor_strategy(target, object(), mx_module=mx)
+
+    if recorded:
+        with pytest.raises(formats.FormatRefusedError, match="format") as refused:
+            start(model)
+        assert (refused.value.mode, refused.value.path) == ("toy", tmp_path)
+        assert refused.value.written == "omlx-toy 0.3.1"
+        assert not calls
+        # The original stock model shares the same classes with the loaded model.
+        start(reference)
+    else:
+        start(model)
+    assert calls == [entry]
+
+
+def test_a_model_keeps_its_distributed_refusal_when_its_format_branch_is_absent(
+    toy, tmp_path, monkeypatch
+):
+    from omlx.cluster import tensor_strategies
+
+    reference, _, _ = _llama(tmp_path, **_written({}))
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["quantization"]["mtp.proj"] = config["quantization"].pop(_GATE)
+    config_path.write_text(json.dumps(config))
+    mx.save_safetensors(
+        str(tmp_path / "model.safetensors"), dict(tree_flatten(reference.parameters()))
+    )
+
+    def shard(*args, **kwargs):
+        pytest.fail("entered tensor sharding for a checkpoint with a format record")
+
+    monkeypatch.setattr(llama.Model, "shard", shard)
+    monkeypatch.setattr(tensor_strategies, "_native_layerwise_shard", shard)
+    model, _ = load_model(tmp_path)
+    assert all(
+        not isinstance(layer, FormatLinear) for _, layer in model.named_modules()
+    )
+    for start in (
+        model.shard,
+        lambda group: tensor_strategies.apply_tensor_strategy(
+            model, group, mx_module=mx
+        ),
+    ):
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            start(object())
+        assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
 
 
 def test_a_tensor_group_is_refused_a_format_checkpoint_before_a_shard(
@@ -3025,31 +4111,28 @@ def test_a_tensor_group_is_refused_a_format_checkpoint_before_a_shard(
         return load_model(*args, **kwargs)
 
     monkeypatch.setattr(mlx_lm.utils, "load_model", counted)
-    words = (
-        "tensor parallelism cannot shard model.layers.0.mlp.gate_proj: a layer "
-        "of quant format 'toy'"
-    )
     for load in (_local_sharded_load, progressive_sharded_load):
-        with pytest.raises(RuntimeError, match=re.escape(words)):
-            load(str(_tiny(tmp_path / load.__name__, [1.0])), tensor_group=object())
-    # Progressive loading refuses after its first load, before it stages the
-    # weights and loads again.
-    assert len(loads) == 2
+        path = _tiny(tmp_path / load.__name__, [1.0])
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            load(str(path), tensor_group=object())
+        assert (refusal.value.path, refusal.value.mode) == (path, "toy")
+    assert not loads
 
 
 def test_a_format_checkpoint_is_loaded_by_no_tensor_strategy(
     levels, tmp_path, monkeypatch
 ):
-    """Without a group given, progressive loading takes pipelining for it."""
+    """A group chosen by the loader still goes through checkpoint admission."""
     from omlx.cluster import progressive_loading
 
     def sharded(*args, **kwargs):
         pytest.fail("a format checkpoint was sharded by tensors")
 
     monkeypatch.setattr(progressive_loading, "apply_tensor_strategy", sharded)
-    # A tiny Llama is no converted checkpoint a pipeline stages.
-    with pytest.raises(ValueError, match="Pipeline loading|any sharding"):
-        progressive_loading.progressive_sharded_load(str(_tiny(tmp_path, [1.0])))
+    path = _tiny(tmp_path, [1.0])
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        progressive_loading.progressive_sharded_load(str(path))
+    assert (refusal.value.path, refusal.value.mode) == (path, "toy")
 
 
 @pytest.mark.parametrize("adapter", ["qwen3_5", "minimax_m3", "glm5_next", "qwen4_exp"])
@@ -3133,9 +4216,7 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
         format_load.apply_format_load_patch()
         assert not getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
         with pytest.raises(formats.FormatRefusedError, match="DeepSeek V4 loader"):
-            mlx_lm.utils.load_model(
-                v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
-            )
+            mlx_lm.utils.load_model(v4)
     # The same refusal when installed underneath the wrapped loader.
     mlx_lm.utils.load_model = wrapped.__wrapped__
     mlx_lm.utils.load_model = utils_patch._build_patched_load_model()
@@ -3143,9 +4224,7 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
     format_load.apply_format_load_patch()
     assert getattr(mlx_lm.utils.load_model, "_omlx_format_load", False)
     with pytest.raises(formats.FormatRefusedError, match="DeepSeek V4 loader"):
-        mlx_lm.utils.load_model(
-            v4, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
-        )
+        mlx_lm.utils.load_model(v4)
     # K2 Horizon's loads a directory of links to the checkpoint's files.
     mlx_lm.utils.load_model = wrapped
     monkeypatch.setattr(mlx_lm.utils, "load_tokenizer", mlx_lm.utils.load_tokenizer)
@@ -3153,9 +4232,8 @@ def test_a_family_loader_over_the_patch_keeps_its_place(levels, tmp_path, monkey
     k2 = _tiny(tmp_path / "k2", [17.0])
     config = json.loads((k2 / "config.json").read_text())
     (k2 / "config.json").write_text(json.dumps({**config, "model_type": "k2_horizon"}))
-    model, _ = mlx_lm.utils.load_model(
-        k2, get_model_classes=lambda config: (llama.Model, llama.ModelArgs)
-    )
+    monkeypatch.setitem(sys.modules, "mlx_lm.models.k2_horizon", llama)
+    model, _ = mlx_lm.utils.load_model(k2)
     assert _gate_proj(model).fmt.levels == (17.0,)
 
 
@@ -3301,7 +4379,7 @@ _EARLY = """
 # A user's script: the loader imported before oMLX's patches are applied.
 from {library}.utils import load_model
 
-import json, sys
+import importlib, json, sys
 from pathlib import Path
 
 from omlx import formats, oq
@@ -3313,6 +4391,8 @@ fmt = _Levels([0.0])
 fmt.reads = lambda record: _Levels(record["levels"])
 formats.register(fmt)
 maybe_apply_pre_load_patches(sys.argv[1])
+if sys.argv[2] == "reload":
+    load_model = importlib.reload(sys.modules["{library}.utils"]).load_model
 # The tiny checkpoint's family, taken as verified.
 with testing.verified("llama"):
     loaded = load_model(Path(sys.argv[1]))
@@ -3322,12 +4402,15 @@ print(json.dumps(_gate_proj(model).fmt.levels))
 
 
 @pytest.mark.parametrize("library", ["mlx_lm", "mlx_vlm"])
-def test_a_loader_imported_before_the_patch_reads_its_record(tmp_path, library):
+@pytest.mark.parametrize("binding", ["original", "reload"])
+def test_a_loader_imported_before_the_patch_reads_its_record(
+    tmp_path, library, binding
+):
     import subprocess
 
     path = _tiny(tmp_path / "tiny", [3.0])
     run = subprocess.run(
-        [sys.executable, "-c", _EARLY.format(library=library), str(path)],
+        [sys.executable, "-c", _EARLY.format(library=library), str(path), binding],
         capture_output=True,
         text=True,
         cwd=Path(__file__).parent.parent,
@@ -3341,17 +4424,26 @@ def test_a_drafter_s_loader_installs_the_patch(
     unpatched, tmp_path, monkeypatch, drafter
 ):
     toy = _registered(monkeypatch)
-    path = str(_tiny(tmp_path / "drafter", [18.0]))
+    path = str(tmp_path)
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    seen = []
+
+    def enter(*args, **kwargs):
+        seen.append(_wrapped(mlx_lm.utils.load_model))
+        raise TypeError("stock drafter reached")
+
     if drafter == "DFlash":
-        from omlx.speculative.dflash import load_dflash_drafter
+        from omlx.speculative import dflash
 
-        with pytest.raises(TypeError):
-            load_dflash_drafter(path, target_model=None)
+        monkeypatch.setattr(dflash, "load_drafter", enter)
+        with pytest.raises(TypeError, match="stock drafter reached"):
+            dflash.load_dflash_drafter(path, target_model=None)
     else:
-        from omlx.speculative.vlm_mtp import load_vlm_mtp_drafter
+        from omlx.speculative import vlm_mtp
 
-        assert load_vlm_mtp_drafter(path) is None
-    assert [tuple(record["levels"]) for record, _ in toy.accepted] == [(18.0,)]
+        monkeypatch.setattr(vlm_mtp, "_vlm_load_drafter", enter)
+        assert vlm_mtp.load_vlm_mtp_drafter(path) is None
+    assert seen == [True] and not toy.accepted
 
 
 # Of a family oMLX serves with mlx-embeddings' code: taken as verified.
@@ -3399,12 +4491,29 @@ def test_the_patch_imports_none_of_the_libraries_and_wraps_them_on_import():
         format_load.apply_format_load_patch()
         after = [name for name in libraries if name in sys.modules]
         import mlx_lm.utils, mlx_vlm.utils, mlx_vlm.embedding_loader
+        import mlx_vlm.speculative.drafters
+        import mlx_vlm.speculative.drafters.deepseek_v4_dspark.split
         import mlx_embeddings.utils, mlx_lm.models.switch_layers
         import mlx_vlm.models.switch_layers
         marked = lambda f: getattr(f, "_omlx_format_load", False)
         wrapped = [
             marked(getattr(sys.modules[module], name))
             for module, name in format_load._LOADERS
+        ] + [
+            marked(getattr(getattr(sys.modules[module], cls), method))
+            for module, cls, methods in (
+                (
+                    "mlx_vlm.speculative.drafters.mtp_split",
+                    "MTPSplitter",
+                    ("load", "prepare", "split"),
+                ),
+                (
+                    "mlx_vlm.speculative.drafters.deepseek_v4_dspark.split",
+                    "DeepseekV4DsparkSplitter",
+                    ("split",),
+                ),
+            )
+            for method in methods
         ] + [
             marked(sys.modules[module].SwitchLinear.to_quantized)
             for module in format_load._SWITCH_MODULES
@@ -3416,4 +4525,269 @@ def test_the_patch_imports_none_of_the_libraries_and_wraps_them_on_import():
     )
     seen = json.loads(run.stdout.splitlines()[-1])
     assert seen["after"] == seen["before"]
-    assert seen["wrapped"] == [True] * 6
+    assert seen["wrapped"] == [True] * 13
+
+
+@pytest.mark.parametrize("group", ["pipeline_group", "tensor_group"])
+@pytest.mark.parametrize("at_load", [1, 2])
+def test_progressive_loading_refuses_a_format_layer_before_sharding_or_evaluation(
+    toy, tmp_path, group, at_load
+):
+    from omlx.cluster.progressive_loading import progressive_sharded_load
+
+    config = {"model_type": "llama"}
+    (tmp_path / "model.safetensors.index.json").write_text('{"weight_map": {}}')
+    calls = []
+
+    class Model(nn.Module):
+        def pipeline(self, _group):
+            assert not hasattr(self, "projection"), "split a format model"
+
+        def shard(self, _group):
+            pytest.fail("sharded a format model")
+
+    plain, marked = Model(), Model()
+    plain.model, marked.model = Model(), Model()
+    (weight, scales), _, _ = _matrix(8, 64)
+    with testing.verified("llama"):
+        marked.model.projection = FormatLinear(
+            toy, 8, 1, 64, {"weight": weight, "scales": scales}
+        )
+
+    def read(*_args, **_kwargs):
+        assert len(calls) < at_load, "continued loading after a format layer"
+        calls.append("load")
+        return (marked if len(calls) == at_load else plain), config
+
+    utils = SimpleNamespace(
+        _download=lambda *args, **kw: tmp_path,
+        load_config=lambda _: config,
+        load_model=read,
+        load_tokenizer=lambda *args, **kw: None,
+        open=open,
+        json=json,
+        tree_flatten=tree_flatten,
+    )
+    device = SimpleNamespace(eval=lambda *args: pytest.fail("evaluated format weights"))
+    with pytest.raises(RuntimeError, match=r"cannot shard model\.projection: .*'toy'"):
+        progressive_sharded_load(
+            tmp_path, **{group: object()}, utils_module=utils, mx_module=device
+        )
+    assert len(calls) == at_load
+
+
+@pytest.mark.parametrize(
+    "strided_bfloat", [False, True], ids=["float32", "strided-bfloat16"]
+)
+@pytest.mark.parametrize("stage", ["deepcopy", "accept", "independent"])
+def test_a_checkpoint_reader_owns_storage_imported_twice_through_dlpack(
+    toy, monkeypatch, tmp_path, stage, strided_bfloat
+):
+    import mmap
+
+    # Separate no-copy Metal imports may have separate allocation identities.
+    dtype = np.uint16 if strided_bfloat else np.float32
+    backing = np.ndarray((128, 128), dtype, buffer=mmap.mmap(-1, 65536))
+
+    def import_table():
+        array = mx.from_dlpack(backing, copy=False)
+        return array.view(mx.bfloat16).T if strided_bfloat else array
+
+    def bytes_of(array):
+        raw = array.view(mx.uint16) if strided_bfloat else array
+        return np.asarray(memoryview(raw))
+
+    called = []
+
+    class Reader(_ToyFormat):
+        def __deepcopy__(self, memo):
+            reader = type(self)()
+            if stage == "deepcopy":
+                reader.table = import_table()
+            else:
+                reader.table = mx.array(self.table)
+            return reader
+
+        def accept(self, record):
+            called.append(self)
+            if stage == "accept":
+                self.table = import_table()
+            return self
+
+    registered = Reader()
+    registered.table = import_table()
+    assert np.shares_memory(backing, bytes_of(registered.table))
+    monkeypatch.setitem(formats._FORMATS, registered.mode, registered)
+    (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
+    checkpoint = format_load._Checkpoint(tmp_path)
+    if stage == "independent":
+        reader = checkpoint.read(registered)
+        assert called == [reader]
+        assert not np.shares_memory(backing, bytes_of(reader.table))
+    else:
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            checkpoint.read(registered)
+        assert stage in refusal.value.reason and refusal.value.path == tmp_path
+        assert "sharing mutable state" in refusal.value.reason
+        assert len(called) == (0 if stage == "deepcopy" else 1)
+
+
+@pytest.mark.parametrize("spelling", ["home", "relative"])
+@pytest.mark.parametrize("entry", ["split", "sharded", "drafter"])
+def test_local_loader_spellings_refuse_the_record_without_hub_access(
+    toy, tmp_path, monkeypatch, spelling, entry
+):
+    from mlx_vlm import utils
+    from mlx_vlm.speculative import drafters
+    from mlx_vlm.speculative.drafters.mtp_split import MTPSplitter
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    local = tmp_path / "model"
+    local.mkdir()
+    (local / "config.json").write_text(json.dumps(_typed(_written({}))))
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("resolved a local model through the Hub")
+
+    monkeypatch.setattr(utils, "get_model_path", unexpected)
+    monkeypatch.setattr(mlx_lm.utils, "_download", unexpected)
+    name = "~/model" if spelling == "home" else "model"
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        if entry == "split":
+            MTPSplitter().split(name, str(tmp_path / "out"))
+        elif entry == "sharded":
+            mlx_lm.utils.sharded_load(name)
+        else:
+            drafters.load_drafter(name)
+    assert (refused.value.path, refused.value.mode) == (local, "toy")
+
+
+@pytest.mark.parametrize("positional", [True, False])
+def test_drafter_download_uses_the_callers_revision_and_force_flag(
+    tmp_path, monkeypatch, positional
+):
+    from mlx_vlm import utils
+
+    snapshot = tmp_path / ("a" * 40)
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    calls = []
+
+    def download(source, *, revision, force_download, allow_patterns=None):
+        calls.append((source, revision, force_download, allow_patterns))
+        return snapshot
+
+    def split(source, output, revision=None, force_download=False):
+        return source, output, revision, force_download
+
+    monkeypatch.setattr(utils, "get_model_path", download)
+    extra = ("v2", True) if positional else ()
+    kwargs = {} if positional else {"revision": "v2", "force_download": True}
+    result = format_load._call_drafter(
+        split, inspect.signature(split), "source", ("org/model", "out", *extra), kwargs
+    )
+    assert calls == [
+        ("org/model", "v2", True, ["config.json"]),
+        ("org/model", snapshot.name, True, None),
+    ]
+    assert result == (snapshot, "out", "v2", True)
+
+
+@pytest.mark.parametrize("held", [True, False], ids=["held", "pruned"])
+def test_an_adapter_cannot_shard_the_language_model_of_a_recorded_vlm(
+    toy, tmp_path, monkeypatch, held
+):
+    from omlx.cluster import tensor_strategies
+
+    root = nn.Module()
+    root.language_model = nn.Module()
+    root.language_model.model_type = "llama"
+    path = "language_model.projection" if held else "mtp.projection"
+    config = _typed(_written({}))
+    config["quantization"] = {path: _TOY}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with format_load.loading(tmp_path) as checkpoint:
+        if held:
+            root.language_model.projection = nn.Linear(64, 16).to_quantized(**_TOY)
+        checkpoint.check(root)
+
+    def adapter(*args):
+        pytest.fail("adapter ran on a recorded VLM's language model")
+
+    adapter._omlx_tensor_strategy = SimpleNamespace(name="test")
+    monkeypatch.setitem(tensor_strategies._ADAPTERS, "llama", adapter)
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        tensor_strategies.apply_tensor_strategy(
+            root.language_model, object(), mx_module=mx
+        )
+    assert (refusal.value.path, refusal.value.mode) == (tmp_path, "toy")
+
+
+@pytest.mark.parametrize(
+    "entry", ["drafter", "sharded-args", "sharded-kwargs", "fallback"]
+)
+def test_a_stock_home_path_reaches_the_loader_as_a_local_directory(
+    tmp_path, monkeypatch, entry
+):
+    from mlx_vlm import utils
+
+    from omlx.patches import mlx_lm_sharded_load
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("resolved a local directory through the Hub")
+
+    monkeypatch.setattr(utils, "get_model_path", unexpected)
+    monkeypatch.setattr(mlx_lm.utils, "_download", unexpected)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    local = tmp_path / "model"
+    local.mkdir()
+    (local / "config.json").write_text('{"model_type": "llama"}')
+    source = "~/model"
+
+    def read(repo):
+        assert Path(repo).samefile(local)
+        return repo
+
+    if entry == "drafter":
+        assert (
+            format_load._call_drafter(
+                read, inspect.signature(read), "repo", (source,), {}
+            )
+            == local
+        )
+    elif entry == "fallback":
+
+        def original(repo):
+            read(repo)
+            raise ValueError("MLX converted models")
+
+        monkeypatch.setattr(mlx_lm_sharded_load, "_local_sharded_load", read)
+        assert mlx_lm_sharded_load._wrap(original)(source) == local
+    else:
+        module = SimpleNamespace(__name__="mlx_lm.utils", sharded_load=read)
+        load = format_load.guarded_sharded_loader(module)
+        if entry == "sharded-args":
+            assert load(source) == local
+        else:
+            assert load(repo=source) == local
+
+
+def test_a_reader_refuses_a_bfloat16_export_that_needed_a_copy(toy, monkeypatch):
+    import copy
+
+    reader = copy.deepcopy(toy)
+    toy.table = mx.arange(16, dtype=mx.bfloat16).reshape(4, 4).T
+    reader.table = mx.zeros(16, dtype=mx.bfloat16)
+    size = mx.get_array_buffer_size
+
+    def measured(*arrays):
+        if len(arrays) == 2 and arrays[0] is toy.table:
+            original, exported = arrays
+            assert exported.dtype == mx.uint16
+            return size(original) + size(exported)
+        return size(*arrays)
+
+    monkeypatch.setattr(mx, "get_array_buffer_size", measured)
+    with pytest.raises(formats.FormatRefusedError, match="cannot be verified"):
+        formats._check_reader_isolation(toy, reader, stage="deepcopy")

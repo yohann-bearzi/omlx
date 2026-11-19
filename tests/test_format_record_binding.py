@@ -132,7 +132,7 @@ def test_a_repeated_layout_uses_the_accepted_format_once_per_matrix_at_most(
             result = nn.Linear(64, 128).to_quantized(**_TOY)
             assert result.scales.shape == (128, 2)
         assert toy.asked == [(64, 128, 8, 1)]
-        assert len(wide.asked) <= 4
+        assert wide.asked == [(64, 128, 8, 1)]
         assert len(toy.accepted) == 1
         # The accepted format lays out 4-bit shapes, the registered one does not.
         with pytest.raises(formats.FormatRefusedError, match="lays out no"):
@@ -142,9 +142,13 @@ def test_a_repeated_layout_uses_the_accepted_format_once_per_matrix_at_most(
 def test_the_registered_object_returned_by_accept_lays_out_a_layer_once(tmp_path, toy):
     toy.reads = lambda record: toy
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
-    with format_load.loading(tmp_path):
-        layer = nn.Linear(64, 128).to_quantized(**_TOY)
-    assert layer.fmt is toy
+    with (
+        format_load.loading(tmp_path),
+        pytest.raises(
+            formats.FormatRefusedError, match="accept returned the registered format"
+        ),
+    ):
+        nn.Linear(64, 128).to_quantized(**_TOY)
     assert toy.asked == [(64, 128, 8, 1)]
 
 

@@ -1351,8 +1351,14 @@ class TestSTTProcessorErrors:
 
         return STTEngine(model_name)
 
+    def _stock_dir(self, tmp_path, name: str) -> str:
+        model_dir = tmp_path / name
+        model_dir.mkdir(parents=True, exist_ok=True)
+        (model_dir / "config.json").write_text("{}")
+        return str(model_dir)
+
     def test_qwen3_asr_missing_feature_extractor_raises_actionable_error(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         """``load_model`` raising ``Can't load feature extractor`` becomes a
         clear message pointing at ``preprocessor_config.json``."""
@@ -1377,7 +1383,7 @@ class TestSTTProcessorErrors:
         monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
         monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
 
-        engine = self._stt_engine("Qwen3-ASR-0.6B-MLX-4bit")
+        engine = self._stt_engine(self._stock_dir(tmp_path, "Qwen3-ASR-0.6B-MLX-4bit"))
         with pytest.raises(RuntimeError) as exc_info:
             asyncio.run(engine.start())
 
@@ -1386,7 +1392,7 @@ class TestSTTProcessorErrors:
         assert "qwen3-asr-0.6b-mlx-4bit" in message
 
     def test_whisper_without_processor_fails_start_with_actionable_error(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
         """Whisper models that load without a HuggingFace processor must
         fail fast at ``start()`` with a clear message, not silently later."""
@@ -1417,7 +1423,7 @@ class TestSTTProcessorErrors:
         monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
         monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
 
-        engine = self._stt_engine("mlx-community/whisper-large-v3-turbo")
+        engine = self._stt_engine(self._stock_dir(tmp_path, "whisper-large-v3-turbo"))
         with pytest.raises(RuntimeError) as exc_info:
             asyncio.run(engine.start())
 
@@ -1425,7 +1431,7 @@ class TestSTTProcessorErrors:
         assert "processor" in message
         assert "preprocessor_config.json" in message or "hugging" in message
 
-    def test_whisper_with_processor_starts_successfully(self, monkeypatch):
+    def test_whisper_with_processor_starts_successfully(self, monkeypatch, tmp_path):
         """A whisper-like model that *does* have a processor loads without error."""
         import asyncio
         import sys
@@ -1448,12 +1454,14 @@ class TestSTTProcessorErrors:
         monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
         monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
 
-        engine = self._stt_engine("mlx-community/whisper-tiny")
+        engine = self._stt_engine(self._stock_dir(tmp_path, "whisper-tiny"))
         # Should not raise.
         asyncio.run(engine.start())
         asyncio.run(engine.stop())
 
-    def test_non_whisper_model_without_processor_attribute_starts(self, monkeypatch):
+    def test_non_whisper_model_without_processor_attribute_starts(
+        self, monkeypatch, tmp_path
+    ):
         """Models that legitimately don't use _processor (non-whisper families)
         must not be incorrectly rejected."""
         import asyncio
@@ -1476,11 +1484,13 @@ class TestSTTProcessorErrors:
         monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
         monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
 
-        engine = self._stt_engine("mlx-community/parakeet-tdt")
+        engine = self._stt_engine(self._stock_dir(tmp_path, "parakeet-tdt"))
         asyncio.run(engine.start())
         asyncio.run(engine.stop())
 
-    def test_unrelated_load_error_is_reraised_without_self_cause(self, monkeypatch):
+    def test_unrelated_load_error_is_reraised_without_self_cause(
+        self, monkeypatch, tmp_path
+    ):
         import asyncio
         import sys
         import types
@@ -1499,7 +1509,9 @@ class TestSTTProcessorErrors:
         monkeypatch.setitem(sys.modules, "mlx_audio.stt", fake_stt)
         monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", fake_utils)
 
-        engine = self._stt_engine("mlx-community/Voxtral-Mini-3B-2507-bf16")
+        engine = self._stt_engine(
+            self._stock_dir(tmp_path, "Voxtral-Mini-3B-2507-bf16")
+        )
         with pytest.raises(ImportError, match="PyTorch") as exc_info:
             asyncio.run(engine.start())
 

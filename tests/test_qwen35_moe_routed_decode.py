@@ -2339,7 +2339,9 @@ def format_checkpoint(tmp_path, qwen_regroup):
     """The test's toy layers share the reader accepted for one Qwen4 checkpoint."""
     from omlx.patches import format_load
 
-    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp"}')
+    (tmp_path / "config.json").write_text(
+        '{"model_type": "qwen4_exp", "omlx_quant_formats": {"toy": {}}}'
+    )
     with testing.verified("qwen4_exp"), format_load.loading(tmp_path):
         yield
 

@@ -821,6 +821,7 @@ def _run_rank(
     *,
     rank: int = 0,
     assignments=None,
+    path_map=None,
     argv_extra=(),
     ceiling: int = 107 * GiB,
     wired_result=(0, None),
@@ -857,6 +858,10 @@ def _run_rank(
     }
 
     # --- process boundaries: never reached in a test -----------------------
+    stock = tmp_path / "stock-metadata"
+    stock.mkdir(exist_ok=True)
+    (stock / "config.json").write_text('{"model_type": "llama"}')
+    monkeypatch.setattr("mlx_lm.utils._download", lambda *args, **kwargs: stock)
     monkeypatch.setattr(torch_stub, "install", lambda: None)
     monkeypatch.setattr(
         mx.distributed, "init", lambda **_kw: _Group(rank, len(assignments))
@@ -931,7 +936,7 @@ def _run_rank(
     monkeypatch.setattr(
         inference_worker,
         "decode_worker_path_map",
-        lambda _plan: {},
+        lambda _plan: path_map or {},
     )
     # Likewise its stage links: none, so ranks keep MLX's own send and receive.
     monkeypatch.setattr(inference_worker, "decode_worker_stage_links", lambda _plan: ())
@@ -1013,6 +1018,30 @@ def _run_rank(
     finally:
         pipeline_patch.clear_assigned_stage()
     return record
+
+
+def test_a_cluster_worker_refuses_the_format_record_in_its_assigned_model(
+    monkeypatch, tmp_path
+):
+    from omlx.formats import FormatRefusedError
+
+    checkpoint = tmp_path / "rank-model"
+    checkpoint.mkdir()
+    (checkpoint / "config.json").write_text(
+        json.dumps({"model_type": "llama", "omlx_quant_formats": {"toy": {}}})
+    )
+    assignments = _uneven_plan()
+    with pytest.raises(FormatRefusedError) as refused:
+        _run_rank(
+            monkeypatch,
+            tmp_path,
+            assignments=assignments,
+            path_map={assignments[0].node_id: str(checkpoint)},
+        )
+    assert (refused.value.mode, refused.value.path) == ("toy", checkpoint)
+    (marker,) = tmp_path.glob("*.json")
+    failure = json.loads(marker.read_text())
+    assert failure["phase"] == "failed" and "FormatRefusedError" in failure["error"]
 
 
 def test_worker_refuses_excess_resident_weights_before_ready(monkeypatch, tmp_path):
