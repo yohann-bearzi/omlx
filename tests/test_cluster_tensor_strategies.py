@@ -25,6 +25,7 @@ from omlx.cluster.tensor_strategies import (
     _uneven_group_ranges,
     apply_tensor_strategy,
 )
+from omlx.formats import testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 
 
@@ -141,12 +142,11 @@ def test_a_model_with_a_format_layer_is_refused_with_the_layer_and_its_mode(
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat())
     shards = []
-    if stacked:
-        tensors = {"weight": mx.zeros((4, 8, 64), mx.uint8), "scales": mx.zeros((4, 8))}
-        layer = FormatSwitchLinear("toy", 8, 1, 64, tensors)
-    else:
-        tensors = {"weight": mx.zeros((8, 64), mx.uint8), "scales": mx.zeros((8,))}
-        layer = FormatLinear("toy", 8, 1, 64, tensors)
+    shape = (4, 8, 64) if stacked else (8, 64)
+    tensors = {"weight": mx.zeros(shape, mx.uint8), "scales": mx.zeros(shape[:-1])}
+    layer_type = FormatSwitchLinear if stacked else FormatLinear
+    with testing.verified(model_type):
+        layer = layer_type("toy", 8, 1, 64, tensors)
 
     class Model(nn.Module):
         def __init__(self):

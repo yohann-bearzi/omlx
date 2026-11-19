@@ -87,7 +87,7 @@ def test_a_block_records_a_linear_s_calls_and_the_face_each_ran(toy):
 
 
 def test_a_block_records_a_stack_s_calls_with_what_its_metal_is_built_for(toy):
-    face = _toy("linear")
+    face = replace(_toy("linear"), dtypes=(mx.float32,))
     toy(face)
     switch = _toy_switch(40, 320)
     tokens, routed = _ints((1, 4, 1, 1, 320)), _experts((1, 4, 3))
@@ -100,9 +100,16 @@ def test_a_block_records_a_stack_s_calls_with_what_its_metal_is_built_for(toy):
         ):
             got = switch(x, indices, sorted_indices=ordered)
             assert np.array_equal(np.array(got), _want(switch, x, indices))
-        none = switch(token, few[:0])  # no pair: the decode of none
-        mx.eval(none)
-        assert none.shape == (0, 1, 40)
+        with testing.layer_calls() as empty:
+            none = switch(token, few[:0])
+            mx.eval(none)
+        assert none.shape == (0, 1, 40) and empty == []
+
+        # The face serves float32; a nonempty float16 call uses the decoder.
+        half = switch(token.astype(mx.float16), few)
+        assert np.array_equal(
+            np.array(half), _want(switch, token, few).astype(np.float16)
+        )
     assert calls == [
         _call(switch, face, (mx.float32, 3, False)),
         _call(switch, face, (mx.float32, 3, False)),
