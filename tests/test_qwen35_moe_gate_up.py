@@ -6,12 +6,21 @@ from __future__ import annotations
 import logging
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 from mlx_lm.models.switch_layers import SwitchGLU
 
 import omlx.patches.qwen35_moe_gate_up as patch_mod
 from omlx import formats
+from omlx.formats import linear as format_linear
+from omlx.formats import testing
+from omlx.formats.linear import FormatSwitchLinear
 from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
+from tests.test_formats_load import _PATCHED, _Loadable
+from tests.test_m5_gather_qmm_nax import qwen_regroup as qwen_regroup
+from tests.test_moe_verify_gather import _proofs as _gather_proofs
+
+pytestmark = pytest.mark.usefixtures("qwen_regroup")
 
 E, TOPK, HIDDEN, INTER = 8, 2, 64, 32
 
@@ -65,24 +74,6 @@ def _make_model(
     model.blocks = blocks
     model.named_modules = lambda: [(f"blocks.{i}", b) for i, b in enumerate(blocks)]
     return model
-
-
-@pytest.fixture(autouse=True)
-def _restore_call(monkeypatch):
-    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
-
-    orig = getattr(SwitchGLU, "_omlx_gate_up_original_call", SwitchGLU.__call__)
-    monkeypatch.setattr(
-        Qwen3_5BatchInvariantForward,
-        "_switch_glu",
-        Qwen3_5BatchInvariantForward._switch_glu,
-    )
-    yield
-    SwitchGLU.__call__ = orig
-    for attr in ("_omlx_gate_up_fused_call", "_omlx_gate_up_original_call"):
-        if hasattr(SwitchGLU, attr):
-            delattr(SwitchGLU, attr)
-    patch_mod._CALL_PATCHED = False
 
 
 def _forward_all(model, x, indices):
@@ -456,3 +447,439 @@ def test_vlm_decode_plan_follows_replaced_experts(monkeypatch):
     )
     gate_up.scales = (gate_up.scales * 0.5).astype(gate_up.scales.dtype)
     _assert_decode_plan_matches_per_call(monkeypatch, glu, 5)
+
+
+# A switch block whose experts load as a quant format's layers (through
+# omlx.patches.format_load, as a checkpoint of a plugin format loads).
+_FORMAT_CHECKPOINT = {"group_size": 1, "bits": 8, "mode": "toy"}
+_FORMAT_STACKS = (
+    ("gate_proj", INTER, HIDDEN),
+    ("up_proj", INTER, HIDDEN),
+    ("down_proj", HIDDEN, INTER),
+)
+
+
+def _format_glu(experts=E, cls=None):
+    """mlx-vlm's SwitchGLU (or ``cls``) loaded as the toy format's stacks:
+    one byte a weight and a float32 scale a row (tests.test_formats_load)."""
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from tests.test_formats_kernels import _matrix
+
+    glu = (cls or VLMSwitchGLU)(HIDDEN, INTER, experts)
+    nn.quantize(glu, **_FORMAT_CHECKPOINT)
+    for i, (name, n, k) in enumerate(_FORMAT_STACKS):
+        (codes, scales), _, _ = _matrix(experts * n, k, seed=20 + i)
+        weights = [("weight", codes.reshape(experts, n, k))]
+        # Scales of their own for each projection (powers of two: exact).
+        weights.append(("scales", scales.reshape(experts, n) * 2.0**i))
+        glu[name].load_weights(weights, strict=True)
+    glu.eval()
+    mx.eval(glu.parameters())
+    return glu
+
+
+@pytest.fixture
+def format_checkpoint(tmp_path):
+    """The test's toy layers share the reader accepted for one Qwen4 checkpoint."""
+    from omlx.patches import format_load
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp"}')
+    with testing.verified("qwen4_exp"), format_load.loading(tmp_path):
+        yield
+
+
+@pytest.fixture
+def loaded_format(monkeypatch, format_checkpoint):
+    """The toy format, registered and loadable, with the face of the kernel
+    tests: the loaders build its layers as FormatLinear and
+    FormatSwitchLinear (MLX's own to_quantized under the test's wrappers,
+    as tests.test_formats_load has it)."""
+    from omlx.patches import format_load
+    from tests.test_formats_kernels import _toy
+
+    # The load patch visits each switch module once. Restore that bookkeeping
+    # together with the class methods when the fixture exits.
+    monkeypatch.setattr(
+        format_load, "_PENDING", format_load._PENDING | set(format_load._SWITCH_MODULES)
+    )
+    for cls in _PATCHED:
+        original = cls.to_quantized
+        monkeypatch.setattr(
+            cls, "to_quantized", getattr(original, "__wrapped__", original)
+        )
+    formats.load()
+    fmt = _Loadable()
+    fmt.face = _toy("gate_up_fusion")
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    format_load.apply_format_load_patch()
+    return fmt
+
+
+@pytest.mark.parametrize("length", [1, 3, 64])
+def test_a_block_of_format_stacks_fuses_its_gate_and_up(loaded_format, length):
+    """The [gate; up] concatenation of each of the format's tensors along
+    the rows is one stack of the format: decode, verify blocks (the verify
+    gather) and prefill keep their bits."""
+    glu = _format_glu()
+    gate, up = glu.gate_proj, glu.up_proj
+    assert type(gate) is FormatSwitchLinear
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    mx.random.seed(length)
+    x = mx.random.randint(-8, 9, (2, length, HIDDEN)).astype(mx.float32)
+    idx = mx.random.randint(0, E, shape=(2, length, TOPK)).astype(mx.uint32)
+    weights = mx.full((2, length, TOPK), 0.5)
+    ref = glu(x, idx, weights, mx.zeros_like(x))
+    mx.eval(ref)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    fused = glu.gate_up_proj
+    assert type(fused) is FormatSwitchLinear
+    assert (fused.mode, fused.bits, fused.group_size) == ("toy", 8, 1)
+    assert fused.input_dims == HIDDEN and fused.output_dims == 2 * INTER
+    for name in ("weight", "scales"):
+        assert mx.array_equal(
+            fused[name], mx.concatenate([gate[name], up[name]], axis=1)
+        ).item()
+    out = glu(x, idx, weights, mx.zeros_like(x))
+    mx.eval(out)
+    assert mx.array_equal(ref, out).item()
+    # A verify block of the fused stack takes the verify gather.
+    proofs = [(bool(p.ran), p.failed) for p in _gather_proofs()]
+    assert proofs == ([(True, False)] if length == 3 else [])
+
+
+def test_format_stacks_that_are_not_one_layout_row_by_row_stay_unfused(loaded_format):
+    """Fused only when each tensor of the two stacks has the same dtype and
+    shape, the stacks' rows as its second axis, at the same bits and group
+    size."""
+    from tests.test_formats_kernels import _matrix
+
+    def stack(n=INTER, bits=8, scales_shape=None, scales_dtype=mx.float32):
+        (codes, scales), _, _ = _matrix(E * n, HIDDEN)
+        scales = scales.reshape(E, n) if scales_shape is None else mx.ones(scales_shape)
+        tensors = {
+            "weight": codes.reshape(E, n, HIDDEN),
+            "scales": scales.astype(scales_dtype),
+        }
+        return FormatSwitchLinear("toy", bits, 1, HIDDEN, tensors)
+
+    for gate, up in (
+        (stack(bits=7), stack()),  # other bits
+        (stack(), stack(n=2 * INTER)),  # other rows
+        (stack(scales_dtype=mx.float16), stack()),
+        (stack(), stack(scales_shape=(E, INTER, 2))),  # rows of other shapes
+        (stack(scales_shape=(E, 1)), stack(scales_shape=(E, 1))),  # not a row's
+        (stack(scales_shape=(E,)), stack(scales_shape=(E,))),
+    ):
+        glu = _format_glu()
+        glu.gate_proj, glu.up_proj = gate, up
+        model = _FakeQwen4Model()
+        model.named_modules = lambda glu=glu: [("experts", glu)]
+        assert apply_qwen35_moe_gate_up_fusion(model) == 0
+        assert glu.gate_proj is gate and "gate_up_proj" not in glu
+    glu = _format_glu()
+    glu.gate_proj, glu.up_proj = stack(), stack()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+
+
+@pytest.mark.parametrize("lm", [False, True])
+def test_a_fused_format_stack_keeps_no_plan_of_its_parts(loaded_format, lm):
+    """A layer's plan keeps the arrays it was built over: the fused stack
+    (and mlx-vlm's gate and up views) start without one, so no plan holds
+    the stacks of before the fusion."""
+    glu = _format_glu(cls=SwitchGLU if lm else None)
+    x = mx.random.randint(-8, 9, (1, 1, HIDDEN)).astype(mx.float32)
+    idx = mx.random.randint(0, E, shape=(1, 1, TOPK)).astype(mx.uint32)
+    mx.eval(glu(x, idx))
+    assert all(format_linear._KEPT in vars(glu[n]) for n in ("gate_proj", "up_proj"))
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    layers = ("gate_up_proj",) if lm else ("gate_up_proj", "gate_proj", "up_proj")
+    for name in layers:
+        assert format_linear._KEPT not in vars(glu[name]), name
+
+
+def test_a_batched_verify_of_a_fused_format_stack_never_runs_its_views(
+    loaded_format, monkeypatch
+):
+    """mlx-vlm's batched verify (``batch x top_k >= 64``) is not given to
+    the original call, which runs the gate and up views (a launch copies a
+    view whole) or, at mlx-vlm 0.7.11, each token through the fused stack:
+    a fused format stack's goes to the fused verify switch, one launch a
+    projection for the block, with the unfused layers' bits."""
+    glu = _format_glu(experts=16)
+    batch, length, top_k = 8, 2, 8  # 64 routes per position, 8 rows
+    mx.random.seed(5)
+    x = mx.random.randint(-8, 9, (batch, length, HIDDEN)).astype(mx.float32)
+    idx = mx.random.randint(0, 16, shape=(batch, length, top_k)).astype(mx.uint32)
+    weights = mx.full((batch, length, top_k), 0.5)
+    ref = glu(x, idx, weights)
+    mx.eval(ref)
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    views, called = (glu.gate_proj, glu.up_proj), []
+    call = FormatSwitchLinear.__call__
+    monkeypatch.setattr(
+        FormatSwitchLinear,
+        "__call__",
+        lambda self, *a, **k: (called.append(self), call(self, *a, **k))[1],
+    )
+    out = glu(x, idx, weights)
+    mx.eval(out)
+    assert mx.array_equal(ref, out).item()
+    assert not any(layer is view for layer in called for view in views)
+    assert called == [glu.gate_up_proj, glu.down_proj]
+
+
+@testing.verified("qwen4_exp")
+def test_fusing_warm_format_stacks_keeps_the_sorted_tile_route(monkeypatch):
+    """On a sorted prefill whose epilogue declines, both fused projections
+    run their tile kernel, with the original block's bits."""
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from omlx.formats import kernels
+    from omlx.formats.affine import AffineFormat
+
+    class PackedRows(AffineFormat):
+        mode = "test_packed_rows"
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, k // group_size), mx.bfloat16),
+                "biases": ((n, k // group_size), mx.bfloat16),
+            }
+
+    fmt = PackedRows()
+    formats.load()
+    mx.random.seed(615)
+    hidden, inter, experts, tokens = 256, 128, 8, 64
+    glu = VLMSwitchGLU(hidden, inter, experts)
+    for name, k, n in (
+        ("gate_proj", hidden, inter),
+        ("up_proj", hidden, inter),
+        ("down_proj", inter, hidden),
+    ):
+        weights = (mx.random.normal((experts, n, k)) * 0.125).astype(mx.bfloat16)
+        w, scales, biases = mx.quantize(weights, group_size=64, bits=4)
+        glu[name] = FormatSwitchLinear(
+            fmt, 4, 64, k, {"weight": w, "scales": scales, "biases": biases}
+        )
+    glu.eval()
+    x = mx.random.normal((1, tokens, hidden)).astype(mx.bfloat16)
+    idx = mx.random.randint(0, experts, (1, tokens, 2)).astype(mx.uint32)
+    weights = mx.full(idx.shape, 0.5, dtype=x.dtype)
+    gate, up, down = glu.gate_proj, glu.up_proj, glu.down_proj
+    route = (
+        "format_switch_tile_nax"
+        if format_linear._nax_host()
+        else "format_switch_tile_steel"
+    )
+    called = []
+    forward = FormatSwitchLinear.__call__
+
+    def sorted_call(layer, rows, indices, sorted_indices=False):
+        assert sorted_indices
+        result = forward(layer, rows, indices, sorted_indices=True)
+        kept = vars(layer)[format_linear._KEPT]
+        tile = kept[3]
+        assert tile.proof is kernels.proof(
+            route, tile.face, tuple(a.dtype for a in tile.operands)
+        )
+        signature = (
+            rows.shape,
+            rows.dtype,
+            indices.shape,
+            indices.dtype,
+            layer.output_dims,
+            layer.num_experts,
+        )
+        assert signature in tile.proof.graphs
+        assert not kept[0].proof.ran
+        called.append(id(layer))
+        return result
+
+    monkeypatch.setattr(FormatSwitchLinear, "__call__", sorted_call)
+    monkeypatch.setattr(patch_mod, "fused_gate_up_activation", lambda *a, **kw: None)
+    ref = glu(x, idx, weights)
+    mx.eval(ref)
+    assert sorted(called) == sorted(map(id, (gate, up, down)))
+    assert mx.isfinite(ref).all().item() and (ref != 0).any().item()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    fused = glu.gate_up_proj
+    assert all(format_linear._KEPT not in vars(layer) for layer in (gate, up, fused))
+    assert format_linear._KEPT in vars(down)
+    called.clear()
+    got = glu(x, idx, weights)
+    assert called == [id(fused), id(down)]
+    assert mx.array_equal(got.view(mx.uint16), ref.view(mx.uint16)).item()
+
+
+@testing.verified("qwen4_exp")
+def test_gate_and_up_from_two_checkpoint_readers_stay_separate(monkeypatch):
+    from copy import copy
+
+    from tests.test_formats_load import _Loadable
+
+    fmt = _Loadable()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    first, second = copy(fmt), copy(fmt)
+    glu = SwitchGLU(HIDDEN, INTER, E)
+    arrays = {
+        "weight": mx.zeros((E, INTER, HIDDEN), mx.uint8),
+        "scales": mx.ones((E, INTER), mx.float32),
+    }
+    glu.gate_proj = FormatSwitchLinear(first, 8, 1, HIDDEN, arrays)
+    glu.up_proj = FormatSwitchLinear(second, 8, 1, HIDDEN, arrays)
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert glu.gate_proj.fmt is first and glu.up_proj.fmt is second
+
+
+@testing.verified("qwen4_exp")
+def test_gate_and_up_require_the_same_input_width():
+    from tests.test_formats_load import _Loadable
+
+    class BlockPacked(_Loadable):
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, (k + 31) // 32), mx.uint32),
+                "scales": ((n,), mx.float32),
+            }
+
+    fmt = BlockPacked()
+    glu = SwitchGLU(HIDDEN, INTER, E)
+    # Packing pads K to a block. Different input widths have identical storage.
+    for name, k in (("gate_proj", HIDDEN), ("up_proj", HIDDEN - 1)):
+        tensors = {
+            key: mx.zeros((E, *shape), dtype)
+            for key, (shape, dtype) in fmt.layout(k, INTER, 4, 32).items()
+        }
+        glu[name] = FormatSwitchLinear(fmt, 4, 32, k, tensors)
+    assert glu.gate_proj.weight.shape == glu.up_proj.weight.shape
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert glu.gate_proj.input_dims == HIDDEN and glu.up_proj.input_dims == HIDDEN - 1
+
+
+@testing.verified("qwen4_exp")
+def test_gate_and_up_require_a_matching_layout_at_twice_the_output_width():
+    from tests.test_formats_load import _Loadable
+
+    class Padded(_Loadable):
+        def layout(self, k, n, bits, group_size):
+            shape = super().layout(k, n, bits, group_size)
+            if n == 2 * INTER:
+                shape["weight"] = ((n, k + 32), mx.uint8)
+            return shape
+
+    fmt = Padded()
+    glu = SwitchGLU(HIDDEN, INTER, E)
+    for name in ("gate_proj", "up_proj"):
+        tensors = {
+            key: mx.zeros((E, *shape), dtype)
+            for key, (shape, dtype) in fmt.layout(HIDDEN, INTER, 8, 1).items()
+        }
+        glu[name] = FormatSwitchLinear(fmt, 8, 1, HIDDEN, tensors)
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert "gate_up_proj" not in glu
+
+
+@pytest.mark.parametrize("bad", ["shape", "dtype", "no_layout"])
+@testing.verified("qwen4_exp")
+def test_equal_gate_and_up_buffers_must_match_the_declared_layout(bad):
+    from tests.test_formats_load import _Loadable
+
+    class Reader(_Loadable):
+        def layout(self, k, n, bits, group_size):
+            if bad == "no_layout":
+                return None
+            return super().layout(k, n, bits, group_size)
+
+    fmt = Reader()
+    glu = SwitchGLU(HIDDEN, INTER, E)
+    scales = mx.ones((E, INTER, 1) if bad == "shape" else (E, INTER))
+    tensors = {
+        "weight": mx.zeros((E, INTER, HIDDEN), mx.uint8),
+        "scales": scales.astype(mx.float16 if bad == "dtype" else mx.float32),
+    }
+    for name in ("gate_proj", "up_proj"):
+        glu[name] = FormatSwitchLinear(fmt, 8, 1, HIDDEN, tensors)
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 0
+    assert "gate_up_proj" not in glu
+
+
+@pytest.mark.parametrize("lm", [False, True], ids=["vlm", "lm"])
+@pytest.mark.parametrize("pending", [None, "gate_proj", "up_proj"])
+def test_post_load_fusion_uses_only_materialized_stacks(lm, pending):
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from tests.test_formats_load import _Loadable
+
+    reader = _Loadable()
+    glu = (SwitchGLU if lm else VLMSwitchGLU)(HIDDEN, INTER, E)
+    parts = []
+    with testing.verified("qwen4_exp"):
+        for i, name in enumerate(("gate_proj", "up_proj"), 1):
+            arrays = {
+                "weight": mx.full((E, INTER, HIDDEN), i, mx.uint8),
+                "scales": mx.full((E, INTER), 2 * i, mx.float32),
+            }
+            bias = mx.full((E, INTER), -i, mx.float32)
+            glu[name] = FormatSwitchLinear(
+                reader, 8, 1, HIDDEN, arrays, bias, placeholders=name == pending
+            )
+            parts.append({**arrays, "bias": bias})
+    glu.eval()
+    gate, up = glu.gate_proj, glu.up_proj
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    # The engine transforms the loaded model after its constructor gate closes.
+    with pytest.raises(formats.FormatRefusedError):
+        FormatSwitchLinear(reader, 8, 1, HIDDEN, arrays, bias)
+    if pending is not None:
+        first = type(glu)(HIDDEN, INTER, E)
+        model.named_modules = lambda: [("first", first), ("second", glu)]
+        with pytest.raises(ValueError, match="placeholder"):
+            apply_qwen35_moe_gate_up_fusion(model)
+        assert "gate_up_proj" not in first and "gate_up_proj" not in glu
+        assert glu.gate_proj is gate and glu.up_proj is up
+        with pytest.raises(ValueError, match="placeholder"):
+            glu[pending].refuse_placeholders()
+        return
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    fused = glu.gate_up_proj
+    assert fused.fmt is reader and not fused.training
+    assert (fused.num_experts, fused.input_dims, fused.output_dims) == (
+        E,
+        HIDDEN,
+        2 * INTER,
+    )
+    fused.refuse_placeholders()
+    for name in parts[0]:
+        axis = -1 if name == "bias" else 1
+        expected = mx.concatenate([p[name] for p in parts], axis)
+        assert mx.array_equal(fused[name], expected).item()
+    if lm:
+        assert "gate_proj" not in glu and "up_proj" not in glu
+    else:
+        assert glu.gate_proj is gate and glu.up_proj is up
+        for layer, part in zip((gate, up), parts):
+            assert layer.output_dims == INTER
+            for name, expected in part.items():
+                assert mx.array_equal(layer[name], expected).item()

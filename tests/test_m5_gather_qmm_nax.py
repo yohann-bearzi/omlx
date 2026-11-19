@@ -1713,16 +1713,20 @@ def qwen_regroup(monkeypatch):
 
     verifier = Qwen3_5BatchInvariantForward
     monkeypatch.setattr(verifier, "_switch_glu", verifier._switch_glu)
-    saved = {cls: cls.__dict__.get("__call__") for cls in (SwitchGLU, VLMSwitchGLU)}
-    flags = ("_omlx_gate_up_fused_call", "_omlx_gate_up_original_call")
+    monkeypatch.setattr(gate_up, "_CALL_PATCHED", gate_up._CALL_PATCHED)
+    absent = object()
+    hooks = ("__call__", "_omlx_gate_up_fused_call", "_omlx_gate_up_original_call")
+    saved = [
+        (cls, name, vars(cls).get(name, absent))
+        for cls in (SwitchGLU, VLMSwitchGLU)
+        for name in hooks
+    ]
     yield gate_up
-    for cls, call in saved.items():
-        original = cls.__dict__.get("_omlx_gate_up_original_call", call)
-        cls.__call__ = original if original is not None else call
-        for attr in flags:
-            if attr in cls.__dict__:
-                delattr(cls, attr)
-    gate_up._CALL_PATCHED = False
+    for cls, name, value in saved:
+        if value is not absent:
+            setattr(cls, name, value)
+        elif name in vars(cls):
+            delattr(cls, name)
 
 
 def _regrouped(gate_up_mod, glu):

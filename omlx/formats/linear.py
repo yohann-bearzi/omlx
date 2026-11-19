@@ -638,12 +638,36 @@ class _FormatLayer(nn.Module):
         _load_layout: dict | None = None,
     ) -> None:
         formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
-        super().__init__()
         if isinstance(fmt, str):
             # A layer built by hand, of a registered mode: its format.
             mode, fmt = fmt, formats.get(fmt)
             if fmt is None:
                 raise ValueError(f"no quant format is registered for mode {mode!r}")
+        self._init_tensors(
+            fmt,
+            bits,
+            group_size,
+            input_dims,
+            tensors,
+            bias,
+            placeholders=placeholders,
+            layout=_load_layout,
+        )
+
+    def _init_tensors(
+        self,
+        fmt: formats.QuantFormat,
+        bits: int,
+        group_size: int,
+        input_dims: int,
+        tensors: dict[str, mx.array],
+        bias: mx.array | None,
+        *,
+        placeholders: bool = False,
+        layout: dict | None = None,
+    ) -> None:
+        """Initialize an admitted reader at the geometry of these tensors."""
+        super().__init__()
         mode = fmt.mode
         names = ("weight", *fmt.tensors)
         if set(tensors) != set(names):
@@ -660,7 +684,6 @@ class _FormatLayer(nn.Module):
         # What the format lays out for the matrix the layer holds: a layer's
         # N is its weight's first axis.
         n = weight.shape[-2]
-        layout = _load_layout
         if layout is None:
             layout = fmt.layout(input_dims, n, bits, group_size)
         if layout is not None:
@@ -875,6 +898,31 @@ class FormatSwitchLinear(_FormatLayer):
     @property
     def num_experts(self) -> int:
         return self["weight"].shape[0]
+
+    def _stacked_outputs(self, other: FormatSwitchLinear) -> FormatSwitchLinear:
+        """Join two admitted, row-stackable projections after checkpoint load.
+
+        The fusion has checked their layouts. Only the layers themselves
+        supply the reader, dimensions and arrays for the derived projection.
+        """
+        self.refuse_placeholders()
+        other.refuse_placeholders()
+        tensors = {
+            name: mx.concatenate([self[name], other[name]], axis=1)
+            for name in self._tensors
+        }
+        bias = (
+            mx.concatenate([self["bias"], other["bias"]], axis=-1)
+            if "bias" in self
+            else None
+        )
+        layer = FormatSwitchLinear.__new__(FormatSwitchLinear)
+        layer._init_tensors(
+            self.fmt, self.bits, self.group_size, self.input_dims, tensors, bias
+        )
+        layer.train(self.training)
+        layer._no_grad = set(self._no_grad)
+        return layer
 
     def _through_decode(self, x, indices, sorted_indices):
         """``x`` times the matrices at ``indices``, decoded: what the rows

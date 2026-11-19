@@ -111,6 +111,13 @@ A layout that breaks these rules for a matrix is refused, by oQ before it encode
 
 A format whose tensors are all row-major keeps a matrix's rows apart: where every tensor of `layout(k, n, ...)` has N as its first axis, and `layout(k, 2n, ...)` is the same with 2N, row `r` of the decoded matrix depends on row `r` of each tensor alone. Kernels then stack two matrices of one K along N (a gate and an up projection, fused) and read the stack as one. `formats.stackable(fmt, k, n, bits, group_size)` answers whether a format's matrices may be stacked. It requires a positive N and a layout declaring exactly the weight and the tensors named by `fmt.tensors`. What the layout cannot show is the format's promise, and its tests check it with `omlx.formats.testing.rows_stack(fmt, first, second, k, bits, group_size, x)`: the decode of two stacked matrices is their two decodes, bit for bit, and with `x` so are the dot rows (see [Test a format](#test-a-format)). A format that a layout does not describe whole (a tensor shared by every row, a row's parameters that depend on others) is not stackable: its layout must say so, with a tensor whose first axis is not N.
 
+A switch block's gate and up projections can fuse when they share one checkpoint
+reader, input width, bit width and group size. Their stored tensors must match
+the row layout above. Fusion refuses a source that still holds a checkpoint
+placeholder. Once both are loaded, the same reader serves a new projection
+with twice the output width. It concatenates each tensor in gate, then up
+order along its rows and can take the verify gather.
+
 A switch layer's indices are integers of any integer dtype (mlx-vlm's are `uint32`); others are refused. A negative index counts from the end of the stack, as MLX's indexing does, on every route. A call of 2^30 pairs or more runs through `decode`: MLX's grid is int32.
 
 A layer keeps the format's tensors in the shapes and dtypes it is built with, which the face reads: an array of another shape or dtype assigned to one of them is not taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 activations recast a format layer's bias alone.

@@ -48,12 +48,13 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from .. import formats
+from ..formats.linear import FormatSwitchLinear
 from ..scheduler import _sync_and_clear_cache
 from . import moe_verify_gather
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
-from .moe_routes import sort_routes
 from .module_cache import cached_per_module
+from .moe_routes import sort_routes
 
 logger = logging.getLogger(__name__)
 
@@ -105,42 +106,85 @@ def _can_fuse(switch_mlp: Any) -> bool:
             return False
         if (gate.get("biases") is None) != (up.get("biases") is None):
             return False
+    elif isinstance(gate, FormatSwitchLinear):
+        fmt = gate.fmt
+        k, n = gate.input_dims, gate.output_dims
+        if (
+            fmt is not up.fmt
+            or (k, gate.bits, gate.group_size)
+            != (up.input_dims, up.bits, up.group_size)
+            or not formats.stackable(fmt, k, n, gate.bits, gate.group_size)
+        ):
+            return False
+        # The declaration covers one matrix. Both expert stacks must actually
+        # store it, with the same concrete dtype even for a floating placeholder.
+        layout = fmt.layout(k, n, gate.bits, gate.group_size)
+        if layout.keys() != {"weight", *fmt.tensors}:
+            return False
+        for name, (shape, dtype) in layout.items():
+            a, b = gate.get(name), up.get(name)
+            if (
+                not isinstance(a, mx.array)
+                or not isinstance(b, mx.array)
+                or a.shape != (gate.num_experts, *shape)
+                or a.shape != b.shape
+                or a.dtype != b.dtype
+                or (
+                    not mx.issubdtype(a.dtype, mx.floating)
+                    if dtype is None
+                    else a.dtype != dtype
+                )
+            ):
+                return False
     elif not isinstance(gate, (SwitchLinear, VLMSwitchLinear)):
         return False
     if ("bias" in gate) != ("bias" in up):
         return False
     gate_w, up_w = gate["weight"], up["weight"]
-    return gate_w.shape == up_w.shape and gate_w.dtype == up_w.dtype
+    if gate_w.shape != up_w.shape or gate_w.dtype != up_w.dtype:
+        return False
+    if isinstance(gate, FormatSwitchLinear):
+        # Check every target before installing hooks or rewriting any block.
+        gate.refuse_placeholders()
+        up.refuse_placeholders()
+    return True
 
 
 def _fuse_one(switch_mlp: Any) -> None:
     gate, up = switch_mlp.gate_proj, switch_mlp.up_proj
     # Concat order is [gate, up] along the output axis, matching the GLM
     # DSA fused layout and the HF gate_up_proj checkpoint convention.
-    fused = {"weight": mx.concatenate([gate["weight"], up["weight"]], axis=1)}
-    if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
-        fused["scales"] = mx.concatenate([gate["scales"], up["scales"]], axis=1)
-        if gate.get("biases") is not None:
-            fused["biases"] = mx.concatenate([gate["biases"], up["biases"]], axis=1)
-    if "bias" in gate:
-        fused["bias"] = mx.concatenate([gate["bias"], up["bias"]], axis=-1)
+    keep_views = type(switch_mlp) is VLMSwitchGLU
+    if isinstance(gate, FormatSwitchLinear):
+        gate_up = gate._stacked_outputs(up)
+        fused = gate_up.parameters()
+    else:
+        names = ["weight"]
+        if isinstance(gate, (QuantizedSwitchLinear, VLMQuantizedSwitchLinear)):
+            names.append("scales")
+            if gate.get("biases") is not None:
+                names.append("biases")
+        if "bias" in gate:
+            names.append("bias")
+        fused = {
+            name: mx.concatenate(
+                [gate[name], up[name]], axis=-1 if name == "bias" else 1
+            )
+            for name in names
+        }
+        gate_up = copy.copy(gate) if keep_views else gate
     mx.eval(list(fused.values()))
-
-    # Reuse the gate module as the fused container so quant params and
-    # frozen state carry over; dropping gate_proj/up_proj frees the
-    # original buffers.
-    if type(switch_mlp) is VLMSwitchGLU:
-        gate_up = copy.copy(gate)
+    if not isinstance(gate, FormatSwitchLinear):
         for name, array in fused.items():
             setattr(gate_up, name, array)
+
+    if keep_views:
+        for name, array in fused.items():
             gate[name], up[name] = mx.split(array, 2, axis=-1 if name == "bias" else 1)
         # Verify uses these views on the engine thread after loading.
         mx.eval([gate[name] for name in fused], [up[name] for name in fused])
-        switch_mlp.gate_up_proj = gate_up
-    else:
-        for name, array in fused.items():
-            setattr(gate, name, array)
-        switch_mlp.gate_up_proj = gate
+    switch_mlp.gate_up_proj = gate_up
+    if not keep_views:
         del switch_mlp.gate_proj
         del switch_mlp.up_proj
 
@@ -268,7 +312,10 @@ def _make_vlm_patched_call(original):
         if getattr(self, "gate_up_proj", None) is None:
             return original(self, x, indices, weights, shared, residual)
         if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
-            if x.shape[0] * indices.shape[-1] >= 64:
+            # original() runs the gate and up views, which a format stack's
+            # rows kernel would copy whole at every launch.
+            fused_format = type(self.gate_up_proj) is FormatSwitchLinear
+            if x.shape[0] * indices.shape[-1] >= 64 and not fused_format:
                 return original(self, x, indices, weights, shared, residual)
             # The upstream kernel would copy the strided gate/up views.
             routed = _fused_verify_switch(self, x, indices)
