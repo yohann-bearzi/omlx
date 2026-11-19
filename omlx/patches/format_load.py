@@ -454,7 +454,8 @@ class _Checkpoint:
             placeholders = layer._load_origin[0]
             # A tensor of another shape or dtype is not taken (the layer keeps
             # its placeholder) and recorded as offered: named as it was.
-            for name, offered in getattr(layer, "_placeholders", {}).items():
+            pending = getattr(layer, "_placeholders", {})
+            for name, offered in pending.items():
                 if offered is not None:
                     if offered[0] is None:
                         raise _refused(
@@ -471,7 +472,11 @@ class _Checkpoint:
                         layer.mode,
                         self,
                     )
-            left = [name for name, held in placeholders.items() if layer[name] is held]
+            left = [
+                name
+                for name, held in placeholders.items()
+                if layer[name] is held or name in pending
+            ]
             if left and len(left) < len(placeholders):
                 raise _refused(
                     f"the load filled {path} but its {', '.join(left)}: the "
@@ -593,7 +598,12 @@ def check_loaded(model) -> None:
         if held is None:
             continue
         tensors, checkpoint = held
-        left = [tensor for tensor, kept in tensors.items() if module[tensor] is kept]
+        pending = getattr(module, "_placeholders", {})
+        left = [
+            tensor
+            for tensor, kept in tensors.items()
+            if module[tensor] is kept or tensor in pending
+        ]
         if left:
             # Kept: a check of it again (another thread's, a later caller's)
             # refuses it again.

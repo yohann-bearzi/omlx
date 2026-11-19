@@ -2270,6 +2270,35 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     format_load.check_loaded(model)
 
 
+def test_check_loaded_refuses_placeholders_reassigned_after_loading(toy, tmp_path):
+    path = _without_gate(tmp_path / "partial")
+    model, _ = load_model(path, strict=False)
+    layer = _gate_proj(model)
+    for name in ("weight", "scales"):
+        held = layer[name]
+        layer[name] = mx.zeros_like(held)
+        assert layer[name] is not held
+    for _ in range(2):
+        with pytest.raises(formats.FormatRefusedError) as refusal:
+            format_load.check_loaded(model)
+        assert (refusal.value.path, refusal.value.written) == (path, "omlx-toy 0.3.1")
+        assert f"{_GATE} without its weight, scales" in str(refusal.value)
+
+
+def test_library_exit_refuses_a_missing_scale_reassigned_after_its_load(toy, tmp_path):
+    path = _renamed_scales(tmp_path / "partial")
+    with format_load.loading(path, by_loader=True) as outer:
+        model, _ = load_model(path, strict=False)
+    layer = _gate_proj(model)
+    scale = layer["scales"]
+    layer["scales"] = mx.zeros_like(scale)
+    assert layer["scales"] is not scale
+    with pytest.raises(formats.FormatRefusedError) as refusal:
+        outer.check(model)
+    assert refusal.value.path == path
+    assert f"the load filled {_GATE} but its scales" in refusal.value.reason
+
+
 def test_a_process_that_built_no_format_layer_walks_no_model(monkeypatch):
     monkeypatch.setattr(format_load, "_BUILT_ANY", False)
 
