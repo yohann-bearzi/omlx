@@ -1702,6 +1702,53 @@ def test_a_configured_object_that_would_not_load_is_refused(
     assert not output.exists() and fitted.offered == toy.offered == []
 
 
+def test_writer_and_loader_accept_the_record_on_private_copies(
+    source, toy, tmp_path, monkeypatch
+):
+    readers, laid_out = [], set()
+    layout = _Codec.layout
+
+    def accept(self, record):
+        readers.append(self)
+        self.fitted_levels = tuple(record["levels"])
+
+    def read_layout(self, *geometry):
+        if hasattr(self, "fitted_levels"):
+            laid_out.add(id(self))
+        return layout(self, *geometry)
+
+    monkeypatch.setattr(_Codec, "accept", accept)
+    monkeypatch.setattr(_Codec, "layout", read_layout)
+    fitted = _Codec()
+    fitted.record = lambda: {"levels": [2, 5]}
+    output = tmp_path / "fitted"
+    _, config, applied = _quantize(source, output, quant_format=fitted)
+    assert sorted(_in_format(config)) == applied
+    maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
+    loaded = dict(model.named_modules())[applied[0]].fmt
+    assert loaded.fitted_levels == (2, 5)
+    assert len(readers) == 2 and readers[0] is not readers[1]
+    assert loaded is readers[1]
+    assert laid_out == {id(reader) for reader in readers}
+    assert all(reader is not toy and reader is not fitted for reader in readers)
+    assert not hasattr(toy, "fitted_levels")
+
+
+def test_writer_refuses_an_uncopyable_reader_before_creating_output(
+    source, toy, tmp_path, monkeypatch
+):
+    def cannot_copy(self, memo):
+        raise RuntimeError("reader owns a lock")
+
+    monkeypatch.setattr(_Codec, "__deepcopy__", cannot_copy, raising=False)
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError, match="cannot be copied.*reader owns a lock"):
+        _quantize(source, output, quant_format=toy)
+    assert not output.exists() and not output.with_suffix(".unverified").exists()
+    assert not toy.encoded
+
+
 @pytest.mark.parametrize("kind", ["raises", "configures", "returns"])
 def test_a_record_the_registered_format_does_not_read_is_refused(
     source, toy, tmp_path, monkeypatch, kind

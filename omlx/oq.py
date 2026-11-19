@@ -7070,14 +7070,22 @@ def _left_affine(level: str, unloaded: list, unwalked: list) -> str:
 
 def _format_reader(registered, record):
     """The object a load reads a checkpoint of ``registered``'s mode with:
-    what its accept returns for ``record`` (None: itself), checked as the
-    load checks it, before a weight is read."""
+    what its private copy accepts for ``record`` (None: that copy), checked
+    as the load checks it, before a weight is read."""
+
     from . import formats
 
     mode = registered.mode
+    try:
+        own = copy.deepcopy(registered)
+    except Exception as error:
+        raise ValueError(
+            f"quant format {mode!r} cannot be copied for the load ({error}): "
+            "the checkpoint would not load; report it to the plugin"
+        ) from error
     kept = dict(getattr(registered, "__dict__", {}))
     try:
-        read = registered.accept(record)
+        read = own.accept(record)
     except ValueError as error:
         raise ValueError(
             f"quant format {mode!r} refuses the record it gives ({error}): the "
@@ -7089,7 +7097,7 @@ def _format_reader(registered, record):
             f"quant format {mode!r}'s accept changes the registered format to "
             "read the record: the checkpoint would not load; report it to the plugin"
         )
-    read = registered if read is None else read
+    read = own if read is None else read
     if not (
         isinstance(read, formats.QuantFormat)
         and (read.mode, read.tensors, read.contract)
@@ -7102,26 +7110,21 @@ def _format_reader(registered, record):
     return read
 
 
-def _loads_as_laid_out(fmt, reader, tensor_name, shape, bits, group_size):
+def _loads_as_laid_out(fmt, reader, tensor_name, geometry, layout):
     """Stop the run when ``fmt`` lays out the matrix ``tensor_name`` of
-    ``shape`` otherwise than its checkpoint loads it: the registered format
-    lays out none, or ``reader`` (the object its accept returns for the
+    the given geometry otherwise than its checkpoint loads it: the registered
+    format lays out none, or ``reader`` (the object its accept returns for the
     record) another layout."""
     from . import formats
 
     registered = formats.get(fmt.mode)
-    if fmt is reader is registered:
-        # The registered format reads what it lays out.
-        return
-    n, k = shape[-2:]
-    laid_out = fmt.layout(k, n, bits, group_size)
-    loads = None
-    if registered.layout(k, n, bits, group_size) is not None:
-        loads = reader.layout(k, n, bits, group_size)
-    if loads != laid_out:
+    k, n, _, _ = geometry
+    registered_layout = layout if fmt is registered else registered.layout(*geometry)
+    loads = None if registered_layout is None else reader.layout(*geometry)
+    if loads != layout:
         raise ValueError(
             f"quant format {fmt.mode!r} lays out {tensor_name} ({n}, {k}) as "
-            f"{laid_out}, and its checkpoint loads it as {loads}: the checkpoint "
+            f"{layout}, and its checkpoint loads it as {loads}: the checkpoint "
             "would not load; report it to the plugin"
         )
 
@@ -7137,7 +7140,7 @@ def _encodable(shape) -> bool:
     )
 
 
-def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
+def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=None):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
     ``w`` is empty, neither a matrix nor a stack of matrices that fit a
@@ -7156,7 +7159,10 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size):
         return None
     *stack, n, k = w.shape
     count = stack[0] if stack else 1
-    layout = fmt.layout(k, n, bits, group_size)
+    geometry = (k, n, bits, group_size)
+    layout = fmt.layout(*geometry)
+    if reader is not None:
+        _loads_as_laid_out(fmt, reader, tensor_name, geometry, layout)
     if layout is None:
         return None
     formats.check_layout(fmt, n, k, layout)
@@ -8734,9 +8740,8 @@ def quantize_oq_streaming(
                 offer = _format_offer(run, tensor_name, shape, bits, gs, qmode)
                 grouped, importance, looked_up, base = offer[:4]
                 if offer.offered:
-                    _loads_as_laid_out(quant_fmt, reader, tensor_name, shape, bits, gs)
                     encoded = _encode_in_format(
-                        quant_fmt, tensor_name, w_mx, importance, bits, gs
+                        quant_fmt, tensor_name, w_mx, importance, bits, gs, reader
                     )
                 elif offer.unwalked:
                     unwalked.append(base)

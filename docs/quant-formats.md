@@ -280,7 +280,7 @@ from omlx.oq import quantize_oq_streaming
 quantize_oq_streaming(source, output, 4, enhanced=True, quant_format="myformat")
 ```
 
-`quant_format` is the format's mode, or an object of the class registered for its mode: a plugin's command that fits its format to the model first (a table of levels, say) hands oQ the object it configured. oQ encodes with that object and stores its record; the load reads the record back through the registered format's `accept`. An object of another class, a subclass included, is refused: `quant format 'myformat' is registered as MyFormat, not OtherFormat: pass an object of the registered class`.
+`quant_format` is the format's mode, or an object of the class registered for its mode: a plugin's command that fits its format to the model first (a table of levels, say) hands oQ the object it configured. oQ encodes with that object and stores its record; the writer checks that record with a private copy of the registered format, just as the loader does. Both use the object returned by `accept`, or the configured copy when it returns `None`. An object of another class, a subclass included, is refused: `quant format 'myformat' is registered as MyFormat, not OtherFormat: pass an object of the registered class`.
 
 A format fitted to the model reads oQe's importance before oQ asks for its record. `calibrate_oq_streaming` runs oQe's calibration alone, into the imatrix cache, by the code of the run that will reuse it, and returns the cache's entries and metadata; that run then reads the cache instead of calibrating again:
 
