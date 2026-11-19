@@ -202,8 +202,8 @@ def _capture_nax_without_mlx_headers(monkeypatch):
     monkeypatch.setattr(nax, "_read_mlx_headers", lambda names: "")
 
 
-def _builder_digest(monkeypatch) -> str:
-    """Pin the routed, row and NAX builders over the affine faces."""
+def _affine_sources(monkeypatch):
+    """Name, header and body of every served affine builder in digest order."""
     recorded = []
 
     def record(**kwargs):
@@ -233,6 +233,11 @@ def _builder_digest(monkeypatch) -> str:
         routed._down_kernel.__wrapped__(face, None)
         routed._gate_up_window_kernel.__wrapped__(face, shared, gate)
         routed._down_window_kernel.__wrapped__(face, shared)
+    return recorded
+
+
+def _builder_digest(monkeypatch) -> str:
+    recorded = _affine_sources(monkeypatch)
     return _metal_digest(recorded)
 
 
@@ -255,7 +260,7 @@ def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
     assert _builder_digest(monkeypatch) == _METAL_DIGEST
 
 
-def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
+def _steel_sources(monkeypatch):
     from omlx.formats import tile_gather
 
     records = []
@@ -267,6 +272,11 @@ def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
     monkeypatch.setattr(tile_gather, "_headers", lambda: "")
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
         tile_gather._build.__wrapped__(affine.tile_face(bits, group, dtype))
+    return records
+
+
+def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
+    records = _steel_sources(monkeypatch)
     # B8's independently captured table-free face headers and declarations
     # with the steel loader and launch body, excluding installed MLX headers.
     expected = "0b6af24687c3b42aef8c56bd09c037fad68b6f3d2908570850d926bfe4035691"
@@ -391,6 +401,13 @@ def test_a_gpu_with_tensor_units_stages_small_tables_and_one_without_selects():
     assert not kernels._selects_for("applegpu_g18p")
     assert not kernels._selects_for("")
     assert not kernels._selects_for("applegpu_g15")
+    for unknown in (
+        "applegpu_g15d2",
+        "xapplegpu_g15d",
+        "applegpu_g15ab",
+        "applegpu_g15!",
+    ):
+        assert not kernels._selects_for(unknown)
     architecture = (
         mx.device_info(mx.gpu).get("architecture", "")
         if mx.is_available(mx.gpu)
@@ -411,7 +428,10 @@ def test_small_tables_probe_the_gpu_on_first_use_from_a_cpu_stream(
         assert device == mx.gpu
         return available
 
+    queries = []
+
     def device_info(device=None):
+        queries.append(device)
         assert available, "queried device info without a GPU"
         assert device is not None and device == mx.gpu, "queried the default device"
         return {"architecture": "applegpu_g15d"}
@@ -429,8 +449,16 @@ def test_small_tables_probe_the_gpu_on_first_use_from_a_cpu_stream(
         with ThreadPoolExecutor(max_workers=1) as worker:
             assert worker.submit(first_use).result() is available
         assert probe() is available
+        assert queries == ([mx.gpu] if available else [])
     finally:
         probe.cache_clear()
+
+
+@pytest.mark.parametrize("info", [{}, {"architecture": None}])
+def test_unknown_gpu_metadata_stages_small_tables(monkeypatch, info):
+    monkeypatch.setattr(mx, "is_available", lambda device: True)
+    monkeypatch.setattr(mx, "device_info", lambda device: info)
+    assert not kernels._small_tables_as_selects.__wrapped__()
 
 
 def test_standalone_table_header_resumes_the_callers_source(form):

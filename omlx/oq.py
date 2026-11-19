@@ -7241,6 +7241,22 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
     return {name: mx.concatenate([part[name] for part in parts]) for name in layout}
 
 
+def _probe_faces(layer, tensor_name, k, n):
+    """Ask the persisted reader about both faces on the layer that would load."""
+    from .formats import Dot, Tile, _checked_face
+
+    reader = layer.fmt
+    for kind in (Dot, Tile):
+        name = kind.__name__.lower()
+        try:
+            _checked_face(reader, layer, k, n, kind, name)
+        except Exception as error:
+            raise ValueError(
+                f"quant format {reader.mode!r}: its {name}() fails for {tensor_name}: "
+                f"{error}"
+            ) from error
+
+
 def _quantize_chunked(w, group_size, bits, mode, importance=None):
     _MLX_MAX_ELEMS = 1 << 30
     max_elems = max(group_size, min(_QUANTIZE_CHUNK_BYTES // 2, _MLX_MAX_ELEMS))
@@ -8616,6 +8632,35 @@ def quantize_oq_streaming(
     """
 
     run = _open_oq_run(**locals())
+    reader = run.get("reader")
+
+    def probe_encoded(tensor_name, shape, bits, group, encoded):
+        # Only this write, after _open_oq_run's family and native admission,
+        # may issue a token. Its reader is the one that accepted the record.
+        from .formats.linear import _PENDING_WRITE, FormatLinear, FormatSwitchLinear
+
+        layer_type = FormatSwitchLinear if len(shape) == 3 else FormatLinear
+        n, k = shape[-2:]
+        # MLX arrays support writable buffers as well as indexed assignment.
+        # Give the reader its own bytes, after the source and join runs are gone.
+        tensors = {name: mx.array(array) for name, array in encoded.items()}
+        token = object()
+        _PENDING_WRITE.construction = (
+            token,
+            layer_type,
+            reader,
+            bits,
+            group,
+            k,
+            tensors,
+        )
+        try:
+            layer = layer_type(reader, bits, group, k, tensors, _write_permit=token)
+        finally:
+            # Revoke even if an exception preceded constructor entry.
+            _PENDING_WRITE.construction = None
+        _probe_faces(layer, tensor_name, k, n)
+
     dtype = run.get("dtype")
     enhanced = run.get("enhanced")
     group_size = run.get("group_size")
@@ -8683,7 +8728,6 @@ def quantize_oq_streaming(
     preserve_mtp = run.get("preserve_mtp")
     preserve_ngram_table = run.get("preserve_ngram_table")
     quant_fmt = run.get("quant_fmt")
-    reader = run.get("reader")
     quant_record = run.get("quant_record")
     quantization_config = run.get("quantization_config")
     source = run.get("source")
@@ -8849,6 +8893,7 @@ def quantize_oq_streaming(
                 for tensor in encoded.values():
                     mx.eval(tensor)
                     mx.synchronize()
+                probe_encoded(tensor_name, shape, bits, gs, encoded)
                 encoded = None
 
         current_bytes = sum(v.nbytes for v in out_shard_data.values())

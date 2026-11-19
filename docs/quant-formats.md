@@ -462,6 +462,13 @@ oQ refuses a format before it reads a weight:
   which its loader names). A family leaves the table when its readers decline a format's
   layer and call it.
 
+After oQ admits a checkpoint and encodes a layer, it asks the reader that accepted the
+checkpoint record for both the dot and tile faces. The reader gets a concrete layer with
+the encoded tensors and the input matrix dimensions. A format may return `None` for
+either. A face that raises or fails validation stops the writer with the layer name and
+cause, for example `quant format 'myformat': its tile() fails for
+model.layers.0.mlp.gate_proj.weight: ...`.
+
 ## Faces
 
 A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the kernels that decode tiles of weights (see [The tile face](#the-tile-face)). A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
@@ -791,6 +798,21 @@ Its `decode`, the same products in the same order:
 
 A table that a face reads at indices that differ from lane to lane (a level for each code, a codebook) is data, not Metal. The face gives it in Python, and every kernel built on the face holds it in the form this GPU reads fastest: a copy in threadgroup memory, made when the kernel starts, or for a small table its values themselves. A table read per lane from `constant` or `device` memory instead makes the kernel's speed depend on where the GPU loads the kernel: 2 to 7% on an M3 Ultra from one process to the next, for the same source. The staged copy is the fastest form measured for tables of more than 4 values and has no such spread.
 
+Every Metal fragment a face contributes, including a dot face’s `shared` definitions,
+follows the same rule. A `Dot` or `Tile` refuses an array declarator with static
+storage in its source: one after `static`, `constant` or `constexpr`, or one at the
+file's top level, in a namespace or in an `extern "C"` block. Scalar and vector
+constants, pointers, references,
+functions (with array parameters or an `operator[]`), type aliases and automatic local
+arrays can be written in Metal. The check is a speed lint over the spellings formats
+write, not a C++ parser: a table spelled as a parenthesized declarator
+(`constant float (LUT)[4]`) or a variable template specialization (`LUT<int>[4]`) is
+not detected and only costs speed, since its results are the same. Review refuses it,
+like a table hidden behind a macro or an alias. Code in `#if`/`#else` branches is read
+as text: a table under `#if 0` is reported too. A table in an `extern "C"` block after
+an out-of-line brace-initialized constructor is not detected and only costs speed;
+review refuses it.
+
 ```python
 from omlx.formats import Dot, Table
 
@@ -900,6 +922,12 @@ Kernels are compiled on the user's Mac by the Metal compiler when they are first
 
 - What is known when a kernel is compiled is a template parameter or a `constexpr`: K, the bit width, the group size, the rows of a launch.
 - A choice between code paths is `if constexpr`: a kernel whose K is whole blocks has no code for a last, partial one.
+- Declare a lookup table as data (see [Tables](#tables)). A `Dot` or `Tile` rejects an
+  array declarator with static storage in its Metal source, and reports its name and
+  line. Scalar and vector constants, pointers, references and functions are allowed.
+  At runtime the layer keeps its composed path for a refused dot face and its other
+  kernels for a refused tile face. Review also refuses the spellings the check does
+  not read (see [Tables](#tables)).
 - A source's constants are `constexpr`. It defines no macro, or `#undef`s it before it ends: a macro reaches past the source's namespace, into every source, skeleton and kernel body after it.
 - A run over a fixed count is a fold over an index pack, unless the loop measures faster. `omlx_iota<N>()` is `omlx_ints<0, ..., N - 1>`; a format's source may use both:
 

@@ -1184,12 +1184,15 @@ class Matrices:
         shared-rows skeleton for a shared one. Each skeleton is cited at its
         own lines, whichever others the kernel includes."""
         sources: dict[str, str] = {}
-        for face in self._faces.values():
-            sources.setdefault(face.source, face.key)
-        # A shared source defines what its face's source declares: after it.
-        for face in self._faces.values():
-            if face in self._shared and face.shared:
-                sources.setdefault(face.shared, f"{face.key} shared")
+        # Shared definitions follow every declaration they may depend on.
+        for phase in ("main", "shared"):
+            for face in self._faces.values():
+                if phase == "shared" and face not in self._shared:
+                    continue
+                for name, when, source in face._metal_parts():
+                    if when == phase and (source or name == "source"):
+                        key = face.key if name == "source" else f"{face.key} {name}"
+                        sources.setdefault(source, key)
         dots = any(isinstance(f, Dot) for f in self._faces.values())
         rows = any(
             isinstance(f, Dot) and name not in self._shared_names
@@ -1298,3 +1301,184 @@ def _members_check(face: Dot | Tile) -> str:
 def _members(name: str, face: Dot | Tile) -> str:
     weight, *tensors = _inputs(name, face)
     return ", ".join([f"(const device uint8_t*){weight}", *tensors])
+
+
+# Keep positions in the original Metal so a refusal can quote the declarator,
+# including the second or later name in a declaration. Numeric literals can
+# contain single-quote separators; a quote in a literal is not a character token.
+_METAL_NOISE = re.compile(
+    r"""^[ \t]*\#(?:[^\n\\]|\\[^\n]|\\\n)*|//[^\n]*|/\*[\s\S]*?(?:\*/|\Z)"""
+    r"""|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\\n])+'""",
+    re.M,
+)
+_METAL_WORD = re.compile(
+    r"""\b(?:0[xX][\da-fA-F']+|\d[\w'.]*)|[A-Za-z_]\w*|::|->|<<|<=|>=|==|!=|\S"""
+)
+
+
+def _metal_code(text):
+    # Match a complete number before removing quotes: two digit separators
+    # on one line must never hide the code between them.
+    return _METAL_LITERAL_OR_NOISE.sub(
+        lambda m: m[0] if m.lastgroup else re.sub(r"[^\n]", " ", m[0]), text
+    )
+
+
+_METAL_LITERAL_OR_NOISE = re.compile(
+    r"(?P<number>\b(?:0[xX][\da-fA-F']+|\d[\w'.]*))|" + _METAL_NOISE.pattern,
+    re.M,
+)
+
+
+def _metal_groups(code):
+    """Outer tokens, with each argument list, array bound and template-id
+    argument list kept together. Braces remain visible for nested scopes."""
+    words = list(_METAL_WORD.finditer(code))
+    stack, ends = [], {}
+    for i, word in enumerate(words):
+        token = word[0]
+        if token in ("(", "["):
+            stack.append((token, i))
+        elif stack and (stack[-1][0], token) in (("(", ")"), ("[", "]")):
+            ends[stack.pop()[1]] = i
+    groups = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        end = ends.get(i, i)
+        token = code[word.start() : words[end].end()]
+        if groups and groups[-1][0] == "decltype" and token.startswith("("):
+            i = end + 1
+            continue  # its expression is part of the type
+        if token.startswith("[["):
+            pass  # Metal attributes
+        elif (
+            groups
+            and groups[-1][0] in ("alignas", "__attribute__")
+            and token.startswith("(")
+        ):
+            groups.pop()
+        else:
+            groups.append((token, word.start()))
+        i = end + 1
+
+    # A type's template arguments may themselves contain address spaces or
+    # commas. Comparisons and shifts in initializers are ordinary operators.
+    result, angles = [], []
+    for token, at in groups:
+        if token in (";", "{", "}"):
+            angles.clear()
+        if token == "=" and angles and result[angles[0] - 1][0] != "template":
+            angles.clear()  # crossed into another initializer after a comparison
+        if token == "<" and result and result[-1][0].isidentifier():
+            angles.append(len(result))
+        elif token == ">" and angles:
+            start = angles.pop()
+            del result[start:]
+            token = "<>"
+        result.append((token, at))
+    return result
+
+
+_QUALIFIED_STORAGE = ("static", "constant", "constexpr")
+_REPO_STORAGE = ("static", "constant")
+# Words that come before '[' without naming an array: operator[], array new
+# and delete, a structured binding.
+_NOT_ARRAYS = (
+    "operator",
+    "new",
+    "delete",
+    "auto",
+    "const",
+    "volatile",
+    "constant",
+    "constexpr",
+)
+
+
+def _array_declarators(statement, qualifiers):
+    """``(name, at, qualified)`` for each array declarator of a statement at
+    one brace level: an identifier followed by '['. A comma starts another
+    declarator; the part before its '=' is the declarator, so an indexed read
+    in an initializer is not one. A typedef holds no storage, and the
+    constexpr of an ``if constexpr`` qualifies nothing."""
+    if any(token == "typedef" for token, _ in statement):
+        return
+    qualified, declarator = False, True
+    for i, (token, at) in enumerate(statement):
+        if token == ",":
+            declarator = True
+        elif token == "=":
+            declarator = False
+        elif declarator:
+            previous = statement[i - 1][0] if i else ""
+            qualified = qualified or (token in qualifiers and previous != "if")
+            following = statement[i + 1][0] if i + 1 < len(statement) else ""
+            if (
+                token.isidentifier()
+                and token not in _NOT_ARRAYS
+                and following.startswith("[")
+                # a source template's placeholder type
+                and not previous[:1].isdigit()
+            ):
+                yield token, at, qualified
+
+
+def _namespace(head):
+    """Whether a '{' opened with ``head`` opens namespace scope: a namespace
+    or a linkage block (``extern "C"``, its string read as space)."""
+    return "namespace" in head or head == ["extern"]
+
+
+def _continues(head):
+    """Whether the statement before a '{' goes on after its '}': it does
+    after an initializer's or an inline type's braces, and ends after a
+    namespace's, a function's or a control statement's body."""
+    if _namespace(head) or head[-1:] in (["else"], ["do"], ["try"]):
+        return False
+    return ("=" in head and "operator" not in head) or not any(
+        token.startswith("(") for token in head
+    )
+
+
+@cache
+def hand_tables(text: str, *, face: bool = False) -> tuple[tuple[int, str, str], ...]:
+    """Report array declarators with static storage: an identifier followed
+    by '[' in a declarator, after a storage qualifier, or for a face at the
+    file's top level, in a namespace or in an ``extern "C"`` block. A face
+    refuses each one: a table is declared as data, never written by hand.
+    This is a speed lint over the usual spellings, not a parser: a table in
+    constant memory costs speed, never results. Parenthesized declarators,
+    variable template specializations, macros and aliases are not read;
+    review refuses them."""
+    code = _metal_code(text)
+    lines = text.split("\n")
+    qualifiers = _QUALIFIED_STORAGE if face else _REPO_STORAGE
+    found = []
+    frames = [[]]  # the open statement at each brace level
+    continues = []  # for each open '{', whether its statement goes on after
+    namespaces = set()  # the brace levels a namespace opened
+    for token, at in _metal_groups(code):
+        if token == "{":
+            head = [t for t, _ in frames[-1]]
+            continues.append(_continues(head))
+            frames.append([])
+            if _namespace(head):
+                namespaces.add(len(frames) - 1)
+        elif token == "}":
+            if len(frames) > 1:
+                namespaces.discard(len(frames) - 1)
+                frames.pop()
+                if not continues.pop():
+                    frames[-1].clear()
+        elif token == ";":
+            level = len(frames) - 1
+            static = face and (level == 0 or level in namespaces)
+            for name, where, qualified in _array_declarators(frames[-1], qualifiers):
+                if qualified or static:
+                    line = text.count("\n", 0, where) + 1
+                    found.append((line, name, " ".join(lines[line - 1].split())))
+            frames[-1].clear()
+        else:
+            frames[-1].append((token, at))
+    return tuple(found)

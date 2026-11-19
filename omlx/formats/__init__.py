@@ -35,7 +35,7 @@ import threading
 import types
 import weakref
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from functools import cache
 from importlib.metadata import EntryPoint, entry_points
 
@@ -231,6 +231,16 @@ class Table:
         object.__setattr__(self, "bits", tuple(bits))
 
 
+@cache
+def _metal_fields(face_type):
+    """The source fragments a face contributes, in declaration order."""
+    return tuple(
+        (part.name, part.metadata["metal_part"])
+        for part in fields(face_type)
+        if "metal_part" in part.metadata
+    )
+
+
 @dataclass(frozen=True)
 class _Face:
     """What every kind of face is: Metal, the type it declares, the tensors
@@ -238,7 +248,7 @@ class _Face:
     equals a face of another."""
 
     key: str  # names the instance in kernel names and compiler messages
-    source: str
+    source: str = field(metadata={"metal_part": "main"})
     type: str
     tensors: tuple[str, ...]
     # The activations it is exact for; FLOATS if empty.
@@ -289,6 +299,37 @@ class _Face:
                 f"kernel stages at most {TABLE_BYTES} bytes of tables in "
                 "threadgroup memory, beside its own"
             )
+        from .kernels import hand_tables  # the kernels' module reads this one
+
+        parts = tuple(self._metal_parts())
+        for part, _, source in parts:
+            if not isinstance(source, str):
+                raise ValueError(f"{owner}: {part} is Metal, not {source!r}")
+        found = hand_tables("\n".join(source for _, _, source in parts), face=True)
+        if found:
+            (line, name, text), *_ = found
+            for part, _, source in parts:
+                length = source.count("\n") + 1
+                if line <= length:
+                    label = "source" if part == "source" else f"{part} source"
+                    break
+                line -= length
+            raise ValueError(
+                f"{owner}: line {line} of its {label} declares "
+                f"{name} with static storage ({text}), including namespace scope "
+                "and static members. Per-lane table "
+                "reads there make speed depend on kernel placement. Declare it as "
+                f"data, {type(self).__name__}(..., tables=(Table(name, dtype, "
+                "values),)), and read its omlx_table<type, N> member "
+                "(docs/quant-formats.md, Tables). The check reads the usual "
+                "spellings only: a table written as a parenthesized declarator "
+                "or a variable template specialization is not detected, and "
+                "only costs speed."
+            )
+
+    def _metal_parts(self):
+        for name, phase in _metal_fields(type(self)):
+            yield name, phase, getattr(self, name)
 
     def exact_for(self, dtype) -> bool:
         """Whether the face computes its format's rows for ``dtype``
@@ -316,7 +357,7 @@ class Dot(_Face):
     kernel sizes its launch by it, and asserts it.
     """
 
-    shared: str = field(default="", kw_only=True)
+    shared: str = field(default="", kw_only=True, metadata={"metal_part": "shared"})
     # The inputs a lane reads a block (Lanes<K>::VPT), which sizes a
     # shared-rows launch; 0 for a face that no such kernel reads.
     vpt: int = field(default=0, kw_only=True)
@@ -324,8 +365,6 @@ class Dot(_Face):
     def __post_init__(self) -> None:
         super().__post_init__()
         owner = f"quant format face {self.key!r}"
-        if not isinstance(self.shared, str):
-            raise ValueError(f"{owner}: shared is Metal, not {self.shared!r}")
         if type(self.vpt) is not int or self.vpt < 0:
             raise ValueError(f"{owner}: vpt is a count of inputs, not {self.vpt!r}")
 
@@ -1002,37 +1041,7 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str, keeps
     """``(face, defective)``: ``fmt``'s answer, checked, for ``_face``."""
     mode = fmt.mode
     try:
-        face = getattr(fmt, name)(layer, k, n)
-        if face is None:
-            return None, False
-        if not isinstance(face, kind):
-            raise TypeError(
-                f"{name}() returned a {type(face)!r}, not a {kind.__name__}"
-            )
-        stray = [name for name in face.tensors if name not in fmt.tensors]
-        if stray:
-            raise ValueError(
-                f"face {face.key}: {', '.join(stray)} is no tensor of quant "
-                f"format {mode}"
-            )
-        names = (fmt.codes_name, *face.tensors)
-        lacking = [name for name in names if not isinstance(layer.get(name), mx.array)]
-        if lacking:
-            raise ValueError(
-                f"face {face.key}: the layer has no array {', '.join(lacking)}"
-            )
-        small = [name for name in names if layer[name].size < 8]
-        if small:
-            raise ValueError(
-                f"face {face.key}: {', '.join(small)} of fewer than 8 elements, "
-                "which MLX binds as constants, not as the buffer a face reads"
-            )
-        wide = [name for name in names if layer[name].dtype == mx.float64]
-        if wide:
-            raise ValueError(
-                f"face {face.key}: {', '.join(wide)} of float64, which the GPU "
-                "does not take"
-            )
+        return _checked_face(fmt, layer, k, n, kind, name), False
     except Exception as error:
         defect = (mode, repr(error))
         with _NOTING:
@@ -1050,4 +1059,37 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str, keeps
                 keeps,
             )
         return None, True
-    return face, False
+
+
+def _checked_face(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str):
+    """Ask for one face. Writers propagate a defect, runtime callers record it."""
+    face = getattr(fmt, name)(layer, k, n)
+    if face is None:
+        return None
+    if not isinstance(face, kind):
+        raise TypeError(f"{name}() returned a {type(face)!r}, not a {kind.__name__}")
+    stray = [name for name in face.tensors if name not in fmt.tensors]
+    if stray:
+        raise ValueError(
+            f"face {face.key}: {', '.join(stray)} is no tensor of quant "
+            f"format {fmt.mode}"
+        )
+    names = (fmt.codes_name, *face.tensors)
+    lacking = [name for name in names if not isinstance(layer.get(name), mx.array)]
+    if lacking:
+        raise ValueError(
+            f"face {face.key}: the layer has no array {', '.join(lacking)}"
+        )
+    small = [name for name in names if layer[name].size < 8]
+    if small:
+        raise ValueError(
+            f"face {face.key}: {', '.join(small)} of fewer than 8 elements, "
+            "which MLX binds as constants, not as the buffer a face reads"
+        )
+    wide = [name for name in names if layer[name].dtype == mx.float64]
+    if wide:
+        raise ValueError(
+            f"face {face.key}: {', '.join(wide)} of float64, which the GPU "
+            "does not take"
+        )
+    return face

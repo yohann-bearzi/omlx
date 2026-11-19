@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import math
 from functools import cache
+from threading import local
 from typing import Any, NamedTuple
 
 import mlx.core as mx
@@ -753,6 +754,20 @@ def _unloaded(name: str, held, offered) -> str:
     )
 
 
+# Set only around the concrete constructor in an admitted oQ write. Copying
+# a token or a context cannot copy another thread's pending construction.
+_PENDING_WRITE = local()
+
+
+def _take_write_permit(*args):
+    expected = getattr(_PENDING_WRITE, "construction", None)
+    if expected is None or any(a is not b for a, b in zip(args, expected, strict=True)):
+        return False
+    # An equality check, or even fmt.mode, could enter a plugin.
+    _PENDING_WRITE.construction = None
+    return True
+
+
 class _FormatLayer(nn.Module):
     """What the two layers share: a format's tensors as frozen parameters,
     the attributes of MLX's quantized layers, and the format object that
@@ -793,10 +808,25 @@ class _FormatLayer(nn.Module):
         *,
         placeholders: bool = False,
         _load_layout: dict | None = None,
+        _write_permit: object | None = None,
     ) -> None:
-        if not isinstance(fmt, (str, formats.QuantFormat)):
-            raise TypeError("a format layer needs a mode name or a QuantFormat")
-        formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
+        if _write_permit is None:
+            if not isinstance(fmt, (str, formats.QuantFormat)):
+                raise TypeError("a format layer needs a mode name or a QuantFormat")
+            formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
+        elif (
+            bias is not None
+            or placeholders is not False
+            or _load_layout is not None
+            or not _take_write_permit(
+                _write_permit, type(self), fmt, bits, group_size, input_dims, tensors
+            )
+        ):
+            # Even fmt.mode may run plugin code. A refused permit has no
+            # trusted mode, and must not enter the plugin.
+            raise formats.FormatRefusedError(
+                "the write did not admit this layer", mode="unknown"
+            )
         if isinstance(fmt, str):
             # A layer built by hand, of a registered mode: its format.
             mode, fmt = fmt, formats.get(fmt)
