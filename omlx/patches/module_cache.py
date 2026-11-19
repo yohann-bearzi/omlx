@@ -68,10 +68,10 @@ def cached_per_module(
     value = build(module)
     children = _children(module, depth)
     refs = tuple(chain(dict.values(module), *map(dict.values, children)))
-    module.__dict__[slot] = (children, refs, state, value)
     if slot not in _SLOTS:
         with _SLOTS_LOCK:
             _SLOTS.add(slot)
+    module.__dict__[slot] = (children, refs, state, value)
     return value
 
 

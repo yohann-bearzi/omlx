@@ -202,16 +202,23 @@ def test_a_class_without_its_own_call_gets_none_back():
 
 
 @pytest.mark.parametrize("stacked", [False, True], ids=["linear", "switch"])
-def test_streamed_decoder_releases_a_nested_format_projection(stacked):
+def test_streamed_decoder_releases_a_nested_format_projection(stacked, monkeypatch):
     from omlx.formats import testing
+    from omlx.patches import module_cache
     from tests.test_formats_linear import _experts, _pair, _switch_pair, _x
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set(module_cache._SLOTS))
 
     class Block(nn.Module):
         def __call__(self, *args):
+            module_cache.cached_per_module(self, "_test_block", lambda m: m.proj.weight)
             return self.proj(*args)
 
     class Decoder(nn.Module):
         def __call__(self, *args):
+            module_cache.cached_per_module(
+                self, "_test_decoder", lambda m: m.mlp.proj.weight, depth=2
+            )
             return self.mlp(*args)
 
     decoder = Decoder()
@@ -296,10 +303,68 @@ def test_streamed_decoder_releases_custom_format_declared_tensors(monkeypatch):
         assert sys.getrefcount(orig_lut) == 2
 
 
-def test_clear_cached_is_thread_safe():
+def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread, main_thread
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_first_cache"
+    ready, resume = Event(), Event()
+    lock = module_cache._SLOTS_LOCK
+
+    class PauseRegistration:
+        def __enter__(self):
+            if current_thread() is not main_thread():
+                ready.set()
+                assert resume.wait(10)
+            lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    class Slots(set):
+        def __iter__(self):
+            # A clear takes a stable snapshot while registrations are excluded.
+            assert lock.locked()
+            return super().__iter__()
+
+    monkeypatch.setattr(module_cache, "_SLOTS", Slots())
+    monkeypatch.setattr(module_cache, "_SLOTS_LOCK", PauseRegistration())
+    with ThreadPoolExecutor(1) as pool:
+        build = pool.submit(
+            module_cache.cached_per_module, mod, slot, lambda m: m.weight
+        )
+        try:
+            assert ready.wait(10)
+            published = slot in mod.__dict__
+            if published:
+                module_cache.clear_cached(mod)
+        finally:
+            resume.set()
+        assert build.result(timeout=10) is mod.weight
+        if not published:
+            assert slot in mod.__dict__
+            module_cache.clear_cached(mod)
+        assert slot not in mod.__dict__
+
+        # A miss for a known slot can rebuild without taking the registry lock.
+        ready.clear()
+        rebuild = pool.submit(
+            module_cache.cached_per_module, mod, slot, lambda m: m.weight
+        )
+        assert rebuild.result(timeout=10) is mod.weight
+        assert not ready.is_set()
+
+
+def test_clear_cached_is_thread_safe(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
 
+    from omlx.patches import module_cache
     from omlx.patches.module_cache import cached_per_module, clear_cached
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set(module_cache._SLOTS))
 
     def worker(idx: int) -> int:
         mod = nn.Linear(16, 8, bias=False)
