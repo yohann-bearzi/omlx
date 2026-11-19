@@ -20,9 +20,6 @@ def traversal(
     MLX retains multiple input matrices, rows is each matrix's height and
     batched is true. Both use the same QMV limit in MLX 0.32.4.
     """
-    if rows == 1:
-        return "rows", 1
-
     match = re.fullmatch(r"applegpu_g([0-9]+)([a-z])", architecture)
     if match is None:
         return "fallback", 1
@@ -43,7 +40,7 @@ def traversal(
     if rows < limit:
         if k in (64, 128) and bits in (2, 4, 8):
             return "quad", 1
-        return ("wide" if generation >= 15 else "rows"), 1
+        return ("wide" if rows >= 2 and generation >= 15 else "rows"), 1
     if batched:
         return "qmm", 1
 

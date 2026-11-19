@@ -89,10 +89,21 @@ def test_a_batch_uses_rows_per_matrix_and_keeps_k_whole(architecture, limit, n):
     assert traversal(limit, n, 2560, 64, architecture)[0] == "split_k"
 
 
+@pytest.mark.parametrize("rows", [1, 2])
 @pytest.mark.parametrize("k", [64, 128])
-@pytest.mark.parametrize("bits", [2, 3, 4, 8])
-def test_narrow_matrices_select_stock_quad_only_for_power_of_two_bits(k, bits):
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_narrow_matrices_select_stock_quad_only_for_power_of_two_bits(rows, k, bits):
     from omlx.formats.mlx import traversal
 
-    expected = "wide" if bits == 3 else "quad"
-    assert traversal(2, 512, k, 64, "applegpu_g17s", bits=bits) == (expected, 1)
+    if bits in (3, 5, 6):
+        expected = "rows" if rows == 1 else "wide"
+    else:
+        expected = "quad"
+    assert traversal(rows, 512, k, 64, "applegpu_g17s", bits=bits) == (expected, 1)
+
+
+@pytest.mark.parametrize("k", [128, 2560])
+def test_singleton_declines_an_unknown_device_before_selecting_a_kernel(k):
+    from omlx.formats.mlx import traversal
+
+    assert traversal(1, 512, k, 64, "unknown", bits=4) == ("fallback", 1)
