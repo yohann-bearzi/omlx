@@ -31,6 +31,7 @@ from mlx.utils import tree_flatten
 from mlx_vlm.models.switch_layers import SwitchGLU, SwitchLinear
 
 from omlx import formats
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.formats import affine, kernels, linear, testing
 from omlx.formats.linear import MAX_ROWS, FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
@@ -502,15 +503,24 @@ def test_mlx_vlm_s_switch_glu_runs_over_the_layers():
     # 18 pairs, which mlx-vlm runs as they come.
     x, indices = _x((1, 3, 512)), _experts((1, 3, 6))
     assert _same_bits(ours(x, indices), theirs(x, indices))
-    # 96 pairs, which it sorts by expert: each still has the bits it has
-    # in a decode step. (MLX runs its sorted pairs in another kernel.)
+    # 96 pairs, which it sorts by expert. On tensor units they take the tile
+    # route, with the bits of MLX's sorted kernel; elsewhere each still has
+    # the bits it has in a decode step (MLX runs its sorted pairs in another
+    # kernel).
     x, indices = _x((1, 16, 512)), _experts((1, 16, 6))
-    steps = [theirs(x[:, t : t + 1], indices[:, t : t + 1]) for t in range(16)]
-    assert _same_bits(ours(x, indices), mx.concatenate(steps, axis=1))
-    # gate and up share a proof: the same face, tensor dtypes and shape.
-    assert len(kernels._PROOFS) == 2
-    for (kernel, *_), proof in kernels._PROOFS.items():
-        assert kernel == "format_switch_linear" and proof.ran and not proof.failed
+    nax = is_nax_available()
+    if nax:
+        assert _same_bits(ours(x, indices), theirs(x, indices))
+    else:
+        steps = [theirs(x[:, t : t + 1], indices[:, t : t + 1]) for t in range(16)]
+        assert _same_bits(ours(x, indices), mx.concatenate(steps, axis=1))
+    # gate and up share a proof: the same face, tensor dtypes and shape; on
+    # tensor units, the three layers' tile proof (one face, any K and N).
+    rows = [k for k in kernels._PROOFS if k[0] == "format_switch_linear"]
+    tiles = [k for k in kernels._PROOFS if k[0] == "format_switch_tile_nax"]
+    assert len(rows) == 2 and len(tiles) == (1 if nax else 0)
+    for proof in kernels._PROOFS.values():
+        assert proof.ran and not proof.failed
 
 
 def test_outside_the_kernel_a_switch_decodes_its_indices_matrices_or_its_stack(

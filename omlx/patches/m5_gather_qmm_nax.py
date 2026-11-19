@@ -1693,34 +1693,16 @@ def supports(
     With ``row_map`` (uint32 ``[M]``, sorted row -> row of ``x``) the rows
     are read through the map and ``x`` may have any row count (32-bit
     element offsets: fewer than 2**32 elements)."""
-    if x.dtype not in (mx.bfloat16, mx.float16):
-        return False
-    if x.ndim != 3 or x.shape[1] != 1 or indices.ndim != 1:
-        return False
-    M, K = int(indices.shape[0]), int(x.shape[2])
-    if row_map is None:
-        if int(x.shape[0]) != M:
-            return False
-    elif (
-        row_map.ndim != 1
-        or int(row_map.shape[0]) != M
-        or row_map.dtype != mx.uint32
-        or int(x.shape[0]) * K >= 2**32
-    ):
-        return False
-    # Fewer than 8 indices would be bound as a constant buffer.
-    if M < 8 or indices.dtype != mx.uint32:
-        return False
     if w.ndim != 3 or w.dtype != mx.uint32:
         return False
     E, N = int(w.shape[0]), int(w.shape[1])
-    # Ragged N is canaried at N % 64 == 32 only.
-    if E == 0 or E > _MAX_EXPERTS or N == 0 or N % 32 or K == 0 or K % 32:
+    if not geometry(x, indices, E, N, row_map):
         return False
+    k = int(x.shape[2])
     if mode == "affine":
         if bits not in (4, 8) or group_size not in (32, 64, 128):
             return False
-        if biases is None or K % group_size:
+        if biases is None or k % group_size:
             return False
         if scales.dtype != x.dtype or biases.dtype != x.dtype:
             return False
@@ -1733,9 +1715,56 @@ def supports(
             return False
     else:
         return False
-    if w.shape[2] * 32 != K * bits:
+    if w.shape[2] * 32 != k * bits:
         return False
-    return scales.shape == (E, N, K // group_size)
+    return scales.shape == (E, N, k // group_size)
+
+
+def geometry(
+    x: mx.array,
+    indices: mx.array,
+    experts: int,
+    n: int,
+    row_map: mx.array | None = None,
+) -> bool:
+    """True when the kernels take sorted rows ``x`` ``[M, 1, K]`` of
+    activations ``indices`` (uint32 ``[M]``) into a stack of ``experts``
+    matrices of ``n`` rows, read in place through ``row_map`` (as
+    ``supports``) or not: what the call's shapes and types allow, whatever
+    the weights' format."""
+    if x.dtype not in (mx.bfloat16, mx.float16):
+        return False
+    if x.ndim != 3 or x.shape[1] != 1 or indices.ndim != 1:
+        return False
+    rows, k = int(indices.shape[0]), int(x.shape[2])
+    if row_map is None:
+        if int(x.shape[0]) != rows:
+            return False
+    elif (
+        row_map.ndim != 1
+        or int(row_map.shape[0]) != rows
+        or row_map.dtype != mx.uint32
+        or int(x.shape[0]) * k >= 2**32
+    ):
+        return False
+    # Fewer than 8 indices would be bound as a constant buffer.
+    if rows < 8 or indices.dtype != mx.uint32:
+        return False
+    # Ragged N is canaried at N % 64 == 32 only.
+    return (
+        0 < experts <= _MAX_EXPERTS and n > 0 and n % 32 == 0 and k > 0 and k % 32 == 0
+    )
+
+
+def face_plan(rows: int, experts: int, k: int, n: int) -> Plan:
+    """The configuration of a sorted call of ``rows`` rows into ``experts``
+    matrices of N x K: ``_plan``'s, on aligned 64-deep K steps for the
+    double buffer."""
+    plan = _plan(rows, experts, k, n)
+    if plan.sched == _SCHED_DB and (k % 64 or n % 64 or plan.bk != 64):
+        # db runs aligned 64-deep K steps only.
+        plan = plan._replace(sched=_SCHED_SEG)
+    return plan
 
 
 def _launch(
@@ -2213,8 +2242,8 @@ def sorted_gather_qmm(
     M, K = int(x.shape[0]), int(x.shape[2])
     E, N = int(w.shape[0]), int(w.shape[1])
     if plan is None:
-        plan = _plan(M, E, K, N)
-    if plan.sched == _SCHED_DB and (K % 64 or N % 64 or plan.bk != 64):
+        plan = face_plan(M, E, K, N)
+    elif plan.sched == _SCHED_DB and (K % 64 or N % 64 or plan.bk != 64):
         # db runs aligned 64-deep K steps only.
         plan = plan._replace(sched=_SCHED_SEG)
     if verify:

@@ -9,6 +9,11 @@ asks the registry how to run them:
 - the rows of a decode step, or of the short blocks around one, go through
   the format's dot face in the mat-vec skeleton, one launch for all of them,
   each row with the bits it has alone;
+- a switch layer's sorted rows of a prefill, on a GPU with tensor units,
+  go through the format's tile face in oMLX's sorted gather
+  (``omlx.patches.m5_gather_qmm_nax``) from MLX's own threshold for its
+  sorted kernel (16 rows, 4 an expert); below it, elsewhere, or where the
+  tile route declines, the rows kernel as for a decode;
 - everything else (more rows of one matrix, a layout the face does not
   cover, activations of a type it is not exact for, a format without the
   face, a face that did not compile) is the format's ``decode``, cast to the
@@ -28,7 +33,7 @@ import mlx.nn as nn
 
 from .. import formats
 from ..patches.module_cache import cached_per_module
-from . import Dot, kernels
+from . import Dot, Tile, kernels
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +162,16 @@ def _kernel(face: Dot, stacked: bool):
     )
 
 
+class _Tile(NamedTuple):
+    """How a stack's sorted rows run through its format's tile face."""
+
+    face: Tile
+    kernel: Any
+    operands: tuple
+    proof: kernels.Proof
+    said: tuple[str, str]
+
+
 class _Plan(NamedTuple):
     face: Dot
     kernel: Any
@@ -166,6 +181,40 @@ class _Plan(NamedTuple):
     k: int
     n: int
     said: tuple[str, str]  # what a proof logs: the launches engaged, or failed
+
+
+def _tile(layer, plan: _Plan) -> _Tile | None:
+    """The tile route of a stack whose rows run as ``plan``, or None: no
+    kernel for its tensor units here, or no tile face from the format. Its
+    proof is the tile kernels' (``format_switch_tile_nax``), apart from the
+    rows kernel's: a tile Metal that fails costs the route, not the rows."""
+    from ..patches import m5_gather_qmm_nax as nax
+
+    face = formats.tile(layer, plan.k, plan.n)
+    if face is None:
+        return None
+    kernel = nax._face_kernel(face)
+    if kernel is None:
+        return None
+    said = (
+        f"quant format face {face.key}: tile kernel engaged",
+        f"quant format face {face.key}: tile kernel failed; rows kernel fallback",
+    )
+    operands = tuple(layer[name] for name in ("weight", *face.tensors))
+    dtypes = tuple(a.dtype for a in operands)
+    proof = kernels.proof("format_switch_tile_nax", face, dtypes)
+    return _Tile(face, kernel, operands, proof, said)
+
+
+@cache
+def _nax_host() -> bool:
+    """Whether this GPU has the tensor units oMLX's sorted gather runs on."""
+    from ..custom_kernels.nax import is_nax_available
+
+    try:
+        return bool(is_nax_available())
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _plan(layer) -> _Plan | None:
@@ -449,6 +498,73 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     graph = mx.compile(graph)
     y = graph(*arrays, *plan.operands)
     proof.keep(signature, graph)
+    return y
+
+
+def _sorts(plan: _Plan, x, indices) -> bool:
+    """Whether a stack's sorted call goes to the tile route: on tensor
+    units, from MLX's threshold for its own sorted kernel (16 rows, 4 a
+    matrix), and of the shapes the tile kernels take."""
+    if not _nax_host():
+        return False
+    from ..patches import m5_gather_qmm_nax as nax
+
+    experts, rows = plan.operands[0].shape[0], indices.size
+    return (
+        rows >= 16
+        and rows >= 4 * experts
+        and nax.geometry(x, indices, experts, plan.n)
+        and x.shape[-1] == plan.k
+    )
+
+
+def _sorted(plan: _Plan, kernel, x, indices):
+    """A stack's launch of its sorted rows through the tile face, as
+    ``_switch`` gives the rows kernel's. The Metal holds the call's dtype,
+    K and tile plan."""
+    from ..patches import m5_gather_qmm_nax as nax
+
+    experts = plan.operands[0].shape[0]
+    config = nax.face_plan(indices.size, experts, plan.k, plan.n)
+
+    def graph(x, indices, *operands):
+        return nax._launch_face(kernel, x, operands, indices, config, None)
+
+    return (x.dtype, plan.k, config, plan.n % 64 == 0), graph
+
+
+def _sorted_stand_in(tile: _Tile, metal):
+    """The smallest launch of the tile Metal ``metal``, over zeros: 16 rows
+    of x, all for matrix 0, and the fewest matrices that leave each tensor
+    8 elements. The template values are the call's (its plan), not the
+    stand-in's."""
+    from ..patches import m5_gather_qmm_nax as nax
+
+    dtype, k, config, _ = metal
+    matrices = max(-(-8 * a.shape[0] // a.size) for a in tile.operands)
+    operands = (((matrices, *a.shape[1:]), a.dtype) for a in tile.operands)
+    specs = (((16, 1, k), dtype), ((16,), mx.uint32), *operands)
+
+    def launch(x, idx, *tensors):
+        return nax._launch_face(tile.kernel, x, tensors, idx, config, None)
+
+    return kernels.zeros(*specs), launch
+
+
+def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
+    """``x`` and its sorted ``indices`` through the tile route, as
+    ``_launch`` runs the rows kernel; None where the face is not exact for
+    x's type or its proof has failed, for the rows kernel to take it."""
+    if not tile.face.exact_for(x.dtype):
+        return None
+    metal, graph = _sorted(plan, tile.kernel, x, indices)
+    if not tile.proof.prove(
+        metal, lambda: _sorted_stand_in(tile, metal), logger, *tile.said
+    ):
+        return None
+    graph = mx.compile(graph)
+    y = graph(x, indices, *tile.operands)
+    tile.proof.keep(signature, graph)
     return y
 
 
@@ -835,27 +951,44 @@ class FormatSwitchLinear(_FormatLayer):
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ) -> mx.array:
-        # sorted_indices is mlx-vlm's hint to MLX's gathers. The rows kernel
-        # runs every pair as one mat-vec, in any order; the decode passes the
-        # hint on to MLX's gather_mm.
+        # sorted_indices is mlx-vlm's hint to MLX's gathers. Sorted rows of
+        # a prefill run the tile route where it takes them, whatever ran
+        # before (its graphs are its proof's alone: an unsorted call never
+        # replays one); the rows kernel runs every pair as one mat-vec, in
+        # any order; the decode passes the hint on to MLX's gather_mm.
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept[2] is not self["weight"]:
             kept = self._keep()
-        plan, bias, _ = kept
-        graph = plan.proof.graphs.get(signature) if plan is not None else None
-        if graph is not None:
-            y = graph(x, indices, *plan.operands)
-        else:
-            k = self.input_dims
-            if len(shape) < 2 or shape[-1] != k:
-                raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
-            if not mx.issubdtype(indices.dtype, mx.integer):
-                raise ValueError(f"indices are integers, not {indices.dtype}")
-            y = _launch(plan, signature, _switch, _switch_stand_in, x, indices)
-            if y is None:
-                y = self._through_decode(x, indices, sorted_indices)
+        plan, bias = kept[0], kept[1]
+        y = None
+        if sorted_indices and plan is not None and _sorts(plan, x, indices):
+            if len(kept) == 3:
+                # The fourth entry is lazy and dies with the kept weight and plan.
+                kept = self.__dict__[_KEPT] = (*kept, _tile(self, plan))
+            tile = kept[3]
+            # The graph captures the schedule, which depends on both stack
+            # dimensions even for an identical activation and index shape.
+            tile_signature = (*signature, plan.n, self.num_experts)
+            graph = tile.proof.graphs.get(tile_signature) if tile is not None else None
+            if graph is not None:
+                y = graph(x, indices, *tile.operands)
+            elif tile is not None:
+                y = _launch_sorted(plan, tile, tile_signature, x, indices)
+        if y is None:
+            graph = plan.proof.graphs.get(signature) if plan is not None else None
+            if graph is not None:
+                y = graph(x, indices, *plan.operands)
+            else:
+                k = self.input_dims
+                if len(shape) < 2 or shape[-1] != k:
+                    raise ValueError(f"x is (..., M, {k}), not of shape {shape}")
+                if not mx.issubdtype(indices.dtype, mx.integer):
+                    raise ValueError(f"indices are integers, not {indices.dtype}")
+                y = _launch(plan, signature, _switch, _switch_stand_in, x, indices)
+                if y is None:
+                    y = self._through_decode(x, indices, sorted_indices)
         if bias is not None:
             y = y + mx.expand_dims(bias[indices], -2)
         return y
