@@ -9,14 +9,18 @@ decoder layer resident at a time.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
+import os
+import shutil
 import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import mlx.core as mx
 import numpy as np
@@ -115,13 +119,51 @@ def reference_of(model, prompt: mx.array, layers) -> dict[str, np.ndarray]:
     return {name: np.array(value) for name, value in reference.items()}
 
 
+def _take_reference(
+    path: Path, signature: dict, verify_dir: Path | None, staged: Path | None = None
+) -> bool:
+    """Reuse a matching archive or publish a completed one. Pin the same pair
+    into the writer's output while other publishers are excluded."""
+    from .oq import _atomic_write_json, _file_sha256
+
+    signed = path.with_suffix(".json")
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(directory, fcntl.LOCK_EX)
+        try:
+            metadata = json.loads(signed.read_text())
+            matches = metadata == {**signature, "archive_sha256": _file_sha256(path)}
+        except (OSError, ValueError):
+            matches = False
+        if not matches:
+            if staged is None:
+                return False
+            metadata = {**signature, "archive_sha256": _file_sha256(staged)}
+            staged.replace(path)
+            # An interruption between the replacements leaves a digest mismatch.
+            _atomic_write_json(signed, metadata)
+        if verify_dir is not None:
+            verify_dir.mkdir()
+            shutil.copy2(path, verify_dir / "reference.npz")
+            shutil.copy2(signed, verify_dir / "reference.json")
+        return True
+    finally:
+        os.close(directory)
+
+
 def source_reference(
-    model_path, config: dict, cache_dir: Path, *, trust_remote_code: bool = False
+    model_path,
+    config: dict,
+    cache_dir: Path,
+    *,
+    trust_remote_code: bool = False,
+    verify_dir: Path | None = None,
 ) -> Path:
     """The file of the source's reference: the one in ``cache_dir`` when it
     is of this source (its config and weight files), calibration corpus,
     tokenizer and version, found without loading any of them; else made by
-    one streamed pass over the source (its time logged)."""
+    one streamed pass over the source (its time logged). A writer supplies
+    its private verification directory to keep a snapshot of this generation."""
     from mlx_lm.tokenizer_utils import load as load_tokenizer
 
     from . import oq
@@ -147,12 +189,7 @@ def source_reference(
         "tokenizer_hash": tokenizer.hexdigest(),
     }
     path = cache_dir / f"{source.name}.reference.npz"
-    signed = cache_dir / f"{source.name}.reference.json"
-    if (
-        path.is_file()
-        and signed.is_file()
-        and json.loads(signed.read_text()) == signature
-    ):
+    if cache_dir.is_dir() and _take_reference(path, signature, verify_dir):
         return path
     prompt = oq._load_calibration_data(
         load_tokenizer(source),
@@ -174,8 +211,10 @@ def source_reference(
     del model, layers
     mx.clear_cache()
     cache_dir.mkdir(parents=True, exist_ok=True)
-    np.savez(path, **reference)
-    signed.write_text(json.dumps(signature, indent=2))
+    with TemporaryDirectory(dir=cache_dir) as tmp:
+        archive = Path(tmp) / path.name
+        np.savez(archive, **reference)
+        _take_reference(path, signature, verify_dir, archive)
     logger.info(
         "oQ verify: the source's reference over %d tokens, streamed in %.0f s",
         REFERENCE_TOKENS,

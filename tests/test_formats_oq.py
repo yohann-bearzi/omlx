@@ -469,6 +469,211 @@ def test_a_run_in_a_format_keeps_the_source_s_reference(source, toy, tmp_path):
     assert not (tmp_path / "c" / "verify").exists()
 
 
+def test_a_truncated_reference_signature_is_regenerated(source, tmp_path, monkeypatch):
+    from omlx import oq_verify
+
+    config = json.loads((source / "config.json").read_text())
+    reads = []
+    _calibration(monkeypatch, reads)
+    reference = oq_verify.source_reference(source, config, tmp_path)
+    signed = reference.with_suffix(".json")
+    signature = json.loads(signed.read_text())
+    signed.write_text('{"source_hash":')
+    assert oq_verify.source_reference(source, config, tmp_path) == reference
+    assert json.loads(signed.read_text()) == signature
+    assert oq_verify.source_reference(source, config, tmp_path) == reference
+    assert len(reads) == 2
+
+
+@pytest.mark.parametrize("artifact", ["signature", "archive"])
+def test_reference_replacement_keeps_open_readers_whole(
+    source, tmp_path, monkeypatch, artifact
+):
+    from omlx import oq_verify
+
+    config = json.loads((source / "config.json").read_text())
+    _calibration(monkeypatch)
+    reference = oq_verify.source_reference(source, config, tmp_path)
+    signed = reference.with_suffix(".json")
+    first = json.loads(signed.read_text())
+    monkeypatch.setattr(oq_verify, "REFERENCE_VERSION", first["reference_version"] + 1)
+    with signed.open() as prior_signature, reference.open("rb") as prior_archive:
+        original = prior_archive.read()
+        prior_archive.seek(0)
+        # A second reference uses a different prompt, identifiable in the archive.
+        monkeypatch.setattr(
+            oq, "_load_calibration_data", lambda *a, **kw: mx.ones((1, 16), mx.int32)
+        )
+        assert oq_verify.source_reference(source, config, tmp_path) == reference
+        with np.load(reference) as new:
+            assert new["prompt"].tolist() == [1] * 16
+        assert json.loads(signed.read_text()) != first
+        if artifact == "signature":
+            assert json.load(prior_signature) == first
+        else:
+            # Keep pytest from dumping the entire binary archive on a mismatch.
+            unchanged = prior_archive.read() == original
+            assert unchanged
+
+
+@pytest.mark.parametrize(
+    "legacy", [False, True], ids=["current", "before-atomic-writes"]
+)
+def test_a_reference_archive_must_match_its_signature(
+    source, tmp_path, monkeypatch, legacy
+):
+    from omlx import oq_verify
+
+    config = json.loads((source / "config.json").read_text())
+    reads = []
+    _calibration(monkeypatch, reads)
+    reference = oq_verify.source_reference(source, config, tmp_path)
+    with np.load(reference) as archive:
+        expected = archive["prompt"].copy()
+    if legacy:
+        # The metadata from writers that overwrote their archives in place.
+        signed = reference.with_suffix(".json")
+        metadata = json.loads(signed.read_text())
+        fields = (
+            "reference_version",
+            "source_hash",
+            "calib_data_hash",
+            "tokenizer_hash",
+        )
+        signed.write_text(json.dumps({key: metadata[key] for key in fields}))
+    reference.write_bytes(b"PK\x03\x04interrupted")
+    assert oq_verify.source_reference(source, config, tmp_path) == reference
+    with np.load(reference) as repaired:
+        np.testing.assert_array_equal(repaired["prompt"], expected)
+    assert oq_verify.source_reference(source, config, tmp_path) == reference
+    assert len(reads) == 2
+
+
+def test_interrupted_reference_publication_cannot_sign_the_wrong_archive(
+    source, tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    config = json.loads((source / "config.json").read_text())
+    _calibration(monkeypatch)
+    reference = oq_verify.source_reference(source, config, tmp_path)
+    signed = reference.with_suffix(".json")
+    first = json.loads(signed.read_text())
+    with np.load(reference) as cached:
+        prompt = cached["prompt"].copy()
+
+    with monkeypatch.context() as interrupt:
+        interrupt.setattr(
+            oq_verify, "REFERENCE_VERSION", first["reference_version"] + 1
+        )
+        interrupt.setattr(
+            oq, "_load_calibration_data", lambda *a, **kw: mx.ones((1, 16), mx.int32)
+        )
+        # Interrupt either form of metadata publication after producing the new data.
+        write, replace = Path.write_text, Path.replace
+
+        def write_text(path, *args, **kwargs):
+            if path == signed:
+                raise OSError("could not publish signature")
+            return write(path, *args, **kwargs)
+
+        def replace_file(path, target):
+            if Path(target) == signed:
+                raise OSError("could not publish signature")
+            return replace(path, target)
+
+        interrupt.setattr(Path, "write_text", write_text)
+        interrupt.setattr(Path, "replace", replace_file)
+        with pytest.raises(OSError, match="could not publish signature"):
+            oq_verify.source_reference(source, config, tmp_path)
+
+    recovered = oq_verify.source_reference(source, config, tmp_path)
+    assert json.loads(recovered.with_suffix(".json").read_text()) == first
+    with np.load(recovered) as restored:
+        np.testing.assert_array_equal(restored["prompt"], prompt)
+
+
+def test_a_writer_keeps_its_reference_when_another_source_uses_the_cache(
+    source, toy, tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    other = tmp_path / "other" / source.name
+    shutil.copytree(source, other)
+    sidecar = other / "tokenizer_config.json"
+    sidecar.write_text(
+        json.dumps({**json.loads(sidecar.read_text()), "model_max_length": 8})
+    )
+    cache = tmp_path / "cache"
+    output = tmp_path / "written"
+    copy = oq._copy_model_sidecars
+    prior = []
+
+    def other_source(src, out, **kwargs):
+        # A second source with the same basename finishes before the first writer.
+        name = cache / f"{source.name}.reference.json"
+        prior.append(json.loads(name.read_text()))
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                oq,
+                "_load_calibration_data",
+                lambda *a, **kw: mx.ones((1, 16), mx.int32),
+            )
+            oq_verify.source_reference(
+                other, json.loads((other / "config.json").read_text()), cache
+            )
+        assert json.loads(name.read_text()) != prior[0]
+        return copy(src, out, **kwargs)
+
+    monkeypatch.setattr(oq, "_copy_model_sidecars", other_source)
+    _quantize(
+        source, output, quant_format="toy", imatrix_cache_path=str(cache / "i.npz")
+    )
+    assert prior == [json.loads((output / "verify" / "reference.json").read_text())]
+    with np.load(output / "verify" / "reference.npz") as kept:
+        assert kept["prompt"].tolist() == (mx.arange(16) % 63 + 1).tolist()
+
+
+def test_a_cache_publisher_cannot_mix_a_writers_two_reference_files(
+    source, toy, tmp_path, monkeypatch
+):
+    """A competing publisher becomes ready between the two snapshot copies."""
+    import fcntl
+    import os
+
+    cache = tmp_path / "cache"
+    output = tmp_path / "written"
+    archive = cache / f"{source.name}.reference.npz"
+    signed = archive.with_suffix(".json")
+    copy = shutil.copy2
+    snapshots = []
+
+    def copying(src, dst, *args, **kwargs):
+        result = copy(src, dst, *args, **kwargs)
+        if Path(dst).name == "reference.npz" and Path(dst).parent.name == "verify":
+            snapshots.append(json.loads(signed.read_text()))
+            # Another publisher follows the cache's lock protocol. If it can
+            # publish now, the writer must already have pinned its own metadata.
+            directory = os.open(cache, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                try:
+                    fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return result
+                other = signed.with_suffix(".new")
+                other.write_text(json.dumps({"source_hash": "another checkpoint"}))
+                other.replace(signed)
+            finally:
+                os.close(directory)
+        return result
+
+    monkeypatch.setattr(shutil, "copy2", copying)
+    _quantize(
+        source, output, quant_format="toy", imatrix_cache_path=str(cache / "i.npz")
+    )
+    assert snapshots == [json.loads((output / "verify" / "reference.json").read_text())]
+
+
 def test_a_run_keeps_no_record_of_its_source_s_verification(source, tmp_path):
     """A source written by a run in a format tells of that run's checks,
     not of this one's."""

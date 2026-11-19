@@ -298,6 +298,8 @@ A fit reads the matrices it fits on as oQ will offer them: `iter_format_offers(s
 
 Its keyword arguments are that run's own (`group_size`, `text_only`, `dtype`, `preserve_mtp`, the `imatrix_*` settings, `stream_calibration`, ...; `enhanced=True` may be among them). The cache is of a source, a calibration corpus, a number of samples and their length: a run of another (`imatrix_num_samples`, `imatrix_seq_length`) calibrates again, and so does a run with `imatrix_reuse_cache=False`, whatever it finds. `<cache>` is the file's name as given, a folder is refused. It writes nothing but the cache (`<cache>` and `<cache>.json`, each written whole, the metadata last) and, beside it, the source's reference that a run in a format verifies its output against (`<source>.reference.npz` and `.json`, made once per source by one pass of the source's own forward that holds one decoder layer at a time); a calibration proxy that a model above the calibration budget needs is built beside the cache and removed, and a refused call leaves none of the folders it made for the cache. DeepSeek V4.1 calibrates inside its own writer and is refused.
 
+The reference metadata binds the archive to its SHA-256 digest. The first use of an older reference without a digest regenerates it from the source. Each format write copies its reference into its private verification directory before writing weights, so concurrent runs can share a cache directory.
+
 `encode` returns the tensors that keep `w`, by name, in the shapes and dtypes that `layout(k, n, bits, group_size)` gives, or None for a matrix it leaves to oQ.
 
 - `w` is a matrix `(n, k)`, or some of a stack's matrices, `(e, n, k)`, in the floats of the source checkpoint. The tensors of a stack's matrices have its axis first.

@@ -8453,7 +8453,7 @@ def _plan_oq_run(run: _OQRun) -> None:
     run.update((k, v) for k, v in locals().items() if k != "run")
 
 
-def _source_reference(run: _OQRun) -> Path:
+def _source_reference(run: _OQRun, *, verify_dir: Path | None = None) -> Path:
     """The file of the source's reference (oq_verify), kept beside the
     run's calibration cache: made once per source and prompt."""
     from .oq_verify import source_reference
@@ -8464,6 +8464,7 @@ def _source_reference(run: _OQRun) -> Path:
         # A run with a format is oQe's, so it has its cache.
         Path(run.get("imatrix_cache_path")).parent,
         trust_remote_code=run.get("trust_remote_code"),
+        verify_dir=verify_dir,
     )
 
 
@@ -8621,10 +8622,9 @@ def quantize_oq_streaming(
             preserve_ngram_table=preserve_ngram_table,
         )
     _calibrate_oq_run(run)
-    reference = None
     if run.get("quant_fmt") is not None:
-        # What the written checkpoint is verified against: the source's own.
-        reference = _source_reference(run)
+        # Pin the source's reference before another job can replace the cache.
+        _source_reference(run, verify_dir=run["output"] / "verify")
     _plan_oq_run(run)
     # The writer's alone: its del below lets the source's index go.
     all_weights = run.pop("all_weights")
@@ -9048,12 +9048,6 @@ def quantize_oq_streaming(
         export_sidecars(source, output, config)
 
     if final_output is not None:
-        # The reference goes with the checkpoint, to verify it again.
-        (output / "verify").mkdir()
-        for kind in (".npz", ".json"):
-            shutil.copy2(
-                reference.with_suffix(kind), output / "verify" / f"reference{kind}"
-            )
         written = json.loads((output / "config.json").read_text())
         written[VERIFICATION] = {
             "verified": True,
