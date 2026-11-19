@@ -372,6 +372,34 @@ def test_a_run_in_a_format_writes_beside_its_output_until_done(
     assert seen == [(tmp_path / "oqe", True)]
 
 
+@pytest.mark.parametrize("as_path", [False, True], ids=["trailing-slash", "path"])
+def test_a_format_write_stages_beside_the_requested_directory(
+    source, toy, tmp_path, monkeypatch, as_path
+):
+    output = tmp_path / "written"
+    staging = tmp_path / "written.unverified"
+    _calibration(monkeypatch)
+    seen = []
+    copy = oq._copy_model_sidecars
+
+    def observe(src, out, **kwargs):
+        seen.append((out, output.exists()))
+        return copy(src, out, **kwargs)
+
+    monkeypatch.setattr(oq, "_copy_model_sidecars", observe)
+    oq.quantize_oq_streaming(
+        str(source),
+        output if as_path else f"{output}/",
+        4,
+        enhanced=True,
+        quant_format="toy",
+        **_SETTINGS,
+    )
+    assert seen == [(staging, False)]
+    assert json.loads((output / "config.json").read_text())[_VERIFICATION]["verified"]
+    assert not staging.exists()
+
+
 def test_a_run_in_a_format_records_its_verification(source, toy, tmp_path, monkeypatch):
     """Not verified while it writes, so a crash leaves what a load refuses;
     verified, by the version of the checks it passed, once done."""

@@ -7580,7 +7580,7 @@ def _format_offer(run: _OQRun, tensor_name: str, shape, bits, gs, qmode) -> _Off
 
 def _open_oq_run(
     model_path: str,
-    output_path: str,
+    output_path: str | Path,
     oq_level: int,
     group_size: int = 64,
     progress_callback: Callable[[str, float], None] | None = None,
@@ -7690,7 +7690,7 @@ def _open_oq_run(
     final_output = None
     if quant_fmt is not None:
         # Written beside its place, where no scan serves it, until verified.
-        final_output, output = output, Path(output_path + UNVERIFIED_SUFFIX)
+        final_output, output = output, output.with_name(output.name + UNVERIFIED_SUFFIX)
         if output.exists():
             raise ValueError(f"Output directory already exists: {output}")
 
@@ -8469,7 +8469,7 @@ def _source_reference(run: _OQRun) -> Path:
 
 def quantize_oq_streaming(
     model_path: str,
-    output_path: str,
+    output_path: str | Path,
     oq_level: int,
     group_size: int = 64,
     progress_callback: Callable[[str, float], None] | None = None,
