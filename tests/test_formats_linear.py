@@ -10,6 +10,7 @@ layer's whole stack, its ``gather_mm``.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import copy
 import logging
 import math
@@ -644,8 +645,13 @@ def test_a_tensor_of_float64_is_no_face_and_the_layer_runs_composed(
     switch = _toy_switch(8, 320)
     rows, indices = _ints((2, 1, 320)), mx.array([[3], [5]])
     with mx.stream(mx.cpu), caplog.at_level(logging.ERROR, logger=formats.__name__):
-        layer["scales"] = layer["scales"].astype(mx.float64)
-        switch["scales"] = switch["scales"].astype(mx.float64)
+        # The layout is fixed at construction, so supply float64 at that point.
+        layer = FormatLinear(
+            "toy", 8, 1, 320, {**layer, "scales": layer["scales"].astype(mx.float64)}
+        )
+        switch = FormatSwitchLinear(
+            "toy", 8, 1, 320, {**switch, "scales": switch["scales"].astype(mx.float64)}
+        )
         got, stacked = layer(x), switch(rows, indices)
         mx.eval(got, stacked)
     assert np.allclose(np.array(got), _want(layer, x))
@@ -2743,7 +2749,7 @@ def test_a_tensor_a_load_unloads_drops_the_plan_built_over_it(toy, tmp_path):
     layer, x, want = _toy_linear(40, 320)
     # Twice: the second call replays the graph the first one kept.
     assert _equal(layer(x), want) and _equal(layer(x), want)
-    assert layer.__dict__["_omlx_format_plan"][-1] is not None
+    assert layer.__dict__[linear._KEPT][0] is not None
     with format_load.loading(tmp_path):
         layer["scales"] = layer["scales"].astype(mx.float16)
     offered = _refusal(
@@ -2816,6 +2822,53 @@ def test_a_recast_after_a_failed_load_keeps_what_the_load_offered(toy, tmp_path)
     )
     with pytest.raises(ValueError, match=offered):
         layer(x)
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_an_ended_load_cannot_fill_or_unload_a_tensor(toy, tmp_path, loaded):
+    layer, (codes, scales), x, want = _over_placeholders(toy)
+    with format_load.loading(tmp_path):
+        if loaded:
+            layer["weight"], layer["scales"] = codes, scales
+        stale = contextvars.copy_context()
+
+    def write():
+        layer["weight"] = codes
+        layer["scales"] = scales.astype(mx.float16) if loaded else scales
+
+    stale.run(write)
+    if loaded:
+        assert _equal(layer(x), want)
+    else:
+        with pytest.raises(ValueError, match="weight .never loaded"):
+            layer(x)
+
+
+def test_a_layer_updated_by_dict_union_keeps_its_layout_and_load_proof(toy, tmp_path):
+    layer, (codes, scales), x, want = _over_placeholders(toy)
+    held = layer["scales"]
+    layer |= {"scales": scales.astype(mx.float16)}
+    assert layer["scales"] is held
+    with format_load.loading(tmp_path):
+        layer |= [("weight", codes), ("scales", scales)]
+    assert _equal(layer(x), want)
+    with format_load.loading(tmp_path):
+        layer |= {"scales": scales[:1]}
+    with pytest.raises(ValueError, match="scales .offered"):
+        layer(x)
+
+
+def test_a_nested_value_leaves_its_tensor_unloaded_until_an_array_replaces_it(
+    toy, tmp_path
+):
+    layer, (codes, scales), x, want = _over_placeholders(toy)
+    with format_load.loading(tmp_path):
+        layer["weight"] = codes
+        layer["scales"] = [scales]
+        with pytest.raises(ValueError, match=r"scales \(offered list, not an array\)"):
+            layer(x)
+        layer["scales"] = scales
+    assert _equal(layer(x), want)
 
 
 def test_the_page_says_only_a_load_fills_a_placeholder():

@@ -437,7 +437,7 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
 
     # The checkpoint's load: the layers are built and filled; a recast
     # "after" comes once the load has returned.
-    (tmp_path / "config.json").write_text("{}")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "llama"}))
     with format_load.loading(tmp_path):
         nn.quantize(model, class_predicate=_named({"linear": _TOY, "switch": _TOY}))
         if when == "before":
@@ -1462,9 +1462,8 @@ def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_pat
     assert type(layer.fmt) is _Levels and layer.fmt.levels == (0.5, 1.5)
     # The object reads the layer: it lays the matrix out, its decode and its
     # face are the layer's; nothing is kept on the registered format.
-    # The hook asks both; the layer asks its own once more.
-    assert toy.asked == [(64, 128, 8, 1)]
-    assert layer.fmt.asked == [(64, 128, 8, 1)] * 2
+    # The hook asks both; the layer reuses its accepted layout.
+    assert layer.fmt.asked == toy.asked == [(64, 128, 8, 1)]
     assert formats.get("toy") is toy and not hasattr(toy, "levels")
     tensors = {name: layer[name] for name in ("weight", "scales")}
     assert mx.array_equal(layer._decoded(), toy.decode(tensors, 8, 1) * 0.5)
@@ -1798,7 +1797,7 @@ def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
     # The registered format said it lays such a matrix out; the checkpoint's
     # laid it out.
     assert toy.asked == [(64, 128, 8, 1)]
-    assert wide.asked == [(64, 128, 8, 1)] * 2  # and the layer's own
+    assert wide.asked == [(64, 128, 8, 1)]
     assert layer.fmt is wide and _kept(layer)["scales"] == ((128, 2), mx.float32)
     # One the registered format lays out none of is refused before the record
     # is read.

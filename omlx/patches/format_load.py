@@ -455,6 +455,14 @@ class _Checkpoint:
             # its placeholder) and recorded as offered: named as it was.
             for name, offered in getattr(layer, "_placeholders", {}).items():
                 if offered is not None:
+                    if offered[0] is None:
+                        raise _refused(
+                            f"the load left {path}.{name} {offered[1]}, where the "
+                            "format lays out an array: the checkpoint holds tensors "
+                            "under that name",
+                            layer.mode,
+                            self,
+                        )
                     held = placeholders[name]
                     raise _refused(
                         f"{path}.{name} is {offered[0]} {offered[1]}, where the "
@@ -1035,7 +1043,14 @@ def _format_layer(layer, layer_cls, signature, arguments):
         for name, (shape, dtype) in layout.items()
     }
     built = layer_cls(
-        fmt, bits, group_size, k, tensors, layer.get("bias"), placeholders=True
+        fmt,
+        bits,
+        group_size,
+        k,
+        tensors,
+        layer.get("bias"),
+        placeholders=True,
+        _load_layout=layout,
     )
     checkpoint.built.append(built)
     # Its placeholders and its checkpoint, until oMLX's own load has checked

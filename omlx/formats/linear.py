@@ -27,6 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
+from ..patches.module_cache import cached_per_module
 from . import Dot, kernels
 
 logger = logging.getLogger(__name__)
@@ -47,10 +48,6 @@ MAX_ROWS = 16
 _AT_ONCE_PAIRS = 20
 _DECODE_AT_ONCE_BYTES = 1 << 31
 _DECODE_BYTES = 1 << 28
-
-# What opens the ValueError of MLX's eval for an array of a function that it
-# is tracing (compile, vmap).
-_TRACED = "[eval] Attempting to eval"
 
 # One threadgroup per pair (a row of x and the matrix it meets) and tile of 8
 # of the pair's outputs: 4 for each of the threadgroup's two simdgroups.
@@ -454,6 +451,8 @@ def _unloaded(name: str, held, offered) -> str:
     if offered is None:
         return f"{name} (never loaded)"
     shape, dtype = offered
+    if shape is None:
+        return f"{name} (offered {dtype}, not an array)"
     return (
         f"{name} (offered {shape} {dtype}, not the layout's {held.shape} "
         f"{held.dtype})"
@@ -499,6 +498,7 @@ class _FormatLayer(nn.Module):
         bias: mx.array | None = None,
         *,
         placeholders: bool = False,
+        _load_layout: dict | None = None,
     ) -> None:
         formats._may_build(fmt if isinstance(fmt, str) else fmt.mode)
         super().__init__()
@@ -523,7 +523,9 @@ class _FormatLayer(nn.Module):
         # What the format lays out for the matrix the layer holds: a layer's
         # N is its weight's first axis.
         n = weight.shape[-2]
-        layout = fmt.layout(input_dims, n, bits, group_size)
+        layout = _load_layout
+        if layout is None:
+            layout = fmt.layout(input_dims, n, bits, group_size)
         if layout is not None:
             formats.check_layout(fmt, n, input_dims, layout)
         # What lets a stack's matrices be gathered, tensor by tensor.
@@ -565,12 +567,18 @@ class _FormatLayer(nn.Module):
         if held is not None and key in self._tensors:
             if value is held:
                 return
-            loading = formats._LOADING.get() is not None
-            if value.shape != held.shape or value.dtype != held.dtype:
+            checkpoint = formats._LOADING.get()
+            loading = checkpoint is not None and checkpoint.active
+            array = isinstance(value, mx.array)
+            if not array or value.shape != held.shape or value.dtype != held.dtype:
                 if loading:
                     unloads = key not in self._placeholders
                     # The dtype's name: a Dtype neither pickles nor copies.
-                    self._placeholders[key] = (value.shape, str(value.dtype))
+                    self._placeholders[key] = (
+                        (value.shape, str(value.dtype))
+                        if array
+                        else (None, type(value).__name__)
+                    )
                     if unloads:
                         # A loaded tensor goes: a plan cached over it is
                         # built again, and refuses.
@@ -643,8 +651,10 @@ class _FormatLayer(nn.Module):
         super().clear()
 
     def __ior__(self, other):
-        self.__dict__.pop(_KEPT, None)
-        return super().__ior__(other)
+        # A dictionary union accepts mappings and iterables of key/value pairs.
+        for key, value in dict(other).items():
+            self[key] = value
+        return self
 
     def __delattr__(self, name: str) -> None:
         self.__dict__.pop(_KEPT, None)
