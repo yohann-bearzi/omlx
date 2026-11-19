@@ -79,7 +79,17 @@ from . import m1_verify_mma, m1_verify_qmv
 logger = logging.getLogger(__name__)
 
 _KERNEL_CACHE: dict = {}
-_ROUTE_ARMED = threading.local()
+
+
+class _RouteState(threading.local):
+    value: bool = False
+    row_exact: bool = False
+    layers: int = 0
+
+
+_ROUTE_ARMED = _RouteState()
+_ROW_EXACT_LOCK = threading.Lock()
+_ROW_EXACT_ACTIVE = 0
 
 _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 
@@ -107,18 +117,27 @@ def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
     ``nn.QuantizedLinear`` call runs ``row_exact_qmv`` (one-row decode
     arithmetic per row) and the fast verify kernels below stay disarmed.
     """
+    global _ROW_EXACT_ACTIVE
+    armed = bool(flag) and bool(row_exact)
+    prev = _ROUTE_ARMED.row_exact
     _ROUTE_ARMED.value = bool(flag) and not row_exact
-    _ROUTE_ARMED.row_exact = bool(flag) and bool(row_exact)
+    _ROUTE_ARMED.row_exact = armed
     _ROUTE_ARMED.layers = 0
+    if armed != prev:
+        with _ROW_EXACT_LOCK:
+            _ROW_EXACT_ACTIVE += 1 if armed else -1
+    from omlx.custom_kernels.quant_matmul import fast as _native
+
+    _native.set_row_exact_armed(armed)
 
 
 def _is_armed() -> bool:
-    return getattr(_ROUTE_ARMED, "value", False)
+    return _ROUTE_ARMED.value
 
 
 def is_row_exact_armed() -> bool:
     """True inside a verify forward whose rows must equal serial decode rows."""
-    return getattr(_ROUTE_ARMED, "row_exact", False)
+    return _ROW_EXACT_ACTIVE > 0 and _ROUTE_ARMED.row_exact
 
 
 # ---------------------------------------------------------------------------

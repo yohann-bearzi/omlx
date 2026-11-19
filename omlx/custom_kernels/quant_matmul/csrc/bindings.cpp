@@ -10,6 +10,7 @@
 #include "ane/ane_hybrid.h"
 #include "command_buffer_caps.h"
 #include "command_queue.h"
+#include "format_dispatch.h"
 #include "gather_qmm.h"
 #include "grouped_expert.h"
 #include "head_flat_qmm.h"
@@ -594,4 +595,5 @@ NB_MODULE(_ext, m) {
         std::begin(omlx::quant_matmul::kMoeWeightedSumTopKs),
         std::end(omlx::quant_matmul::kMoeWeightedSumTopKs));
   });
+  omlx::quant_matmul::register_format_dispatch(m);
 }

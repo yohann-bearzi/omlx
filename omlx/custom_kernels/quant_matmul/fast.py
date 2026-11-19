@@ -52,6 +52,23 @@ def share_command_queue(stream) -> int | None:
     return int(share(stream))
 
 
+_SET_ROW_EXACT_ARMED = getattr(_ext, "set_row_exact_armed", None)
+_FORMAT_LINEAR_FAST = getattr(_ext, "FormatLinearFast", None)
+
+
+def set_row_exact_armed(armed: bool) -> None:
+    """Mirror this thread's row-exact arming state into the native dispatcher."""
+    if _SET_ROW_EXACT_ARMED is not None:
+        _SET_ROW_EXACT_ARMED(bool(armed))
+
+
+def format_linear_fast(weight, bias, operands, proof_state):
+    """Return a native warm FormatLinear dispatcher, or None when unavailable."""
+    if _FORMAT_LINEAR_FAST is None or not hasattr(_FORMAT_LINEAR_FAST, "bind"):
+        return None
+    return _FORMAT_LINEAR_FAST(weight, bias, operands, proof_state).bind()
+
+
 # Extensions built before the NAX split reject the use_nax/nax_variant kwargs,
 # so only pass them when the rebuilt binding is present.
 _EXT_HAS_NAX = _ext is not None and hasattr(_ext, "is_nax_available")

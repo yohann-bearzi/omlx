@@ -630,6 +630,15 @@ def zeros(*specs) -> list[mx.array]:
     return made
 
 
+class _Replay:
+    """A non-weakrefable MLX graph, borrowed by native callers through this owner."""
+
+    __slots__ = ("graph", "__weakref__")
+
+    def __init__(self, graph):
+        self.graph = graph
+
+
 class _Kept(threading.local):
     """The graphs that a thread keeps of one proof, each under its launch's
     signature. Every thread that asks has a dict of its own, which ends with
@@ -637,6 +646,18 @@ class _Kept(threading.local):
 
     def __init__(self) -> None:
         self.graphs: dict = {}
+        self._replays = None
+
+    def replay(self, signature):
+        graph = self.graphs.get(signature)
+        if graph is None:
+            return None
+        if self._replays is None:
+            self._replays = {}
+        record = self._replays.get(signature)
+        if record is None:
+            record = self._replays[signature] = _Replay(graph)
+        return record
 
 
 # Held to keep a graph and to record a failure: a proof that fails while a
@@ -764,6 +785,13 @@ class Proof:
             kept = self._kept
             if len(kept.graphs) >= MAX_GRAPHS:
                 ended, kept.graphs = kept.graphs, {}
+            # Native layers borrow the thread's records weakly. Retire the
+            # affected records even if a caller still holds the old graph map.
+            if kept._replays is not None:
+                if ended is not None:
+                    kept._replays = None
+                else:
+                    kept._replays.pop(signature, None)
             kept.graphs[signature] = graph
         # The graphs that one more dropped end here, the lock released: as
         # many as MAX_GRAPHS launches for MLX to end.

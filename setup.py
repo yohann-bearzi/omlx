@@ -128,6 +128,7 @@ def _custom_kernel_build_kwargs() -> dict:
                     f"{quant}/affine_qmm.cpp",
                     f"{quant}/command_buffer_caps.cpp",
                     f"{quant}/command_queue.cpp",
+                    f"{quant}/format_dispatch.cpp",
                     f"{quant}/gather_qmm.cpp",
                     f"{quant}/grouped_expert.cpp",
                     f"{quant}/head_flat_qmm.cpp",

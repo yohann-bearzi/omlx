@@ -6,17 +6,17 @@ formats MLX knows.
 A layer holds a matrix's tensors under the names its format gives them, and
 asks the registry how to run them:
 
-- the rows of a decode step, or of the short blocks around one, go through
-  the format's dot face in the mat-vec skeleton, one launch for all of them,
-  each row with the bits it has alone;
+- ordinary Qwen dense projections select a single-row dot or wide mat-vec
+  according to MLX's row count, layout and size rules. The wide kernel
+  decodes weights through the format's tile face.
+  Explicitly row-exact calls use the dot face for each input row;
 - a switch layer's sorted prefill uses its tile face on tensor units or
   through MLX's steel matrix kernels, from 16 rows and four rows per expert
   on average. Below that threshold it uses its decode rows kernel;
-- everything else (more rows of one matrix, a layout the face does not
-  cover, activations of a type it is not exact for, a format without the
-  face, a face that did not compile) is the format's ``decode``, cast to the
-  activations' type, then MLX's matmul (its ``gather_mm`` from as many
-  indices as a switch layer's stack has matrices).
+- dense layers can fall back to the dot face for short calls. When a layer
+  has no eligible launch it decodes to the activations' type, then uses
+  MLX's matmul (its ``gather_mm`` from as many indices as a switch layer's
+  stack has matrices).
 """
 
 from __future__ import annotations
@@ -31,13 +31,13 @@ import mlx.nn as nn
 
 from .. import formats
 from ..patches.module_cache import cached_per_module
-from . import Dot, Tile, kernels
+from . import Dot, Tile, kernels, tile_wide
+from .mlx import traversal
 
 logger = logging.getLogger(__name__)
 
-# The rows of one ``FormatLinear`` call that go through the dot face: a decode
-# step and the short blocks around it (an MTP verify window). Each has the
-# bits of its one-row call, whatever rows it is launched with.
+# Maximum number of serial-exact rows in one dense Dot launch. A longer
+# explicitly row-exact Qwen call uses several such groups.
 MAX_ROWS = 16
 
 # Outside the rows kernel a switch layer decodes its whole stack at once for
@@ -206,6 +206,73 @@ def _tile(layer, plan: _Plan) -> _Tile | None:
     dtypes = tuple(a.dtype for a in operands)
     proof = kernels.proof(route, face, dtypes)
     return _Tile(face, kernel, operands, proof, said)
+
+
+def _ordinary_tile(layer, k, n, route, build_kernel):
+    face = formats.tile(layer, k, n)
+    if face is None:
+        return None
+    kernel = build_kernel(face)
+    if kernel is None:
+        return None
+    operands = tuple(layer[name] for name in ("weight", *face.tensors))
+    proof = kernels.proof(
+        f"format_linear_{route}", face, tuple(a.dtype for a in operands), k, n
+    )
+    said = (
+        f"quant format face {face.key}: {route} kernel engaged",
+        f"quant format face {face.key}: {route} kernel failed; rows kernel fallback",
+    )
+    return _Tile(face, kernel, operands, proof, said)
+
+
+def _decode_pair(layer, plan):
+    tile = formats.tile(layer, plan.k, plan.n)
+    if tile is None or kernels.table_bytes(plan.face, tile) > formats.TABLE_BYTES:
+        return None
+    names, kernel = tile_wide.pair_kernel(plan.face, tile)
+    # These weight buffers are fixed until a layer write retires the plan.
+    operands = tuple(mx.contiguous(layer[name]) for name in names)
+    proof = kernels.proof(
+        "format_linear_decode_pair",
+        plan.face,
+        tile,
+        tuple(a.dtype for a in operands),
+        plan.k,
+        plan.n,
+    )
+    said = (
+        f"quant format face {tile.key}: two-request decode kernel engaged",
+        f"quant format face {tile.key}: two-request decode kernel failed",
+    )
+    return _Tile(tile, kernel, operands, proof, said)
+
+
+@cache
+def _metal_architecture():
+    if mx.is_available(mx.gpu):
+        return mx.device_info(mx.gpu).get("architecture")
+    return None
+
+
+def _loading_qwen():
+    checkpoint = formats._LOADING.get()
+    if checkpoint is None or not checkpoint.active:
+        return False
+    try:
+        config = checkpoint._read_config()
+    except (OSError, ValueError):
+        return False
+    if not isinstance(config, dict):
+        return False
+    from ..oq import _family
+
+    for section in (config, config.get("text_config")):
+        if isinstance(section, dict):
+            name = section.get("model_type")
+            if isinstance(name, str) and _family(name) == "qwen4_exp":
+                return True
+    return False
 
 
 @cache
@@ -581,6 +648,19 @@ def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
 # Where a layer keeps what its calls work out of it once: its plan and its
 # bias.
 _KEPT = "_omlx_format_call"
+_FAST = "_fast"
+_NATIVE_FALLBACK_LOGGED = False
+
+
+def _log_native_fallback() -> None:
+    global _NATIVE_FALLBACK_LOGGED
+    if not _NATIVE_FALLBACK_LOGGED:
+        _NATIVE_FALLBACK_LOGGED = True
+        logger.warning(
+            "quant_matmul native FormatLinearFast unavailable; "
+            "using Python warm dispatch fallback"
+        )
+
 
 def _unloaded(name: str, held, offered) -> str:
     """A placeholder ``held`` of tensor ``name``, as a refusal names it: with
@@ -710,6 +790,10 @@ class _FormatLayer(nn.Module):
         self.__dict__.update(
             _tensors=names, _placeholders=dict.fromkeys(names if placeholders else ())
         )
+        if not self._STACK and _loading_qwen():
+            from ..patches.qwen35_verify_qmm import is_row_exact_armed
+
+            object.__setattr__(self, "_qwen_row_exact", is_row_exact_armed)
         for name in names:
             self[name] = tensors[name]
         if bias is not None:
@@ -725,6 +809,7 @@ class _FormatLayer(nn.Module):
         # by what was offered. A recast (set_dtype, before or after a load)
         # hands arrays back outside a load: it changes no tensor's status.
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         held = self.get(key)
         if held is not None and key in self._tensors:
             if value is held:
@@ -784,6 +869,7 @@ class _FormatLayer(nn.Module):
 
     def _keep(self) -> tuple:
         """The layer's plan and bias, worked out and kept."""
+        self.__dict__.pop(_FAST, None)
         bias = self.get("bias")
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
@@ -793,23 +879,28 @@ class _FormatLayer(nn.Module):
 
     def __delitem__(self, key: str) -> None:
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         super().__delitem__(key)
 
     def pop(self, *key_and_default):
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         return super().pop(*key_and_default)
 
     # A dict's own mutators, which do not go through the three above.
     def setdefault(self, key: str, default: Any = None) -> Any:
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         return super().setdefault(key, default)
 
     def popitem(self) -> tuple:
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         return super().popitem()
 
     def clear(self) -> None:
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         super().clear()
 
     def __ior__(self, other):
@@ -820,6 +911,7 @@ class _FormatLayer(nn.Module):
 
     def __delattr__(self, name: str) -> None:
         self.__dict__.pop(_KEPT, None)
+        self.__dict__.pop(_FAST, None)
         super().__delattr__(name)
 
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
@@ -863,16 +955,195 @@ def keeps_dtype(module, key: str) -> bool:
     return isinstance(module, _FormatLayer) and key in module._tensors
 
 
+def _exact_rows(plan, x):
+    """Keep long verify calls in groups of at most MAX_ROWS serial-exact rows."""
+    if plan is None or plan.proof.failed or not plan.face.exact_for(x.dtype):
+        return None
+    proof = plan.proof
+    signature = ("row_exact", x.shape, x.dtype)
+    graph = proof.graphs.get(signature)
+    if graph is not None:
+        return graph(x, *plan.operands)
+
+    k, n = plan.k, plan.n
+    groups, tail = divmod(x.size // k, MAX_ROWS)
+    flat = x.reshape(-1, k)
+
+    def rows_graph(count):
+        key = ((count, k), x.dtype)
+        if key not in proof.graphs:
+            _launch(plan, key, _linear, _linear_stand_in, flat[:count])
+        return proof.graphs.get(key)
+
+    full = rows_graph(MAX_ROWS)
+    last = rows_graph(tail) if tail else None
+    if full is None or (tail and last is None):
+        return None
+
+    def grouped(x, *operands):
+        rows = x.reshape(-1, k)
+        outputs = [
+            full(rows[i * MAX_ROWS : (i + 1) * MAX_ROWS], *operands)
+            for i in range(groups)
+        ]
+        if tail:
+            outputs.append(last(rows[-tail:], *operands))
+        return mx.concatenate(outputs).reshape(*x.shape[:-1], n)
+
+    graph = mx.compile(grouped)
+    result = graph(x, *plan.operands)
+    proof.keep(signature, graph)
+    return result
+
+
 class FormatLinear(_FormatLayer):
     """``x @ W.T + bias`` for a matrix ``W`` kept in format ``mode``:
     ``tensors`` are its ``weight`` and the format's tensors, by name."""
 
+    _qwen_row_exact = None
+    _fast = None
+
+    def _ordinary(self, kept, x, signature):
+        plan = kept[0]
+        architecture = _metal_architecture()
+        if not architecture:
+            return None
+        rows = x.size // plan.k
+        geometry = (plan.n, plan.k, self.group_size, architecture)
+        folded = traversal(rows, *geometry, bits=self.bits)
+        if folded[0] in ("fallback", "quad"):
+            return None
+        if len(kept) == 3:
+            kept = self.__dict__[_KEPT] = (*kept, {})
+        if (
+            signature[0][:-1] == (2, 1)
+            and folded[0] == "wide"
+            and plan.n % 8 == 0
+            and plan.face.exact_for(x.dtype)
+        ):
+            routes = kept[3]
+            if "decode_pair" not in routes:
+                routes["decode_pair"] = _decode_pair(self, plan)
+            pair = routes["decode_pair"]
+            if pair is not None:
+                graph = pair.proof.graphs.get(signature)
+                if graph is not None:
+                    self._register_fast(kept, pair, signature)
+                    return graph(x, *pair.operands)
+                y = _launch(
+                    pair, signature, tile_wide.describe, tile_wide.pair_stand_in, x
+                )
+                if y is not None:
+                    self._register_fast(kept, pair, signature)
+                    return y
+        single = x.ndim < 3 or rows == x.shape[-2]
+        route_sig = signature if single else ("batched", *signature)
+        result = self._project_route(kept, x, route_sig, folded)
+        if result is None or single:
+            return result
+        # MLX folds the leading axes if the input is row-contiguous or it
+        # must copy each matrix. A gap between intact matrices keeps M per
+        # matrix instead. The same trace can receive either physical layout.
+        batched = traversal(x.shape[-2], *geometry, bits=self.bits, batched=True)
+        if batched == folded:
+            return result
+        separate = self._project_route(kept, x, route_sig, batched)
+        if separate is None:
+            return None
+        from .tile_layout import per_matrix
+
+        return mx.where(per_matrix(x), separate, result)
+
+    def _project_route(self, kept, x, signature, choice):
+        plan, routes = kept[0], kept[3]
+        route = choice[0]
+        if route == "rows":
+            key = ("ordinary_rows", *signature)
+            graph = plan.proof.graphs.get(key)
+            if graph is not None:
+                return graph(x, *plan.operands)
+            return _launch(plan, key, _linear, _linear_stand_in, x)
+        if route != "wide":
+            return None
+        if route not in routes:
+            tile = _ordinary_tile(self, plan.k, plan.n, route, tile_wide.kernel)
+            routes[route] = tile
+            if tile is not None:
+                self.__dict__[_KEPT] = (*kept[:4], tile)
+        tile = routes[route]
+        if tile is None:
+            return None
+        graph = tile.proof.graphs.get(signature)
+        if graph is not None:
+            if len(signature) == 2:
+                self._register_fast(kept, tile, signature)
+            return graph(x, *tile.operands)
+        y = _launch(tile, signature, tile_wide.describe, tile_wide.stand_in, x)
+        if y is not None and len(signature) == 2:
+            self._register_fast(kept, tile, signature)
+        return y
+
+    def _register_fast(self, kept, tile: _Tile, signature: tuple) -> None:
+        graph = tile.proof.graphs.get(signature)
+        if graph is None:
+            return
+        # Each plan binds its own operands and live proof. A layer can switch
+        # between a prefill's wide graph and the two-request decode graph.
+        binding = ("native", id(tile))
+        fast = kept[3].get(binding)
+        if fast is None:
+            try:
+                from ..custom_kernels.quant_matmul import fast as native
+            except ImportError:
+                _log_native_fallback()
+                return
+
+            if not native.has_symbol("FormatLinearFast"):
+                _log_native_fallback()
+                return
+            fast = native.format_linear_fast(
+                kept[2], kept[1], tile.operands, vars(tile.proof)
+            )
+            if fast is None:
+                _log_native_fallback()
+                return
+            kept[3][binding] = fast
+        fast.__self__.register(signature)
+        self.__dict__[_FAST] = fast
+
     def __call__(self, x: mx.array) -> mx.array:
+        fast = self._fast
+        if fast is not None:
+            y = fast(self, x)
+            if y is not None:
+                return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept[2] is not self["weight"]:
             kept = self._keep()
-        plan, bias, _ = kept
+        plan, bias = kept[0], kept[1]
+        row_exact = self._qwen_row_exact
+        if row_exact is not None and plan is not None:
+            if len(kept) > 4 and not row_exact():
+                wide = kept[4]
+                graph = wide.proof.graphs.get((shape, dtype))
+                if graph is not None:
+                    if fast is not None:
+                        self._register_fast(kept, wide, (shape, dtype))
+                    y = graph(x, *wide.operands)
+                    return y if bias is None else y + bias
+            if not shape or shape[-1] != plan.k:
+                raise ValueError(f"x is (..., {plan.k}), not of shape {shape}")
+            if x.size > plan.k:
+                if row_exact():
+                    if x.size > MAX_ROWS * plan.k:
+                        y = _exact_rows(plan, x)
+                        if y is not None:
+                            return y if bias is None else y + bias
+                else:
+                    y = self._ordinary(kept, x, (shape, dtype))
+                    if y is not None:
+                        return y if bias is None else y + bias
         # A decode step is this, its kept graph's replay and the bias.
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:

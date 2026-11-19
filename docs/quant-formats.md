@@ -126,10 +126,25 @@ A switch layer's indices are integers of any integer dtype (mlx-vlm's are `uint3
 
 A layer keeps the format's tensors in the shapes and dtypes it is built with, which the face reads: an array of another shape or dtype assigned to one of them is not taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 activations recast a format layer's bias alone.
 
+When a checkpoint with model type `qwen4_exp` constructs a `FormatLinear`,
+the layer remembers the family after the load ends. For an ordinary call on
+the M5 Max or M3 Ultra, stock affine and plugin layers use the same MLX row
+thresholds and the same kernels over their format's faces. A contiguous batch
+can fold into one matrix. A gap between contiguous matrices can preserve a
+separate row count for each matrix, even when the two inputs have the same shape.
+The wide kernel reads the final partial parameter group, including when one
+group covers the entire row. Its Metal specialization checks that the last
+eight-weight run ends at K. For K of 64 or 128 at 2, 4 or 8 bits, MLX's
+short-vector traversal is quad. Those geometries and unrecognized GPU
+architectures use the format layer's existing fallback.
+
 | Call | What runs |
 |---|---|
-| `FormatLinear`, 1 to 16 rows of `x` (`linear.MAX_ROWS`: a decode step and the short blocks around one) | the dot face, in one launch. Rows in groups of 2, 3 or 4 (the most that divide them with a lane's inputs of the group within `kernels.ROW_VALUES_BUDGET`, 32 values: groups of 4 at 8 values a lane, of 2 at 16) run in the shared-rows skeleton, each block of the matrix decoded once for its group (`decode`, then `apply`); a count that none divides, and one row, run in the mat-vec skeleton, one row a simdgroup pair. Each row has the bits it has alone. A matrix whose N is not whole tiles of 8 runs every count in the shared-rows skeleton, its last tile holding the rows that are left, as MLX's `qmv` does. A face of no `vpt` runs every count in the mat-vec skeleton. |
-| `FormatLinear`, more rows | `decode`, then MLX's matmul |
+| Qwen ordinary dense, one row per matrix | The format's Dot computes its single-row product. |
+| Qwen ordinary dense, two rows per matrix up to the chip and matrix size's QMM threshold (exclusive) | The wide mat-vec kernel decodes each run of eight Tile weights once and reuses it across input rows. Its reduction order can change an ordinary plugin batch's low bits compared with evaluating each row alone. |
+| Qwen explicitly row-exact dense, with an eligible Dot | Each row has its own single-row bits. Calls longer than `linear.MAX_ROWS` use groups of up to 16 plus the remaining rows. This includes explicitly row-exact MTP verification. |
+| `FormatLinear`, 1 to 16 rows of `x` (`linear.MAX_ROWS`: a decode step and the short blocks around one), when using its Dot fallback or in another family | The dot face, in one launch. Rows in groups of 2, 3 or 4 (the most that divide them with a lane's inputs of the group within `kernels.ROW_VALUES_BUDGET`, 32 values: groups of 4 at 8 values a lane, of 2 at 16) run in the shared-rows skeleton, each block of the matrix decoded once for its group (`decode`, then `apply`); a count that none divides, and one row, run in the mat-vec skeleton, one row a simdgroup pair. Each row has the bits it has alone. A matrix whose N is not whole tiles of 8 runs every count in the shared-rows skeleton, its last tile holding the rows that are left, as MLX's `qmv` does. A face of no `vpt` runs every count in the mat-vec skeleton. |
+| `FormatLinear`, more than 16 rows with no eligible ordinary tile route or row-exact Dot route | `decode`, then MLX's matmul |
 | `FormatSwitchLinear`, eligible sorted prefill | NAX or steel tile gather |
 | `FormatSwitchLinear`, other calls with a dot face | one launch, one mat-vec per pair |
 | either, with no dot face that is exact for `x`'s dtype, or a K under 8; a switch layer, or a layer of a face of no `vpt`, with an N that is not a multiple of 8 | `decode`, then MLX's matmul. A switch layer decodes the matrices its indices name or, from as many indices as its stack has matrices, the stack once (then MLX's `gather_mm`). The bits are those of the MLX kernel the call lands on, not a pair's own. |
