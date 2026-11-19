@@ -7095,6 +7095,7 @@ def _format_reader(registered, record):
             f"quant format {mode!r} cannot be copied for the load ({error}): "
             "the checkpoint would not load; report it to the plugin"
         ) from error
+    formats._check_reader_isolation(registered, own, stage="deepcopy")
     kept = dict(getattr(registered, "__dict__", {}))
     try:
         read = own.accept(record)
@@ -7110,6 +7111,7 @@ def _format_reader(registered, record):
             "read the record: the checkpoint would not load; report it to the plugin"
         )
     read = own if read is None else read
+    formats._check_reader_isolation(registered, read, stage="accept")
     if not (
         isinstance(read, formats.QuantFormat)
         and (read.mode, read.tensors, read.contract)

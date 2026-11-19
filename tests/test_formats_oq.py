@@ -1872,7 +1872,7 @@ def test_a_checkpoint_keeps_the_record_as_it_was_checked(
     """A record the format changes after oQ asked for it (here, as it
     encodes) is stored as it was when oQ checked it."""
     record = {"layout": 2, "encoded": 0}
-    monkeypatch.setattr(toy, "record", lambda: record)
+    monkeypatch.setattr(type(toy), "record", staticmethod(lambda: record))
 
     def answer(tensors, w):
         record["encoded"] += 1
@@ -1882,6 +1882,44 @@ def test_a_checkpoint_keeps_the_record_as_it_was_checked(
     _, config, _ = _quantize(source, tmp_path / "oqe-toy", quant_format="toy")
     assert record["encoded"] > 0
     assert config[_RECORD]["toy"]["record"] == {"layout": 2, "encoded": 0}
+
+
+@pytest.mark.parametrize(
+    "value", [float("inf"), float("-inf")], ids=["positive", "negative"]
+)
+def test_an_infinite_format_record_is_refused_before_writing(
+    source, toy, tmp_path, monkeypatch, value
+):
+    record = {"layout": {"levels": [0, value]}}
+    monkeypatch.setattr(toy, "record", lambda: record)
+    output = tmp_path / "refused"
+    with pytest.raises(ValueError, match="not a dict that JSON keeps as it is"):
+        _quantize(source, output, quant_format=toy.mode)
+    assert not output.exists()
+    assert toy.offered == []
+
+
+def test_oq_stores_the_single_record_snapshot_taken_before_encode(
+    source, toy, tmp_path, monkeypatch
+):
+    record = {"layout": {"levels": [-1, 1]}}
+    calls = []
+
+    def describe():
+        calls.append("record")
+        return record
+
+    def encode_answer(tensors, _weight):
+        levels = record["layout"]["levels"]
+        levels[0] += 1
+        return tensors
+
+    monkeypatch.setattr(type(toy), "record", staticmethod(describe))
+    monkeypatch.setattr(toy, "answer", encode_answer)
+    _, config, _ = _quantize(source, tmp_path / "encoded", quant_format=toy.mode)
+    assert calls == ["record"]
+    assert record["layout"]["levels"][0] > -1
+    assert config[_RECORD][toy.mode]["record"] == {"layout": {"levels": [-1, 1]}}
 
 
 def test_oq_writes_with_a_format_object_of_the_registered_class(
@@ -2024,7 +2062,7 @@ def test_a_record_the_registered_format_does_not_read_is_refused(
 ):
     """Before a weight is read: as the load would refuse it."""
 
-    def accept(record):
+    def accept(self, record):
         if kind == "raises":
             raise ValueError("no layout 2")
         if kind == "configures":
@@ -2032,7 +2070,7 @@ def test_a_record_the_registered_format_does_not_read_is_refused(
             return None
         return "levels"
 
-    monkeypatch.setattr(toy, "accept", accept)
+    monkeypatch.setattr(type(toy), "accept", accept)
     words = {
         "raises": "quant format 'toy' refuses the record it gives (no layout 2): "
         "the checkpoint would not load; report it to the plugin",
@@ -2052,7 +2090,7 @@ def test_a_record_the_registered_format_does_not_read_is_refused(
 
 @pytest.mark.parametrize("loads", ["none", "other"])
 def test_a_configured_object_laid_out_otherwise_than_it_loads_stops_the_run(
-    source, toy, tmp_path, loads
+    source, toy, tmp_path, monkeypatch, loads
 ):
     """The registered format lays out none of a matrix the configured object
     lays out, or the object its accept returns another layout."""
@@ -2060,14 +2098,17 @@ def test_a_configured_object_laid_out_otherwise_than_it_loads_stops_the_run(
     if loads == "none":
         # Though the object its accept returns would lay it out.
         toy.lays_out = False
-        toy.accept = lambda record: _Codec()
+        monkeypatch.setattr(type(toy), "accept", lambda self, record: _Codec())
     else:
-        reader = _Codec()
-        reader.layout = lambda k, n, bits, gs: {
-            "weight": ((n, k), mx.uint8),
-            "scales": ((n,), mx.float16),
-        }
-        toy.accept = lambda record: reader
+
+        class _OtherLayout(_Codec):
+            def layout(self, k, n, bits, gs):
+                return {
+                    "weight": ((n, k), mx.uint8),
+                    "scales": ((n,), mx.float16),
+                }
+
+        monkeypatch.setattr(type(toy), "accept", lambda self, record: _OtherLayout())
     with pytest.raises(ValueError) as refusal:
         _quantize(source, tmp_path / "stopped", quant_format=fitted)
     said = str(refusal.value)
