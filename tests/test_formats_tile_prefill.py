@@ -1,8 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A format switch layer's sorted prefill on tensor units: its sorted rows
-through the format's tile face in oMLX's NAX sorted gather, from MLX's own
-threshold for its sorted kernel; the rows kernel below it, where the route
-declines and where its Metal fails."""
+"""Sorted prefill through a format's tile face on NAX and steel GPUs."""
 
 from __future__ import annotations
 
@@ -39,7 +36,10 @@ def _on_nax() -> bool:
         return False
 
 
-needs_nax = pytest.mark.skipif(not _on_nax(), reason="needs an M5 (NAX) GPU")
+_NAX = _on_nax()
+_TILE_PROOF = "format_switch_tile_nax" if _NAX else "format_switch_tile_steel"
+needs_nax = pytest.mark.skipif(not _NAX, reason="needs an M5 (NAX) GPU")
+needs_steel = pytest.mark.skipif(_NAX, reason="needs the steel sorted gather")
 
 # A format of 8-bit codes around 128 and a float32 scale per row (the dot
 # face of tests/test_formats_kernels.py), with a tile face of the same
@@ -197,7 +197,6 @@ def _proof(name):
     return proof
 
 
-@needs_nax
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("k, n", [(256, 128), (320, 96), (640, 256)])
 def test_a_format_stack_s_sorted_rows_take_the_tile_route(toy, caplog, k, n, dtype):
@@ -209,7 +208,7 @@ def test_a_format_stack_s_sorted_rows_take_the_tile_route(toy, caplog, k, n, dty
         got = layer(x, idx, sorted_indices=True)
         mx.eval(got)
     assert _same(got, _want(tensors, x, idx))
-    tile = _proof("format_switch_tile_nax")
+    tile = _proof(_TILE_PROOF)
     assert tile.ran and not tile.failed and not _proof("format_switch_linear").ran
     assert "quant format face tiletoy_route: tile kernel engaged" in caplog.text
     # The second call replays the kept graph.
@@ -218,7 +217,31 @@ def test_a_format_stack_s_sorted_rows_take_the_tile_route(toy, caplog, k, n, dty
     assert list(tile.graphs.values()) == [kept]
 
 
-@needs_nax
+@pytest.mark.parametrize("case", ["control", "const_face", "int_weight_index"])
+def test_sorted_tile_calls_the_checked_face_overloads(toy, case):
+    source = _TILE
+    if case == "const_face":
+        source = source.replace(
+            "Runs(Tile m, size_t row)",
+            "Runs(thread Tile&, size_t) = delete;\n"
+            "    Runs(thread const Tile& m, size_t row)",
+        )
+    if case == "int_weight_index":
+        source = source.replace(
+            "static float weight(thread const P& p, Codes q, int i)",
+            "static float weight(thread const P&, Codes, short) { return 0; }\n"
+            "    static float weight(thread const P& p, Codes q, int i)",
+        )
+    toy(_tile_toy("checked_" + case, source))
+    tensors = _stack(128, 256, seed=122)
+    layer = FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)
+    x, ids = _rows(256)
+    got = layer(x, ids, sorted_indices=True)
+    assert _same(got, _want(tensors, x, ids))
+    tile = _proof(_TILE_PROOF)
+    assert tile.ran and not tile.failed
+
+
 @pytest.mark.parametrize("bits, group_size", [(4, 64), (8, 32)])
 def test_affine_through_a_format_stack_is_mlx_s_sorted_gather_qmm(bits, group_size):
     k, n = 512, 128
@@ -241,7 +264,7 @@ def test_affine_through_a_format_stack_is_mlx_s_sorted_gather_qmm(bits, group_si
         sorted_indices=True,
     )
     assert _same(got, want)
-    assert _proof("format_switch_tile_nax").ran
+    assert _proof(_TILE_PROOF).ran
 
 
 @needs_nax
@@ -260,7 +283,6 @@ def test_the_rows_are_the_same_under_every_plan(toy, monkeypatch):
         assert _same(layer(x, idx, sorted_indices=True), want)
 
 
-@needs_nax
 def test_an_unsorted_call_of_the_same_shapes_runs_the_rows_kernel(toy):
     toy(_tile_toy("unsorted"))
     tensors = _stack(128, 256, seed=5)
@@ -273,7 +295,6 @@ def test_an_unsorted_call_of_the_same_shapes_runs_the_rows_kernel(toy):
     assert _proof("format_switch_linear").ran
 
 
-@needs_nax
 def test_a_sorted_call_after_an_unsorted_one_of_the_same_shapes_takes_the_tile_route(
     toy,
 ):
@@ -283,10 +304,9 @@ def test_a_sorted_call_after_an_unsorted_one_of_the_same_shapes_takes_the_tile_r
     x, idx = _rows(256)
     mx.eval(layer(x, idx))
     assert _same(layer(x, idx, sorted_indices=True), _want(tensors, x, idx))
-    assert _proof("format_switch_tile_nax").ran
+    assert _proof(_TILE_PROOF).ran
 
 
-@needs_nax
 def test_activations_the_tile_face_is_not_exact_for_leave_the_route():
     k, n = 256, 128
     w = mx.zeros((E, n, k), mx.bfloat16)
@@ -295,10 +315,9 @@ def test_activations_the_tile_face_is_not_exact_for_leave_the_route():
     layer = FormatSwitchLinear("affine", 4, 64, k, tensors)
     x, idx = _rows(k, dtype=mx.float16)
     mx.eval(layer(x, idx, sorted_indices=True))
-    assert not _proof("format_switch_tile_nax").ran
+    assert not _proof(_TILE_PROOF).ran
 
 
-@needs_nax
 @pytest.mark.parametrize(
     "counts",
     [
@@ -313,7 +332,7 @@ def test_below_mlx_s_threshold_the_rows_kernel(toy, counts):
     x, idx = _rows(256, counts)
     got = layer(x, idx, sorted_indices=True)
     assert _same(got, FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)(x, idx))
-    assert not [k for k in kernels._PROOFS if k[0] == "format_switch_tile_nax"]
+    assert not [k for k in kernels._PROOFS if k[0] == _TILE_PROOF]
 
 
 @needs_nax
@@ -324,10 +343,9 @@ def test_an_n_the_tile_kernels_do_not_take_runs_the_rows_kernel(toy):
     x, idx = _rows(256)
     got = layer(x, idx, sorted_indices=True)
     assert _same(got, FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)(x, idx))
-    assert not [k for k in kernels._PROOFS if k[0] == "format_switch_tile_nax"]
+    assert not [k for k in kernels._PROOFS if k[0] == _TILE_PROOF]
 
 
-@needs_nax
 def test_a_tile_face_that_fails_leaves_the_rows_kernel(toy, caplog):
     toy(_tile_toy("broken", _TILE.replace("RUN = 8;", "RUN = 16;")))
     tensors = _stack(128, 256, seed=8)
@@ -340,11 +358,10 @@ def test_a_tile_face_that_fails_leaves_the_rows_kernel(toy, caplog):
     assert _same(got, rows) and _same(again, rows)
     failed = "quant format face tiletoy_broken: tile kernel failed; rows kernel"
     assert caplog.text.count(failed) == 1
-    assert _proof("format_switch_tile_nax").failed
+    assert _proof(_TILE_PROOF).failed
     assert _proof("format_switch_linear").ran
 
 
-@needs_nax
 def test_the_tile_route_inside_mx_compile(toy):
     toy(_tile_toy("compiled"))
     tensors = _stack(128, 256, seed=9)
@@ -353,10 +370,9 @@ def test_the_tile_route_inside_mx_compile(toy):
     layer = FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)
     compiled = mx.compile(lambda x, idx: layer(x, idx, sorted_indices=True))
     assert _same(compiled(x, idx), want)
-    assert _proof("format_switch_tile_nax").ran
+    assert _proof(_TILE_PROOF).ran
 
 
-@needs_nax
 def test_two_threads_through_one_layer_s_tile_route(toy):
     toy(_tile_toy("threads"))
     tensors = _stack(128, 256, seed=10)
@@ -391,7 +407,6 @@ def _affine_tensors():
     return {"weight": wq, "scales": scales, "biases": biases}
 
 
-@needs_nax
 def test_two_layers_sharing_a_tile_face_choose_their_own_column_plan(toy):
     toy(_tile_toy("shared_width"))
     x, idx = _rows(256)
@@ -401,7 +416,6 @@ def test_two_layers_sharing_a_tile_face_choose_their_own_column_plan(toy):
         assert _same(layer(x, idx, sorted_indices=True), _want(tensors, x, idx))
 
 
-@needs_nax
 def test_a_warm_sorted_graph_cannot_hide_a_layers_wrong_input_width(toy):
     toy(_tile_toy("shared_k"))
     first = FormatSwitchLinear("tiletoy", 8, 1, 256, _stack(128, 256))
@@ -412,7 +426,6 @@ def test_a_warm_sorted_graph_cannot_hide_a_layers_wrong_input_width(toy):
         mx.eval(wider(x, idx, sorted_indices=True))
 
 
-@needs_nax
 def test_tile_and_dot_faces_can_read_different_scale_operands(toy):
     source = _TILE.replace("return {r[0]};", "return {2.0f * r[0]};")
     face = replace(_tile_toy("own_scales", source), tensors=("tile_scales",))
@@ -424,7 +437,7 @@ def test_tile_and_dot_faces_can_read_different_scale_operands(toy):
         tensors["tile_scales"] = tensors["scales"] * 0.5
         layer = FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)
         assert _same(layer(x, idx, sorted_indices=True), _want(tensors, x, idx))
-    assert _proof("format_switch_tile_nax").ran
+    assert _proof(_TILE_PROOF).ran
 
 
 def test_stock_supports_declines_a_scalar_activation():
@@ -442,7 +455,6 @@ def test_stock_supports_declines_a_scalar_activation():
     )
 
 
-@needs_nax
 def test_a_sorted_trace_uses_the_current_layers_operands(toy):
     toy(_tile_toy("trace_state"))
     tensors = _stack(128, 256, seed=57)
@@ -459,7 +471,6 @@ def test_a_sorted_trace_uses_the_current_layers_operands(toy):
     assert _same(layer(x, idx, sorted_indices=True), want)
 
 
-@needs_nax
 @pytest.mark.parametrize(
     "counts, takes_tile",
     [((5, 5, 5), False), ((4, 4, 4, 4), True), ((4, 4, 4, 4, 3), False)],
@@ -473,7 +484,7 @@ def test_sorted_rows_at_the_two_mlx_thresholds(toy, counts, takes_tile):
     got = layer(x, idx, sorted_indices=True)
     want = _want(tensors, x, idx) if takes_tile else layer(x, idx)
     assert _same(got, want)
-    proved = [p for k, p in kernels._PROOFS.items() if k[0] == "format_switch_tile_nax"]
+    proved = [p for k, p in kernels._PROOFS.items() if k[0] == _TILE_PROOF]
     assert bool(proved and proved[0].ran) is takes_tile
 
 
@@ -487,4 +498,216 @@ def test_the_number_of_experts_selects_the_sorted_graph(toy):
         # The same 480 rows require different schedules at 120 and 48 per expert.
         x, idx = _rows(256, (480 // experts,) * experts)
         assert _same(layer(x, idx, sorted_indices=True), _want(stack, x, idx))
-    assert len(_proof("format_switch_tile_nax").ran) == 2
+    assert len(_proof(_TILE_PROOF).ran) == 2
+
+
+@needs_steel
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_ragged_columns_use_the_toy_face_on_steel(toy, dtype):
+    toy(_tile_toy("steel_columns"))
+    k, n = 256, 40
+    tensors = _stack(n, k, seed=79)
+    layer = FormatSwitchLinear("tiletoy", 8, 1, k, tensors)
+    x, idx = _rows(k, dtype=dtype)
+    got = layer(x, idx, sorted_indices=True)
+    assert _same(got, _want(tensors, x, idx))
+    assert _proof(_TILE_PROOF).ran
+
+
+@needs_steel
+def test_a_48_wide_call_keeps_the_rows_kernel_on_steel(toy):
+    toy(_tile_toy("steel_short_k"))
+    k, n = 48, 40
+    tensors = _stack(n, k, seed=83)
+    layer = FormatSwitchLinear("tiletoy", 8, 1, k, tensors)
+    x, idx = _rows(k)
+    got = layer(x, idx, sorted_indices=True)
+    assert _same(got, layer(x, idx))
+    assert not any(key[0] == _TILE_PROOF for key in kernels._PROOFS)
+
+
+@needs_steel
+def test_steel_affine_partial_output_tile_matches_mlx():
+    k, n = 256, 40
+    mx.random.seed(73)
+    w = mx.random.normal((E, n, k)).astype(mx.bfloat16)
+    codes, scales, biases = mx.quantize(w, group_size=32, bits=8)
+    tensors = {"weight": codes, "scales": scales, "biases": biases}
+    layer = FormatSwitchLinear("affine", 8, 32, k, tensors)
+    x, ids = _rows(k)
+    got = layer(x, ids, sorted_indices=True)
+    want = mx.gather_qmm(
+        x,
+        codes,
+        scales,
+        biases,
+        rhs_indices=ids,
+        transpose=True,
+        group_size=32,
+        bits=8,
+        sorted_indices=True,
+    )
+    assert _same(got, want)
+    assert _proof(_TILE_PROOF).ran
+
+
+@needs_steel
+def test_splitting_a_sorted_run_at_an_unaligned_row_keeps_its_bits(toy):
+    toy(_tile_toy("split_run"))
+    tensors = _stack(40, 256)
+    layer = FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)
+    x, ids = _rows(256)
+    left = layer(x[:53], ids[:53], sorted_indices=True)
+    right = layer(x[53:], ids[53:], sorted_indices=True)
+    want = _want(tensors, x, ids)
+    assert _same(mx.concatenate((left, right)), want)
+    assert _same(layer(x, ids, sorted_indices=True), want)
+    assert _proof(_TILE_PROOF).ran
+
+
+@needs_steel
+def test_a_sparse_expert_uses_the_full_weight_row_offset():
+    from omlx.formats import tile_gather
+
+    # Only the first 32 outputs for expert four are dispatched. This face
+    # derives a weight from its logical row and reads no backing weight page.
+    source = """
+    struct WideRow {
+      static constant constexpr int CONTRACT = 1;
+      const device uchar* codes;
+      template <int K> struct Runs {
+        static constant constexpr int RUN = 8;
+        static constant constexpr int GROUP = 16;
+        using P = float;
+        using Codes = uint;
+        size_t row;
+        Runs(WideRow, size_t r) : row(r) {}
+        P params(int) const {
+          return float((row >> 32) == 1) + 8.0f * float((row & 31) == 0);
+        }
+        Codes fetch(int) const { return 0; }
+        static float weight(P p, Codes, int) { return p; }
+      };
+    };
+    """
+    face = Tile(key="steel_wide_row", type="WideRow", source=source, tensors=())
+    kernel = tile_gather.kernel(face)
+    x = mx.ones((1, 1, 32), mx.float16)
+    dummy = mx.zeros((8,), mx.uint8)
+    offsets = mx.zeros((8,), mx.int32)
+    for n in (40, (1 << 30) + 8):
+        # Five experts, the first four with zero rows; M=1 and K=32.
+        meta = mx.array([1, n, 5], dtype=mx.int32)
+        (out,) = kernel(
+            inputs=[x, dummy, offsets, meta],
+            template=[("T", x.dtype), ("K", 32), ("ALIGN_N", False)],
+            grid=(64, 1, 1),
+            threadgroup=(64, 1, 1),
+            output_shapes=[(1, 1, 32)],
+            output_dtypes=[x.dtype],
+        )
+        rows = range(4 * n, 4 * n + 32)
+        expected = [32 * ((r >> 32 == 1) + 8 * (r % 32 == 0)) for r in rows]
+        assert out.tolist() == [[expected]]
+
+
+@needs_steel
+def test_a_sorted_format_layer_stages_its_faces_table(monkeypatch):
+    from omlx.formats import affine
+    from tests.test_formats_tables import tabled_tile
+
+    face = tabled_tile(affine.tile_face(4, 64, mx.bfloat16))
+    monkeypatch.setattr(affine.AffineFormat, "tile", lambda *args: face)
+    # Make decoding require distinct lookup-table entries.
+    mx.random.seed(91)
+    w = mx.random.normal((E, 128, 256)).astype(mx.bfloat16)
+    codes, scales, biases = mx.quantize(w, 64, 4)
+    tensors = dict(weight=codes, scales=scales, biases=biases)
+    layer = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+    x, idx = _rows(256)
+    got = layer(x, idx, sorted_indices=True)
+    want = mx.gather_qmm(
+        x,
+        codes,
+        scales,
+        biases,
+        rhs_indices=idx,
+        transpose=True,
+        group_size=64,
+        bits=4,
+        sorted_indices=True,
+    )
+    assert _same(got, want)
+    assert _proof(_TILE_PROOF).ran
+
+
+@needs_steel
+def test_missing_steel_headers_keep_two_layers_on_the_rows_kernel(
+    toy, monkeypatch, caplog
+):
+    from functools import cache
+
+    from omlx.formats import tile_gather
+
+    reads = []
+
+    def missing(paths):
+        reads.append(paths)
+        return None
+
+    monkeypatch.setattr(tile_gather, "_read_mlx_headers", missing)
+    monkeypatch.setattr(
+        tile_gather, "_headers", cache(tile_gather._headers.__wrapped__)
+    )
+    monkeypatch.setattr(tile_gather, "_build", cache(tile_gather._build.__wrapped__))
+    x, ids = _rows(256)
+    for key in ("first_missing", "second_missing"):
+        toy(_tile_toy(key))
+        layer = FormatSwitchLinear("tiletoy", 8, 1, 256, _stack(40, 256))
+        assert _same(layer(x, ids, sorted_indices=True), layer(x, ids))
+    assert len(reads) == 1
+    assert caplog.text.count("MLX steel headers unavailable") == 1
+    assert _proof("format_switch_linear").ran
+    assert not any(key[0] == _TILE_PROOF for key in kernels._PROOFS)
+
+
+@needs_steel
+@pytest.mark.parametrize("change", ["signed_ids", "fp32", "rank_two_ids"])
+def test_steel_declines_calls_outside_the_sorted_layout(toy, change):
+    toy(_tile_toy("steel_layout"))
+    layer = FormatSwitchLinear("tiletoy", 8, 1, 256, _stack(40, 256))
+    x, ids = _rows(256)
+    if change == "signed_ids":
+        ids = ids.astype(mx.int32)
+    elif change == "fp32":
+        x = x.astype(mx.float32)
+    else:
+        ids = ids.reshape(1, -1)
+    assert _same(layer(x, ids, sorted_indices=True), layer(x, ids))
+    assert not any(key[0] == _TILE_PROOF for key in kernels._PROOFS)
+
+
+@needs_steel
+def test_steel_reads_both_groups_of_a_threads_sixteen_weights():
+    from omlx.formats import tile_gather
+
+    # Flip the sign on alternating eight-weight groups. The two groups
+    # owned by a loader thread need different parameters from the same row.
+    face = _tile_toy(
+        "two_groups",
+        _TILE.replace(
+            "P params(int) const {\n      return {r[0]};",
+            "P params(int g) const {\n      return {(g & 1) ? -r[0] : r[0]};",
+        ),
+    )
+    k = 256
+    tensors = _stack(40, k, seed=97)
+    x, ids = _rows(k)
+    got = tile_gather.launch(
+        tile_gather.kernel(face), x, (tensors["weight"], tensors["scales"]), ids
+    )
+    signs = mx.where((mx.arange(k) // 8) % 2 == 0, 1.0, -1.0)
+    values = tensors["weight"].astype(mx.float32) - 128.0
+    w = (values * tensors["scales"][..., None] * signs).astype(x.dtype)
+    want = mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=ids, sorted_indices=True)
+    assert _same(got, want)

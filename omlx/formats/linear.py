@@ -9,11 +9,9 @@ asks the registry how to run them:
 - the rows of a decode step, or of the short blocks around one, go through
   the format's dot face in the mat-vec skeleton, one launch for all of them,
   each row with the bits it has alone;
-- a switch layer's sorted rows of a prefill, on a GPU with tensor units,
-  go through the format's tile face in oMLX's sorted gather
-  (``omlx.patches.m5_gather_qmm_nax``) from MLX's own threshold for its
-  sorted kernel (16 rows, 4 an expert); below it, elsewhere, or where the
-  tile route declines, the rows kernel as for a decode;
+- a switch layer's sorted prefill uses its tile face on tensor units or
+  through MLX's steel matrix kernels, from 16 rows and four rows per expert
+  on average. Below that threshold it uses its decode rows kernel;
 - everything else (more rows of one matrix, a layout the face does not
   cover, activations of a type it is not exact for, a format without the
   face, a face that did not compile) is the format's ``decode``, cast to the
@@ -184,16 +182,20 @@ class _Plan(NamedTuple):
 
 
 def _tile(layer, plan: _Plan) -> _Tile | None:
-    """The tile route of a stack whose rows run as ``plan``, or None: no
-    kernel for its tensor units here, or no tile face from the format. Its
-    proof is the tile kernels' (``format_switch_tile_nax``), apart from the
-    rows kernel's: a tile Metal that fails costs the route, not the rows."""
-    from ..patches import m5_gather_qmm_nax as nax
-
+    """Bind the tile backend for this GPU with its own proof and operands."""
     face = formats.tile(layer, plan.k, plan.n)
     if face is None:
         return None
-    kernel = nax._face_kernel(face)
+    if _nax_host():
+        from ..patches import m5_gather_qmm_nax as nax
+
+        kernel = nax._face_kernel(face)
+        route = "format_switch_tile_nax"
+    else:
+        from . import tile_gather
+
+        kernel = tile_gather.kernel(face)
+        route = "format_switch_tile_steel"
     if kernel is None:
         return None
     said = (
@@ -202,7 +204,7 @@ def _tile(layer, plan: _Plan) -> _Tile | None:
     )
     operands = tuple(layer[name] for name in ("weight", *face.tensors))
     dtypes = tuple(a.dtype for a in operands)
-    proof = kernels.proof("format_switch_tile_nax", face, dtypes)
+    proof = kernels.proof(route, face, dtypes)
     return _Tile(face, kernel, operands, proof, said)
 
 
@@ -502,19 +504,24 @@ def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
 
 
 def _sorts(plan: _Plan, x, indices) -> bool:
-    """Whether a stack's sorted call goes to the tile route: on tensor
-    units, from MLX's threshold for its own sorted kernel (16 rows, 4 a
-    matrix), and of the shapes the tile kernels take."""
-    if not _nax_host():
+    """Check MLX's prefill threshold and the geometry of this GPU's kernel."""
+    experts = plan.operands[0].shape[0]
+    rows = indices.size
+    if rows < 16 or rows < 4 * experts or not x.ndim or x.shape[-1] != plan.k:
         return False
-    from ..patches import m5_gather_qmm_nax as nax
+    if _nax_host():
+        from ..patches import m5_gather_qmm_nax as nax
 
-    experts, rows = plan.operands[0].shape[0], indices.size
+        return nax.geometry(x, indices, experts, plan.n)
     return (
-        rows >= 16
-        and rows >= 4 * experts
-        and nax.geometry(x, indices, experts, plan.n)
-        and x.shape[-1] == plan.k
+        x.shape == (rows, 1, plan.k)
+        and indices.ndim == 1
+        and indices.dtype == mx.uint32
+        and x.dtype in (mx.float16, mx.bfloat16)
+        and plan.k % 32 == 0
+        and plan.n > 0
+        and experts > 0
+        and rows < 1 << 30
     )
 
 
@@ -522,6 +529,14 @@ def _sorted(plan: _Plan, kernel, x, indices):
     """A stack's launch of its sorted rows through the tile face, as
     ``_switch`` gives the rows kernel's. The Metal holds the call's dtype,
     K and tile plan."""
+    if not _nax_host():
+        from . import tile_gather
+
+        def steel(x, indices, *operands):
+            return tile_gather.launch(kernel, x, operands, indices)
+
+        return (x.dtype, plan.k, plan.n % 32 == 0), steel
+
     from ..patches import m5_gather_qmm_nax as nax
 
     experts = plan.operands[0].shape[0]
@@ -533,22 +548,17 @@ def _sorted(plan: _Plan, kernel, x, indices):
     return (x.dtype, plan.k, config, plan.n % 64 == 0), graph
 
 
-def _sorted_stand_in(tile: _Tile, metal):
+def _sorted_stand_in(tile: _Tile, metal, graph):
     """The smallest launch of the tile Metal ``metal``, over zeros: 16 rows
     of x, all for matrix 0, and the fewest matrices that leave each tensor
     8 elements. The template values are the call's (its plan), not the
     stand-in's."""
-    from ..patches import m5_gather_qmm_nax as nax
-
-    dtype, k, config, _ = metal
+    dtype, k = metal[:2]
     matrices = max(-(-8 * a.shape[0] // a.size) for a in tile.operands)
     operands = (((matrices, *a.shape[1:]), a.dtype) for a in tile.operands)
     specs = (((16, 1, k), dtype), ((16,), mx.uint32), *operands)
 
-    def launch(x, idx, *tensors):
-        return nax._launch_face(tile.kernel, x, tensors, idx, config, None)
-
-    return kernels.zeros(*specs), launch
+    return kernels.zeros(*specs), graph
 
 
 def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
@@ -559,7 +569,7 @@ def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
         return None
     metal, graph = _sorted(plan, tile.kernel, x, indices)
     if not tile.proof.prove(
-        metal, lambda: _sorted_stand_in(tile, metal), logger, *tile.said
+        metal, lambda: _sorted_stand_in(tile, metal, graph), logger, *tile.said
     ):
         return None
     graph = mx.compile(graph)

@@ -503,22 +503,16 @@ def test_mlx_vlm_s_switch_glu_runs_over_the_layers():
     # 18 pairs, which mlx-vlm runs as they come.
     x, indices = _x((1, 3, 512)), _experts((1, 3, 6))
     assert _same_bits(ours(x, indices), theirs(x, indices))
-    # 96 pairs, which it sorts by expert. On tensor units they take the tile
-    # route, with the bits of MLX's sorted kernel; elsewhere each still has
-    # the bits it has in a decode step (MLX runs its sorted pairs in another
-    # kernel).
+    # At 96 pairs both layers sort by expert. Their prefill uses the same
+    # accumulation order on both NAX and steel GPUs.
     x, indices = _x((1, 16, 512)), _experts((1, 16, 6))
-    nax = is_nax_available()
-    if nax:
-        assert _same_bits(ours(x, indices), theirs(x, indices))
-    else:
-        steps = [theirs(x[:, t : t + 1], indices[:, t : t + 1]) for t in range(16)]
-        assert _same_bits(ours(x, indices), mx.concatenate(steps, axis=1))
-    # gate and up share a proof: the same face, tensor dtypes and shape; on
-    # tensor units, the three layers' tile proof (one face, any K and N).
-    rows = [k for k in kernels._PROOFS if k[0] == "format_switch_linear"]
-    tiles = [k for k in kernels._PROOFS if k[0] == "format_switch_tile_nax"]
-    assert len(rows) == 2 and len(tiles) == (1 if nax else 0)
+    assert _same_bits(ours(x, indices), theirs(x, indices))
+    # Gate/up share the rows proof. All three layers share the tile proof.
+    backend = "nax" if is_nax_available() else "steel"
+    tile = f"format_switch_tile_{backend}"
+    rows = [key for key in kernels._PROOFS if key[0] == "format_switch_linear"]
+    tiles = [key for key in kernels._PROOFS if key[0] == tile]
+    assert len(rows) == 2 and len(tiles) == 1
     for proof in kernels._PROOFS.values():
         assert proof.ran and not proof.failed
 

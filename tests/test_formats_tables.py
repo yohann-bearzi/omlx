@@ -203,9 +203,7 @@ def _capture_nax_without_mlx_headers(monkeypatch):
 
 
 def _builder_digest(monkeypatch) -> str:
-    """The digest of every Metal that the served kernels over faces build
-    for the affine faces (the kit's own kernels left out): each kernel's
-    name, header and body, in one order."""
+    """Pin the routed, row and NAX builders over the affine faces."""
     recorded = []
 
     def record(**kwargs):
@@ -235,6 +233,10 @@ def _builder_digest(monkeypatch) -> str:
         routed._down_kernel.__wrapped__(face, None)
         routed._gate_up_window_kernel.__wrapped__(face, shared, gate)
         routed._down_window_kernel.__wrapped__(face, shared)
+    return _metal_digest(recorded)
+
+
+def _metal_digest(recorded):
     digest = hashlib.sha256()
     for record_ in recorded:
         for part in record_:
@@ -251,6 +253,24 @@ _METAL_DIGEST = "460 98edb02fd856202a0515edf9a9eb6f092c84b9701e276975dcc1c29adc7
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
     assert _builder_digest(monkeypatch) == _METAL_DIGEST
+
+
+def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
+    from omlx.formats import tile_gather
+
+    records = []
+
+    def record(**kw):
+        records.append((kw["name"], kw["header"], kw["source"]))
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", record)
+    monkeypatch.setattr(tile_gather, "_headers", lambda: "")
+    for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
+        tile_gather._build.__wrapped__(affine.tile_face(bits, group, dtype))
+    # B8's independently captured table-free face headers and declarations
+    # with the steel loader and launch body, excluding installed MLX headers.
+    expected = "0b6af24687c3b42aef8c56bd09c037fad68b6f3d2908570850d926bfe4035691"
+    assert _metal_digest(records) == f"12 {expected}"
 
 
 _TOY = r"""
