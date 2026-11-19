@@ -134,6 +134,57 @@ def test_a_layer_that_runs_twice_is_refused_and_the_classes_restored(checkpoint)
     assert cls.__dict__["__call__"] is own
 
 
+def test_streamed_subclass_releases_weights_after_the_outermost_call():
+    class Base(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = mx.array([2.0])
+
+        def __call__(self, x):
+            return x * self.weight
+
+    class Sub(Base):
+        def __call__(self, x):
+            return super().__call__(x) + self.weight
+
+    base, sub = Base(), Sub()
+    with oq_verify.layer_by_layer([base, sub]):
+        assert sub(mx.array([3.0])).tolist() == [8.0]
+        assert sub.weight.size == 0
+        assert base(mx.array([4.0])).tolist() == [8.0]
+        assert base.weight.size == 0
+
+
+def test_overlapping_reference_passes_restore_the_shared_layer_class():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    class Layer(nn.Module):
+        def __call__(self, x):
+            return x
+
+    original = Layer.__call__
+    started, entered, finish = Event(), Event(), Event()
+
+    def other_pass():
+        started.set()
+        with oq_verify.layer_by_layer([Layer()]):
+            entered.set()
+            assert finish.wait(10)
+
+    with ThreadPoolExecutor(1) as workers:
+        try:
+            with oq_verify.layer_by_layer([Layer()]):
+                future = workers.submit(other_pass)
+                assert started.wait(10)
+                # A serialized pass can enter as soon as this first pass exits.
+                entered.wait(0.5)
+        finally:
+            finish.set()
+        future.result(timeout=10)
+    assert Layer.__call__ is original
+
+
 def test_a_class_without_its_own_call_gets_none_back():
     class Base(nn.Module):
         def __call__(self, x):

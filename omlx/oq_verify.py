@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,6 +43,9 @@ _TOKENIZER_FILES = frozenset(
 )
 
 
+_STREAMED_CALLS = threading.RLock()
+
+
 @contextmanager
 def layer_by_layer(layers) -> Iterator[None]:
     """While the block runs, each of ``layers`` evaluates its output and lets
@@ -49,14 +53,14 @@ def layer_by_layer(layers) -> Iterator[None]:
     holds one decoder layer's weights at a time. A layer that runs again in
     the block is refused (its weights are gone). Other modules of the same
     classes run as they do."""
-    ours = {id(layer) for layer in layers}
+    ours = {id(layer): layer for layer in layers}
     ran: set[int] = set()
-    classes = {type(layer) for layer in layers}
-    own = {cls: cls.__dict__.get("__call__") for cls in classes}
+    classes = {type(layer) for layer in ours.values()}
 
-    def streamed(original):
+    def streamed(cls, original):
         def call(self, *args, **kwargs):
-            if id(self) not in ours:
+            # A subclass may still need its weights after calling super().
+            if type(self) is not cls or id(self) not in ours:
                 return original(self, *args, **kwargs)
             if id(self) in ran:
                 raise RuntimeError(
@@ -73,16 +77,22 @@ def layer_by_layer(layers) -> Iterator[None]:
 
         return call
 
-    for cls in classes:
-        cls.__call__ = streamed(cls.__call__)
-    try:
-        yield
-    finally:
-        for cls, call in own.items():
-            if call is None:
-                del cls.__call__
-            else:
-                cls.__call__ = call
+    # The methods belong to the classes. Each pass takes its snapshot after
+    # the previous pass has restored them, including inherited methods.
+    with _STREAMED_CALLS:
+        own = {}
+        try:
+            for cls in classes:
+                saved = cls.__dict__.get("__call__")
+                cls.__call__ = streamed(cls, cls.__call__)
+                own[cls] = saved
+            yield
+        finally:
+            for cls, call in own.items():
+                if call is None:
+                    del cls.__call__
+                else:
+                    cls.__call__ = call
 
 
 def reference_of(model, prompt: mx.array, layers) -> dict[str, np.ndarray]:
