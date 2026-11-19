@@ -7,6 +7,7 @@ verifier's composed MoE returned for the window before."""
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -18,7 +19,9 @@ import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx.formats import affine
 from omlx.patches import qwen35_moe_router as router
 from omlx.patches import qwen35_verify_qmm
+from tests.test_m5_gather_qmm_nax import qwen_regroup as qwen_regroup
 from tests.test_qwen35_moe_routed_decode import _plan
+from tests.test_qwen35_moe_routed_decode import format_checkpoint as format_checkpoint
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -566,3 +569,20 @@ def test_a_face_with_a_table_runs_the_window_launches_to_the_bit(monkeypatch, en
         for key in kernels._PROOFS
         if key[0] == "routed_window"
     )
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_window_of_format_layers_equals_one_token_decode(monkeypatch, engaged):
+    """A block of quant format layers takes the window launches as MLX's
+    quantized layers do."""
+    from tests.test_formats_kernels import _toy
+    from tests.test_qwen35_moe_routed_decode import format_block, load_toy_format
+
+    load_toy_format(monkeypatch, replace(_toy("window"), dtypes=(mx.bfloat16,)))
+    # The fused router needs hidden < 16 x experts and experts % 128 == 0.
+    block = format_block(1024, 320, "toy", experts=128)
+    x = _inputs(4, 0, hidden=1024)
+    assert routed.routed_verify_window(block, x) is not None
+    for rows in (1, 2, 3, 8):
+        for step in range(2):
+            _check(block, _inputs(rows, step, hidden=1024), engaged)

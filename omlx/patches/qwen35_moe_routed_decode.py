@@ -101,6 +101,7 @@ import numpy as np
 
 from .. import formats
 from ..formats import Dot, kernels
+from ..formats.linear import FormatLinear, FormatSwitchLinear
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
     fused_router_topk,
@@ -503,10 +504,11 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
     )
 
 
-def _plain(layer, cls) -> bool:
-    # Exactly the class whose call is a bare quantized_matmul / gather_qmm;
-    # subclasses and repacked layers may compute differently.
-    return type(layer) is cls and "bias" not in layer
+def _plain(layer, *classes) -> bool:
+    # Exactly a class whose call is a bare quantized_matmul / gather_qmm, or
+    # a quant format's rows over its dot face; subclasses and repacked layers
+    # may compute differently.
+    return type(layer) in classes and "bias" not in layer
 
 
 def _operands(layer, face: Dot) -> tuple:
@@ -585,7 +587,7 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     if type(shared) is not Qwen3_5MLP:
         return None
     layers = (shared.get("gate_proj"), shared.get("up_proj"), shared.get("down_proj"), gate)
-    if not all(_plain(layer, nn.QuantizedLinear) for layer in layers):
+    if not all(_plain(layer, nn.QuantizedLinear, FormatLinear) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
     width = gate_proj["weight"].shape[0]
@@ -625,7 +627,8 @@ def _build_plan(block) -> _Plan | None:
     gate_up = switch_mlp.get("gate_up_proj")
     down = switch_mlp.get("down_proj")
     if not (
-        _plain(gate_up, QuantizedSwitchLinear) and _plain(down, QuantizedSwitchLinear)
+        _plain(gate_up, QuantizedSwitchLinear, FormatSwitchLinear)
+        and _plain(down, QuantizedSwitchLinear, FormatSwitchLinear)
     ):
         return None
     hidden = down["weight"].shape[1]

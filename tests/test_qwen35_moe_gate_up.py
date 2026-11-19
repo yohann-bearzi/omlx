@@ -16,9 +16,10 @@ from omlx.formats import linear as format_linear
 from omlx.formats import testing
 from omlx.formats.linear import FormatSwitchLinear
 from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
-from tests.test_formats_load import _PATCHED, _Loadable
 from tests.test_m5_gather_qmm_nax import qwen_regroup as qwen_regroup
 from tests.test_moe_verify_gather import _proofs as _gather_proofs
+from tests.test_qwen35_moe_routed_decode import format_checkpoint as format_checkpoint
+from tests.test_qwen35_moe_routed_decode import load_toy_format
 
 pytestmark = pytest.mark.usefixtures("qwen_regroup")
 
@@ -480,40 +481,12 @@ def _format_glu(experts=E, cls=None):
 
 
 @pytest.fixture
-def format_checkpoint(tmp_path):
-    """The test's toy layers share the reader accepted for one Qwen4 checkpoint."""
-    from omlx.patches import format_load
-
-    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp"}')
-    with testing.verified("qwen4_exp"), format_load.loading(tmp_path):
-        yield
-
-
-@pytest.fixture
 def loaded_format(monkeypatch, format_checkpoint):
     """The toy format, registered and loadable, with the face of the kernel
-    tests: the loaders build its layers as FormatLinear and
-    FormatSwitchLinear (MLX's own to_quantized under the test's wrappers,
-    as tests.test_formats_load has it)."""
-    from omlx.patches import format_load
+    tests."""
     from tests.test_formats_kernels import _toy
 
-    # The load patch visits each switch module once. Restore that bookkeeping
-    # together with the class methods when the fixture exits.
-    monkeypatch.setattr(
-        format_load, "_PENDING", format_load._PENDING | set(format_load._SWITCH_MODULES)
-    )
-    for cls in _PATCHED:
-        original = cls.to_quantized
-        monkeypatch.setattr(
-            cls, "to_quantized", getattr(original, "__wrapped__", original)
-        )
-    formats.load()
-    fmt = _Loadable()
-    fmt.face = _toy("gate_up_fusion")
-    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
-    format_load.apply_format_load_patch()
-    return fmt
+    return load_toy_format(monkeypatch, _toy("gate_up_fusion"))
 
 
 @pytest.mark.parametrize("length", [1, 3, 64])

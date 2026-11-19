@@ -102,7 +102,11 @@ with testing.verified("llama"):
     y = experts(x, indices)
 ```
 
-A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), and the format that reads them (`fmt`: what the checkpoint's [`accept`](#load-a-checkpoint) returned, or the registered format of a mode the layer is built with by hand), whose `dot` reads the rest. Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks any layer for its face; the routed decode plans over MLX's quantized layers only. A layer is given every tensor the format names, and no other:
+A layer keeps the tensors under their names, frozen, with the attributes of MLX's quantized layers (`mode`, `bits`, `group_size`), and the format that reads them (`fmt`: what the checkpoint's [`accept`](#load-a-checkpoint) returned, or the registered format of a mode the layer is built with by hand), whose `dot` reads the rest.
+Of the [kernels built on faces](#kernels-built-on-faces), the verify gather asks
+any layer for its face. The routed decode and verify window plan over MLX's
+quantized layers and format layers. A layer is given every tensor the format
+names, and no other:
 
 - the weight of a matrix has two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
 - in a stack every tensor has the stack's axis first, and the weight then two more. What follows the stack's axis in another tensor is the format's own.

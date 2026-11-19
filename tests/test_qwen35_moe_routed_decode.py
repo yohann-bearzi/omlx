@@ -18,8 +18,9 @@ from mlx.utils import tree_flatten
 
 import omlx.patches.qwen35_moe_routed_decode as routed
 from omlx import formats
-from omlx.formats import affine, kernels
+from omlx.formats import affine, kernels, testing
 from tests.test_formats_affine import uncalled
+from tests.test_m5_gather_qmm_nax import qwen_regroup as qwen_regroup
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -2331,3 +2332,129 @@ def test_faces_whose_tables_exceed_a_kernel_s_keep_the_shared_expert_apart(
     assert not _plan(block, x).launches.fold
     monkeypatch.setattr(kernels, "table_bytes", bytes_of)
     assert _plan(_block(1024, 320, seed=1), x).launches.fold
+
+
+@pytest.fixture
+def format_checkpoint(tmp_path, qwen_regroup):
+    """The test's toy layers share the reader accepted for one Qwen4 checkpoint."""
+    from omlx.patches import format_load
+
+    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp"}')
+    with testing.verified("qwen4_exp"), format_load.loading(tmp_path):
+        yield
+
+
+def load_toy_format(monkeypatch, face):
+    """The toy format of tests.test_formats_load, registered with ``face``
+    and loadable: the loaders build its layers as FormatLinear and
+    FormatSwitchLinear (MLX's own to_quantized under the test's wrappers)."""
+    from omlx.patches import format_load
+    from tests.test_formats_load import _PATCHED, _Loadable
+
+    # The load patch visits each switch module once. Restore that bookkeeping
+    # together with the class methods when the fixture exits.
+    monkeypatch.setattr(
+        format_load, "_PENDING", format_load._PENDING | set(format_load._SWITCH_MODULES)
+    )
+    for cls in _PATCHED:
+        original = cls.to_quantized
+        monkeypatch.setattr(
+            cls, "to_quantized", getattr(original, "__wrapped__", original)
+        )
+    formats.load()
+
+    class LoadableFace(_Loadable):
+        def dot(self, layer, k, n):
+            return face
+
+    fmt = LoadableFace()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    format_load.apply_format_load_patch()
+    return fmt
+
+
+def _load_toy(layer, n, k, seed, stack=None):
+    """Bytes and power-of-two row scales into ``layer`` (a stack of
+    ``stack`` matrices, or one)."""
+    from tests.test_formats_kernels import _matrix
+
+    (codes, scales), _, _ = _matrix((stack or 1) * n, k, seed=seed)
+    if stack is not None:
+        codes, scales = codes.reshape(stack, n, k), scales.reshape(stack, n)
+    layer.load_weights([("weight", codes), ("scales", scales)], strict=True)
+
+
+def format_block(hidden, inter, shared, top_k=8, experts=EXPERTS):
+    """A bf16 block whose routed experts load as the toy format's stacks
+    (gate and up fused) and whose shared expert is the toy format's
+    matrices (``shared="toy"``) or 8-bit affine; its gate is 8-bit affine."""
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
+
+    from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+    from omlx.patches.qwen35_moe_gate_up import apply_qwen35_moe_gate_up_fusion
+
+    mx.random.seed(3)
+    args = SimpleNamespace(
+        hidden_size=hidden,
+        moe_intermediate_size=inter,
+        shared_expert_intermediate_size=inter,
+        num_experts=experts,
+        num_experts_per_tok=top_k,
+        norm_topk_prob=True,
+    )
+    block = Qwen3_5MoeSparseMoeBlock(args)
+    block.set_dtype(mx.bfloat16)
+    sm, se = block.switch_mlp, block.shared_expert
+    nn.quantize(sm, group_size=1, bits=8, mode="toy")
+    shapes = ("gate_proj", inter, hidden), ("up_proj", inter, hidden)
+    for i, (name, n, k) in enumerate((*shapes, ("down_proj", hidden, inter))):
+        assert type(sm[name]) is FormatSwitchLinear
+        _load_toy(sm[name], n, k, seed=30 + i, stack=experts)
+        if shared == "toy":
+            se[name] = se[name].to_quantized(group_size=1, bits=8, mode="toy")
+            assert type(se[name]) is FormatLinear
+            _load_toy(se[name], n, k, seed=40 + i)
+        else:
+            se[name] = nn.QuantizedLinear.from_linear(se[name], 64, 8)
+    gate = nn.QuantizedLinear.from_linear(block.shared_expert_gate, 64, 8)
+    block.shared_expert_gate = gate
+    block.eval()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("mlp.switch_mlp", sm)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    mx.eval(block.parameters())
+    return block
+
+
+@pytest.mark.parametrize("shared", ["toy", "affine"])
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_block_of_format_layers_takes_the_fused_decode(monkeypatch, shared):
+    """The plan takes a quant format's stacks (gate and up fused) and, for
+    the shared expert, its matrices, as it takes MLX's quantized layers: the
+    same bits as the composed body."""
+    from tests.test_formats_kernels import _toy
+
+    load_toy_format(monkeypatch, replace(_toy("routed"), dtypes=(mx.bfloat16,)))
+    hidden = 1024
+    block = format_block(hidden, 320, shared)
+    for step in range(4):
+        x = (mx.random.normal((1, 1, hidden)) * (0.5 + step)).astype(mx.bfloat16)
+        plan = _plan(block, x)
+        assert plan is not None and plan.launches.fold
+        ref, out = _pair(block, x)
+        assert _same_bits(ref, out)
+    assert _engaged()
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_format_stack_with_a_bias_keeps_the_composed_body(monkeypatch):
+    """The fused launches add no bias: a stack that has one is not planned."""
+    from tests.test_formats_kernels import _toy
+
+    load_toy_format(monkeypatch, replace(_toy("biased"), dtypes=(mx.bfloat16,)))
+    hidden = 1024
+    block = format_block(hidden, 320, "affine")
+    x = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+    assert _plan(block, x) is not None
+    block.switch_mlp.down_proj["bias"] = mx.zeros((EXPERTS, hidden), mx.bfloat16)
+    assert _plan(block, x) is None
