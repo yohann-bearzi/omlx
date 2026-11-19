@@ -3407,6 +3407,26 @@ def test_a_decode_in_pieces_has_the_bits_of_a_decode_at_once(
         assert _equal(got, _at_once(layer, x, indices, hint)), (shape, batch)
 
 
+def test_only_later_decode_pieces_make_a_selection_mask(toy, monkeypatch):
+    toy()
+    layer = _toy_stack(6, 8, 64)
+    _pieces_of(monkeypatch, 2, 8, 64, mx.float32)
+    x = _ints((6, 1, 64))
+    indices = mx.arange(6)
+    expected = _at_once(layer, x, indices, False)
+    masks = []
+    expand = mx.expand_dims
+
+    def expand_dims(a, axis):
+        if a.dtype == mx.bool_ and axis == (-2, -1):
+            masks.append(a.tolist())
+        return expand(a, axis)
+
+    monkeypatch.setattr(mx, "expand_dims", expand_dims)
+    assert _equal(layer(x, indices), expected)
+    assert masks == [[i >= first for i in range(6)] for first in (2, 4)]
+
+
 def test_a_stack_a_piece_holds_is_decoded_whole(toy, monkeypatch):
     """Whatever the pairs and the budget: its decode's dtype is not read."""
     toy()

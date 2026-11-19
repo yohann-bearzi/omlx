@@ -814,8 +814,11 @@ class FormatSwitchLinear(_FormatLayer):
                 rhs_indices=mx.clip(indices, first, last - 1) - first,
                 sorted_indices=sorted_indices,
             )
-            inside = mx.expand_dims(indices >= first, (-2, -1))
-            y = part if y is None else mx.where(inside, part, y)
+            if y is None:
+                y = part
+            else:
+                inside = mx.expand_dims(indices >= first, (-2, -1))
+                y = mx.where(inside, part, y)
         return y
 
     def __call__(
