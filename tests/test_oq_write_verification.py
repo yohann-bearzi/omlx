@@ -20,7 +20,7 @@ def test_writer_keeps_a_broken_reload_unverified(
 ):
     output = tmp_path / "result"
     staging = output.with_suffix(".unverified")
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
     _calibration(monkeypatch)
     save = mx.save_safetensors
     damaged = []
@@ -29,7 +29,13 @@ def test_writer_keeps_a_broken_reload_unverified(
         if Path(file).parent == staging:
             tensors = dict(tensors)
             if damage == "missing-scale":
-                tensors.pop("model.layers.0.mlp.down_proj.scales")
+                down = "model.layers.0.mlp.down_proj."
+                for name in ("group_scales", "scales"):
+                    if down + name in tensors:
+                        tensors.pop(down + name)
+                        break
+                else:
+                    raise AssertionError("the shard has no down_proj scale tensor")
             elif damage == "missing-norm":
                 tensors.pop("model.norm.weight")
             else:
@@ -71,7 +77,7 @@ def test_writer_runs_the_saved_model_before_marking_it_verified(
 
     output = tmp_path / "result"
     staging = output.with_suffix(".unverified")
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
     _calibration(monkeypatch)
     forward = FormatLinear.__call__
     observed = []
@@ -174,7 +180,7 @@ def test_writer_forwards_trust_remote_code(llama_source, toy, tmp_path, monkeypa
     from omlx import oq_verify
 
     output = tmp_path / "trust"
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
     _calibration(monkeypatch)
     seen = {}
 
@@ -640,7 +646,7 @@ def test_writer_verification_streams_layer_by_layer(
     from omlx.formats.linear import FormatLinear
 
     output = tmp_path / "streamed"
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
     _calibration(monkeypatch)
     streamed = []
     original = oq_verify.layer_by_layer
