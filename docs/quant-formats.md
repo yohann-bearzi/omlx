@@ -434,8 +434,9 @@ oQ refuses a format before it reads a weight:
   oQ writes a format only for a family in `_QUANT_FORMAT_VERIFIED` (`omlx/oq.py`), under
   any spelling of its model type (lower case, `-` for `_`), the checkpoint's and its
   text model's: families quant formats have been verified with end to end. A family
-  enters with the run that verifies it, and none has yet; families mlx-lm's own code
-  serves come back after the proof of concept. The family is read from the config alone,
+  enters with the run that verifies it; one has so far, Qwen3.8 Flash-Next (`qwen4_exp`
+  with its text model `qwen4_exp_text`). Families mlx-lm's own code serves come back
+  after the proof of concept. The family is read from the config alone,
   never from a directory's name; a decision model identified by its declared family,
   architecture or sidecar is refused before the format walk, as are native embedding,
   reranking and audio models, MiMo v2 and MiMo v2 Flash. Stock writes use their usual writer. Any other is refused with
