@@ -17,6 +17,7 @@ faster.
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 import threading
@@ -27,6 +28,8 @@ import mlx.core as mx
 
 from .. import formats
 from . import Dot, Table, Tile
+
+logger = logging.getLogger(__name__)
 
 # What the Metal compiler calls the Metal below when it cites a line of it.
 _SKELETONS = "<omlx skeletons, docs/quant-formats.md>"
@@ -551,6 +554,35 @@ ROW_VALUES_BUDGET = 32
 # of 16 values at 4 bits), so unrolled launches stay inside it.
 UNROLLED_ACCUMULATORS = 16
 UNROLLED_ROW_VALUES = 80
+
+
+# A GPU's cores when the system does not say: the most of an Apple GPU, so
+# that a launch sized by them is never left underfilled.
+_MOST_GPU_CORES = 80
+
+
+@cache
+def gpu_cores() -> int:
+    """This GPU's cores (system_profiler, read once), or the most an Apple
+    GPU has where it cannot be read (logged once)."""
+    from ..utils.hardware import get_gpu_core_count
+
+    cores = get_gpu_core_count()
+    if cores:
+        return cores
+    logger.warning(
+        "GPU core count unreadable; shared-rows launches are sized for %d cores",
+        _MOST_GPU_CORES,
+    )
+    return _MOST_GPU_CORES
+
+
+def gpu_generation() -> int:
+    """This GPU's family generation (15 the M3's, 17 the M5's) from MLX's
+    architecture string, read once; 0 where it cannot be read."""
+    from ..utils.hardware import get_apple_gpu_generation
+
+    return get_apple_gpu_generation()
 
 
 def shared_geometry(vpt: int, n: int, rows: int, pad: bool) -> tuple[int, int]:

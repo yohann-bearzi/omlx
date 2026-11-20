@@ -42,12 +42,22 @@ from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _sam
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
 
+# The GPU's cores and generation as read, before a test sets them.
+_GPU_CORES, _GPU_GENERATION = kernels.gpu_cores, kernels.gpu_generation
+
+
 @pytest.fixture(autouse=True)
-def by_hand():
+def by_hand(monkeypatch):
     """The tests build format layers by hand, as a verified family's load
-    would: a format's layer is built nowhere else."""
+    would: a format's layer is built nowhere else. Their matrices are a few
+    tiles of outputs, which fill no GPU: the occupancy floor of the groups
+    is set aside here and has tests of its own."""
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: 0)
+    # A measured generation: on any other, the table's fallback would log.
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: 17)
     with testing.verified("llama"):
         yield
+
 
 EXPERTS = 6
 _NAMES = ("weight", "scales", "biases")
@@ -149,7 +159,7 @@ def test_a_row_has_the_bits_of_mlx_s_quantized_linear(caplog, k, n, bits, dtype,
     assert key == ("format_linear", face, (mx.uint32, dtype, dtype), k, n)
     # The rows are not compiled into a launch: one row a launch, or 2 to 16
     # rows in groups of 2 to 4 (the shared launch, a Metal for each group).
-    groups = {linear._group(m, face.vpt) for m in (2, 3, 6, MAX_ROWS)} - {1}
+    groups = {linear._group(m, face.vpt, n) for m in (2, 3, 6, MAX_ROWS)} - {1}
     assert proof.ran == {dtype, *((dtype, g) for g in groups)} and not proof.failed
     assert [r.getMessage() for r in _logged(caplog, linear)] == [
         f"quant format face {face.key}: rows kernel engaged"
@@ -157,14 +167,200 @@ def test_a_row_has_the_bits_of_mlx_s_quantized_linear(caplog, k, n, bits, dtype,
 
 
 def test_rows_go_to_the_shared_launch_in_the_largest_group_of_the_budget():
+    n = 1 << 20  # outputs enough to fill any GPU
     # Affine at 4 bits on qmv (8 values a lane): groups of 4, 3, 2.
     groups = "1 2 3 4 1 3 1 4 3 2 1 4 1 2 3 4"
-    assert [linear._group(m, 8) for m in range(1, 17)] == list(map(int, groups.split()))
+    got = [linear._group(m, 8, n) for m in range(1, 17)]
+    assert got == list(map(int, groups.split()))
     # 16 values a lane (affine at 4 and 5 bits on qmv_fast): groups of 2 at
     # most, 32 values a lane between them.
-    assert [linear._group(m, 16) for m in (2, 3, 4, 6, 8)] == [2, 1, 2, 2, 2]
+    assert [linear._group(m, 16, n) for m in (2, 3, 4, 6, 8)] == [2, 1, 2, 2, 2]
     # 32 values a lane: one row a group, the one-row launch.
-    assert [linear._group(m, 32) for m in (2, 3, 4, 6)] == [1, 1, 1, 1]
+    assert [linear._group(m, 32, n) for m in (2, 3, 4, 6)] == [1, 1, 1, 1]
+
+
+def test_a_warm_call_does_not_size_its_group_again(monkeypatch):
+    """The group (and the GPU's cores under it) is worked out as a call's
+    launch is built, once a shape; a call its thread has a graph for
+    replays it and asks nothing."""
+    _, layer = _pair(320, 72)
+    sized = []
+    group = linear._group
+
+    def counted(*args):
+        sized.append(args)
+        return group(*args)
+
+    monkeypatch.setattr(linear, "_group", counted)
+    x = mx.ones((4, 320), mx.bfloat16)
+    for _ in range(3):
+        mx.eval(layer(x))
+    assert len(sized) == 1
+
+
+# Measured points (occupancy_bench.py, affine, K 2560, chained launches; the
+# shared launch against the one-row launch): the GPU (generation, cores),
+# the face's values a lane (vpt), rows, N, the group the rule gives, and what
+# grouping measured there.
+_M3_ULTRA, _M5_MAX = (15, 80), (17, 40)
+# The vpt each measured width's face declares: affine on qmv_fast (K a
+# multiple of 512, as the benches' K 2560 and 2048) at 2, 3 and 4 bits holds
+# 16, at 8 bits 8; at 8 bits on qmv (another K) it holds 4, not measured.
+_FAST16, _FAST8 = affine.values_per_thread(4, True), affine.values_per_thread(8, True)
+_QMV8 = affine.values_per_thread(8, False)
+_OCCUPIED = [
+    # vpt 16 (2, 3 and 4 bits).
+    (_M3_ULTRA, _FAST16, 2, 1280, 1),  # 2 a core: 1.093 / 1.030 / 1.010
+    (_M3_ULTRA, _FAST16, 2, 1920, 1),  # 3 a core: 1.064 / 1.027
+    (_M3_ULTRA, _FAST16, 2, 2048, 2),  # 3.2 a core: the gate's 35B, refused 1.0051
+    (_M3_ULTRA, _FAST16, 2, 2560, 2),  # 4 a core: the gate's flash, refused 1.0093
+    (_M3_ULTRA, _FAST16, 2, 3840, 2),  # 6 a core: 0.945 / 0.957
+    (_M3_ULTRA, _FAST16, 2, 5120, 2),  # 8 a core: 0.951 / 0.976
+    (_M5_MAX, _FAST16, 2, 1920, 1),  # 6 a core: 1.016 / 1.045
+    (_M5_MAX, _FAST16, 2, 2560, 2),  # 8 a core: 0.960 / 0.997 / 0.969
+    (_M5_MAX, _FAST16, 4, 1280, 2),  # 8 a core (2 groups a tile): 0.967
+    # vpt 8 (8 bits), whatever the group.
+    (_M3_ULTRA, _FAST8, 2, 1280, 2),  # 2 a core: 1.001
+    (_M3_ULTRA, _FAST8, 3, 1280, 3),  # 0.986
+    (_M3_ULTRA, _FAST8, 4, 1280, 4),  # 0.956
+    (_M5_MAX, _FAST8, 2, 1280, 2),  # 4 a core: 0.968 / 0.982
+    (_M5_MAX, _FAST8, 4, 1280, 4),  # 0.922
+    (_M5_MAX, _FAST8, 2, 640, 1),  # 2 a core: not measured, refused
+    # A vpt the table has no row for takes the vpt-16 floor: 12 values a
+    # lane in a group of 2 where vpt 8's floor would keep it (2 / 4 a core).
+    (_M3_ULTRA, 12, 2, 1280, 1),
+    (_M5_MAX, 12, 2, 1280, 1),
+    (_M3_ULTRA, 12, 2, 3840, 2),  # 6 a core
+    (_M5_MAX, 12, 2, 2560, 2),  # 8 a core
+    # Below each measured floor by one step: refused.
+    (_M3_ULTRA, _FAST8, 2, 640, 1),  # 1 a core
+    (_M5_MAX, _FAST16, 2, 2240, 1),  # 7 a core
+    # 8 bits on qmv (vpt 4) is not measured: the generation's largest floor.
+    (_M3_ULTRA, _QMV8, 2, 1280, 1),
+    (_M3_ULTRA, _QMV8, 2, 3840, 2),
+]
+
+
+def test_the_measured_widths_declare_the_vpt_their_points_are_keyed_by():
+    """The measurements ran affine faces on qmv_fast (K 2560 and 2048): the
+    table's vpt rows are what those faces declare."""
+    assert [affine.values_per_thread(b, True) for b in (2, 3, 4, 8)] == [16] * 3 + [8]
+    assert (_FAST16, _FAST8, _QMV8) == (16, 8, 4)
+    for bits, vpt in ((2, 16), (3, 16), (4, 16), (8, 8)):
+        assert affine.face(bits, 64, True, mx.bfloat16).vpt == vpt
+    assert affine.face(8, 64, False, mx.bfloat16).vpt == 4
+    assert set(linear.OCCUPANCY[15]) == set(linear.OCCUPANCY[17]) == {8, 16}
+
+
+@pytest.mark.parametrize("gpu, vpt, rows, n, group", _OCCUPIED)
+def test_a_group_leaves_every_gpu_core_occupied(monkeypatch, gpu, vpt, rows, n, group):
+    """A group of rows divides a launch's threadgroups (the shared launch's
+    own tiles of outputs) by its size: rows are grouped only while every
+    GPU core keeps the threadgroups that the face's vpt needs on that GPU
+    generation, where the measurements put the rule."""
+    generation, cores = gpu
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: generation)
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: cores)
+    assert linear._group(rows, vpt, n) == group
+
+
+def test_a_gpu_whose_cores_cannot_be_read_counts_the_most(monkeypatch, caplog):
+    """Sized for the most cores an Apple GPU has, no launch is underfilled
+    where the system does not say; that is logged once."""
+    from omlx.utils import hardware
+
+    monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: None)
+    _GPU_CORES.cache_clear()
+    try:
+        with caplog.at_level(logging.WARNING, logger=kernels.logger.name):
+            assert _GPU_CORES() == _GPU_CORES() == 80
+            # A count of none is no count; one the system gives is taken as
+            # it is, and not logged.
+            monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: 0)
+            _GPU_CORES.cache_clear()
+            assert _GPU_CORES() == 80
+            monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: 40)
+            _GPU_CORES.cache_clear()
+            assert _GPU_CORES() == 40
+        said = [r for r in caplog.records if r.name == kernels.logger.name]
+        assert len(said) == 2
+        assert all("core count unreadable" in r.getMessage() for r in said)
+    finally:
+        _GPU_CORES.cache_clear()
+
+
+def test_the_gpu_generation_is_the_hardware_s(monkeypatch):
+    from omlx.utils import hardware
+
+    for generation in (15, 17):
+        monkeypatch.setattr(
+            hardware, "get_apple_gpu_generation", lambda g=generation: g
+        )
+        assert _GPU_GENERATION() == generation
+
+
+@pytest.mark.parametrize("generation", [15, 17, 99])
+def test_a_vpt_not_measured_takes_the_wide_floor_or_stricter(monkeypatch, generation):
+    """A face of a vpt the table has no row for (4: 8 bits on qmv; 12; 32
+    and past) never gets the narrow faces' lower floor: it takes its
+    generation's largest."""
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: generation)
+    linear._occupancy_table.cache_clear()
+    try:
+        wide = linear._occupancy(16)
+        assert wide > linear._occupancy(8)
+        for vpt in (4, 9, 12, 20, 32, 128):
+            assert linear._occupancy(vpt) >= wide
+    finally:
+        linear._occupancy_table.cache_clear()
+
+
+def test_a_gpu_generation_not_measured_keeps_the_larger_floors(monkeypatch, caplog):
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: 99)
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: 80)
+    linear._occupancy_table.cache_clear()
+    tile = linear._SHARED_TILE
+    try:
+        with caplog.at_level(logging.WARNING, logger=linear.logger.name):
+            # The edges: 8 a core for vpt 16, 4 for vpt 8.
+            assert linear._group(2, 16, 8 * 80 * tile) == 2
+            assert linear._group(2, 16, (8 * 80 - 1) * tile) == 1
+            assert linear._group(2, 8, 4 * 80 * tile) == 2
+            assert linear._group(2, 8, (4 * 80 - 1) * tile) == 1
+        said = [r.getMessage() for r in caplog.records if r.name == linear.logger.name]
+        assert len(said) == 1 and "GPU generation 99" in said[0]
+    finally:
+        linear._occupancy_table.cache_clear()
+
+
+@pytest.mark.parametrize("rows, vpt", [(1, 8), (5, 8), (7, 16), (2, 32)])
+def test_the_gpu_is_not_asked_where_no_group_is_possible(monkeypatch, rows, vpt):
+    """One row, a count no group divides, a face past the budget: the
+    one-row launch, without asking the GPU anything."""
+
+    def asked():
+        raise AssertionError("the GPU was asked")
+
+    monkeypatch.setattr(kernels, "gpu_cores", asked)
+    monkeypatch.setattr(kernels, "gpu_generation", asked)
+    assert linear._group(rows, vpt, 1 << 20) == 1
+
+
+def test_the_occupancy_floor_is_exact_and_takes_a_smaller_group(monkeypatch):
+    generation, cores = _M5_MAX
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: generation)
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: cores)
+    tile = linear._SHARED_TILE
+    # 2 rows of vpt 16 in a group of 2: 8 threadgroups a core, exactly; a
+    # last partial tile is a threadgroup.
+    assert linear._group(2, 16, 8 * cores * tile) == 2
+    assert linear._group(2, 16, (8 * cores - 1) * tile + 1) == 2
+    assert linear._group(2, 16, (8 * cores - 1) * tile) == 1
+    # 4 rows of vpt 8: 4 threadgroups a core; a group of 4 has one a tile,
+    # a group of 2 two.
+    assert linear._group(4, 8, 4 * cores * tile) == 4
+    assert linear._group(4, 8, 2 * cores * tile) == 2
+    assert linear._group(4, 8, (2 * cores - 1) * tile) == 1
 
 
 def test_a_face_past_the_unrolled_envelope_shares_rolled(monkeypatch):
@@ -3442,6 +3638,7 @@ def test_a_face_with_a_table_runs_the_rows_kernels_to_the_bit(monkeypatch):
     faces = {face for _, face, *_ in kernels._PROOFS}
     assert faces and all(face.key.endswith("_lut") for face in faces)
     assert all(proof.ran and not proof.failed for proof in kernels._PROOFS.values())
+
 
 def _toy_stack(experts, n, k, exact=True, seed=0):
     """A stack of the toy format's matrices: with power-of-two scales (every

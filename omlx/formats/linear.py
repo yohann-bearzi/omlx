@@ -89,7 +89,7 @@ _SOURCE = r"""
 # is not whole tiles (PARTIAL), the last tile's simdgroups hold the rows that
 # are left, or none, as MLX's qmv does for its last tile.
 _SHARED_SOURCE = r"""
-    constexpr int RPS = 4;
+    constexpr int RPS = __RPS__;
     constexpr bool PARTIAL = N_SIZE % (2 * RPS) != 0;
     const size_t row0 = size_t(threadgroup_position_in_grid.y) * ROWS;
     const int out_row = int(threadgroup_position_in_grid.z) * (2 * RPS) +
@@ -114,11 +114,43 @@ _SHARED_SOURCE = r"""
       }
     }
 """
+# The shared launch's outputs: RPS rows a simdgroup, two simdgroups a
+# threadgroup's tile; its Metal and its grid read them from here.
+_SHARED_RPS = 4
+_SHARED_TILE = 2 * _SHARED_RPS
+_SHARED_SOURCE = _SHARED_SOURCE.replace("__RPS__", str(_SHARED_RPS))
+# A group of rows takes a launch's threadgroups down by its size; below a
+# number of threadgroups a GPU core the cores idle and the group loses what
+# sharing the weights saves. That number grows with the face's values a lane
+# of a row (affine's vpt: 16 at 2 to 5 bits on qmv_fast, 8 at 6 and 8 bits
+# on qmv_fast, 4 at 8 bits on qmv), whatever the group, and differs between
+# GPU generations: for each, {vpt: threadgroups a core}. Measured
+# (tools/main/unify/occupancy_bench.py, affine, K 2560, chains of 64
+# dependent launches, the shared launch against the one-row launch; M3 Ultra
+# 80 cores, M5 Max 40):
+# - vpt 16 (2, 3 and 4 bits, groups of 2): both lose at 2 a core (1.010 to
+#   1.093). The M3 Ultra loses at 3 a core (240 threadgroups: 1.064 / 1.027
+#   at 3 / 4 bits); 3.2 (256) is the lowest measured threadgroup count that
+#   wins for 4 bits (the gate's 35B shape, K 2048: refusing the group cost
+#   0.5%), and 4 (the gate's flash shape, K 2560: refusing cost 0.9%; 2 / 4
+#   bits 0.954 / 0.990), 6 and 8 (0.945 / 0.957) win; affine 3 bits at 320
+#   stays at 1.017, the pre-bound behaviour, on no served path. The M5 Max
+#   loses 1.6-4.5% at 6 a core and wins at 8 (0.960 / 0.997 / 0.969), 12
+#   and 16.
+# - vpt 8 (8 bits on qmv_fast, groups of 2, 3 and 4): the M3 Ultra breaks
+#   even or wins at 2 a core (1.001 / 0.986 / 0.956), the M5 Max wins at 4
+#   (0.968 to 0.922).
+# A vpt not measured (4, 12, 32, ...) takes its generation's largest floor;
+# a generation not measured takes the larger of each.
+OCCUPANCY = {15: {8: 2, 16: 3.2}, 17: {8: 4, 16: 8}}
+_UNMEASURED = {8: 4, 16: 8}
 
 
 @cache
 def _shared_kernel(face: Dot):
-    matrices = kernels.Matrices(unrolled=kernels.unrolled_tile_ok(face.vpt, 4, 1))
+    matrices = kernels.Matrices(
+        unrolled=kernels.unrolled_tile_ok(face.vpt, _SHARED_RPS, 1)
+    )
     inputs = ["x", *matrices.add("m", face, shared=True)]
     return mx.fast.metal_kernel(
         name=f"omlx_format_linear_rows_{face.key}",
@@ -129,15 +161,46 @@ def _shared_kernel(face: Dot):
     )
 
 
-def _group(rows: int, vpt: int) -> int:
+def _group(rows: int, vpt: int, n: int) -> int:
     """The rows of x a threadgroup of the shared launch takes: the most, up
-    to 4, that divide ``rows`` and keep a lane's inputs of the group within
+    to 4, that divide ``rows``, keep a lane's inputs of the group within
     kernels.ROW_VALUES_BUDGET (which keeps the unrolled tile in its
-    envelope); 1 where none does (the one-row launch then runs each row).
+    envelope) and leave each GPU core the threadgroups that the face's vpt
+    needs on this GPU (OCCUPANCY) over N ``n``; 1 where none does (the
+    one-row launch then runs each row).
     Measured (u7 spike, both Macs): at 16 values a lane, groups of 3 and 4
     ran 1.15-1.70 of the one-row launch where groups of 2 ran 0.76-0.98."""
     limit = kernels.ROW_VALUES_BUDGET // vpt
-    return next((g for g in (4, 3, 2) if g <= limit and rows % g == 0), 1)
+    groups = [g for g in (4, 3, 2) if g <= limit and rows % g == 0]
+    if not groups:
+        # One row, a count no group divides, a wide face: nothing to ask
+        # of the GPU.
+        return 1
+    floor = _occupancy(vpt) * kernels.gpu_cores()
+    tiles = -(-n // _SHARED_TILE)
+    return next((g for g in groups if rows // g * tiles >= floor), 1)
+
+
+def _occupancy(vpt: int) -> int:
+    """The threadgroups a GPU core needs of a shared launch over a face of
+    ``vpt`` values a lane, on this GPU (OCCUPANCY)."""
+    table = _occupancy_table(kernels.gpu_generation())
+    return table.get(vpt, max(table.values()))
+
+
+@cache
+def _occupancy_table(generation: int) -> dict:
+    """OCCUPANCY's table for a GPU ``generation``; a generation not measured
+    takes the larger of each, logged once."""
+    table = OCCUPANCY.get(generation)
+    if table is None:
+        logger.warning(
+            "GPU generation %d: no measured occupancy; format linear row groups "
+            "keep the larger floors",
+            generation,
+        )
+        table = _UNMEASURED
+    return table
 
 
 @cache
@@ -419,7 +482,9 @@ def _linear_metal(plan: _Plan, x):
     """What a matrix's launch for ``x`` is instantiated with beside the
     proof's key: x's type and the group of rows a threadgroup takes for the
     shared launch, x's type alone for the one-row launch (``_linear``)."""
-    group = 1 if plan.shared is None else _group(x.size // plan.k, plan.face.vpt)
+    group = (
+        1 if plan.shared is None else _group(x.size // plan.k, plan.face.vpt, plan.n)
+    )
     if group > 1 or plan.n % 8:
         return x.dtype, group
     return _metal(x)
@@ -440,7 +505,11 @@ def _shared_rows(
             ("ROWS", group),
             ("VPT", vpt),
         ],
-        grid=(32, 2 * (rows // group), -(-n // 8) if tiles is None else tiles),
+        grid=(
+            32,
+            2 * (rows // group),
+            -(-n // _SHARED_TILE) if tiles is None else tiles,
+        ),
         threadgroup=(32, 2, 1),
         output_shapes=[shape],
         output_dtypes=[x.dtype],
@@ -660,6 +729,7 @@ def _log_native_fallback() -> None:
             "quant_matmul native FormatLinearFast unavailable; "
             "using Python warm dispatch fallback"
         )
+
 
 
 def _unloaded(name: str, held, offered) -> str:

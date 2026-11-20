@@ -43,7 +43,11 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 
 @pytest.fixture(autouse=True)
-def by_hand():
+def by_hand(monkeypatch):
+    # A few tiles of outputs fill no GPU: the groups' occupancy floor is set
+    # aside here (tests/test_formats_linear.py tests it).
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: 0)
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: 17)
     with testing.verified("llama"):
         yield
 
