@@ -77,8 +77,10 @@ logger = logging.getLogger(__name__)
 
 OQ_LEVELS = {2, 2.5, 2.7, 3, 3.5, 4, 5, 6, 8}
 # The version of the checks a run in a quant format passes before its output
-# is verified (its config's record): 0, the run completed, nothing checked.
-VERIFY_VERSION = 0
+# is verified (its config's record): 1, the staged checkpoint was loaded and a
+# forward ran before publication; 0 (older outputs), the run completed and
+# nothing was checked.
+VERIFY_VERSION = 1
 
 OQ_DTYPES: tuple[str, ...] = ("bfloat16", "float16")
 
@@ -9084,6 +9086,13 @@ def quantize_oq_streaming(
         export_sidecars(source, output, config)
 
     if final_output is not None:
+        from .oq_verify import verify_written_format_checkpoint
+
+        verify_written_format_checkpoint(
+            output,
+            mode=quant_fmt.mode,
+            trust_remote_code=trust_remote_code,
+        )
         written = json.loads((output / "config.json").read_text())
         written[VERIFICATION] = {
             "verified": True,
@@ -12344,21 +12353,24 @@ def _source_tensors(source: Path) -> list[str]:
 
 
 @contextlib.contextmanager
-def _calibration_patches(model_path, config, *, walk: Path | None = None):
+def _calibration_patches(
+    model_path, config, *, walk: Path | None = None, serving_routing: bool = False
+):
     """For the block, the pre-load patches oQe's resident calibration loads
     the checkpoint at ``model_path`` with, and its MTP head attached when it
     has one; yields whether mlx-vlm loads it.
 
     For the walk over the checkpoint a run writes (``walk``, its directory):
     the written layout selects the serving library and the runtime MTP
-    patch. Qwen4-Exp's tables stay resident."""
+    patch. Qwen4-Exp's tables stay resident. ``serving_routing`` selects the
+    serving library for a checkpoint that is loaded, not calibrated."""
     from omlx.utils.model_loading import (
         _checkpoint_has_mtp_weights,
         _has_mtp_heads,
         maybe_apply_pre_load_patches,
     )
 
-    if walk is None:
+    if walk is None and not serving_routing:
         is_vlm = _is_vlm_load(config)
     else:
         from omlx.model_discovery import (
@@ -12375,7 +12387,7 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
             or (
                 not inkling2_layout.is_inkling2(config)
                 and not _gemma4_text_only_prefers_llm_engine(config)
-                and detect_model_type(walk) == "vlm"
+                and detect_model_type(walk or Path(model_path)) == "vlm"
             )
         )
     has_mtp_weights = _checkpoint_has_mtp_weights(model_path)
@@ -12409,7 +12421,7 @@ def _calibration_patches(model_path, config, *, walk: Path | None = None):
                 )
 
                 apply_mlx_vlm_mtp_patch()
-                if walk is None:
+                if walk is None and not serving_routing:
                     apply_mlx_vlm_mtp_runtime_patch()
                 else:
                     apply_mlx_vlm_mtp_runtime_patch(config.get("model_type"))

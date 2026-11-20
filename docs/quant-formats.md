@@ -408,10 +408,10 @@ What oQ writes:
 - In `config.json`, the record of the run's verification, whatever the format took:
 
   ```json
-  "omlx_verification": {"verified": true, "mode": "myformat", "verify_version": 0}
+  "omlx_verification": {"verified": true, "mode": "myformat", "verify_version": 1}
   ```
 
-  `verify_version` is the version of oQ's checks that the output passed (`omlx.oq.VERIFY_VERSION`); a model card that oMLX's uploader writes says it. Version 0: the run completed, nothing is checked yet, and the card says so (`this oMLX version does not check format checkpoints yet`). While the run writes, its record says `"verified": false` with the reason, and so does the record of a checkpoint whose checks fail: a load refuses it before it reads a weight, `quant format 'myformat' of the checkpoint at <output> (written by my-package 0.1.0; installed: my-package 0.1.0): not verified: its quantization did not complete`.
+  `verify_version` is the version of oQ's checks that the output passed (`omlx.oq.VERIFY_VERSION`); a model card that oMLX's uploader writes says it. Version 1: the writer loaded the staged checkpoint and ran a forward before publishing it. Version 0 (older outputs): the run completed, nothing was checked, and the card says so (`this oMLX version does not check format checkpoints yet`). While the run writes, its record says `"verified": false` with the reason, and so does the record of a checkpoint whose checks fail: a load refuses it before it reads a weight, `quant format 'myformat' of the checkpoint at <output> (written by my-package 0.1.0; installed: my-package 0.1.0): not verified: its quantization did not complete`. A checkpoint whose writer checks failed records `writer verification failed: <error>` (refused with `not verified: writer verification failed: <error>`) and leaves `VERIFY-FAILED.txt`.
 - All of it in `<output>.unverified`, renamed to `<output>` once written. Model discovery, the oQ manager, the HF uploader and the cluster's catalogue list neither such a folder nor a checkpoint whose record does not say verified (moved by hand, or whose checks failed); the admin's list of downloaded models shows both, to delete them. A run with a format refuses an existing `<output>` or `<output>.unverified` before it reads a weight.
 - A line in the log, `oQ4: 23 layers in quant format myformat`, or a warning when the format took none: `oQ4: quant format myformat took no layer: the output is as without it`.
 

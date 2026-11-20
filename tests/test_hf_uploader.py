@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import mlx.core as mx
 import pytest
 
+from omlx import oq
 from omlx._version import __version__
 from omlx.admin.hf_uploader import (
     HFUploader,
@@ -233,6 +234,22 @@ class TestGenerateModelCard:
             "The effective average is 16.000 bits/weight excluding the N-gram "
             "embedding table, or"
         ) in card
+
+    def test_current_verify_version_reports_checked_on_card(self, tmp_path):
+        mx.save_safetensors(
+            str(tmp_path / "model.safetensors"),
+            {"model.norm.weight": mx.ones((64,), dtype=mx.bfloat16)},
+        )
+        record = {
+            "verified": True,
+            "mode": "toy",
+            "verify_version": oq.VERIFY_VERSION,
+        }
+        card = _generate_model_card(
+            "Llama-oQ4e", tmp_path, {"omlx_verification": record}
+        )
+        assert "verified by oQ's checks, version 1" in card
+        assert "does not check" not in card
 
     def test_the_card_says_the_checks_a_format_s_layers_passed(self, tmp_path):
         mx.save_safetensors(

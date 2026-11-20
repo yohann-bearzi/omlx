@@ -1802,17 +1802,22 @@ def test_a_checkpoint_keeps_the_record_its_format_gives(
     output = tmp_path / "oqe-toy"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": record}}
-    # The run hands it back to the format as the load does, before it
-    # reads a weight; the load, once.
-    assert toy.accepted == [record]
+    # The run hands it back to the format once as it writes and once more
+    # when its verification load reads it; this load reads it once more.
+    assert toy.accepted == [record, record]
     maybe_apply_pre_load_patches(str(output))
     model, _ = load_model(output, strict=True)
-    assert toy.accepted == [record, record]
+    assert toy.accepted == [record, record, record]
     layers = [m for _, m in model.named_modules() if isinstance(m, FormatLinear)]
     # Read with the load's copy of the format, one for all of them.
     (read,) = {id(layer.fmt): layer.fmt for layer in layers}.values()
     assert read is not toy and type(read) is _Codec
     assert read.log is not toy.log and read.accepted is toy.accepted
+
+
+def test_docs_state_writer_verification_failure_reason():
+    assert "writer verification failed:" in _QUOTED
+    assert "VERIFY-FAILED.txt" in _QUOTED
 
 
 def test_the_record_names_the_contract_the_format_states(
@@ -2039,12 +2044,14 @@ def test_writer_and_loader_accept_the_record_on_private_copies(
     output = tmp_path / "fitted"
     _, config, applied = _quantize(source, output, quant_format=fitted)
     assert sorted(_in_format(config)) == applied
+    # The writer's read and the verification load's.
+    assert len(readers) == 2
     maybe_apply_pre_load_patches(str(output))
     model, _ = load_model(output, strict=True)
     loaded = dict(model.named_modules())[applied[0]].fmt
     assert loaded.fitted_levels == (2, 5)
-    assert len(readers) == 2 and readers[0] is not readers[1]
-    assert loaded is readers[1]
+    assert len(readers) == 3 and len({id(reader) for reader in readers}) == 3
+    assert loaded is readers[2]
     assert laid_out == {id(reader) for reader in readers}
     assert all(reader is not toy and reader is not fitted for reader in readers)
     assert not hasattr(toy, "fitted_levels")
@@ -2327,6 +2334,13 @@ def test_the_offers_are_the_matrices_a_run_offers_its_format(
     and group size; it encodes and writes none. So also when the run drops a
     matrix (an MTP tensor of a run that keeps none) or writes it as its
     source packed it."""
+    # These checkpoints are not ones a run would publish; the writer's
+    # verification has its own oracle in test_oq_write_verification.py.
+    from omlx import oq_verify
+
+    monkeypatch.setattr(
+        oq_verify, "verify_written_format_checkpoint", lambda *a, **k: None
+    )
     cache = str(tmp_path / "imatrix.npz")
     if left is not None:
         # The first matrix a run offers, left out of the run.

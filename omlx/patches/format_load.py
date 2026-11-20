@@ -47,6 +47,7 @@ import types
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property, update_wrapper, wraps
 from importlib import _bootstrap
 from pathlib import Path
@@ -103,6 +104,42 @@ _ABSENT = object()
 # holds one to check.
 _BUILT_ANY = False
 _SHARDED = threading.local()
+
+
+class _VerifyGrant:
+    """One `verifying()` entry: its checkpoint, and whether the block runs."""
+
+    __slots__ = ("path", "active")
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.active = True
+
+
+_VERIFYING: ContextVar = ContextVar("omlx_formats_verifying", default=())
+
+
+@contextmanager
+def verifying(path):
+    """Allow only the checkpoint at ``path`` to load while it is unverified in
+    this context.
+
+    Used by oQ's writer verification to run the staged checkpoint before it is
+    published: no other checkpoint's refusal is lifted. The grant travels in
+    the context (a copied one carries it) and is revoked when the block ends.
+    """
+    grant = _VerifyGrant(_shown(Path(path).expanduser()))
+    token = _VERIFYING.set((*_VERIFYING.get(), grant))
+    try:
+        yield
+    finally:
+        grant.active = False
+        _VERIFYING.reset(token)
+
+
+def _is_verifying(path: Path) -> bool:
+    return any(grant.active and grant.path == path for grant in _VERIFYING.get())
+
 
 # A value of config.json by its JSON type.
 _JSON_TYPES = {
@@ -367,6 +404,8 @@ class _Checkpoint:
         """Refuse the checkpoint, before a weight is read, when a run in a
         quant format wrote it and its verification did not pass: the run
         did not complete, or its checks failed."""
+        if _is_verifying(self.shown):
+            return
         try:
             config = self._read_config()
         except (OSError, ValueError):

@@ -1,0 +1,615 @@
+# SPDX-License-Identifier: Apache-2.0
+"""A format write must verify the bytes it will publish."""
+
+import json
+from pathlib import Path
+
+import mlx.core as mx
+import pytest
+
+from omlx import oq
+from tests.test_formats_oq import _SETTINGS, _calibration
+from tests.test_formats_oq import llama_source as llama_source
+from tests.test_formats_oq import toy as toy
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("damage", ["missing-scale", "nonfinite-norm", "missing-norm"])
+def test_writer_keeps_a_broken_reload_unverified(
+    llama_source, toy, tmp_path, monkeypatch, damage
+):
+    output = tmp_path / "result"
+    staging = output.with_suffix(".unverified")
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    _calibration(monkeypatch)
+    save = mx.save_safetensors
+    damaged = []
+
+    def save_shard(file, tensors, **kwargs):
+        if Path(file).parent == staging:
+            tensors = dict(tensors)
+            if damage == "missing-scale":
+                tensors.pop("model.layers.0.mlp.down_proj.scales")
+            elif damage == "missing-norm":
+                tensors.pop("model.norm.weight")
+            else:
+                norm = tensors["model.norm.weight"]
+                tensors["model.norm.weight"] = mx.full(
+                    norm.shape, float("nan"), dtype=norm.dtype
+                )
+            damaged.append(Path(file).name)
+        return save(file, tensors, **kwargs)
+
+    monkeypatch.setattr(mx, "save_safetensors", save_shard)
+    error = None
+    try:
+        oq.quantize_oq_streaming(
+            str(llama_source),
+            str(output),
+            4,
+            enhanced=True,
+            quant_format=toy.mode,
+            **_SETTINGS,
+        )
+    except (ValueError, RuntimeError) as exc:
+        error = exc
+
+    assert damaged, "the saved checkpoint must contain the injected corruption"
+    assert not output.exists(), "the writer published a damaged checkpoint"
+    assert error is not None
+    record = json.loads((staging / "config.json").read_text())["omlx_verification"]
+    assert record["verified"] is False
+    assert record["mode"] == "toy"
+    assert (staging / "VERIFY-FAILED.txt").read_text().strip()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_writer_runs_the_saved_model_before_marking_it_verified(
+    llama_source, toy, tmp_path, monkeypatch
+):
+    from omlx.formats.linear import FormatLinear
+
+    output = tmp_path / "result"
+    staging = output.with_suffix(".unverified")
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    _calibration(monkeypatch)
+    forward = FormatLinear.__call__
+    observed = []
+
+    def observe(layer, x):
+        if (staging / "config.json").is_file():
+            config = json.loads((staging / "config.json").read_text())
+            observed.append((config["omlx_verification"]["verified"], output.exists()))
+        return forward(layer, x)
+
+    monkeypatch.setattr(FormatLinear, "__call__", observe)
+    oq.quantize_oq_streaming(
+        str(llama_source),
+        str(output),
+        4,
+        enhanced=True,
+        quant_format=toy.mode,
+        **_SETTINGS,
+    )
+    assert observed, "the writer never ran a forward on the staged format checkpoint"
+    assert set(observed) == {(False, False)}
+    assert not staging.exists()
+    assert (
+        json.loads((output / "config.json").read_text())["omlx_verification"][
+            "verified"
+        ]
+        is True
+    )
+
+
+def _unverified_checkpoint(path):
+    path.mkdir()
+    (path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "omlx_verification": {
+                    "verified": False,
+                    "reason": "its quantization did not complete",
+                },
+            }
+        )
+    )
+    return path
+
+
+def test_verifying_admits_only_its_checkpoint(tmp_path):
+    from omlx.patches import format_load
+
+    first = _unverified_checkpoint(tmp_path / "first")
+    second = _unverified_checkpoint(tmp_path / "second")
+    with format_load.verifying(first):
+        with format_load.loading(first):
+            pass
+        with pytest.raises(ValueError):
+            with format_load.loading(second):
+                pass
+    with pytest.raises(ValueError):
+        with format_load.loading(first):
+            pass
+
+
+def test_verifying_propagates_to_copied_context_thread(tmp_path):
+    import contextvars
+    from concurrent.futures import ThreadPoolExecutor
+
+    from omlx.patches import format_load
+
+    first = _unverified_checkpoint(tmp_path / "first")
+    with format_load.verifying(first):
+        context = contextvars.copy_context()
+
+        def load():
+            with format_load.loading(first):
+                pass
+
+        with ThreadPoolExecutor(1) as pool:
+            pool.submit(context.run, load).result()
+
+
+def test_verifying_copied_context_revoked_after_exit(tmp_path):
+    import contextvars
+
+    from omlx.patches import format_load
+
+    first = _unverified_checkpoint(tmp_path / "first")
+    with format_load.verifying(first):
+        context = contextvars.copy_context()
+
+    def load():
+        with format_load.loading(first):
+            pass
+
+    with pytest.raises(ValueError):
+        context.run(load)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_writer_forwards_trust_remote_code(llama_source, toy, tmp_path, monkeypatch):
+    from omlx import oq_verify
+
+    output = tmp_path / "trust"
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    _calibration(monkeypatch)
+    seen = {}
+
+    def verify(path, **kwargs):
+        seen.update(kwargs)
+
+    monkeypatch.setattr(oq_verify, "verify_written_format_checkpoint", verify)
+    oq.quantize_oq_streaming(
+        str(llama_source),
+        str(output),
+        4,
+        enhanced=True,
+        quant_format=toy.mode,
+        trust_remote_code=True,
+        **_SETTINGS,
+    )
+    assert seen.get("trust_remote_code") is True
+
+
+def test_vlm_check_loaded_failure_closes_model(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model:
+        closed = False
+
+        def close(self):
+            self.closed = True
+
+    model = Model()
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: model)
+
+    def refuse(loaded):
+        raise ValueError("the loaded model is not admissible")
+
+    monkeypatch.setattr(oq, "check_loaded", refuse)
+    with pytest.raises(ValueError, match="not admissible"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert model.closed
+
+
+def test_vlm_close_failure_preserves_verification_error(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    cleared = []
+
+    class Model:
+        def close(self):
+            raise RuntimeError("close boom")
+
+    model = Model()
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: model)
+    monkeypatch.setattr(mx, "clear_cache", lambda: cleared.append(True))
+
+    def refuse(loaded):
+        raise ValueError("the loaded model is not admissible")
+
+    monkeypatch.setattr(oq, "check_loaded", refuse)
+    with pytest.raises(ValueError, match="not admissible"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert "not admissible" in (output / "VERIFY-FAILED.txt").read_text()
+    record = json.loads((output / "config.json").read_text())["omlx_verification"]
+    assert "not admissible" in record["reason"]
+    assert cleared
+
+
+def test_vlm_verification_loads_strictly(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    seen = {}
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    def load(*args, **kwargs):
+        seen.update(kwargs)
+        return Model()
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", load)
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert seen.get("strict") is True
+
+
+def test_text_only_qwen4_exp_routes_to_vlm_during_verification(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+
+    import mlx.nn as nn
+
+    import omlx.utils.model_loading as model_loading
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "qwen"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    seen = []
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    def pre_load(path, model_settings=None, for_vlm=False):
+        seen.append(for_vlm)
+
+    def wrong(*args, **kwargs):
+        raise AssertionError("wrong loader")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", pre_load)
+    monkeypatch.setattr(model_loading, "lm_load_compat", wrong)
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: Model())
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert seen == [True]
+
+
+@pytest.mark.parametrize("failure", ["bad-config", "io-error"])
+def test_writer_failure_preserves_cause_on_bad_config_or_io_error(
+    tmp_path, monkeypatch, failure
+):
+    from contextlib import contextmanager, nullcontext
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    if failure == "bad-config":
+        (output / "config.json").write_text("[]")
+    else:
+        (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model:
+        def close(self):
+            pass
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    for name in (
+        "_strip_audio_config_if_orphaned",
+        "_strip_vision_config_if_orphaned",
+        "_drop_gemma4_mlx_shared_kv_extras_on_load",
+        "_derive_gemma4_global_kv_on_load",
+        "_preserve_gemma4_unified_image_processor_on_load",
+        "_force_minimax_m3_moe_sanitize_on_load",
+        "_force_qwen4_exp_sanitize_on_load",
+        "_remap_nested_visual_on_load",
+        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    ):
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+
+    def refuse(loaded):
+        raise ValueError("the loaded model is not admissible")
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: Model())
+    monkeypatch.setattr(oq, "check_loaded", refuse)
+    if failure == "io-error":
+
+        def disk_full(path, value):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(oq, "_atomic_write_json", disk_full)
+    with pytest.raises(ValueError, match="not admissible"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert "not admissible" in (output / "VERIFY-FAILED.txt").read_text()
+
+
+def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    entered = []
+    names = [
+        "_strip_audio_config_if_orphaned",
+        "_strip_vision_config_if_orphaned",
+        "_drop_gemma4_mlx_shared_kv_extras_on_load",
+        "_derive_gemma4_global_kv_on_load",
+        "_preserve_gemma4_unified_image_processor_on_load",
+        "_force_minimax_m3_moe_sanitize_on_load",
+        "_force_qwen4_exp_sanitize_on_load",
+        "_remap_nested_visual_on_load",
+        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    ]
+
+    for name in names:
+
+        @contextmanager
+        def context(path, name=name):
+            entered.append(name)
+            yield
+
+        monkeypatch.setattr(engine_vlm, name, context)
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: Model())
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert entered == names
+
+
+def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+    import mlx_vlm.utils as vlm_utils
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    called = []
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    def bypassed(*args, **kwargs):
+        raise AssertionError("bypassed remap")
+
+    @contextmanager
+    def remap(path):
+        original = vlm_utils.load_model
+
+        def remapped(*args, **kwargs):
+            called.append(True)
+            return Model()
+
+        vlm_utils.load_model = remapped
+        try:
+            yield
+        finally:
+            vlm_utils.load_model = original
+
+    monkeypatch.setattr(engine_vlm, "_remap_nested_visual_on_load", remap)
+    for name in (
+        "_strip_audio_config_if_orphaned",
+        "_strip_vision_config_if_orphaned",
+        "_drop_gemma4_mlx_shared_kv_extras_on_load",
+        "_derive_gemma4_global_kv_on_load",
+        "_preserve_gemma4_unified_image_processor_on_load",
+        "_force_minimax_m3_moe_sanitize_on_load",
+        "_force_qwen4_exp_sanitize_on_load",
+        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    ):
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+    monkeypatch.setattr(vlm_utils, "load_model", bypassed)
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert called
+
+
+@pytest.mark.parametrize("is_vlm", [True, False])
+def test_loads_forward_trust_remote_code(tmp_path, monkeypatch, is_vlm):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+
+    import omlx.engine.vlm as engine_vlm
+    import omlx.utils.model_loading as model_loading
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "load"
+    output.mkdir()
+    model_type = "qwen4_exp" if is_vlm else "llama"
+    (output / "config.json").write_text(json.dumps({"model_type": model_type}))
+    seen = {}
+
+    for name in (
+        "_strip_audio_config_if_orphaned",
+        "_strip_vision_config_if_orphaned",
+        "_drop_gemma4_mlx_shared_kv_extras_on_load",
+        "_derive_gemma4_global_kv_on_load",
+        "_preserve_gemma4_unified_image_processor_on_load",
+        "_force_minimax_m3_moe_sanitize_on_load",
+        "_force_qwen4_exp_sanitize_on_load",
+        "_remap_nested_visual_on_load",
+        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    ):
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield is_vlm
+
+    def vlm_load(*args, **kwargs):
+        seen.update(kwargs)
+        return Model()
+
+    def lm_load(*args, **kwargs):
+        seen.update(kwargs)
+        return Model(), None
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", vlm_load)
+    monkeypatch.setattr(model_loading, "lm_load_compat", lm_load)
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output, trust_remote_code=True)
+    assert seen.get("trust_remote_code") is True
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_writer_verification_streams_layer_by_layer(
+    llama_source, toy, tmp_path, monkeypatch
+):
+    from contextlib import contextmanager
+
+    from omlx import oq_verify
+    from omlx.formats.linear import FormatLinear
+
+    output = tmp_path / "streamed"
+    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"llama"}))
+    _calibration(monkeypatch)
+    streamed = []
+    original = oq_verify.layer_by_layer
+
+    @contextmanager
+    def watch(layers):
+        streamed.append(True)
+        try:
+            with original(layers):
+                yield
+        finally:
+            streamed.pop()
+
+    monkeypatch.setattr(oq_verify, "layer_by_layer", watch)
+    seen = []
+    forward = FormatLinear.__call__
+
+    def observe(layer, x):
+        seen.append(bool(streamed))
+        return forward(layer, x)
+
+    monkeypatch.setattr(FormatLinear, "__call__", observe)
+    oq.quantize_oq_streaming(
+        str(llama_source),
+        str(output),
+        4,
+        enhanced=True,
+        quant_format=toy.mode,
+        **_SETTINGS,
+    )
+    assert seen, "the writer never ran the staged format layers"
+    assert all(seen), "a format layer ran outside layer_by_layer"

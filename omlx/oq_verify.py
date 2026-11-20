@@ -233,3 +233,162 @@ def source_reference(
         time.monotonic() - started,
     )
     return path
+
+
+def _writer_failure(
+    output: Path, exc: BaseException, *, mode: str | None = None
+) -> None:
+    """Record a failed writer verification in the staged checkpoint.
+
+    The report is written first and every write is guarded: recording the
+    failure must not replace the error that failed the check."""
+    try:
+        (output / "VERIFY-FAILED.txt").write_text(f"{exc}\n", encoding="utf-8")
+    except Exception:
+        logger.exception("oQ verify: could not write VERIFY-FAILED.txt")
+    from .oq import _atomic_write_json
+
+    config_path = output / "config.json"
+    try:
+        config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    except Exception:
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    record = config.get("omlx_verification")
+    if not isinstance(record, dict):
+        record = {}
+    record["verified"] = False
+    if mode is not None:
+        record["mode"] = mode
+    record["reason"] = f"writer verification failed: {exc}"
+    config["omlx_verification"] = record
+    try:
+        _atomic_write_json(config_path, config)
+    except Exception:
+        logger.exception("oQ verify: could not record the failure in config.json")
+
+
+def verify_written_format_checkpoint(
+    output,
+    *,
+    mode: str | None = None,
+    prompt: np.ndarray | mx.array | None = None,
+    trust_remote_code: bool = False,
+) -> None:
+    """Load the staged checkpoint the way a server does and run a forward on
+    it before the run publishes it.
+
+    The load runs in ``verifying()``, which lifts the unverified refusal for
+    this checkpoint alone; the family gate still applies. It runs on the MLX
+    executor thread the engines load on, with the process-wide state a load
+    sets restored after. On any failure the staged folder keeps
+    ``verified: false`` with the reason and a ``VERIFY-FAILED.txt`` report, and
+    the error is raised as a ``ValueError``/``RuntimeError``; on success the
+    caller may mark it verified and rename it into place.
+    """
+    from . import oq
+    from .patches import format_load
+
+    output = Path(output)
+
+    def run() -> None:
+        config = json.loads((output / "config.json").read_text())
+        chosen = prompt
+        if chosen is None:
+            chosen = np.arange(REFERENCE_TOKENS, dtype=np.int32) % 63 + 1
+            snapshot = output / "verify" / "reference.npz"
+            if snapshot.is_file():
+                with np.load(snapshot) as reference:
+                    if "prompt" in reference:
+                        chosen = reference["prompt"]
+        chosen = np.asarray(chosen, dtype=np.int32)
+        if chosen.ndim == 1:
+            chosen = chosen[None]
+        prompt_mx = mx.array(chosen)
+        model = layers = out = logits = None
+        with (
+            oq._load_globals_kept(config),
+            oq._calibration_patches(
+                str(output), config, serving_routing=True
+            ) as is_vlm,
+        ):
+            try:
+                with format_load.verifying(output):
+                    if is_vlm:
+                        import mlx_vlm.utils as vlm_utils
+
+                        from .engine.vlm import (
+                            _derive_gemma4_global_kv_on_load,
+                            _drop_gemma4_mlx_shared_kv_extras_on_load,
+                            _force_minimax_m3_moe_sanitize_on_load,
+                            _force_qwen4_exp_sanitize_on_load,
+                            _preserve_gemma4_unified_image_processor_on_load,
+                            _remap_nested_visual_on_load,
+                            _strip_audio_config_if_orphaned,
+                            _strip_vision_config_if_orphaned,
+                            _transpose_qwen35_mlx_vision_patch_embed_on_load,
+                        )
+
+                        with (
+                            _strip_audio_config_if_orphaned(output),
+                            _strip_vision_config_if_orphaned(output),
+                            _drop_gemma4_mlx_shared_kv_extras_on_load(output),
+                            _derive_gemma4_global_kv_on_load(output),
+                            _preserve_gemma4_unified_image_processor_on_load(output),
+                            _force_minimax_m3_moe_sanitize_on_load(output),
+                            _force_qwen4_exp_sanitize_on_load(output),
+                            _remap_nested_visual_on_load(output),
+                            _transpose_qwen35_mlx_vision_patch_embed_on_load(output),
+                        ):
+                            model = vlm_utils.load_model(
+                                output,
+                                lazy=True,
+                                trust_remote_code=trust_remote_code,
+                                strict=True,
+                            )
+                            oq.check_loaded(model)
+                    else:
+                        from omlx.utils.model_loading import lm_load_compat as lm_load
+
+                        model, _ = lm_load(
+                            str(output),
+                            lazy=True,
+                            trust_remote_code=trust_remote_code,
+                            model_config=oq._sensitivity_lm_config_override(
+                                config, str(output)
+                            ),
+                        )
+                _, layers = oq._find_model_layers(model)
+                if layers is None:
+                    out = model(prompt_mx)
+                else:
+                    with layer_by_layer(layers):
+                        out = model(prompt_mx)
+                logits = getattr(out, "logits", out)
+                mx.eval(logits)
+                if not bool(mx.all(mx.isfinite(logits))):
+                    raise RuntimeError(
+                        "the written checkpoint's forward produced non-finite logits"
+                    )
+            finally:
+                if model is not None:
+                    close = getattr(model, "close", None)
+                    if callable(close):
+                        try:
+                            close()
+                        except Exception:
+                            logger.exception("oQ verify: model.close() failed")
+                model = layers = out = logits = None
+                mx.clear_cache()
+
+    try:
+        oq._on_mlx_thread(run)
+    except Exception as exc:
+        try:
+            _writer_failure(output, exc, mode=mode)
+        except Exception:
+            logger.exception("oQ verify: could not record the verification failure")
+        if isinstance(exc, (ValueError, RuntimeError)):
+            raise
+        raise RuntimeError(f"the written checkpoint did not verify: {exc}") from exc
