@@ -581,6 +581,16 @@ class _Plan(NamedTuple):
     window: kernels.Proof | None = None  # theirs; failed: one token still runs
 
 
+def _projection_dot(layer, k: int, n: int) -> Dot | None:
+    # A checkpoint reader can describe the face of the layer it holds
+    # without checking the dimensions the routed kernel is about to use.
+    if isinstance(layer, (FormatLinear, FormatSwitchLinear)) and (
+        layer.input_dims != k or layer.output_dims != n
+    ):
+        return None
+    return formats.dot(layer, k, n)
+
+
 def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     """(gate+up, down, gate) dot faces and operands of a foldable shared
     expert and gate, or None."""
@@ -594,14 +604,14 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
         return None
     gate_proj, up_proj, down_proj, _ = layers
     width = gate_proj[formats.tensor_names(gate_proj)[0]].shape[0]
-    gu_fmt = formats.dot(gate_proj, hidden, width)
-    d_fmt = formats.dot(down_proj, width, hidden)
-    g_fmt = formats.dot(gate, hidden, 1)
+    gu_fmt = _projection_dot(gate_proj, hidden, width)
+    d_fmt = _projection_dot(down_proj, width, hidden)
+    g_fmt = _projection_dot(gate, hidden, 1)
     if (
         gu_fmt is None
         or d_fmt is None
         or g_fmt is None
-        or formats.dot(up_proj, hidden, width) != gu_fmt
+        or _projection_dot(up_proj, hidden, width) != gu_fmt
         or not all(face.exact_for(dtype) for face in (gu_fmt, d_fmt, g_fmt))
         or width % (_GATE_UP_ROWS * _GATE_UP_SIMDGROUPS)
     ):
@@ -635,9 +645,12 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     ):
         return None
     hidden = down[formats.tensor_names(down)[0]].shape[1]
-    inter = gate_up[formats.tensor_names(gate_up)[0]].shape[1] // 2
-    gu_fmt = formats.dot(gate_up, hidden, 2 * inter)
-    d_fmt = formats.dot(down, inter, hidden)
+    width = gate_up[formats.tensor_names(gate_up)[0]].shape[1]
+    if width % 2:
+        return None
+    inter = width // 2
+    gu_fmt = _projection_dot(gate_up, hidden, width)
+    d_fmt = _projection_dot(down, inter, hidden)
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     if (
         gu_fmt is None

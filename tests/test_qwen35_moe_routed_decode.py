@@ -2588,3 +2588,76 @@ def test_routed_plans_and_proofs_follow_the_activation_on_one_block(
     if restricted == "neither":
         assert plans[0].proof is plans[-1].proof
         assert len({id(p.proof) for p in plans[:3]}) == 3
+
+
+def _format_shared_gate(k, n):
+    """A one-output gate fits eight or more affine groups into its scale buffer."""
+    from omlx.formats.linear import FormatLinear
+
+    class Reader(affine.AffineFormat):
+        def dot(self, layer, k, n):
+            # This reader describes the layer it holds. The caller must check
+            # whether its requested geometry can use that layer.
+            return super().dot(layer, layer.input_dims, layer.output_dims)
+
+    matrix = mx.random.normal((n, k)).astype(mx.bfloat16)
+    weight, scales, biases = mx.quantize(matrix, group_size=64, bits=8)
+    return FormatLinear(
+        Reader(), 8, 64, k, {"weight": weight, "scales": scales, "biases": biases}
+    )
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+@pytest.mark.parametrize(
+    "part,name,k,n",
+    [
+        ("switch_mlp", "gate_up_proj", 1024, 641),
+        ("switch_mlp", "gate_up_proj", 512, 640),
+        ("switch_mlp", "down_proj", 160, 1024),
+        ("shared_expert", "gate_proj", 512, 320),
+        ("shared_expert", "up_proj", 512, 320),
+        ("shared_expert", "up_proj", 1024, 321),
+        ("shared_expert", "down_proj", 160, 1024),
+        ("shared_expert", "down_proj", 320, 1025),
+        ("block", "shared_expert_gate", 512, 1),
+        ("block", "shared_expert_gate", 1024, 2),
+    ],
+)
+def test_a_routed_face_must_have_the_dimensions_it_will_read(
+    monkeypatch, part, name, k, n
+):
+    """A reader may supply its face without rechecking the caller's dimensions."""
+    from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+    from tests.test_formats_kernels import _toy
+
+    reader = load_toy_format(monkeypatch, replace(_toy("dims"), dtypes=(mx.bfloat16,)))
+    block = format_block(1024, 320, "toy")
+    group = block if part == "block" else block[part]
+    switch = part == "switch_mlp"
+    cls = FormatSwitchLinear if switch else FormatLinear
+    stack = (EXPERTS,) if switch else ()
+    if part == "block":
+        group[name] = _format_shared_gate(k, n)
+    else:
+        tensors = {reader.codes_name: mx.zeros((*stack, n, k), mx.uint8)}
+        for side in reader.tensors:
+            tensors[side] = mx.ones((*stack, n), mx.float32)
+        group[name] = cls(reader, 8, 1, k, tensors)
+    plan = _plan(block, mx.zeros((1, 1, 1024), mx.bfloat16))
+    if switch:
+        assert plan is None
+    else:
+        assert plan is not None and not plan.launches.fold
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_format_shared_expert_gate_folds_into_routed_decode(monkeypatch):
+    from tests.test_formats_kernels import _toy
+
+    face = replace(_toy("shared_gate"), dtypes=(mx.bfloat16,))
+    load_toy_format(monkeypatch, face)
+    block = format_block(1024, 320, "toy")
+    block.shared_expert_gate = _format_shared_gate(1024, 1)
+    x = mx.random.randint(-2, 3, (1, 1, 1024)).astype(mx.bfloat16)
+    assert _plan(block, x).launches.fold
+    assert _same_bits(*_pair(block, x))
