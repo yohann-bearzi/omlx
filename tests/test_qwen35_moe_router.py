@@ -377,5 +377,8 @@ def test_router_gemv_declines_layouts_mlx_reduces_differently():
 def test_module_docstring_names_the_rows_header():
     """The rows fallbacks take the dtype-generic header; only
     topk_header(dtype) is built for one dtype. The docstring says which."""
-    assert "``softmax_topk_row``'s body with" in (router.__doc__ or "")
-    assert "``TOPK_HEADER`` verbatim" in (router.__doc__ or "")
+    text = " ".join((router.__doc__ or "").split())
+    assert (
+        "``softmax_topk_rows`` runs ``softmax_topk_row``'s body with "
+        "``TOPK_HEADER`` verbatim"
+    ) in text

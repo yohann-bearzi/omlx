@@ -1132,7 +1132,6 @@ def test_every_stamp_field_forces_a_reread(tmp_path, monkeypatch, field):
     assert unverified(model)
 
 
-
 def test_the_unverified_cache_follows_an_older_config(tmp_path):
     """A config restored with an older mtime than the one read before is
     parsed again, not served from the cache."""

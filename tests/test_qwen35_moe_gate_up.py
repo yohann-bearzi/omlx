@@ -581,14 +581,15 @@ def test_a_fused_format_stack_keeps_no_plan_of_its_parts(loaded_format, lm):
 def _assert_kept_views_share_the_fused_buffer():
     """Fuse a VLM format stack (with a bias, which takes the axis=-1
     split) and assert its kept gate/up views share the fused buffers."""
+    gc.collect()
     mx.clear_cache()
     glu = _format_glu()
     for proj in (glu.gate_proj, glu.up_proj):
         proj["bias"] = mx.zeros((E, INTER), mx.float32)
     mx.eval(glu.parameters())
     mx.synchronize()
-    mx.clear_cache()
     gc.collect()
+    mx.clear_cache()
     gate, up = glu.gate_proj, glu.up_proj
     names = sorted(gate._tensors) + ["bias"]
     before = mx.get_active_memory()
@@ -623,12 +624,34 @@ def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
 def test_vlm_kept_gate_up_views_ignore_warm_buffer_cache(loaded_format):
     """The reading holds on a warm allocator: a cached three-page buffer
     is not reused as the fused stack's (the cleared cache and the ``<=``
-    bound keep the equality from measuring the cache)."""
+    bound keep the active-memory check from measuring the cache)."""
     warm = mx.zeros((49152,), dtype=mx.uint8)
     mx.eval(warm)
     del warm
     mx.synchronize()
     _assert_kept_views_share_the_fused_buffer()
+
+
+def test_the_fused_buffer_reading_collects_before_it_clears(loaded_format, monkeypatch):
+    """The helper collects garbage before every cache clear of its own, so
+    a buffer freed from a reference cycle is dropped, not cached for the
+    fusion to reuse (a cycle collected after the last clear failed the
+    parent's order at 72,767 > 56,383). The fusion's own clear comes
+    after the reading."""
+    calls = []
+    collect, clear = gc.collect, mx.clear_cache
+    fuse = apply_qwen35_moe_gate_up_fusion
+
+    def fusing(model):
+        calls.append("fuse")
+        return fuse(model)
+
+    monkeypatch.setattr(gc, "collect", lambda: calls.append("collect") or collect())
+    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append("clear") or clear())
+    monkeypatch.setitem(globals(), "apply_qwen35_moe_gate_up_fusion", fusing)
+    _assert_kept_views_share_the_fused_buffer()
+    assert calls[:4] == ["collect", "clear", "collect", "clear"]
+    assert calls.index("fuse") == 4
 
 
 def test_a_batched_verify_of_a_fused_format_stack_never_runs_its_views(
