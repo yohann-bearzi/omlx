@@ -42,8 +42,10 @@ from ..formats.affine import (
 logger = logging.getLogger(__name__)
 
 MAX_ROWS = 16
-# The affine widths whose weights the tile decodes (``affine.decoded``):
-# not 2 and 3 bits, which affine.py's faces take.
+# The affine widths the row-exact verify tile decodes. 2- and 3-bit stock
+# layers keep MLX's path here, as they did in upstream's verify gather
+# (``_BITS`` 4/5/6/8 too): they are out of the PoC's served widths, not
+# refused by ``affine.decoded`` (which takes them).
 _BITS = (4, 5, 6, 8)
 # Padding a partial row tile pays for large 8-bit weight streams. Smaller
 # matrices and 4/5/6-bit unpackers are faster with the existing divisor tile.

@@ -29,7 +29,11 @@ their order) and then selects exactly as ``fused_router_topk`` does, so
 indices and scores are bit-identical to the two launches. The bf16
 selection packs each probability with its expert index into one integer
 key and keeps each lane's three largest keys at hand, so a selection is one
-simd_max; ``TOPK_HEADER`` exports it for launches that fold the routing in.
+simd_max. ``TOPK_HEADER`` carries both dtype instantiations for the
+``softmax_topk_row`` fallbacks, whose launches take the activation dtype as
+a template parameter; ``topk_header(dtype)`` builds the one-dtype source
+the routed-decode kernels fold in (only the selection their dtype compiles;
+MLX hashes a kernel's whole source at every launch).
 ``softmax_topk_rows`` runs that source verbatim for each row of a verify
 window in one launch.
 

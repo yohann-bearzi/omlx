@@ -8661,7 +8661,6 @@ def quantize_oq_streaming(
     formats = run.get("formats")
     group_size = run.get("group_size")
     imatrix_report = run.get("imatrix_report")
-    imatrix_strict = run.get("imatrix_strict")
     mimo_multimodal = run.get("mimo_multimodal")
     oq_level = run.get("oq_level")
     output = run.get("output")
