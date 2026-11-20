@@ -622,9 +622,9 @@ def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
 
 
 def test_vlm_kept_gate_up_views_ignore_warm_buffer_cache(loaded_format):
-    """The reading holds on a warm allocator: a cached three-page buffer
-    is not reused as the fused stack's (the cleared cache and the ``<=``
-    bound keep the active-memory check from measuring the cache)."""
+    """The reading holds on a warm allocator: the helper clears a cached
+    three-page buffer before fusing so it is not reused as the 32,768 B
+    fused weight (which would add one page and fail ``<=``)."""
     warm = mx.zeros((49152,), dtype=mx.uint8)
     mx.eval(warm)
     del warm
@@ -640,18 +640,29 @@ def test_the_fused_buffer_reading_collects_before_it_clears(loaded_format, monke
     after the reading."""
     calls = []
     collect, clear = gc.collect, mx.clear_cache
+    build, read = _format_glu, mx.get_active_memory
     fuse = apply_qwen35_moe_gate_up_fusion
 
-    def fusing(model):
-        calls.append("fuse")
-        return fuse(model)
+    def recording(tag, fn):
+        return lambda *args, **kwargs: calls.append(tag) or fn(*args, **kwargs)
 
-    monkeypatch.setattr(gc, "collect", lambda: calls.append("collect") or collect())
-    monkeypatch.setattr(mx, "clear_cache", lambda: calls.append("clear") or clear())
-    monkeypatch.setitem(globals(), "apply_qwen35_moe_gate_up_fusion", fusing)
+    monkeypatch.setattr(gc, "collect", recording("collect", collect))
+    monkeypatch.setattr(mx, "clear_cache", recording("clear", clear))
+    monkeypatch.setattr(mx, "get_active_memory", recording("read", read))
+    monkeypatch.setitem(globals(), "_format_glu", recording("build", build))
+    monkeypatch.setitem(
+        globals(), "apply_qwen35_moe_gate_up_fusion", recording("fuse", fuse)
+    )
     _assert_kept_views_share_the_fused_buffer()
-    assert calls[:4] == ["collect", "clear", "collect", "clear"]
-    assert calls.index("fuse") == 4
+    assert calls[:7] == [
+        "collect",
+        "clear",
+        "build",
+        "collect",
+        "clear",
+        "read",
+        "fuse",
+    ]
 
 
 def test_a_batched_verify_of_a_fused_format_stack_never_runs_its_views(
