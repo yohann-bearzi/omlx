@@ -409,6 +409,14 @@ def gather_qmv(
         raise RuntimeError("verify gather: pairs are whole rows of LHS_DIV experts")
     if order is not None and (order.shape != (pairs,) or order.dtype != mx.uint32):
         raise ValueError("verify gather: order must be one uint32 per pair")
+    if not projection.face.exact_for(x.dtype):
+        raise ValueError("verify gather: x's dtype is not one the face is exact for")
+    if not pairs:
+        return mx.zeros((0, projection.n), dtype=x.dtype)
+    if x.size < 8:
+        raise ValueError(
+            "verify gather: x has fewer than 8 values, which MLX binds as constants"
+        )
     return _gather_qmv(projection, x, rhs, pairs_per_row, order)
 
 

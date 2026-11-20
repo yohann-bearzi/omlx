@@ -1251,9 +1251,13 @@ below, each threadgroup searches for its own. A block of 2 to 8 rows takes it at
 width, but one of 16 pairs or fewer over 64 experts or more, which keeps the composed
 path (measured faster than the composed path everywhere else; 2 rows of a 256-expert
 top-8 block read 1% slower). The grid fits up to 1,073,741,823 pairs. For each ordered
-projection the block plan selects 32-bit input and output offsets if every permitted
-row fits, or 64-bit offsets otherwise. Direct ordered gathers use 64-bit offsets.
-The block's
+projection the block plan selects 32-bit input and output offsets when every permitted
+row stays at or below 2**32 elements, and 64-bit offsets otherwise; a direct call
+always uses 64-bit offsets and refuses indices that are not one integer vector, pairs
+past the signed grid dimension, a pair count that is not whole rows, a `pairs_per_row`
+below 1, an order that is not one uint32 per pair, an `x` that is not two-dimensional,
+an `x` dtype its face is not exact for, and a non-zero pair count whose `x` has fewer
+than 8 values; it returns an empty result without launching for zero pairs. The block's
 indices are integers, top-k of them (one or more) for each row of `x`, and `x` is
 float16, bfloat16 or float32 (as `gather_qmm` takes) with 8 values or more (MLX binds
 fewer as constants). The gather proves each Metal of a block's two launches (and, from

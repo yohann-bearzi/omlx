@@ -987,6 +987,9 @@ def test_gather_pair_grid_fits_a_signed_mlx_launch(monkeypatch, rows, top_k, pro
         ((6, 320), (6, 4), mx.uint32, (24,), mx.uint32, "expert indices"),
         ((6, 320), (24,), mx.float32, (24,), mx.uint32, "expert indices"),
         ((6,), (24,), mx.uint32, (24,), mx.uint32, "rows"),
+        ((5, 320), (24,), mx.uint32, (24,), mx.uint32, "whole rows"),
+        ((6, 1, 320), (24,), mx.uint32, (24,), mx.uint32, "rows"),
+        ((6, 320), (), mx.uint32, (1,), mx.uint32, "expert indices"),
         ((2**28, 320), (2**30,), mx.uint32, (2**30,), mx.uint32, "grid"),
     ],
 )
@@ -1010,6 +1013,68 @@ def test_a_direct_gather_can_read_a_prefix_of_the_input_rows():
     full = gather.gather_qmv(projection, x, rhs, 4, order)
     prefix = gather.gather_qmv(projection, x[:4], rhs, 4, order)
     assert _same_bits(full, prefix)
+
+
+def test_a_negative_pairs_per_row_is_refused_before_a_launch():
+    projection = gather.projection(_experts(320, 64), 320)
+    projection = projection._replace(
+        kernel=lambda **kw: pytest.fail("launched"),
+        ordered=lambda **kw: pytest.fail("launched"),
+    )
+    x = mx.broadcast_to(mx.array(0, mx.bfloat16), (6, 320))
+    rhs = mx.broadcast_to(mx.array(0, mx.uint32), (24,))
+    for order in (None, rhs):
+        with pytest.raises(RuntimeError, match="LHS_DIV is the experts of a row"):
+            gather.gather_qmv(projection, x, rhs, -4, order)
+
+
+def test_no_launch_is_needed_to_gather_zero_pairs():
+    projection = gather.projection(_experts(320, 64), 320)
+    projection = projection._replace(
+        kernel=lambda **kw: pytest.fail("launched"),
+        ordered=lambda **kw: pytest.fail("launched"),
+    )
+    x = mx.zeros((0, 320), mx.bfloat16)
+    rhs = mx.array([], mx.uint32)
+    for order in (None, gather._order(rhs)):
+        out = gather.gather_qmv(projection, x, rhs, 4, order)
+        assert out.shape == (0, 64) and out.dtype == mx.bfloat16
+        mx.eval(out)
+
+
+def test_a_direct_gather_refuses_x_the_kernel_cannot_take():
+    projection = gather.projection(_experts(320, 64), 320)
+    projection = projection._replace(
+        kernel=lambda **kw: pytest.fail("launched"),
+        ordered=lambda **kw: pytest.fail("launched"),
+    )
+    with pytest.raises(ValueError, match="exact"):
+        gather.gather_qmv(
+            projection, mx.zeros((2, 320), mx.float16),
+            mx.zeros((8,), mx.uint32), 4,
+        )
+    with pytest.raises(ValueError, match="8"):
+        gather.gather_qmv(
+            projection, mx.zeros((1, 7), mx.bfloat16),
+            mx.zeros((1,), mx.uint32), 1,
+        )
+    launched = []
+    accept = projection._replace(kernel=lambda **kw: launched.append(kw) or [None])
+    gather.gather_qmv(
+        accept, mx.zeros((2, 4), mx.bfloat16), mx.zeros((2,), mx.uint32), 1
+    )
+    assert len(launched) == 1
+
+
+def test_the_gate_up_input_bound_is_max_rows(toy):
+    toy(_toy("bound"))
+    switch = _ToySwitch(k=32, inter=4, n=8)
+    at = gather._build_plan(switch, 2**29, 6)
+    over = gather._build_plan(switch, 2**29 + 1, 6)
+    assert at is not None and over is not None
+    assert at.gate_up.ordered is gather._ordered_kernel(at.gate_up.face, True)
+    assert over.gate_up.ordered is gather._ordered_kernel(over.gate_up.face, False)
+    assert over.down.ordered is gather._ordered_kernel(over.down.face, True)
 
 
 def test_the_largest_whole_pair_grid_reaches_the_launch():
