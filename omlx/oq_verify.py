@@ -242,8 +242,9 @@ def _writer_failure(
 
     The report is written first and every write is guarded: recording the
     failure must not replace the error that failed the check."""
+    detail = str(exc) or type(exc).__name__
     try:
-        (output / "VERIFY-FAILED.txt").write_text(f"{exc}\n", encoding="utf-8")
+        (output / "VERIFY-FAILED.txt").write_text(f"{detail}\n", encoding="utf-8")
     except Exception:
         logger.exception("oQ verify: could not write VERIFY-FAILED.txt")
     from .oq import _atomic_write_json
@@ -261,7 +262,7 @@ def _writer_failure(
     record["verified"] = False
     if mode is not None:
         record["mode"] = mode
-    record["reason"] = f"writer verification failed: {exc}"
+    record["reason"] = f"writer verification failed: {detail}"
     config["omlx_verification"] = record
     try:
         _atomic_write_json(config_path, config)
@@ -305,6 +306,8 @@ def verify_written_format_checkpoint(
         chosen = np.asarray(chosen, dtype=np.int32)
         if chosen.ndim == 1:
             chosen = chosen[None]
+        if chosen.size == 0:
+            raise ValueError("the verification prompt must contain at least one token")
         prompt_mx = mx.array(chosen)
         model = layers = out = logits = None
         with (
@@ -367,7 +370,9 @@ def verify_written_format_checkpoint(
                         out = model(prompt_mx)
                 logits = getattr(out, "logits", out)
                 mx.eval(logits)
-                if not bool(mx.all(mx.isfinite(logits))):
+                if getattr(logits, "size", 0) == 0 or not bool(
+                    mx.all(mx.isfinite(logits))
+                ):
                     raise RuntimeError(
                         "the written checkpoint's forward produced non-finite logits"
                     )

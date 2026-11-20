@@ -448,6 +448,66 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
     assert entered == names
 
 
+def test_empty_prompt_or_logits_fails_verification(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+    import numpy as np
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 0, 4))
+
+        def close(self):
+            pass
+
+    for name in (
+        "_strip_audio_config_if_orphaned",
+        "_strip_vision_config_if_orphaned",
+        "_drop_gemma4_mlx_shared_kv_extras_on_load",
+        "_derive_gemma4_global_kv_on_load",
+        "_preserve_gemma4_unified_image_processor_on_load",
+        "_force_minimax_m3_moe_sanitize_on_load",
+        "_force_qwen4_exp_sanitize_on_load",
+        "_remap_nested_visual_on_load",
+        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    ):
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: Model())
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    with pytest.raises(ValueError, match="at least one token"):
+        oq_verify.verify_written_format_checkpoint(
+            output, prompt=np.array([], dtype=np.int32)
+        )
+    with pytest.raises(RuntimeError, match="non-finite"):
+        oq_verify.verify_written_format_checkpoint(output)
+
+
+def test_writer_failure_uses_exception_type_when_message_empty(tmp_path):
+    from omlx import oq_verify
+
+    (tmp_path / "config.json").write_text(json.dumps({}))
+    oq_verify._writer_failure(tmp_path, RuntimeError(), mode="toy")
+    assert (tmp_path / "VERIFY-FAILED.txt").read_text().strip() == "RuntimeError"
+    record = json.loads((tmp_path / "config.json").read_text())["omlx_verification"]
+    assert record["reason"] == "writer verification failed: RuntimeError"
+
+
 def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
     from contextlib import contextmanager, nullcontext
 
