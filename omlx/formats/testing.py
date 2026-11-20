@@ -233,9 +233,9 @@ def staged_tables(
     length, by name. Its bits are the table's ``bits`` when the face
     declares its members as the page says.
 
-    ``operands`` are a matrix's weight and the face's tensors, as for
-    ``dot_rows`` (the face is declared over them), and ``dtype`` the
-    activations' type ``T`` the face is compiled for."""
+    ``operands`` are a matrix's codes (``codes_name``) and the face's
+    tensors, as for ``dot_rows`` (the face is declared over them), and
+    ``dtype`` the activations' type ``T`` the face is compiled for."""
     if not isinstance(face, (Dot, Tile)):
         raise ValueError(f"{face!r} is not a Dot or a Tile")
     if dtype not in formats.FLOATS:
@@ -307,8 +307,9 @@ def dot_rows(
     """The products of ``x`` (K activations) with the first ``n`` rows of a
     matrix, through the row skeleton.
 
-    ``operands`` are the matrix's weight and the face's tensors, in order.
-    A launch takes ``packs[0]`` rows as the skeleton's first pack and the
+    ``operands`` are the matrix's codes (``codes_name``) and the face's
+    tensors, in order. A launch takes ``packs[0]`` rows as the skeleton's
+    first pack and the
     next ``packs[1]`` as its second, one row or more in all; ``n`` is one
     or more times their sum, and no more than the matrix's rows (which is
     not checked). ``x`` is one vector of a dtype the face is exact for; it
@@ -547,11 +548,16 @@ def rows_stack(
     format layers, so call it inside ``testing.verified(...)`` in a format
     test. With ``x=None`` it only calls the format's decode after checking
     both matrices against the declared tensor names, shapes and dtypes.
+    (their codes, ``fmt.codes_name``, and the format's tensors, by name, as
+    ``layout`` gives them)
     Raises an ``AssertionError`` that names what differs, or that the
     format is not ``stackable``."""
     weight = first.get(fmt.codes_name)
     if not isinstance(weight, mx.array) or not weight.ndim:
-        raise AssertionError(f"quant format {fmt.mode}: first matrix needs weight rows")
+        raise AssertionError(
+            f"quant format {fmt.mode}: first matrix needs its codes "
+            f"({fmt.codes_name!r}) rows"
+        )
     n = weight.shape[0]
     layout = formats._stackable_layout(fmt, k, n, bits, group_size)
     if layout is None:
@@ -677,7 +683,8 @@ def tile_rows(
     """Every weight of some rows of a matrix of K inputs, read through a tile
     face as a tile kernel reads it: ``weight(params(g), fetch(run), i)``.
 
-    ``operands`` are the matrix's weight and the face's tensors, in order.
+    ``operands`` are the matrix's codes (``codes_name``) and the face's
+    tensors, in order.
     ``rows`` are the rows' indices (in a stack, the row ``n`` of matrix
     ``e`` is ``e * N + n``). Each index is an int in [0, 2**63) and names
     a row of the matrix (the matrix bound is unchecked).

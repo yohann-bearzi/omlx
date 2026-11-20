@@ -739,7 +739,6 @@ def _log_native_fallback() -> None:
         )
 
 
-
 def _unloaded(name: str, held, offered) -> str:
     """A placeholder ``held`` of tensor ``name``, as a refusal names it: with
     the shape and dtype last offered in its place, or as never loaded."""
@@ -838,11 +837,11 @@ class _FormatLayer(nn.Module):
         packed = tensors[fmt.codes_name]
         if packed.ndim != self._STACK + 2:
             raise ValueError(
-                f"{type(self).__name__}: the weight has {self._STACK + 2} axes, "
-                f"not the shape {packed.shape}"
+                f"{type(self).__name__}: the codes ({fmt.codes_name!r}) have "
+                f"{self._STACK + 2} axes, not the shape {packed.shape}"
             )
         # What the format lays out for the matrix the layer holds: a layer's
-        # N is its weight's first axis.
+        # N is its codes' first axis.
         n = packed.shape[-2]
         if layout is None:
             layout = fmt.layout(input_dims, n, bits, group_size)
@@ -854,7 +853,7 @@ class _FormatLayer(nn.Module):
         if ragged:
             raise ValueError(
                 f"{type(self).__name__}: {', '.join(ragged)} does not open with "
-                f"the weight's stack of {stack}"
+                f"the codes' ({fmt.codes_name!r}) stack of {stack}"
             )
         # The object, not a lookup of its mode: a checkpoint's own (what its
         # format's accept returned for its record) reads its layers. Kept out

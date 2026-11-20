@@ -276,7 +276,7 @@ def test_gapped_single_row_matrices_use_each_formats_dot(
     gapped = _gapped_rows(1, k, key, matrices=3)
     dense = mx.contiguous(gapped)
     face = dot(layer, k, n)
-    operands = [layer[name] for name in formats.tensor_names(layer)]
+    operands = [layer[name] for name in (formats.tensor_names(layer)[0], *face.tensors)]
     singles = mx.stack([testing.dot_rows(face, operands, x[0], n) for x in gapped])
     singles = singles[:, None, :]
     stock = _stock(gapped, packed, 8)
@@ -419,6 +419,10 @@ def test_the_native_binding_is_bound_with_the_layers_packed_key():
     weight = mx.zeros((8, 8), mx.uint8)
     with pytest.raises(TypeError):
         native.format_linear_fast(weight, None, [weight], {})
+    with pytest.raises(TypeError, match="weight_key must be str"):
+        native.format_linear_fast(weight, None, [weight], {}, 123)
+    with pytest.raises(TypeError):
+        native.format_linear_fast(weight, None, [weight], "not_a_dict", "codes")
     # A layer that keeps its codes under another name replays natively.
     dispatch = native.format_linear_fast(weight, None, [weight], {}, "codes")
     assert dispatch.__self__ is not None

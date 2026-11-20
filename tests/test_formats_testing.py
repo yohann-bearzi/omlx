@@ -1091,6 +1091,16 @@ def test_the_defects_are_swapped_under_the_lock_a_defect_is_noted_under():
     thread.join(timeout=30)
 
 
+def test_rows_stack_refusal_names_the_formats_codes():
+    """The rows rule's refusal says what the matrix keeps, in the format's
+    words: its codes, by their name."""
+    fmt = _ToyFormat()
+    fmt.tensors = ("group_scales",)
+    fmt.dot = lambda layer, k, n: _toy("rows_codes")
+    with pytest.raises(AssertionError, match=r"needs its codes \('codes'\)"):
+        testing.rows_stack(fmt, {}, {}, 8, 8, 1)
+
+
 def test_face_helpers_report_custom_codes_name_on_operand_mismatch():
     """Each of the six face helpers names a layer's operands by its format's
     codes name, in the refusal it gives for a count that is not the face's."""

@@ -2841,14 +2841,19 @@ def test_a_layer_holds_a_registered_format_s_tensors(toy):
         FormatLinear("toy", 8, 1, 64, {**matrix, "biases": scales})
     with pytest.raises(ValueError, match=names + "codes"):
         FormatSwitchLinear("toy", 8, 1, 64, {"codes": stack["codes"]})
-    axes = re.escape("FormatLinear: the weight has 2 axes, not the shape (2, 4, 64)")
+    axes = re.escape(
+        "FormatLinear: the codes ('codes') have 2 axes, not the shape (2, 4, 64)"
+    )
     with pytest.raises(ValueError, match=axes):
         FormatLinear("toy", 8, 1, 64, stack)
-    axes = re.escape("FormatSwitchLinear: the weight has 3 axes, not the shape (8, 64)")
+    axes = re.escape(
+        "FormatSwitchLinear: the codes ('codes') have 3 axes, not the shape " "(8, 64)"
+    )
     with pytest.raises(ValueError, match=axes):
         FormatSwitchLinear("toy", 8, 1, 64, matrix)
     ragged = re.escape(
-        "FormatSwitchLinear: group_scales does not open with the weight's stack of (2,)"
+        "FormatSwitchLinear: group_scales does not open with the codes' ('codes') "
+        "stack of (2,)"
     )
     with pytest.raises(ValueError, match=ragged):
         FormatSwitchLinear(
