@@ -13,6 +13,18 @@ from tests.test_formats_oq import _SETTINGS, _calibration
 from tests.test_formats_oq import llama_source as llama_source
 from tests.test_formats_oq import toy as toy
 
+_VLM_CONTEXTS = (
+    "_strip_audio_config_if_orphaned",
+    "_strip_vision_config_if_orphaned",
+    "_drop_gemma4_mlx_shared_kv_extras_on_load",
+    "_derive_gemma4_global_kv_on_load",
+    "_preserve_gemma4_unified_image_processor_on_load",
+    "_force_minimax_m3_moe_sanitize_on_load",
+    "_force_qwen4_exp_sanitize_on_load",
+    "_remap_nested_visual_on_load",
+    "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+)
+
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("damage", ["missing-scale", "nonfinite-norm", "missing-norm"])
@@ -401,17 +413,7 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
     output.mkdir()
     (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
     entered = []
-    names = [
-        "_strip_audio_config_if_orphaned",
-        "_strip_vision_config_if_orphaned",
-        "_drop_gemma4_mlx_shared_kv_extras_on_load",
-        "_derive_gemma4_global_kv_on_load",
-        "_preserve_gemma4_unified_image_processor_on_load",
-        "_force_minimax_m3_moe_sanitize_on_load",
-        "_force_qwen4_exp_sanitize_on_load",
-        "_remap_nested_visual_on_load",
-        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-    ]
+    names = list(_VLM_CONTEXTS)
 
     for name in names:
 
@@ -442,19 +444,6 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
     assert entered == names
 
 
-_VLM_CONTEXTS = (
-    "_strip_audio_config_if_orphaned",
-    "_strip_vision_config_if_orphaned",
-    "_drop_gemma4_mlx_shared_kv_extras_on_load",
-    "_derive_gemma4_global_kv_on_load",
-    "_preserve_gemma4_unified_image_processor_on_load",
-    "_force_minimax_m3_moe_sanitize_on_load",
-    "_force_qwen4_exp_sanitize_on_load",
-    "_remap_nested_visual_on_load",
-    "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-)
-
-
 def _stub_vlm_verification(monkeypatch, model):
     from contextlib import contextmanager, nullcontext
 
@@ -475,7 +464,14 @@ def _stub_vlm_verification(monkeypatch, model):
     monkeypatch.setattr(oq, "check_loaded", lambda model: None)
 
 
-def test_refused_empty_prompt_leaves_staged_config_untouched(tmp_path):
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param(lambda: np.array([], dtype=np.int32), id="np"),
+        pytest.param(lambda: mx.array([], dtype=mx.int32), id="mx"),
+    ],
+)
+def test_refused_empty_prompt_leaves_staged_config_untouched(tmp_path, prompt):
 
     from omlx import oq_verify
 
@@ -492,9 +488,7 @@ def test_refused_empty_prompt_leaves_staged_config_untouched(tmp_path):
     )
     before = config.read_bytes()
     with pytest.raises(ValueError, match="at least one token"):
-        oq_verify.verify_written_format_checkpoint(
-            output, prompt=np.array([], dtype=np.int32)
-        )
+        oq_verify.verify_written_format_checkpoint(output, prompt=prompt())
     assert config.read_bytes() == before
     assert not (output / "VERIFY-FAILED.txt").exists()
 
@@ -627,6 +621,8 @@ def test_non_array_logits_names_the_type(tmp_path, monkeypatch):
     [
         pytest.param(lambda: np.array(5, dtype=np.int32), id="0d"),
         pytest.param(lambda: np.ones((1, 1, 2), dtype=np.int32), id="3d"),
+        pytest.param(lambda: mx.array(5, dtype=mx.int32), id="mx-0d"),
+        pytest.param(lambda: mx.ones((1, 1, 2), dtype=mx.int32), id="mx-3d"),
     ],
 )
 def test_refused_bad_rank_prompt_leaves_config_untouched(tmp_path, monkeypatch, prompt):
@@ -716,7 +712,9 @@ def test_non_finite_logits_fails_verification(tmp_path, monkeypatch, value):
 
     class Model(nn.Module):
         def __call__(self, x):
-            return mx.full((1, 2, 4), value)
+            bad = np.zeros((2, 2, 4), dtype=np.float32)
+            bad[1, 1, 3] = value
+            return mx.array(bad)
 
         def close(self):
             pass
@@ -727,13 +725,14 @@ def test_non_finite_logits_fails_verification(tmp_path, monkeypatch, value):
     assert "non-finite logits" in (output / "VERIFY-FAILED.txt").read_text()
     record = json.loads((output / "config.json").read_text())["omlx_verification"]
     assert "non-finite logits" in record["reason"]
+    assert record["verified"] is False
 
 
 @pytest.mark.parametrize(
     "prompt",
     [
-        pytest.param(lambda: np.arange(6).reshape(2, 3), id="np"),
-        pytest.param(lambda: mx.arange(6).reshape(2, 3), id="mx"),
+        pytest.param(lambda: np.arange(6, dtype=np.int64).reshape(2, 3), id="np"),
+        pytest.param(lambda: mx.array([[0, 1, 2], [3, 4, 5]], dtype=mx.int64), id="mx"),
     ],
 )
 def test_two_dimensional_caller_prompt_is_passed_through(tmp_path, monkeypatch, prompt):
@@ -751,7 +750,7 @@ def test_two_dimensional_caller_prompt_is_passed_through(tmp_path, monkeypatch, 
             self.seen = None
 
         def __call__(self, x):
-            self.seen = tuple(x.shape)
+            self.seen = (tuple(x.shape), x.dtype, np.array(x).tolist())
             return mx.zeros((1, 2, 4))
 
         def close(self):
@@ -760,7 +759,7 @@ def test_two_dimensional_caller_prompt_is_passed_through(tmp_path, monkeypatch, 
     model = Model()
     _stub_vlm_verification(monkeypatch, model)
     oq_verify.verify_written_format_checkpoint(output, prompt=prompt())
-    assert model.seen == (2, 3)
+    assert model.seen == ((2, 3), mx.int32, [[0, 1, 2], [3, 4, 5]])
 
 
 def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
@@ -802,16 +801,9 @@ def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
             vlm_utils.load_model = original
 
     monkeypatch.setattr(engine_vlm, "_remap_nested_visual_on_load", remap)
-    for name in (
-        "_strip_audio_config_if_orphaned",
-        "_strip_vision_config_if_orphaned",
-        "_drop_gemma4_mlx_shared_kv_extras_on_load",
-        "_derive_gemma4_global_kv_on_load",
-        "_preserve_gemma4_unified_image_processor_on_load",
-        "_force_minimax_m3_moe_sanitize_on_load",
-        "_force_qwen4_exp_sanitize_on_load",
-        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-    ):
+    for name in [
+        name for name in _VLM_CONTEXTS if name != "_remap_nested_visual_on_load"
+    ]:
         monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
     monkeypatch.setattr(vlm_utils, "load_model", bypassed)
 
