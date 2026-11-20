@@ -50,6 +50,8 @@ MANY_EXPERTS = 64
 # Measured with 16 instances a side in 3 processes on both Macs: the extra
 # launch costs 0.3-0.8% at 16 and 20 pairs and gains from 24 pairs.
 ORDERED_PAIRS = 24
+# MLX takes signed int32 grid dimensions. Two simdgroups are launched per pair.
+_MAX_PAIRS = (2**31 - 1) // 2
 
 # Each threadgroup takes the pair at sorted position ``y`` (pairs ordered by
 # expert, then by pair index) and output tile ``z``. The grid walks every
@@ -92,9 +94,9 @@ _SOURCE = r"""
     float result[RPS];
     qmv_rows<T, K_SIZE, RPS, 0>(
         rt, size_t(rhs[pair]) * N_SIZE + out_row, rt, 0,
-        x + (pair / LHS_DIV) * K_SIZE, simd_lid, result);
+        x + size_t(pair / LHS_DIV) * K_SIZE, simd_lid, result);
     if (simd_lid == 0) {
-      store_rows(omlx_iota<RPS>(), result, y + pair * N_SIZE + out_row);
+      store_rows(omlx_iota<RPS>(), result, y + size_t(pair) * N_SIZE + out_row);
     }
 """
 
@@ -114,9 +116,9 @@ _ORDERED_SOURCE = r"""
     float result[RPS];
     qmv_rows<T, K_SIZE, RPS, 0>(
         rt, size_t(rhs[pair]) * N_SIZE + out_row, rt, 0,
-        x + (pair / uint(LHS_DIV)) * K_SIZE, thread_index_in_simdgroup, result);
+        x + OFFSET(pair / uint(LHS_DIV)) * K_SIZE, thread_index_in_simdgroup, result);
     if (thread_index_in_simdgroup == 0) {
-      store_rows(omlx_iota<RPS>(), result, y + pair * N_SIZE + out_row);
+      store_rows(omlx_iota<RPS>(), result, y + OFFSET(pair) * N_SIZE + out_row);
     }
 """
 
@@ -148,6 +150,8 @@ def _order(rhs: mx.array) -> mx.array:
     """Pair indices in expert order (the experts as 32-bit unsigned
     integers), ties by pair: ``rhs``'s stable argsort for expert ids."""
     pairs = rhs.shape[0]
+    if not pairs:
+        return rhs.astype(mx.uint32)
     return _order_kernel()(
         inputs=[rhs],
         template=[("N_PAIRS", pairs)],
@@ -159,15 +163,18 @@ def _order(rhs: mx.array) -> mx.array:
 
 
 @cache
-def _ordered_kernel(face: Dot):
+def _ordered_kernel(face: Dot, small_offsets: bool = False):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("rt", face), "rhs", "order"]
+    offset_type = "uint" if small_offsets else "size_t"
+    suffix = "_u32" if small_offsets else ""
+    body = _ORDERED_SOURCE.replace("OFFSET", offset_type)
     return mx.fast.metal_kernel(
-        name=f"omlx_moe_verify_gather_ordered_{face.key}",
+        name=f"omlx_moe_verify_gather_ordered_{face.key}{suffix}",
         input_names=inputs,
         output_names=["y"],
         header=matrices.header + kernels.STORE_ROWS,
-        source=matrices.declarations + _ORDERED_SOURCE,
+        source=matrices.declarations + body,
     )
 
 
@@ -206,6 +213,12 @@ def projection(linear, k: int) -> Projection | None:
     """``linear``'s experts (``[E, N, K]``, no bias) as this kernel runs
     them, or None: their format has a dot face for them, and N is whole
     tiles of 8 outputs."""
+    return _projection(linear, k, None)
+
+
+def _projection(
+    linear, k: int, row_bounds: tuple[int, int] | None
+) -> Projection | None:
     if not isinstance(linear, nn.Module) or "bias" in linear:
         return None
     names = formats.tensor_names(linear)
@@ -222,15 +235,23 @@ def projection(linear, k: int) -> Projection | None:
     if face is None:
         return None
     operands = tuple(linear[name] for name in (names[0], *face.tensors))
-    return Projection(face, _kernel(face), _ordered_kernel(face), operands, n)
+    # The last input/output element is one less than its element count.
+    # Direct gathers accept any valid pair grid and keep wide offsets.
+    small_offsets = False
+    if row_bounds is not None:
+        input_rows, output_rows = row_bounds
+        small_offsets = max(input_rows * k, output_rows * n) <= 2**32
+    ordered = _ordered_kernel(face, small_offsets)
+    return Projection(face, _kernel(face), ordered, operands, n)
 
 
-def _build_plan(switch_mlp, width: int) -> _Plan | None:
+def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:
     layers = switch_mlp.get("gate_up_proj"), switch_mlp.get("down_proj")
-    gate_up = projection(layers[0], width)
+    max_pairs = MAX_ROWS * top_k
+    gate_up = _projection(layers[0], width, (MAX_ROWS, max_pairs))
     if gate_up is None:
         return None
-    down = projection(layers[1], gate_up.n // 2)
+    down = _projection(layers[1], gate_up.n // 2, (max_pairs, max_pairs))
     # A pair's expert indexes both stacks.
     if down is None or down.operands[0].shape[0] != gate_up.operands[0].shape[0]:
         return None
@@ -280,8 +301,8 @@ def _stand_in(plan: _Plan, metal):
         down = plan.down._replace(operands=stacks[cut:])
         order = _order(rhs) if pairs >= ORDERED_PAIRS else None
         return [
-            gather_qmv(gate_up, x, rhs, top_k, order),
-            gather_qmv(down, hidden, rhs, 1, order),
+            _gather_qmv(gate_up, x, rhs, top_k, order),
+            _gather_qmv(down, hidden, rhs, 1, order),
         ]
 
     return kernels.zeros(*specs), launch
@@ -301,9 +322,9 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     over MANY_EXPERTS experts or more, indices that are not integers or not
     top_k >= 1 of them for each row of x, x that is not float16, bfloat16
     or float32 or has fewer than 8 values), a projection has no dot face
-    that is exact for ``x``'s dtype, the
-    activation gives another dtype than ``x``'s or another shape than the
-    up's, or a block of these faces and shapes failed.
+    that is exact for ``x``'s dtype, the stacks have different expert counts,
+    the pairs exceed the grid limit, the activation gives another dtype or
+    shape than the up's, or a block of these faces and shapes failed.
 
     The first block of each Metal proves it on a stand-in (``_stand_in``):
     nothing of the call is evaluated here. Any of its arrays may belong to a
@@ -322,26 +343,23 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     plan = cached_per_module(
         switch_mlp,
         "_omlx_verify_gather_plan",
-        lambda switch: _build_plan(switch, width),
-        flags=(width,),
+        lambda switch: _build_plan(switch, width, top_k),
+        flags=(width, top_k),
     )
-    if (
-        plan is None
-        or plan.proof.failed
-        or not plan.gate_up.face.exact_for(x.dtype)
-        or not plan.down.face.exact_for(x.dtype)
-    ):
+    if plan is None or plan.proof.failed:
         return None
     # What a block's launches are instantiated with beside the proof's
     # key. A Metal in ran passed the checks below when it was proven: a call
     # pays for neither, nor for the stand-in and the log line it would build.
+    pair_count = rows * top_k
     metal = (rows, top_k, x.dtype, indices.dtype)
     if metal not in plan.proof.ran and (
         # MLX binds an input of fewer than 8 values as constants, and the
-        # kernel reads x from device memory; like gather_qmm, it takes integer
-        # indices only (exact_for above takes float activations of the GPU).
-        top_k < 1
-        or rows * top_k <= plan.few_pairs
+        # kernel reads x from device memory; like gather_qmm, it takes float
+        # activations of the GPU and integer indices only.
+        not plan.few_pairs < pair_count <= _MAX_PAIRS
+        or not plan.gate_up.face.exact_for(x.dtype)
+        or not plan.down.face.exact_for(x.dtype)
         or rows * width < 8
         or not mx.issubdtype(indices.dtype, mx.integer)
         or not plan.proof.prove(
@@ -353,16 +371,16 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         )
     ):
         return None
-    pairs = indices.reshape(rows * top_k)
-    order = _order(pairs) if rows * top_k >= ORDERED_PAIRS else None
-    gate_up = gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
+    pairs = indices.reshape(pair_count)
+    order = _order(pairs) if pair_count >= ORDERED_PAIRS else None
+    gate_up = _gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
     gate, up = mx.split(gate_up, 2, axis=-1)
     hidden = switch_mlp.activation(up, gate)
     if hidden.dtype != x.dtype or hidden.shape != up.shape:
         # Not the rows that the down launch is planned and proven for.
         # Nothing is kept of it: the next block asks its activation again.
         return None
-    down = gather_qmv(plan.down, hidden, pairs, 1, order)
+    down = _gather_qmv(plan.down, hidden, pairs, 1, order)
     return down.reshape(batch, length, top_k, -1)
 
 
@@ -380,6 +398,22 @@ def gather_qmv(
     expert order (``_order``), or None for each threadgroup to find its
     pair. Returns ``[P, N]``.
     """
+    if rhs.ndim != 1 or not mx.issubdtype(rhs.dtype, mx.integer):
+        raise ValueError("verify gather: expert indices must be an integer vector")
+    pairs = rhs.size
+    if pairs > _MAX_PAIRS:
+        raise ValueError("verify gather: pairs exceed the signed grid dimension")
+    if pairs_per_row < 1:
+        raise RuntimeError("verify gather: LHS_DIV is the experts of a row, 1 or more")
+    if x.ndim != 2 or pairs % pairs_per_row or pairs > x.shape[0] * pairs_per_row:
+        raise RuntimeError("verify gather: pairs are whole rows of LHS_DIV experts")
+    if order is not None and (order.shape != (pairs,) or order.dtype != mx.uint32):
+        raise ValueError("verify gather: order must be one uint32 per pair")
+    return _gather_qmv(projection, x, rhs, pairs_per_row, order)
+
+
+def _gather_qmv(projection, x, rhs, pairs_per_row, order):
+    """Launch on the row and pair shapes admitted by the caller."""
     n = projection.n
     pairs = rhs.shape[0]
     template = [("T", x.dtype), ("K_SIZE", x.shape[-1]), ("N_SIZE", n)]
@@ -388,9 +422,10 @@ def gather_qmv(
         template.append(("N_PAIRS", pairs))
     else:
         kernel, inputs = projection.ordered, [x, *projection.operands, rhs, order]
+    template.append(("LHS_DIV", pairs_per_row))
     return kernel(
         inputs=inputs,
-        template=[*template, ("LHS_DIV", pairs_per_row)],
+        template=template,
         grid=(32, 2 * pairs, n // 8),
         threadgroup=(32, 2, 1),
         output_shapes=[(pairs, n)],

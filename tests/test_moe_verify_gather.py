@@ -115,19 +115,19 @@ def test_no_projection_outside_the_kernel():
 def test_a_block_has_the_composed_route_s_bits(monkeypatch, caplog, bits, dtype):
     caplog.set_level(logging.INFO, logger=gather.__name__)
     switch = _switch(bits, dtype)
-    blocks = ((1, 2), (1, 3), (2, 2), (3, 1), (2, 4), (1, 8), (1, 3))
+    blocks = ((1, 2), (1, 3), (2, 2), (3, 1), (1, 7), (2, 4), (1, 8), (1, 3))
     for batch, length in blocks:
         x, indices = _block(batch, length, dtype)
         got = gather.fused_switch(switch, x, indices)
         assert got.shape == (batch, length, TOP_K, HIDDEN) and got.dtype == dtype
         assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
     (proof,) = _proofs()
-    assert proof.ran == {(rows, TOP_K, dtype, mx.uint32) for rows in (2, 3, 4, 8)}
+    assert proof.ran == {(rows, TOP_K, dtype, mx.uint32) for rows in (2, 3, 4, 7, 8)}
     assert not proof.failed
     # Once per launch that the blocks build.
     assert [r.getMessage() for r in _logged(caplog, gather)] == [
         f"MoE expert-ordered verify gather engaged ({rows} rows)"
-        for rows in (2, 3, 4, 8)
+        for rows in (2, 3, 4, 7, 8)
     ]
 
 
@@ -175,9 +175,8 @@ def _routed(rows, top_k, experts, seed=7):
 def test_2_and_3_bit_experts_take_the_gather_at_every_block(
     monkeypatch, bits, down_bits, dtype, group, experts
 ):
-    """Few experts or many, 32 pairs or more: with the pairs ordered once
-    the gather was faster than the composed path at every block measured
-    but 16 pairs over 256 experts."""
+    """The 12-pair block stays composed over 64 experts. Each larger block
+    uses the gather for both expert counts and matches the composed rows."""
     switch = _switch(bits, dtype, group=group, down_bits=down_bits, experts=experts)
     blocks = ((2, 6), (4, 8), (8, 4), (6, 6), (5, 8), (3, 11), (3, 16))
     for rows, top_k in blocks:
@@ -192,10 +191,11 @@ def test_2_and_3_bit_experts_take_the_gather_at_every_block(
     assert len(proof.ran) == len(blocks) - (experts == 64) and not proof.failed
 
 
-def test_a_down_stack_of_other_experts_than_the_gate_up_s_has_no_plan():
+@pytest.mark.parametrize("gate,down", [(8, 16), (16, 8)])
+def test_a_down_stack_of_other_experts_than_the_gate_up_s_has_no_plan(gate, down):
     """A pair's expert indexes both stacks."""
-    switch = _switch()
-    switch.down_proj = _switch(experts=16).down_proj
+    switch = _switch(experts=gate)
+    switch.down_proj = _switch(experts=down).down_proj
     assert gather.fused_switch(switch, *_block(1, 3)) is None
     assert not _proofs()
 
@@ -216,13 +216,13 @@ def test_indices_of_another_dtype_are_a_launch_of_their_own(monkeypatch):
     want = gather.fused_switch(switch, x, indices)
     evaluate, evaluated = mx.eval, []
     monkeypatch.setattr(mx, "eval", lambda *a: (evaluated.append(a), evaluate(*a)))
-    launch, read = gather.gather_qmv, []
+    launch, read = gather._gather_qmv, []
 
     def built(projection, x, rhs, per_row, order):
         read.append(rhs.dtype)
         return launch(projection, x, rhs, per_row, order)
 
-    monkeypatch.setattr(gather, "gather_qmv", built)
+    monkeypatch.setattr(gather, "_gather_qmv", built)
     assert _same_bits(gather.fused_switch(switch, x, indices), want)
     assert not evaluated  # proven
     signed = indices.astype(mx.int32)
@@ -480,15 +480,16 @@ def test_a_format_oMLX_does_not_know_runs_the_route(toy):  # noqa: N802
     assert len(proof.ran) == gather.MAX_ROWS - 1 and not proof.failed
 
 
-def test_a_row_of_one_expert_runs_the_route(toy):
+@pytest.mark.parametrize("rows", [2, 3])
+def test_a_row_of_one_expert_runs_the_route(toy, rows):
     toy(_toy("one_expert"))
     switch = _ToySwitch(k=320, inter=72, n=40)
-    x, indices = _toy_block(switch, 3, top_k=1)
+    x, indices = _toy_block(switch, rows, top_k=1)
     got = gather.fused_switch(switch, x, indices)
     experts = np.array(indices).reshape(-1)
     gate, up = np.split(switch.gate_up_proj.rows(experts, np.array(x[0])), 2, axis=-1)
     want = switch.down_proj.rows(experts, switch.activation(up, gate))
-    assert np.array_equal(np.array(got).reshape(3, 40), want)
+    assert np.array_equal(np.array(got).reshape(rows, 40), want)
 
 
 def test_x_that_is_not_a_float_of_the_gpu_is_left_to_the_composed_route(toy):
@@ -516,9 +517,9 @@ def test_an_activation_of_another_dtype_or_shape_leaves_the_block_composed(
     toy(_toy("gather"))
     switch = _ToySwitch(k=320, inter=72, n=40)
     x, indices = _toy_block(switch, 3)
-    activation, launch, launched = switch.activation, gather.gather_qmv, []
+    activation, launch, launched = switch.activation, gather._gather_qmv, []
     monkeypatch.setattr(
-        gather, "gather_qmv", lambda p, *a: (launched.append(p.n), launch(p, *a))[1]
+        gather, "_gather_qmv", lambda p, *a: (launched.append(p.n), launch(p, *a))[1]
     )
     others = (
         lambda up, gate: activation(up, gate).astype(mx.float16),
@@ -591,7 +592,7 @@ def test_a_face_that_does_not_compile_keeps_its_blocks_composed(
     # tensor dtypes and shapes.
     other = _ToySwitch(k=320, inter=72, n=40, seed=2)
     with monkeypatch.context() as patch:
-        patch.setattr(gather, "gather_qmv", lambda *launch: pytest.fail("built"))
+        patch.setattr(gather, "_gather_qmv", lambda *launch: pytest.fail("built"))
         assert gather.fused_switch(switch, x, indices) is None
         assert gather.fused_switch(other, *_toy_block(other, 2)) is None
     assert len(_logged(caplog, gather, logging.WARNING)) == 1
@@ -617,11 +618,15 @@ def test_a_proof_that_fails_after_a_block_ran_keeps_that_block_composed():
 
 
 class _TwoTensors(_ToyExperts):
-    """The toy experts with a second tensor that its face reads: ones."""
+    """A down stack with a separate power-of-two factor per expert and row."""
 
     def __init__(self, experts, n, k, seed):
         super().__init__(experts, n, k, seed)
-        self.unit = mx.ones_like(self.group_scales)
+        parity = (mx.arange(experts)[:, None] + mx.arange(n)) % 2
+        self.unit = mx.where(parity == 0, 0.5, 2.0)
+
+    def rows(self, experts, x):
+        return super().rows(experts, x) * np.array(self.unit)[experts]
 
 
 class _ByTensors(formats.QuantFormat):
@@ -645,6 +650,9 @@ def test_projections_of_different_tensor_counts_take_their_own(monkeypatch):
         "  const device float* scales;\n",
         "  const device float* scales;\n  const device float* unit;\n",
     )
+    source = source.replace("const device float* s;", "const device float *s, *u;")
+    source = source.replace("s(m.scales + row)", "s(m.scales + row), u(m.unit + row)")
+    source = source.replace("return sum * s[r];", "return sum * s[r] * u[r];")
     two = Dot(
         key="toy_two_tensors",
         source=source,
@@ -722,14 +730,14 @@ def test_only_a_stand_in_is_evaluated_in_the_call(monkeypatch):
         evaluated.append(arrays)
         evaluate(*arrays)
 
-    launch, launched = gather.gather_qmv, []
+    launch, launched = gather._gather_qmv, []
 
     def built(projection, x, rhs, per_row, order):
         launched.append((projection.operands, x, rhs, per_row))
         return launch(projection, x, rhs, per_row, order)
 
     monkeypatch.setattr(mx, "eval", recorded)
-    monkeypatch.setattr(gather, "gather_qmv", built)
+    monkeypatch.setattr(gather, "_gather_qmv", built)
     y = gather.fused_switch(switch, x, indices)
     # The proof evaluates the stand-in's inputs, then its launches.
     inputs, (stand_in,) = evaluated
@@ -785,7 +793,7 @@ def test_a_block_of_24_pairs_or_more_is_put_in_expert_order_once(monkeypatch):
     monkeypatch.setattr(
         gather, "_order", lambda rhs: (ordered.append(rhs.shape[0]), order(rhs))[1]
     )
-    launch, launched = gather.gather_qmv, []
+    launch, launched = gather._gather_qmv, []
 
     def built(projection, x, rhs, per_row, order):
         launched.append((rhs.shape[0], order is not None))
@@ -794,7 +802,7 @@ def test_a_block_of_24_pairs_or_more_is_put_in_expert_order_once(monkeypatch):
     for batch, length in ((1, 3), (1, 4), (2, 3), (1, 8)):  # 18, 24, 36, 48 pairs
         x, indices = _block(batch, length)
         with monkeypatch.context() as patch:
-            patch.setattr(gather, "gather_qmv", built)
+            patch.setattr(gather, "_gather_qmv", built)
             got = gather.fused_switch(switch, x, indices)
         assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
     # Each ordered Metal: its stand-in, then the call; both launches of each.
@@ -802,7 +810,7 @@ def test_a_block_of_24_pairs_or_more_is_put_in_expert_order_once(monkeypatch):
     assert launched == [(p, p >= 24) for p in (18, 24, 36, 48) for _ in range(4)]
 
 
-@pytest.mark.parametrize("pairs", [24, 25, 80, 128])
+@pytest.mark.parametrize("pairs", [24, 25, 80, 128, 260])
 @pytest.mark.parametrize("dtype", [mx.uint32, mx.int32, mx.uint8])
 def test_the_order_is_the_pairs_stable_sort_by_expert(pairs, dtype):
     mx.random.seed(pairs)
@@ -811,6 +819,14 @@ def test_the_order_is_the_pairs_stable_sort_by_expert(pairs, dtype):
         rhs = mx.random.randint(0, top, (pairs,)).astype(dtype)
         want = np.argsort(np.array(rhs).astype(np.int64), kind="stable")
         assert np.array_equal(np.array(gather._order(rhs)), want)
+
+
+@pytest.mark.parametrize("dtype", [mx.uint32, mx.int32])
+def test_the_order_compares_all_32_bits_of_each_expert(dtype):
+    ids = np.array([2**32 - 1, 1, 65536, 0, 65537, 1, 65536, 0], dtype=np.uint32)
+    rhs = mx.array(ids).astype(dtype)
+    want = np.argsort(ids, kind="stable")
+    assert np.array_equal(np.array(gather._order(rhs)), want)
 
 
 def test_the_ordered_launch_reads_each_position_s_pair_from_the_order():
@@ -857,8 +873,8 @@ def test_a_face_with_a_table_runs_the_gather_to_the_bit(monkeypatch):
 
 
 def test_the_pairs_are_ordered_from_24_and_searched_below(toy, monkeypatch):
-    """20, 21, 22 and 23 pairs keep each threadgroup's search; 24 is the
-    first ordered block. Either way: the pairs' own rows."""
+    """20, 21 and 22 pairs use the search. Both 24-pair geometries order
+    the stand-in and the real block, and each pair gets its own rows."""
     toy(_toy("ordered_from"))
     switch = _ToySwitch(k=320, inter=72, n=40)
     order, ordered = gather._order, []
@@ -866,6 +882,7 @@ def test_the_pairs_are_ordered_from_24_and_searched_below(toy, monkeypatch):
         gather, "_order", lambda rhs: (ordered.append(rhs.shape[0]), order(rhs))[1]
     )
     for rows, top_k in ((2, 10), (3, 7), (2, 11), (2, 12), (3, 8)):
+        ordered.clear()
         x, indices = _toy_block(switch, rows, top_k)
         got = gather.fused_switch(switch, x, indices)
         experts = np.array(indices).reshape(-1)
@@ -873,7 +890,7 @@ def test_the_pairs_are_ordered_from_24_and_searched_below(toy, monkeypatch):
         gate, up = np.split(switch.gate_up_proj.rows(experts, rows_x), 2, axis=-1)
         want = switch.down_proj.rows(experts, switch.activation(up, gate))
         assert np.array_equal(np.array(got).reshape(rows * top_k, 40), want)
-    assert sorted(set(ordered)) == [24]
+        assert ordered == ([24, 24] if rows * top_k == 24 else [])
 
 
 def test_a_face_s_kernels_are_built_once():
@@ -904,8 +921,148 @@ def test_few_pairs_over_many_experts_keep_the_composed_path(monkeypatch):
     few, many = _switch(experts=63), _switch(experts=64)
     for rows, top_k, runs in ((2, 8, False), (4, 4, False), (3, 6, True), (2, 9, True)):
         x, indices = _routed(rows, top_k, 63)
-        assert (gather.fused_switch(many, x, indices) is not None) == runs
         got = gather.fused_switch(few, x, indices)
         assert _same_bits(got, _composed(monkeypatch, few, x, indices))
+        assert (gather.fused_switch(many, x, indices) is not None) == runs
     proofs = sorted(_proofs(), key=lambda proof: len(proof.ran))
     assert [len(proof.ran) for proof in proofs] == [2, 4]
+
+
+@pytest.mark.parametrize("rows,top_k", [(3, 6), (4, 65)])
+def test_high_expert_and_pair_indices_keep_the_composed_bits(monkeypatch, rows, top_k):
+    switch = _switch(experts=260)
+    x, _ = _routed(rows, top_k, 260)
+    rhs = (259 - mx.arange(rows * top_k)) % 260
+    indices = rhs.reshape(1, rows, top_k).astype(mx.uint32)
+    got = gather.fused_switch(switch, x, indices)
+    assert _same_bits(got, _composed(monkeypatch, switch, x, indices))
+
+
+def test_a_proven_block_skips_both_face_dtype_checks(monkeypatch):
+    switch = _switch()
+    x, indices = _block(1, 4)
+    want = gather.fused_switch(switch, x, indices)
+    mx.eval(want)
+    monkeypatch.setattr(Dot, "exact_for", lambda *_: pytest.fail("rechecked a face"))
+    assert _same_bits(gather.fused_switch(switch, x, indices), want)
+
+
+@pytest.mark.parametrize(
+    "rows,top_k,proves",
+    [(3, (2**30 - 1) // 3, True), (4, 2**28, False), (4, 2**28 + 1, False)],
+)
+def test_gather_pair_grid_fits_a_signed_mlx_launch(monkeypatch, rows, top_k, proves):
+    switch = _switch()
+    x, _ = _block(1, rows)
+    indices = mx.broadcast_to(mx.array(0, mx.uint32), (1, rows, top_k))
+    attempted = []
+    monkeypatch.setattr(
+        kernels.Proof, "prove", lambda *args: attempted.append(args[1]) or False
+    )
+    assert gather.fused_switch(switch, x, indices) is None
+    assert bool(attempted) == proves
+
+
+@pytest.mark.parametrize(
+    "x_shape,rhs_shape,rhs_type,order_shape,order_type,reason",
+    [
+        ((6, 320), (22,), mx.uint32, (22,), mx.uint32, "whole rows"),
+        ((4, 320), (24,), mx.uint32, (24,), mx.uint32, "whole rows"),
+        ((6, 320), (24,), mx.uint32, (8,), mx.uint32, "order"),
+        ((6, 320), (24,), mx.uint32, (6, 4), mx.uint32, "order"),
+        ((6, 320), (24,), mx.uint32, (24,), mx.int32, "order"),
+        ((6, 320), (6, 4), mx.uint32, (24,), mx.uint32, "expert indices"),
+        ((6, 320), (24,), mx.float32, (24,), mx.uint32, "expert indices"),
+        ((6,), (24,), mx.uint32, (24,), mx.uint32, "rows"),
+        ((2**28, 320), (2**30,), mx.uint32, (2**30,), mx.uint32, "grid"),
+    ],
+)
+def test_direct_ordered_gather_rejects_invalid_metadata_before_launch(
+    x_shape, rhs_shape, rhs_type, order_shape, order_type, reason
+):
+    projection = gather.projection(_experts(320, 64), 320)
+    projection = projection._replace(ordered=lambda **kw: pytest.fail("launched"))
+    x = mx.broadcast_to(mx.array(0, mx.bfloat16), x_shape)
+    rhs = mx.broadcast_to(mx.array(0, rhs_type), rhs_shape)
+    order = mx.broadcast_to(mx.array(0, order_type), order_shape)
+    with pytest.raises((ValueError, RuntimeError), match=reason):
+        gather.gather_qmv(projection, x, rhs, 4, order)
+
+
+def test_a_direct_gather_can_read_a_prefix_of_the_input_rows():
+    projection = gather.projection(_experts(320, 64), 320)
+    x = mx.random.normal((5, 320)).astype(mx.bfloat16)
+    rhs = mx.arange(16, dtype=mx.uint32) % EXPERTS
+    order = gather._order(rhs)
+    full = gather.gather_qmv(projection, x, rhs, 4, order)
+    prefix = gather.gather_qmv(projection, x[:4], rhs, 4, order)
+    assert _same_bits(full, prefix)
+
+
+def test_the_largest_whole_pair_grid_reaches_the_launch():
+    pairs = 2**30 - 1
+    projection = gather.projection(_experts(320, 64), 320)
+    grids = []
+
+    def launch(**kwargs):
+        grids.append(kwargs["grid"])
+        return [None]
+
+    projection = projection._replace(ordered=launch)
+    rhs = mx.broadcast_to(mx.array(0, mx.uint32), (pairs,))
+    x = mx.broadcast_to(mx.array(0, mx.bfloat16), (pairs // 3, 320))
+    gather.gather_qmv(projection, x, rhs, 3, rhs)
+    assert grids == [(32, 2 * pairs, 8)]
+
+
+def test_no_launch_is_needed_to_order_zero_pairs(monkeypatch):
+    monkeypatch.setattr(gather, "_order_kernel", lambda: pytest.fail("launched"))
+    order = gather._order(mx.array([], mx.int32))
+    assert order.shape == (0,) and order.dtype == mx.uint32
+
+
+@pytest.mark.parametrize(
+    "inter,limits,first_wide",
+    [
+        # Gate/up has 128 outputs. Down reads 64 values and writes 512.
+        (64, (2**20, 2**22), (False, True)),
+        # Gate/up has 2048 outputs. On down the 1024-wide input sets its limit.
+        (1024, (2**18, 2**19), (True, False)),
+    ],
+)
+def test_the_ordered_plan_uses_small_offsets_only_when_all_rows_fit(
+    monkeypatch, inter, limits, first_wide
+):
+    switch = _switch(inter=inter)
+    direct_gate = gather.projection(switch.gate_up_proj, HIDDEN)
+    direct_down = gather.projection(switch.down_proj, inter)
+    x, _ = _block(1, gather.MAX_ROWS)
+    plans = []
+
+    def capture(plan, metal):
+        plans.append(plan)
+        return False
+
+    monkeypatch.setattr(gather, "_stand_in", capture)
+    monkeypatch.setattr(kernels.Proof, "prove", lambda self, metal, build, *_: build())
+    counts = [TOP_K, limits[0], limits[0] + 1, limits[1], limits[1] + 1, TOP_K]
+    for top_k in counts:
+        indices = mx.broadcast_to(mx.array(0, mx.uint32), (1, gather.MAX_ROWS, top_k))
+        assert gather.fused_switch(switch, x, indices) is None
+    # Direct callers can supply any valid pair grid, so their ordered kernel must
+    # handle large offsets. A bounded block can use a narrower one for each projection.
+    wide = [
+        (
+            p.gate_up.ordered is direct_gate.ordered,
+            p.down.ordered is direct_down.ordered,
+        )
+        for p in plans
+    ]
+    assert wide == [
+        (False, False),
+        (False, False),
+        first_wide,
+        first_wide,
+        (True, True),
+        (False, False),
+    ]

@@ -218,6 +218,7 @@ def _affine_sources(monkeypatch):
         format_linear._shared_kernel.__wrapped__(face)
         gather._kernel.__wrapped__(face)
         gather._ordered_kernel.__wrapped__(face)
+        gather._ordered_kernel.__wrapped__(face, True)
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
         tile = affine.tile_face(bits, group, dtype)
         for kind in ("plain", "act", "act_map"):
@@ -255,7 +256,9 @@ def _metal_digest(recorded):
 # builders (the format linear's shared-rows kernels among them) and 36
 # plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
 # preserve their Metal byte for byte when the face declares none.
-_METAL_DIGEST = "460 b7a4a469a789fbfcd5b9547543b62d8a56e07524fa2b3376373679dbb1974033"
+# The 144 verify-gather builders use wide offsets. Bounded ordered blocks
+# add 72 kernels using 32-bit input and output offsets.
+_METAL_DIGEST = "532 153e82bdea9a231d4c796534ba647e151283f9f9db81c75f3184637ddd89c198"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
