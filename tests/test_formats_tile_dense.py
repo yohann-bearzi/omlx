@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Dense format prefill and row-exact verification over the same weight."""
 
+import builtins
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
@@ -126,6 +127,23 @@ def test_sixteen_rows_keep_the_dot_launch(monkeypatch):
     monkeypatch.setattr(tile_dense, "one_run", never_launch)
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
     assert _same_bits(layer(x), serial)
+
+
+@needs_nax
+def test_sixteen_rows_without_a_dot_face_still_decode(toy, monkeypatch):
+    k, n = 256, 64
+    fmt = toy(_tile_toy("tile_only_16"))
+    fmt.dot_face = None
+    tensors = {key: a[0] for key, a in _stack(n, k).items()}
+    layer = FormatLinear("tiletoy", 8, 1, k, tensors)
+    x = _x((16, k), mx.float16)
+    want = x @ fmt.decode(tensors, 8, 1).astype(x.dtype).T
+
+    def never_launch(*args, **kwargs):
+        pytest.fail("sixteen rows took the dense prefill")
+
+    monkeypatch.setattr(tile_dense, "one_run", never_launch)
+    assert _same_bits(layer(x), want)
 
 
 @needs_nax
@@ -391,7 +409,7 @@ def test_dense_nax_one_run_works_without_a_scan_kernel(monkeypatch):
 
 
 @needs_nax
-@pytest.mark.parametrize("rows", [40, 193])
+@pytest.mark.parametrize("rows", [40, 193, 4225])
 def test_dense_nax_one_run_covers_the_split_grid(monkeypatch, rows):
     k, n = 2560, 512
     quantized, layer = _pair(k, n, bits=4, bias=True)
@@ -410,3 +428,43 @@ def test_dense_nax_one_run_covers_the_split_grid(monkeypatch, rows):
     for _ in range(2):
         assert _same_bits(layer(x), want)
     assert len(configs) == 1 and configs[0].gx > 0
+
+
+@needs_nax
+def test_dense_prefill_handles_ragged_k_and_proves_both_n_alignments(monkeypatch):
+    k, rows = 160, 33
+    tiles = []
+    project = tile_dense.project
+
+    def record(tile, z):
+        tiles.append(tile)
+        return project(tile, z)
+
+    monkeypatch.setattr(tile_dense, "project", record)
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for n in (64, 96):
+        quantized, layer = _pair(k, n, bits=4)
+        x = _x((rows, k), seed=n)
+        assert _same_bits(layer(x), _one_expert(quantized, x))
+    assert len(tiles) == 2 and tiles[0].proof is tiles[1].proof
+    assert len(tiles[0].proof.ran) == 2
+
+
+@needs_nax
+def test_dense_prefill_does_not_import_its_module_per_call(monkeypatch):
+    k, n = 512, 128
+    _, layer = _pair(k, n, bits=4, bias=True)
+    x = _x((33, k))
+    mx.eval(layer(x))
+    imports = []
+    real = builtins.__import__
+
+    def record(name, *args, **kwargs):
+        fromlist = kwargs.get("fromlist", args[2] if len(args) > 2 else ())
+        if fromlist and "tile_dense" in fromlist:
+            imports.append(name)
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", record)
+    mx.eval(layer(x))
+    assert imports == []

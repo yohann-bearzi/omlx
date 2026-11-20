@@ -1633,9 +1633,11 @@ def _get_kernel(kind: str):
 
 def _face_kernel(face: Tile, kind: str = "plain"):
     """Build (once) the kernel of ``kind`` (``_FACE_KINDS``) over tile face
-    ``face``, ``omlx_gqmm_<key>[_swiglu[_map]]``: its inputs are ``x``, the
-    face's matrix (``w_weight`` and ``w_<tensor>``), ``tiles``, ``tile_count``
-    and ``params``, then the epilogue's ``lim`` and the row map's ``rmap``."""
+    ``face``, ``omlx_gqmm_<key>[_one_run|_swiglu[_map]]``: its inputs are
+    ``x``, the face's matrix (``w_weight`` and ``w_<tensor>``) and ``params``;
+    all kinds but ``one_run`` also take ``tiles`` and ``tile_count``, and the
+    activation kinds the epilogue's ``lim``, the mapped one the row map
+    ``rmap``. ``one_run`` derives a single expert's run from the grid."""
     global _header_failed, _act_header_failed
     kernel = _kernels.get((face, kind))
     act = kind in ("act", "act_map")

@@ -36,7 +36,7 @@ import mlx.nn as nn
 
 from .. import formats
 from ..patches.module_cache import cached_per_module
-from . import Dot, Tile, kernels, tile_wide
+from . import Dot, Tile, kernels, tile_dense, tile_wide
 from .mlx import traversal
 
 logger = logging.getLogger(__name__)
@@ -1336,8 +1336,6 @@ class FormatLinear(_FormatLayer):
     def _prefill(self, kept, x, rows):
         """A dense call above MAX_ROWS over the format's tile face, as one
         run of expert zero; None where the call decodes instead."""
-        from . import tile_dense
-
         n = self.output_dims
         if (
             x.dtype not in (mx.float16, mx.bfloat16)
