@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import struct
 from pathlib import Path
 
@@ -1026,6 +1027,46 @@ def test_discovery_skips_a_present_invalid_verification_record(tmp_path, record)
 
     (tmp_path / "config.json").write_text(json.dumps({"omlx_verification": record}))
     assert unverified(tmp_path)
+
+
+def test_a_scan_parses_each_config_once(tmp_path, monkeypatch):
+    """_skipped_entry and then _is_model_dir ask about the same directory in
+    one scan: the verification record is parsed once per (path, config
+    mtime), not once per ask."""
+    from omlx import model_discovery
+
+    for name in ("first", "second", "third"):
+        model = tmp_path / name
+        model.mkdir()
+        (model / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (model / "model.safetensors").write_bytes(b"0" * 1000)
+    parsed = []
+    record = model_discovery.unverified_reason
+
+    def counting(config):
+        parsed.append(config)
+        return record(config)
+
+    monkeypatch.setattr(model_discovery, "unverified_reason", counting)
+    models = discover_models(tmp_path)
+    assert len(models) == 3
+    assert len(parsed) == 3
+
+
+def test_the_unverified_cache_follows_the_config_mtime(tmp_path):
+    """A cached verdict is only used while the config's mtime is the one it
+    was read at: a rewrite (here: adding a failed record) is seen."""
+    from omlx.model_discovery import unverified
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    config.write_text(json.dumps({"model_type": "llama"}))
+    assert not unverified(model)
+    config.write_text(json.dumps({"omlx_verification": {"verified": False}}))
+    stamp = config.stat().st_mtime_ns
+    os.utime(config, ns=(stamp + 1_000_000, stamp + 1_000_000))
+    assert unverified(model)
 
 
 class TestDiscoverModels:
