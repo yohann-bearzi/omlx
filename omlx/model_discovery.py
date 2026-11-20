@@ -1489,10 +1489,12 @@ def unverified_reason(config) -> str | None:
     return str(record.get("reason", "its verification record does not say verified"))
 
 
-# unverified()'s verdicts, a path's config mtime beside it: one scan asks
-# through _skipped_entry and then _is_model_dir about the same directory,
-# and should parse its config once. A parse that fails is not kept.
-_UNVERIFIED_CACHE: dict[str, tuple[int, bool]] = {}
+# unverified()'s verdicts, a path's config identity stamp beside it: one
+# scan asks through _skipped_entry and then _is_model_dir about the same
+# directory, and should parse its config once. The stamp (device, inode,
+# mtime, ctime, size) catches a rewrite that keeps the old mtime; a parse
+# that fails is not kept.
+_UNVERIFIED_CACHE: dict[str, tuple[tuple[int, int, int, int, int], bool]] = {}
 
 
 def unverified(path: Path) -> bool:
@@ -1503,19 +1505,26 @@ def unverified(path: Path) -> bool:
         return True
     config_path = path / "config.json"
     try:
-        mtime = config_path.stat().st_mtime_ns
+        info = config_path.stat()
     except OSError:
         return False
+    stamp = (
+        info.st_dev,
+        info.st_ino,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+        info.st_size,
+    )
     key = str(path)
     found = _UNVERIFIED_CACHE.get(key)
-    if found is not None and found[0] == mtime:
+    if found is not None and found[0] == stamp:
         return found[1]
     try:
         config = json.loads(config_path.read_text())
     except (OSError, ValueError):
         return False
     verdict = unverified_reason(config) is not None
-    _UNVERIFIED_CACHE[key] = (mtime, verdict)
+    _UNVERIFIED_CACHE[key] = (stamp, verdict)
     return verdict
 
 

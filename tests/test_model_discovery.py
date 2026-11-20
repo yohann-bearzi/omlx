@@ -1032,7 +1032,7 @@ def test_discovery_skips_a_present_invalid_verification_record(tmp_path, record)
 def test_a_scan_parses_each_config_once(tmp_path, monkeypatch):
     """_skipped_entry and then _is_model_dir ask about the same directory in
     one scan: the verification record is parsed once per (path, config
-    mtime), not once per ask."""
+    identity stamp), not once per ask."""
     from omlx import model_discovery
 
     for name in ("first", "second", "third"):
@@ -1067,6 +1067,77 @@ def test_the_unverified_cache_follows_the_config_mtime(tmp_path):
     stamp = config.stat().st_mtime_ns
     os.utime(config, ns=(stamp + 1_000_000, stamp + 1_000_000))
     assert unverified(model)
+
+
+def test_the_unverified_cache_invalidates_when_mtime_is_preserved(tmp_path):
+    """A rewrite can keep the old mtime (cp -p, tar, rsync -a) and even the
+    old length; the identity stamp (device, inode, mtime, ctime, size) still
+    changes, so the cached verdict is not reused."""
+    from omlx.model_discovery import unverified
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    kept = '{"omlx_verification": {"verified": true, "reason": ""}}'
+    dropped = '{"omlx_verification": {"verified": false, "reason":""}}'
+    assert len(kept) == len(dropped)
+    config.write_text(kept)
+    assert not unverified(model)
+    stamp = config.stat().st_mtime_ns
+    config.write_text(dropped)
+    os.utime(config, ns=(stamp, stamp))
+    assert unverified(model)
+
+
+def test_the_unverified_cache_follows_an_older_config(tmp_path):
+    """A config restored with an older mtime than the one read before is
+    parsed again, not served from the cache."""
+    from omlx.model_discovery import unverified
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    config.write_text(json.dumps({"omlx_verification": {"verified": False}}))
+    assert unverified(model)
+    config.write_text(json.dumps({"model_type": "llama"}))
+    stamp = config.stat().st_mtime_ns
+    os.utime(config, ns=(stamp - 1_000_000_000, stamp - 1_000_000_000))
+    assert not unverified(model)
+
+
+def test_a_failed_parse_is_not_cached(tmp_path):
+    """A half-written config is refused, and the refusal is not kept: the
+    finished rewrite is read."""
+    from omlx import model_discovery
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    config.write_text("{not json")
+    assert not model_discovery.unverified(model)
+    assert str(model) not in model_discovery._UNVERIFIED_CACHE
+    config.write_text(json.dumps({"omlx_verification": {"verified": False}}))
+    assert model_discovery.unverified(model)
+
+
+def test_unverified_cache_hit_does_not_read_config(tmp_path, monkeypatch):
+    """A hit returns the verdict without opening config.json again."""
+    from omlx import model_discovery
+
+    model = tmp_path / "model"
+    model.mkdir()
+    (model / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    reads = []
+    read_text = Path.read_text
+
+    def counting(self, *args, **kwargs):
+        reads.append(self)
+        return read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", counting)
+    assert not model_discovery.unverified(model)
+    assert not model_discovery.unverified(model)
+    assert len(reads) == 1
 
 
 class TestDiscoverModels:
