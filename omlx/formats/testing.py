@@ -541,15 +541,14 @@ def rows_stack(
     fmt, first: dict, second: dict, k: int, bits: int, group_size: int, x=None
 ) -> None:
     """Checks the rows rule's promise for two ``(n, k)`` matrices of ``fmt``
-    (their ``weight`` and the format's tensors, by name, as ``layout`` gives
-    them): stacked along N, their decode is the two decodes one after the
-    other, bit for bit, and with ``x`` (K activations of a dtype the face is
-    exact for) so are their dot face's rows. With ``x`` the helper builds
-    format layers, so call it inside ``testing.verified(...)`` in a format
-    test. With ``x=None`` it only calls the format's decode after checking
-    both matrices against the declared tensor names, shapes and dtypes.
     (their codes, ``fmt.codes_name``, and the format's tensors, by name, as
-    ``layout`` gives them)
+    ``layout`` gives them): stacked along N, their decode is the two decodes
+    one after the other, bit for bit, and with ``x`` (K activations of a dtype
+    the face is exact for) so are their dot face's rows. With ``x`` the helper
+    builds format layers, so call it inside ``testing.verified(...)`` in a
+    format test. With ``x=None`` it only calls the format's decode after
+    checking both matrices against the declared tensor names, shapes and
+    dtypes.
     Raises an ``AssertionError`` that names what differs, or that the
     format is not ``stackable``."""
     weight = first.get(fmt.codes_name)

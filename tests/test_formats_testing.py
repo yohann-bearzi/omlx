@@ -1143,3 +1143,11 @@ def test_face_helpers_report_custom_codes_name_on_operand_mismatch():
     for call in calls:
         with pytest.raises(ValueError, match="packed_bytes"):
             call()
+
+
+def test_rows_stack_refusal_names_a_plugins_codes():
+    fmt = _ToyFormat()
+    fmt.codes_name = "packed_bytes"
+    fmt.tensors = ("group_scales",)
+    with pytest.raises(AssertionError, match=r"needs its codes \('packed_bytes'\)"):
+        testing.rows_stack(fmt, {}, {}, 8, 8, 1)

@@ -149,3 +149,30 @@ def test_the_packed_name_of_a_pair_kernel_is_weight_by_default():
     face = _toy("pair_default")
     names, _ = tile_wide.pair_kernel(face, face)
     assert names[0] == "weight"
+
+
+def test_rows_stack_docstring_names_codes_not_weight():
+    doc = testing.rows_stack.__doc__ or ""
+    assert "``weight``" not in doc
+    assert doc.count("``fmt.codes_name``") == 1
+    assert "(their codes, ``fmt.codes_name``" in doc
+
+
+def test_layer_refusals_name_a_plugins_codes(reader):
+    """The refusals of a layer's own tensors read the format's name, not the
+    literal "codes": a plugin with another name gets its own words."""
+    formats.register(reader)
+    stack = {reader.codes_name: mx.zeros((2, 8, 8), mx.uint8), "gain": mx.zeros((2, 8))}
+    with testing.verified("example"):
+        with pytest.raises(ValueError, match=r"codes \('packed_bytes'\)"):
+            FormatLinear(reader.mode, 8, 1, 8, stack)
+        with pytest.raises(
+            ValueError, match=r"codes' \('packed_bytes'\) stack of \(2,\)"
+        ):
+            FormatSwitchLinear(
+                reader.mode,
+                8,
+                1,
+                8,
+                {**stack, "gain": mx.zeros((3, 8))},
+            )

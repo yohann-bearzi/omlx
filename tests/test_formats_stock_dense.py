@@ -419,7 +419,7 @@ def test_the_native_binding_is_bound_with_the_layers_packed_key():
     weight = mx.zeros((8, 8), mx.uint8)
     with pytest.raises(TypeError):
         native.format_linear_fast(weight, None, [weight], {})
-    with pytest.raises(TypeError, match="weight_key must be str"):
+    with pytest.raises(TypeError, match=r"weight_key must be str, not int"):
         native.format_linear_fast(weight, None, [weight], {}, 123)
     with pytest.raises(TypeError):
         native.format_linear_fast(weight, None, [weight], "not_a_dict", "codes")
