@@ -6,15 +6,19 @@ formats MLX knows.
 A layer holds a matrix's tensors under the names its format gives them, and
 asks the registry how to run them:
 
-- ordinary Qwen dense projections select a single-row dot or wide mat-vec
-  according to MLX's row count, layout and size rules. The wide kernel
-  decodes weights through the format's tile face.
+- ordinary Qwen dense projections select a single-row dot, a wide mat-vec or
+  the dense prefill below, according to MLX's row count, layout and size
+  rules. The wide kernel decodes weights through the format's tile face.
   Explicitly row-exact calls use the dot face for each input row;
 - a switch layer's sorted prefill uses its tile face on tensor units or
   through MLX's steel matrix kernels, from 16 rows and four rows per expert
   on average. Below that threshold it uses its decode rows kernel;
-- dense layers can fall back to the dot face for short calls. When a layer
-  has no eligible launch it decodes to the activations' type, then uses
+- a matrix above 16 rows with no ordinary route takes its tile face as one
+  expert on tensor units; during row-exact verification its dot face handles
+  up to 16 rows at once;
+- everything else (a layout the face does not cover, activations of a type
+  it is not exact for, a format without the face, a face that did not
+  compile) is the format's ``decode``, cast to the activations' type, then
   MLX's matmul (its ``gather_mm`` from as many indices as a switch layer's
   stack has matrices).
 """
@@ -236,7 +240,7 @@ def _kernel(face: Dot, stacked: bool):
 
 
 class _Tile(NamedTuple):
-    """How a stack's sorted rows run through its format's tile face."""
+    """The selected tile kernel, its proof and the layer's current operands."""
 
     face: Tile
     kernel: Any
@@ -256,26 +260,29 @@ class _Plan(NamedTuple):
     said: tuple[str, str]  # what a proof logs: the launches engaged, or failed
 
 
-def _tile(layer, plan: _Plan) -> _Tile | None:
+def _tile(layer) -> _Tile | None:
     """Bind the tile backend for this GPU with its own proof and operands."""
-    face = formats.tile(layer, plan.k, plan.n)
+    face = formats.tile(layer, layer.input_dims, layer.output_dims)
     if face is None:
         return None
     if _nax_host():
         from ..patches import m5_gather_qmm_nax as nax
 
-        kernel = nax._face_kernel(face)
-        route = "format_switch_tile_nax"
+        kernel = nax._face_kernel(face, "plain" if layer._STACK else "one_run")
+        route = "format_switch_tile_nax" if layer._STACK else "format_linear_tile_nax"
     else:
         from . import tile_gather
 
         kernel = tile_gather.kernel(face)
-        route = "format_switch_tile_steel"
+        route = (
+            "format_switch_tile_steel" if layer._STACK else "format_linear_tile_steel"
+        )
     if kernel is None:
         return None
+    fallback = "rows kernel" if layer._STACK else "decode"
     said = (
         f"quant format face {face.key}: tile kernel engaged",
-        f"quant format face {face.key}: tile kernel failed; rows kernel fallback",
+        f"quant format face {face.key}: tile kernel failed; {fallback} fallback",
     )
     operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
     dtypes = tuple(a.dtype for a in operands)
@@ -800,6 +807,32 @@ def _swiglu(plan, tile, x, indices, limit, row_map=None):
 _KEPT = "_omlx_format_call"
 _FAST = "_fast"
 _NATIVE_FALLBACK_LOGGED = False
+_UNBUILT = object()
+
+
+class _Kept:
+    """What one call of a layer works out, kept until a write retires it.
+
+    Every cached route has its own name: the ordinary routes a Qwen-style
+    dense call selects (``routes``, each entry a tile or its decline, beside
+    the native memo), the warm wide tile of that call (``wide``), the dense
+    prefill's tile (``dense``) and a switch layer's sorted tile
+    (``sorted``). A tile is ``_UNBUILT`` until its route first asks for it
+    and None once that route declined, so a decline is not built again and
+    one route's write can never land in another's slot. ``weight`` is the
+    array the record was worked out over; another array retires it whole,
+    as a write of any tensor or attribute does."""
+
+    __slots__ = ("plan", "bias", "weight", "routes", "wide", "dense", "sorted")
+
+    def __init__(self, plan, bias, weight):
+        self.plan = plan
+        self.bias = bias
+        self.weight = weight
+        self.routes = {}
+        self.wide = _UNBUILT
+        self.dense = _UNBUILT
+        self.sorted = _UNBUILT
 
 
 def _log_native_fallback() -> None:
@@ -846,17 +879,18 @@ class _FormatLayer(nn.Module):
     reads them (``fmt``).
 
     A layer works out its plan and finds its bias at its first call, and
-    keeps them in its ``__dict__`` with the weight they were found with,
-    until one of its arrays or attributes is assigned or removed
+    keeps them in one record in its ``__dict__`` with the weight they were
+    found with, until one of its arrays or attributes is assigned or removed
     (``__setitem__``, ``__delitem__``, ``pop``: what MLX's loads,
     ``update``, ``set_dtype`` and attribute writes go through; a dict's
     own mutators and ``del`` of an attribute too) or its
     weight is another array: a function that ``mx.compile`` traces over the
     layer's state (``inputs=``) swaps every array of it for a trace's, and
     back, behind those methods. A call then reads one dict entry and the
-    weight. Threads: a layer that is being loaded is not called meanwhile;
-    two threads that make a layer's first call at once each work out the
-    same plan, and either keeps it.
+    weight; the routes it proves are named entries of that record, which a
+    write retires with it. Threads: a layer that is being loaded is not
+    called meanwhile; two threads that make a layer's first call at once
+    each work out the same plan, and either keeps it.
 
     The format's tensors keep the shapes and dtypes the layer is built
     with, which its face reads. MLX writes a module's arrays back one by one
@@ -1046,19 +1080,21 @@ class _FormatLayer(nn.Module):
             f"holds the load's placeholder of {held}"
         )
 
-    def _keep(self) -> tuple:
+    def _keep(self) -> _Kept:
         """The layer's plan and bias, worked out and kept."""
         self.__dict__.pop(_FAST, None)
         bias = self.get("bias")
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        kept = self.__dict__[_KEPT] = (
-            _plan(self),
-            bias,
-            self[packed_name(self)],
-        )
+        kept = self.__dict__[_KEPT] = _Kept(_plan(self), bias, self[packed_name(self)])
         return kept
+
+    def _dense_tile(self, kept: _Kept) -> _Tile | None:
+        """The dense-prefill tile, built once; None where the layer's format
+        has no face this GPU's tile kernel takes. It dies with the record."""
+        kept.dense = _tile(self)
+        return kept.dense
 
     def __delitem__(self, key: str) -> None:
         self.__dict__.pop(_KEPT, None)
@@ -1188,7 +1224,7 @@ class FormatLinear(_FormatLayer):
     _fast = None
 
     def _ordinary(self, kept, x, signature):
-        plan = kept[0]
+        plan = kept.plan
         architecture = _metal_architecture()
         if not architecture:
             return None
@@ -1197,15 +1233,13 @@ class FormatLinear(_FormatLayer):
         folded = traversal(rows, *geometry, bits=self.bits)
         if folded[0] in ("fallback", "quad"):
             return None
-        if len(kept) == 3:
-            kept = self.__dict__[_KEPT] = (*kept, {})
         if (
             signature[0][:-1] == (2, 1)
             and folded[0] == "wide"
             and plan.n % 8 == 0
             and plan.face.exact_for(x.dtype)
         ):
-            routes = kept[3]
+            routes = kept.routes
             if "decode_pair" not in routes:
                 routes["decode_pair"] = _decode_pair(self, plan)
             pair = routes["decode_pair"]
@@ -1239,7 +1273,7 @@ class FormatLinear(_FormatLayer):
         return mx.where(per_matrix(x), separate, result)
 
     def _project_route(self, kept, x, signature, choice):
-        plan, routes = kept[0], kept[3]
+        plan, routes = kept.plan, kept.routes
         route = choice[0]
         if route == "rows":
             key = ("ordinary_rows", *signature)
@@ -1253,7 +1287,7 @@ class FormatLinear(_FormatLayer):
             tile = _ordinary_tile(self, plan.k, plan.n, route, tile_wide.kernel)
             routes[route] = tile
             if tile is not None:
-                self.__dict__[_KEPT] = (*kept[:4], tile)
+                kept.wide = tile
         tile = routes[route]
         if tile is None:
             return None
@@ -1274,7 +1308,7 @@ class FormatLinear(_FormatLayer):
         # Each plan binds its own operands and live proof. A layer can switch
         # between a prefill's wide graph and the two-request decode graph.
         binding = ("native", id(tile))
-        fast = kept[3].get(binding)
+        fast = kept.routes.get(binding)
         if fast is None:
             try:
                 from ..custom_kernels.quant_matmul import fast as native
@@ -1286,14 +1320,35 @@ class FormatLinear(_FormatLayer):
                 _log_native_fallback()
                 return
             fast = native.format_linear_fast(
-                kept[2], kept[1], tile.operands, vars(tile.proof), packed_name(self)
+                kept.weight,
+                kept.bias,
+                tile.operands,
+                vars(tile.proof),
+                packed_name(self),
             )
             if fast is None:
                 _log_native_fallback()
                 return
-            kept[3][binding] = fast
+            kept.routes[binding] = fast
         fast.__self__.register(signature)
         self.__dict__[_FAST] = fast
+
+    def _prefill(self, kept, x, rows):
+        """A dense call above MAX_ROWS over the format's tile face, as one
+        run of expert zero; None where the call decodes instead."""
+        from . import tile_dense
+
+        n = self.output_dims
+        if (
+            x.dtype not in (mx.float16, mx.bfloat16)
+            or self.input_dims % 32
+            or n <= 0
+            or n % 32
+            or rows >= 2**31
+        ):
+            return None
+        tile = kept.dense if kept.dense is not _UNBUILT else self._dense_tile(kept)
+        return tile_dense.project(tile, x)
 
     def __call__(self, x: mx.array) -> mx.array:
         fast = self._fast
@@ -1303,13 +1358,13 @@ class FormatLinear(_FormatLayer):
                 return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[packed_name(self)]:
             kept = self._keep()
-        plan, bias = kept[0], kept[1]
+        plan, bias = kept.plan, kept.bias
         row_exact = self._qwen_row_exact
         if row_exact is not None and plan is not None:
-            if len(kept) > 4 and not row_exact():
-                wide = kept[4]
+            if kept.wide is not _UNBUILT and not row_exact():
+                wide = kept.wide
                 graph = wide.proof.graphs.get((shape, dtype))
                 if graph is not None:
                     if fast is not None:
@@ -1337,8 +1392,11 @@ class FormatLinear(_FormatLayer):
             if not shape or shape[-1] != k:
                 raise ValueError(f"x is (..., {k}), not of shape {shape}")
             y = None
-            if plan is not None and 0 < x.size // k <= MAX_ROWS:
+            rows = x.size // k if k else 0
+            if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
+            elif rows > MAX_ROWS and _nax_host():
+                y = self._prefill(kept, x, rows)
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
         return y if bias is None else y + bias
@@ -1463,11 +1521,12 @@ class FormatSwitchLinear(_FormatLayer):
                 y = mx.where(inside, part, y)
         return y
 
-    def _keep_tile(self, kept):
-        # The fourth entry is lazy and dies with the kept weight and plan.
-        tile = _tile(self, kept[0])
-        self.__dict__[_KEPT] = (*kept, tile)
-        return tile
+    def _sorted_tile(self, kept: _Kept) -> _Tile | None:
+        """The sorted tile, built once; None where the layer's format has no
+        face this GPU's tile kernel takes. It dies with the record."""
+        if kept.sorted is _UNBUILT:
+            kept.sorted = _tile(self)
+        return kept.sorted
 
     def _sorted_swiglu(self, x, indices, limit, token_rows):
         """The sorted NAX activation of a fused stack, optionally reading token rows."""
@@ -1476,10 +1535,10 @@ class FormatSwitchLinear(_FormatLayer):
         from ..patches import m5_gather_qmm_nax as nax
 
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[packed_name(self)]:
             kept = self._keep()
-        plan = kept[0]
-        if plan is None or kept[1] is not None:
+        plan = kept.plan
+        if plan is None or kept.bias is not None:
             return None
         experts, rows = plan.operands[0].shape[0], indices.size
         if (
@@ -1493,7 +1552,7 @@ class FormatSwitchLinear(_FormatLayer):
             return None
         if limit is not None and not math.isfinite(limit):
             return None
-        tile = kept[3] if len(kept) > 3 else self._keep_tile(kept)
+        tile = self._sorted_tile(kept)
         if tile is None or not tile.face.exact_for(x.dtype):
             return None
         if token_rows is not None:
@@ -1526,12 +1585,12 @@ class FormatSwitchLinear(_FormatLayer):
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[packed_name(self)]:
             kept = self._keep()
-        plan, bias = kept[0], kept[1]
+        plan, bias = kept.plan, kept.bias
         y = None
         if sorted_indices and plan is not None and _sorts(plan, x, indices):
-            tile = kept[3] if len(kept) > 3 else self._keep_tile(kept)
+            tile = self._sorted_tile(kept)
             # The graph captures the schedule, which depends on both stack
             # dimensions even for an identical activation and index shape.
             tile_signature = (*signature, plan.n, self.num_experts)

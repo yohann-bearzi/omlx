@@ -749,7 +749,7 @@ def test_fusing_warm_format_stacks_keeps_the_sorted_tile_route(monkeypatch):
         assert sorted_indices
         result = forward(layer, rows, indices, sorted_indices=True)
         kept = vars(layer)[format_linear._KEPT]
-        tile = kept[3]
+        tile = kept.sorted
         assert tile.proof is kernels.proof(
             route, tile.face, tuple(a.dtype for a in tile.operands)
         )
@@ -762,7 +762,7 @@ def test_fusing_warm_format_stacks_keeps_the_sorted_tile_route(monkeypatch):
             layer.num_experts,
         )
         assert signature in tile.proof.graphs
-        assert not kept[0].proof.ran
+        assert not kept.plan.proof.ran
         called.append(id(layer))
         return result
 

@@ -764,7 +764,7 @@ def test_decode_pair_binds_strided_static_operands_once(build_layer, monkeypatch
         np.testing.assert_array_equal(layer(x).view(mx.uint16), want.view(mx.uint16))
     assert sorted(seen) == sorted(names), "bind each strided operand exactly once"
     kept = vars(layer)[linear._KEPT]
-    assert kept[3]["decode_pair"] is not None
+    assert kept.routes["decode_pair"] is not None
     assert layer._fast is not None
 
     replacement = mx.zeros_like(strided[1])

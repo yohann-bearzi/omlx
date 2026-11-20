@@ -1250,6 +1250,35 @@ METAL_FUNC void gather_face(
 # A kernel over a tile face: its matrix is ``w``, declared by
 # omlx.formats.kernels.Matrices.declarations ahead of this. Plain kernels pass
 # ``tiles`` as the (unread) row map, as the words kernels do.
+_SCANNED_TILE = """omlx_gqmm::tile_of<GX>(
+            tiles, tile_count[0], threadgroup_position_in_grid, params[0],
+            desc, y_col)"""
+
+_ONE_RUN_HEADER = """
+namespace omlx_gqmm {
+// A dense matrix has just expert zero. Use the gather plan's grid order and
+// derive its single run directly, including the last partial tile.
+template <int GX, int BM>
+METAL_FUNC bool one_run_tile(
+    uint rows, uint3 tid, int N, thread uint4& desc, thread int& y_col) {
+  uint t = tid.y;
+  uint c = tid.x;
+  if constexpr (GX > 0) {
+    const uint n_cols = (uint(N) + kBN - 1) / kBN;
+    t = (tid.y / n_cols) * GX + tid.x;
+    c = tid.y % n_cols;
+  }
+  if (t >= (rows + BM - 1) / BM) {
+    return false;
+  }
+  const uint row = t * BM;
+  desc = uint4(row, 0, min(uint(BM), rows - row), 0);
+  y_col = int(c) * kBN;
+  return true;
+}
+} // namespace omlx_gqmm
+"""
+
 _FACE_SOURCE_TMPL = """
     using G = omlx_gqmm::Geo<BM, BK>;
     constexpr int BKP = BK + 16 / sizeof(T);
@@ -1257,9 +1286,7 @@ _FACE_SOURCE_TMPL = """
                      PAD / sizeof(T)];
     uint4 desc;
     int y_col;
-    if (!omlx_gqmm::tile_of<GX>(
-            tiles, tile_count[0], threadgroup_position_in_grid, params[0],
-            desc, y_col)) {{
+    if (!{tile}) {{
         return;
     }}
     omlx_gqmm::gather_face<T, G, SCHED, {align_n}, K, {epi}, {mapped}>(
@@ -1268,28 +1295,58 @@ _FACE_SOURCE_TMPL = """
         omlx_gqmm::ActArgs<T>{{{args}}});
 """
 
-# The kernels over a face, by kind: the plain matmul, and its activation
-# epilogue on a fused [gate; up] matrix, on the sorted rows or through the
-# row map: (name suffix, source, inputs after params).
+# The kernels over a face, by kind: the plain matmul, the dense one run, and
+# its activation epilogue on a fused [gate; up] matrix, on the sorted rows or
+# through the row map: (name suffix, source, inputs after params).
 _FACE_KINDS = {
     "plain": (
         "",
         _FACE_SOURCE_TMPL.format(
-            align_n="ALIGN_N", epi="0", mapped="false", rmap="tiles", args=""
+            tile=_SCANNED_TILE,
+            align_n="ALIGN_N",
+            epi="0",
+            mapped="false",
+            rmap="tiles",
+            args="",
+        ),
+        [],
+    ),
+    "one_run": (
+        "_one_run",
+        _FACE_SOURCE_TMPL.format(
+            tile=(
+                "omlx_gqmm::one_run_tile<GX, BM>(params[1], "
+                "threadgroup_position_in_grid, params[0], desc, y_col)"
+            ),
+            align_n="ALIGN_N",
+            epi="0",
+            mapped="false",
+            rmap="nullptr",
+            args="",
         ),
         [],
     ),
     "act": (
         "_swiglu",
         _FACE_SOURCE_TMPL.format(
-            align_n="true", epi="EPI", mapped="false", rmap="tiles", args="lim[0]"
+            tile=_SCANNED_TILE,
+            align_n="true",
+            epi="EPI",
+            mapped="false",
+            rmap="tiles",
+            args="lim[0]",
         ),
         ["lim"],
     ),
     "act_map": (
         "_swiglu_map",
         _FACE_SOURCE_TMPL.format(
-            align_n="true", epi="EPI", mapped="true", rmap="rmap", args="lim[0]"
+            tile=_SCANNED_TILE,
+            align_n="true",
+            epi="EPI",
+            mapped="true",
+            rmap="rmap",
+            args="lim[0]",
         ),
         ["lim", "rmap"],
     ),
@@ -1581,12 +1638,12 @@ def _face_kernel(face: Tile, kind: str = "plain"):
     and ``params``, then the epilogue's ``lim`` and the row map's ``rmap``."""
     global _header_failed, _act_header_failed
     kernel = _kernels.get((face, kind))
-    act = kind != "plain"
+    act = kind in ("act", "act_map")
     if kernel is not None or _header_failed or (act and _act_header_failed):
         return kernel
     with _lock:
         kernel = _kernels.get((face, kind))
-        act = kind != "plain"
+        act = kind in ("act", "act_map")
         if kernel is not None or _header_failed or (act and _act_header_failed):
             return kernel
         mlx_src = _read_mlx_headers(_MLX_MM_HEADERS + (_MLX_OPS_HEADERS if act else ()))
@@ -1603,7 +1660,10 @@ def _face_kernel(face: Tile, kind: str = "plain"):
             return None
         suffix, source, extra = _FACE_KINDS[kind]
         matrices = format_kernels.Matrices()
-        inputs = ["x", *matrices.add("w", face), "tiles", "tile_count", "params"]
+        inputs = ["x", *matrices.add("w", face)]
+        if kind != "one_run":
+            inputs.extend(("tiles", "tile_count"))
+        inputs.append("params")
         staged = matrices.staged_bytes
         if staged:
             # The face's staged tables take threadgroup memory: the pad,
@@ -1620,7 +1680,8 @@ def _face_kernel(face: Tile, kind: str = "plain"):
             + matrices.header
             + _MM_HEADER
             + (_ACT_HEADER if act else "")
-            + _FACE_HEADER,
+            + _FACE_HEADER
+            + (_ONE_RUN_HEADER if kind == "one_run" else ""),
             source=matrices.declarations + source,
         )
         _kernels[(face, kind)] = kernel

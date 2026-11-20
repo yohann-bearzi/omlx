@@ -963,7 +963,8 @@ def _wrappers(linear) -> list:
         if not frames:
             return graphs
         # The running call's plan, as its layer keeps it.
-        plan = frames[-1].layer.__dict__.get(linear._KEPT, (None,))[0]
+        record = frames[-1].layer.__dict__.get(linear._KEPT)
+        plan = getattr(record, "plan", None)
         if getattr(plan, "proof", None) is proof:
             return _Replays(graphs, linear, frames[-1], plan)
         return graphs

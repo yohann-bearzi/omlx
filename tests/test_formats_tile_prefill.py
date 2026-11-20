@@ -619,6 +619,27 @@ def test_a_sparse_expert_uses_the_full_weight_row_offset():
         assert out.tolist() == [[expected]]
 
 
+def test_a_sorted_switch_builds_its_tile_once(toy, monkeypatch):
+    from omlx.formats import linear
+
+    k, n = 256, 64
+    toy(_tile_toy("sorted_once"))
+    tensors = _stack(n, k)
+    layer = FormatSwitchLinear("tiletoy", 8, 1, k, tensors)
+    x, indices = _rows(k)
+    built = []
+    build = linear._tile
+
+    def record(held):
+        built.append(held is layer)
+        return build(held)
+
+    monkeypatch.setattr(linear, "_tile", record)
+    for _ in range(2):
+        assert _same(layer(x, indices, sorted_indices=True), _want(tensors, x, indices))
+    assert built == [True]
+
+
 @needs_steel
 def test_a_sorted_format_layer_stages_its_faces_table(monkeypatch):
     from omlx.formats import affine

@@ -474,8 +474,8 @@ def test_a_failed_epilogue_proof_builds_no_other_kernel(installed, toy, monkeypa
     layer = _layer("tiletoy")
     x, idx = _rows(256)
     kept = layer._keep()
-    tile = layer._keep_tile(kept)
-    fmt_linear._epilogue_proof(tile, kept[0], False).fail()
+    tile = layer._sorted_tile(kept)
+    fmt_linear._epilogue_proof(tile, kept.plan, False).fail()
     kinds = []
     build = nax._face_kernel
 
@@ -484,7 +484,7 @@ def test_a_failed_epilogue_proof_builds_no_other_kernel(installed, toy, monkeypa
         return build(face, kind)
 
     monkeypatch.setattr(nax, "_face_kernel", record)
-    assert fmt_linear._swiglu(kept[0], tile, x, idx, None) is None
+    assert fmt_linear._swiglu(kept.plan, tile, x, idx, None) is None
     assert kinds == [], "a failed proof still built its epilogue kernel"
 
 
@@ -584,11 +584,11 @@ def test_a_failed_mapped_epilogue_keeps_unmapped_and_plain_tile(installed, toy):
     )
     assert gather.fused_gate_up_activation(layer, x, idx, SwiGLU()) is not None
     kept = layer.__dict__[fmt_linear._KEPT]
-    tile = kept[3]
+    tile = kept.sorted
     proof_for = getattr(
         fmt_linear, "_epilogue_proof", lambda tile_, plan_, mapped_: tile_.proof
     )
-    mapped_proof = proof_for(tile, kept[0], True)
+    mapped_proof = proof_for(tile, kept.plan, True)
     mapped_proof.fail()
     got = gather.fused_gate_up_activation(
         layer, materialized, idx, SwiGLU(), (x, row_map)
@@ -695,8 +695,8 @@ def test_mapped_token_blocks_keep_a_graph_per_token_rows(installed, toy):
     x, idx = _rows(256)
     rows = idx.size
     kept = layer._keep()
-    tile = layer._keep_tile(kept)
-    proof = fmt_linear._epilogue_proof(tile, kept[0], True)
+    tile = layer._sorted_tile(kept)
+    proof = fmt_linear._epilogue_proof(tile, kept.plan, True)
     seen = []
     for count in (128, 64):
         tokens = mx.random.normal((count, 1, 256)).astype(x.dtype)
@@ -755,7 +755,7 @@ def test_warm_epilogue_pins_width_dtype_and_route_count(installed, toy):
     narrow = _layer("tiletoy", n=128)
     wide = _layer("tiletoy", n=256)
     kept = narrow._keep()
-    proof = fmt_linear._epilogue_proof(narrow._keep_tile(kept), kept[0], False)
+    proof = fmt_linear._epilogue_proof(narrow._sorted_tile(kept), kept.plan, False)
 
     def graphs():
         return len(proof.graphs)
@@ -792,7 +792,7 @@ def test_warm_epilogue_pins_width_dtype_and_route_count(installed, toy):
         row_map = (mx.arange(idxr.size, dtype=mx.uint32) % 64).astype(mx.uint32)
         materialized = tokens[row_map]
         mkept = four._keep()
-        mapped = fmt_linear._epilogue_proof(four._keep_tile(mkept), mkept[0], True)
+        mapped = fmt_linear._epilogue_proof(four._sorted_tile(mkept), mkept.plan, True)
         if mapped_before is None:
             mapped_before = len(mapped.graphs)
         got = gather.fused_gate_up_activation(
@@ -807,7 +807,7 @@ def test_epilogue_proofs_are_kept_per_width(installed, toy):
     toy(_tile_toy("epilogue_k_isolated"))
     narrow = FormatSwitchLinear("tiletoy", 8, 1, 128, _stack(128, 128, seed=5))
     kept = narrow._keep()
-    fmt_linear._epilogue_proof(narrow._keep_tile(kept), kept[0], False).fail()
+    fmt_linear._epilogue_proof(narrow._sorted_tile(kept), kept.plan, False).fail()
     wide = FormatSwitchLinear("tiletoy", 8, 1, 256, _stack(128, 256, seed=5))
     x, idx = _rows(256)
     got = gather.fused_gate_up_activation(wide, x, idx, SwiGLU())

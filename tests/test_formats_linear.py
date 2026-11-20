@@ -3094,7 +3094,7 @@ def test_a_tensor_a_load_unloads_drops_the_plan_built_over_it(toy, tmp_path):
     layer, x, want = _toy_linear(40, 320)
     # Twice: the second call replays the graph the first one kept.
     assert _equal(layer(x), want) and _equal(layer(x), want)
-    assert layer.__dict__[linear._KEPT][0] is not None
+    assert layer.__dict__[linear._KEPT].plan is not None
     with format_load.loading(tmp_path):
         layer["group_scales"] = layer["group_scales"].astype(mx.float16)
     offered = _refusal(
