@@ -443,7 +443,7 @@ def test_a_run_in_a_format_keeps_the_source_s_reference(source, toy, tmp_path):
         made.append(prompt.tolist())
         return reference_of(model, prompt, layers)
 
-    cached = tmp_path / ".oqe_imatrix" / f"{source.name}.reference.npz"
+    cached = tmp_path / ".oqe_imatrix" / f"{source.name}.verify.reference.npz"
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(oq_verify, "reference_of", making)
         # A run without a format makes none.
@@ -596,6 +596,24 @@ def test_interrupted_reference_publication_cannot_sign_the_wrong_archive(
         np.testing.assert_array_equal(restored["prompt"], prompt)
 
 
+def test_the_collector_reference_does_not_touch_the_verification_pair(
+    source, tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    _calibration(monkeypatch)
+    config = json.loads((source / "config.json").read_text())
+    verify = oq_verify.source_reference(
+        source, config, tmp_path, name=f"{source.name}.verify"
+    )
+    pair = (verify, verify.with_suffix(".json"))
+    before = [path.read_bytes() for path in pair]
+    collector = oq_verify.source_reference(source, config, tmp_path)
+    assert collector.name == f"{source.name}.reference.npz"
+    assert verify != collector
+    assert [path.read_bytes() for path in pair] == before
+
+
 def test_a_writer_keeps_its_reference_when_another_source_uses_the_cache(
     source, toy, tmp_path, monkeypatch
 ):
@@ -614,7 +632,7 @@ def test_a_writer_keeps_its_reference_when_another_source_uses_the_cache(
 
     def other_source(src, out, **kwargs):
         # A second source with the same basename finishes before the first writer.
-        name = cache / f"{source.name}.reference.json"
+        name = cache / f"{source.name}.verify.reference.json"
         prior.append(json.loads(name.read_text()))
         with monkeypatch.context() as patch:
             patch.setattr(
@@ -623,7 +641,10 @@ def test_a_writer_keeps_its_reference_when_another_source_uses_the_cache(
                 lambda *a, **kw: mx.ones((1, 16), mx.int32),
             )
             oq_verify.source_reference(
-                other, json.loads((other / "config.json").read_text()), cache
+                other,
+                json.loads((other / "config.json").read_text()),
+                cache,
+                name=f"{other.name}.verify",
             )
         assert json.loads(name.read_text()) != prior[0]
         return copy(src, out, **kwargs)
@@ -646,7 +667,7 @@ def test_a_cache_publisher_cannot_mix_a_writers_two_reference_files(
 
     cache = tmp_path / "cache"
     output = tmp_path / "written"
-    archive = cache / f"{source.name}.reference.npz"
+    archive = cache / f"{source.name}.verify.reference.npz"
     signed = archive.with_suffix(".json")
     copy = shutil.copy2
     snapshots = []
@@ -2197,7 +2218,8 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
     assert sorted(arrays) == sorted(their_arrays)
     assert all(np.array_equal(arrays[name], their_arrays[name]) for name in arrays)
     assert metadata == their_metadata
-    # A run with a format reads the calibration, and samples nothing.
+    # A run with a format reads the calibration: no calibration samples, and
+    # it makes and pins its own verification reference.
     sampled.clear()
     _, _, applied = _quantize(
         source,
@@ -2206,7 +2228,9 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
         quant_format="toy",
         imatrix_cache_path=str(alone),
     )
-    assert sampled == [] and len(toy.encoded) == len(applied) > 0
+    assert len(sampled) == 1 and len(toy.encoded) == len(applied) > 0
+    assert (alone.parent / f"{source.name}.verify.reference.npz").is_file()
+    assert (tmp_path / "oqe-toy" / "verify" / "reference.npz").is_file()
     report = json.loads((tmp_path / "oqe-toy" / "oq_imatrix_report.json").read_text())
     assert report["cache_reused"] is True
 

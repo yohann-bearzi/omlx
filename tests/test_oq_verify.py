@@ -622,3 +622,9 @@ def test_a_reference_cache_replaced_by_a_file_is_refused(tmp_path):
     cache.write_bytes(b"replaced directory")
     with pytest.raises(NotADirectoryError):
         oq_verify._take_reference(cache / "reference.npz", {}, None)
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "sub/a", "../a", "/tmp/a"])
+def test_source_reference_refuses_non_stem_names(tmp_path, bad):
+    with pytest.raises(ValueError):
+        oq_verify.source_reference(tmp_path / "src", {}, tmp_path / "cache", name=bad)

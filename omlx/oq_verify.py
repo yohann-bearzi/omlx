@@ -170,12 +170,20 @@ def source_reference(
     *,
     trust_remote_code: bool = False,
     verify_dir: Path | None = None,
+    name: str | None = None,
 ) -> Path:
     """The file of the source's reference: the one in ``cache_dir`` when it
     is of this source (its config and weight files), calibration corpus,
     tokenizer and version, found without loading any of them; else made by
     one streamed pass over the source (its time logged). A writer supplies
-    its private verification directory to keep a snapshot of this generation."""
+    its private verification directory to keep a snapshot of this generation.
+    ``name`` gives the pair a file stem of its own; the collector keeps the
+    default ``<source>.reference``, so a writer's pair cannot be rewritten by
+    a calibration beside it."""
+    if name is not None and (
+        not name or name in (".", "..") or Path(name).name != name
+    ):
+        raise ValueError(f"reference name must be a single file stem, not {name!r}")
     from mlx_lm.tokenizer_utils import load as load_tokenizer
 
     from . import oq
@@ -190,17 +198,19 @@ def source_reference(
         calib_dataset=oq._OQE_CALIB_DATASET,
     )
     tokenizer = hashlib.sha256()
-    for name in sorted(
+    for tokenizer_file in sorted(
         path.name for path in source.iterdir() if path.name in _TOKENIZER_FILES
     ):
-        tokenizer.update(name.encode() + (source / name).read_bytes())
+        tokenizer.update(
+            tokenizer_file.encode() + (source / tokenizer_file).read_bytes()
+        )
     signature = {
         "reference_version": REFERENCE_VERSION,
         "source_hash": made_of["source_hash"],
         "calib_data_hash": made_of["calib_data_hash"],
         "tokenizer_hash": tokenizer.hexdigest(),
     }
-    path = cache_dir / f"{source.name}.reference.npz"
+    path = cache_dir / f"{name or source.name}.reference.npz"
     if cache_dir.is_dir() and _take_reference(path, signature, verify_dir):
         return path
     prompt = oq._load_calibration_data(

@@ -8510,9 +8510,12 @@ def _plan_oq_run(run: _OQRun) -> None:
 
 def _source_reference(run: _OQRun, *, verify_dir: Path | None = None) -> Path:
     """The file of the source's reference (oq_verify), kept beside the
-    run's calibration cache: made once per source and prompt."""
+    run's calibration cache: made once per source and prompt. A writer's
+    verification pair is named apart from the collector's, which rewrites
+    the default pair when a calibration runs beside it."""
     from .oq_verify import source_reference
 
+    source = Path(run.get("model_path"))
     return source_reference(
         run.get("model_path"),
         run.get("config"),
@@ -8520,6 +8523,7 @@ def _source_reference(run: _OQRun, *, verify_dir: Path | None = None) -> Path:
         Path(run.get("imatrix_cache_path")).parent,
         trust_remote_code=run.get("trust_remote_code"),
         verify_dir=verify_dir,
+        name=f"{source.name}.verify" if verify_dir is not None else None,
     )
 
 
