@@ -130,7 +130,18 @@ def test_mapped_and_unmapped_graphs_keep_their_own_operands(installed, toy):
     assert graphs() == after_limit
 
 
-@pytest.mark.parametrize("defect", ["map_dtype", "token_dtype", "token_width", "empty"])
+@pytest.mark.parametrize(
+    "defect",
+    [
+        "map_dtype",
+        "token_dtype",
+        "token_width",
+        "empty",
+        "map_length",
+        "map_ndim",
+        "token_overflow",
+    ],
+)
 def test_an_invalid_row_map_uses_the_materialized_epilogue(
     installed, toy, defect, monkeypatch
 ):
@@ -154,6 +165,12 @@ def test_an_invalid_row_map_uses_the_materialized_epilogue(
         )
     elif defect == "token_width":
         token_rows = x[..., :128]
+    elif defect == "map_length":
+        row_map = row_map[:-1]
+    elif defect == "map_ndim":
+        row_map = row_map[:, None]
+    elif defect == "token_overflow":
+        token_rows = mx.broadcast_to(x[:1], (1 << 24, 1, 256))
     else:
         token_rows = x[:0]
     got = gather.fused_gate_up_activation(
@@ -617,9 +634,9 @@ def test_an_epilogue_failure_logs_the_epilogue_message(installed, toy, caplog):
     x, idx = _rows(256)
     caplog.set_level("WARNING")
     got = gather.fused_gate_up_activation(layer, x, idx, SwiGLU())
-    if got is None:
-        assert "epilogue kernel failed" in caplog.text
-        assert "rows kernel fallback" not in caplog.text
+    assert got is None
+    assert "epilogue kernel failed" in caplog.text
+    assert "rows kernel fallback" not in caplog.text
 
 
 def test_a_layer_keeps_its_codes_when_they_are_not_first(installed, monkeypatch):
@@ -694,3 +711,105 @@ def test_mapped_token_blocks_keep_a_graph_per_token_rows(installed, toy):
         _assert_bitwise(got, want)
         assert len(proof.graphs) == before + 1, "a token block reused a graph"
         seen.append(got)
+
+
+def test_a_format_epilogue_declines_a_wrong_input_width(installed, toy, monkeypatch):
+    toy(_tile_toy("epilogue_wrong_width"))
+    layer = _layer("tiletoy")
+    x, idx = _rows(256)
+    kinds = []
+    build = nax._face_kernel
+
+    def record(face, kind="plain"):
+        kinds.append(kind)
+        return build(face, kind)
+
+    monkeypatch.setattr(nax, "_face_kernel", record)
+    got = gather.fused_gate_up_activation(layer, x[..., :128], idx, SwiGLU())
+    assert got is None
+    assert kinds == [], "a wrong input width reached an epilogue kernel"
+
+
+def test_a_format_epilogue_declines_below_four_rows_an_expert(
+    installed, toy, monkeypatch
+):
+    toy(_tile_toy("epilogue_few_per_expert"))
+    layer = _layer("tiletoy")
+    x, idx = _rows(256, counts=(4,) * 9 + (3,))
+    kinds = []
+    build = nax._face_kernel
+
+    def record(face, kind="plain"):
+        kinds.append(kind)
+        return build(face, kind)
+
+    monkeypatch.setattr(nax, "_face_kernel", record)
+    got = gather.fused_gate_up_activation(layer, x, idx, SwiGLU())
+    assert got is None
+    assert kinds == [], "few rows an expert reached an epilogue kernel"
+
+
+def test_warm_epilogue_pins_width_dtype_and_route_count(installed, toy):
+    toy(_tile_toy("epilogue_pins"))
+    x, idx = _rows(256)
+    narrow = _layer("tiletoy", n=128)
+    wide = _layer("tiletoy", n=256)
+    kept = narrow._keep()
+    proof = fmt_linear._epilogue_proof(narrow._keep_tile(kept), kept[0], False)
+
+    def graphs():
+        return len(proof.graphs)
+
+    before = graphs()
+    got = gather.fused_gate_up_activation(narrow, x, idx, SwiGLU())
+    assert got is not None
+    _assert_bitwise(got, _reference(narrow, x, idx, SwiGLU()))
+    assert graphs() == before + 1
+    wide_out = gather.fused_gate_up_activation(wide, x, idx, SwiGLU())
+    assert wide_out is not None
+    _assert_bitwise(wide_out, _reference(wide, x, idx, SwiGLU()))
+    assert graphs() == before + 2, "two widths shared a graph"
+    again = gather.fused_gate_up_activation(narrow, x, idx, SwiGLU())
+    _assert_bitwise(again, _reference(narrow, x, idx, SwiGLU()))
+    assert graphs() == before + 2, "a warm call rebuilt a graph"
+    x16, idx16 = _rows(256, dtype=mx.float16)
+    half = gather.fused_gate_up_activation(narrow, x16, idx16, SwiGLU())
+    if half is not None:
+        _assert_bitwise(half, _reference(narrow, x16, idx16, SwiGLU()))
+        assert graphs() == before + 3, "two dtypes shared a graph"
+    stacked = _stack(128, 256, seed=5)
+    four = FormatSwitchLinear(
+        "tiletoy",
+        8,
+        1,
+        256,
+        {"codes": stacked["codes"][:4], "group_scales": stacked["group_scales"][:4]},
+    )
+    tokens = mx.random.normal((64, 1, 256)).astype(x.dtype)
+    mapped_before = None
+    for counts in ((40,) * 4, (128,) * 4):
+        xr, idxr = _rows(256, counts=counts)
+        row_map = (mx.arange(idxr.size, dtype=mx.uint32) % 64).astype(mx.uint32)
+        materialized = tokens[row_map]
+        mkept = four._keep()
+        mapped = fmt_linear._epilogue_proof(four._keep_tile(mkept), mkept[0], True)
+        if mapped_before is None:
+            mapped_before = len(mapped.graphs)
+        got = gather.fused_gate_up_activation(
+            four, materialized, idxr, SwiGLU(), (tokens, row_map)
+        )
+        assert got is not None
+        _assert_bitwise(got, _reference(four, materialized, idxr, SwiGLU()))
+    assert len(mapped.graphs) == mapped_before + 2, "two row counts shared a graph"
+
+
+def test_epilogue_proofs_are_kept_per_width(installed, toy):
+    toy(_tile_toy("epilogue_k_isolated"))
+    narrow = FormatSwitchLinear("tiletoy", 8, 1, 128, _stack(128, 128, seed=5))
+    kept = narrow._keep()
+    fmt_linear._epilogue_proof(narrow._keep_tile(kept), kept[0], False).fail()
+    wide = FormatSwitchLinear("tiletoy", 8, 1, 256, _stack(128, 256, seed=5))
+    x, idx = _rows(256)
+    got = gather.fused_gate_up_activation(wide, x, idx, SwiGLU())
+    assert got is not None
+    _assert_bitwise(got, _reference(wide, x, idx, SwiGLU()))
