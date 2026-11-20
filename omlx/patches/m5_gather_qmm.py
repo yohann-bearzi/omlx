@@ -50,6 +50,7 @@ import logging
 import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
+from omlx.formats.linear import FormatSwitchLinear
 
 from . import m5_gather_qmm_nax as _nax
 from .moe_routes import sort_routes
@@ -263,8 +264,10 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     activation is a SwiGLU this module knows, the activation runs in the
     kernel's epilogue (``m5_gather_qmm_nax.sorted_gather_qmm_swiglu``,
     self-tested bit-identical to the unfused path) and only the ``[M, 1,
-    N / 2]`` result is written. None otherwise: the caller runs the
-    projection, the split and the activation itself.
+    N / 2]`` result is written. A ``FormatSwitchLinear`` instead runs the
+    same epilogue over its own tile face through
+    ``FormatSwitchLinear._sorted_swiglu``. None otherwise: the caller runs
+    the projection, the split and the activation itself.
 
     ``token_rows`` = ``(x_tok, row_map)`` with ``x == x_tok[row_map]``
     (``moe_routes.sort_routes``) lets the kernel read the sorted rows from
@@ -283,11 +286,13 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
         return None
     if "global_scale" in proj:
         return None
+    if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
+        return None
+    if isinstance(proj, FormatSwitchLinear):
+        return proj._sorted_swiglu(x, indices, limit, token_rows)
     w = proj.get("weight")
     scales = proj.get("scales")
     if not isinstance(w, mx.array) or not isinstance(scales, mx.array):
-        return None
-    if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
         return None
     if not _nax_rows_ok(x.shape[0] if x.ndim == 3 else 0, w):
         return None

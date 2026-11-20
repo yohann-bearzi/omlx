@@ -39,9 +39,12 @@ logger = logging.getLogger(__name__)
 
 
 def packed_name(layer) -> str:
-    """The name of ``layer``'s packed tensor: its format's codes name for a
-    format layer, ``weight`` for MLX's own quantized layers
-    (``formats.tensor_names``)."""
+    """The name of ``layer``'s packed tensor: the format's declared codes
+    name for a format layer, never a position in its tensor tuple;
+    ``weight`` for MLX's own quantized layers (``formats.tensor_names``)."""
+    fmt = getattr(layer, "fmt", None)
+    if fmt is not None:
+        return fmt.codes_name
     return formats.tensor_names(layer)[0]
 
 
@@ -693,17 +696,18 @@ def _sorted(plan: _Plan, kernel, x, indices):
     return (x.dtype, plan.k, config, plan.n % 64 == 0), graph
 
 
-def _sorted_stand_in(tile: _Tile, metal, graph):
-    """The smallest launch of the tile Metal ``metal``, over zeros: 16 rows
-    of x, all for matrix 0, and the fewest matrices that leave each tensor
-    8 elements. The template values are the call's (its plan), not the
-    stand-in's."""
+def _sorted_stand_in(tile: _Tile, metal, graph, mapped=False):
+    """Prove the call's tile plan on 16 rows of expert zero. A mapped launch
+    reads those rows from one token. Use the fewest matrices that leave
+    eight elements in every operand."""
     dtype, k = metal[:2]
     matrices = max(-(-8 * a.shape[0] // a.size) for a in tile.operands)
     operands = (((matrices, *a.shape[1:]), a.dtype) for a in tile.operands)
-    specs = (((16, 1, k), dtype), ((16,), mx.uint32), *operands)
-
-    return kernels.zeros(*specs), graph
+    rows = 1 if mapped else 16
+    specs = (((rows, 1, k), dtype), ((16,), mx.uint32))
+    if mapped:
+        specs += (((16,), mx.uint32),)
+    return kernels.zeros(*specs, *operands), graph
 
 
 def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
@@ -713,14 +717,82 @@ def _launch_sorted(plan: _Plan, tile: _Tile, signature: tuple, x, indices):
     if not tile.face.exact_for(x.dtype):
         return None
     metal, graph = _sorted(plan, tile.kernel, x, indices)
-    if not tile.proof.prove(
-        metal, lambda: _sorted_stand_in(tile, metal, graph), logger, *tile.said
+    return _keep_sorted(tile, tile.proof, signature, metal, graph, (x, indices))
+
+
+def _epilogue_proof(tile: _Tile, plan: _Plan, mapped: bool) -> kernels.Proof:
+    """The epilogue's own proof, apart from the tile gather's: one mapping
+    failing to compile must not retire the other, or the gather. K is part
+    of it: one face serves layers of different width."""
+    route = "format_switch_tile_nax_act_map" if mapped else "format_switch_tile_nax_act"
+    return kernels.proof(
+        route, tile.face, tuple(a.dtype for a in tile.operands), plan.k
+    )
+
+
+def _keep_sorted(tile, proof, signature, metal, graph, arrays, mapped=False, said=None):
+    if not proof.prove(
+        metal,
+        lambda: _sorted_stand_in(tile, metal, graph, mapped),
+        logger,
+        *(tile.said if said is None else said),
     ):
         return None
     graph = mx.compile(graph)
-    y = graph(x, indices, *tile.operands)
-    tile.proof.keep(signature, graph)
+    y = graph(*arrays, *tile.operands)
+    proof.keep(signature, graph)
     return y
+
+
+def _swiglu(plan, tile, x, indices, limit, row_map=None):
+    """Replay this activation and mapping, or prove and keep their graph."""
+    mapped = row_map is not None
+    proof = _epilogue_proof(tile, plan, mapped)
+    if proof.failed:
+        return None
+    experts = plan.operands[0].shape[0]
+    signature = (
+        "swiglu",
+        x.shape,
+        x.dtype,
+        indices.shape,
+        plan.n,
+        experts,
+        limit,
+        mapped,
+    )
+    arrays = (x, indices, row_map) if mapped else (x, indices)
+    graph = proof.graphs.get(signature)
+    if graph is not None:
+        return graph(*arrays, *tile.operands)
+    from ..patches import m5_gather_qmm_nax as nax
+
+    kernel = nax._face_kernel(tile.face, "act_map" if mapped else "act")
+    if kernel is None:
+        return None
+    config = nax.face_plan(indices.size, experts, plan.k, plan.n)
+    epi = nax._EPI_SWIGLU if limit is None else nax._EPI_CLAMPED
+    metal = (x.dtype, plan.k, config, epi, mapped)
+    if mapped:
+
+        def graph(x, indices, row_map, *operands):
+            return nax._launch_face(
+                kernel, x, operands, indices, config, None, epi, limit, row_map
+            )
+
+    else:
+
+        def graph(x, indices, *operands):
+            return nax._launch_face(
+                kernel, x, operands, indices, config, None, epi, limit
+            )
+
+    kind = "mapped epilogue" if mapped else "epilogue"
+    said = (
+        f"quant format face {tile.face.key}: {kind} kernel engaged",
+        f"quant format face {tile.face.key}: {kind} kernel failed; composed fallback",
+    )
+    return _keep_sorted(tile, proof, signature, metal, graph, arrays, mapped, said)
 
 
 # Where a layer keeps what its calls work out of it once: its plan and its
@@ -981,7 +1053,11 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        kept = self.__dict__[_KEPT] = (_plan(self), bias, self[self._tensors[0]])
+        kept = self.__dict__[_KEPT] = (
+            _plan(self),
+            bias,
+            self[packed_name(self)],
+        )
         return kept
 
     def __delitem__(self, key: str) -> None:
@@ -1210,7 +1286,7 @@ class FormatLinear(_FormatLayer):
                 _log_native_fallback()
                 return
             fast = native.format_linear_fast(
-                kept[2], kept[1], tile.operands, vars(tile.proof), self._tensors[0]
+                kept[2], kept[1], tile.operands, vars(tile.proof), packed_name(self)
             )
             if fast is None:
                 _log_native_fallback()
@@ -1227,7 +1303,7 @@ class FormatLinear(_FormatLayer):
                 return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self[self._tensors[0]]:
+        if kept is None or kept[2] is not self[packed_name(self)]:
             kept = self._keep()
         plan, bias = kept[0], kept[1]
         row_exact = self._qwen_row_exact
@@ -1278,7 +1354,7 @@ class FormatSwitchLinear(_FormatLayer):
 
     @property
     def num_experts(self) -> int:
-        return self[self._tensors[0]].shape[0]
+        return self[packed_name(self)].shape[0]
 
     def _stacked_outputs(self, other: FormatSwitchLinear) -> FormatSwitchLinear:
         """Join two admitted, row-stackable projections after checkpoint load.
@@ -1387,6 +1463,58 @@ class FormatSwitchLinear(_FormatLayer):
                 y = mx.where(inside, part, y)
         return y
 
+    def _keep_tile(self, kept):
+        # The fourth entry is lazy and dies with the kept weight and plan.
+        tile = _tile(self, kept[0])
+        self.__dict__[_KEPT] = (*kept, tile)
+        return tile
+
+    def _sorted_swiglu(self, x, indices, limit, token_rows):
+        """The sorted NAX activation of a fused stack, optionally reading token rows."""
+        if not _nax_host():
+            return None
+        from ..patches import m5_gather_qmm_nax as nax
+
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept[2] is not self[packed_name(self)]:
+            kept = self._keep()
+        plan = kept[0]
+        if plan is None or kept[1] is not None:
+            return None
+        experts, rows = plan.operands[0].shape[0], indices.size
+        if (
+            plan.n % 64
+            or rows < 16
+            or rows < 4 * experts
+            or not x.ndim
+            or x.shape[-1] != plan.k
+            or not nax.geometry(x, indices, experts, plan.n)
+        ):
+            return None
+        if limit is not None and not math.isfinite(limit):
+            return None
+        tile = kept[3] if len(kept) > 3 else self._keep_tile(kept)
+        if tile is None or not tile.face.exact_for(x.dtype):
+            return None
+        if token_rows is not None:
+            tokens, row_map = token_rows
+            if (
+                isinstance(tokens, mx.array)
+                and isinstance(row_map, mx.array)
+                and tokens.ndim == 3
+                and tokens.shape[0] > 0
+                and tokens.shape[1:] == (1, plan.k)
+                and tokens.dtype == x.dtype
+                and row_map.ndim == 1
+                and row_map.shape[0] == rows
+                and row_map.dtype == mx.uint32
+                and int(tokens.shape[0]) * plan.k < 2**32
+            ):
+                y = _swiglu(plan, tile, tokens, indices, limit, row_map)
+                if y is not None:
+                    return y
+        return _swiglu(plan, tile, x, indices, limit)
+
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ) -> mx.array:
@@ -1398,15 +1526,12 @@ class FormatSwitchLinear(_FormatLayer):
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self[self._tensors[0]]:
+        if kept is None or kept[2] is not self[packed_name(self)]:
             kept = self._keep()
         plan, bias = kept[0], kept[1]
         y = None
         if sorted_indices and plan is not None and _sorts(plan, x, indices):
-            if len(kept) == 3:
-                # The fourth entry is lazy and dies with the kept weight and plan.
-                kept = self.__dict__[_KEPT] = (*kept, _tile(self, plan))
-            tile = kept[3]
+            tile = kept[3] if len(kept) > 3 else self._keep_tile(kept)
             # The graph captures the schedule, which depends on both stack
             # dimensions even for an identical activation and index shape.
             tile_signature = (*signature, plan.n, self.num_experts)

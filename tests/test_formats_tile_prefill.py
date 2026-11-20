@@ -98,6 +98,12 @@ class _ToyFormat(formats.QuantFormat):
     def __init__(self, dot, tile):
         self.dot_face, self.tile_face = dot, tile
 
+    def layout(self, k, n, bits, group_size):
+        if (bits, group_size) != (8, 1):
+            return None
+        scales = {name: ((n,), mx.float32) for name in self.tensors}
+        return {self.codes_name: ((n, k), mx.uint8), **scales}
+
     def dot(self, layer, k, n):
         return self.dot_face
 

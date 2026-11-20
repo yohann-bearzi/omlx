@@ -1232,7 +1232,13 @@ for sorted prompt rows. The gather can apply SwiGLU to fused gate/up outputs
 using sorted rows or a row map. Before use, each configuration checks the
 plain result against MLX's sorted `gather_qmm` at the call's K. The fused
 variants check the result of splitting the plain output and applying SwiGLU.
-A format switch layer can use the plain kernel with its own tile face (see
-[Layers](#layers)). Its fused gate/up still applies the activation separately.
+A fused format switch layer can apply SwiGLU or clamped SwiGLU through its
+own tile face on the M5 Max and later (NAX hosts). Each expert's gate rows
+precede its up rows.
+The combined width must be a multiple of 64 and the layer must be bias-free.
+The kernel can read token rows through the sort's uint32 row map. Without a
+usable map it reads the sorted rows directly. Both paths produce the bits
+of splitting the plain projection and applying the same activation.
+On the M3 Ultra the block applies the activation after its steel gather.
 
 The verify gather runs a block's fused gate+up projection, then its down projection, when both are stacked expert weights without a bias, of an N that is whole tiles of 8 outputs, each with a dot face that is exact for the block's dtype, and the block's activation returns that dtype in the shape of the up's rows. From 24 pairs (rows times top-k) one launch puts a block's pairs in expert order ahead of its two; below, each threadgroup searches for its own. A block of 2 to 8 rows takes it at any bit width, but one of 16 pairs or fewer over 64 experts or more, which keeps the composed path (measured faster than the composed path everywhere else; 2 rows of a 256-expert top-8 block read 1% slower). The block's indices are integers, top-k of them (one or more) for each row of `x`, and `x` is float16, bfloat16 or float32 (as `gather_qmm` takes) with 8 values or more (MLX binds fewer as constants). The gather proves each Metal of a block's two launches (and, from 24 pairs, its order's) as a format layer does, on a stand-in: zeros of the block's rows and pairs, every pair with expert 0 of stacks of the fewest experts that leave each tensor 8 elements, views of one buffer made on the GPU's stream and evaluated by the proof ahead of the launch (what fails in making them is raised by the call and fails no proof). It evaluates nothing of the call, so a block may be built inside a function that `mx.compile` traces, and what fails in `x`, in the indices, in a tensor or in the activation's arrays is raised where the caller evaluates the result; the activation itself runs in the call, so what it raises, the call raises. A block whose stand-in fails (`expert-ordered verify gather failed; composed fallback`) keeps the projections of the same faces, tensor dtypes and shapes on their composed path, on every thread.
