@@ -175,14 +175,9 @@ def test_yarn_rotary_matches_mlx_lm_yarn_rope_and_is_shared_by_the_indexer():
     position_ids = mx.broadcast_to(mx.array([positions])[None], (3, 1, 3))
     # GPU sin/cos at these angles differ by ~1e-4 across chip families.
     with mx.stream(mx.cpu):
-        rotated, _ = rotary.apply_rotary(
-            queries, keys, position_ids, cast_output=False
-        )
+        rotated, _ = rotary.apply_rotary(queries, keys, position_ids, cast_output=False)
         expected = mx.concatenate(
-            [
-                yarn(queries[:, :, i : i + 1], offset=p)
-                for i, p in enumerate(positions)
-            ],
+            [yarn(queries[:, :, i : i + 1], offset=p) for i, p in enumerate(positions)],
             axis=2,
         )
         assert mx.allclose(rotated, expected, atol=1e-5).item()
@@ -226,9 +221,7 @@ def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     mx.random.seed(17)
     module = Qwen4ExpGatedResidual(config)
     if quantized:
-        module.input_mix_weight_down = module.input_mix_weight_down.to_quantized(
-            32, 4
-        )
+        module.input_mix_weight_down = module.input_mix_weight_down.to_quantized(32, 4)
         module.block_inject_weight = module.block_inject_weight.to_quantized(32, 4)
 
     inputs = mx.random.normal((2, 3, 64)).astype(mx.bfloat16)
@@ -406,16 +399,11 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     fuse.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert (
-        "96 exact hybrid projection pairs, 97 compiled decode paths"
-        in caplog.text
-    )
+    assert "96 exact hybrid projection pairs, 97 compiled decode paths" in caplog.text
     assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
 
 
-def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
-    monkeypatch, caplog
-):
+def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(monkeypatch, caplog):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx.nn as nn
     from mlx_vlm.models.qwen3_5 import Model as Qwen3_5Model
@@ -444,10 +432,7 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
     assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
-    assert (
-        "0 exact hybrid projection pairs, 100 compiled decode paths"
-        in caplog.text
-    )
+    assert "0 exact hybrid projection pairs, 100 compiled decode paths" in caplog.text
 
 
 def test_qwen4_exp_sanitize_keeps_converted_norm_values():
@@ -459,9 +444,7 @@ def test_qwen4_exp_sanitize_keeps_converted_norm_values():
             text_config=SimpleNamespace(tie_word_embeddings=False, num_hidden_layers=0)
         )
     )
-    result = Model.sanitize(
-        model, {"model.language_model.norm.weight": norm}
-    )
+    result = Model.sanitize(model, {"model.language_model.norm.weight": norm})
     assert mx.array_equal(result["language_model.model.norm.weight"], norm).item()
 
 
@@ -490,8 +473,7 @@ def _qwen4_rmsnorm_sanitize_fixture(*, include_mtp=False):
     )
     for layer_idx, residual in enumerate(anchor_residuals):
         path = (
-            f"language_model.model.layers.{layer_idx}."
-            "attn_hyper_connection.hc_norm"
+            f"language_model.model.layers.{layer_idx}." "attn_hyper_connection.hc_norm"
         )
         modules.append((path, Qwen4ExpRMSNorm(4)))
         key = f"{path}.weight"
@@ -582,9 +564,7 @@ def test_qwen4_exp_sanitize_recenters_ones_centered_base_and_mtp(tmp_path, caplo
 
         # Every other gamma recentres exactly in BF16 and keeps that dtype.
         for key in target_keys:
-            assert result[key].dtype == (
-                mx.float32 if key == fp32_key else mx.bfloat16
-            )
+            assert result[key].dtype == (mx.float32 if key == fp32_key else mx.bfloat16)
             assert mx.array_equal(
                 1.0 + result[key].astype(mx.float32),
                 shifted[key].astype(mx.float32),
@@ -678,10 +658,7 @@ def test_qwen4_exp_sanitize_adds_unit_ple_scale_for_bf16_checkpoint():
     result = Model.sanitize(model, {})
 
     assert list(name for name in result if name.endswith("weight_scale")) == [key]
-    assert mx.array_equal(
-        result[key], mx.ones((1,), dtype=mx.bfloat16)
-    ).item()
-
+    assert mx.array_equal(result[key], mx.ones((1,), dtype=mx.bfloat16)).item()
 
 def test_qwen4_exp_sanitize_splits_quantized_fused_experts():
     from mlx_vlm.models.qwen4_exp.qwen4_exp import Model
@@ -1310,7 +1287,9 @@ def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
     model(prefix, cache=step_cache)
     model(prefix, cache=serial_cache)
 
-    stepped = model(mx.array([[5]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    stepped = model(
+        mx.array([[5]], dtype=mx.int32), cache=step_cache, return_hidden=True
+    )
     serial = model(mx.array([[5]], dtype=mx.int32), cache=serial_cache)
     mx.eval(stepped.logits, stepped.hidden_states, serial.logits)
 
@@ -1324,7 +1303,9 @@ def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
         assert mx.array_equal(got, want).item()
 
     # The next window verifies on top of the step and rolls back as usual.
-    verified = model(mx.array([[6, 7]], dtype=mx.int32), cache=step_cache, return_hidden=True)
+    verified = model(
+        mx.array([[6, 7]], dtype=mx.int32), cache=step_cache, return_hidden=True
+    )
     assert verified.gdn_states.active
     model.rollback_speculative_cache(
         step_cache, verified.gdn_states, accepted=0, block_size=2
@@ -1334,7 +1315,6 @@ def test_qwen4_mtp_one_row_step_is_the_serial_decode_step():
         mx.argmax(verified.logits[:, :1], axis=-1), mx.argmax(first.logits, axis=-1)
     ).item()
     assert step_cache[1].offset == serial_cache[1].offset == 5
-
 
 
 def _assert_ple_state_matches(actual_cache, expected_cache):
@@ -1444,7 +1424,9 @@ def test_qwen4_fp16_model_stays_fp16_with_bf16_ple_table():
     model = LanguageModel(config.text_config, config)
     model.update(
         tree_map(
-            lambda x: x.astype(mx.float16) if mx.issubdtype(x.dtype, mx.floating) else x,
+            lambda x: (
+                x.astype(mx.float16) if mx.issubdtype(x.dtype, mx.floating) else x
+            ),
             model.parameters(),
         )
     )
@@ -1603,9 +1585,7 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path, indexed):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import DiskBackedShardedEmbedding
 
-    prefix = (
-        "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
-    )
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
     tensors = {
         f"{prefix}.shard_0.weight": mx.arange(16, dtype=mx.float32)
         .reshape(4, 4)
@@ -1628,7 +1608,9 @@ def test_disk_backed_bf16_ple_reads_only_requested_rows(tmp_path, indexed):
     )
     values = embedding(mx.array([[1, 6]], dtype=mx.int32))
     mx.eval(values)
-    expected = mx.stack([tensors[f"{prefix}.shard_0.weight"][1], tensors[f"{prefix}.shard_1.weight"][2]])[None]
+    expected = mx.stack(
+        [tensors[f"{prefix}.shard_0.weight"][1], tensors[f"{prefix}.shard_1.weight"][2]]
+    )[None]
     assert mx.array_equal(values, expected).item()
     assert embedding.last_touched_shards == (0, 1)
     assert embedding.rows_read == 2
@@ -1782,8 +1764,7 @@ def test_disk_backed_affine_ple_supports_all_oq_bits(tmp_path, bits):
     expected_rows = []
     for shard_index in range(2):
         dense = (
-            mx.arange(4 * 160, dtype=mx.float32).reshape(4, 160) / 97
-            + shard_index * 10
+            mx.arange(4 * 160, dtype=mx.float32).reshape(4, 160) / 97 + shard_index * 10
         ).astype(mx.bfloat16)
         weight, scales, biases = mx.quantize(
             dense, group_size=32, bits=bits, mode="affine"
@@ -1852,9 +1833,13 @@ def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
     reader.rows_np = rows_np
 
     # One decode token: a row in each of the four shards.
-    indices = mx.array([[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32)
+    indices = mx.array(
+        [[5, 2048 + 900, 2 * 2048 + 2047, 3 * 2048 + 1500]], dtype=mx.int32
+    )
     values = embedding(indices)
-    assert mx.array_equal(values, mx.take(table, indices.reshape(-1), axis=0)[None]).item()
+    assert mx.array_equal(
+        values, mx.take(table, indices.reshape(-1), axis=0)[None]
+    ).item()
     advised = [event for event in events if event[0] == "advise"]
     assert len(advised) == 4 * 3 and events[: len(advised)] == advised
     for _, key, row in events[len(advised) :]:
@@ -1863,7 +1848,9 @@ def test_disk_backed_ple_advises_a_decode_tokens_pages_before_copying(tmp_path):
         row_bytes = (end - start) // entry["shape"][0]
         first = reader._data_start + start + row * row_bytes
         assert any(
-            begin % ple._PLE_PAGE_SIZE == 0 and begin <= first and first + row_bytes <= stop
+            begin % ple._PLE_PAGE_SIZE == 0
+            and begin <= first
+            and first + row_bytes <= stop
             for _, begin, stop in advised
         ), key
 
@@ -2041,6 +2028,8 @@ def test_qwen4_batch_qsa_trim_slices_indexer_arrays():
     assert batch.index_offset == 5
     assert batch.index_keys.shape[1] == 5
     assert batch.index_position_ids.shape[-1] == 5
+
+
 def _make_bound_qwen4_language_model(config):
     from mlx_vlm.models.qwen4_exp.language import LanguageModel, Qwen4ExpMTPModule
 
@@ -2108,15 +2097,29 @@ def _disk_ple(tmp_path, *, shards, rows, dims, bits=None, dtype=mx.bfloat16):
             tensors[f"{base}.weight"] = dense
             dense_rows.append(dense)
         else:
-            weight, scales, biases = mx.quantize(dense, group_size=32, bits=bits, mode="affine")
-            tensors[f"{base}.weight"], tensors[f"{base}.scales"], tensors[f"{base}.biases"] = weight, scales, biases
-            dense_rows.append(mx.dequantize(weight, scales, biases, group_size=32, bits=bits, mode="affine").astype(dtype))
+            weight, scales, biases = mx.quantize(
+                dense, group_size=32, bits=bits, mode="affine"
+            )
+            (
+                tensors[f"{base}.weight"],
+                tensors[f"{base}.scales"],
+                tensors[f"{base}.biases"],
+            ) = (weight, scales, biases)
+            dense_rows.append(
+                mx.dequantize(
+                    weight, scales, biases, group_size=32, bits=bits, mode="affine"
+                ).astype(dtype)
+            )
     mx.eval(*tensors.values(), *dense_rows)
     filename = "model-00001-of-00001.safetensors"
     mx.save_safetensors(str(tmp_path / filename), tensors, metadata={"format": "mlx"})
-    (tmp_path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {key: filename for key in tensors}}), encoding="utf-8"
+    )
     table = mx.concatenate(dense_rows)
-    embedding = DiskBackedShardedEmbedding(tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards)
+    embedding = DiskBackedShardedEmbedding(
+        tmp_path, prefix, num_embeddings=shards * rows, dims=dims, num_shards=shards
+    )
     # Converted checkpoints store the shared scale in the checkpoint dtype.
     embedding.weight_scale = mx.ones((1,), dtype=dtype)
     return embedding, table
@@ -2124,9 +2127,13 @@ def _disk_ple(tmp_path, *, shards, rows, dims, bits=None, dtype=mx.bfloat16):
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("bits", [None, 4, 5])
-def test_disk_backed_ple_gathers_a_chunk_with_one_upload_per_tensor(tmp_path, bits, dtype):
+def test_disk_backed_ple_gathers_a_chunk_with_one_upload_per_tensor(
+    tmp_path, bits, dtype
+):
     """A chunk's rows are assembled on the host and uploaded once per tensor, not once per shard."""
-    embedding, table = _disk_ple(tmp_path, shards=3, rows=8, dims=64, bits=bits, dtype=dtype)
+    embedding, table = _disk_ple(
+        tmp_path, shards=3, rows=8, dims=64, bits=bits, dtype=dtype
+    )
     mx.random.seed(11)
     indices = mx.random.randint(0, 24, (2, 40)).astype(mx.int32)
     mx.eval(indices)
@@ -2162,16 +2169,22 @@ def test_disk_backed_ple_prefetch_serves_the_matching_call(tmp_path):
     values_other = embedding(other)
     mx.eval(values_other)
     assert embedding.last_prefetch_hit is True
-    assert mx.array_equal(values_other, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    assert mx.array_equal(
+        values_other, mx.take(table, other.reshape(-1), axis=0)[None]
+    ).item()
     assert embedding(other) is not None and embedding.last_prefetch_hit is False
     values = embedding(first)
     mx.eval(values)
     assert embedding.last_prefetch_hit is False
-    assert mx.array_equal(values, mx.take(table, first.reshape(-1), axis=0)[None]).item()
+    assert mx.array_equal(
+        values, mx.take(table, first.reshape(-1), axis=0)[None]
+    ).item()
     values = embedding(other)
     mx.eval(values)
     assert embedding.last_prefetch_hit is False
-    assert mx.array_equal(values, mx.take(table, other.reshape(-1), axis=0)[None]).item()
+    assert mx.array_equal(
+        values, mx.take(table, other.reshape(-1), axis=0)[None]
+    ).item()
     embedding.close()
 
 
@@ -2205,7 +2218,9 @@ def test_prompt_loop_without_a_prefetch_hook_is_unchanged():
         def __call__(self, tokens, cache=None):
             forwards.append(tokens.shape[1])
 
-    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=3).prompt([list(range(7))])
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=3).prompt(
+        [list(range(7))]
+    )
     assert forwards == [3, 3, 1]
 
 
@@ -2240,16 +2255,20 @@ def test_ngram_prefetch_computes_the_next_chunks_indices():
     assert mx.array_equal(seen["prefetch"], seen["call"]).item()
 
 
-
 def test_ple_gathers_ahead_only_with_a_prefetching_table():
     from mlx_vlm.models.qwen4_exp.language import LanguageModel
 
     config = _tiny_config()
     model = LanguageModel(config.text_config, config)
     assert model.ple_gathers_ahead() is False
-    ple = next(layer.ple for layer in model.model.layers if getattr(layer, "ple", None) is not None)
+    ple = next(
+        layer.ple
+        for layer in model.model.layers
+        if getattr(layer, "ple", None) is not None
+    )
     ple.ple_embedding.ngram_embedding.prefetch = lambda indices: None
     assert model.ple_gathers_ahead() is True
+
 
 def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
     """The scheduler wraps prompt() to set mRoPE deltas first; the lookahead loop must run under it, not over it."""
@@ -2259,7 +2278,9 @@ def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
     from mlx_lm.generate import PromptProcessingBatch
 
     order = []
-    monkeypatch.setattr(scheduler, "_prepare_mrope_prompt", lambda self: order.append("before"))
+    monkeypatch.setattr(
+        scheduler, "_prepare_mrope_prompt", lambda self: order.append("before")
+    )
 
     class Model:
         def __call__(self, tokens, cache=None):
@@ -2268,7 +2289,9 @@ def test_prompt_lookahead_keeps_the_schedulers_mrope_hook(monkeypatch):
         def prefetch_ple(self, next_ids, current_ids):
             order.append(("prefetch", next_ids.shape[1]))
 
-    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt([list(range(6))])
+    PromptProcessingBatch(Model(), uids=[0], caches=[[]], prefill_step_size=4).prompt(
+        [list(range(6))]
+    )
     assert order == ["before", ("prefetch", 2), ("forward", 4), ("forward", 2)]
 
 
@@ -2390,7 +2413,12 @@ def _depthwise_conv_state(monkeypatch):
 
 def _depthwise_conv(channels, taps=4, dilation=3, dtype=mx.bfloat16, bias=False):
     conv = nn.Conv1d(
-        channels, channels, kernel_size=taps, dilation=dilation, groups=channels, bias=bias
+        channels,
+        channels,
+        kernel_size=taps,
+        dilation=dilation,
+        groups=channels,
+        bias=bias,
     )
     conv.weight = (mx.random.normal(conv.weight.shape) * 0.3).astype(dtype)
     if bias:
@@ -2401,7 +2429,9 @@ def _depthwise_conv(channels, taps=4, dilation=3, dtype=mx.bfloat16, bias=False)
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16, mx.float32])
 @pytest.mark.parametrize("dilation,taps", [(3, 4), (1, 4), (2, 3)])
-def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(_depthwise_conv_state, dtype, dilation, taps):
+def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(
+    _depthwise_conv_state, dtype, dilation, taps
+):
     language = _depthwise_conv_state
     mx.random.seed(dilation * 10 + taps)
     conv = _depthwise_conv(320, taps=taps, dilation=dilation, dtype=dtype)
@@ -2417,7 +2447,9 @@ def test_ple_depthwise_conv_kernel_is_bit_equal_to_conv1d(_depthwise_conv_state,
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_ple_depthwise_conv_one_pipeline_serves_every_length(_depthwise_conv_state, monkeypatch):
+def test_ple_depthwise_conv_one_pipeline_serves_every_length(
+    _depthwise_conv_state, monkeypatch
+):
     language = _depthwise_conv_state
     names = []
     real = mx.fast.metal_kernel
@@ -2430,11 +2462,15 @@ def test_ple_depthwise_conv_one_pipeline_serves_every_length(_depthwise_conv_sta
     monkeypatch.setitem(language._DEPTHWISE_CONV_STATE, "kernel", None)
     conv = _depthwise_conv(64)
     for rows in (5, 9, 100):
-        mx.eval(language._depthwise_conv1d(conv, mx.ones((1, rows + 9, 64), mx.bfloat16)))
+        mx.eval(
+            language._depthwise_conv1d(conv, mx.ones((1, rows + 9, 64), mx.bfloat16))
+        )
     assert names == ["omlx_qwen4_depthwise_conv1d"]
 
 
-def test_ple_depthwise_conv_unsupported_layouts_use_conv1d(_depthwise_conv_state, monkeypatch):
+def test_ple_depthwise_conv_unsupported_layouts_use_conv1d(
+    _depthwise_conv_state, monkeypatch
+):
     language = _depthwise_conv_state
     calls = []
     monkeypatch.setattr(
@@ -2458,7 +2494,9 @@ def test_ple_depthwise_conv_unsupported_layouts_use_conv1d(_depthwise_conv_state
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_state, monkeypatch):
+def test_ple_depthwise_conv_validation_mismatch_disables_kernel(
+    _depthwise_conv_state, monkeypatch
+):
     language = _depthwise_conv_state
 
     class Wrong:
@@ -2472,3 +2510,74 @@ def test_ple_depthwise_conv_validation_mismatch_disables_kernel(_depthwise_conv_
     assert mx.array_equal(out, conv(x)).item()
     assert language._DEPTHWISE_CONV_STATE["enabled"] is False
     assert language._DEPTHWISE_CONV_STATE["validated"] is False
+
+
+def test_qwen4_resident_ple_fuses_format_shards_exactly():
+    """U31: format shards join into one FormatEmbedding, unequal rows and
+    all, read by the format's own names."""
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatEmbedding
+    from tests.test_format_embedding import RowReader, _packed
+
+    mx.random.seed(45)
+    # Five shards over nine rows: 2, 2, 2, 2 and 1.
+    embedding = ShardedEmbedding(9, 8, 5)
+    reader = RowReader()
+    rows = _packed()
+    with testing.verified("qwen4_exp"):
+        shards, start = [], 0
+        for size in embedding.shard_sizes:
+            shards.append(
+                FormatEmbedding(
+                    reader,
+                    4,
+                    8,
+                    8,
+                    {
+                        name: values[start : start + size]
+                        for name, values in rows.items()
+                    },
+                )
+            )
+            start += size
+        embedding.shards = shards
+        indices = mx.array([[8, 0, 5, 3]], dtype=mx.int32)
+        want = embedding(indices)
+        mx.eval(want)
+
+        assert embedding.fuse_quantized_shards() is True
+        fused = embedding.fused
+        assert type(fused) is FormatEmbedding and fused.fmt is reader
+        assert (fused.num_embeddings, fused.dims) == (9, 8)
+        assert embedding.shards == []
+        assert mx.array_equal(fused(indices), want).item()
+        assert mx.array_equal(fused["codes"], rows["codes"]).item()
+        assert fused["offset"] is not None
+
+        # A shard that still holds a load's placeholder is refused.
+        pending = ShardedEmbedding(9, 8, 5)
+        pending.shards = [
+            FormatEmbedding(
+                reader,
+                4,
+                8,
+                8,
+                {
+                    name: mx.zeros_like(
+                        values[
+                            sum(pending.shard_sizes[:index]) : sum(
+                                pending.shard_sizes[: index + 1]
+                            )
+                        ]
+                    )
+                    for name, values in rows.items()
+                },
+                placeholders=True,
+            )
+            for index in range(len(pending.shard_sizes))
+        ]
+        with pytest.raises(ValueError, match="placeholder"):
+            pending.fuse_quantized_shards()

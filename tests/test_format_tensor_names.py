@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A plugin chooses its packed tensor name for dense and expert matrices."""
 
+import pathlib
 from dataclasses import replace
 
 import mlx.core as mx
@@ -192,3 +193,10 @@ def test_quant_formats_doc_has_no_stray_scratch_path():
         line for line in doc.read_text().splitlines() if line.strip().startswith("opencode/")
     ]
     assert not stray, stray
+
+
+def test_quant_formats_doc_matches_the_embedding_refusal():
+    page = (pathlib.Path(__file__).parents[1] / "docs/quant-formats.md").read_text()
+    assert "decodes the matrix before selecting rows" not in page
+    assert "can differ from MLX's quantized embedding projection" not in page
+    assert page.count("A format without a dot face is correct and slow") == 1

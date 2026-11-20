@@ -58,7 +58,12 @@ import mlx.nn as nn
 
 from .. import formats
 from ..formats import FormatRefusedError, LoadHookError
-from ..formats.linear import FormatLinear, FormatSwitchLinear, warm_dot
+from ..formats.linear import (
+    FormatEmbedding,
+    FormatLinear,
+    FormatSwitchLinear,
+    warm_dot,
+)
 from ..model_discovery import VERIFICATION, unverified_reason
 
 logger = logging.getLogger(__name__)
@@ -162,6 +167,7 @@ _TAKEN = ("self", "mode", "bits", "group_size")
 _LOADS_IN_FORMAT = frozenset(
     (
         f"{nn.Linear.__module__}.{nn.Linear.__qualname__}",
+        f"{nn.Embedding.__module__}.{nn.Embedding.__qualname__}",
         *(f"{module}.SwitchLinear" for module in _SWITCH_MODULES),
     )
 )
@@ -457,7 +463,9 @@ class _Checkpoint:
             written, _ = self._written(mode)
         except (OSError, ValueError):
             written = _ABSENT
-        plugin = written.get("plugin", _ABSENT) if isinstance(written, dict) else _ABSENT
+        plugin = (
+            written.get("plugin", _ABSENT) if isinstance(written, dict) else _ABSENT
+        )
         if plugin is None:
             # oQ records a format registered by hand as null.
             return "a format registered by hand"
@@ -1281,6 +1289,12 @@ def _format_layer(layer, layer_cls, signature, arguments):
         formats.check_layout(fmt, n, k, layout)
     except ValueError as error:
         raise _refused(str(error), mode) from error
+    if layer_cls is FormatEmbedding and not formats.stackable(
+        fmt, k, n, bits, group_size
+    ):
+        raise _refused(
+            "its rows are not independent (not formats.stackable)", mode
+        )
     for name, value in arguments.items():
         if name not in _TAKEN and value != signature.parameters[name].default:
             raise _refused(
@@ -1693,6 +1707,7 @@ def apply_format_load_patch() -> None:
     mlx-embeddings: what is not imported yet is wrapped when it is."""
     formats.load()
     _patch(nn.Linear, FormatLinear)
+    _patch(nn.Embedding, FormatEmbedding)
     with _LOCK:
         if _FINDER not in sys.meta_path:
             sys.meta_path.insert(0, _FINDER)

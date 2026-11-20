@@ -905,13 +905,13 @@ def format_layer(
     named_modules = getattr(model, "named_modules", None)
     if not callable(named_modules):
         return None
-    from ..formats.linear import FormatLinear, FormatSwitchLinear
+    from ..formats.linear import _FormatLayer
 
     first = None
     for name, module in named_modules():
         if refuse_recorded:
             _refuse_recorded_module(module)
-        if first is None and isinstance(module, (FormatLinear, FormatSwitchLinear)):
+        if first is None and isinstance(module, _FormatLayer):
             first = name, module
             if not refuse_recorded:
                 return first

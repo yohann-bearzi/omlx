@@ -29,7 +29,9 @@ from omlx.memory_monitor import (
     qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
 )
 
-from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import register_ple_resource
+from omlx.patches.mlx_vlm_qwen4_exp_compat.ple_load_resources import (
+    register_ple_resource,
+)
 from omlx.patches.vlm_batch_kv_capacity import _ladder_capacity, _roll_logical_prefix
 from omlx.patches import row_exact_qmv
 from omlx.patches.qwen35_verify_qmm import is_row_exact_armed
@@ -98,9 +100,7 @@ def _split_text_mrope_positions(
 ) -> tuple[mx.array, mx.array]:
     """Indexer text ids vs rotary ids for the gathered QSA arms."""
     if position_ids is None:
-        text_position_ids = mx.arange(
-            past_len, past_len + length, dtype=mx.int32
-        )[None]
+        text_position_ids = mx.arange(past_len, past_len + length, dtype=mx.int32)[None]
         rotary_position_ids = mx.broadcast_to(
             text_position_ids,
             (3, batch, length),
@@ -177,8 +177,7 @@ def configure_ple_runtime(model_path: str | Path, mode: str | None = None) -> st
     compute_path = Path(model_path).expanduser().resolve()
     requested = mode or "auto"
     checkpoint_bytes = sum(
-        path.stat().st_size
-        for path in compute_path.glob("*.safetensors")
+        path.stat().st_size for path in compute_path.glob("*.safetensors")
     )
     physical_memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     _PLE_RUNTIME_MODE = resolve_ple_runtime_mode(
@@ -365,9 +364,7 @@ class _QSAIndexerCache:
                 # MRoPE promotion is rare. Collapse the old position backing to
                 # its logical prefix so the capacity grow below creates a
                 # writable three-coordinate allocation.
-                old_positions = self._index_position_ids[
-                    ..., : self._index_offset
-                ]
+                old_positions = self._index_position_ids[..., : self._index_offset]
                 self._index_position_ids = mx.broadcast_to(
                     old_positions[None],
                     (position_ids.shape[0], *old_positions.shape),
@@ -523,9 +520,7 @@ class QSAKVCache(_QSAIndexerCache, KVCache):
     def extract(self, idx):
         cache = QSAKVCache()
         if self.keys is not None:
-            cache.keys = mx.contiguous(
-                self.keys[idx : idx + 1, :, : self.offset, :]
-            )
+            cache.keys = mx.contiguous(self.keys[idx : idx + 1, :, : self.offset, :])
             cache.values = mx.contiguous(
                 self.values[idx : idx + 1, :, : self.offset, :]
             )
@@ -680,7 +675,11 @@ class _BatchPooledBank:
         return (
             len(self.blocks) == rows
             and self.ratio == ratio
-            and (self.tag is None if tag is None else self.tag is not None and self.tag() is tag)
+            and (
+                self.tag is None
+                if tag is None
+                else self.tag is not None and self.tag() is tag
+            )
         )
 
     def drop_tail(self, row: int, tokens: int) -> None:
@@ -697,10 +696,14 @@ class _BatchPooledBank:
             kept.keys = self.keys[mx.array(rows, dtype=mx.int32)]
         return kept
 
-    def join(self, other: Optional["_BatchPooledBank"], other_rows: int) -> "_BatchPooledBank":
+    def join(
+        self, other: Optional["_BatchPooledBank"], other_rows: int
+    ) -> "_BatchPooledBank":
         """This bank's rows followed by ``other``'s (or ``other_rows`` empty rows)."""
         if other is not None and not (
-            other.ratio == self.ratio and other.tag is not None and self.tag is not None
+            other.ratio == self.ratio
+            and other.tag is not None
+            and self.tag is not None
             and other.tag() is self.tag()
         ):
             other = None
@@ -909,7 +912,9 @@ class BatchQSAKVCache:
         batch = int(self._index_keys.shape[0])
         bank = self._pooled_bank
         if bank is None or not bank.owned_by(batch, compress_ratio, cache_tag):
-            bank = self._pooled_bank = _BatchPooledBank(batch, compress_ratio, cache_tag)
+            bank = self._pooled_bank = _BatchPooledBank(
+                batch, compress_ratio, cache_tag
+            )
         positions = self.index_position_ids
         needed = 0
         for row in range(batch) if rows is None else rows:
@@ -1081,9 +1086,7 @@ class BatchQSAKVCache:
                     dtype=sample_positions.dtype,
                 )
             else:
-                positions = mx.zeros(
-                    (batch_size, 0), dtype=sample_positions.dtype
-                )
+                positions = mx.zeros((batch_size, 0), dtype=sample_positions.dtype)
         else:
             keys = cache.index_keys[:, :length]
             positions = cache.index_position_ids[..., :length]
@@ -1389,8 +1392,7 @@ class QSAQuantizedKVCache(_QSAIndexerCache, QuantizedKVCache):
         cache = QSAQuantizedKVCache(self.group_size, self.bits)
         if self.keys is not None:
             cache.keys = tuple(
-                mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
-                for x in self.keys
+                mx.contiguous(x[idx : idx + 1, :, : self.offset, :]) for x in self.keys
             )
             cache.values = tuple(
                 mx.contiguous(x[idx : idx + 1, :, : self.offset, :])
@@ -1588,9 +1590,10 @@ class Qwen4ExpQSAIndexer(nn.Module):
     @staticmethod
     def _default_position_ids(batch: int, start: int, length: int):
         if isinstance(start, mx.array) and start.ndim == 1:
-            return mx.maximum(start[:batch], 0)[:, None] + mx.arange(
-                length, dtype=mx.int32
-            )[None, :]
+            return (
+                mx.maximum(start[:batch], 0)[:, None]
+                + mx.arange(length, dtype=mx.int32)[None, :]
+            )
         positions = mx.arange(start, start + length, dtype=mx.int32)
         return mx.broadcast_to(positions[None], (batch, length))
 
@@ -1955,10 +1958,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and not target_verify
             and (
                 position_ids is None
-                or (
-                    position_ids.ndim == 2
-                    and tuple(position_ids.shape) == (1, 1)
-                )
+                or (position_ids.ndim == 2 and tuple(position_ids.shape) == (1, 1))
             )
         ):
             return False
@@ -2374,10 +2374,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         projected = projected.reshape(
             batch, length, indexer.n_heads + indexer.kv_heads, indexer.head_dim
         )
-        index_queries = indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
-            0, 2, 1, 3
+        index_queries = indexer.q_layernorm(
+            projected[:, :, : indexer.n_heads]
+        ).transpose(0, 2, 1, 3)
+        cache.update_indexer(
+            projected[:, :, indexer.n_heads :].squeeze(2), index_positions
         )
-        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
         index_queries = indexer._apply_rope(index_queries, index_positions)
         pooled_keys = mx.expand_dims(
             cache.pooled_indexer_keys(
@@ -2390,9 +2392,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         ).astype(mx.float32)
 
         if fused:
-            values = v_out.reshape(batch, length, self.num_key_value_heads, -1).transpose(
-                0, 2, 1, 3
-            )
+            values = v_out.reshape(
+                batch, length, self.num_key_value_heads, -1
+            ).transpose(0, 2, 1, 3)
             keys, values = cache.update_and_fetch(new_keys, values)
             gate = mx.sigmoid(
                 q_out.reshape(length, self.num_attention_heads, 2, -1)[:, :, 1]
@@ -2412,9 +2414,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             blocks = key_tokens // indexer.compress_ratio
             # A contiguous one-row FP32 query, as the serial step builds it: a
             # strided row view takes another matmul kernel (other FP32 sums).
-            scores = index_queries[:, :, row : row + 1].astype(mx.float32) @ pooled_keys[
-                :, :, :blocks
-            ].transpose(0, 1, 3, 2)
+            scores = index_queries[:, :, row : row + 1].astype(
+                mx.float32
+            ) @ pooled_keys[:, :, :blocks].transpose(0, 1, 3, 2)
             row_mask = indexer.aligned_row_mask(scores, key_tokens)
             row_queries = queries[:, :, row : row + 1]
             row_keys = keys[..., :key_tokens, :]
@@ -2545,9 +2547,13 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             if position_ids is not None
             else indexer._default_position_ids(batch, cache.offset, length)
         )
-        cache.update_indexer(projected[:, :, indexer.n_heads :].squeeze(2), index_positions)
+        cache.update_indexer(
+            projected[:, :, indexer.n_heads :].squeeze(2), index_positions
+        )
         index_queries = indexer._apply_rope(
-            indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(0, 2, 1, 3),
+            indexer.q_layernorm(projected[:, :, : indexer.n_heads]).transpose(
+                0, 2, 1, 3
+            ),
             index_positions,
         )
         pooled = cache.pooled_indexer_rows(
@@ -2569,9 +2575,12 @@ class Qwen4ExpAttention(Qwen3_5Attention):
 
         # Each query sees its row's tokens up to itself.
         width = cache.index_offset
-        visible = mx.array(
-            [width - pad - length + 1 for pad in paddings], dtype=mx.int32
-        )[:, None] + mx.arange(length, dtype=mx.int32)[None]
+        visible = (
+            mx.array([width - pad - length + 1 for pad in paddings], dtype=mx.int32)[
+                :, None
+            ]
+            + mx.arange(length, dtype=mx.int32)[None]
+        )
         tokens, valid = batched_causal_block_selection(
             index_queries,
             pooled,
@@ -2773,7 +2782,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         past = cache.offset
         # The indexer returns no mask while its blocks fit the budget; past it
         # only a decode row gets here (_masked_decode).
-        dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
+        dense = (
+            cache._index_offset + rows
+        ) // indexer.compress_ratio <= indexer.block_topk
         if not (dense or rows == 1):
             return 0
         if (
@@ -2880,7 +2891,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             rope_scale=rotary.attention_scaling,
         )
 
-    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
+    def _fused_projections_ready(
+        self, x: mx.array, position_ids: Optional[mx.array]
+    ) -> bool:
         """Whether ``_fused_prologue`` runs these rows: the grouped projection
         launch takes the four projections and the kernels this layout."""
         rotary = self.rotary_emb
@@ -2955,7 +2968,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         rows = x.shape[1]
         indexer = self.indexer
         past = cache.offset
-        dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
+        dense = (
+            cache._index_offset + rows
+        ) // indexer.compress_ratio <= indexer.block_topk
         q_out, index_out, v_out, queries, keys, index_positions = self._fused_prologue(
             x, past, position_ids
         )
@@ -2964,11 +2979,15 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             index_out = index_out.reshape(
                 1, rows, indexer.n_heads + indexer.kv_heads, indexer.head_dim
             )
-            cache.update_indexer(index_out[:, :, indexer.n_heads :].squeeze(2), index_positions)
+            cache.update_indexer(
+                index_out[:, :, indexer.n_heads :].squeeze(2), index_positions
+            )
             qsa_mask = None
         else:
             qsa_mask = indexer.from_projected(index_out, cache, index_positions)
-        values = v_out.reshape(1, rows, self.num_key_value_heads, -1).transpose(0, 2, 1, 3)
+        values = v_out.reshape(1, rows, self.num_key_value_heads, -1).transpose(
+            0, 2, 1, 3
+        )
         keys, values = cache.update_and_fetch(keys, values)
         # MLX's own sigmoid of each head's gate half.
         gate = mx.sigmoid(q_out.reshape(rows, self.num_attention_heads, 2, -1)[:, :, 1])
@@ -3044,9 +3063,7 @@ class Qwen4ExpGatedResidual(nn.Module):
                 hc_hidden_size, self.hc_count, bias=False
             )
 
-    def __call__(
-        self, hyper_input: mx.array, target_verify: bool = False, write=None
-    ):
+    def __call__(self, hyper_input: mx.array, target_verify: bool = False, write=None):
         # ``write`` is a pending (branch, gate) residual write onto hyper_input.
         # The written residual comes back as the passthrough; the mixer (no
         # block_inject_weight) then returns (mixed, written).
@@ -3152,9 +3169,7 @@ class Qwen4ExpGatedResidual(nn.Module):
         mixed_input = mx.mean(mix * streams, axis=-2)
         if block_injection is None:
             return mixed_input
-        injection_weights = 2 * mx.sigmoid(
-            block_injection / self.hc_count
-        )
+        injection_weights = 2 * mx.sigmoid(block_injection / self.hc_count)
         return mixed_input, hyper_input, injection_weights
 
 
@@ -3215,9 +3230,7 @@ def _can_fuse_hyper_connection(module: Qwen4ExpGatedResidual) -> bool:
 
 def _can_prepare_exact_hybrid(module: Qwen4ExpGatedResidual) -> bool:
     if not (
-        module.hc_count == 4
-        and module.hidden_size == 2560
-        and module.hc_lowrank == 320
+        module.hc_count == 4 and module.hidden_size == 2560 and module.hc_lowrank == 320
     ):
         return False
     from .hc_projection import compatible_projections
@@ -3251,8 +3264,7 @@ def fuse_hyper_connection_projections(model: nn.Module) -> int:
     targets = [
         module
         for module in _unique_hyper_connections(model)
-        if _can_fuse_hyper_connection(module)
-        and _can_prepare_exact_hybrid(module)
+        if _can_fuse_hyper_connection(module) and _can_prepare_exact_hybrid(module)
     ]
     for module in targets:
         module._omlx_exact_hybrid_projection = True
@@ -3390,7 +3402,9 @@ class _SafeTensorMMap:
                 header_size = struct.unpack("<Q", self._file.read(8))[0]
                 self._header = json.loads(self._file.read(header_size))
                 self._data_start = 8 + header_size
-                self._mapping = mmap.mmap(self._file.fileno(), 0, access=mmap.ACCESS_READ)
+                self._mapping = mmap.mmap(
+                    self._file.fileno(), 0, access=mmap.ACCESS_READ
+                )
                 self._seen_pages = bytearray(
                     1 + (max(path.stat().st_size, 1) - 1) // _PLE_PAGE_SIZE
                 )
@@ -3761,11 +3775,14 @@ class DiskBackedShardedEmbedding(nn.Module):
         bits, group_size = specs[0][3], specs[0][4]
         families = [0] if bits is None else [0, 1, 2]
         dtypes = {
-            family: self._tensor_readers[specs[0][family]].tensor_dtype(specs[0][family])
+            family: self._tensor_readers[specs[0][family]].tensor_dtype(
+                specs[0][family]
+            )
             for family in families
         }
         if any(spec[3:] != (bits, group_size) for spec in specs) or any(
-            self._tensor_readers[spec[family]].tensor_dtype(spec[family]) != dtypes[family]
+            self._tensor_readers[spec[family]].tensor_dtype(spec[family])
+            != dtypes[family]
             for spec in specs
             for family in families
         ):
@@ -3807,7 +3824,9 @@ class DiskBackedShardedEmbedding(nn.Module):
         flat = indices.reshape(-1)
         mx.eval(flat)
         host = np.asarray(flat.astype(mx.int64)).reshape(-1)
-        if host.size and (int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]):
+        if host.size and (
+            int(host.min()) < 0 or int(host.max()) >= self.shard_offsets[-1]
+        ):
             raise IndexError("embedding index is outside the sharded vocabulary")
         return host
 
@@ -3859,7 +3878,10 @@ class DiskBackedShardedEmbedding(nn.Module):
         _, _, touched, _, families, dtypes, bits, group_size = plan
         self.last_touched_shards = tuple(touched)
         self.rows_read = int(host.size)
-        arrays = [_SafeTensorMMap.to_mx(buffers[family], dtypes[family]) for family in families]
+        arrays = [
+            _SafeTensorMMap.to_mx(buffers[family], dtypes[family])
+            for family in families
+        ]
         self.last_uploads = len(arrays)
         values = arrays[0]
         if bits is not None:
@@ -4137,7 +4159,10 @@ class ShardedEmbedding(nn.Module):
                 if entry is None or entry[0] is not shard.weight:
                     entry = bound[index] = (
                         shard.weight,
-                        *(_bound_rows(a) for a in (shard.weight, shard.scales, shard.biases)),
+                        *(
+                            _bound_rows(a)
+                            for a in (shard.weight, shard.scales, shard.biases)
+                        ),
                     )
                 views.append(entry[1:])
             offsets = offset_arrays.get((start, stop))
@@ -4222,9 +4247,11 @@ class ShardedEmbedding(nn.Module):
         if getattr(self, "fused", None) is not None:
             return False
         shards = list(self.shards)
-        if not shards or not all(
-            type(shard) is nn.QuantizedEmbedding for shard in shards
-        ):
+        if not shards:
+            return False
+        if all(type(shard).__name__ == "FormatEmbedding" for shard in shards):
+            return self._fuse_format_shards(shards)
+        if not all(type(shard) is nn.QuantizedEmbedding for shard in shards):
             return False
         first = shards[0]
         if not all(
@@ -4267,6 +4294,60 @@ class ShardedEmbedding(nn.Module):
         if fused.biases is not None:
             arrays.append(fused.biases)
         mx.eval(*arrays)
+        self.fused = fused
+        self.shards = []
+        return True
+
+    def _fuse_format_shards(self, shards: list) -> bool:
+        """Join compatible format shards into one FormatEmbedding.
+
+        The shards of a plugin's PLE table keep their codes and side tensors
+        per checkpoint shard; joined along the rows they are one embedding of
+        the same reader, read by the format's own names (D11). Unequal row
+        counts join: each shard's rows are its own, and their sum is the
+        table's. A shard that still holds a load's placeholder is refused.
+        """
+
+        first = shards[0]
+        names = tuple(first._tensors)
+        for shard in shards:
+            if (
+                shard.fmt is not first.fmt
+                or shard.dims != first.dims
+                or shard.bits != first.bits
+                or shard.group_size != first.group_size
+                or tuple(shard._tensors) != names
+                or ("bias" in shard) != ("bias" in first)
+            ):
+                return False
+            for name in names:
+                if (
+                    shard[name].dtype != first[name].dtype
+                    or shard[name].shape[1:] != first[name].shape[1:]
+                ):
+                    return False
+            shard.refuse_placeholders()
+        total_rows = sum(int(shard[names[0]].shape[0]) for shard in shards)
+        if total_rows != self.shard_offsets[-1] or first.dims != self.dims:
+            return False
+        tensors = {
+            name: mx.concatenate([shard[name] for shard in shards], axis=0)
+            for name in names
+        }
+        bias = (
+            mx.concatenate([shard["bias"] for shard in shards], axis=0)
+            if "bias" in first
+            else None
+        )
+        fused = type(first)(
+            first.fmt,
+            first.bits,
+            first.group_size,
+            self.dims,
+            tensors,
+            bias,
+        )
+        mx.eval(*tensors.values())
         self.fused = fused
         self.shards = []
         return True
@@ -4438,9 +4519,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         batch = input_ids.shape[0]
         if cache is not None and cache[3] is not None:
             return cache[3]
-        return mx.full(
-            (batch, self.context_len), self.eos_token_id, dtype=mx.int64
-        )
+        return mx.full((batch, self.context_len), self.eos_token_id, dtype=mx.int64)
 
     def _ngram_indices(self, token_history: mx.array, length: int) -> mx.array:
         """Hashed table rows for the last ``length`` tokens of ``token_history``."""
@@ -5102,7 +5181,11 @@ class LanguageModel(Qwen3_5LanguageModel):
         """True when an SSD-backed PLE table gathers rows one prefill chunk ahead."""
         for layer in self.model.layers:
             ple = getattr(layer, "ple", None)
-            if ple is not None and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None) is not None:
+            if (
+                ple is not None
+                and getattr(ple.ple_embedding.ngram_embedding, "prefetch", None)
+                is not None
+            ):
                 return True
         return False
 
@@ -5124,7 +5207,9 @@ class LanguageModel(Qwen3_5LanguageModel):
             embedding.prefetch(next_ids, history[:, -embedding.context_len :])
             if not getattr(self, "_ple_lookahead_logged", False):
                 self._ple_lookahead_logged = True
-                logger.info("PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk")
+                logger.info(
+                    "PLE gather-ahead active: next prefill chunk rows are gathered during the current chunk"
+                )
 
     def mtp_forward(
         self,
@@ -5203,27 +5288,27 @@ class LanguageModel(Qwen3_5LanguageModel):
     @staticmethod
     def _restore_ple_state(cache, snapshot, accepted_values):
         batch = snapshot.input_ids.shape[0]
-        values = accepted_values * batch if len(accepted_values) == 1 else accepted_values
+        values = (
+            accepted_values * batch if len(accepted_values) == 1 else accepted_values
+        )
         accepted_array = mx.array(values, dtype=mx.int32)
         retained = accepted_array + 1
 
         history_len = snapshot.history.shape[1]
         history = mx.concatenate([snapshot.history, snapshot.input_ids], axis=1)
-        history_positions = retained[:, None] + mx.arange(
-            history_len, dtype=mx.int32
-        )[None, :]
-        cache[3] = mx.contiguous(
-            mx.take_along_axis(history, history_positions, axis=1)
+        history_positions = (
+            retained[:, None] + mx.arange(history_len, dtype=mx.int32)[None, :]
         )
+        cache[3] = mx.contiguous(mx.take_along_axis(history, history_positions, axis=1))
 
         state_len = snapshot.conv_state.shape[1]
         if state_len:
             conv_input = mx.concatenate(
                 [snapshot.conv_state, snapshot.conv_inputs], axis=1
             )
-            conv_positions = retained[:, None] + mx.arange(
-                state_len, dtype=mx.int32
-            )[None, :]
+            conv_positions = (
+                retained[:, None] + mx.arange(state_len, dtype=mx.int32)[None, :]
+            )
             conv_positions = mx.broadcast_to(
                 conv_positions[..., None],
                 (batch, state_len, snapshot.conv_state.shape[-1]),

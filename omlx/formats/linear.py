@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+from copy import copy
 from functools import cache
 from threading import local
 from typing import Any, NamedTuple
@@ -37,6 +38,7 @@ import mlx.nn as nn
 from .. import formats
 from ..patches.module_cache import cached_per_module
 from . import Dot, Tile, kernels, tile_dense, tile_wide
+from .affine import AffineFormat
 from .mlx import traversal
 
 logger = logging.getLogger(__name__)
@@ -643,7 +645,11 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
     a stack (its route builds with the served experts' geometry), a k or
     an n the rows kernel does not take, no face for the matrix, or no
     served activation dtype the face is exact for."""
-    if getattr(layer_cls, "_STACK", 0) or k < 8:
+    if (
+        getattr(layer_cls, "_STACK", 0)
+        or issubclass(layer_cls, FormatEmbedding)
+        or k < 8
+    ):
         return None
     codes = tensors.get(fmt.codes_name)
     if codes is not None and codes.ndim >= 2 and (
@@ -1499,6 +1505,90 @@ class FormatLinear(_FormatLayer):
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
         return y if bias is None else y + bias
+
+
+class FormatEmbedding(_FormatLayer):
+    """A token embedding whose matrix is a format's, looked up by row.
+
+    The rows rule is the promise a lookup needs: a format whose layout
+    declares N first (``formats.stackable``) keeps a row's weights in that
+    row of each tensor, so a lookup decodes only the rows its ids name. A
+    format that cannot promise it is refused here, before a checkpoint
+    builds it: decoding the whole table to gather from it would be a silent
+    slow path on a vocabulary's size (D11: the format's own names).
+    """
+
+    def _init_tensors(
+        self,
+        fmt,
+        bits,
+        group_size,
+        input_dims,
+        tensors,
+        bias,
+        *,
+        placeholders=False,
+        layout=None,
+    ) -> None:
+        n = tensors[fmt.codes_name].shape[-2]
+        # The built-in affine's rows are independent by construction (its
+        # layout is MLX's, which the format does not declare yet, L1). Any
+        # other format promises it through the rows rule, or is refused.
+        if type(fmt) is not AffineFormat and not formats.stackable(
+            fmt, input_dims, n, bits, group_size
+        ):
+            raise ValueError(
+                f"quant format {fmt.mode!r} cannot hold a token embedding: its "
+                f"rows are not independent, so a lookup could not decode the "
+                f"rows it names (a layout with N first promises it, "
+                f"formats.stackable)"
+            )
+        super()._init_tensors(
+            fmt,
+            bits,
+            group_size,
+            input_dims,
+            tensors,
+            bias,
+            placeholders=placeholders,
+            layout=layout,
+        )
+        # A dense view over the same reader and arrays, built at the first
+        # as_linear and dropped by every write to the layer (the setters drop
+        # the kept view), as a FormatLinear's plan is.
+        prototype = FormatLinear.__new__(FormatLinear)
+        prototype._init_tensors(
+            fmt, bits, group_size, input_dims, tensors, bias, layout=layout
+        )
+        for name in tensors:
+            del prototype[name]
+        if bias is not None:
+            del prototype.bias
+        object.__setattr__(self, "_linear_prototype", prototype)
+
+    @property
+    def num_embeddings(self) -> int:
+        return self.output_dims
+
+    @property
+    def dims(self) -> int:
+        return self.input_dims
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        rows = self._decoded(ids.reshape(-1))
+        return rows.reshape(*ids.shape, self.dims)
+
+    def as_linear(self, x: mx.array) -> mx.array:
+        self.refuse_placeholders()
+        view = self.__dict__.get(_KEPT)
+        if view is None:
+            view = copy(self._linear_prototype)
+            for name in self._tensors:
+                view[name] = self[name]
+            if "bias" in self:
+                view["bias"] = self["bias"]
+            self.__dict__[_KEPT] = view
+        return view(x)
 
 
 class FormatSwitchLinear(_FormatLayer):

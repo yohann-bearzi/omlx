@@ -1543,3 +1543,22 @@ def test_prefill_chunks_match_eager_writes(monkeypatch, chunk):
         return [first, second, model(ids(1, 1), cache=cache).logits]
 
     _assert_identical(monkeypatch, 40 + chunk, prefill)
+
+
+def test_hc_fused_refuses_unfilled_format_linear_placeholder():
+    from omlx.formats import linear as formats_linear, testing
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+    projection = module.input_mix_weight_down
+    tensors = {name: projection[name] for name in ("weight", "scales", "biases")}
+    with testing.verified("qwen4_exp"):
+        placeholder = formats_linear.FormatLinear(
+            "affine", 4, 64, WIDTH, tensors, placeholders=True
+        )
+    placeholder.scales = placeholder.scales.astype(mx.bfloat16)
+    placeholder.biases = placeholder.biases.astype(mx.bfloat16)
+    module.input_mix_weight_down = placeholder
+    assert hc_fused._quantized_ok(placeholder, mx.bfloat16) is False
+    with pytest.raises(ValueError, match="placeholder"):
+        module(mx.zeros((1, 1, WIDTH), mx.bfloat16))

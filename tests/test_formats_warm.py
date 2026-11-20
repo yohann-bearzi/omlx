@@ -1260,3 +1260,21 @@ def test_warm_dot_skips_zero_n_without_querying_dot(monkeypatch):
     )
     with testing.verified("llama"):
         assert warm_dot(FormatLinear, NoQuery(), 8, 1, 320, tensors, layout) is None
+
+
+def test_warm_dot_skips_format_embedding(monkeypatch):
+    from omlx.formats.linear import FormatEmbedding
+
+    (codes, scales), _, _ = _matrix(16, 320)
+    tensors = {"codes": codes, "group_scales": scales}
+    layout = {"codes": ((16, 320), mx.uint8), "group_scales": ((16,), mx.float32)}
+    fmt = _Only(())
+    monkeypatch.setattr(
+        fmt, "dot", lambda *arguments: pytest.fail("queried dot for an embedding")
+    )
+    monkeypatch.setattr(
+        "omlx.formats.linear.kernels.warm",
+        lambda instances: pytest.fail("warmed a format embedding"),
+    )
+    with testing.verified("llama"):
+        assert warm_dot(FormatEmbedding, fmt, 8, 1, 320, tensors, layout) is None

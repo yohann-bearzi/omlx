@@ -20,12 +20,14 @@ from mlx_lm.models.switch_layers import SwitchLinear
 
 from omlx import formats
 from omlx.cluster.tensor_strategies import (
+    _refuse_format_layers,
     _shard_switch_mlp_uneven,
     _uneven_group_ranges,
     apply_tensor_strategy,
+    format_layer,
 )
 from omlx.formats import testing
-from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+from omlx.formats.linear import FormatEmbedding, FormatLinear, FormatSwitchLinear
 
 
 @pytest.mark.parametrize(
@@ -179,3 +181,30 @@ def test_noncallable_named_modules_reaches_the_unsupported_strategy_refusal():
         "tensor parallelism is unsupported for model type 'no_adapter': "
         "no registered strategy and no native shard method"
     )
+
+
+def test_format_embedding_is_refused_by_tensor_strategy():
+    formats.load()
+    stock = nn.Embedding(16, 64).to_quantized(group_size=32, bits=4)
+    tensors = {name: stock[name] for name in ("weight", "scales", "biases")}
+    with testing.verified("qwen4_exp"):
+        emb = FormatEmbedding("affine", 4, 32, 64, tensors)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model_type = "qwen4_exp"
+            self.embed = emb
+
+    model = Model()
+    assert format_layer(model) == ("embed", emb)
+    expected = (
+        "tensor parallelism cannot shard embed: a layer of quant "
+        "format 'affine', which no strategy splits; serve this model on one machine"
+    )
+    with pytest.raises(RuntimeError) as refusal:
+        _refuse_format_layers(model)
+    assert str(refusal.value) == expected
+    with pytest.raises(RuntimeError) as strategy_refusal:
+        apply_tensor_strategy(model, SimpleNamespace(), mx_module=mx)
+    assert str(strategy_refusal.value) == expected
