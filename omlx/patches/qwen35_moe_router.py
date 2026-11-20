@@ -34,8 +34,8 @@ simd_max. ``TOPK_HEADER`` carries both dtype instantiations for the
 a template parameter; ``topk_header(dtype)`` builds the one-dtype source
 the routed-decode kernels fold in (only the selection their dtype compiles;
 MLX hashes a kernel's whole source at every launch).
-``softmax_topk_rows`` runs that source verbatim for each row of a verify
-window in one launch.
+``softmax_topk_rows`` runs ``softmax_topk_row``'s body with
+``TOPK_HEADER`` verbatim for each row of a verify window in one launch.
 
 ``router_gemv`` runs the bias-free bf16 or fp16 gate linear of one row with MLX's
 one-row gemv arithmetic (per-lane column order, shuffle-down tree) but one

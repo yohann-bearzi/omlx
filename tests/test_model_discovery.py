@@ -1071,8 +1071,9 @@ def test_the_unverified_cache_follows_the_config_mtime(tmp_path):
 
 def test_the_unverified_cache_invalidates_when_mtime_is_preserved(tmp_path):
     """A rewrite can keep the old mtime (cp -p, tar, rsync -a) and even the
-    old length; the identity stamp (device, inode, mtime, ctime, size) still
-    changes, so the cached verdict is not reused."""
+    old length; on filesystems whose ctime advances per write the identity
+    stamp still changes (same-length in-place rewrites inside one coarse
+    tick cannot be distinguished)."""
     from omlx.model_discovery import unverified
 
     model = tmp_path / "model"
@@ -1087,6 +1088,49 @@ def test_the_unverified_cache_invalidates_when_mtime_is_preserved(tmp_path):
     config.write_text(dropped)
     os.utime(config, ns=(stamp, stamp))
     assert unverified(model)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["st_dev", "st_ino", "st_mtime_ns", "st_ctime_ns", "st_size"],
+)
+def test_every_stamp_field_forces_a_reread(tmp_path, monkeypatch, field):
+    """Each field of the identity stamp is load-bearing: a change in any
+    one of them is a new stamp and re-reads the config."""
+    import types
+
+    from omlx.model_discovery import unverified
+
+    model = tmp_path / "model"
+    model.mkdir()
+    config = model / "config.json"
+    vals = {
+        "st_dev": 1,
+        "st_ino": 1,
+        "st_mtime_ns": 10,
+        "st_ctime_ns": 10,
+        "st_size": 9,
+    }
+    text = [json.dumps({"model_type": "llama"})]
+    orig_stat, orig_read = Path.stat, Path.read_text
+
+    def counting_stat(self, *args, **kwargs):
+        if self == config:
+            return types.SimpleNamespace(**vals)
+        return orig_stat(self, *args, **kwargs)
+
+    def counting_read(self, *args, **kwargs):
+        if self == config:
+            return text[0]
+        return orig_read(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", counting_stat)
+    monkeypatch.setattr(Path, "read_text", counting_read)
+    assert not unverified(model)
+    text[0] = json.dumps({"omlx_verification": {"verified": False}})
+    vals[field] += 1
+    assert unverified(model)
+
 
 
 def test_the_unverified_cache_follows_an_older_config(tmp_path):

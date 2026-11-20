@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 
 import mlx.core as mx
@@ -577,23 +578,27 @@ def test_a_fused_format_stack_keeps_no_plan_of_its_parts(loaded_format, lm):
         assert format_linear._KEPT not in vars(glu[name]), name
 
 
-def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
-    """mlx-vlm keeps gate/up for the verifier: ``mx.split`` returns views
-    of the fused stack (MLX 0.32.4), so the routed gate/up bytes stay
-    resident once: each view reports the fused buffer, the three report
-    one buffer together, and active memory does not grow."""
+def _assert_kept_views_share_the_fused_buffer():
+    """Fuse a VLM format stack (with a bias, which takes the axis=-1
+    split) and assert its kept gate/up views share the fused buffers."""
+    mx.clear_cache()
     glu = _format_glu()
+    for proj in (glu.gate_proj, glu.up_proj):
+        proj["bias"] = mx.zeros((E, INTER), mx.float32)
     mx.eval(glu.parameters())
     mx.synchronize()
+    mx.clear_cache()
+    gc.collect()
     gate, up = glu.gate_proj, glu.up_proj
-    names = sorted(gate._tensors)
+    names = sorted(gate._tensors) + ["bias"]
     before = mx.get_active_memory()
     model = _FakeQwen4Model()
     model.named_modules = lambda: [("experts", glu)]
     assert apply_qwen35_moe_gate_up_fusion(model) == 1
     mx.synchronize()
     fused = glu.gate_up_proj
-    assert mx.get_active_memory() == before
+    # A copy adds the routed bytes; a collected cycle can only free some.
+    assert mx.get_active_memory() <= before
     for name in names:
         assert fused[name].nbytes == gate[name].nbytes + up[name].nbytes
         assert mx.get_array_buffer_size(gate[name]) == mx.get_array_buffer_size(
@@ -605,6 +610,25 @@ def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
         assert mx.get_array_buffer_size(
             fused[name], gate[name], up[name]
         ) == mx.get_array_buffer_size(fused[name])
+
+
+def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
+    """mlx-vlm keeps gate/up for the verifier: ``mx.split`` returns views
+    of the fused stack (MLX 0.32.4), so the routed gate/up bytes stay
+    resident once: each view reports the fused buffer, the three report
+    one buffer together, and active memory does not grow."""
+    _assert_kept_views_share_the_fused_buffer()
+
+
+def test_vlm_kept_gate_up_views_ignore_warm_buffer_cache(loaded_format):
+    """The reading holds on a warm allocator: a cached three-page buffer
+    is not reused as the fused stack's (the cleared cache and the ``<=``
+    bound keep the equality from measuring the cache)."""
+    warm = mx.zeros((49152,), dtype=mx.uint8)
+    mx.eval(warm)
+    del warm
+    mx.synchronize()
+    _assert_kept_views_share_the_fused_buffer()
 
 
 def test_a_batched_verify_of_a_fused_format_stack_never_runs_its_views(

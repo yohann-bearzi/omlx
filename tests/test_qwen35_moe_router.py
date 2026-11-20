@@ -14,6 +14,7 @@ import mlx.nn as nn
 import numpy as np
 import pytest
 
+import omlx.patches.qwen35_moe_router as router
 from omlx.patches.qwen35_moe_router import fused_router_topk, router_eligible
 
 K = 8
@@ -371,3 +372,10 @@ def test_router_gemv_declines_layouts_mlx_reduces_differently():
     assert router_logits_row(f32, mx.zeros((512, 2048), mx.float32)) is None
     # The weight sets the kernel dtype: rows of another dtype stay stock.
     assert router_logits_row(f16, mx.zeros((512, 2048), mx.bfloat16)) is None
+
+
+def test_module_docstring_names_the_rows_header():
+    """The rows fallbacks take the dtype-generic header; only
+    topk_header(dtype) is built for one dtype. The docstring says which."""
+    assert "``softmax_topk_row``'s body with" in (router.__doc__ or "")
+    assert "``TOPK_HEADER`` verbatim" in (router.__doc__ or "")
