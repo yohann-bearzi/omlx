@@ -16,8 +16,8 @@ kernel rounds once to the activations' dtype: MLX's ``dequantize`` of the
 same weight over float32 copies of the scales and the biases (``scale * q``
 is exact in float32 where it is finite), and what MLX's sorted
 ``gather_qmm`` loads into its tiles. MLX's ``dequantize`` over scales of
-bf16 or fp16 computes in that type, and can differ. It reads runs of 4 and
-8 bits only.
+bf16 or fp16 computes in that type, and can differ. It reads runs of 2, 3, 4,
+5, 6 and 8 bits.
 
 The codes face gives the packed integer levels and the group's map to the
 single and shared SwiGLU sg8 traversal; MLX has no such route.
@@ -628,9 +628,9 @@ def serial_up_header(face: Dot) -> str:
     )
 
 
-# The widths a tile kernel over format layers takes (AffineFormat.tile), and
-# the widths a tile face has (tile_face: the verify kernels read every width
-# MLX quantizes to).
+# The 4- and 8-bit spellings the frozen face digest pins, and every width a
+# tile face reads (tile_face, and AffineFormat.tile over format layers):
+# every width MLX quantizes to.
 _TILE_BITS = (4, 8)
 _TILE_FACE_BITS = (2, 3, 4, 5, 6, 8)
 
@@ -882,7 +882,7 @@ class AffineFormat(QuantFormat):
 
     def tile(self, layer, k: int, n: int) -> Tile | None:
         if (
-            layer.bits not in _TILE_BITS
+            layer.bits not in _TILE_FACE_BITS
             or layer.group_size not in _GROUP_SIZES
             or not all(
                 isinstance(layer.get(name), mx.array)

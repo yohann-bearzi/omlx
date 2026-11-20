@@ -874,6 +874,20 @@ _LAYOUTS = [(bits, gs) for bits in (4, 8) for gs in (32, 64, 128)]
 _DTYPES = [mx.bfloat16, mx.float16]
 
 
+@metal
+@pytest.mark.parametrize("bits", [5, 6])
+def test_a_5_or_6_bit_run_face_is_read_at_the_tightest_row(bits):
+    # K 32 in groups of 32: one group a row, the scales' 8 elements, and a
+    # five- or six-byte run whose own alignment's last load ends exactly at
+    # the row's end.
+    layer = _layer(32, 8, bits, 32, mx.bfloat16)
+    assert formats.tile(layer, 32, 8) is affine.tile_face(bits, 32, mx.bfloat16)
+    want = _float32_decode(layer)
+    exact, rounded = _affine_rows(layer, 32, mx.bfloat16)
+    assert _same(exact, want)
+    assert _same(rounded, want.astype(mx.bfloat16))
+
+
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("bits, group_size", _LAYOUTS)
 @pytest.mark.parametrize("experts", [None, 3])
@@ -907,10 +921,8 @@ def _with(layer, **arrays):
 # What affine has no tile face for, each as a layer of K 256 and N 16 that
 # differs in that alone from one it has a face for.
 _NO_TILE = [
-    "2 bits",
-    "3 bits",
-    "5 bits",
-    "6 bits",
+    "1 bit",
+    "7 bits",
     "groups of 16",
     "float32 scales",
     "biases of another dtype",
@@ -926,9 +938,13 @@ _NO_TILE = [
 
 
 def _no_tile(name):
-    bits = {"2 bits": 2, "3 bits": 3, "5 bits": 5, "6 bits": 6}.get(name, 4)
+    bits = 4
     dtype = mx.float32 if name == "float32 scales" else mx.bfloat16
     layer = _layer(256, 16, bits, 64, dtype)
+    if name in ("1 bit", "7 bits"):
+        layer.bits = 1 if name == "1 bit" else 7
+        layer["weight"] = mx.zeros((16, 256 * layer.bits // 32), mx.uint32)
+        return layer
     if name == "groups of 16":
         layer.group_size = 16
         return _with(
@@ -1055,9 +1071,8 @@ def test_affine_tile_weights_are_mlx_dequantize_in_float32(bits, group_size, dty
     assert _same(rounded, want.astype(dtype))
 
 
-# The widths the verify kernels read that no tile kernel over format layers
-# takes (AffineFormat.tile gives 4 and 8 bits): their runs of 2, 3, 5 and 6
-# bytes as one 64-bit word.
+# Every width a tile face reads: the runs of 2, 3, 5 and 6 bytes at their
+# own alignment.
 @metal
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("bits", [2, 3, 5, 6])
@@ -1067,7 +1082,7 @@ def test_every_width_s_tile_weights_are_mlx_dequantize_in_float32(
 ):
     layer = _layer(512, 24, bits, group_size, dtype, experts=3, seed=bits + group_size)
     want = _float32_decode(layer).reshape(72, 512)
-    assert formats.tile(layer, 512, 24) is None
+    assert formats.tile(layer, 512, 24) is affine.tile_face(bits, group_size, dtype)
     face = affine.tile_face(bits, group_size, dtype)
     operands = [layer[name] for name in ("weight", *face.tensors)]
     exact, rounded = testing.tile_rows(face, operands, 512, range(72), dtype)
@@ -1124,3 +1139,8 @@ def test_affine_tile_weights_hold_on_canaries(name, bits, dtype):
         assert not mx.any(exact).item()
     if name == "past_fp16" and dtype == mx.float16:
         assert mx.all(exact == 32800.0).item() and mx.all(rounded == 32800.0).item()
+
+
+def test_quant_formats_doc_affine_tile_bits_matches_code():
+    assert "two words read and shifted" not in _PAGE
+    assert "`AffineFormat.tile` takes 4 and 8 bits" not in _PAGE
