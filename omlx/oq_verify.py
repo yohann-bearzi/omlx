@@ -242,7 +242,7 @@ def _writer_failure(
 
     The report is written first and every write is guarded: recording the
     failure must not replace the error that failed the check."""
-    detail = str(exc) or type(exc).__name__
+    detail = str(exc).strip() or type(exc).__name__
     try:
         (output / "VERIFY-FAILED.txt").write_text(f"{detail}\n", encoding="utf-8")
     except Exception:
@@ -283,15 +283,26 @@ def verify_written_format_checkpoint(
     The load runs in ``verifying()``, which lifts the unverified refusal for
     this checkpoint alone; the family gate still applies. It runs on the MLX
     executor thread the engines load on, with the process-wide state a load
-    sets restored after. On any failure the staged folder keeps
-    ``verified: false`` with the reason and a ``VERIFY-FAILED.txt`` report, and
-    the error is raised as a ``ValueError``/``RuntimeError``; on success the
-    caller may mark it verified and rename it into place.
+    sets restored after. On any failure of the staged run the staged folder
+    keeps ``verified: false`` with the reason and a ``VERIFY-FAILED.txt``
+    report, and the error is raised as a ``ValueError``/``RuntimeError``; on
+    success the caller may mark it verified and rename it into place. An
+    invalid caller-supplied ``prompt`` is refused before the staged folder is
+    read or written.
     """
     from . import oq
     from .patches import format_load
 
     output = Path(output)
+    if prompt is not None:
+        if not isinstance(prompt, mx.array):
+            prompt = np.asarray(prompt, dtype=np.int32)
+        if prompt.ndim not in (1, 2):
+            raise ValueError(
+                f"the verification prompt must be 1-D or 2-D, not {prompt.ndim}-D"
+            )
+        if prompt.size == 0:
+            raise ValueError("the verification prompt must contain at least one token")
 
     def run() -> None:
         config = json.loads((output / "config.json").read_text())
@@ -303,12 +314,23 @@ def verify_written_format_checkpoint(
                 with np.load(snapshot) as reference:
                     if "prompt" in reference:
                         chosen = reference["prompt"]
-        chosen = np.asarray(chosen, dtype=np.int32)
-        if chosen.ndim == 1:
-            chosen = chosen[None]
-        if chosen.size == 0:
-            raise ValueError("the verification prompt must contain at least one token")
-        prompt_mx = mx.array(chosen)
+        if isinstance(chosen, mx.array):
+            prompt_mx = chosen.astype(mx.int32)
+            if prompt_mx.ndim == 1:
+                prompt_mx = prompt_mx[None]
+        else:
+            chosen = np.asarray(chosen, dtype=np.int32)
+            if chosen.ndim == 1:
+                chosen = chosen[None]
+            if chosen.ndim not in (1, 2):
+                raise ValueError(
+                    f"the verification prompt must be 1-D or 2-D, not {chosen.ndim}-D"
+                )
+            if chosen.size == 0:
+                raise ValueError(
+                    "the verification prompt must contain at least one token"
+                )
+            prompt_mx = mx.array(chosen)
         model = layers = out = logits = None
         with (
             oq._load_globals_kept(config),
@@ -369,10 +391,17 @@ def verify_written_format_checkpoint(
                     with layer_by_layer(layers):
                         out = model(prompt_mx)
                 logits = getattr(out, "logits", out)
+                if not isinstance(logits, mx.array):
+                    raise RuntimeError(
+                        "the written checkpoint's forward produced "
+                        f"{type(logits).__name__}, not logits"
+                    )
                 mx.eval(logits)
-                if getattr(logits, "size", 0) == 0 or not bool(
-                    mx.all(mx.isfinite(logits))
-                ):
+                if logits.size == 0:
+                    raise RuntimeError(
+                        "the written checkpoint's forward produced empty logits"
+                    )
+                if not bool(mx.all(mx.isfinite(logits))):
                     raise RuntimeError(
                         "the written checkpoint's forward produced non-finite logits"
                     )

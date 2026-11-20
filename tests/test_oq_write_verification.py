@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from omlx import oq
@@ -454,6 +455,64 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
     assert entered == names
 
 
+_VLM_CONTEXTS = (
+    "_strip_audio_config_if_orphaned",
+    "_strip_vision_config_if_orphaned",
+    "_drop_gemma4_mlx_shared_kv_extras_on_load",
+    "_derive_gemma4_global_kv_on_load",
+    "_preserve_gemma4_unified_image_processor_on_load",
+    "_force_minimax_m3_moe_sanitize_on_load",
+    "_force_qwen4_exp_sanitize_on_load",
+    "_remap_nested_visual_on_load",
+    "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+)
+
+
+def _stub_vlm_verification(monkeypatch, model):
+    from contextlib import contextmanager, nullcontext
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq
+
+    for name in _VLM_CONTEXTS:
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: model)
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+
+
+def test_refused_empty_prompt_leaves_staged_config_untouched(tmp_path):
+    import numpy as np
+
+    from omlx import oq_verify
+
+    output = tmp_path / "staged"
+    output.mkdir()
+    config = output / "config.json"
+    config.write_text(
+        json.dumps(
+            {
+                "omlx_verification": {"verified": True, "mode": "toy"},
+                "marker": 1,
+            }
+        )
+    )
+    before = config.read_bytes()
+    with pytest.raises(ValueError, match="at least one token"):
+        oq_verify.verify_written_format_checkpoint(
+            output, prompt=np.array([], dtype=np.int32)
+        )
+    assert config.read_bytes() == before
+    assert not (output / "VERIFY-FAILED.txt").exists()
+
+
 def test_empty_prompt_or_logits_fails_verification(tmp_path, monkeypatch):
     from contextlib import contextmanager, nullcontext
 
@@ -500,8 +559,9 @@ def test_empty_prompt_or_logits_fails_verification(tmp_path, monkeypatch):
         oq_verify.verify_written_format_checkpoint(
             output, prompt=np.array([], dtype=np.int32)
         )
-    with pytest.raises(RuntimeError, match="non-finite"):
+    with pytest.raises(RuntimeError, match="empty logits"):
         oq_verify.verify_written_format_checkpoint(output)
+    assert "empty logits" in (output / "VERIFY-FAILED.txt").read_text()
 
 
 def test_writer_failure_uses_exception_type_when_message_empty(tmp_path):
@@ -512,6 +572,152 @@ def test_writer_failure_uses_exception_type_when_message_empty(tmp_path):
     assert (tmp_path / "VERIFY-FAILED.txt").read_text().strip() == "RuntimeError"
     record = json.loads((tmp_path / "config.json").read_text())["omlx_verification"]
     assert record["reason"] == "writer verification failed: RuntimeError"
+    whitespace = tmp_path / "whitespace"
+    whitespace.mkdir()
+    (whitespace / "config.json").write_text(json.dumps({}))
+    oq_verify._writer_failure(whitespace, RuntimeError("   "), mode="toy")
+    assert (whitespace / "VERIFY-FAILED.txt").read_text().strip() == "RuntimeError"
+
+
+def test_mx_array_prompt_stays_on_mlx_thread(tmp_path, monkeypatch):
+    import mlx.nn as nn
+
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    in_mlx = [False]
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen = None
+
+        def __call__(self, x):
+            self.seen = tuple(x.shape)
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    model = Model()
+    _stub_vlm_verification(monkeypatch, model)
+    real_asarray = oq_verify.np.asarray
+
+    def guarded(a, *args, **kwargs):
+        assert not isinstance(a, mx.array) or in_mlx[0]
+        return real_asarray(a, *args, **kwargs)
+
+    monkeypatch.setattr(oq_verify.np, "asarray", guarded)
+
+    def on_mlx(run):
+        in_mlx[0] = True
+        try:
+            return run()
+        finally:
+            in_mlx[0] = False
+
+    monkeypatch.setattr(oq, "_on_mlx_thread", on_mlx)
+    oq_verify.verify_written_format_checkpoint(
+        output, prompt=mx.array([7], dtype=mx.int32)
+    )
+    assert model.seen == (1, 1)
+
+
+def test_non_array_logits_names_the_type(tmp_path, monkeypatch):
+    import mlx.nn as nn
+
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return (mx.zeros((1, 2, 4)),)
+
+        def close(self):
+            pass
+
+    _stub_vlm_verification(monkeypatch, Model())
+    with pytest.raises(RuntimeError, match="tuple, not logits"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert "tuple, not logits" in (output / "VERIFY-FAILED.txt").read_text()
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param(lambda: np.array(5, dtype=np.int32), id="0d"),
+        pytest.param(lambda: np.ones((1, 1, 2), dtype=np.int32), id="3d"),
+    ],
+)
+def test_refused_bad_rank_prompt_leaves_config_untouched(tmp_path, monkeypatch, prompt):
+    import mlx.nn as nn
+    import numpy as np
+
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    config = output / "config.json"
+    config.write_text(
+        json.dumps({"omlx_verification": {"verified": True, "mode": "toy"}})
+    )
+    before = config.read_bytes()
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    _stub_vlm_verification(monkeypatch, Model())
+    with pytest.raises(ValueError, match="1-D or 2-D"):
+        oq_verify.verify_written_format_checkpoint(output, prompt=prompt())
+    assert config.read_bytes() == before
+    assert not (output / "VERIFY-FAILED.txt").exists()
+
+
+def test_empty_snapshot_prompt_fails_verification(tmp_path, monkeypatch):
+    import mlx.nn as nn
+    import numpy as np
+
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    (output / "verify").mkdir()
+    np.savez(output / "verify" / "reference.npz", prompt=np.array([], dtype=np.int32))
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    _stub_vlm_verification(monkeypatch, Model())
+    with pytest.raises(ValueError, match="at least one token"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert "at least one token" in (output / "VERIFY-FAILED.txt").read_text()
+
+
+def test_refused_empty_prompt_does_not_read_config(tmp_path):
+    import numpy as np
+
+    from omlx import oq_verify
+
+    absent = tmp_path / "absent"
+    with pytest.raises(ValueError, match="at least one token"):
+        oq_verify.verify_written_format_checkpoint(
+            absent, prompt=np.array([], dtype=np.int32)
+        )
+    assert not absent.exists()
 
 
 def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
