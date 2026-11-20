@@ -245,7 +245,7 @@ def qmv_fast_layout(k: int, n: int, bits: int, *, gathered: bool = False) -> boo
 # once per K block and output column, then every row accumulates them against
 # its own inputs. Each term and each accumulation step is qdot's, in qdot's
 # order (the 3/5/6-bit runs cover at most two packs, so qdot's cumulative
-# pointer steps are the 8i/5i and 4i/3i offsets used here). A tile holds the
+# pointer steps are the 8i/3i, 8i/5i and 4i/3i offsets used here). A tile holds the
 # branch of its own width.
 _DECODED_DOT = r"""
 constant constexpr int W_TERMS = __W_TERMS__;

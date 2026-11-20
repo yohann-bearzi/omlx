@@ -872,11 +872,12 @@ def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     assert "\nfor (int k = 0; k < WHOLE; k += L::BLOCK) {\n" in unrolled.header
 
 
-# Matrices whose every tensor is whole pages of 16 KiB (MLX's buffer is the
-# tensor, the cache off), with rows a launch's last pack only partly holds:
-# the shared-rows skeleton over 4096 rows in packs of 3, rolled and unrolled
-# (the codes and the scales that finish reads), and a format linear of 4
-# outputs (two simdgroups a tile of 8: the second has no row).
+# Matrices whose rows' tensors are whole pages of 16 KiB (MLX's buffer is the
+# tensor, the cache off: the toy's codes and scales, the linear's weight),
+# with rows a launch's last pack only partly holds: the shared-rows skeleton
+# over 4096 rows in packs of 3, rolled and unrolled (the codes and the scales
+# that finish reads), and a format linear of 4 outputs (two simdgroups a tile
+# of 8: the second has no row).
 _PAST_THE_MATRIX = r"""
 import numpy as np
 import mlx.core as mx
@@ -965,6 +966,8 @@ def test_shared_rows_take_1_to_16_vectors_of_a_face_with_a_vpt():
     for n in (1.5, True):
         with pytest.raises(ValueError, match="one row or more"):
             testing.shared_rows(_toy("many"), operands, xs[:2], n)
+        with pytest.raises(ValueError, match="one row or more"):
+            testing.shared_rows(_toy("many"), operands, xs[:2], 16, rps=n)
         with pytest.raises(ValueError, match="one launch or more"):
             testing.dot_rows(_toy("many"), operands, xs[0], n, packs=(1, 0))
     tile = SimpleNamespace(key="tile")

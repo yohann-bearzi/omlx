@@ -2205,6 +2205,41 @@ def test_a_window_s_reshapes_take_the_gpu_s_stream(monkeypatch):
     assert _same_bits(want, y)
 
 
+def test_every_reshape_of_a_routed_result_takes_the_gpu_s_stream(monkeypatch):
+    """One row through the window entry, a batched one-token decode and an
+    armed verify window, under a CPU default stream: each result's reshape
+    is given the GPU's stream, and each is the one-by-one call's."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import (
+        Qwen3_5BatchInvariantForward,
+    )
+
+    block = _block(512, 256, top_k=8, experts=128)
+    one, batched, window = (
+        _rows_of(block, 1, 1),
+        _rows_of(block, 2, 1),
+        _rows_of(block, 1, 3),
+    )
+    wants = [_one_by_one(block, x) for x in (one, batched, window)]
+    reshape, streams = mx.reshape, []
+
+    def recorded(*args, **named):
+        streams.append(named.get("stream"))
+        return reshape(*args, **named)
+
+    monkeypatch.setattr(mx, "reshape", recorded)
+    monkeypatch.setattr(routed, "is_row_exact_armed", lambda: True)
+    feed_forward = Qwen3_5BatchInvariantForward._feed_forward
+    with mx.stream(mx.cpu):
+        got = [
+            routed.routed_verify_window(block, one),
+            block(batched),
+            feed_forward(None, block, window),
+        ]
+    assert len(streams) >= 3 and all(stream == mx.gpu for stream in streams)
+    for y, want, x in zip(got, wants, (one, batched, window), strict=True):
+        assert _same_bits(y.reshape(want.shape), want), x.shape
+
+
 def test_a_router_of_any_module_scores_the_stacks_experts():
     """A router of the block's own module type is checked as a linear one,
     and a weight of no axis declines the plan instead of raising."""
@@ -2225,17 +2260,17 @@ def test_a_router_of_any_module_scores_the_stacks_experts():
 
 
 def test_a_block_s_plan_is_kept_for_its_top_k_s_type(monkeypatch):
-    """8 and 8.0 are two plans: a top-k set again as a float is planned
-    again, not served the integer's."""
+    """8 and 8.0 are two plans: a top-k or an expert count set again as a
+    float is planned again, not served the integer's."""
     block = _block(512, 256, top_k=8, experts=128)
     assert routed._cached_plan(block) is not None
     built = []
-    monkeypatch.setattr(
-        routed, "_build_plan", lambda block: built.append(block.top_k)
-    )
+    monkeypatch.setattr(routed, "_build_plan", lambda block: built.append(block.top_k))
     block.top_k = 8.0
     routed._cached_plan(block)
-    assert built == [8.0]
+    block.num_experts = 128.0
+    routed._cached_plan(block)
+    assert built == [8.0, 8.0]
 
 
 def test_a_block_s_plan_follows_its_top_k_and_expert_count():
