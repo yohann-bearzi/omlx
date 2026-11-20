@@ -947,6 +947,19 @@ def test_a_proven_block_skips_both_face_dtype_checks(monkeypatch):
     assert _same_bits(gather.fused_switch(switch, x, indices), want)
 
 
+def test_an_unproven_block_checks_each_face_s_activation_dtype(monkeypatch):
+    switch = _switch()
+    x, indices = _block(1, 4)
+    gate = formats.dot(switch.get("gate_up_proj"), HIDDEN, 2 * INTER)
+    down = formats.dot(switch.get("down_proj"), INTER, HIDDEN)
+    assert gate is not None and down is not None
+    for face in (gate, down):
+        monkeypatch.setattr(
+            Dot, "exact_for", lambda self, dtype, face=face: self is not face
+        )
+        assert gather.fused_switch(switch, x, indices) is None
+
+
 @pytest.mark.parametrize(
     "rows,top_k,proves",
     [(3, (2**30 - 1) // 3, True), (4, 2**28, False), (4, 2**28 + 1, False)],
