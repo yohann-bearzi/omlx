@@ -19,6 +19,10 @@ raises an audit event and costs several times more.
 
 Built values must not reference ``module`` itself (only its children and
 tensors), so the entry creates no reference cycle through the module.
+
+``clear_cached`` drops a module's entries and advances a permanent per-module
+``_omlx_clear_epoch`` int in its ``__dict__``: a build that overlapped the
+clear returns without publishing.
 """
 
 from __future__ import annotations
@@ -85,7 +89,8 @@ def cached_per_module(
 
 
 def clear_cached(module: nn.Module) -> None:
-    """Drop all ``cached_per_module`` entries stored on ``module``."""
+    """Drop a module's ``cached_per_module`` entries and advance its
+    ``_omlx_clear_epoch`` so overlapping builds return without publishing."""
     with _SLOTS_LOCK:
         d = module.__dict__
         for slot in _SLOTS:

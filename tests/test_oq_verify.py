@@ -590,6 +590,26 @@ def test_clear_cached_is_thread_safe(monkeypatch):
     assert refs == [2] * 16
 
 
+def test_clear_advances_epoch_before_releasing_lock(monkeypatch):
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    seen = []
+    lock = module_cache._SLOTS_LOCK
+
+    class ObserveRelease:
+        def __enter__(self):
+            lock.acquire()
+
+        def __exit__(self, *exc):
+            seen.append(mod.__dict__.get(module_cache._EPOCH_SLOT, 0))
+            lock.release()
+
+    monkeypatch.setattr(module_cache, "_SLOTS_LOCK", ObserveRelease())
+    module_cache.clear_cached(mod)
+    assert seen == [1]
+
+
 def test_streamed_forward_accepts_a_one_shot_layer_iterator():
     layer = nn.Linear(32, 16)
     with oq_verify.layer_by_layer(iter([layer])):
