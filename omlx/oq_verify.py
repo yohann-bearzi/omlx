@@ -361,6 +361,7 @@ def verify_written_format_checkpoint(
                             _drop_gemma4_mlx_shared_kv_extras_on_load,
                             _force_minimax_m3_moe_sanitize_on_load,
                             _force_qwen4_exp_sanitize_on_load,
+                            _load_optiq_vision_sidecar_on_load,
                             _preserve_gemma4_unified_image_processor_on_load,
                             _remap_nested_visual_on_load,
                             _strip_audio_config_if_orphaned,
@@ -379,13 +380,14 @@ def verify_written_format_checkpoint(
                             _remap_nested_visual_on_load(output),
                             _transpose_qwen35_mlx_vision_patch_embed_on_load(output),
                         ):
-                            model = vlm_utils.load_model(
-                                output,
-                                lazy=True,
-                                trust_remote_code=trust_remote_code,
-                                strict=True,
-                            )
-                            oq.check_loaded(model)
+                            with _load_optiq_vision_sidecar_on_load(output):
+                                model = vlm_utils.load_model(
+                                    output,
+                                    lazy=True,
+                                    trust_remote_code=trust_remote_code,
+                                    strict=True,
+                                )
+                                oq.check_loaded(model)
                     else:
                         from omlx.utils.model_loading import lm_load_compat as lm_load
 

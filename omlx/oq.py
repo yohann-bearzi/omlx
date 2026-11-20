@@ -4769,6 +4769,7 @@ def _normalize_text_only_in_config(config: dict) -> None:
         "eoa_token_id",
         "eoa_token_index",
         "processor_config",
+        "optiq_vision",
     ):
         config.pop(key, None)
 
@@ -5297,6 +5298,67 @@ def _copy_sidecar_tree(src: Path, dst: Path) -> None:
             shutil.copy(path, target)
 
 
+def _sidecar_is_merged(source: Path, sidecar: Path) -> bool:
+    """Whether the source's own shards already carry the sidecar file."""
+    return sidecar.parent == source.resolve() or any(
+        f.resolve() == sidecar for f in _source_weight_files(source)
+    )
+
+
+def _optiq_vision_sidecar(source: Path) -> Path | None:
+    """The config-declared OptiQ vision sidecar inside ``source``, if any.
+
+    Returns None when ``config.json`` declares no sidecar. A declaration that
+    points outside the model directory or to a non-``.safetensors`` file
+    raises ``ValueError``; a missing file raises ``FileNotFoundError``, as
+    serving's resolver does.
+    """
+    try:
+        config = json.loads((source / "config.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(config, dict):
+        return None
+    declared = config.get("optiq_vision")
+    if not isinstance(declared, dict):
+        return None
+    relative = declared.get("sidecar")
+    if not isinstance(relative, str) or not relative:
+        return None
+    root = source.resolve()
+    sidecar = (root / relative).resolve()
+    try:
+        sidecar.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(
+            "OptiQ vision sidecar must stay inside the model directory: "
+            f"{relative}"
+        ) from exc
+    if sidecar.suffix != ".safetensors":
+        raise ValueError(f"OptiQ vision sidecar must be a safetensors file: {sidecar}")
+    if not sidecar.is_file():
+        raise FileNotFoundError(f"OptiQ vision sidecar not found: {sidecar}")
+    return sidecar
+
+
+def _normalize_optiq_vision_in_config(config: dict, source: Path) -> None:
+    """Rebase a declared OptiQ sidecar into the output, or drop a root one."""
+    declared = config.get("optiq_vision")
+    if not isinstance(declared, dict):
+        return
+    sidecar = _optiq_vision_sidecar(source)
+    if sidecar is None:
+        return
+    root = source.resolve()
+    if _sidecar_is_merged(source, sidecar):
+        config.pop("optiq_vision", None)
+        return
+    config["optiq_vision"] = {
+        **declared,
+        "sidecar": sidecar.relative_to(root).as_posix(),
+    }
+
+
 def _copy_model_sidecars(
     source: Path, output: Path, *, text_only: bool = False, model_type: str = ""
 ) -> None:
@@ -5306,7 +5368,10 @@ def _copy_model_sidecars(
     modality metadata that :func:`_normalize_text_only_in_config` drops from
     the output config. A processor config that carries an inline chat
     template is kept regardless, since that template is not modality
-    metadata and may be the only copy.
+    metadata and may be the only copy. A config-declared OptiQ vision
+    sidecar is copied from its subdirectory unless ``text_only``; a root-level
+    sidecar is not copied, and :func:`_normalize_optiq_vision_in_config` drops
+    its declaration.
     """
     for pattern in _SIDECAR_PATTERNS:
         for src_file in source.glob(pattern):
@@ -5320,6 +5385,17 @@ def _copy_model_sidecars(
 
     for py_file in source.glob("*.py"):
         shutil.copy(py_file, output / py_file.name)
+
+    if not text_only:
+        sidecar = _optiq_vision_sidecar(source)
+        if sidecar is not None and not _sidecar_is_merged(source, sidecar):
+            destination = output / sidecar.relative_to(source.resolve())
+            if destination.exists():
+                raise ValueError(
+                    f"OptiQ vision sidecar would overwrite existing file: {destination}"
+                )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(sidecar, destination)
 
     # LFM3 speech decoding loads its codec separately from the model weights.
     if not text_only and model_type == "lfm3_omni":
@@ -8101,6 +8177,8 @@ def _calibrate_oq_run(run: _OQRun) -> None:
     capture_skip = _muse_spark_passthrough_capture_skip(config, oq_level, group_size)
     if capture_skip:
         config["_oq_imatrix_capture_skip"] = capture_skip
+    if not text_only:
+        _optiq_vision_sidecar(source)
 
     output.mkdir(parents=True, exist_ok=True)
 
@@ -8217,6 +8295,7 @@ def _calibrate_oq_run(run: _OQRun) -> None:
                 working_dir=str(output.parent),
                 trust_remote_code=trust_remote_code,
                 preserve_mtp=preserve_mtp,
+                text_only=text_only,
             )
             proxy_bytes = _checkpoint_storage_bytes(candidate.glob("*.safetensors"))
             proxy_resident_bytes = _calibration_resident_checkpoint_bytes(
@@ -9349,6 +9428,8 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         _normalize_text_only_in_config(output_config)
+    else:
+        _normalize_optiq_vision_in_config(output_config, source)
     # The DSpark draft is copied unchanged, so the config keeps declaring it.
     bundled_draft = inkling2_layout.is_inkling2(config) and (
         inkling2_layout.has_bundled_draft(source)
@@ -13437,6 +13518,8 @@ def _written_layout(
         written.pop(key, None)
     if text_only:
         _normalize_text_only_in_config(written)
+    else:
+        _normalize_optiq_vision_in_config(written, source)
     bundled_draft = inkling2_layout.is_inkling2(config) and (
         inkling2_layout.has_bundled_draft(source)
     )
@@ -14226,6 +14309,7 @@ def _build_proxy_for_sensitivity(
     working_dir: str | None = None,
     trust_remote_code: bool = False,
     preserve_mtp: bool = False,
+    text_only: bool = False,
 ) -> Path:
     """Build a temporary uniform 4-bit proxy for calibration passes.
 
@@ -14244,6 +14328,9 @@ def _build_proxy_for_sensitivity(
     ``preserve_mtp`` keeps the MTP head in the proxy so the imatrix head
     pass can exercise its linears; sensitivity-only proxies leave it off.
 
+    ``text_only`` drops a declared OptiQ vision sidecar from the proxy config
+    and skips copying it, as a text-only calibration never reads it.
+
     The caller is responsible for deleting the returned directory.
     """
     # Reserve a unique temp name and let the streaming writer create it.
@@ -14255,6 +14342,7 @@ def _build_proxy_for_sensitivity(
         dtype=dtype,
         trust_remote_code=trust_remote_code,
         preserve_mtp=preserve_mtp,
+        text_only=text_only,
     )
     return proxy_dir
 
@@ -14266,6 +14354,7 @@ def _build_streaming_proxy_for_sensitivity(
     dtype: str,
     trust_remote_code: bool = False,
     preserve_mtp: bool = False,
+    text_only: bool = False,
 ) -> None:
     """Build a loadable 4-bit sensitivity proxy without loading the source.
 
@@ -14477,6 +14566,10 @@ def _build_streaming_proxy_for_sensitivity(
         output_config.pop(temp_key, None)
     if not preserve_mtp:
         _normalize_mtp_in_config(output_config)
+    if text_only:
+        output_config.pop("optiq_vision", None)
+    else:
+        _normalize_optiq_vision_in_config(output_config, source)
     quant_info = dict(quantization_config)
     for key, val in per_layer_config.items():
         quant_info[key] = val
@@ -14486,7 +14579,7 @@ def _build_streaming_proxy_for_sensitivity(
     with open(output / "config.json", "w") as f:
         json.dump(output_config, f, indent=2, ensure_ascii=False)
 
-    _copy_model_sidecars(source, output)
+    _copy_model_sidecars(source, output, text_only=text_only)
 
 
 def _measure_sensitivity_from_quantized_model(

@@ -955,9 +955,7 @@ class TestSourceHasNextnTensors:
             },
         }
 
-        assert _source_has_nextn_tensors(
-            [f"{prefix}.eh_proj.weight"], config
-        ) is True
+        assert _source_has_nextn_tensors([f"{prefix}.eh_proj.weight"], config) is True
 
     def test_rejects_backbone_only_weights(self):
         config = {
@@ -1316,14 +1314,9 @@ class TestStreamingHelpers:
         assert (bits, gs, mode) == (expected_bits, 32, "affine")
 
     def test_non_qwen4_ngram_keeps_default_group_size(self):
-        path = (
-            "model.layers.1.ple.ple_embedding.ngram_embedding."
-            "shards.0.weight"
-        )
+        path = "model.layers.1.ple.ple_embedding.ngram_embedding." "shards.0.weight"
 
-        bits, gs, mode = _get_predicate_bits(
-            path, {"model_type": "other"}, 4, 64
-        )
+        bits, gs, mode = _get_predicate_bits(path, {"model_type": "other"}, 4, 64)
 
         assert (bits, gs, mode) == (4, 64, "affine")
 
@@ -1492,6 +1485,7 @@ class TestStreamingHelpers:
             "_oq_use_budget_plan": True,
             "_oq_sensitivity_map": {str(i): 1.0 - i / 8 for i in range(8)},
         }
+
         def bits(plan, path):
             return plan.boost_map.get(path, {"bits": level})["bits"]
 
@@ -1779,9 +1773,7 @@ class TestLevelBudgetPlan:
     def test_dense_floor_lifts_two_bit_tensors_first(self):
         shapes = self._dense_shapes()
         config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
-        plan = _build_quant_plan(
-            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
-        )
+        plan = _build_quant_plan(shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3)
         assert plan.effective_bpw <= 3.3
         layers = [p for p in shapes if p != "lm_head"]
         assert min(plan.boost_map.get(p, {"bits": 2})["bits"] for p in layers) >= 3
@@ -1793,9 +1785,7 @@ class TestLevelBudgetPlan:
             shapes[f"model.layers.{i}.self_attn.q_proj"] = (960, 960)
             shapes[f"model.layers.{i}.mlp.down_proj"] = (960, 2560)
         config = {"num_hidden_layers": 8, "_oq_use_budget_plan": True}
-        plan = _build_quant_plan(
-            shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3
-        )
+        plan = _build_quant_plan(shapes, config, 2.5, target_bpw=3.1, hard_cap_bpw=3.3)
         q = plan.boost_map["model.layers.0.self_attn.q_proj"]
         down = plan.boost_map["model.layers.0.mlp.down_proj"]
         assert (q["bits"], q["group_size"]) == (3, 64)
@@ -1822,9 +1812,7 @@ class TestLevelBudgetPlan:
             "_oq_use_budget_plan": True,
             "_oq_sensitivity_map": {str(i): float(8 - i) for i in range(8)},
         }
-        plan = _build_quant_plan(
-            shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7
-        )
+        plan = _build_quant_plan(shapes, config, 3, target_bpw=3.5, hard_cap_bpw=3.7)
         assert plan.effective_bpw <= 3.7
         attention = [p for p in shapes if "self_attn" in p]
         # Spread over every attention tensor, not 8-bit next to base 3-bit.
@@ -2134,7 +2122,6 @@ class TestForwardLayer:
         assert isinstance(result, mx.array)
         assert aux == "next_topk"
         assert seen == [("mask", None, "prev_topk")]
-
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_failed_signature_probe_does_not_retain_block(self):
@@ -4017,9 +4004,10 @@ class TestModelExceedsRamGuard:
             str(path),
         )
 
-        assert _calibration_resident_checkpoint_bytes(
-            tmp_path, {"model_type": "llama"}
-        ) == path.stat().st_size
+        assert (
+            _calibration_resident_checkpoint_bytes(tmp_path, {"model_type": "llama"})
+            == path.stat().st_size
+        )
 
     @pytest.mark.parametrize("capacity_gib", [16, 32, 64])
     def test_budget_reserves_25_percent_on_smaller_systems(
@@ -4268,9 +4256,17 @@ class TestBuildProxyForSensitivity:
             dtype,
             trust_remote_code=False,
             preserve_mtp=False,
+            text_only=False,
         ):
             calls.append(
-                (model_path, output_path, dtype, trust_remote_code, preserve_mtp)
+                (
+                    model_path,
+                    output_path,
+                    dtype,
+                    trust_remote_code,
+                    preserve_mtp,
+                    text_only,
+                )
             )
             output_path.mkdir()
 
@@ -4282,7 +4278,7 @@ class TestBuildProxyForSensitivity:
         )
 
         assert calls == [
-            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True, False)
+            (str(tmp_path / "src_model"), proxy_dir, "bfloat16", True, False, False)
         ]
         assert proxy_dir.exists()
 
@@ -4408,6 +4404,47 @@ class TestBuildProxyForSensitivity:
         assert (out / "model.safetensors").exists()
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_text_only_streaming_proxy_skips_broken_optiq_declaration(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        out = tmp_path / "proxy"
+        src.mkdir()
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 1,
+                    "optiq_vision": {"sidecar": "optiq/missing.safetensors"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        np_save(
+            {
+                "model.layers.0.self_attn.q_proj.weight": np.ones(
+                    (8, 64), dtype=np.float16
+                ),
+                "model.layers.0.input_layernorm.weight": np.ones(
+                    (64,), dtype=np.float16
+                ),
+            },
+            str(src / "model.safetensors"),
+        )
+
+        with (
+            patch("omlx.oq._build_model_sanitizer", return_value=None),
+            patch("omlx.oq._build_non_quantizable_set", return_value=set()),
+        ):
+            _build_streaming_proxy_for_sensitivity(
+                str(src), out, dtype="bfloat16", text_only=True
+            )
+
+        config = json.loads((out / "config.json").read_text(encoding="utf-8"))
+        assert "optiq_vision" not in config
+        assert not (out / "optiq").exists()
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_qwen4_streaming_proxy_records_group32_for_ngram_table(self, tmp_path):
         """The BF16-source calibration proxy must match Qwen4 PLE layout."""
         from safetensors.numpy import save_file as np_save
@@ -4429,12 +4466,8 @@ class TestBuildProxyForSensitivity:
         np_save(
             {
                 f"{table}.weight": np.ones((2, 160), dtype=np.float16),
-                f"{prefix}.key_proj.weight": np.ones(
-                    (32, 256), dtype=np.float16
-                ),
-                f"{prefix}.value_proj.weight": np.ones(
-                    (32, 256), dtype=np.float16
-                ),
+                f"{prefix}.key_proj.weight": np.ones((32, 256), dtype=np.float16),
+                f"{prefix}.value_proj.weight": np.ones((32, 256), dtype=np.float16),
             },
             str(src / "model.safetensors"),
         )
@@ -4476,8 +4509,7 @@ class TestBuildProxyForSensitivity:
         (src / "config.json").write_text(json.dumps(config), encoding="utf-8")
         raw = "model.language_model.layers.0.mlp.experts"
         ngram = (
-            "model.language_model.layers.0.ple.ple_embedding."
-            "ngram_embedding.shard_0"
+            "model.language_model.layers.0.ple.ple_embedding." "ngram_embedding.shard_0"
         )
         vision = "model.visual.blocks.0.attn.q_proj.weight"
         np_save(
@@ -4497,9 +4529,7 @@ class TestBuildProxyForSensitivity:
             prefix = "language_model.model.layers.0.mlp.switch_mlp"
             weights[f"{prefix}.gate_proj.weight"] = gate
             weights[f"{prefix}.up_proj.weight"] = up
-            weights[f"{prefix}.down_proj.weight"] = weights.pop(
-                f"{raw}.down_proj"
-            )
+            weights[f"{prefix}.down_proj.weight"] = weights.pop(f"{raw}.down_proj")
             return weights
 
         monkeypatch.setattr(
@@ -4697,9 +4727,7 @@ class TestSensitivityRequiredEnforcement:
 
         assert not proxy.exists()
 
-    def test_proxy_reuses_prebuild_live_budget(
-        self, tmp_path, monkeypatch
-    ):
+    def test_proxy_reuses_prebuild_live_budget(self, tmp_path, monkeypatch):
         if not HAS_MLX:
             pytest.skip("mlx not available")
         from safetensors.numpy import save_file as np_save
@@ -5162,7 +5190,8 @@ class TestPreQuantizedSource:
             path,
             {
                 prefix + "gate_up_proj": (packed.tobytes(), [2, 32, 16], "U8"),
-                prefix + "gate_up_proj_weight_scale": (
+                prefix
+                + "gate_up_proj_weight_scale": (
                     block.tobytes(),
                     [2, 32, 2],
                     "F8_E4M3",
@@ -5170,7 +5199,8 @@ class TestPreQuantizedSource:
                 prefix + "gate_up_proj_weight_scale_2": f32(scale2),
                 prefix + "gate_up_proj_input_scale": f32(scale2),
                 prefix + "down_proj": (packed[:, :16].tobytes(), [2, 16, 16], "U8"),
-                prefix + "down_proj_weight_scale": (
+                prefix
+                + "down_proj_weight_scale": (
                     block[:, :16].tobytes(),
                     [2, 16, 2],
                     "F8_E4M3",
@@ -6467,9 +6497,7 @@ class TestBuildModelSanitizerQwen4Compat:
         assert applied == [True]
         assert sanitize is not None
 
-    def test_qwen4_model_path_binds_mmap_and_preserve_mtp(
-        self, tmp_path, monkeypatch
-    ):
+    def test_qwen4_model_path_binds_mmap_and_preserve_mtp(self, tmp_path, monkeypatch):
         from omlx import oq
 
         configured = MagicMock(return_value=True)
@@ -6745,9 +6773,7 @@ class TestMeasureSensitivityVlmMtp:
             prev_active=prev_active,
         )
 
-        _measure_sensitivity(
-            "/fake/vlm-mtp", {"vision_config": {"hidden_size": 1}}, 6
-        )
+        _measure_sensitivity("/fake/vlm-mtp", {"vision_config": {"hidden_size": 1}}, 6)
 
         assert mock_set_active.call_args_list[-1] == ((prev_active,),)
 
@@ -6758,9 +6784,7 @@ class TestMeasureSensitivityVlmMtp:
             has_mtp=False,
         )
 
-        _measure_sensitivity(
-            "/fake/vlm", {"vision_config": {"hidden_size": 1}}, 6
-        )
+        _measure_sensitivity("/fake/vlm", {"vision_config": {"hidden_size": 1}}, 6)
 
         mock_apply_patch.assert_not_called()
         mock_apply_runtime.assert_not_called()
@@ -8027,9 +8051,7 @@ class TestInklingQuantPredicate:
         )
         assert isinstance(result, dict) and result["bits"] == 8
 
-    def test_fused_qkvr_keeps_inkling_attention_at_q8(
-        self, inkling_config, module
-    ):
+    def test_fused_qkvr_keeps_inkling_attention_at_q8(self, inkling_config, module):
         result = universal_quant_predicate(
             "language_model.model.layers.3.self_attn.qkvr_proj.weight",
             module,
@@ -8117,9 +8139,7 @@ class TestInklingSanitizeDiscovery:
                 (hidden, 1, 4), dtype=np.float16
             ),
             "model.llm.embed.weight": np.zeros((16, hidden), dtype=np.float16),
-            "model.mtp.layers.0.input_proj.weight": np.zeros(
-                (4, 4), dtype=np.float16
-            ),
+            "model.mtp.layers.0.input_proj.weight": np.zeros((4, 4), dtype=np.float16),
         }
         path = tmp_path / "weights.safetensors"
         _write_safetensors(str(path), tensors)
@@ -8236,9 +8256,7 @@ class TestQwen4ExpLayerWalk:
             tokens = mx.array([[1, 2, 3, 4, 5, 6]], dtype=mx.int32)
             layers = model.language_model.model.layers
             inputs = model.language_model.model.embed_tokens(tokens)
-            inputs, masks, state = _prepare_layer_inputs(
-                model, layers, tokens, inputs
-            )
+            inputs, masks, state = _prepare_layer_inputs(model, layers, tokens, inputs)
 
             assert inputs.shape == (1, 6, 64)
             assert state["kind"] == "qwen4_exp"
@@ -10093,3 +10111,241 @@ class TestLfm3OmniSanitize:
         actual = model.embedding_norm(hidden)
         expected = model(tokens)
         assert mx.allclose(actual, expected, atol=1e-5, rtol=1e-5).item()
+
+
+def test_a_declared_optiq_vision_sidecar_is_copied(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    sidecar = source / "optiq" / "optiq_vision.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq/optiq_vision.safetensors"}})
+    )
+    oq._copy_model_sidecars(source, output)
+    assert (output / "optiq" / "optiq_vision.safetensors").read_bytes() == b"weights"
+
+
+def test_an_outside_optiq_vision_sidecar_is_refused(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "../outside.safetensors"}})
+    )
+    with pytest.raises(ValueError, match="inside the model directory"):
+        oq._copy_model_sidecars(source, output)
+    assert not (output / "outside.safetensors").exists()
+
+
+def test_an_absolute_outside_optiq_vision_sidecar_is_refused(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    outside = tmp_path / "outside.safetensors"
+    outside.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": str(outside)}})
+    )
+    with pytest.raises(ValueError, match="inside the model directory"):
+        oq._copy_model_sidecars(source, output)
+
+
+def test_a_missing_optiq_vision_sidecar_is_refused(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq/missing.safetensors"}})
+    )
+    with pytest.raises(FileNotFoundError, match="not found"):
+        oq._copy_model_sidecars(source, output)
+
+
+def test_optiq_sidecar_ignores_non_mapping_config(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("[]")
+    assert oq._optiq_vision_sidecar(source) is None
+
+
+def test_text_only_skips_optiq_vision_sidecar(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    sidecar = source / "optiq" / "optiq_vision.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq/optiq_vision.safetensors"}})
+    )
+    oq._copy_model_sidecars(source, output, text_only=True)
+    assert not (output / "optiq").exists()
+    config = {"optiq_vision": {"sidecar": "optiq/optiq_vision.safetensors"}}
+    oq._normalize_text_only_in_config(config)
+    assert "optiq_vision" not in config
+
+
+def test_root_optiq_sidecar_not_copied_and_dropped(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    sidecar = source / "optiq_vision.safetensors"
+    sidecar.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq_vision.safetensors"}})
+    )
+    oq._copy_model_sidecars(source, output)
+    assert not (output / "optiq_vision.safetensors").exists()
+    config = {"optiq_vision": {"sidecar": "optiq_vision.safetensors"}}
+    oq._normalize_optiq_vision_in_config(config, source)
+    assert "optiq_vision" not in config
+
+
+def test_optiq_sidecar_refuses_overwrite(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    sidecar = source / "optiq" / "optiq_vision.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq/optiq_vision.safetensors"}})
+    )
+    destination = output / "optiq" / "optiq_vision.safetensors"
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"existing")
+    with pytest.raises(ValueError, match="overwrite"):
+        oq._copy_model_sidecars(source, output)
+
+
+def test_optiq_sidecar_path_is_rebased(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    source.mkdir()
+    sidecar = source / "optiq" / "x.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    declared = {"sidecar": str(sidecar)}
+    (source / "config.json").write_text(json.dumps({"optiq_vision": declared}))
+    config = {"optiq_vision": declared}
+    oq._normalize_optiq_vision_in_config(config, source)
+    assert config["optiq_vision"]["sidecar"] == "optiq/x.safetensors"
+    assert declared["sidecar"] == str(sidecar)
+
+    real = source / "real" / "x.safetensors"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"weights")
+    link = source / "optiq" / "link.safetensors"
+    link.symlink_to(real)
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "optiq/link.safetensors"}})
+    )
+    config = {"optiq_vision": {"sidecar": "optiq/link.safetensors"}}
+    oq._normalize_optiq_vision_in_config(config, source)
+    assert config["optiq_vision"]["sidecar"] == "real/x.safetensors"
+
+
+def test_invalid_optiq_sidecar_fails_before_output_dir(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    source.mkdir()
+    bad = source / "optiq" / "vision.bin"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"weights")
+    (source / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "optiq_vision": {"sidecar": "optiq/vision.bin"},
+            }
+        )
+    )
+    output = tmp_path / "out"
+    with pytest.raises(ValueError, match="safetensors file"):
+        oq.quantize_oq_streaming(str(source), str(output), 4)
+    assert not output.exists()
+
+
+def test_written_layout_rebases_and_drops_optiq_vision(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    source.mkdir()
+    sidecar = source / "optiq" / "x.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    config = {
+        "model_type": "llama",
+        "optiq_vision": {"sidecar": str(sidecar)},
+    }
+    (source / "config.json").write_text(json.dumps(config))
+    written = oq._written_layout(
+        config,
+        source,
+        text_only=False,
+        preserve_mtp=False,
+        dtype="bfloat16",
+        quantization={},
+    )
+    assert written["optiq_vision"]["sidecar"] == "optiq/x.safetensors"
+    written = oq._written_layout(
+        config,
+        source,
+        text_only=True,
+        preserve_mtp=False,
+        dtype="bfloat16",
+        quantization={},
+    )
+    assert "optiq_vision" not in written
+
+
+def test_root_symlink_optiq_sidecar_is_merged_not_copied(tmp_path):
+    from omlx import oq
+
+    source = tmp_path / "source"
+    output = tmp_path / "output"
+    source.mkdir()
+    output.mkdir()
+    real = source / "optiq" / "vision.safetensors"
+    real.parent.mkdir(parents=True)
+    real.write_bytes(b"weights")
+    link = source / "vision.safetensors"
+    link.symlink_to(real)
+    (source / "config.json").write_text(
+        json.dumps({"optiq_vision": {"sidecar": "vision.safetensors"}})
+    )
+    assert [f.name for f in oq._source_weight_files(source)] == ["vision.safetensors"]
+    config = {"optiq_vision": {"sidecar": "vision.safetensors"}}
+    oq._normalize_optiq_vision_in_config(config, source)
+    assert "optiq_vision" not in config
+    oq._copy_model_sidecars(source, output)
+    assert not (output / "optiq").exists()

@@ -3727,3 +3727,23 @@ def test_the_refinement_writer_leaves_the_layers_it_is_told_to_skip(tmp_path):
     assert oq._OQRefineWriter(tmp_path, weight_map, quantization).spec(
         "model.layers.0.a"
     ) == (4, 64)
+
+def test_the_writer_rebases_and_skips_optiq_sidecar(source, tmp_path):
+    import shutil
+
+    src = tmp_path / "src"
+    shutil.copytree(source, src)
+    sidecar = src / "optiq" / "x.safetensors"
+    sidecar.parent.mkdir(parents=True)
+    sidecar.write_bytes(b"weights")
+    config = json.loads((src / "config.json").read_text())
+    config["optiq_vision"] = {"sidecar": str(sidecar)}
+    (src / "config.json").write_text(json.dumps(config))
+
+    _, written, _ = _quantize(src, tmp_path / "out")
+    assert written["optiq_vision"]["sidecar"] == "optiq/x.safetensors"
+    assert (tmp_path / "out" / "optiq" / "x.safetensors").is_file()
+
+    _, text_config, _ = _quantize(src, tmp_path / "text", text_only=True)
+    assert "optiq_vision" not in text_config
+    assert not (tmp_path / "text" / "optiq").exists()

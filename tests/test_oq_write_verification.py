@@ -23,6 +23,7 @@ _VLM_CONTEXTS = (
     "_force_qwen4_exp_sanitize_on_load",
     "_remap_nested_visual_on_load",
     "_transpose_qwen35_mlx_vision_patch_embed_on_load",
+    "_load_optiq_vision_sidecar_on_load",
 )
 
 
@@ -422,7 +423,7 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
 
         @contextmanager
         def context(path, name=name):
-            entered.append(name)
+            entered.append((name, path))
             yield
 
         monkeypatch.setattr(engine_vlm, name, context)
@@ -444,7 +445,7 @@ def test_vlm_verification_uses_serving_load_contexts(tmp_path, monkeypatch):
     monkeypatch.setattr("mlx_vlm.utils.load_model", lambda *a, **k: Model())
     monkeypatch.setattr(oq, "check_loaded", lambda model: None)
     oq_verify.verify_written_format_checkpoint(output)
-    assert entered == names
+    assert entered == [(name, output) for name in names]
 
 
 def _stub_vlm_verification(monkeypatch, model):
@@ -913,3 +914,63 @@ def test_writer_verification_streams_layer_by_layer(
     )
     assert seen, "the writer never ran the staged format layers"
     assert all(seen), "a format layer ran outside layer_by_layer"
+
+
+def test_vlm_verification_injects_declared_optiq_sidecar(tmp_path, monkeypatch):
+    from contextlib import contextmanager, nullcontext
+
+    import mlx.nn as nn
+
+    import omlx.engine.vlm as engine_vlm
+    from omlx import oq, oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "optiq_vision": {"sidecar": "optiq/x.safetensors"},
+            }
+        )
+    )
+    (output / "optiq").mkdir()
+    mx.save_safetensors(
+        str(output / "optiq" / "x.safetensors"),
+        {"vision_tower.w": mx.ones((2,))},
+    )
+    seen = {}
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_w = mx.zeros((1,))
+            self.vision_tower = nn.Module()
+            self.vision_tower.w = mx.zeros((2,))
+
+        def __call__(self, x):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    def load(*args, **kwargs):
+        model = Model()
+        seen["model"] = model
+        model.load_weights([("lm_w", mx.zeros((1,)))], strict=True)
+        return model
+
+    for name in _VLM_CONTEXTS[:-1]:
+        monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
+
+    @contextmanager
+    def patches(path, config, **kwargs):
+        yield True
+
+    monkeypatch.setattr(oq, "_calibration_patches", patches)
+    monkeypatch.setattr(oq, "_load_globals_kept", lambda config: nullcontext())
+    monkeypatch.setattr(oq, "_on_mlx_thread", lambda run: run())
+    monkeypatch.setattr("mlx_vlm.utils.load_model", load)
+    monkeypatch.setattr(oq, "check_loaded", lambda model: None)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert seen["model"].vision_tower.w.tolist() == [1.0, 1.0]
