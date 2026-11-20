@@ -2578,11 +2578,13 @@ def test_routed_plans_and_proofs_follow_the_activation_on_one_block(
 
     monkeypatch.setattr(routed, "_cached_plan", observe)
     for dtype in (mx.bfloat16, mx.float16, mx.float32, mx.bfloat16):
+        before = set(kernels._PROOFS)
         x = mx.zeros((1, 1, 1024), dtype)
         routed.routed_verify_window(block, x)
         plan = plans[-1]
         if dtype == mx.float32:
             assert plan is None
+            assert set(kernels._PROOFS) == before
         elif restricted == "neither" or dtype == mx.float16:
             assert plan is not None and plan.launches.dtype == dtype
         else:

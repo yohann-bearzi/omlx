@@ -722,9 +722,12 @@ def test_no_kernel_built_over_faces_holds_a_table_written_by_hand(monkeypatch):
             testing._lane_parts_kernel.__wrapped__(face, variant)
         testing._finish_rows_kernel.__wrapped__(face)
         kernels.face_kernel("scan", ("m",), {"m": face}, ("out",), "", "")
-        for builder in (routed._gate_up_kernel, routed._gate_up_topk_kernel):
-            builder.__wrapped__(face, None, None)
-            builder.__wrapped__(face, tabled(plain), gate)
+        routed._gate_up_kernel.__wrapped__(face, None, None)
+        routed._gate_up_kernel.__wrapped__(face, tabled(plain), gate)
+        routed._gate_up_topk_kernel.__wrapped__(face, None, None, face.dtypes[0])
+        routed._gate_up_topk_kernel.__wrapped__(
+            face, tabled(plain), gate, face.dtypes[0]
+        )
         routed._down_kernel.__wrapped__(face, None)
         routed._down_kernel.__wrapped__(face, shared)
         routed._gate_up_window_kernel.__wrapped__(face, shared, gate)
