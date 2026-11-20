@@ -198,6 +198,8 @@ class _Checkpoint:
         self._accepting = threading.RLock()
         self.built: list[nn.Module] = []
         self._pruned = []
+        # Resident PLE fusions: (container, shard count, mode, fused id).
+        self._fused: list[tuple] = []
         # The Metals started for its layers' first calls, and the faces and
         # geometries started (a layer of the same builds nothing).
         self.warmers: list = []
@@ -489,7 +491,7 @@ class _Checkpoint:
             config = None
         config = config if isinstance(config, dict) else {}
         mode = self._marked_mode()
-        if mode is None and not self.built:
+        if mode is None and not self.built and not self._fused:
             return
         quants = _quantizations(config)
         if _damaged(config):
@@ -502,7 +504,7 @@ class _Checkpoint:
         entries = self._format_entries(quants)
         paths: dict[int, list[str]] = {}
         loaded_modules = []
-        if self.built or entries:
+        if self.built or entries or self._fused:
             models = loaded if isinstance(loaded, tuple) else (loaded,)
             for model in models:
                 if isinstance(model, nn.Module):
@@ -526,6 +528,7 @@ class _Checkpoint:
                 if id(layer) in paths or id(layer) not in omitted
             ]
         modes = {layer.mode for layer in built}
+        modes.update(fused_mode for _, _, fused_mode, _ in self._fused)
         for quant in quants:
             top = quant.get("mode", "affine")
             if not self._in_format(top) or top in modes:
@@ -549,7 +552,7 @@ class _Checkpoint:
                 mode,
                 self,
             )
-        if not self.built and not entries:
+        if not self.built and not entries and not self._fused:
             # A load of no format's layers: an MLX checkpoint's.
             return
         stray = [layer for layer in built if id(layer) not in paths]
@@ -584,9 +587,11 @@ class _Checkpoint:
                             self,
                         )
                     held = placeholders[name]
+                    expected = layer._load_dtype(name, held.dtype)
+                    dtype = "floating dtype" if expected is None else expected
                     raise _refused(
                         f"{path}.{name} is {offered[0]} {offered[1]}, where the "
-                        f"format lays out {tuple(held.shape)} {held.dtype}",
+                        f"format lays out {tuple(held.shape)} {dtype}",
                         layer.mode,
                         self,
                     )
@@ -609,13 +614,28 @@ class _Checkpoint:
                         self,
                     )
                 kept = (tuple(tensor.shape), tensor.dtype)
-                if tensor is not held and kept != (tuple(held.shape), held.dtype):
+                if tensor is not held and not layer._matches_load_tensor(
+                    name, tensor, held
+                ):
+                    expected = layer._load_dtype(name, held.dtype)
+                    dtype = "floating dtype" if expected is None else expected
                     raise _refused(
                         f"{path}.{name} is {kept[0]} {kept[1]}, where the format "
-                        f"lays out {tuple(held.shape)} {held.dtype}",
+                        f"lays out {tuple(held.shape)} {dtype}",
                         layer.mode,
                         self,
                     )
+        for container_ref, count, fused_mode, fused_id in self._fused:
+            owner = container_ref()
+            if owner is None or id(owner) not in paths or fused_id not in paths:
+                raise _refused(
+                    "the resident PLE fusion's embedding is not in its model",
+                    fused_mode,
+                    self,
+                )
+            for name in paths[id(owner)]:
+                for index in range(count):
+                    bound[(f"{name}.shards.{index}", fused_mode)] = (fused_id, index)
         # A list or dict of modules has named children but no module at
         # the container's own path (e.g. mtp.0 exists without mtp).
         present_parts = {
@@ -651,7 +671,9 @@ class _Checkpoint:
                     mode,
                     self,
                 )
-        mode = self._marked_mode() or self.built[0].mode
+        mode = self._marked_mode() or (
+            self.built[0].mode if self.built else self._fused[0][2]
+        )
         error = _refused(
             "distributed loading cannot shard a quant format checkpoint", mode, self
         )
@@ -665,6 +687,30 @@ class _Checkpoint:
         # Checked: the layers are the model's to keep, not this checkpoint's.
         self.built.clear()
         self._pruned.clear()
+        self._fused.clear()
+
+    def record_fused(self, container, shards, fused) -> None:
+        """A resident PLE fusion replaced ``shards`` with one embedding:
+        those shards leave the built list (the model no longer names them),
+        and the fused layer's own binding is checked as theirs."""
+        ids = {id(shard) for shard in shards}
+        for index, shard in enumerate(shards):
+            origin = shard.__dict__.get("_load_origin")
+            if origin is None:
+                continue
+            pending = getattr(shard, "_placeholders", {})
+            left = _unfilled(shard, origin[0], pending, f"shards.{index}", self)
+            if left:
+                raise _refused(
+                    f"a fused shard's {', '.join(left)}: the checkpoint holds "
+                    "no such tensor, or holds it under another name",
+                    shard.mode,
+                    self,
+                )
+        self.built = [layer for layer in self.built if id(layer) not in ids]
+        self._fused.append(
+            (weakref.ref(container), len(shards), shards[0].mode, id(fused))
+        )
 
     def _check_layout(self, config: dict, mode: str) -> None:
         """Validate the flat per-layer maps of a checkpoint declaring a format."""
@@ -895,6 +941,37 @@ def _format_mode(config) -> str | None:
     return _format_declaration(config)[0]
 
 
+# The families whose stock checkpoints the switch loads as format layers
+# (the built-in format's own layout, read by oMLX's layers). It gains a
+# family with the commit that verifies it end to end.
+PORTED: frozenset[str] = frozenset({"qwen4_exp"})
+
+
+def ported_family(config) -> bool:
+    """Whether a checkpoint's config names a family the stock switch has
+    ported: its ``model_type`` or its text model's, lower case and with "-"
+    read as "_" (the spellings oQ and the gate normalise alike)."""
+    if not isinstance(config, dict):
+        return False
+    text = config.get("text_config")
+    names = [config.get("model_type")]
+    if isinstance(text, dict):
+        names.append(text.get("model_type"))
+    for name in names:
+        if isinstance(name, str) and name.strip().lower().replace("-", "_") in PORTED:
+            return True
+    return False
+
+
+def _ported(checkpoint: _Checkpoint) -> bool:
+    """Whether the checkpoint's family is one the stock switch has ported."""
+    try:
+        config = checkpoint._read_config()
+    except (OSError, ValueError):
+        return False
+    return ported_family(config)
+
+
 def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     """Refuse a checkpoint of a quant format (one it records, or names in its
     quantization config, or ``mode``, a format's layer being built for it)
@@ -916,13 +993,19 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
         return
     sharded = getattr(_SHARDED, "entry", None)
     if sharded is not None:
-        # A Hub branch can change between metadata preflight and the library's
-        # own resolution. Check the directory actually passed to load_model too.
+        # A distributed rank shards MLX's layers (DEFERRED 29) even when the
+        # checkpoint's family is ported and its config records the built-in.
         raise _refused(
             f"the {sharded[1]} loader cannot read a quant format checkpoint",
             mode,
             checkpoint,
         )
+    if mode in formats._BUILTIN_MODES and _ported(checkpoint):
+        # The switch's own list: a ported family's checked load builds the
+        # built-in format's layers, with no plugin's record to verify. The
+        # plugin roster is what a plugin's checkpoint asks of its family.
+        checkpoint.verified = True
+        return
     from .. import oq
 
     # Its config alone names its family, wherever the load found it.
@@ -1256,6 +1339,37 @@ def _format_layer(layer, layer_cls, signature, arguments):
     layout = None
     if fmt is not None and bits is not None and group_size is not None:
         checkpoint = _current()
+        kept_record = (
+            checkpoint is not None
+            and mode in formats._BUILTIN_MODES
+            and checkpoint.records(mode)
+        )
+        if kept_record:
+            # A record of a built-in mode is read where it was written, or
+            # refused as damaged: the switch's list does not hide it. No
+            # plugin writes one of MLX's modes, so a record that names a
+            # plugin is not this format's.
+            written = checkpoint._written(mode)[0]
+            if isinstance(written, dict) and written.get("plugin") is not None:
+                raise _refused(
+                    f"{mode} is one of MLX's modes, which a plugin does not "
+                    f"write: its record says {written['plugin']!r}",
+                    mode,
+                    checkpoint,
+                )
+            checkpoint._record(mode)
+        # A built-in format builds its layers only in the families the stock
+        # switch has ported (a plugin's own record always builds its); every
+        # other checkpoint of an MLX mode keeps MLX's layer, as before.
+        if mode in formats._BUILTIN_MODES and not kept_record and (
+            checkpoint is None
+            or getattr(_SHARDED, "entry", None) is not None
+            or not _ported(checkpoint)
+        ):
+            # Outside a load, under a distributed loader (a rank shards MLX's
+            # own packed layers, DEFERRED 29), or in a family the switch has
+            # not ported: MLX's layer, as before.
+            return None
         geometry = (k, n, bits, group_size)
         if checkpoint is not None:
             fmt, layout = checkpoint.layout(fmt, geometry)
@@ -1303,7 +1417,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
                 mode,
             )
     tensors = {
-        name: mx.zeros((*stack, *shape), dtype)
+        name: mx.zeros((*stack, *shape), mx.float32 if dtype is None else dtype)
         for name, (shape, dtype) in layout.items()
     }
     built = layer_cls(

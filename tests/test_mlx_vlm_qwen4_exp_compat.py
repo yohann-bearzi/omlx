@@ -209,7 +209,6 @@ def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     from mlx_vlm.models.qwen4_exp.language import (
         Qwen4ExpGatedResidual,
         compile_hyper_connections,
-        fuse_hyper_connection_projections,
     )
 
     config = SimpleNamespace(
@@ -229,8 +228,6 @@ def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     verify_eager = module(inputs, target_verify=True)
     mx.eval(*eager, *verify_eager)
 
-    assert fuse_hyper_connection_projections(module) == 0
-    assert fuse_hyper_connection_projections(module) == 0
     fused = module(inputs)
     verify_fused = module(inputs, target_verify=True)
     mx.eval(*fused, *verify_fused)
@@ -270,33 +267,6 @@ def test_qwen4_small_hyper_connection_fusion_fails_closed(quantized):
     module._compiled_forward = compiled_forward
 
 
-def test_qwen4_hyper_connection_optimizations_fail_closed():
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    from mlx_vlm.models.qwen4_exp.language import (
-        Qwen4ExpGatedResidual,
-        compile_hyper_connections,
-        fuse_hyper_connection_projections,
-    )
-
-    config = SimpleNamespace(
-        hc_count=2,
-        hidden_size=32,
-        hc_lowrank=32,
-        rms_norm_eps=1e-6,
-    )
-    incompatible = Qwen4ExpGatedResidual(config)
-    incompatible.block_inject_weight = incompatible.block_inject_weight.to_quantized(
-        32, 4
-    )
-    assert fuse_hyper_connection_projections(incompatible) == 0
-    assert hasattr(incompatible, "input_mix_weight_down")
-    assert hasattr(incompatible, "block_inject_weight")
-
-    already_compiled = Qwen4ExpGatedResidual(config)
-    assert compile_hyper_connections(already_compiled) == 1
-    assert fuse_hyper_connection_projections(already_compiled) == 0
-
-
 def test_qwen4_hyper_connection_compile_covers_uncombined_mixer():
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import (
@@ -320,54 +290,6 @@ def test_qwen4_hyper_connection_compile_covers_uncombined_mixer():
     assert mx.allclose(eager, compiled, rtol=1e-5, atol=1e-6).item()
 
 
-def test_qwen4_resident_ple_fuses_packed_shards_exactly():
-    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
-    import mlx.nn as nn
-    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
-
-    mx.random.seed(43)
-    embedding = ShardedEmbedding(32, 64, 4)
-    embedding.shards = [
-        nn.QuantizedEmbedding.from_embedding(
-            shard,
-            group_size=32,
-            bits=4,
-            mode="affine",
-        )
-        for shard in embedding.shards
-    ]
-    indices = mx.array([[0, 9, 17, 31, 9]], dtype=mx.int32)
-    expected = embedding(indices)
-    mx.eval(expected)
-    scales_dtype = embedding.shards[0].scales.dtype
-    loads = []
-
-    def load_sources():
-        loads.append(1)
-        # Reloaded copies with another scales dtype must not replace the shards.
-        return [
-            SimpleNamespace(
-                weight=shard.weight,
-                scales=shard.scales.astype(mx.float16),
-                biases=shard.biases,
-            )
-            for shard in embedding.shards
-        ]
-
-    assert embedding.fuse_quantized_shards(load_sources) is True
-    assert embedding.fused.scales.dtype == scales_dtype
-    assert embedding.fuse_quantized_shards(load_sources) is False
-    assert len(loads) == 1
-    assert embedding.shards == []
-    # The fused arm performs one device gather and no longer consults the host
-    # shard boundaries after load.
-    embedding.shard_offsets = ()
-    actual = embedding(indices)
-    mx.eval(actual)
-
-    assert mx.array_equal(actual, expected).item()
-
-
 def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, caplog):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     import mlx.nn as nn
@@ -377,11 +299,9 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
     model = model_module.Model.__new__(model_module.Model)
     nn.Module.__init__(model)
     base_load = MagicMock(return_value="loaded")
-    fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=97)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
-    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
     monkeypatch.setattr(
@@ -396,10 +316,10 @@ def test_qwen4_exp_load_enables_hyper_connection_optimizations(monkeypatch, capl
 
     assert result == "loaded"
     base_load.assert_called_once_with(weights, strict=False)
-    fuse.assert_called_once_with(model)
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "96 exact hybrid projection pairs, 97 compiled decode paths" in caplog.text
+    assert "97 compiled decode paths" in caplog.text
+    assert "exact hybrid projection pairs" not in caplog.text
     assert "Fused 1 resident Qwen4-Exp PLE table" in caplog.text
 
 
@@ -412,11 +332,9 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(monkeypatch, c
     model = model_module.Model.__new__(model_module.Model)
     nn.Module.__init__(model)
     base_load = MagicMock(return_value=model)
-    fuse = MagicMock(return_value=96)
     fuse_ple = MagicMock(return_value=1)
     compile_connections = MagicMock(return_value=100)
     monkeypatch.setattr(Qwen3_5Model, "load_weights", base_load)
-    monkeypatch.setattr(model_module, "fuse_hyper_connection_projections", fuse)
     monkeypatch.setattr(model_module, "fuse_resident_ple_embeddings", fuse_ple)
     monkeypatch.setattr(model_module, "compile_hyper_connections", compile_connections)
     monkeypatch.setattr(
@@ -428,11 +346,10 @@ def test_qwen4_exp_load_skips_projection_fusion_during_mtp_verify(monkeypatch, c
 
     assert model.load_weights([], strict=False) is model
 
-    fuse.assert_not_called()
     fuse_ple.assert_called_once_with(model)
     compile_connections.assert_called_once_with(model)
-    assert "Skipped Qwen4-Exp exact hybrid projections" in caplog.text
-    assert "0 exact hybrid projection pairs, 100 compiled decode paths" in caplog.text
+    assert "100 compiled decode paths" in caplog.text
+    assert "exact hybrid projection pairs" not in caplog.text
 
 
 def test_qwen4_exp_sanitize_keeps_converted_norm_values():
@@ -2536,10 +2453,7 @@ def test_qwen4_resident_ple_fuses_format_shards_exactly():
                     4,
                     8,
                     8,
-                    {
-                        name: values[start : start + size]
-                        for name, values in rows.items()
-                    },
+                    {name: v[start : start + size] for name, v in rows.items()},
                 )
             )
             start += size
@@ -2555,29 +2469,571 @@ def test_qwen4_resident_ple_fuses_format_shards_exactly():
         assert embedding.shards == []
         assert mx.array_equal(fused(indices), want).item()
         assert mx.array_equal(fused["codes"], rows["codes"]).item()
-        assert fused["offset"] is not None
 
         # A shard that still holds a load's placeholder is refused.
         pending = ShardedEmbedding(9, 8, 5)
-        pending.shards = [
-            FormatEmbedding(
-                reader,
-                4,
-                8,
-                8,
-                {
-                    name: mx.zeros_like(
-                        values[
-                            sum(pending.shard_sizes[:index]) : sum(
-                                pending.shard_sizes[: index + 1]
-                            )
-                        ]
-                    )
-                    for name, values in rows.items()
-                },
-                placeholders=True,
+        pending.shards = []
+        start = 0
+        for size in pending.shard_sizes:
+            pending.shards.append(
+                FormatEmbedding(
+                    reader,
+                    4,
+                    8,
+                    8,
+                    {
+                        name: mx.zeros_like(v[start : start + size])
+                        for name, v in rows.items()
+                    },
+                    placeholders=True,
+                )
             )
-            for index in range(len(pending.shard_sizes))
-        ]
+            start += size
         with pytest.raises(ValueError, match="placeholder"):
             pending.fuse_quantized_shards()
+
+        # Shards of different readers do not join.
+        other = ShardedEmbedding(9, 8, 5)
+        other.shards = []
+        start = 0
+        for index, size in enumerate(other.shard_sizes):
+            other.shards.append(
+                FormatEmbedding(
+                    RowReader() if index == 0 else reader,
+                    4,
+                    8,
+                    8,
+                    {name: v[start : start + size] for name, v in rows.items()},
+                )
+            )
+            start += size
+        assert other.fuse_quantized_shards() is False
+
+
+def test_qwen4_resident_format_ple_uses_droppable_load_sources():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatEmbedding
+
+    rows, dims = (5, 7), 64
+    layers = []
+    for index, count in enumerate(rows):
+        mx.random.seed(50 + index)
+        w = mx.random.normal((count, dims)).astype(mx.float32)
+        packed = mx.quantize(w, group_size=64, bits=4)
+        with testing.verified("qwen4_exp"):
+            layers.append(
+                FormatEmbedding(
+                    "affine",
+                    4,
+                    64,
+                    dims,
+                    dict(zip(("weight", "scales", "biases"), packed)),
+                )
+            )
+    embedding = ShardedEmbedding(sum(rows), dims, 2)
+    embedding.shards = list(layers)
+    calls = []
+    provided = []
+
+    def load_sources():
+        calls.append(1)
+        provided.extend(
+            SimpleNamespace(
+                weight=layer["weight"],
+                scales=layer["scales"] + 1,
+                biases=layer["biases"] + 1,
+            )
+            for layer in layers
+        )
+        return provided
+
+    with testing.verified("qwen4_exp"):
+        assert embedding.fuse_quantized_shards(load_sources) is True
+    assert len(calls) == 1
+    fused = embedding.fused
+    for name in fused._tensors:
+        expected = mx.concatenate(
+            [getattr(source, name) for source in provided], axis=0
+        )
+        assert mx.array_equal(fused[name], expected).item()
+    shard_scales = mx.concatenate([layer["scales"] for layer in layers], axis=0)
+    assert not mx.array_equal(fused["scales"], shard_scales).item()
+
+
+def test_qwen4_resident_format_ple_falls_back_on_row_count_mismatch():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatEmbedding
+
+    rows, dims = (5, 7), 64
+    layers = []
+    for index, count in enumerate(rows):
+        mx.random.seed(70 + index)
+        w = mx.random.normal((count, dims)).astype(mx.float32)
+        packed = mx.quantize(w, group_size=64, bits=4)
+        with testing.verified("qwen4_exp"):
+            layers.append(
+                FormatEmbedding(
+                    "affine",
+                    4,
+                    64,
+                    dims,
+                    dict(zip(("weight", "scales", "biases"), packed)),
+                )
+            )
+    embedding = ShardedEmbedding(sum(rows), dims, 2)
+    embedding.shards = list(layers)
+
+    def swapped():
+        # The sources hold one another's rows: the join must fall back.
+        return [
+            SimpleNamespace(**{name: layers[1][name] for name in layers[1]._tensors}),
+            SimpleNamespace(**{name: layers[0][name] for name in layers[0]._tensors}),
+        ]
+
+    with testing.verified("qwen4_exp"):
+        assert embedding.fuse_quantized_shards(swapped) is True
+    for name in embedding.fused._tensors:
+        expected = mx.concatenate([layer[name] for layer in layers], axis=0)
+        assert mx.array_equal(embedding.fused[name], expected).item()
+
+    embedding = ShardedEmbedding(sum(rows), dims, 2)
+    embedding.shards = list(layers)
+
+    def truncated():
+        return [
+            (
+                SimpleNamespace(
+                    weight=layer["weight"],
+                    scales=layer["scales"][:3],
+                    biases=layer["biases"],
+                )
+                if index == 0
+                else SimpleNamespace(**{name: layer[name] for name in layer._tensors})
+            )
+            for index, layer in enumerate(layers)
+        ]
+
+    with testing.verified("qwen4_exp"):
+        assert embedding.fuse_quantized_shards(truncated) is True
+    for name in embedding.fused._tensors:
+        expected = mx.concatenate([layer[name] for layer in layers], axis=0)
+        assert mx.array_equal(embedding.fused[name], expected).item()
+
+    embedding = ShardedEmbedding(sum(rows), dims, 2)
+    embedding.shards = list(layers)
+
+    def narrowed():
+        # Same rows, another trailing width: a trailing-axis mismatch.
+        return [
+            (
+                SimpleNamespace(
+                    weight=layer["weight"],
+                    scales=mx.concatenate([layer["scales"], layer["scales"]], axis=1),
+                    biases=layer["biases"],
+                )
+                if index == 0
+                else SimpleNamespace(**{name: layer[name] for name in layer._tensors})
+            )
+            for index, layer in enumerate(layers)
+        ]
+
+    with testing.verified("qwen4_exp"):
+        assert embedding.fuse_quantized_shards(narrowed) is True
+    for name in embedding.fused._tensors:
+        expected = mx.concatenate([layer[name] for layer in layers], axis=0)
+        assert mx.array_equal(embedding.fused[name], expected).item()
+
+
+def test_qwen4_resident_format_ple_falls_back_on_mismatched_sources():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatEmbedding
+
+    rows, dims = (5, 7), 64
+    layers = []
+    for index, count in enumerate(rows):
+        mx.random.seed(60 + index)
+        w = mx.random.normal((count, dims)).astype(mx.float32)
+        packed = mx.quantize(w, group_size=64, bits=4)
+        with testing.verified("qwen4_exp"):
+            layers.append(
+                FormatEmbedding(
+                    "affine",
+                    4,
+                    64,
+                    dims,
+                    dict(zip(("weight", "scales", "biases"), packed)),
+                )
+            )
+    embedding = ShardedEmbedding(sum(rows), dims, 2)
+    embedding.shards = list(layers)
+
+    def load_sources():
+        return [
+            SimpleNamespace(
+                weight=layer["weight"],
+                scales=layer["scales"].astype(mx.float16),
+                biases=layer["biases"],
+            )
+            for layer in layers
+        ]
+
+    with testing.verified("qwen4_exp"):
+        assert embedding.fuse_quantized_shards(load_sources) is True
+    for name in embedding.fused._tensors:
+        expected = mx.concatenate([layer[name] for layer in layers], axis=0)
+        assert mx.array_equal(embedding.fused[name], expected).item()
+
+
+def test_uniform_affine_layout_rejects_non_uint32_weight():
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from types import SimpleNamespace
+
+    from mlx_vlm.models.qwen4_exp.language import ShardedEmbedding
+
+    embedding = ShardedEmbedding(16, 8, 2)
+    embedding.shards = [
+        SimpleNamespace(
+            mode="affine",
+            bits=4,
+            group_size=32,
+            weight=mx.zeros((8, 1), dtype=mx.float32),
+            scales=mx.zeros((8, 1), dtype=mx.bfloat16),
+            biases=mx.zeros((8, 1), dtype=mx.bfloat16),
+        )
+        for _ in range(2)
+    ]
+    assert embedding._uniform_affine_layout() is False
+
+
+def test_qwen4_windowed_ple_refuses_unfilled_format_shard(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    dims, rows = 32, 4
+    tensors = {
+        "weight": mx.zeros((rows, dims * 4 // 32), mx.uint32),
+        "scales": mx.ones((rows, dims // 32), mx.bfloat16),
+        "biases": mx.zeros((rows, dims // 32), mx.bfloat16),
+    }
+    with testing.verified("qwen4_exp"):
+        shards = [
+            formats_linear.FormatEmbedding(
+                "affine", 4, 32, dims, dict(tensors), placeholders=True
+            )
+            for _ in range(2)
+        ]
+    table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    table.shards = shards
+    assert table._uniform_affine_layout() == (4, 1)
+    assert (
+        table._windowed_lookup(
+            mx.array([[0, rows]]), ((0, rows), (rows, 2 * rows))
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="placeholder"):
+        table(mx.array([[0, rows]]), ((0, rows), (rows, 2 * rows)))
+
+
+def test_qwen4_resident_format_ple_fuses_outside_load(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+    from tests.test_format_embedding import RowReader
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    if "embedding_test" not in formats._FORMATS:
+        formats.register(RowReader())
+    dims, rows = 8, 4
+    tensors = {
+        "codes": mx.zeros((rows, dims), mx.float32),
+        "offset": mx.ones((rows, 1), mx.float32),
+    }
+    with testing.verified("qwen4_exp"):
+        shards = [
+            formats_linear.FormatEmbedding(
+                "embedding_test", 8, 1, dims, dict(tensors)
+            )
+            for _ in range(2)
+        ]
+    table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    table.shards = shards
+    assert table.fuse_quantized_shards() is True
+
+
+def test_qwen4_resident_affine_ple_refuses_unfilled_later_shard(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    dims, rows = 32, 4
+    loaded_tensors = {
+        "weight": mx.zeros((rows, dims * 4 // 32), mx.uint32),
+        "scales": mx.ones((rows, dims // 32), mx.bfloat16),
+        "biases": mx.zeros((rows, dims // 32), mx.bfloat16),
+    }
+    placeholder_tensors = {
+        "weight": mx.zeros((rows, dims * 4 // 32), mx.uint32),
+        "scales": mx.ones((rows, dims // 32), mx.float32),
+        "biases": mx.zeros((rows, dims // 32), mx.float32),
+    }
+    with testing.verified("qwen4_exp"):
+        shards = [
+            formats_linear.FormatEmbedding(
+                "affine", 4, 32, dims, loaded_tensors, placeholders=False
+            ),
+            formats_linear.FormatEmbedding(
+                "affine", 4, 32, dims, placeholder_tensors, placeholders=True
+            ),
+        ]
+    table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    table.shards = shards
+    with pytest.raises(ValueError, match="placeholder"):
+        table.fuse_quantized_shards()
+
+
+def test_qwen4_resident_format_ple_rejects_mismatched_bias_dtype(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+    from tests.test_format_embedding import RowReader
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    if "embedding_test" not in formats._FORMATS:
+        formats.register(RowReader())
+    dims, rows = 8, 4
+    tensors = {
+        "codes": mx.zeros((rows, dims), mx.float32),
+        "offset": mx.ones((rows, 1), mx.float32),
+    }
+    with testing.verified("qwen4_exp"):
+        bad = [
+            formats_linear.FormatEmbedding(
+                "embedding_test",
+                8,
+                1,
+                dims,
+                dict(tensors),
+                bias=mx.zeros((rows,), mx.float16),
+            ),
+            formats_linear.FormatEmbedding(
+                "embedding_test",
+                8,
+                1,
+                dims,
+                dict(tensors),
+                bias=mx.zeros((rows,), mx.bfloat16),
+            ),
+        ]
+        good = [
+            formats_linear.FormatEmbedding(
+                "embedding_test",
+                8,
+                1,
+                dims,
+                dict(tensors),
+                bias=mx.ones((rows,), mx.float16),
+            )
+            for _ in range(2)
+        ]
+    bad_table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    bad_table.shards = bad
+    assert bad_table.fuse_quantized_shards() is False
+
+    good_table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    good_table.shards = good
+    assert good_table.fuse_quantized_shards() is True
+    assert good_table.fused["bias"].dtype == mx.float16
+    assert good_table.fused["bias"].shape == (2 * rows,)
+
+
+def test_qwen4_resident_ple_fusion_passes_checkpoint_check(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.patches import format_load
+    from tests.test_format_embedding import RowReader
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    format_load.apply_format_load_patch()
+    if "embedding_test" not in formats._FORMATS:
+        formats.register(RowReader())
+    config = {
+        "model_type": "qwen4_exp",
+        "omlx_quant_formats": {"embedding_test": {}},
+        "quantization": {
+            "table.shards.0": {"mode": "embedding_test"},
+            "table.shards.1": {"mode": "embedding_test"},
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    dims, rows = 8, 4
+    with testing.verified("qwen4_exp"), format_load.loading(tmp_path) as checkpoint:
+        table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+        shards = []
+        for _ in range(2):
+            shard = nn.Embedding(rows, dims)
+            shard.set_dtype(mx.float32)
+            built = shard.to_quantized(
+                group_size=1, bits=8, mode="embedding_test"
+            )
+            built["codes"] = mx.zeros((rows, dims), mx.float32)
+            built["offset"] = mx.ones((rows, 1), mx.float32)
+            shards.append(built)
+        table.shards = shards
+
+        class Holder(nn.Module):
+            def __init__(self, held):
+                super().__init__()
+                self.table = held
+
+        holder = Holder(table)
+        assert table.fuse_quantized_shards() is True
+        checkpoint.check(holder)
+    assert type(table.fused).__name__ == "FormatEmbedding"
+
+
+def test_qwen4_resident_ple_fusion_defers_unfilled_active_load_to_format_refused_error(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.patches import format_load
+    from tests.test_format_embedding import RowReader
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    format_load.apply_format_load_patch()
+    if "embedding_test" not in formats._FORMATS:
+        formats.register(RowReader())
+    config = {
+        "model_type": "qwen4_exp",
+        "omlx_quant_formats": {"embedding_test": {}},
+        "quantization": {
+            "table.shards.0": {"mode": "embedding_test"},
+            "table.shards.1": {"mode": "embedding_test"},
+        },
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    dims, rows = 8, 4
+    with testing.verified("qwen4_exp"), format_load.loading(tmp_path) as checkpoint:
+        table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+        shards = []
+        for idx in range(2):
+            shard = nn.Embedding(rows, dims)
+            shard.set_dtype(mx.float32)
+            built = shard.to_quantized(
+                group_size=1, bits=8, mode="embedding_test"
+            )
+            built["codes"] = mx.zeros((rows, dims), mx.float32)
+            if idx == 0:
+                built["offset"] = mx.ones((rows, 1), mx.float32)
+            shards.append(built)
+        table.shards = shards
+
+        class Holder(nn.Module):
+            def __init__(self, held):
+                super().__init__()
+                self.table = held
+
+        holder = Holder(table)
+        assert table.fuse_quantized_shards() is False
+        assert getattr(table, "fused", None) is None and len(table.shards) == 2
+        with pytest.raises(formats.FormatRefusedError) as refused:
+            checkpoint.check(holder)
+        assert "table.shards.1" in refused.value.reason
+        assert "offset" in refused.value.reason
+
+
+def test_qwen4_resident_ple_fusion_top_level_affine_mode_checks_and_refuses_sharding(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.patches import format_load
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    format_load.apply_format_load_patch()
+    config = {
+        "model_type": "qwen4_exp",
+        "quantization": {"mode": "affine", "group_size": 32, "bits": 4},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    dims, rows = 32, 4
+    with testing.verified("qwen4_exp"), format_load.loading(tmp_path) as checkpoint:
+        table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+        shards = []
+        for _ in range(2):
+            shard = nn.Embedding(rows, dims)
+            shard.set_dtype(mx.bfloat16)
+            built = shard.to_quantized(group_size=32, bits=4, mode="affine")
+            built["weight"] = mx.zeros((rows, dims * 4 // 32), mx.uint32)
+            built["scales"] = mx.ones((rows, dims // 32), mx.bfloat16)
+            built["biases"] = mx.zeros((rows, dims // 32), mx.bfloat16)
+            shards.append(built)
+        table.shards = shards
+
+        class Holder(nn.Module):
+            def __init__(self, held):
+                super().__init__()
+                self.table = held
+
+        holder = Holder(table)
+        assert table.fuse_quantized_shards() is True
+        checkpoint.check(holder)
+    assert type(table.fused).__name__ == "FormatEmbedding"
+    with pytest.raises(formats.FormatRefusedError) as refused:
+        holder._omlx_refuse_sharding()
+    assert refused.value.mode == "affine"
