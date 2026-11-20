@@ -177,11 +177,14 @@ def source_reference(
     tokenizer and version, found without loading any of them; else made by
     one streamed pass over the source (its time logged). A writer supplies
     its private verification directory to keep a snapshot of this generation.
-    ``name`` gives the pair a file stem of its own; the collector keeps the
-    default ``<source>.reference``, so a writer's pair cannot be rewritten by
-    a calibration beside it."""
+    ``name`` replaces ``<source>`` in ``<name>.reference.{npz,json}``; the
+    collector keeps the default, so a writer's pair cannot be rewritten by a
+    calibration beside it."""
     if name is not None and (
-        not name or name in (".", "..") or Path(name).name != name
+        not name
+        or name in (".", "..")
+        or "\x00" in name
+        or Path(name).name != name
     ):
         raise ValueError(f"reference name must be a single file stem, not {name!r}")
     from mlx_lm.tokenizer_utils import load as load_tokenizer

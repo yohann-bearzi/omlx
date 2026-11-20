@@ -606,12 +606,31 @@ def test_the_collector_reference_does_not_touch_the_verification_pair(
     verify = oq_verify.source_reference(
         source, config, tmp_path, name=f"{source.name}.verify"
     )
+    assert verify.name == f"{source.name}.verify.reference.npz"
     pair = (verify, verify.with_suffix(".json"))
     before = [path.read_bytes() for path in pair]
+    monkeypatch.setattr(
+        oq, "_load_calibration_data", lambda *a, **kw: mx.ones((1, 16), mx.int32)
+    )
     collector = oq_verify.source_reference(source, config, tmp_path)
     assert collector.name == f"{source.name}.reference.npz"
     assert verify != collector
     assert [path.read_bytes() for path in pair] == before
+
+
+def test_a_dotted_source_directory_keeps_its_name_in_the_verify_pair(
+    source, toy, tmp_path
+):
+    model = tmp_path / "model.v1"
+    shutil.copytree(source, model)
+    cache = tmp_path / "cache" / "i.npz"
+    _quantize(
+        model,
+        tmp_path / "written",
+        quant_format="toy",
+        imatrix_cache_path=str(cache),
+    )
+    assert (cache.parent / "model.v1.verify.reference.npz").is_file()
 
 
 def test_a_writer_keeps_its_reference_when_another_source_uses_the_cache(
@@ -940,6 +959,10 @@ def test_the_contract_page_quotes_the_refusal_of_other_tensors(toy, monkeypatch)
     with pytest.raises(ValueError) as refusal:
         oq._encode_in_format(toy, name, _weights(16, 64), mx.ones((64,)), 8, 1)
     assert str(refusal.value) in _QUOTED
+
+
+def test_the_contract_page_documents_the_separate_verify_reference():
+    assert ".verify.reference" in _QUOTED
 
 
 def test_the_contract_page_s_codec_is_the_toy_s():

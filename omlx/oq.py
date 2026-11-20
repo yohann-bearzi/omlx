@@ -7377,9 +7377,9 @@ def calibrate_oq_streaming(
     oq_level, enhanced=True, imatrix_cache_path=imatrix_cache_path,
     **settings)`` collects (or reuses) before it reads a weight, by the same
     code. That call then reuses the cache. A quant format's plugin fits from
-    it before it hands oQ its configured format (docs/quant-formats.md). The
-    source's reference that the run verifies its output against is made
-    beside the cache too.
+    it before it hands oQ its configured format (docs/quant-formats.md). A
+    calibration's reference is made beside the cache; a format writer makes
+    and pins its own ``<source>.verify.reference.{npz,json}`` pair instead.
 
     ``settings`` are quantize_oq_streaming's other arguments, those of the
     run that will reuse the cache (group_size, text_only, dtype,
