@@ -127,7 +127,7 @@ def _plan(block, x):
     it, or None."""
     if x.size != x.shape[-1]:
         return None
-    plan = routed._cached_plan(block)
+    plan = routed._cached_plan(block, x.dtype)
     return plan if plan is not None and routed._routes(plan, x) else None
 
 
@@ -388,8 +388,8 @@ def test_a_launch_holds_the_swiglu_only_where_it_applies_it(monkeypatch):
         (routed._gate_up_kernel, (gate_up, None, None)),
         (routed._gate_up_kernel, (gate_up, shared, gate)),
         (routed._gate_up_window_kernel, (gate_up, shared, gate)),
-        (routed._gate_up_topk_kernel, (gate_up, None, None)),
-        (routed._gate_up_topk_kernel, (gate_up, shared, gate)),
+        (routed._gate_up_topk_kernel, (gate_up, None, None, mx.bfloat16)),
+        (routed._gate_up_topk_kernel, (gate_up, shared, gate, mx.bfloat16)),
         (routed._down_kernel, (down, None)),
         (routed._down_kernel, (down, shared)),
         (routed._down_window_kernel, (down, shared)),
@@ -412,7 +412,9 @@ def test_the_folded_top_k_launch_holds_its_dtype_s_selection_alone(monkeypatch, 
         built[kernel["name"]] = kernel["header"]
 
     monkeypatch.setattr(mx.fast, "metal_kernel", build)
-    routed._gate_up_topk_kernel.__wrapped__(affine.face(4, 64, True, dtype), None, None)
+    routed._gate_up_topk_kernel.__wrapped__(
+        affine.face(4, 64, True, dtype), None, None, dtype
+    )
     ((name, header),) = built.items()
     bf16 = dtype == mx.bfloat16
     assert ("struct omlx_router_topk<bfloat16_t, NE> {" in header) == bf16
@@ -568,7 +570,7 @@ def test_fp32_folded_routing_matches_the_routing_launch(bits):
     ]
     width = top_k * inter + inter + 1
     blocks = 1 + inter // 4 + top_k * inter // 4
-    h, inds, scores = routed._gate_up_topk_kernel(*formats)(
+    h, inds, scores = routed._gate_up_topk_kernel(*formats, f32)(
         inputs=[x, *experts_gate_up, logits, *shared, *gate_row],
         template=template + [("NE", experts), ("M", rows), ("YW", width)],
         grid=(32, 2 * blocks * rows, 1),
@@ -800,10 +802,11 @@ def test_rows_that_are_not_whole_launch_groups_keep_the_composed_body(
     assert not kernels._PROOFS
 
 
-@pytest.mark.parametrize("dtypes", [(), (mx.bfloat16, mx.float16)])
-def test_a_gate_up_face_names_the_one_dtype_of_the_launches(dtypes, monkeypatch):
-    """The launches are compiled for the activations the gate+up face is
-    exact for; a face exact for several does not say which."""
+@pytest.mark.parametrize("dtypes", [(), (mx.float16, mx.bfloat16)])
+def test_the_activation_selects_an_exact_dtype_from_the_gate_up_face(
+    dtypes, monkeypatch
+):
+    """The gate+up face may support the activation after a different dtype."""
     face = affine.AffineFormat.dot
 
     def several(self, layer, k, n):
@@ -815,9 +818,9 @@ def test_a_gate_up_face_names_the_one_dtype_of_the_launches(dtypes, monkeypatch)
     monkeypatch.setattr(affine.AffineFormat, "dot", several)
     block = _block(1024, 320)
     x = mx.random.normal((1, 1, 1024)).astype(mx.bfloat16)
-    assert _plan(block, x) is None
+    assert _plan(block, x) is not None
     assert _same_bits(*_pair(block, x))
-    assert not kernels._PROOFS
+    assert _engaged()
 
 
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
@@ -2263,13 +2266,15 @@ def test_a_block_s_plan_is_kept_for_its_top_k_s_type(monkeypatch):
     """8 and 8.0 are two plans: a top-k or an expert count set again as a
     float is planned again, not served the integer's."""
     block = _block(512, 256, top_k=8, experts=128)
-    assert routed._cached_plan(block) is not None
+    assert routed._cached_plan(block, mx.bfloat16) is not None
     built = []
-    monkeypatch.setattr(routed, "_build_plan", lambda block: built.append(block.top_k))
+    monkeypatch.setattr(
+        routed, "_build_plan", lambda block, dtype: built.append(block.top_k)
+    )
     block.top_k = 8.0
-    routed._cached_plan(block)
+    routed._cached_plan(block, mx.bfloat16)
     block.num_experts = 128.0
-    routed._cached_plan(block)
+    routed._cached_plan(block, mx.bfloat16)
     assert built == [8.0, 8.0]
 
 
@@ -2279,12 +2284,12 @@ def test_a_block_s_plan_follows_its_top_k_and_expert_count():
     block = _block(512, 256, top_k=8, experts=128)
     x, rows = _token_of(block), _rows_of(block, 1, 3)
     assert _same_bits(*_pair(block, x))
-    assert routed._cached_plan(block).launches.top_k == 8
+    assert routed._cached_plan(block, mx.bfloat16).launches.top_k == 8
     block.top_k = 10
     assert _same_bits(*_pair(block, x))
-    assert routed._cached_plan(block).launches.top_k == 10
+    assert routed._cached_plan(block, mx.bfloat16).launches.top_k == 10
     block.num_experts = 64  # not what the stacks hold: no plan
-    assert routed._cached_plan(block) is None
+    assert routed._cached_plan(block, mx.bfloat16) is None
     assert routed.routed_verify_window(block, rows) is None
     assert _same_bits(*_pair(block, x))
 
@@ -2519,3 +2524,67 @@ def test_a_format_router_of_another_width_keeps_the_composed_body(monkeypatch):
         },
     )
     assert routed._build_plan(block) is None
+
+
+@pytest.mark.parametrize(
+    "dtype,selection", [(mx.bfloat16, "bf16"), (mx.float16, "scan")]
+)
+@pytest.mark.usefixtures("format_checkpoint")
+def test_default_face_runs_the_routed_topk_for_the_activation(
+    monkeypatch, launched, dtype, selection
+):
+    from tests.test_formats_kernels import _toy
+
+    face = _toy("routed_default")
+    assert face.dtypes == ()
+    load_toy_format(monkeypatch, face)
+    block = format_block(1024, 320, "affine", experts=128)
+    for module in (block.gate, block.shared_expert, block.shared_expert_gate):
+        module.set_dtype(dtype)
+    x = (mx.random.normal((1, 1, 1024)) * 0.25).astype(dtype)
+    ref, got = _pair(block, x)
+    assert ref.dtype == got.dtype == dtype and _same_bits(ref, got)
+    assert any(
+        call.name.startswith(f"omlx_qwen35_moe_gate_up_topk_{selection}_{face.key}")
+        for call in launched.built
+    )
+    assert _engaged()
+
+
+@pytest.mark.parametrize("restricted", ["neither", "gate_up_proj", "down_proj"])
+@pytest.mark.usefixtures("format_checkpoint")
+def test_routed_plans_and_proofs_follow_the_activation_on_one_block(
+    monkeypatch, restricted
+):
+    from tests.test_formats_kernels import _toy
+
+    face = _toy("routed_types")
+    half = replace(face, dtypes=(mx.float16,))
+    reader = load_toy_format(monkeypatch, face)
+    block = format_block(1024, 320, "affine")
+    limited = block.switch_mlp.get(restricted)
+    monkeypatch.setattr(
+        type(reader),
+        "dot",
+        lambda self, layer, k, n: half if layer is limited else face,
+    )
+    plans = []
+    cached = routed._cached_plan
+
+    def observe(*args, **kwargs):
+        plan = cached(*args, **kwargs)
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(routed, "_cached_plan", observe)
+    for dtype in (mx.bfloat16, mx.float16, mx.float32, mx.bfloat16):
+        x = mx.zeros((1, 1, 1024), dtype)
+        routed.routed_verify_window(block, x)
+        plan = plans[-1]
+        if restricted == "neither" or dtype == mx.float16:
+            assert plan is not None and plan.launches.dtype == dtype
+        else:
+            assert plan is None
+    if restricted == "neither":
+        assert plans[0].proof is plans[-1].proof
+        assert len({id(p.proof) for p in plans[:3]}) == 3

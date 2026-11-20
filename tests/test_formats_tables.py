@@ -226,9 +226,11 @@ def _affine_sources(monkeypatch):
         8, 64, True, mx.bfloat16
     )
     for face in faces[:8]:
-        for builder in (routed._gate_up_kernel, routed._gate_up_topk_kernel):
-            builder.__wrapped__(face, shared, gate)
-            builder.__wrapped__(face, None, None)
+        (dtype,) = face.dtypes
+        routed._gate_up_kernel.__wrapped__(face, shared, gate)
+        routed._gate_up_kernel.__wrapped__(face, None, None)
+        routed._gate_up_topk_kernel.__wrapped__(face, shared, gate, dtype)
+        routed._gate_up_topk_kernel.__wrapped__(face, None, None, dtype)
         routed._down_kernel.__wrapped__(face, shared)
         routed._down_kernel.__wrapped__(face, None)
         routed._gate_up_window_kernel.__wrapped__(face, shared, gate)

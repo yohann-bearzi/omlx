@@ -479,7 +479,9 @@ def _down_window_kernel(routed: Dot, shared: Dot):
 
 
 @cache
-def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
+def _gate_up_topk_kernel(
+    routed: Dot, shared: Dot | None, gate: Dot | None, dtype: mx.Dtype
+):
     """Gate+up/SwiGLU with the router softmax + top-k folded in, for M rows;
     with ``shared`` (and ``gate``) it also runs the shared expert's gate+up
     and the shared-expert gate row."""
@@ -487,7 +489,7 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
     inputs = ["x", *matrices.add("rt", routed), "logits"]
     source = _GATE_UP_TOPK_HEAD
     # The selection is compiled for the activation dtype alone (topk_header).
-    selection = "bf16" if routed.dtypes[0] == mx.bfloat16 else "scan"
+    selection = "bf16" if dtype == mx.bfloat16 else "scan"
     name = f"omlx_qwen35_moe_gate_up_topk_{selection}_{routed.key}"
     if shared is None:
         source += _GATE_UP_TOPK_UNSHARED
@@ -499,7 +501,7 @@ def _gate_up_topk_kernel(routed: Dot, shared: Dot | None, gate: Dot | None):
         name=name,
         input_names=inputs,
         output_names=["y", "indices", "scores"],
-        header=_COMMON + _SWIGLU + topk_header(routed.dtypes[0]) + matrices.header,
+        header=_COMMON + _SWIGLU + topk_header(dtype) + matrices.header,
         source=matrices.declarations + source + _GATE_UP_TOPK_ROUTED + "    }\n",
     )
 
@@ -616,7 +618,7 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     )
 
 
-def _build_plan(block) -> _Plan | None:
+def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     """Kernels and operands for one MoE block, or None outside the layout."""
     from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwiGLU
 
@@ -642,8 +644,8 @@ def _build_plan(block) -> _Plan | None:
         or d_fmt is None
         or gate_up[formats.tensor_names(gate_up)[0]].shape[0]
         != down[formats.tensor_names(down)[0]].shape[0]
-        or len(gu_fmt.dtypes) != 1
-        or not d_fmt.exact_for(gu_fmt.dtypes[0])
+        or not gu_fmt.exact_for(dtype)
+        or not d_fmt.exact_for(dtype)
         # The launches cover whole groups of rows.
         or inter % rows
         or any(hidden % _down_rows(window) for window in range(1, WINDOW_MAX_ROWS + 1))
@@ -658,7 +660,7 @@ def _build_plan(block) -> _Plan | None:
         isinstance(scores, mx.array) and scores.shape[:1] != (experts,)
     ):
         return None
-    dtype, top_k = gu_fmt.dtypes[0], block.top_k
+    top_k = block.top_k
     gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
     shared = _shared_formats(block, hidden, dtype)
@@ -692,6 +694,7 @@ def _build_plan(block) -> _Plan | None:
         inter,
         top_k,
         router is not None,
+        dtype,
     )
     proof = kernels.proof("routed_decode", *key)
     gate_up_template = [
@@ -722,7 +725,7 @@ def _build_plan(block) -> _Plan | None:
             down_kernel=_down_kernel(d_fmt, None),
             down_template=down_template + [("NPART", top_k)],
             down_threadgroup=(32, top_k, 1),
-            topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None),
+            topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None, dtype),
             topk_blocks=1 + top_k * inter // rows,
             topk_width=top_k * inter,
         )
@@ -753,7 +756,7 @@ def _build_plan(block) -> _Plan | None:
         down_threadgroup=(32, top_k + 1, 1),
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
         window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
-        topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt),
+        topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
     )
@@ -1063,17 +1066,17 @@ def _windows(plan: _Plan, x) -> bool:
     )
 
 
-def _cached_plan(block) -> _Plan | None:
+def _cached_plan(block, dtype: mx.Dtype) -> _Plan | None:
     """The block's plan, kept in the block: depth 2 keys it on the expert
-    and shared-expert weight arrays, the flags on the block's attributes
+    and shared-expert weight arrays, the activation dtype, and the block attributes
     that it is planned for, with their types (8 and 8.0 differ)."""
     top_k, experts = block.top_k, block.num_experts
     return cached_per_module(
         block,
         "_omlx_routed_decode_plan",
-        _build_plan,
+        partial(_build_plan, dtype=dtype),
         depth=2,
-        flags=(type(top_k), top_k, type(experts), experts),
+        flags=(dtype, type(top_k), top_k, type(experts), experts),
     )
 
 
@@ -1097,7 +1100,7 @@ def routed_verify_window(block, x):
     too."""
     if x.ndim != 3:
         return None
-    plan = _cached_plan(block)
+    plan = _cached_plan(block, x.dtype)
     if plan is None or plan.window is None or plan.proof.failed:
         return None
     signature = (x.shape, x.dtype, plan.experts)
@@ -1181,7 +1184,7 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     def patched_call(self, x):
         shape = x.shape
         if shape and x.size == shape[-1]:
-            plan = _cached_plan(self)
+            plan = _cached_plan(self, x.dtype)
             if plan is not None:
                 # A decode step is the replay of the graph its thread kept.
                 graph = plan.proof.graphs.get((shape, x.dtype, plan.experts))
