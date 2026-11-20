@@ -303,7 +303,7 @@ def test_streamed_decoder_releases_custom_format_declared_tensors(monkeypatch):
         assert sys.getrefcount(orig_lut) == 2
 
 
-def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
+def _run_published_cache_entry_test(monkeypatch):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event, current_thread
 
@@ -350,14 +350,207 @@ def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
             module_cache.clear_cached(mod)
         assert slot not in mod.__dict__
 
-        # A miss for a known slot can rebuild without taking the registry lock.
+        # A miss for a known slot also publishes under the registry lock.
         ready.clear()
         rebuild = pool.submit(
             module_cache.cached_per_module, mod, slot, lambda m: m.weight
         )
         assert rebuild.result(timeout=10) is mod.weight
-        assert not ready.is_set()
+        assert ready.is_set()
         assert slot in mod.__dict__
+
+
+def test_a_published_cache_entry_can_already_be_cleared(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    # The caller is a worker thread, distinct from the builder's and from
+    # main: the check distinguishes current_thread() from main_thread().
+    with ThreadPoolExecutor(1) as callers:
+        callers.submit(_run_published_cache_entry_test, monkeypatch).result()
+
+
+def test_clear_between_registration_and_publish_removes_the_entry(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, current_thread
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_registered_then_cleared"
+    caller = current_thread()
+    registered, cleared = Event(), Event()
+    lock = module_cache._SLOTS_LOCK
+
+    class PauseAfterRegistration:
+        def __enter__(self):
+            lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+            if current_thread() is not caller:
+                registered.set()
+                assert cleared.wait(10)
+
+    class Slots(set):
+        def __iter__(self):
+            # A clear takes a stable snapshot while registrations are excluded.
+            assert lock.locked()
+            return super().__iter__()
+
+    monkeypatch.setattr(module_cache, "_SLOTS", Slots())
+    monkeypatch.setattr(module_cache, "_SLOTS_LOCK", PauseAfterRegistration())
+    # The builder is paused once its registration lock is released; on the
+    # parent code the publish follows that point, so the entry must not
+    # survive the clear here.
+    with ThreadPoolExecutor(1) as pool:
+        build = pool.submit(
+            module_cache.cached_per_module, mod, slot, lambda m: m.weight
+        )
+        try:
+            assert registered.wait(10)
+            module_cache.clear_cached(mod)
+        finally:
+            cleared.set()
+        assert build.result(timeout=10) is mod.weight
+    assert slot not in mod.__dict__
+
+
+def test_known_slot_rebuild_takes_the_registry_lock(monkeypatch):
+    from threading import Event
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_known_lock"
+    entered = Event()
+    lock = module_cache._SLOTS_LOCK
+
+    class ObserveLock:
+        def __enter__(self):
+            entered.set()
+            lock.acquire()
+
+        def __exit__(self, *exc):
+            lock.release()
+
+    monkeypatch.setattr(module_cache, "_SLOTS", {slot})
+    monkeypatch.setattr(module_cache, "_SLOTS_LOCK", ObserveLock())
+    module_cache.cached_per_module(mod, slot, lambda m: m.weight)
+    assert entered.is_set()
+    assert slot in mod.__dict__
+
+
+def test_clear_during_build_does_not_publish_entry(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_clear_in_build"
+    started, resume = Event(), Event()
+
+    def build(module):
+        started.set()
+        assert resume.wait(10)
+        return module.weight
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set(module_cache._SLOTS))
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(module_cache.cached_per_module, mod, slot, build)
+        assert started.wait(10)
+        module_cache.clear_cached(mod)
+        resume.set()
+        assert future.result(timeout=10) is mod.weight
+    assert slot not in mod.__dict__
+
+
+def test_clear_on_another_module_does_not_discard_publish(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from omlx.patches import module_cache
+
+    a = nn.Linear(16, 8, bias=False)
+    b = nn.Linear(16, 8, bias=False)
+    slot = "_test_other_clear"
+    started, resume = Event(), Event()
+
+    def build(module):
+        started.set()
+        assert resume.wait(10)
+        return module.weight
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set(module_cache._SLOTS))
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(module_cache.cached_per_module, b, slot, build)
+        try:
+            assert started.wait(10)
+            module_cache.clear_cached(a)
+        finally:
+            resume.set()
+        assert future.result(timeout=10) is b.weight
+    assert slot in b.__dict__
+
+
+def test_build_starting_during_clear_pop_loop_does_not_publish(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    in_pop, built = Event(), Event()
+
+    class Slots(set):
+        def __iter__(self):
+            in_pop.set()
+            assert built.wait(10)
+            return super().__iter__()
+
+    monkeypatch.setattr(module_cache, "_SLOTS", Slots({"_test_existing"}))
+    with ThreadPoolExecutor(1) as pool:
+        clearing = pool.submit(module_cache.clear_cached, mod)
+        try:
+            assert in_pop.wait(10)
+            module_cache.cached_per_module(
+                mod, "_test_overlap", lambda m: (built.set(), m.weight)[1]
+            )
+        finally:
+            built.set()
+        clearing.result(timeout=10)
+    assert "_test_overlap" not in mod.__dict__
+
+
+def test_known_slot_rebuild_during_clear_does_not_publish(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    from omlx.patches import module_cache
+
+    mod = nn.Linear(16, 8, bias=False)
+    slot = "_test_known_clear_in_build"
+    started, resume = Event(), Event()
+
+    monkeypatch.setattr(module_cache, "_SLOTS", set(module_cache._SLOTS))
+    module_cache.cached_per_module(mod, slot, lambda m: m.weight)
+    module_cache.clear_cached(mod)
+    assert slot not in mod.__dict__
+
+    def build(module):
+        started.set()
+        assert resume.wait(10)
+        return module.weight
+
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(module_cache.cached_per_module, mod, slot, build)
+        try:
+            assert started.wait(10)
+            module_cache.clear_cached(mod)
+        finally:
+            resume.set()
+        assert future.result(timeout=10) is mod.weight
+    assert slot not in mod.__dict__
 
 
 def test_failed_cache_build_does_not_register_or_publish_a_slot(monkeypatch):

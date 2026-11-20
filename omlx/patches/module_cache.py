@@ -32,6 +32,10 @@ import mlx.nn as nn
 
 _SLOTS_LOCK = threading.Lock()
 _SLOTS: set[str] = set()
+# A module's clear generation, kept in its __dict__: a build that overlapped
+# a clear of its own module must not publish its pre-clear references. A
+# clear of another module does not advance it.
+_EPOCH_SLOT = "_omlx_clear_epoch"
 
 
 def _children(module: nn.Module, depth: int) -> list:
@@ -65,23 +69,30 @@ def cached_per_module(
             current = tuple(chain(dict.values(module), *map(dict.values, children)))
             if len(current) == len(refs) and all(map(is_, current, refs)):
                 return value
+    epoch = module.__dict__.get(_EPOCH_SLOT, 0)
     value = build(module)
     children = _children(module, depth)
     refs = tuple(chain(dict.values(module), *map(dict.values, children)))
-    if slot not in _SLOTS:
-        with _SLOTS_LOCK:
+    entry = (children, refs, state, value)
+    with _SLOTS_LOCK:
+        if module.__dict__.get(_EPOCH_SLOT, 0) == epoch:
             _SLOTS.add(slot)
-    module.__dict__[slot] = (children, refs, state, value)
+            # Publish under the registry lock the clear takes: a known slot's
+            # rebuild must not land after a clear, and a clear during the
+            # build must not be overwritten by the pre-clear references.
+            module.__dict__[slot] = entry
     return value
 
 
 def clear_cached(module: nn.Module) -> None:
     """Drop all ``cached_per_module`` entries stored on ``module``."""
     with _SLOTS_LOCK:
-        slots = tuple(_SLOTS)
-    d = module.__dict__
-    for slot in slots:
-        d.pop(slot, None)
+        d = module.__dict__
+        for slot in _SLOTS:
+            d.pop(slot, None)
+        # After the pops, while the lock still excludes a publish: a build
+        # that read the old epoch cannot land behind this clear.
+        d[_EPOCH_SLOT] = d.get(_EPOCH_SLOT, 0) + 1
 
 
 __all__ = ["cached_per_module", "clear_cached"]
