@@ -27,7 +27,7 @@ from functools import cache
 import mlx.core as mx
 
 from .. import formats
-from . import Dot, Table, Tile
+from . import Codes, Dot, Table, Tile
 
 logger = logging.getLogger(__name__)
 
@@ -977,7 +977,7 @@ def proof(kernel: str, *key) -> Proof:
 def face_kernel(
     name: str,
     inputs,
-    matrices: dict[str, Dot | Tile],
+    matrices: dict[str, Dot | Tile | Codes],
     outputs,
     header: str,
     source: str,
@@ -1221,6 +1221,24 @@ _LOOP_FILL = (
 )
 
 
+_CODES_FACE = r"""
+template <typename F, int K>
+struct omlx_code_runs {
+static_assert(F::CONTRACT >= OMLX_OLDEST_CONTRACT && F::CONTRACT <= OMLX_CONTRACT,
+"codes face: unsupported contract revision");
+using type = typename F::template Runs<K>;
+static_assert(type::GROUP > 0 && type::GROUP % 8 == 0 && K % type::GROUP == 0,
+"codes face: K must hold whole groups of eight-code runs");
+using Pack = decltype(metal::declval<thread const type&>().fetch(0));
+using Params = decltype(metal::declval<thread const type&>().params(0));
+static_assert(metal::is_same_v<Params, float2>,
+"codes face: params(g) must return float2(scale, bias)");
+static_assert(metal::is_same_v<decltype(type::pair(metal::declval<Pack>(), 0)), uint>,
+"codes face: pair(pack, j) must return a uint");
+};
+"""
+
+
 class Matrices:
     """The matrices a kernel reads, each under the name its body uses."""
 
@@ -1228,7 +1246,7 @@ class Matrices:
         """``unrolled``: the shared-rows skeleton's loops are unrolled in full,
         where a kernel's arrays then live in registers. ``unroll_pairs``: the
         rows skeleton's K loop takes the two-at-a-time pragma."""
-        self._faces: dict[str, Dot | Tile] = {}
+        self._faces: dict[str, Dot | Tile | Codes] = {}
         self._names: set[str] = set()
         self._tables = Tables()
         self._staged: dict[str, tuple[str, ...]] = {}
@@ -1241,28 +1259,31 @@ class Matrices:
     def add(
         self,
         name: str,
-        face: Dot | Tile,
+        face: Dot | Tile | Codes,
         shared: bool = False,
         pair: bool = False,
     ) -> list[str]:
-        """Add matrix ``name``, read through ``face``, a ``Dot`` or a
-        ``Tile``. Returns its kernel inputs: the weight, then the face's
+        """Add matrix ``name``, read through ``face``, a ``Dot``, ``Tile``
+        or ``Codes``. Returns its kernel inputs: the weight, then the face's
         tensors in order. With ``shared``, the kernel applies one block's
         weights to several inputs (``decode`` and ``apply``, in the
         shared-rows skeleton ``qmv_shared``, which the header then holds)
         and includes the dot face's shared source too. With ``pair``, the
         kernel calls ``qmv_pair_rows`` (and may also call ``qmv_rows``) and
         includes the dot face's shared source too. Refuses a name that
-        is not an identifier, a face of another type, a shared tile or a
-        shared face of no ``vpt``, and a matrix whose name or inputs repeat
-        those of a matrix added before: the kernel's other names are the
-        kernel's to keep apart."""
+        is not an identifier, a face of another type, a shared tile or
+        codes face, a shared face of no ``vpt``, and a matrix whose name or
+        inputs repeat those of a matrix added before: the kernel's other
+        names are the kernel's to keep apart."""
         if not (isinstance(name, str) and name.isascii() and name.isidentifier()):
             raise ValueError(f"matrix {name!r}: its name is not an identifier")
-        if not isinstance(face, (Dot, Tile)):
-            raise TypeError(f"matrix {name!r}: {face!r} is not a Dot or a Tile")
+        if not isinstance(face, (Dot, Tile, Codes)):
+            raise TypeError(
+                f"matrix {name!r}: {face!r} is not a Dot or a Tile or Codes"
+            )
         if (shared or pair) and not isinstance(face, Dot):
-            raise TypeError(f"matrix {name!r}: a tile face has no shared source")
+            kind = "tile" if isinstance(face, Tile) else "codes"
+            raise TypeError(f"matrix {name!r}: a {kind} face has no shared source")
         if (shared or pair) and face.vpt < 1:
             raise ValueError(
                 f"matrix {name!r}: face {face.key} states no vpt, which sizes a "
@@ -1347,7 +1368,12 @@ class Matrices:
         ):
             if wanted:
                 header += _named(_SKELETONS, piece, line)
-        if not (dots or tiles):
+        if any(isinstance(face, Codes) for face in self._faces.values()):
+            line = _CODES_LINES[self._unrolled]
+            if self._pair:
+                line += _QMV_PAIR_ROWS.count("\n")
+            header += _named(_SKELETONS, _CODES_FACE, line)
+        elif not (dots or tiles):
             header += "\n"
         return header + _REVISIONS_END + _named("<kernel header>", "")
 
@@ -1395,6 +1421,7 @@ _ROWS_LINE = _REVISIONS_LINE + 1 + _CHECKS.count("\n")
 _TILE_LINE = _ROWS_LINE + _QMV_ROWS.count("\n")
 _SHARED_LINE = _TILE_LINE + _TILE_FACE.count("\n")
 _PAIR_LINE = _SHARED_LINE + _SHARED_SKELETONS[0].count("\n")
+_CODES_LINES = tuple(_SHARED_LINE + piece.count("\n") for piece in _SHARED_SKELETONS)
 
 # The skeletons' asserts hold the numbers by now. What follows (a face's
 # type, a kernel's header and body) does not read the macros.

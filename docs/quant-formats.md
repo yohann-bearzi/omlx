@@ -14,7 +14,7 @@ This page is the contract between oMLX and a format. It has a revision number, a
 
 | File | What it holds |
 |---|---|
-| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot`, `Tile`, `FormatRefusedError` |
+| `omlx/formats/__init__.py` | the registry, `QuantFormat`, `Dot`, `Tile`, `Codes`, `Table`, `FormatRefusedError` |
 | `omlx/formats/kernels.py` | the skeletons and `Matrices` |
 | `omlx/formats/linear.py` | the layers that hold a format's tensors |
 | `omlx/patches/format_load.py` | what loads a format's checkpoint into them |
@@ -219,7 +219,7 @@ A checkpoint's layers of a format are read with the record oQ stored for it (`om
 - A format whose checkpoints differ by what their record holds (a table of levels, say) configures its copy from it, or returns a new object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors`, codes and `contract`; anything else is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): accept returned 'myformat', not a format of its mode, tensors, codes and contract: report it to my-package 0.1.0`. Make it immutable once accepted, with no unevaluated arrays: the layers of several threads read it.
 - Nothing `accept` does reaches the registered format, so checkpoints of several records load and run side by side, each layer with its own checkpoint's object. The registered format is copied once per load and checkpoint, so it holds nothing `copy.deepcopy` refuses (a lock, an MLX dtype; define `__deepcopy__` for anything else) and nothing large; a format that cannot be copied is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): the format cannot be copied for the load (cannot pickle '_thread.lock' object): accept runs on a copy of the registered format, which holds no lock, dtype or other object that copy.deepcopy refuses; report it to my-package 0.1.0`. A format keeps what it caches (its faces) outside the object: `functools.cache` on a function (or a `staticmethod`), as the built-in affine format does (on a method it would key on, and keep, the format object).
 - `accept` raises a ValueError in the format's own words to refuse a checkpoint. The load raises them as its reason: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: my-package 0.1.0): written in layout 2; this plugin reads layout 1`.
-- A plugin may hold oMLX's `Table`, `Dot` and `Tile` objects. Copies of those
+- A plugin may hold oMLX's `Table`, `Dot`, `Tile` and `Codes` objects. Copies of those
   descriptors retain the immutable MLX dtypes. A custom `__deepcopy__` must
   produce a separate format instance with independent mutable state. oMLX
   checks the copy before calling `accept` and checks the reader it returns.
@@ -464,15 +464,15 @@ oQ refuses a format before it reads a weight:
   layer and call it.
 
 After oQ admits a checkpoint and encodes a layer, it asks the reader that accepted the
-checkpoint record for both the dot and tile faces. The reader gets a concrete layer with
+checkpoint record for the dot, tile and codes faces. The reader gets a concrete layer with
 the encoded tensors and the input matrix dimensions. A format may return `None` for
-either. A face that raises or fails validation stops the writer with the layer name and
+any of them. A face that raises or fails validation stops the writer with the layer name and
 cause, for example `quant format 'myformat': its tile() fails for
 model.layers.0.mlp.gate_proj.weight: ...`.
 
 ## Faces
 
-A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the kernels that decode tiles of weights (see [The tile face](#the-tile-face)). A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
+A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the kernels that decode tiles of weights (see [The tile face](#the-tile-face)), and a `Codes` for integer levels with a group scale and bias (see [The codes face](#the-codes-face)). A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
 
 `QuantFormat.dot(layer, k, n)` returns the mat-vec face of `layer`'s `(..., n, k)` matrix, a `Dot`, or `None`. With `None` the kernel is not used for that layer and the model keeps its composed path. Return `None` for:
 
@@ -480,7 +480,7 @@ A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the 
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds,
 - a layer with a float64 tensor: the GPU takes none.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (its codes and each of the face's `tensors`, among its format's `tensors`, of 8 elements or more each and none of float64, which the GPU does not take), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` or a `tile()` was defective in it (an exception of the block's body is raised in its place):
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (its codes and each of the face's `tensors`, among its format's `tensors`, of 8 elements or more each and none of float64, which the GPU does not take), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block if it encountered a defective `dot()`, `tile()` or `codes()` face, or a `layout()` that raised in `stackable` (an exception of the block's body is raised in its place):
 
 ```python
 import pytest
@@ -497,7 +497,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 
 `QuantFormat.tile(layer, k, n)` returns the tile face of the same matrix, a `Tile`, or `None`, and kernels ask through `omlx.formats.tile(layer, k, n)` with the same answers to the same defects (`quant format MODE gave no usable tile face ...`). A defect is a format's mode and the error: the same error from its `dot()` and its `tile()` is one defect, logged once.
 
-| `Dot` and `Tile` field | Meaning |
+| `Dot`, `Tile` and `Codes` field | Meaning |
 |---|---|
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`, or one that the faces sharing the source share: the affine tile face's bf16 and fp16 keys share `omlx_affine_tile_b{bits}g{group_size}`). A kernel includes each distinct source once. |
@@ -795,12 +795,45 @@ Its `decode`, the same products in the same order:
         return levels * mx.repeat(scales, 32, axis=-1)[..., : levels.shape[-1]]
 ```
 
+## The codes face
+
+An integer-grid format can implement `QuantFormat.codes(layer, k, n)`.
+Return a `Codes` instance when each weight is an unsigned level from 0 through
+127 times a group scale, plus a group bias. Other formats inherit the default
+of `None`. Kernels look up the face with `omlx.formats.codes(layer, k, n)`.
+It accepts the same tensor declarations and checks the operands as `tile()` does.
+
+The Metal struct holds the weight byte pointer and the declared tensor pointers
+in order, followed by any declared table members (see [Tables](#tables)).
+It states its contract revision in `CONTRACT`. A kernel constructs
+`Runs<K>(matrix, row)` for a row it will read. The skeleton asserts the
+revision first; while revision 1 is the only codes face, a face of another
+revision is refused by that assert, and its diagnostics can also name the
+`Runs<K>` it does not have. A later revision states its own cursor and the
+skeleton selects it in the same update. The cursor provides these members.
+
+| Member | Meaning |
+|---|---|
+| `static constant constexpr int GROUP` | Number of adjacent weights sharing the same scale and bias. Each group consists of whole eight-weight runs and K consists of whole groups. |
+| `float2 params(int g) const` | Scale in `.x` and bias in `.y` for group `g` of this row, both in float32. |
+| `Pack fetch(int run) const` | Eight consecutive levels in the format's own representation, beginning at column `8 * run`. `Pack` can be any type returned by value. |
+| `static uint pair(Pack p, int j)` | Level `j` in bits 0–15 and level `j + 4` in bits 16–31 for `0 <= j < 4`. Each half contains the decoded integer level. |
+
+Each read is relative to its row and independent of previous reads. A format
+may map stored symbols to integer levels before returning a pair. sg8 encodes
+each level as the exact bf16 or fp16 operand `128 + level`. At each group
+boundary it applies the scale and bias and removes the added 128 using the
+group's activation sum. Its 32-wide inner loop requires a group size divisible
+by 32. MLX affine supplies this face at 2 through 6 bits and group sizes 32,
+64 and 128. Scales and biases retain their stored float16, bfloat16 or float32
+types independently of the activations.
+
 ## Tables
 
 A table that a face reads at indices that differ from lane to lane (a level for each code, a codebook) is data, not Metal. The face gives it in Python, and every kernel built on the face holds it in the form this GPU reads fastest: a copy in threadgroup memory, made when the kernel starts, or for a small table its values themselves. A table read per lane from `constant` or `device` memory instead makes the kernel's speed depend on where the GPU loads the kernel: 2 to 7% on an M3 Ultra from one process to the next, for the same source. The staged copy is the fastest form measured for tables of more than 4 values and has no such spread.
 
 Every Metal fragment a face contributes, including a dot face’s `shared` definitions,
-follows the same rule. A `Dot` or `Tile` refuses an array declarator with static
+follows the same rule. A `Dot`, `Tile` or `Codes` refuses an array declarator with static
 storage in its source: one after `static`, `constant` or `constexpr`, or one at the
 file's top level, in a namespace or in an `extern "C"` block. Scalar and vector
 constants, pointers, references,
@@ -862,7 +895,7 @@ The copy runs once in every threadgroup, before the kernel's own code, and ends 
 
 ## Kernels over faces
 
-A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot` or a `Tile`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons the kernel calls, and no other: MLX hashes a kernel's whole source at every launch, so the skeletons are also carried without indentation or comment lines) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
+A kernel names each matrix it reads in a `Matrices`, with the face it reads the matrix through, a `Dot`, `Tile` or `Codes`. That gives the matrix's kernel inputs, the Metal to include (the faces' sources, then the skeletons the kernel calls, and no other: MLX hashes a kernel's whole source at every launch, so the skeletons are also carried without indentation or comment lines) and the statements that declare the matrices in the kernel body. A matrix's inputs are `<name>_weight` and `<name>_<tensor>`. `add` refuses a name that is not an identifier, and a matrix whose name or inputs repeat those of a matrix added before. The kernel's other names (`x`, its outputs, its body's locals) are the kernel's to keep apart from them.
 
 ```python
 import mlx.core as mx
@@ -1101,11 +1134,18 @@ def kernel_proofs():
 
 A test's `monkeypatch` is undone after the fixture's block ends, unless `monkeypatch` depends on the fixture: a test that patches the registry would then leave its patch as the process's registry. oMLX's `tests/conftest.py` overrides `monkeypatch` to request the fixture (`def monkeypatch(kernel_proofs, monkeypatch): return monkeypatch`); a plugin that patches the registry in its tests does the same. The block's value is its registry, a dict of `kernels.Proof`, which is not part of the contract. The registry is the process's while the block is open: every thread's kernels prove their launches in it, and blocks may end in any order, in any thread. `omlx.formats.testing.no_dot_defects()` holds the process's set of defects the same way: the latest of its blocks still open takes the defects that any thread meets. A layer, and a kernel that a layer of an MoE block feeds, keeps the plan and proof of whichever call ran it first: a layer or a model shared between tests (built by a module or session fixture, or kept by a test for later) keeps the proofs of the first test that ran it, and a face that failed there stays failed for it in every later test. Build the layers a test runs inside the test, or run a shared one first inside the block.
 
+For a codes face, `levels, weights = testing.codes_rows(face, operands, k, rows, dtype)`
+reads both halves of each pair and the group's affine map. Compare the uint16
+levels with the format's integer reference and the float32 weights with its
+float32 decode, including the last run of the last group. The check raises
+`AssertionError` if any level exceeds 127. The row indices and operands follow
+the same conventions as `tile_rows`.
+
 ## Versions
 
 This page is a contract: a format written to it keeps running as oMLX changes. The contract is what a format uses and what oMLX asks of it:
 
-- `QuantFormat`, `Dot`, `Tile`, `Table`, `FormatRefusedError`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `stackable`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `lane_parts`, `finish_rows`, `rows_stack`, `tile_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls`, `LayerCall` and `verified` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
+- `QuantFormat`, `Dot`, `Tile`, `Codes`, `Table`, `FormatRefusedError`, `register`, `load`, `get`, `origin`, `dot`, `tile`, `codes`, `stackable`, `FLOATS`, `CONTRACT` and `OLDEST_CONTRACT` in `omlx.formats`, `dot_rows`, `shared_rows`, `lane_parts`, `finish_rows`, `rows_stack`, `tile_rows`, `codes_rows`, `staged_tables`, `no_dot_defects`, `fresh_proofs`, `layer_calls`, `LayerCall` and `verified` in `omlx.formats.testing`, and the `omlx.quant_formats` entry-point group,
 - the members of a face, the order a kernel runs them in and the rules a face follows,
 - the names of oMLX's Metal that a format's source may use: `omlx_ints`, `omlx_iota` and `omlx_table`.
 
@@ -1113,7 +1153,7 @@ The contract has a revision, a whole number that goes up by one with each change
 
 | Revision | In oMLX since | What it adds |
 |---|---|---|
-| 1 | not released yet | The registry, the dot face and the tile face, a face's tables, what loads and what writes a checkpoint (`layout`, `encode`, and its record: `record`, `accept`), `omlx.formats.testing`. |
+| 1 | not released yet | The registry, the dot, tile and codes faces, a face's tables, what loads and what writes a checkpoint (`layout`, `encode`, and its record: `record`, `accept`), `omlx.formats.testing`. |
 
 A format states the revision it is written for in two places: `contract` on its `QuantFormat`, and `CONTRACT` in the struct of each face. oMLX reads the first when the format registers. A kernel reads the second when it is compiled, and calls on the face the members of that revision and of none after it. A format written for one revision has the same number in both, and no face states a later revision than its format.
 
@@ -1217,6 +1257,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 
 | Kernel | Face | Code |
 |---|---|---|
+| Armed sg8 single projection and dense gate/up SwiGLU | codes | `omlx/patches/qwen35_verify_qmm.py` |
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 | Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
 | A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |

@@ -90,7 +90,7 @@ def tensor_names(layer) -> tuple[str, ...]:
 def _check_tensors(owner: str, tensors) -> None:
     """Refuses ``tensors`` unless they are what a format keeps beside
     ``weight`` and ``bias``, as kernels splice them into Metal: a tuple of
-    distinct identifiers. ``register``, ``Dot`` and ``Tile`` ask the same."""
+    distinct identifiers. ``register``, ``Dot``, ``Tile`` and ``Codes`` ask the same."""
     if not isinstance(tensors, tuple):
         raise ValueError(f"{owner}: tensors are a tuple, not {tensors!r}")
     for name in tensors:
@@ -381,6 +381,13 @@ class Tile(_Face):
     """
 
 
+@dataclass(frozen=True)
+class Codes(_Face):
+    """Unsigned integer levels and an affine map per group. The matrix's
+    Runs<K> reads eight levels at a time and returns pairs for sg8's
+    simdgroup-matrix operands. See docs/quant-formats.md."""
+
+
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
     ``contract``, and overrides ``decode``, ``layout`` (what loads its
@@ -404,6 +411,10 @@ class QuantFormat:
 
     def tile(self, layer, k: int, n: int) -> Tile | None:
         """The tile face of ``layer``'s ``(..., n, k)`` matrix, or None."""
+        return None
+
+    def codes(self, layer, k: int, n: int) -> Codes | None:
+        """Integer levels with a scale and offset per group, when available."""
         return None
 
     def decode(
@@ -900,8 +911,7 @@ def origin(mode: str) -> str | None:
     return _ORIGINS.get(mode)
 
 
-# The dot() and tile() defects that are logged: a format's mode and the
-# error's repr.
+# Each face or layout defect is logged once per (format mode, error repr).
 _DOT_DEFECTS: set[tuple[str, str]] = set()
 # Held to note a defect and learn whether it is new (threads that meet one at
 # once log it once), and by omlx.formats.testing to swap the set.
@@ -983,6 +993,11 @@ def tile(layer, k: int, n: int) -> Tile | None:
     logged once, a defect being the format's mode and the error: the same
     error from the format's ``dot`` is the same defect."""
     return _face(layer, k, n, Tile, "tile", "the layer keeps its other kernels")
+
+
+def codes(layer, k: int, n: int) -> Codes | None:
+    """The layer's codes face, with the same checks and fallback as tile()."""
+    return _face(layer, k, n, Codes, "codes", "the layer keeps its other kernels")
 
 
 def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):

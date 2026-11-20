@@ -871,13 +871,26 @@ def test_each_defect_of_a_format_is_logged_once(plugins, caplog, dot_defects):
     dot_defects.clear()  # expected
 
 
+def test_a_layout_defect_names_the_layout_in_the_block_report(dot_defects):
+    class Reader(_Format):
+        def layout(self, k, n, bits, group_size):
+            raise _DefectError("unsupported row stride")
+
+    with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
+        assert not formats.stackable(Reader(), 64, 8, 4, 32)
+    summary, detail = str(failure.value).split(": ", 1)
+    assert "layout" in summary
+    assert detail == str([("toy", "_DefectError('unsupported row stride')")])
+    assert not dot_defects
+
+
 def test_a_defect_fails_a_block_that_admits_none(plugins, dot_defects):
     formats.register(_Raises())
     defect = ("toy", "_DefectError('no biases')")
     with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
         assert formats.dot(_layer(), 64, 8) is None
     assert str(failure.value) == (
-        f"a quant format's dot() or tile() is defective: {[defect]}"
+        f"a quant format has a defective face or layout: {[defect]}"
     )
     # The defect is the block's: nothing outside collected it.
     assert formats._DOT_DEFECTS is dot_defects and not dot_defects
@@ -1118,9 +1131,9 @@ def test_a_tile_defect_fails_a_block_that_admits_none(plugins, dot_defects):
     formats.register(_TileRaises())
     with pytest.raises(AssertionError) as failure, testing.no_dot_defects():
         assert formats.tile(_layer(), 64, 8) is None
+    defect = ("toy", "_DefectError('no biases')")
     assert str(failure.value) == (
-        "a quant format's dot() or tile() is defective: "
-        "[('toy', \"_DefectError('no biases')\")]"
+        f"a quant format has a defective face or layout: {[defect]}"
     )
     assert not dot_defects
 

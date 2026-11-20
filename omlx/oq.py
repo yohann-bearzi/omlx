@@ -7434,11 +7434,11 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
 
 
 def _probe_faces(layer, tensor_name, k, n):
-    """Ask the persisted reader about both faces on the layer that would load."""
-    from .formats import Dot, Tile, _checked_face
+    """Ask the persisted reader about each face on the layer that would load."""
+    from .formats import Codes, Dot, Tile, _checked_face
 
     reader = layer.fmt
-    for kind in (Dot, Tile):
+    for kind in (Dot, Tile, Codes):
         name = kind.__name__.lower()
         try:
             _checked_face(reader, layer, k, n, kind, name)

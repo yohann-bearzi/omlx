@@ -6,9 +6,10 @@ lane's part of rows through cursors stepped and placed, ``finish_rows``
 gives ``finish`` sums to scale, ``rows_stack`` checks the rows rule's
 promise of a format, and ``tile_rows`` reads every weight of rows through
 a tile face. ``staged_tables`` reads a face's tables back as a kernel
-stages them. ``no_dot_defects`` fails a test in
-which a format's ``dot()`` or ``tile()`` was defective. ``layer_calls`` records
-where format layers' rows ran: their face's launch, or the format's decode.
+stages them. ``codes_rows`` reads integer levels and weights.
+``no_dot_defects`` reports defective faces and layouts.
+``layer_calls`` records where format layers' rows ran:
+their face's launch, or the format's decode.
 ``fresh_proofs`` gives a test proofs of its own. ``verified`` has oQ take model families
 as verified with quant formats for a test's checkpoints.
 
@@ -29,7 +30,7 @@ from typing import Any
 import mlx.core as mx
 
 from .. import formats
-from . import Dot, Tile, kernels
+from . import Codes, Dot, Tile, kernels
 from .linear import FormatLinear
 
 # One threadgroup of one simdgroup per NA + NB rows. The rows read x where
@@ -155,13 +156,12 @@ def _publish() -> None:
 
 @contextmanager
 def no_dot_defects():
-    """Fail on leaving the block when a format's ``dot()`` or ``tile()`` was
-    defective in it.
+    """Fail on leaving the block when a format gave a defective face or layout.
 
-    ``omlx.formats.dot`` and ``omlx.formats.tile`` log a defect and answer
-    None: a model keeps its other kernels. A test wants the failure. oMLX
-    runs each test under ``tests/`` in this block, and so can a plugin, from
-    an autouse fixture. An exception of the block's body is raised in place
+    The ``dot``, ``tile`` and ``codes`` lookups log defects and answer None.
+    If a layout raises, ``stackable`` logs the defect and returns False.
+    oMLX runs each test under ``tests/`` in this block, and so can a plugin,
+    from an autouse fixture. An exception of the block's body is raised in place
     of this failure.
 
     The block's value is the set of the defects met so far, each a format's
@@ -175,7 +175,7 @@ def no_dot_defects():
         yield defects
     if defects:
         raise AssertionError(
-            f"a quant format's dot() or tile() is defective: {sorted(defects)}"
+            f"a quant format has a defective face or layout: {sorted(defects)}"
         )
 
 
@@ -204,7 +204,7 @@ def _staged_bytes(face: Dot) -> int:
 
 
 @cache
-def _staged_tables_kernel(face: Dot | Tile):
+def _staged_tables_kernel(face: Dot | Tile | Codes):
     matrices = kernels.Matrices()
     inputs = matrices.add("m", face)
     copies = "".join(
@@ -226,7 +226,7 @@ def _staged_tables_kernel(face: Dot | Tile):
 
 
 def staged_tables(
-    face: Dot | Tile, operands, dtype: mx.Dtype, *, codes_name: str = "weight"
+    face: Dot | Tile | Codes, operands, dtype: mx.Dtype, *, codes_name: str = "weight"
 ) -> dict[str, mx.array]:
     """Each of ``face``'s tables as a kernel stages it, read back through the
     face's member of the table's name: one array of the table's dtype and
@@ -236,8 +236,8 @@ def staged_tables(
     ``operands`` are a matrix's codes (``codes_name``) and the face's
     tensors, as for ``dot_rows`` (the face is declared over them), and
     ``dtype`` the activations' type ``T`` the face is compiled for."""
-    if not isinstance(face, (Dot, Tile)):
-        raise ValueError(f"{face!r} is not a Dot or a Tile")
+    if not isinstance(face, (Dot, Tile, Codes)):
+        raise ValueError(f"{face!r} is not a Dot or a Tile or Codes")
     if dtype not in formats.FLOATS:
         raise ValueError(f"dtype={dtype} is not a float type of the GPU")
     if not face.tables:
@@ -698,6 +698,20 @@ def tile_rows(
     """
     if not isinstance(face, Tile):
         raise ValueError(f"{face!r} is not a Tile")
+    rows, operands = _weight_rows_args(face, operands, k, rows, dtype, codes_name)
+    return tuple(
+        _tile_rows_kernel(face)(
+            inputs=[mx.array(rows, dtype=mx.uint64), *operands],
+            template=[("T", dtype), ("K", k)],
+            grid=(k, len(rows), 1),
+            threadgroup=(min(k, 256), 1, 1),
+            output_shapes=[(len(rows), k), (len(rows), k)],
+            output_dtypes=[mx.float32, dtype],
+        )
+    )
+
+
+def _weight_rows_args(face, operands, k, rows, dtype, codes_name="weight"):
     if not (isinstance(k, int) and 0 < k < 1 << 31 and k % 8 == 0):
         raise ValueError(f"k={k} is not one run or more of 8 inputs")
     try:
@@ -717,7 +731,7 @@ def tile_rows(
     if dtype not in (mx.float32, mx.float16, mx.bfloat16):
         raise ValueError(f"dtype={dtype} is not a float type of the GPU")
     if not face.exact_for(dtype):
-        exact = ", ".join(str(exact) for exact in face.dtypes)
+        exact = ", ".join(str(exact) for exact in face.dtypes or formats.FLOATS)
         raise ValueError(f"face {face.key} is exact for {exact}, not {dtype}")
     for name, operand in zip(names, operands, strict=True):
         if not isinstance(operand, mx.array):
@@ -727,16 +741,56 @@ def tile_rows(
                 f"face {face.key}: {name} has {operand.size} elements; MLX binds an "
                 "input of fewer than 8 as constants, not as a device buffer"
             )
-    return tuple(
-        _tile_rows_kernel(face)(
-            inputs=[mx.array(rows, dtype=mx.uint64), *operands],
-            template=[("T", dtype), ("K", k)],
-            grid=(k, len(rows), 1),
-            threadgroup=(min(k, 256), 1, 1),
-            output_shapes=[(len(rows), k), (len(rows), k)],
-            output_dtypes=[mx.float32, dtype],
-        )
+    return rows, operands
+
+
+_CODES_ROWS = """
+    using R = typename omlx_code_runs<decltype(m), K>::type;
+    uint w = thread_position_in_grid.x;
+    uint r = thread_position_in_grid.y;
+    R cursor(m, size_t(rows[r]));
+    const auto pack = cursor.fetch(w / 8);
+    uint pair = R::pair(pack, int(w % 4));
+    ushort level = ushort(pair >> ((w & 4) * 4));
+    float2 map = cursor.params(w / R::GROUP);
+    size_t at = size_t(r) * K + w;
+    levels[at] = level;
+    weights[at] = map.x * float(level) + map.y;
+"""
+
+
+@cache
+def _codes_rows_kernel(face: Codes):
+    return kernels.face_kernel(
+        "omlx_format_codes_rows",
+        ("rows", "m"),
+        {"m": face},
+        ("levels", "weights"),
+        "",
+        _CODES_ROWS,
     )
+
+
+def codes_rows(
+    face: Codes, operands, k: int, rows, dtype: mx.Dtype, *, codes_name: str = "weight"
+):
+    """Read unsigned levels and float32 weights for the selected rows, using
+    the same row indices and operands as tile_rows. Reject a level above 127.
+    Both results have shape (len(rows), K)."""
+    if not isinstance(face, Codes):
+        raise ValueError(f"{face!r} is not a Codes face")
+    rows, operands = _weight_rows_args(face, operands, k, rows, dtype, codes_name)
+    levels, weights = _codes_rows_kernel(face)(
+        inputs=[mx.array(rows, dtype=mx.uint64), *operands],
+        template=[("T", dtype), ("K", k)],
+        grid=(k, len(rows), 1),
+        threadgroup=(min(k, 256), 1, 1),
+        output_shapes=[(len(rows), k), (len(rows), k)],
+        output_dtypes=[mx.uint16, mx.float32],
+    )
+    if levels.max().item() > 127:
+        raise AssertionError(f"codes face {face.key} returned a level above 127")
+    return levels, weights
 
 
 @dataclass(frozen=True, eq=False)

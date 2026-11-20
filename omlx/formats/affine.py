@@ -18,6 +18,9 @@ is exact in float32 where it is finite), and what MLX's sorted
 ``gather_qmm`` loads into its tiles. MLX's ``dequantize`` over scales of
 bf16 or fp16 computes in that type, and can differ. It reads runs of 4 and
 8 bits only.
+
+The codes face gives the packed integer levels and the group's map to the
+single and shared SwiGLU sg8 traversal; MLX has no such route.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from functools import cache
 
 import mlx.core as mx
 
-from . import Dot, QuantFormat, Tile
+from . import Codes, Dot, QuantFormat, Tile
 
 _BITS = (2, 3, 4, 5, 6, 8)
 _GROUP_SIZES = (32, 64, 128)
@@ -642,6 +645,75 @@ def tile_face(bits: int, group_size: int, dtype: mx.Dtype) -> Tile:
     )
 
 
+_CODE_BITS = (2, 3, 4, 5, 6)
+_CODE_TYPES = {**_METAL_TYPES, mx.float32: "float"}
+
+# Read exactly the words containing one eight-level run. The last run of a
+# row can end at a word boundary and must not read into the following row.
+_PACKED_RUN = """
+    uint2 fetch(int run) const {
+      const device uint* block = w + size_t(run >> 2) * BITS;
+      uint at = uint(run & 3) * BITS;
+      uint shift = (at % 4) * 8;
+      ulong v = ulong(block[at / 4]);
+      if (shift + 8 * BITS > 32) v |= ulong(block[at / 4 + 1]) << 32;
+      v >>= shift;
+      return uint2(uint(v), uint(v >> (4 * BITS)));
+    }
+    static uint pair(uint2 q, int j) {
+      constexpr uint MASK = (1u << BITS) - 1;
+      uint2 p = (q >> (BITS * j)) & MASK;
+      return p.x | (p.y << 16);
+    }"""
+
+_NIBBLE_RUN = """
+    uint fetch(int run) const { return w[run]; }
+    static uint pair(uint q, int j) { return (q >> (4 * j)) & 0x000f000fu; }"""
+
+
+@cache
+def codes_face(bits, group_size, scale_dtype, bias_dtype) -> Codes:
+    """The affine integer levels, with the parameter types stored on disk."""
+    if bits not in _CODE_BITS or group_size not in _GROUP_SIZES:
+        raise ValueError(f"affine codes face: {bits} bits in groups of {group_size}")
+    if scale_dtype not in _CODE_TYPES or bias_dtype not in _CODE_TYPES:
+        raise ValueError(
+            f"affine codes face: {scale_dtype} scales and {bias_dtype} biases"
+        )
+    scale, bias = _CODE_TYPES[scale_dtype], _CODE_TYPES[bias_dtype]
+    key = f"affine_codes_b{bits}g{group_size}_{scale}_{bias}"
+    source = f"""
+namespace omlx_{key} {{
+struct Codes {{
+  static constant constexpr int CONTRACT = 1;
+  const device uchar* weight;
+  const device {scale}* scales;
+  const device {bias}* biases;
+  template <int K>
+  struct Runs {{
+    static constant constexpr int BITS = {bits};
+    static constant constexpr int GROUP = {group_size};
+    const device uint* w;
+    const device {scale}* s;
+    const device {bias}* b;
+    Runs(Codes m, size_t row)
+      : w((const device uint*)m.weight + row * (K / 32 * BITS)),
+        s(m.scales + row * (K / GROUP)), b(m.biases + row * (K / GROUP)) {{}}
+    float2 params(int g) const {{ return float2(float(s[g]), float(b[g])); }}
+    {_NIBBLE_RUN if bits == 4 else _PACKED_RUN}
+  }};
+}};
+}}
+"""
+    return Codes(
+        key,
+        source,
+        f"omlx_{key}::Codes",
+        AffineFormat.tensors,
+        (mx.bfloat16, mx.float16),
+    )
+
+
 class AffineFormat(QuantFormat):
     mode = "affine"
     tensors = ("scales", "biases")
@@ -701,6 +773,26 @@ class AffineFormat(QuantFormat):
         ):
             return None
         return tile_face(layer.bits, layer.group_size, scales.dtype)
+
+    def codes(self, layer, k: int, n: int) -> Codes | None:
+        bits, group = layer.bits, layer.group_size
+        if bits not in _CODE_BITS or group not in _GROUP_SIZES or k <= 0 or k % group:
+            return None
+        weight, scales, biases = (layer.get(key) for key in ("weight", *self.tensors))
+        if not all(isinstance(a, mx.array) for a in (weight, scales, biases)):
+            return None
+        if (
+            weight.dtype != mx.uint32
+            or weight.ndim not in (2, 3)
+            or weight.shape[-2:] != (n, k // 32 * bits)
+            or scales.shape != (*weight.shape[:-1], k // group)
+            or biases.shape != scales.shape
+            or scales.dtype not in _CODE_TYPES
+            or biases.dtype not in _CODE_TYPES
+            or min(weight.size, scales.size) < 8
+        ):
+            return None
+        return codes_face(bits, group, scales.dtype, biases.dtype)
 
     def decode(self, tensors, bits: int, group_size: int) -> mx.array:
         return mx.dequantize(

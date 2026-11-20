@@ -181,3 +181,14 @@ def test_layer_refusals_name_a_plugins_codes(reader):
                 8,
                 {**stack, "gain": mx.zeros((3, 8))},
             )
+
+def test_quant_formats_doc_has_no_stray_scratch_path():
+    """The contract page states the format's rules; a pasted merge file or
+    workspace path is not one of them."""
+    from pathlib import Path
+
+    doc = Path(__file__).resolve().parents[1] / "docs" / "quant-formats.md"
+    stray = [
+        line for line in doc.read_text().splitlines() if line.strip().startswith("opencode/")
+    ]
+    assert not stray, stray

@@ -18,16 +18,11 @@ from tests.oracles import sg8 as oracle
 # The comparisons run kernels; the verbatim check runs anywhere.
 _GPU = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
-# What the oracle copies of the live module: its functions and its constants.
+# Functions and constants still shared with the legacy implementation.
 _FUNCTIONS = (
     "_operand_bits",
-    "_sg8_source",
     "_with_group_sums",
-    "_build_sg8_kernel",
     "_sg8_geometry",
-    "_sg8_call",
-    "vk_qmm_sg8",
-    "vk_swiglu_sg8",
     "group_sums",
     "_sg8_group_source",
     "vk_group_sg8",
@@ -51,12 +46,8 @@ def test_the_oracle_is_the_live_code_verbatim():
         assert getattr(frozen, name) == getattr(live, name), name
     # Kernels of its own: the live cache never holds the oracle's.
     assert frozen._KERNEL_CACHE is not live._KERNEL_CACHE
-    # And the Metal it generates, for every form a kernel takes.
-    for mats in (1, 2):
-        for half in (False, True):
-            source = frozen._sg8_source(mats, half)
-            assert source == live._sg8_source(mats, half)
-            assert frozen._with_group_sums(source) == live._with_group_sums(source)
+    # The grouped kernel still shares its original source with the oracle.
+    # Single and SwiGLU read codes faces and are compared by their outputs.
     for ns, bits in (((1024,), (4,)), ((4096, 512, 1024), (4, 5, 4))):
         for half in (False, True):
             group = frozen._sg8_group_source(ns, bits, half)

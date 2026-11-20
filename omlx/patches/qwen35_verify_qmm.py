@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from functools import cache, partial
 
 from omlx.custom_kernels import nax_skinny_qmm
 from omlx.custom_kernels.nax import is_nax_available
@@ -620,12 +621,7 @@ def _operand_bits(pair: str, half: bool) -> str:
 
 
 def _sg8_source(mats: int, half: bool = False) -> str:
-    pair4 = _operand_bits("((wds[0] >> (4 * j)) & 0x000F000Fu)", half)
-    pair_split = _operand_bits(
-        "((wds[0] >> (BITS * j)) & MASK) | (((wds[1] >> (BITS * j)) & MASK) << 16)",
-        half,
-    )
-    names = [("w_q", "scales", "biases"), ("w_q2", "scales2", "biases2")][:mats]
+    pair = _operand_bits("R::pair(pack, j)", half)
     decl = "\n".join(
         f"    float2 out{m}[CT];\n"
         f"    for (int c = 0; c < CT; ++c) out{m}[c] = float2(0.0f);"
@@ -638,26 +634,27 @@ def _sg8_source(mats: int, half: bool = False) -> str:
         for m in range(mats)
     )
     mma = "\n".join(f"""                {{
-                    const device uchar* wg =
-                        (const device uchar*){w} + long(n) * ROW_BYTES + long(g) * WB;
-                    uint wds[2];
-                    load_words(wg, qd, wds);
+                    using R = typename omlx_code_runs<decltype(m{m}), K>::type;
+                    static_assert(R::GROUP == GS, "codes face: group size differs");
+                    R cursor(m{m}, size_t(n));
+                    const auto pack = cursor.fetch(kq / 8 + int(fn >> 1));
                     for (int j = 0; j < 4; ++j) {{
                         simdgroup_matrix<T, 8, 8> a, b;
-                        uint pair = operand_pair(wds, j);
+                        uint pair = {pair};
                         a.thread_elements()[0] = as_type<T>(ushort(pair));
                         a.thread_elements()[1] = as_type<T>(ushort(pair >> 16));
                         b.thread_elements()[0] = xa[j];
                         b.thread_elements()[1] = xb[j];
                         simdgroup_multiply_accumulate(acc{m}[c], a, b, acc{m}[c]);
                     }}
-                }}""" for m, (w, _, _) in enumerate(names))
+                }}""" for m in range(mats))
     fold = "\n".join(f"""            {{
-                float s = float({s}[n * GROUPS + g]);
-                float bias = float({b}[n * GROUPS + g]);
+                using R = typename omlx_code_runs<decltype(m{m}), K>::type;
+                const float2 map = R(m{m}, size_t(n)).params(g);
+                float s = map.x, bias = map.y;
                 float2 a2 = float2(acc{m}[c].thread_elements()[0], acc{m}[c].thread_elements()[1]);
                 out{m}[c] += s * a2 + (bias - 128.0f * s) * xsum;
-            }}""" for m, (_, s, b) in enumerate(names))
+            }}""" for m in range(mats))
     parts = "\n".join(
         f"    for (int c = 0; c < CT; ++c) part[(({m} * CT + c) * NSG + sg) * 32 + lane] = out{m}[c];"
         for m in range(mats)
@@ -681,12 +678,13 @@ def _sg8_source(mats: int, half: bool = False) -> str:
     uint fn = ((qid & 2) << 1) | ((lane & 1) << 1);
     constexpr int GROUPS = K / GS;
     constexpr int PER = GROUPS / NSG;
-    constexpr int WB = GS * BITS / 8;
-    constexpr long ROW_BYTES = long(K) * BITS / 8;
     int g_begin = int(sg) * PER;
     int nbase = int(threadgroup_position_in_grid.y) * 8 * CT;
     bool r0 = int(fn) < M;
     bool r1 = int(fn) + 1 < M;
+    static_assert(M >= 1 && M <= 8 && GS >= 32 && GS % 32 == 0 &&
+                  K > 0 && K % (GS * NSG) == 0 && N > 0 && N % (8 * CT) == 0,
+                  "sg8 launch geometry: whole row, column and K tiles required");
     // Step j of a 32-wide k block: A columns 2i and 2i + 1 are values j and
     // j + 4 of the lane's eight packed values i * 8 .. i * 8 + 7, so both
     // operands come from one shift and mask. Its x values over j are adjacent.
@@ -695,29 +693,6 @@ def _sg8_source(mats: int, half: bool = False) -> str:
     // loop has no row branches.
     const device T* x0 = x + min(int(fn), M - 1) * K + kx;
     const device T* x1 = x + min(int(fn) + 1, M - 1) * K + kx;
-    auto load_words = [&](const device uchar* wg, int qd, thread uint* wds) {{
-        if (BITS == 4) {{
-            wds[0] = ((const device uint*)(wg + qd * 16))[fn >> 1];
-        }} else {{
-            // Pack i holds eight values in BITS bytes at byte BITS * i.
-            // Read the second word only when the pack reaches it.
-            // The last pack of a row then stays inside the block.
-            const device uint* wp = (const device uint*)(wg + qd * 4 * BITS);
-            uint at = (fn >> 1) * BITS;
-            ulong v = ulong(wp[at / 4]);
-            if ((at % 4) * 8 + 8 * BITS > 32)
-                v |= ulong(wp[at / 4 + 1]) << 32;
-            v >>= (at % 4) * 8;
-            wds[0] = uint(v);
-            wds[1] = uint(v >> (4 * BITS));
-        }}
-    }};
-    constexpr uint MASK = (1u << BITS) - 1u;
-    auto operand_pair = [&](thread uint* wds, int j) {{
-        if (BITS == 4)
-            return {pair4};
-        return {pair_split};
-    }};
 {decl}
     for (int g = g_begin; g < g_begin + PER; ++g) {{
 {acc_decl}
@@ -788,29 +763,6 @@ def _with_group_sums(source: str) -> str:
     )
 
 
-def _build_sg8_kernel(mats: int = 1, sums: bool = False, half: bool = False):
-    import mlx.core as mx
-
-    key = ("sg8", mats, sums, half)
-    if key not in _KERNEL_CACHE:
-        inputs = ["x", "w_q", "scales", "biases"]
-        if mats == 2:
-            inputs += ["w_q2", "scales2", "biases2"]
-        source = _sg8_source(mats, half)
-        if sums:
-            inputs.append("xs")
-            source = _with_group_sums(source)
-        _KERNEL_CACHE[key] = mx.fast.metal_kernel(
-            name=f"omlx_vk_sg8_m{mats}"
-            + ("_xs" if sums else "")
-            + ("_fp16" if half else ""),
-            input_names=inputs,
-            output_names=["y"],
-            source=source,
-        )
-    return _KERNEL_CACHE[key]
-
-
 def _sg8_geometry(K: int, N: int) -> tuple[int, int]:
     """Simdgroups per threadgroup (K split) and 8-column tiles per simdgroup.
 
@@ -844,54 +796,143 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
     )
 
 
-def _sg8_call(x2, mats, weights, *, group_size: int, bits: int, sums=None):
+@cache
+def _sg8_launch(faces, rows, k, n, group_size, dtype, summed):
+    """Bind the Metal constants and launch dimensions for one input signature."""
     import mlx.core as mx
 
-    M = int(x2.shape[0])
-    K = int(x2.shape[1])
-    N = int(weights[0].shape[0])
-    nsg, ct = _sg8_geometry(K, N)
-    if sums is not None and int(group_size) != _SUM_GROUP:
-        sums = None
-    extra = [] if sums is None else [sums]
-    half = x2.dtype == mx.float16
-    (y,) = _build_sg8_kernel(mats, sums is not None, half)(
-        inputs=[x2, *weights, *extra],
-        template=[
-            ("T", x2.dtype),
-            ("K", K),
-            ("N", N),
-            ("M", M),
-            ("BITS", int(bits)),
-            ("GS", int(group_size)),
-            ("NSG", nsg),
-            ("CT", ct),
-        ],
-        grid=(32 * nsg, N // (8 * ct), 1),
-        threadgroup=(32 * nsg, 1, 1),
-        output_shapes=[(M, N)],
-        output_dtypes=[x2.dtype],
+    from omlx.formats import kernels
+
+    nsg, ct = _sg8_geometry(k, n)
+    half = dtype == mx.float16
+    matrices = {f"m{i}": face for i, face in enumerate(faces)}
+    inputs = ("x", *matrices)
+    source = _sg8_source(len(faces), half)
+    if summed:
+        inputs += ("xs",)
+        source = _with_group_sums(source)
+    constants = (
+        f"    constexpr int K = {k:d}, N = {n:d}, M = {rows:d};\n"
+        f"    constexpr int GS = {group_size:d}, NSG = {nsg:d}, CT = {ct:d};\n"
     )
-    return y
+    name = f"omlx_codes_sg8_k{k:d}_n{n:d}_m{rows:d}_g{group_size:d}"
+    if summed:
+        name += "_xs"
+    if half:
+        name += "_fp16"
+    kernel = kernels.face_kernel(name, inputs, matrices, ("y",), "", constants + source)
+    return partial(
+        kernel,
+        template=[("T", dtype)],
+        grid=(32 * nsg, n // (8 * ct), 1),
+        threadgroup=(32 * nsg, 1, 1),
+        output_shapes=[(rows, n)],
+        output_dtypes=[dtype],
+    )
+
+
+def _sg8_call(x2, faces, weights, n, group_size, sums):
+    rows, k = x2.shape
+    summed = group_size == _SUM_GROUP and sums is not None
+    launch = _sg8_launch(faces, rows, k, n, group_size, x2.dtype, summed)
+    inputs = [x2, *weights]
+    if summed:
+        inputs.append(sums)
+    return launch(inputs=inputs)[0]
+
+
+def sg8_codes(x2, face, operands, *, n, group_size, sums=None):
+    """Launch one eligible (rows, K) projection over its matrix's codes face.
+    The caller binds the weight and face tensors in order for (n, K)."""
+    import mlx.core as mx
+
+    from omlx.formats import FLOATS, Codes
+
+    if not isinstance(face, Codes):
+        raise ValueError(f"{face!r} is not a Codes face")
+    if x2.dtype not in (mx.bfloat16, mx.float16):
+        raise ValueError(f"sg8 reads bf16 or fp16 activations, not {x2.dtype}")
+    if not face.exact_for(x2.dtype):
+        exact = ", ".join(str(d) for d in face.dtypes or FLOATS)
+        raise ValueError(f"face {face.key} is exact for {exact}, not {x2.dtype}")
+    return _sg8_call(x2, (face,), operands, n, group_size, sums)
+
+
+@cache
+def _affine_sg8_launch(
+    bits, group_size, scale_dtype, bias_dtype, rows, k, n, dtype, summed
+):
+    from omlx.formats.affine import codes_face
+
+    face = codes_face(bits, group_size, scale_dtype, bias_dtype)
+    return _sg8_launch((face,), rows, k, n, group_size, dtype, summed)
 
 
 def vk_qmm_sg8(x2, w_q, scales, biases, *, group_size: int, bits: int = 4, sums=None):
-    """(M, K) x (N, K)^T -> (M, N) for M in 7..8 through the sg8 kernel."""
-    return _sg8_call(
-        x2, 1, (w_q, scales, biases), group_size=group_size, bits=bits, sums=sums
+    """An affine projection through the same integer-level kernel as a plugin."""
+    rows, k = x2.shape
+    summed = group_size == _SUM_GROUP and sums is not None
+    launch = _affine_sg8_launch(
+        bits,
+        group_size,
+        scales.dtype,
+        biases.dtype,
+        rows,
+        k,
+        w_q.shape[0],
+        x2.dtype,
+        summed,
     )
+    inputs = [x2, w_q, scales, biases]
+    if summed:
+        inputs.append(sums)
+    return launch(inputs=inputs)[0]
+
+
+@cache
+def _affine_swiglu_sg8_launch(
+    bits, group_size, g_sd, g_bd, u_sd, u_bd, rows, k, n, dtype, summed
+):
+    from omlx.formats.affine import codes_face
+
+    faces = (
+        codes_face(bits, group_size, g_sd, g_bd),
+        codes_face(bits, group_size, u_sd, u_bd),
+    )
+    return _sg8_launch(faces, rows, k, n, group_size, dtype, summed)
 
 
 def vk_swiglu_sg8(x2, gate, up, sums=None):
-    """silu(x gate^T) * (x up^T) for M in 7..8 in one pass over both weights."""
-    return _sg8_call(
-        x2,
-        2,
-        (gate.weight, gate.scales, gate.biases, up.weight, up.scales, up.biases),
-        group_size=gate.group_size,
-        bits=gate.bits,
-        sums=sums,
+    """silu(x gate^T) * (x up^T) over the same codes traversal in one launch."""
+    rows, k = x2.shape
+    if (gate.bits, gate.group_size) != (up.bits, up.group_size):
+        raise ValueError("swiglu needs one bits and group size for its pair")
+    summed = gate.group_size == _SUM_GROUP and sums is not None
+    launch = _affine_swiglu_sg8_launch(
+        gate.bits,
+        gate.group_size,
+        gate.scales.dtype,
+        gate.biases.dtype,
+        up.scales.dtype,
+        up.biases.dtype,
+        rows,
+        k,
+        gate.weight.shape[0],
+        x2.dtype,
+        summed,
     )
+    inputs = [
+        x2,
+        gate.weight,
+        gate.scales,
+        gate.biases,
+        up.weight,
+        up.scales,
+        up.biases,
+    ]
+    if summed:
+        inputs.append(sums)
+    return launch(inputs=inputs)[0]
 
 
 # Inputs whose producer already wrote their per-64 group sums, by identity.

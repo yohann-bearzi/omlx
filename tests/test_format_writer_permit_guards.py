@@ -168,8 +168,10 @@ def test_writer_revokes_an_unused_permit_when_construction_raises(
     [
         ("wrong type", "dot"),
         ("wrong type", "tile"),
+        ("wrong type", "codes"),
         ("hand table", "dot"),
         ("hand table", "tile"),
+        ("hand table", "codes"),
         ("shared table", "dot"),
     ],
 )
@@ -197,7 +199,7 @@ def test_writer_rejects_a_bad_face_from_the_persisted_reader(
                 tensors=(),
                 vpt=8,
             )
-        face_type = formats.Dot if kind == "dot" else formats.Tile
+        face_type = {"dot": formats.Dot, "tile": formats.Tile, "codes": formats.Codes}[kind]
         return face_type(
             key="hand",
             source="constant float LEVELS[] = {-1.0f, 1.0f};",
