@@ -4403,6 +4403,29 @@ class TestBuildProxyForSensitivity:
         assert config["quantization"]["group_size"] == _PROXY_QUANT_GROUP_SIZE
         assert (out / "model.safetensors").exists()
 
+    def test_forwards_text_only_argument(self, tmp_path, monkeypatch):
+        from omlx import oq as _oq
+
+        captured = {}
+
+        def _fake_build(
+            model_path,
+            output_path,
+            *,
+            dtype,
+            trust_remote_code=False,
+            preserve_mtp=False,
+            text_only=False,
+        ):
+            captured["text_only"] = text_only
+            output_path.mkdir()
+
+        monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
+        _build_proxy_for_sensitivity(
+            str(tmp_path / "src_model"), dtype="bfloat16", text_only=True
+        )
+        assert captured["text_only"] is True
+
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
     def test_text_only_streaming_proxy_skips_broken_optiq_declaration(self, tmp_path):
         from safetensors.numpy import save_file as np_save
@@ -10253,12 +10276,15 @@ def test_optiq_sidecar_path_is_rebased(tmp_path):
     sidecar = source / "optiq" / "x.safetensors"
     sidecar.parent.mkdir(parents=True)
     sidecar.write_bytes(b"weights")
-    declared = {"sidecar": str(sidecar)}
+    declared = {"sidecar": str(sidecar), "n_tensors": 3}
     (source / "config.json").write_text(json.dumps({"optiq_vision": declared}))
     config = {"optiq_vision": declared}
     oq._normalize_optiq_vision_in_config(config, source)
-    assert config["optiq_vision"]["sidecar"] == "optiq/x.safetensors"
-    assert declared["sidecar"] == str(sidecar)
+    assert config["optiq_vision"] == {
+        "sidecar": "optiq/x.safetensors",
+        "n_tensors": 3,
+    }
+    assert declared == {"sidecar": str(sidecar), "n_tensors": 3}
 
     real = source / "real" / "x.safetensors"
     real.parent.mkdir(parents=True)

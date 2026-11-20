@@ -98,9 +98,7 @@ class _Codec(_ToyFormat):
         rows = w.astype(mx.float32)
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
         codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
-        return self.answer(
-            {"codes": codes.astype(mx.uint8), "group_scales": scales}, w
-        )
+        return self.answer({"codes": codes.astype(mx.uint8), "group_scales": scales}, w)
 
     def accept(self, record):
         self.accepted.append(record)
@@ -1184,9 +1182,7 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
             entries[name]["group_size"],
         )
         assert mx.array_equal(layer["codes"], tensors[f"{name}.codes"])
-        assert mx.array_equal(
-            layer["group_scales"], tensors[f"{name}.group_scales"]
-        )
+        assert mx.array_equal(layer["group_scales"], tensors[f"{name}.group_scales"])
     logits = model(mx.array([[1, 2, 3, 4]]))
     assert logits.shape == (1, 4, 64) and mx.isfinite(logits).all()
 
@@ -3747,3 +3743,26 @@ def test_the_writer_rebases_and_skips_optiq_sidecar(source, tmp_path):
     _, text_config, _ = _quantize(src, tmp_path / "text", text_only=True)
     assert "optiq_vision" not in text_config
     assert not (tmp_path / "text" / "optiq").exists()
+
+
+def test_a_qwen35_moe_write_verifies_after_reload(source, toy, tmp_path, monkeypatch):
+    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
+    output = tmp_path / "qwen35-oq4e"
+    _, config, _ = _quantize(source, output, quant_format="toy")
+    assert config["omlx_verification"]["verified"] is True
+    maybe_apply_pre_load_patches(str(output))
+    model, _ = load_model(output, strict=True)
+    out = model(mx.array([[1, 2, 3, 4]]))
+    logits = getattr(out, "logits", out)
+    assert mx.isfinite(logits).all()
+
+def test_a_text_only_run_ignores_a_broken_optiq_declaration(source, tmp_path):
+    import shutil
+
+    src = tmp_path / "src"
+    shutil.copytree(source, src)
+    config = json.loads((src / "config.json").read_text())
+    config["optiq_vision"] = {"sidecar": "optiq/missing.safetensors"}
+    (src / "config.json").write_text(json.dumps(config))
+    _, written, _ = _quantize(src, tmp_path / "text", text_only=True)
+    assert "optiq_vision" not in written

@@ -95,8 +95,7 @@ _MINIMAX_INDEXER_PROJECTIONS = ("index_q_proj", "index_k_proj")
 
 _QWEN4_EXP_NGRAM_GROUP_SIZE = 32
 _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
-    r"\.ple\.ple_embedding\.ngram_embedding\."
-    r"(?:shard_\d+|shards\.\d+)$"
+    r"\.ple\.ple_embedding\.ngram_embedding\." r"(?:shard_\d+|shards\.\d+)$"
 )
 
 
@@ -426,8 +425,7 @@ def _is_vlm_load(config: dict) -> bool:
         # mlx-lm's Inkling 2 module holds the vision tower too.
         return False
     return model_type in VLM_NATIVE_TEXT_MODEL_TYPES or (
-        _has_vision_subconfig(config)
-        and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
+        _has_vision_subconfig(config) and model_type not in MLX_LM_TEXT_ONLY_MODEL_TYPES
     )
 
 
@@ -2082,9 +2080,7 @@ _MTPLX_CONTRACT_ALLOWLIST = {
 _MTPLX_DELTA_NORM_ENCODINGS = {"delta", "delta_plus_one", "mlx_delta"}
 
 
-def validate_gemma4_assistant_pair(
-    base_config: dict, assistant_config: dict
-) -> None:
+def validate_gemma4_assistant_pair(base_config: dict, assistant_config: dict) -> None:
     """Validate that a Gemma 4 assistant checkpoint can be merged into a base.
 
     Raises ValueError with an operator-readable message on any mismatch so
@@ -2169,8 +2165,7 @@ def combine_gemma4_assistant_mtp(
     _atomic_write_json(output / "config.json", config)
 
     logger.info(
-        "Merged gemma4 assistant MTP head into %s "
-        "(%d tensors, %.2f GB, source=%s)",
+        "Merged gemma4 assistant MTP head into %s " "(%d tensors, %.2f GB, source=%s)",
         output.name,
         len(mtp_weights),
         mtp_size / 1e9,
@@ -5068,8 +5063,10 @@ def _build_model_sanitizer(
                             ]
                         },
                     )()
-                    _lm_proxy.sanitize = lambda weights: model_module.LanguageModel.sanitize(
-                        _lm_proxy, weights
+                    _lm_proxy.sanitize = (
+                        lambda weights: model_module.LanguageModel.sanitize(
+                            _lm_proxy, weights
+                        )
                     )
                     _vision_proxy = type("_VisionProxy", (), {})()
                     _vision_proxy.sanitize = (
@@ -5331,8 +5328,7 @@ def _optiq_vision_sidecar(source: Path) -> Path | None:
         sidecar.relative_to(root)
     except ValueError as exc:
         raise ValueError(
-            "OptiQ vision sidecar must stay inside the model directory: "
-            f"{relative}"
+            "OptiQ vision sidecar must stay inside the model directory: " f"{relative}"
         ) from exc
     if sidecar.suffix != ".safetensors":
         raise ValueError(f"OptiQ vision sidecar must be a safetensors file: {sidecar}")
@@ -6648,9 +6644,7 @@ def _lookup_imatrix_importance(
 ):
     if imatrix is None or not tensor_name.endswith(".weight"):
         return None
-    if config is not None and _is_qwen4_exp_ngram_embedding_tensor(
-        tensor_name, config
-    ):
+    if config is not None and _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config):
         # The collector measures Linear/SwitchLinear input channels, not
         # embedding rows. Do not turn the intentionally uniform PLE policy
         # into a missing-entry error under imatrix_strict.
@@ -7202,7 +7196,14 @@ def _row_chunks(t, max_elems):
 # the gate fails closed. Families served by mlx-lm's own code alone come back
 # after the proof of concept (DEFERRED.md row 22).
 # Match the whole config. The text backbone is admitted only in this wrapper.
-_QUANT_FORMAT_VERIFIED = frozenset({("qwen4_exp", "qwen4_exp_text")})
+_QUANT_FORMAT_VERIFIED = frozenset(
+    {
+        ("qwen4_exp", "qwen4_exp_text"),
+        ("qwen3_5_moe", "qwen3_5_moe_text"),
+        ("qwen3_5_moe",),
+        ("qwen3_5_moe_text",),
+    }
+)
 # The families tests take as verified (omlx.formats.testing.verified), while
 # one of their blocks is open, in any thread.
 _TEST_VERIFIED: frozenset[str] = frozenset()
@@ -8057,9 +8058,7 @@ def _open_oq_run(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
-    normalized_model_type = str(config.get("model_type", "")).lower().replace(
-        "-", "_"
-    )
+    normalized_model_type = str(config.get("model_type", "")).lower().replace("-", "_")
     mimo_multimodal = (
         normalized_model_type in {"mimo_v2", "mimo_v2_flash"}
         and _has_vision_subconfig(config)
@@ -9095,9 +9094,7 @@ def quantize_oq_streaming(
     total_bytes = _progress_total_bytes(all_weights, source)
     processed_bytes = 0
 
-    folded_scales = _muse_spark_folded_scales(
-        all_weights, config, oq_level, group_size
-    )
+    folded_scales = _muse_spark_folded_scales(all_weights, config, oq_level, group_size)
     pending_scales = {}
     consumed_scales = set()
     upstream_writer = None
@@ -9588,11 +9585,11 @@ _OQE_SWITCH_LINEAR_CLASSES = {"SwitchLinear", "QuantizedSwitchLinear", "ExpertPr
 
 
 def _is_oqe_switch_module(module) -> bool:
-    return (
-        type(module).__name__ in _OQE_SWITCH_LINEAR_CLASSES
-        or (type(module).__name__ == "QuantizedProjection"
-            and getattr(module.weight, "ndim", 0) == 3)
+    return type(module).__name__ in _OQE_SWITCH_LINEAR_CLASSES or (
+        type(module).__name__ == "QuantizedProjection"
+        and getattr(module.weight, "ndim", 0) == 3
     )
+
 
 _OQE_MULTI_LINEAR_CLASSES = {"MultiLinear", "QuantizedMultiLinear"}
 _OQ_CODE_MULTILINGUAL_KEYS = (
@@ -10150,8 +10147,7 @@ def _prepare_embedding_gemma2_layer_inputs(model, layers, calib_data, inputs):
         mx.abs(positions[:, None] - positions[None, :]) <= config.sliding_window
     )
     layer_masks = [
-        sliding if kind == "sliding_attention" else full
-        for kind in config.layer_types
+        sliding if kind == "sliding_attention" else full for kind in config.layer_types
     ]
     state = {
         "kind": _EMBEDDING_GEMMA2_LAYER_STATE_KIND,
@@ -10704,9 +10700,7 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
         positions = mx.arange(calib_data.shape[1])
         attn_scale = 1 + rope_parameters["llama_4_scaling_beta"] * mx.log(
             1
-            + mx.floor(
-                positions / rope_parameters["original_max_position_embeddings"]
-            )
+            + mx.floor(positions / rope_parameters["original_max_position_embeddings"])
         )
         state = {
             "kind": _LLAMA4_SCALED_LAYER_STATE_KIND,
@@ -10745,10 +10739,7 @@ class _ImatrixCaptureWrapper(nn.Module):
 
     def __call__(self, *args, **kwargs):
         if args:
-            if (
-                _is_oqe_switch_module(self._module)
-                and len(args) >= 2
-            ):
+            if _is_oqe_switch_module(self._module) and len(args) >= 2:
                 self._collector.collect_switch(
                     self._name, self._module, args[0], args[1]
                 )
@@ -12052,7 +12043,11 @@ def _streamed_sensitivity_layer(
     )
     try:
         out_quant, _ = _forward_layer_result(
-            block, state["inputs"], layer_mask, state["position_ids"], layer_idx=layer_idx
+            block,
+            state["inputs"],
+            layer_mask,
+            state["position_ids"],
+            layer_idx=layer_idx,
         )
         if out_quant is None:
             raise RuntimeError(
@@ -13964,8 +13959,7 @@ def _load_or_collect_imatrix(
             )
         )
         raise RuntimeError(
-            "oQe imatrix collection produced no entries "
-            f"(stage={stage}: {reason})"
+            "oQe imatrix collection produced no entries " f"(stage={stage}: {reason})"
         )
     metadata = {
         **expected,
@@ -14479,11 +14473,7 @@ def _build_streaming_proxy_for_sensitivity(
                     if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
                     else base_gs
                 )
-                if (
-                    pred is not False
-                    and len(shape) >= 2
-                    and shape[-1] % tensor_gs == 0
-                ):
+                if pred is not False and len(shape) >= 2 and shape[-1] % tensor_gs == 0:
                     if (
                         mx.issubdtype(w_mx.dtype, mx.floating)
                         and w_mx.dtype != target_dtype
@@ -14641,7 +14631,9 @@ def _measure_sensitivity_from_quantized_model(
                     apply_mlx_vlm_mtp_runtime_patch()
                     prev_active = is_mtp_active()
                     set_mtp_active(True)
-                    restore_mtp_active = lambda: set_mtp_active(prev_active)  # noqa: E731
+                    restore_mtp_active = lambda: set_mtp_active(
+                        prev_active
+                    )  # noqa: E731
                 except Exception as e:
                     logger.debug(
                         f"mlx-vlm MTP runtime patch skipped for proxy sensitivity: {e}"
