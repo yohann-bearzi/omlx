@@ -1149,5 +1149,111 @@ def test_rows_stack_refusal_names_a_plugins_codes():
     fmt = _ToyFormat()
     fmt.codes_name = "packed_bytes"
     fmt.tensors = ("group_scales",)
-    with pytest.raises(AssertionError, match=r"needs its codes \('packed_bytes'\)"):
-        testing.rows_stack(fmt, {}, {}, 8, 8, 1)
+    # A matrix under "codes" is not the format's codes: the refusal must say
+    # so, and a lookup that falls back to "codes" would pass it through.
+    other = {"codes": mx.zeros((8, 8), mx.uint8)}
+    with pytest.raises(
+        AssertionError, match=r"first matrix needs its codes \('packed_bytes'\) rows"
+    ):
+        testing.rows_stack(fmt, other, other, 8, 8, 1)
+
+
+def test_rows_stack_accepts_a_plugins_codes_without_activations():
+    class Packed(_ToyFormat):
+        codes_name = "packed_bytes"
+        tensors = ("group_scales",)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "packed_bytes": ((n, k), mx.uint8),
+                "group_scales": ((n,), mx.float32),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            codes = tensors["packed_bytes"].astype(mx.float32) - 128.0
+            return codes * tensors["group_scales"][..., None]
+
+    (codes, scales), _, _ = _matrix(8, 320)
+    one = {"packed_bytes": codes, "group_scales": scales}
+    testing.rows_stack(Packed(), one, one, 320, 8, 1)
+
+
+def test_rows_stack_with_activations_reads_a_plugins_codes_in_face_order(
+    monkeypatch,
+):
+    """With ``x`` the helper builds each layer from the format object
+    (unregistered): a format whose codes are "packed_bytes" is read by that
+    name, and its face's tensors in the face's order."""
+
+    class Packed(_ToyFormat):
+        codes_name = "packed_bytes"
+        tensors = ("group_scales",)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "packed_bytes": ((n, k), mx.uint8),
+                "group_scales": ((n,), mx.float32),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            codes = tensors["packed_bytes"].astype(mx.float32) - 128.0
+            return codes * tensors["group_scales"][..., None]
+
+        def dot(self, layer, k, n):
+            return _toy("packed_rows")
+
+    seen = []
+    rows = testing.dot_rows
+
+    def recorded(face, operands, x, n, packs=(1, 1), **named):
+        seen.append((named.get("codes_name"), face.tensors))
+        return rows(face, operands, x, n, packs, **named)
+
+    monkeypatch.setattr(testing, "dot_rows", recorded)
+    fmt = Packed()
+    (codes, scales), _, _ = _matrix(8, 320)
+    one = {"packed_bytes": codes, "group_scales": scales}
+    testing.rows_stack(fmt, one, one, 320, 8, 1, _ints((320,)))
+    assert seen and seen[0] == ("packed_bytes", ("group_scales",))
+
+
+def test_rows_stack_passes_the_faces_tensors_in_face_order(monkeypatch):
+    """A face that reads two side tensors in its own order is given them in
+    that order, after the format's codes: the operand list is the face's."""
+
+    class Packed(_ToyFormat):
+        codes_name = "packed_bytes"
+        tensors = ("group_scales", "row_scales")
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "packed_bytes": ((n, k), mx.uint8),
+                "group_scales": ((n,), mx.float32),
+                "row_scales": ((n, 2), mx.float32),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            codes = tensors["packed_bytes"].astype(mx.float32) - 128.0
+            return codes * tensors["group_scales"][..., None]
+
+        def dot(self, layer, k, n):
+            return replace(_toy("packed_order"), tensors=("row_scales", "group_scales"))
+
+    seen = []
+
+    def recorded(face, operands, x, n, packs=(1, 1), **named):
+        seen.append((named.get("codes_name"), [o.shape for o in operands]))
+        return mx.zeros((n,))
+
+    monkeypatch.setattr(testing, "dot_rows", recorded)
+    (codes, scales), _, _ = _matrix(8, 320)
+    one = {
+        "packed_bytes": codes,
+        "group_scales": scales,
+        "row_scales": mx.ones((8, 2), mx.float32),
+    }
+    testing.rows_stack(Packed(), one, one, 320, 8, 1, _ints((320,)))
+    assert seen and seen[0] == (
+        "packed_bytes",
+        [(16, 320), (16, 2), (16,)],
+    )

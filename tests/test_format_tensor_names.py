@@ -156,6 +156,9 @@ def test_rows_stack_docstring_names_codes_not_weight():
     assert "``weight``" not in doc
     assert doc.count("``fmt.codes_name``") == 1
     assert "(their codes, ``fmt.codes_name``" in doc
+    # Where it is, not only that it is: a half-applied edit that leaves the
+    # phrase after the sentence is the edit this pins against.
+    assert doc.index("their codes") < doc.index("stacked along N")
 
 
 def test_layer_refusals_name_a_plugins_codes(reader):
@@ -164,7 +167,9 @@ def test_layer_refusals_name_a_plugins_codes(reader):
     formats.register(reader)
     stack = {reader.codes_name: mx.zeros((2, 8, 8), mx.uint8), "gain": mx.zeros((2, 8))}
     with testing.verified("example"):
-        with pytest.raises(ValueError, match=r"codes \('packed_bytes'\)"):
+        with pytest.raises(
+            ValueError, match=r"the codes \('packed_bytes'\) have 2 axes"
+        ):
             FormatLinear(reader.mode, 8, 1, 8, stack)
         with pytest.raises(
             ValueError, match=r"codes' \('packed_bytes'\) stack of \(2,\)"
