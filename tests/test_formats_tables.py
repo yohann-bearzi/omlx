@@ -260,7 +260,7 @@ def _metal_digest(recorded):
 # The 144 verify-gather builders use wide offsets. Bounded ordered blocks
 # add 72 kernels using 32-bit input and output offsets, and bounded blocks'
 # unordered gathers add the other 72.
-_METAL_DIGEST = "604 aff09fd51d852058fa372e29799714a4d3d0c7ee75313db51878e2d2ba6791ea"
+_METAL_DIGEST = "604 40ccf77eaa5bcda8076e6c32dfca77cb136cf8292858db24a0db754def01056a"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
@@ -286,7 +286,7 @@ def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
     records = _steel_sources(monkeypatch)
     # B8's independently captured table-free face headers and declarations
     # with the steel loader and launch body, excluding installed MLX headers.
-    expected = "0b6af24687c3b42aef8c56bd09c037fad68b6f3d2908570850d926bfe4035691"
+    expected = "971f95d75c083dedf8a50bff3181289665c9cc5aaacd26a62780c2b37136b222"
     assert _metal_digest(records) == f"12 {expected}"
 
 

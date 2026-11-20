@@ -119,8 +119,9 @@ METAL_FUNC void omlx_qmv_block(
     thread float* result) {
   constexpr int NA = sizeof...(RA);
   const auto aux = L::load(x, x_thread);
-  ((result[RA] = L::madd(result[RA], a.row(RA), x_thread, aux)), ...);
-  ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), x_thread, aux)), ...);
+  thread const float* xt = x_thread;
+  ((result[RA] = L::madd(result[RA], a.row(RA), xt, aux)), ...);
+  ((result[NA + RB] = L::madd(result[NA + RB], b.row(RB), xt, aux)), ...);
 }
 
 template <int K, typename D, typename XP, int... RA, int... RB>
@@ -431,7 +432,8 @@ METAL_FUNC void omlx_shared_block(
     }
     const auto d = L::decode(a.row(r));
     for (int i = 0; i < ROWS; i++) {
-      result[i * RPS + r] = L::apply(result[i * RPS + r], d, xs[i], aux[i]);
+      thread const float* xt = xs[i];
+      result[i * RPS + r] = L::apply(result[i * RPS + r], d, xt, aux[i]);
     }
   }
 }
@@ -440,7 +442,7 @@ METAL_FUNC void omlx_shared_block(
 _SHARED_FOLDED = _compact(r"""
 template <int R, int RPS, bool PARTIAL, typename L, typename A, int... I>
 METAL_FUNC void omlx_shared_row(
-    thread const L& a, int valid, thread float (*xs)[L::VPT],
+    thread const L& a, int valid, thread const float (*xs)[L::VPT],
     thread const A* aux, thread float* result, omlx_ints<I...>) {
   if (PARTIAL && R >= valid) {
     return;

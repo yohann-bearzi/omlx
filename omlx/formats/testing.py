@@ -408,18 +408,19 @@ METAL_FUNC void omlx_lane_parts(
   using L = typename D::template Lanes<K>;
   constexpr int J = K / L::VPT;
   float xt[L::VPT];
+  thread const float* inputs = xt;
   parts += row * K;
   if constexpr (STEPPED) {
     L a(m, row, at);
     for (int j = int(at); j < J; j += 32) {
       const auto aux = L::load(x + j * L::VPT, xt);
-      parts[j] = L::madd(0.0f, a.row(0), xt, aux);
+      parts[j] = L::madd(0.0f, a.row(0), inputs, aux);
       a.step();
     }
   } else if (int(at) < J) {
     const L c(m, row, at);
     const auto aux = L::load(x + int(at) * L::VPT, xt);
-    parts[at] = L::madd(0.0f, c.row(0), xt, aux);
+    parts[at] = L::madd(0.0f, c.row(0), inputs, aux);
   }
 }
 """

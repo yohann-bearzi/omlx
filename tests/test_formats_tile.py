@@ -245,7 +245,7 @@ def test_a_matrix_is_read_through_a_dot_or_a_tile():
 # face, as oMLX's dot kernels have them since the skeletons are carried
 # compact and hold no comment: tile faces leave a dot kernel's source as it is, to the byte, so
 # that every kernel a checkpoint runs is too.
-_DOT_KERNEL = "dfc152aecefa86618afb919b002f89cbbf74d306038bb0588bc0bed92b69124c"
+_DOT_KERNEL = "51f6e7db30726d3d30a881e1e1ca09f16d34b25d520745e06ad291ab6d364531"
 
 
 def test_a_kernel_of_dot_faces_is_written_as_before_tile_faces():

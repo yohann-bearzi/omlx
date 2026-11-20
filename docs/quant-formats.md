@@ -538,6 +538,8 @@ struct Dot {
 | `struct Decoded` and `static Decoded decode(Row r)` | One row's weights of the current block as `apply` takes them, read once for several inputs. A face with nothing to share writes `using Decoded = Row;` and returns `r`. A face whose `decode` and `apply` are long declares them in its struct and defines them in `shared` (affine does). |
 | `static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux)` | What `madd` gives, from `decode`'s weights: `apply(acc, decode(r), xt, aux)` equals `madd(acc, r, xt, aux)` bit for bit. A kernel that applies one block's weights to several inputs decodes them once and calls `apply` for each. |
 
+The skeleton gives `load` a const activation pointer and writable scratch. It passes that scratch to `madd` and `apply` as `thread const float*`. A face may also define a mutable overload. The kit checks which overload runs by comparing non-zero reference products bit for bit.
+
 A kernel runs a face in this order, in every lane, on the rows `r` it computes together:
 
 ```
@@ -670,6 +672,8 @@ A kernel builds a cursor for each row a thread decodes, and reads the row throug
 | `P params(int g) const` | The parameters of group `g` of the row, `g` in `[0, (K - 1) / GROUP + 1)`. |
 | `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, K / 8)`. |
 | `static float weight(thread const P& p, Codes c, int i)` | Weight `i` (0 to 7) of a run of codes `c` in a group of parameters `p`, as a float32. |
+
+Tile readers pass `p` and `c` as const and `i` as an `int`. A by-value `Codes` parameter copies the codes. The kit compares the decoded weights before and after the activation cast with an independent non-zero reference, including faces that offer mutable or short overloads.
 
 `P` and `Codes` are types that are default-constructible and copy-assignable: a kernel holds arrays of them and assigns their elements. K is a whole number of runs. A kernel runs a face in this order, in each thread that decodes values of a row, for each block of K that it decodes, with `T` the activations' type:
 
@@ -991,7 +995,7 @@ The messages quoted below are the compiler's for the example above with one mist
 A face that breaks a rule the compiler cannot see fails with the rule:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:104:1: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:105:1: error: static_assert failed due to requirement
 'Lanes<512>::BLOCK == 32 * Lanes<512>::VPT' "dot face: Lanes<K>::BLOCK must be VPT inputs for
 each of a simdgroup's 32 lanes"
 <kernel>:5:5: note: in instantiation of function template specialization
@@ -999,7 +1003,7 @@ each of a simdgroup's 32 lanes"
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:108:1: error: static_assert failed due to requirement
+<omlx skeletons, docs/quant-formats.md>:109:1: error: static_assert failed due to requirement
 '60 % Lanes<60>::VPT == 0' "dot face: K must be a whole number of a lane's VPT inputs"
 ```
 
@@ -1012,12 +1016,12 @@ A mistake inside the format is cited in the format:
 A missing or mismatched member is cited where the skeleton uses it, with a note on the format's line when there is one:
 
 ```
-<omlx skeletons, docs/quant-formats.md>:82:18: error: no member named 'finish' in
+<omlx skeletons, docs/quant-formats.md>:83:18: error: no member named 'finish' in
 'omlx_myformat_b8::Dot::Lanes<512>'
 ```
 
 ```
-<omlx skeletons, docs/quant-formats.md>:43:57: error: too many arguments to function call,
+<omlx skeletons, docs/quant-formats.md>:44:51: error: too many arguments to function call,
 expected 3, have 4
 <quant format myformat_b8>:38:18: note: 'madd' declared here
 ```
@@ -1179,7 +1183,7 @@ A face of another revision does not compile. The requirement that fails is the f
 ```
 <omlx skeletons, docs/quant-formats.md>:18:1: error: static_assert failed due to requirement
 '2 <= 1' "dot face: written for a later revision of the contract than this oMLX runs"
-<omlx skeletons, docs/quant-formats.md>:97:7: note: in instantiation of template class
+<omlx skeletons, docs/quant-formats.md>:98:7: note: in instantiation of template class
 'omlx_revision<2>' requested here
 <kernel>:5:5: note: in instantiation of function template specialization
 'qmv_rows<float, 512, 1, 1, omlx_myformat_b8::Dot, const device float *>' requested here
