@@ -59,6 +59,18 @@ def verified():
         yield
 
 
+@pytest.fixture
+def no_family_verified(verified):
+    """No family taken as verified in the test. Its own MonkeyPatch, set up
+    after this file's block opens and undone before it closes: conftest's
+    autouse monkeypatch is set up before the block, so undoing a setattr of
+    it would run once the block has closed and publish the block's families
+    again, for every test that follows in the process."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(oq, "_TEST_VERIFIED", frozenset())
+        yield
+
+
 class _Codec(_ToyFormat):
     """The toy format with its codec: a byte for each weight and a scale for
     each row, which keep a weight to half a scale. ``answer`` stands in for
@@ -1626,9 +1638,8 @@ def test_a_verified_type_with_an_alternate_model_file_cannot_be_written_in_a_for
     assert not output.exists()
 
 
-def test_unlisted_families_need_a_test_block(monkeypatch):
+def test_unlisted_families_need_a_test_block(no_family_verified):
     # Outside every block (this file's tests take llama as verified).
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
     for model_type in ("llama", " Llama ", "qwen2"):
         refused = oq._unverified_family({"model_type": model_type})
         assert refused == (oq._family(model_type), _NOT_VERIFIED)
@@ -3745,8 +3756,9 @@ def test_the_writer_rebases_and_skips_optiq_sidecar(source, tmp_path):
     assert not (tmp_path / "text" / "optiq").exists()
 
 
-def test_a_qwen35_moe_write_verifies_after_reload(source, toy, tmp_path, monkeypatch):
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
+def test_a_qwen35_moe_write_verifies_after_reload(
+    source, toy, tmp_path, no_family_verified
+):
     output = tmp_path / "qwen35-oq4e"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config["omlx_verification"]["verified"] is True
