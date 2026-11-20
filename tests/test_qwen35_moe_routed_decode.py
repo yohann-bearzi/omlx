@@ -2581,13 +2581,15 @@ def test_routed_plans_and_proofs_follow_the_activation_on_one_block(
         x = mx.zeros((1, 1, 1024), dtype)
         routed.routed_verify_window(block, x)
         plan = plans[-1]
-        if restricted == "neither" or dtype == mx.float16:
+        if dtype == mx.float32:
+            assert plan is None
+        elif restricted == "neither" or dtype == mx.float16:
             assert plan is not None and plan.launches.dtype == dtype
         else:
             assert plan is None
     if restricted == "neither":
         assert plans[0].proof is plans[-1].proof
-        assert len({id(p.proof) for p in plans[:3]}) == 3
+        assert len({id(p.proof) for p in plans[:2]}) == 2
 
 
 def _format_shared_gate(k, n):
@@ -2648,6 +2650,39 @@ def test_a_routed_face_must_have_the_dimensions_it_will_read(
         assert plan is None
     else:
         assert plan is not None and not plan.launches.fold
+
+
+@pytest.mark.parametrize(
+    "bf16_only",
+    [("gate_proj", "up_proj"), ("down_proj",), ("shared_expert_gate",)],
+)
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_shared_expert_not_exact_for_the_activation_keeps_its_own_launches(
+    monkeypatch, bf16_only
+):
+    from tests.test_formats_kernels import _toy
+
+    load_toy_format(monkeypatch, _toy("shared_dtype"))
+    block = format_block(1024, 320, "affine", experts=128)
+    for module in (block.gate, block.shared_expert, block.shared_expert_gate):
+        module.set_dtype(mx.float16)
+    for name in bf16_only:
+        layer = (
+            block.shared_expert_gate
+            if name == "shared_expert_gate"
+            else block.shared_expert[name]
+        )
+        layer.set_dtype(mx.bfloat16)
+    plan = _plan(block, mx.zeros((1, 1, 1024), mx.float16))
+    assert plan is not None and plan.launches.dtype == mx.float16
+    assert not plan.launches.fold
+
+
+def test_the_routed_decode_page_names_the_odd_gate_up_width():
+    from pathlib import Path
+
+    page = Path(__file__).resolve().parents[1] / "docs/quant-formats.md"
+    assert "gate+up width is odd" in page.read_text()
 
 
 @pytest.mark.usefixtures("format_checkpoint")

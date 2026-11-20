@@ -43,7 +43,7 @@ weight format. The affine format's is the MLX 0.32.4 transcription in
 (512 for 2- to 5-bit, 256 for 6/8-bit weights) and ``qmv`` otherwise. Gathered
 expert projections also require N % 8 == 0; shared projections do not.
 Routed experts are taken for one bf16 or fp16 token, top-k 8 or 10, experts
-whose gate+up face is exact for one dtype, the token's, and whose down
+whose gate+up face is exact for the token's dtype, and whose down
 face is exact for it (affine: scales in that dtype;
 Qwen3.5/3.6-35B-A3B: hidden 2048, intermediate 512;
 Qwen3.8-Flash-Next: 2560 and 640). Gate+up and down each take ``qmv_fast``
@@ -551,7 +551,8 @@ class _Launches(NamedTuple):
     serves every block of its proof, each over its own arrays."""
 
     hidden: int
-    dtype: mx.Dtype  # activations and outputs: what the gate+up face is exact for
+    dtype: mx.Dtype  # the token's dtype; both routed faces and any folded
+    # shared faces are exact for it
     top_k: int
     fold: bool  # shared expert and its gate run inside the two launches
     router: object  # router_gemv's launcher; None: the block's gate runs as it is
@@ -584,6 +585,8 @@ class _Plan(NamedTuple):
 def _projection_dot(layer, k: int, n: int) -> Dot | None:
     # A checkpoint reader can describe the face of the layer it holds
     # without checking the dimensions the routed kernel is about to use.
+    # On unmutated routed switch layers N comes from the same tensor, so K
+    # refuses there; shared projections refuse on K or N.
     if isinstance(layer, (FormatLinear, FormatSwitchLinear)) and (
         layer.input_dims != k or layer.output_dims != n
     ):
@@ -633,6 +636,8 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     from mlx_vlm.models.switch_layers import QuantizedSwitchLinear, SwiGLU
 
     switch_mlp = block.get("switch_mlp")
+    if dtype not in (mx.bfloat16, mx.float16):
+        return None
     if block.training or switch_mlp is None or block.top_k not in TOP_KS:
         return None
     if type(switch_mlp.get("activation")) is not SwiGLU:
@@ -1082,7 +1087,8 @@ def _windows(plan: _Plan, x) -> bool:
 def _cached_plan(block, dtype: mx.Dtype) -> _Plan | None:
     """The block's plan, kept in the block: depth 2 keys it on the expert
     and shared-expert weight arrays, the activation dtype, and the block attributes
-    that it is planned for, with their types (8 and 8.0 differ)."""
+    that it is planned for, with their types (8 and 8.0 differ). Keeps one plan
+    per block; switching dtype rebuilds it while proofs persist per dtype."""
     top_k, experts = block.top_k, block.num_experts
     return cached_per_module(
         block,
