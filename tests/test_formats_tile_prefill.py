@@ -86,12 +86,14 @@ def _tile_toy(key, source=_TILE) -> Tile:
         key=f"tiletoy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_tiletoy_{key}::Tile",
-        tensors=("scales",),
+        tensors=("group_scales",),
     )
 
 
 class _ToyFormat(formats.QuantFormat):
-    mode, tensors, contract = "tiletoy", ("scales",), formats.CONTRACT
+    mode, codes_name, tensors, contract = "tiletoy", "codes", ("group_scales",), (
+        formats.CONTRACT
+    )
 
     def __init__(self, dot, tile):
         self.dot_face, self.tile_face = dot, tile
@@ -103,8 +105,8 @@ class _ToyFormat(formats.QuantFormat):
         return self.tile_face
 
     def decode(self, tensors, bits, group_size):
-        codes = tensors["weight"].astype(mx.float32) - 128.0
-        return codes * mx.expand_dims(tensors["scales"], -1)
+        codes = tensors["codes"].astype(mx.float32) - 128.0
+        return codes * mx.expand_dims(tensors["group_scales"], -1)
 
 
 @pytest.fixture
@@ -129,7 +131,7 @@ def _stack(n, k, seed=0):
     mx.random.seed(seed)
     codes = mx.random.randint(0, 256, (E, n, k)).astype(mx.uint8)
     scales = mx.random.normal((E, n)) * 0.01
-    return {"weight": codes, "scales": scales}
+    return {"codes": codes, "group_scales": scales}
 
 
 def _rows(k, counts=_COUNTS, dtype=mx.bfloat16, seed=1):
@@ -167,7 +169,7 @@ def test_a_sorted_shape_the_tile_refuses_decodes_bounded_pieces(toy, monkeypatch
     decode = fmt.decode
 
     def decoded(arrays, bits, group_size):
-        widths.append(arrays["weight"].shape[0])
+        widths.append(arrays["codes"].shape[0])
         return decode(arrays, bits, group_size)
 
     monkeypatch.setattr(fmt, "decode", decoded)
@@ -430,11 +432,11 @@ def test_tile_and_dot_faces_can_read_different_scale_operands(toy):
     source = _TILE.replace("return {r[0]};", "return {2.0f * r[0]};")
     face = replace(_tile_toy("own_scales", source), tensors=("tile_scales",))
     fmt = toy(face)
-    fmt.tensors = ("scales", "tile_scales")
+    fmt.tensors = ("group_scales", "tile_scales")
     x, idx = _rows(256)
     for seed in (53, 54):
         tensors = _stack(128, 256, seed=seed)
-        tensors["tile_scales"] = tensors["scales"] * 0.5
+        tensors["tile_scales"] = tensors["group_scales"] * 0.5
         layer = FormatSwitchLinear("tiletoy", 8, 1, 256, tensors)
         assert _same(layer(x, idx, sorted_indices=True), _want(tensors, x, idx))
     assert _proof(_TILE_PROOF).ran
@@ -464,8 +466,8 @@ def test_a_sorted_trace_uses_the_current_layers_operands(toy):
         lambda x, idx: layer(x, idx, sorted_indices=True), inputs=layer.state
     )
     assert _same(call(x, idx), _want(tensors, x, idx))
-    tensors["scales"] = -tensors["scales"]
-    layer["scales"] = tensors["scales"]
+    tensors["group_scales"] = -tensors["group_scales"]
+    layer["group_scales"] = tensors["group_scales"]
     want = _want(tensors, x, idx)
     assert _same(call(x, idx), want)
     assert _same(layer(x, idx, sorted_indices=True), want)
@@ -704,10 +706,10 @@ def test_steel_reads_both_groups_of_a_threads_sixteen_weights():
     tensors = _stack(40, k, seed=97)
     x, ids = _rows(k)
     got = tile_gather.launch(
-        tile_gather.kernel(face), x, (tensors["weight"], tensors["scales"]), ids
+        tile_gather.kernel(face), x, (tensors["codes"], tensors["group_scales"]), ids
     )
     signs = mx.where((mx.arange(k) // 8) % 2 == 0, 1.0, -1.0)
-    values = tensors["weight"].astype(mx.float32) - 128.0
-    w = (values * tensors["scales"][..., None] * signs).astype(x.dtype)
+    values = tensors["codes"].astype(mx.float32) - 128.0
+    w = (values * tensors["group_scales"][..., None] * signs).astype(x.dtype)
     want = mx.gather_mm(x, w.swapaxes(-1, -2), rhs_indices=ids, sorted_indices=True)
     assert _same(got, want)

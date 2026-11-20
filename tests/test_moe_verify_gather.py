@@ -406,14 +406,18 @@ class _ToyExperts(nn.Module):
     def __init__(self, experts, n, k, seed):
         super().__init__()
         (codes, scales), _, _ = _matrix(experts * n, k, seed)
-        self.weight = codes.reshape(experts, n, k)
-        self.scales = scales.reshape(experts, n)
+        self.codes = codes.reshape(experts, n, k)
+        self.group_scales = scales.reshape(experts, n)
+        # The names a format layer keeps (``formats.tensor_names``): a stand-in
+        # for one, as the kernels read layers of either kind.
+        self.__dict__["_tensors"] = ("codes", "group_scales")
 
     def rows(self, experts, x):
         """The dequantized products for each expert of ``experts`` with its
         row of ``x``: exact in float32."""
-        weight = np.array(self.weight)[experts].astype(np.float32) - 128.0
-        return (weight @ x[:, :, None])[:, :, 0] * np.array(self.scales)[experts]
+        weight = np.array(self.codes)[experts].astype(np.float32) - 128.0
+        scales = np.array(self.group_scales)[experts]
+        return (weight @ x[:, :, None])[:, :, 0] * scales
 
 
 class _ToySwitch(nn.Module):
@@ -428,7 +432,9 @@ class _ToySwitch(nn.Module):
 
 
 class _ToyFormat(formats.QuantFormat):
-    mode, tensors, contract = "toy", ("scales",), formats.CONTRACT
+    mode, codes_name, tensors, contract = "toy", "codes", ("group_scales",), (
+        formats.CONTRACT
+    )
 
     def __init__(self, face):
         self.face = face
@@ -438,7 +444,7 @@ class _ToyFormat(formats.QuantFormat):
 
 
 def _toy_block(switch, rows, top_k=3, seed=11):
-    k = switch.gate_up_proj.weight.shape[-1]
+    k = switch.gate_up_proj.codes.shape[-1]
     mx.random.seed(seed + rows)
     x = mx.random.randint(-8, 9, (1, rows, k)).astype(mx.float32)
     indices = mx.random.randint(0, 6, (1, rows, top_k)).astype(mx.uint32)
@@ -615,11 +621,14 @@ class _TwoTensors(_ToyExperts):
 
     def __init__(self, experts, n, k, seed):
         super().__init__(experts, n, k, seed)
-        self.unit = mx.ones_like(self.scales)
+        self.unit = mx.ones_like(self.group_scales)
 
 
 class _ByTensors(formats.QuantFormat):
-    mode, tensors, contract = "toy", ("scales", "unit"), formats.CONTRACT
+    mode, codes_name, tensors, contract = "toy", "codes", (
+        "group_scales",
+        "unit",
+    ), formats.CONTRACT
 
     def __init__(self, one, two):
         self.one, self.two = one, two
@@ -640,7 +649,7 @@ def test_projections_of_different_tensor_counts_take_their_own(monkeypatch):
         key="toy_two_tensors",
         source=source,
         type="omlx_toy_two_tensors::Dot",
-        tensors=("scales", "unit"),
+        tensors=("group_scales", "unit"),
     )
     monkeypatch.setitem(formats._FORMATS, "toy", _ByTensors(_toy("gather"), two))
     switch = _ToySwitch(k=320, inter=72, n=40)
@@ -664,7 +673,7 @@ def test_a_failed_block_keeps_only_its_tensor_dtypes_and_shapes_composed(toy, ca
 
     # Scales of a dtype that the face's struct does not take.
     halves = _ToySwitch(k=320, inter=72, n=40)
-    halves.down_proj.scales = halves.down_proj.scales.astype(mx.float16)
+    halves.down_proj.group_scales = halves.down_proj.group_scales.astype(mx.float16)
     # A K that is not whole lanes of the face.
     ragged = _ToySwitch(k=324, inter=72, n=40)
     assert not runs(halves) and not runs(ragged)

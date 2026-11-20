@@ -3,6 +3,7 @@
 
 import gc
 import json
+import logging
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
@@ -12,6 +13,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
+from omlx import formats
 from omlx.formats import dot, kernels, testing, tile
 from omlx.formats.affine import AffineFormat
 from omlx.formats.linear import FormatLinear
@@ -117,7 +119,12 @@ def _equivalent_layer(mode, build_layer, n, k, family="qwen4_exp", *, dtype=mx.f
         tile = _tile_toy("stock_wide", _TILE.replace("GROUP = 8", "GROUP = 64"))
         plugin = _ToyFormat(_toy("stock_wide"), None if mode == "dot_only" else tile)
         layer = build_layer(
-            plugin, 8, 64, k, {"weight": codes, "scales": mx.ones((n,))}, family=family
+            plugin,
+            8,
+            64,
+            k,
+            {"codes": codes, "group_scales": mx.ones((n,))},
+            family=family,
         )
     return layer, packed, keys[1]
 
@@ -224,7 +231,8 @@ def test_a_warm_row_exact_graph_preserves_dot_only_fallback_for_both_families(
     half = mx.random.normal((rows, k // 2), key=key).astype(mx.float16)
     x = mx.concatenate([half, -half], axis=1)
     serial = mx.concatenate([qwen(x[i : i + 1]) for i in range(rows)])
-    decoded = (qwen.weight.astype(mx.float32) - 128) * qwen.scales[:, None]
+    names = formats.tensor_names(qwen)
+    decoded = (qwen[names[0]].astype(mx.float32) - 128) * qwen[names[1]][:, None]
     composed = x @ decoded.astype(x.dtype).T
     serial, composed = (np.asarray(y.view(mx.uint16)) for y in (serial, composed))
     assert np.any(serial != composed)
@@ -268,7 +276,7 @@ def test_gapped_single_row_matrices_use_each_formats_dot(
     gapped = _gapped_rows(1, k, key, matrices=3)
     dense = mx.contiguous(gapped)
     face = dot(layer, k, n)
-    operands = [layer[name] for name in ("weight", *face.tensors)]
+    operands = [layer[name] for name in formats.tensor_names(layer)]
     singles = mx.stack([testing.dot_rows(face, operands, x[0], n) for x in gapped])
     singles = singles[:, None, :]
     stock = _stock(gapped, packed, 8)
@@ -374,6 +382,57 @@ def test_native_dispatch_releases_worker_graph_on_thread_exit(build_layer, monke
     assert refs[0]() is None, "native dispatcher retained the exited thread's graph"
 
 
+def test_format_linear_fast_returns_none_on_a_four_arg_extension(monkeypatch, caplog):
+    """An extension built before D11 has no packed-key argument: the wrapper
+    returns None and the layer keeps its Python lookup."""
+    from omlx.custom_kernels.quant_matmul import fast as native
+
+    class Old:
+        def __init__(self, weight, bias, operands, proof_state):
+            self.args = (weight, bias, operands, proof_state)
+
+        def bind(self):
+            return lambda *args: None
+
+    monkeypatch.setattr(native, "_FORMAT_LINEAR_FAST", Old)
+    monkeypatch.setattr(native, "_STALE_PACKED_KEY_WARNED", False)
+    weight = mx.zeros((8, 8), mx.uint8)
+    with caplog.at_level(logging.WARNING, logger=native.__name__):
+        for _ in range(2):
+            assert (
+                native.format_linear_fast(weight, None, [weight], {}, "codes") is None
+            )
+    # One warning, naming the stale build and how to rebuild it.
+    (warning,) = caplog.records
+    said = warning.getMessage()
+    assert "make dev" in said and "packed-key" in said
+
+
+def test_the_native_binding_is_bound_with_the_layers_packed_key():
+    """D11: the replay reads the layer's dict by the format's codes name, so
+    the product's wrapper requires it (no default), while the binding keeps
+    its own default for a caller that predates D11."""
+    from omlx.custom_kernels.quant_matmul import fast as native
+
+    if not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires the native warm dispatcher")
+    weight = mx.zeros((8, 8), mx.uint8)
+    with pytest.raises(TypeError):
+        native.format_linear_fast(weight, None, [weight], {})
+    # A layer that keeps its codes under another name replays natively.
+    dispatch = native.format_linear_fast(weight, None, [weight], {}, "codes")
+    assert dispatch.__self__ is not None
+    signature = ((1, 8), mx.float16)
+    expected = mx.zeros((1, 8), mx.float16)
+    proof = kernels.Proof()
+    proof.keep(signature, lambda *args, result=expected: result)
+    legacy = native._FORMAT_LINEAR_FAST(weight, None, [weight], vars(proof))
+    replay = legacy.bind()
+    legacy.register(signature)
+    # Its own default must be "weight": the layer keeps its codes there.
+    assert replay({"weight": weight}, mx.zeros((1, 8), mx.float16)) is expected
+
+
 def test_native_last_wide_replay_misses_on_shape_or_dtype_change():
     from omlx.custom_kernels.quant_matmul import fast as native
 
@@ -392,7 +451,7 @@ def test_native_last_wide_replay_misses_on_shape_or_dtype_change():
     proof._kept = CountReads()
     weight = object()
     layer = {"weight": weight}
-    replay = native.format_linear_fast(weight, None, [weight], vars(proof))
+    replay = native.format_linear_fast(weight, None, [weight], vars(proof), "weight")
     signatures = [
         ((m, 4), dtype)
         for m, dtype in [(2, mx.float16), (3, mx.float16), (3, mx.float32)]
@@ -515,7 +574,7 @@ def test_wide_reads_the_partial_final_tile_group(k, group, pair, build_layer):
     fmt = _ToyFormat(_toy("partial"), face)
     weights = (129 + mx.arange(n) % 4).astype(mx.uint8)
     codes = mx.broadcast_to(weights[:, None], (n, k))
-    layer = build_layer(fmt, 8, 64, k, {"weight": codes, "scales": mx.ones((n,))})
+    layer = build_layer(fmt, 8, 64, k, {"codes": codes, "group_scales": mx.ones((n,))})
     # One nonzero input in each end run exposes an omitted tail even when
     # the cursor covers the whole row in a single logical parameter group.
     x = mx.zeros((2, k), mx.float16)
@@ -622,7 +681,7 @@ def test_native_replay_tracks_worker_replacement_and_eviction():
     sig = (x.shape, x.dtype)
     w = object()
     layer, proof = {"weight": w}, kernels.Proof()
-    dispatch = native.format_linear_fast(w, None, [w], vars(proof))
+    dispatch = native.format_linear_fast(w, None, [w], vars(proof), "weight")
     dispatch.__self__.register(sig)
     results = [object(), object(), object()]
     proof.keep(sig, lambda *_: results[0])

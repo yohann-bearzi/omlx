@@ -28,12 +28,14 @@ _FACE = formats.Dot(
     key="toy_b4",
     source="namespace omlx_toy_b4 { struct Dot {}; }\n",
     type="omlx_toy_b4::Dot",
-    tensors=("scales",),
+    tensors=("group_scales",),
 )
 
 
 class _Format(formats.QuantFormat):
-    def __init__(self, mode="toy", tensors=("scales",), contract=1):
+    codes_name = "codes"
+
+    def __init__(self, mode="toy", tensors=("group_scales",), contract=1):
         self.mode, self.tensors, self.contract = mode, tensors, contract
 
     def dot(self, layer, k, n):
@@ -670,7 +672,7 @@ def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
     assert plugins[0].loaded == 1
 
 
-def _layer(mode="toy", tensors=("weight", "scales")):
+def _layer(mode="toy", tensors=("codes", "group_scales")):
     """A quantized linear: its mode, and its parameters by name, each of the
     fewest elements that MLX binds as a buffer."""
     layer = nn.Module()
@@ -722,12 +724,12 @@ class _NotADot(_Format):
 
 class _TwoTensors(_Format):
     def dot(self, layer, k, n):
-        return replace(_FACE, tensors=("scales", "biases"))
+        return replace(_FACE, tensors=("group_scales", "biases"))
 
 
 class _ThreeTensors(_Format):
     def dot(self, layer, k, n):
-        return replace(_FACE, tensors=("scales", "biases", "gains"))
+        return replace(_FACE, tensors=("group_scales", "biases", "gains"))
 
 
 def _layer_with_small(*names):
@@ -744,9 +746,9 @@ def _layer_of_float64(*names):
     return layer
 
 
-def _layer_with_a_child_named_scales():
-    layer = _layer(tensors=("weight",))
-    layer.scales = nn.Module()
+def _layer_with_a_child_named_group_scales():
+    layer = _layer(tensors=("codes",))
+    layer.group_scales = nn.Module()
     return layer
 
 
@@ -759,45 +761,45 @@ def _layer_with_a_child_named_scales():
             _layer(),
             f'TypeError("dot() returned a {_NotADot.Dot!r}, not a Dot")',
         ),
-        # _FACE reads scales.
+        # _FACE reads group_scales.
         (
             _Format(),
-            _layer(tensors=("weight",)),
-            "ValueError('face toy_b4: the layer has no array scales')",
+            _layer(tensors=("codes",)),
+            "ValueError('face toy_b4: the layer has no array group_scales')",
         ),
         (
             _Format(),
-            _layer(tensors=("scales",)),
-            "ValueError('face toy_b4: the layer has no array weight')",
+            _layer(tensors=("group_scales",)),
+            "ValueError('face toy_b4: the layer has no array codes')",
         ),
         (
             _Format(),
             _layer(tensors=()),
-            "ValueError('face toy_b4: the layer has no array weight, scales')",
+            "ValueError('face toy_b4: the layer has no array codes, group_scales')",
         ),
         (
             _Format(),
-            _layer_with_a_child_named_scales(),
-            "ValueError('face toy_b4: the layer has no array scales')",
+            _layer_with_a_child_named_group_scales(),
+            "ValueError('face toy_b4: the layer has no array group_scales')",
         ),
         # MLX binds an input of fewer than 8 elements as constants.
         (
             _Format(),
-            _layer_with_small("scales"),
-            "ValueError('face toy_b4: scales of fewer than 8 elements, which MLX "
-            "binds as constants, not as the buffer a face reads')",
-        ),
-        (
-            _Format(),
-            _layer_with_small("weight"),
-            "ValueError('face toy_b4: weight of fewer than 8 elements, which MLX "
-            "binds as constants, not as the buffer a face reads')",
-        ),
-        (
-            _Format(),
-            _layer_with_small("scales", "weight"),
-            "ValueError('face toy_b4: weight, scales of fewer than 8 elements, which "
+            _layer_with_small("group_scales"),
+            "ValueError('face toy_b4: group_scales of fewer than 8 elements, which "
             "MLX binds as constants, not as the buffer a face reads')",
+        ),
+        (
+            _Format(),
+            _layer_with_small("codes"),
+            "ValueError('face toy_b4: codes of fewer than 8 elements, which MLX "
+            "binds as constants, not as the buffer a face reads')",
+        ),
+        (
+            _Format(),
+            _layer_with_small("group_scales", "codes"),
+            "ValueError('face toy_b4: codes, group_scales of fewer than 8 elements, "
+            "which MLX binds as constants, not as the buffer a face reads')",
         ),
         # A face reads its format's tensors, which a load gives the layer.
         (
@@ -807,7 +809,7 @@ def _layer_with_a_child_named_scales():
         ),
         (
             _TwoTensors(),
-            _layer(tensors=("weight", "scales", "biases")),
+            _layer(tensors=("codes", "group_scales", "biases")),
             "ValueError('face toy_b4: biases is no tensor of quant format toy')",
         ),
         (
@@ -818,9 +820,9 @@ def _layer_with_a_child_named_scales():
         # The GPU takes no float64: a stand-in of such a tensor cannot be made.
         (
             _Format(),
-            _layer_of_float64("weight", "scales"),
-            "ValueError('face toy_b4: weight, scales of float64, which the GPU does "
-            "not take')",
+            _layer_of_float64("codes", "group_scales"),
+            "ValueError('face toy_b4: codes, group_scales of float64, which the GPU "
+            "does not take')",
         ),
     ],
 )
@@ -841,11 +843,11 @@ def test_a_defective_dot_is_no_face(plugins, caplog, dot_defects, fmt, layer, de
 def test_each_defect_of_a_format_is_logged_once(plugins, caplog, dot_defects):
     for fmt in (_Format(), _Raises("other"), _Raises("third")):
         formats.register(fmt)
-    no_scales, no_weight = _layer(tensors=("weight",)), _layer(tensors=("scales",))
+    no_scales, no_codes = _layer(tensors=("codes",)), _layer(tensors=("group_scales",))
     asked = (
         no_scales,
-        _layer(tensors=("weight",)),
-        no_weight,
+        _layer(tensors=("codes",)),
+        no_codes,
         no_scales,
         _layer("other"),
         _layer("third"),
@@ -860,8 +862,8 @@ def test_each_defect_of_a_format_is_logged_once(plugins, caplog, dot_defects):
         assert formats.dot(_layer(), 64, 8) is _FACE
     logged = [(r.args[0], repr(r.exc_info[1])) for r in caplog.records]
     assert logged == [
-        ("toy", "ValueError('face toy_b4: the layer has no array scales')"),
-        ("toy", "ValueError('face toy_b4: the layer has no array weight')"),
+        ("toy", "ValueError('face toy_b4: the layer has no array group_scales')"),
+        ("toy", "ValueError('face toy_b4: the layer has no array codes')"),
         ("other", "_DefectError('no biases')"),
         ("third", "_DefectError('no biases')"),
     ]
@@ -941,7 +943,7 @@ def _tile():
         key="toy_tile_b4",
         source="namespace omlx_toy_tile_b4 { struct Tile {}; }\n",
         type="omlx_toy_tile_b4::Tile",
-        tensors=("scales",),
+        tensors=("group_scales",),
     )
 
 
@@ -984,12 +986,15 @@ class _TileIsADot(_Format):
 
 class _TileOfTwoTensors(_Format):
     def tile(self, layer, k, n):
-        return replace(_tile(), tensors=("scales", "biases"))
+        return replace(_tile(), tensors=("group_scales", "biases"))
 
 
 class _TileOfTheFormatsTwoTensors(_TileOfTwoTensors):
     def __init__(self):
-        super().__init__(tensors=("scales", "biases"))
+        super().__init__(tensors=("group_scales", "gains"))
+
+    def tile(self, layer, k, n):
+        return replace(_tile(), tensors=("group_scales", "gains"))
 
 
 @pytest.mark.parametrize(
@@ -1003,14 +1008,14 @@ class _TileOfTheFormatsTwoTensors(_TileOfTwoTensors):
         ),
         (
             _Tiled(),
-            _layer(tensors=("weight",)),
-            "ValueError('face toy_tile_b4: the layer has no array scales')",
+            _layer(tensors=("codes",)),
+            "ValueError('face toy_tile_b4: the layer has no array group_scales')",
         ),
         (
             _Tiled(),
-            _layer_with_small("scales"),
-            "ValueError('face toy_tile_b4: scales of fewer than 8 elements, which "
-            "MLX binds as constants, not as the buffer a face reads')",
+            _layer_with_small("group_scales"),
+            "ValueError('face toy_tile_b4: group_scales of fewer than 8 elements, "
+            "which MLX binds as constants, not as the buffer a face reads')",
         ),
         (
             _TileOfTwoTensors(),
@@ -1020,7 +1025,7 @@ class _TileOfTheFormatsTwoTensors(_TileOfTwoTensors):
         (
             _TileOfTheFormatsTwoTensors(),
             _layer(),
-            "ValueError('face toy_tile_b4: the layer has no array biases')",
+            "ValueError('face toy_tile_b4: the layer has no array gains')",
         ),
     ],
 )
@@ -1216,7 +1221,7 @@ class _Bare(formats.QuantFormat):
 
 def test_a_format_without_a_decode_says_so():
     with pytest.raises(NotImplementedError, match="quant format 'bare' has no decode"):
-        _Bare().decode({"weight": mx.zeros((8, 8))}, 4, 32)
+        _Bare().decode({"codes": mx.zeros((8, 8))}, 4, 32)
 
 
 def test_a_format_without_a_layout_or_a_codec_keeps_no_matrix():
@@ -1267,9 +1272,9 @@ def test_a_layer_asks_again_once_what_its_face_depends_on_changes(plugins, chang
     layer.bits, layer.group_size = 4, 32
     assert formats.dot(layer, 64, 8) is _FACE
     if change == "another array":
-        layer["scales"] = mx.zeros((8,))
+        layer["group_scales"] = mx.zeros((8,))
     elif change == "an array removed and put back":
-        layer["scales"] = layer.pop("scales") + 0
+        layer["group_scales"] = layer.pop("group_scales") + 0
     elif change == "bits":
         layer.bits = 8
     elif change == "group size":
@@ -1295,7 +1300,7 @@ def test_what_is_no_module_is_asked_at_every_call(plugins):
     class Layer(dict):
         mode = "toy"
 
-    fmt, layer = _Counting(), Layer(weight=mx.zeros((8,)), scales=mx.zeros((8,)))
+    fmt, layer = _Counting(), Layer(codes=mx.zeros((8,)), group_scales=mx.zeros((8,)))
     formats.register(fmt)
     for _ in range(2):
         assert formats.dot(layer, 64, 8) is _FACE
@@ -1331,18 +1336,18 @@ def test_a_layer_asks_again_when_a_tensor_is_kept_under_another_name(
     formats.register(fmt)
     assert formats.dot(layer, 64, 8) is _FACE
     # The same array, under another name: the face's tensor is gone.
-    layer["other"] = layer.pop("scales")
+    layer["other"] = layer.pop("group_scales")
     assert formats.dot(layer, 64, 8) is None
     assert fmt.dots == 2
-    dot_defects.clear()  # expected: the layer has no array scales
+    dot_defects.clear()  # expected: the layer has no array group_scales
 
 
 def test_a_layer_asks_again_when_its_tensors_swap_names(plugins):
     fmt, layer = _Counting(), _layer()
     formats.register(fmt)
     assert formats.dot(layer, 64, 8) is _FACE
-    weight, scales = layer.pop("weight"), layer.pop("scales")
-    layer["scales"], layer["weight"] = weight, scales
+    codes, scales = layer.pop("codes"), layer.pop("group_scales")
+    layer["group_scales"], layer["codes"] = codes, scales
     assert formats.dot(layer, 64, 8) is _FACE
     assert fmt.dots == 2
 

@@ -91,7 +91,7 @@ def _toy(key, source=_TOY, vpt=8) -> Dot:
         key=f"toy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_toy_{key}::Dot",
-        tensors=("scales",),
+        tensors=("group_scales",),
         vpt=vpt,
     )
 
@@ -546,13 +546,13 @@ def test_two_threads_prove_a_metal_at_once_without_waiting_for_each_other(
 
 def test_a_matrix_is_its_weight_then_its_tensors():
     matrices = kernels.Matrices()
-    assert matrices.add("sg", _toy("a")) == ["sg_weight", "sg_scales"]
-    assert matrices.add("rt", _toy("b")) == ["rt_weight", "rt_scales"]
+    assert matrices.add("sg", _toy("a")) == ["sg_weight", "sg_group_scales"]
+    assert matrices.add("rt", _toy("b")) == ["rt_weight", "rt_group_scales"]
     assert matrices.declarations == (
         "    const auto sg = omlx_toy_a::Dot{"
-        "(const device uint8_t*)sg_weight, sg_scales};\n"
+        "(const device uint8_t*)sg_weight, sg_group_scales};\n"
         "    const auto rt = omlx_toy_b::Dot{"
-        "(const device uint8_t*)rt_weight, rt_scales};\n"
+        "(const device uint8_t*)rt_weight, rt_group_scales};\n"
         '\n#line 1 "<kernel>"\n'
     )
 
@@ -563,20 +563,25 @@ def test_a_kernel_has_each_name_once():
     with pytest.raises(ValueError) as refusal:
         matrices.add("sg", _toy("b"))
     assert str(refusal.value) == (
-        "matrix 'sg': sg, sg_weight, sg_scales would repeat a name of the kernel"
+        "matrix 'sg': sg, sg_weight, sg_group_scales would repeat a name of the "
+        "kernel"
     )
-    # sg + d_scales and sg_d + scales are one input name.
+    # sg + d_group_scales and sg_d + group_scales are one input name.
     other = kernels.Matrices()
-    other.add("sg", replace(_toy("a"), tensors=("d_scales",)))
-    with pytest.raises(ValueError, match="matrix 'sg_d': sg_d_scales would repeat"):
+    other.add("sg", replace(_toy("a"), tensors=("d_group_scales",)))
+    with pytest.raises(
+        ValueError, match="matrix 'sg_d': sg_d_group_scales would repeat"
+    ):
         other.add("sg_d", _toy("b"))
     # A matrix is declared under its name: no input has it, whichever of the
     # two comes first.
-    with pytest.raises(ValueError, match="matrix 'sg_d_scales': sg_d_scales would"):
-        other.add("sg_d_scales", _toy("b"))
+    with pytest.raises(
+        ValueError, match="matrix 'sg_d_group_scales': sg_d_group_scales would"
+    ):
+        other.add("sg_d_group_scales", _toy("b"))
     first = kernels.Matrices()
-    first.add("rt_scales", _toy("a"))
-    with pytest.raises(ValueError, match="matrix 'rt': rt_scales would repeat"):
+    first.add("rt_group_scales", _toy("a"))
+    with pytest.raises(ValueError, match="matrix 'rt': rt_group_scales would repeat"):
         first.add("rt", _toy("b"))
     # A refused matrix is not in the kernel, and its names are not taken.
     assert "omlx_toy_b" not in matrices.declarations + other.declarations
@@ -591,7 +596,7 @@ def test_a_matrix_is_named_by_an_identifier(name):
     with pytest.raises(ValueError) as refusal:
         matrices.add(name, _toy("a"))
     assert str(refusal.value) == f"matrix {name!r}: its name is not an identifier"
-    assert matrices.add("m", _toy("a")) == ["m_weight", "m_scales"]
+    assert matrices.add("m", _toy("a")) == ["m_weight", "m_group_scales"]
 
 
 def test_a_kernel_includes_each_format_source_once():
@@ -1489,12 +1494,12 @@ def test_dot_rows_refuses_what_the_launch_cannot_cover():
     with pytest.raises(ValueError, match=floats):
         testing.dot_rows(_toy("a"), operands, x.astype(mx.int32), 8)
     (codes, scales), x, _ = _matrix(7, 512)
-    with pytest.raises(ValueError, match="toy_a: scales has 7 elements"):
+    with pytest.raises(ValueError, match="toy_a: group_scales has 7 elements"):
         testing.dot_rows(_toy("a"), (codes, scales), x, 7, (1, 0))
     operands, x, _ = _matrix(8, 512)
     with pytest.raises(ValueError, match="toy_a: x has 4 elements"):
         testing.dot_rows(_toy("a"), operands, x[:4], 8)
-    with pytest.raises(ValueError, match="weight, scales; operands given: 1"):
+    with pytest.raises(ValueError, match="weight, group_scales; operands given: 1"):
         testing.dot_rows(_toy("a"), operands[:1], x, 8)
     with pytest.raises(ValueError, match="one vector of K activations"):
         testing.dot_rows(_toy("a"), operands, mx.stack([x, x]), 8)
@@ -1588,7 +1593,7 @@ def test_the_pages_example_is_the_toy_format():
         key="myformat_b8",
         source=_TOY.strip().replace("omlx_toy_KEY", "omlx_myformat_b8"),
         type="omlx_myformat_b8::Dot",
-        tensors=("scales",),
+        tensors=("group_scales",),
     )
 
 
@@ -1884,7 +1889,7 @@ def test_rows_stack_with_activations_observes_the_family_gate():
 
     fmt = Reader(_toy("unregistered_stack"))
     arrays = _matrix(8, 320)[0]
-    matrix = dict(zip(("weight", "scales"), arrays, strict=True))
+    matrix = dict(zip(("codes", "group_scales"), arrays, strict=True))
     x = _ints((320,))
     testing.rows_stack(fmt, matrix, matrix, 320, 8, 1)
     with pytest.raises(formats.FormatRefusedError, match="outside such a load"):

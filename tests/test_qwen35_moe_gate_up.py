@@ -472,9 +472,9 @@ def _format_glu(experts=E, cls=None):
     nn.quantize(glu, **_FORMAT_CHECKPOINT)
     for i, (name, n, k) in enumerate(_FORMAT_STACKS):
         (codes, scales), _, _ = _matrix(experts * n, k, seed=20 + i)
-        weights = [("weight", codes.reshape(experts, n, k))]
+        weights = [("codes", codes.reshape(experts, n, k))]
         # Scales of their own for each projection (powers of two: exact).
-        weights.append(("scales", scales.reshape(experts, n) * 2.0**i))
+        weights.append(("group_scales", scales.reshape(experts, n) * 2.0**i))
         glu[name].load_weights(weights, strict=True)
     glu.eval()
     mx.eval(glu.parameters())
@@ -512,7 +512,7 @@ def test_a_block_of_format_stacks_fuses_its_gate_and_up(loaded_format, length):
     assert type(fused) is FormatSwitchLinear
     assert (fused.mode, fused.bits, fused.group_size) == ("toy", 8, 1)
     assert fused.input_dims == HIDDEN and fused.output_dims == 2 * INTER
-    for name in ("weight", "scales"):
+    for name in ("codes", "group_scales"):
         assert mx.array_equal(
             fused[name], mx.concatenate([gate[name], up[name]], axis=1)
         ).item()
@@ -534,8 +534,8 @@ def test_format_stacks_that_are_not_one_layout_row_by_row_stay_unfused(loaded_fo
         (codes, scales), _, _ = _matrix(E * n, HIDDEN)
         scales = scales.reshape(E, n) if scales_shape is None else mx.ones(scales_shape)
         tensors = {
-            "weight": codes.reshape(E, n, HIDDEN),
-            "scales": scales.astype(scales_dtype),
+            "codes": codes.reshape(E, n, HIDDEN),
+            "group_scales": scales.astype(scales_dtype),
         }
         return FormatSwitchLinear("toy", bits, 1, HIDDEN, tensors)
 
@@ -784,8 +784,8 @@ def test_gate_and_up_from_two_checkpoint_readers_stay_separate(monkeypatch):
     first, second = copy(fmt), copy(fmt)
     glu = SwitchGLU(HIDDEN, INTER, E)
     arrays = {
-        "weight": mx.zeros((E, INTER, HIDDEN), mx.uint8),
-        "scales": mx.ones((E, INTER), mx.float32),
+        "codes": mx.zeros((E, INTER, HIDDEN), mx.uint8),
+        "group_scales": mx.ones((E, INTER), mx.float32),
     }
     glu.gate_proj = FormatSwitchLinear(first, 8, 1, HIDDEN, arrays)
     glu.up_proj = FormatSwitchLinear(second, 8, 1, HIDDEN, arrays)
@@ -802,8 +802,8 @@ def test_gate_and_up_require_the_same_input_width():
     class BlockPacked(_Loadable):
         def layout(self, k, n, bits, group_size):
             return {
-                "weight": ((n, (k + 31) // 32), mx.uint32),
-                "scales": ((n,), mx.float32),
+                "codes": ((n, (k + 31) // 32), mx.uint32),
+                "group_scales": ((n,), mx.float32),
             }
 
     fmt = BlockPacked()
@@ -815,7 +815,7 @@ def test_gate_and_up_require_the_same_input_width():
             for key, (shape, dtype) in fmt.layout(k, INTER, 4, 32).items()
         }
         glu[name] = FormatSwitchLinear(fmt, 4, 32, k, tensors)
-    assert glu.gate_proj.weight.shape == glu.up_proj.weight.shape
+    assert glu.gate_proj["codes"].shape == glu.up_proj["codes"].shape
     model = _FakeQwen4Model()
     model.named_modules = lambda: [("experts", glu)]
     assert apply_qwen35_moe_gate_up_fusion(model) == 0
@@ -830,7 +830,7 @@ def test_gate_and_up_require_a_matching_layout_at_twice_the_output_width():
         def layout(self, k, n, bits, group_size):
             shape = super().layout(k, n, bits, group_size)
             if n == 2 * INTER:
-                shape["weight"] = ((n, k + 32), mx.uint8)
+                shape["codes"] = ((n, k + 32), mx.uint8)
             return shape
 
     fmt = Padded()
@@ -862,8 +862,8 @@ def test_equal_gate_and_up_buffers_must_match_the_declared_layout(bad):
     glu = SwitchGLU(HIDDEN, INTER, E)
     scales = mx.ones((E, INTER, 1) if bad == "shape" else (E, INTER))
     tensors = {
-        "weight": mx.zeros((E, INTER, HIDDEN), mx.uint8),
-        "scales": scales.astype(mx.float16 if bad == "dtype" else mx.float32),
+        "codes": mx.zeros((E, INTER, HIDDEN), mx.uint8),
+        "group_scales": scales.astype(mx.float16 if bad == "dtype" else mx.float32),
     }
     for name in ("gate_proj", "up_proj"):
         glu[name] = FormatSwitchLinear(fmt, 8, 1, HIDDEN, tensors)
@@ -886,8 +886,8 @@ def test_post_load_fusion_uses_only_materialized_stacks(lm, pending):
     with testing.verified("qwen4_exp"):
         for i, name in enumerate(("gate_proj", "up_proj"), 1):
             arrays = {
-                "weight": mx.full((E, INTER, HIDDEN), i, mx.uint8),
-                "scales": mx.full((E, INTER), 2 * i, mx.float32),
+                "codes": mx.full((E, INTER, HIDDEN), i, mx.uint8),
+                "group_scales": mx.full((E, INTER), 2 * i, mx.float32),
             }
             bias = mx.full((E, INTER), -i, mx.float32)
             glu[name] = FormatSwitchLinear(

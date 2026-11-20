@@ -225,7 +225,9 @@ def _staged_tables_kernel(face: Dot | Tile):
     )
 
 
-def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.array]:
+def staged_tables(
+    face: Dot | Tile, operands, dtype: mx.Dtype, *, codes_name: str = "weight"
+) -> dict[str, mx.array]:
     """Each of ``face``'s tables as a kernel stages it, read back through the
     face's member of the table's name: one array of the table's dtype and
     length, by name. Its bits are the table's ``bits`` when the face
@@ -240,7 +242,7 @@ def staged_tables(face: Dot | Tile, operands, dtype: mx.Dtype) -> dict[str, mx.a
         raise ValueError(f"dtype={dtype} is not a float type of the GPU")
     if not face.tables:
         raise ValueError(f"face {face.key} has no tables")
-    operands, names = tuple(operands), ("weight", *face.tensors)
+    operands, names = tuple(operands), (codes_name, *face.tensors)
     if len(operands) != len(names):
         raise ValueError(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
@@ -267,7 +269,7 @@ def _count(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
-def _checked(face: Dot, operands, x: mx.array) -> tuple:
+def _checked(face: Dot, operands, x: mx.array, codes_name: str = "weight") -> tuple:
     """``operands`` as a tuple, or a ``ValueError``: a dot face, one vector
     ``x`` of a dtype the face is exact for, the face's operands, each of 8
     elements or more."""
@@ -275,7 +277,7 @@ def _checked(face: Dot, operands, x: mx.array) -> tuple:
         raise ValueError(f"{face!r} is not a dot face (formats.Dot)")
     if x.ndim != 1:
         raise ValueError(f"x is one vector of K activations, not of shape {x.shape}")
-    operands, names = tuple(operands), ("weight", *face.tensors)
+    operands, names = tuple(operands), (codes_name, *face.tensors)
     if len(operands) != len(names):
         raise ValueError(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"
@@ -299,6 +301,8 @@ def dot_rows(
     n: int,
     packs: tuple[int, int] = (1, 1),
     staged: bool = False,
+    *,
+    codes_name: str = "weight",
 ) -> mx.array:
     """The products of ``x`` (K activations) with the first ``n`` rows of a
     matrix, through the row skeleton.
@@ -320,7 +324,7 @@ def dot_rows(
         raise ValueError(f"packs={packs}: two counts of rows, one row or more in all")
     if not _count(n) or n % (na + nb):
         raise ValueError(f"n={n} is not one launch or more of {na + nb} rows")
-    operands = _checked(face, operands, x)
+    operands = _checked(face, operands, x, codes_name)
     if staged and x.nbytes + _staged_bytes(face) > _THREADGROUP_BYTES:
         raise ValueError(
             f"x of {x.nbytes} bytes and the face's staged tables of "
@@ -356,6 +360,8 @@ def shared_rows(
     n: int,
     rps: int = 1,
     unrolled: bool = False,
+    *,
+    codes_name: str = "weight",
 ) -> mx.array:
     """The products of each of ``x``'s rows (one to 16 vectors of K
     activations) with the first ``n`` rows of a matrix, through the
@@ -368,7 +374,7 @@ def shared_rows(
     refused as ``dot_rows`` refuses it."""
     if x.ndim != 2 or not 1 <= x.shape[0] <= 16:
         raise ValueError(f"x is 1 to 16 vectors of K activations, not {x.shape}")
-    operands = _checked(face, operands, x[0])
+    operands = _checked(face, operands, x[0], codes_name)
     if not (_count(n) and _count(rps)):
         raise ValueError(f"n={n}, rps={rps}: one row or more of each")
     rows, k = x.shape
@@ -433,7 +439,9 @@ def _lane_parts_kernel(face: Dot, stepped: bool):
     )
 
 
-def lane_parts(face: Dot, operands, x: mx.array, n: int) -> tuple[mx.array, mx.array]:
+def lane_parts(
+    face: Dot, operands, x: mx.array, n: int, *, codes_name: str = "weight"
+) -> tuple[mx.array, mx.array]:
     """Each lane's part of the first ``n`` rows of a matrix, read twice:
     ``madd(0, row(0), xt, aux)`` over the ``VPT`` inputs of each lane index
     ``j = 32 * b + l``, by lane ``l``'s cursor stepped ``b`` blocks, as the
@@ -444,7 +452,7 @@ def lane_parts(face: Dot, operands, x: mx.array, n: int) -> tuple[mx.array, mx.a
     index ``j``'s part for ``j`` below ``K / VPT``, zeros after.
     ``operands`` and ``x`` are as ``dot_rows`` takes them; ``n`` is one or
     more and no more than the matrix's rows (not checked)."""
-    operands = _checked(face, operands, x)
+    operands = _checked(face, operands, x, codes_name)
     if n <= 0:
         raise ValueError(f"n={n}: one row or more")
     k = x.shape[-1]
@@ -494,7 +502,14 @@ def _finish_rows_kernel(face: Dot):
 
 
 def finish_rows(
-    face: Dot, operands, k: int, n: int, sums: mx.array, dtype: mx.Dtype
+    face: Dot,
+    operands,
+    k: int,
+    n: int,
+    sums: mx.array,
+    dtype: mx.Dtype,
+    *,
+    codes_name: str = "weight",
 ) -> mx.array:
     """``finish(0, s)`` of each of the first ``n`` rows of a matrix of K
     inputs, for each sum ``s`` in ``sums`` (8 or more float32 values), in
@@ -508,7 +523,7 @@ def finish_rows(
         raise ValueError(
             f"sums are 8 or more float32 values, not {sums.dtype} {sums.shape}"
         )
-    operands = _checked(face, operands, mx.zeros((max(k, 8),), dtype))
+    operands = _checked(face, operands, mx.zeros((max(k, 8),), dtype), codes_name)
     if k <= 0 or n <= 0:
         raise ValueError(f"k={k}, n={n}: one input and one row or more")
     return _finish_rows_kernel(face)(
@@ -534,7 +549,7 @@ def rows_stack(
     both matrices against the declared tensor names, shapes and dtypes.
     Raises an ``AssertionError`` that names what differs, or that the
     format is not ``stackable``."""
-    weight = first.get("weight")
+    weight = first.get(fmt.codes_name)
     if not isinstance(weight, mx.array) or not weight.ndim:
         raise AssertionError(f"quant format {fmt.mode}: first matrix needs weight rows")
     n = weight.shape[0]
@@ -570,8 +585,17 @@ def rows_stack(
         face = fmt.dot(layer, k, layer.output_dims)
         if face is None:
             raise AssertionError(f"quant format {fmt.mode}: no dot face to compare")
-        operands = [layer[name] for name in ("weight", *face.tensors)]
-        rows.append(dot_rows(face, operands, x, layer.output_dims, (1, 0)))
+        operands = [layer[name] for name in (fmt.codes_name, *face.tensors)]
+        rows.append(
+            dot_rows(
+                face,
+                operands,
+                x,
+                layer.output_dims,
+                (1, 0),
+                codes_name=fmt.codes_name,
+            )
+        )
     if not _same_bits(rows[0], mx.concatenate(rows[1:])):
         raise AssertionError(
             f"quant format {fmt.mode}: the dot rows of two stacked matrices are not "
@@ -642,7 +666,13 @@ def _tile_rows_kernel(face: Tile):
 
 
 def tile_rows(
-    face: Tile, operands, k: int, rows, dtype: mx.Dtype
+    face: Tile,
+    operands,
+    k: int,
+    rows,
+    dtype: mx.Dtype,
+    *,
+    codes_name: str = "weight",
 ) -> tuple[mx.array, mx.array]:
     """Every weight of some rows of a matrix of K inputs, read through a tile
     face as a tile kernel reads it: ``weight(params(g), fetch(run), i)``.
@@ -673,7 +703,7 @@ def tile_rows(
         for r in rows
     ):
         raise ValueError(f"rows={rows} are not one row index or more")
-    names = ("weight", *face.tensors)
+    names = (codes_name, *face.tensors)
     if len(operands) != len(names):
         raise ValueError(
             f"face {face.key} reads {', '.join(names)}; operands given: {len(operands)}"

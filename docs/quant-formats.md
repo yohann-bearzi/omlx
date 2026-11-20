@@ -31,7 +31,8 @@ from omlx.formats import Dot, QuantFormat, Tile
 
 class MyFormat(QuantFormat):
     mode = "myformat"      # a linear's "mode" in the quantization config
-    tensors = ("scales",)  # its parameters beside "weight" and "bias"
+    codes_name = "codes"   # the tensor that holds its codes
+    tensors = ("group_scales",)  # its side parameters, beside bias
     contract = 1           # the revision of this page it is written for
 
     def decode(self, tensors, bits, group_size):
@@ -67,6 +68,7 @@ myformat = "my_package:FORMAT"
 
 Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot`, `tile` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
+- A format names the tensor that holds its codes, `codes_name` (`weight` by default). **A plugin's format keeps no tensor called `weight`, `scales`, `biases` or `bias`**: those are MLX's own names on a quantized layer, and a format layer of a plugin has none of them, so a family's by-hand reader that indexes one fails loudly instead of reading codes as floats. Its codes and its tensors are identifiers, each named once and apart from `bias`. The built-in affine format keeps MLX's names (`weight`, `scales`, `biases`).
 - A mode has one format. A second format for a registered mode is refused.
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
@@ -80,7 +82,7 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 
 `QuantFormat.decode(tensors, bits, group_size)` returns a matrix's weights as floats, of shape `(..., n, k)`. It is the format's reference: what a layer runs where no kernel takes its rows, and what a format's tests compare a face with.
 
-- `tensors` holds `weight` and the format's `tensors`, by name. They are one matrix's, or those of several: a switch layer passes the experts a call asks for, gathered tensor by tensor (`tensor[indices]`), or its whole stack. Each tensor then has the same axes ahead of its own, and so do the weights returned.
+- `tensors` holds the format's `codes_name` and its `tensors`, by name. They are one matrix's, or those of several: a switch layer passes the experts a call asks for, gathered tensor by tensor (`tensor[indices]`), or its whole stack. Each tensor then has the same axes ahead of its own, and so do the weights returned.
 - `bits` and `group_size` are the layer's, from the checkpoint's quantization config.
 - The floats are of any float type. A layer casts them to the activations' type ahead of MLX's matmul, so the product has `x`'s dtype.
 
@@ -94,7 +96,7 @@ from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 
 with testing.verified("llama"):
     linear = FormatLinear(
-        "myformat", bits, group_size, k, {"weight": codes, "scales": scales}
+        "myformat", bits, group_size, k, {"codes": codes, "group_scales": gs}
     )
     y = linear(x)
 
@@ -108,12 +110,12 @@ any layer for its face. The routed decode and verify window plan over MLX's
 quantized layers and format layers. A layer is given every tensor the format
 names, and no other:
 
-- the weight of a matrix has two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
-- in a stack every tensor has the stack's axis first, and the weight then two more. What follows the stack's axis in another tensor is the format's own.
+- its codes (`codes_name`) have two axes, the first of which is N (the layer's `output_dims`); the second is the format's own. K is given (`input_dims`);
+- in a stack every tensor has the stack's axis first, and the codes then two more. What follows the stack's axis in another tensor is the format's own.
 
-A layout that breaks these rules for a matrix is refused, by oQ before it encodes the matrix and by a layer when it is built: tensors of other names than the weight and the format's `tensors`, a weight of other than two axes, or a weight whose first axis is not N (a format packs along K, never along N): `quant format 'myformat' lays out the weight of a (16, 64) matrix as (8, 128): its first axis is N (16); a format packs along K, never along N`.
+A layout that breaks these rules for a matrix is refused, by oQ before it encodes the matrix and by a layer when it is built: tensors of other names than its codes and the format's `tensors`, codes of other than two axes, or codes whose first axis is not N (a format packs along K, never along N): `quant format 'myformat' lays out the tensor 'codes' of a (16, 64) matrix as (8, 128): its first axis is N (16); a format packs along K, never along N`.
 
-A format whose tensors are all row-major keeps a matrix's rows apart: where every tensor of `layout(k, n, ...)` has N as its first axis, and `layout(k, 2n, ...)` is the same with 2N, row `r` of the decoded matrix depends on row `r` of each tensor alone. Kernels then stack two matrices of one K along N (a gate and an up projection, fused) and read the stack as one. `formats.stackable(fmt, k, n, bits, group_size)` answers whether a format's matrices may be stacked. It requires a positive N and a layout declaring exactly the weight and the tensors named by `fmt.tensors`. What the layout cannot show is the format's promise, and its tests check it with `omlx.formats.testing.rows_stack(fmt, first, second, k, bits, group_size, x)`: the decode of two stacked matrices is their two decodes, bit for bit, and with `x` so are the dot rows (see [Test a format](#test-a-format)). A format that a layout does not describe whole (a tensor shared by every row, a row's parameters that depend on others) is not stackable: its layout must say so, with a tensor whose first axis is not N.
+A format whose tensors are all row-major keeps a matrix's rows apart: where every tensor of `layout(k, n, ...)` has N as its first axis, and `layout(k, 2n, ...)` is the same with 2N, row `r` of the decoded matrix depends on row `r` of each tensor alone. Kernels then stack two matrices of one K along N (a gate and an up projection, fused) and read the stack as one. `formats.stackable(fmt, k, n, bits, group_size)` answers whether a format's matrices may be stacked. It requires a positive N and a layout declaring exactly `fmt.codes_name` and the tensors named by `fmt.tensors`. What the layout cannot show is the format's promise, and its tests check it with `omlx.formats.testing.rows_stack(fmt, first, second, k, bits, group_size, x)`: the decode of two stacked matrices is their two decodes, bit for bit, and with `x` so are the dot rows (see [Test a format](#test-a-format)). A format that a layout does not describe whole (a tensor shared by every row, a row's parameters that depend on others) is not stackable: its layout must say so, with a tensor whose first axis is not N.
 
 A switch block's gate and up projections can fuse when they share one checkpoint
 reader, input width, bit width and group size. Their stored tensors must match
@@ -182,10 +184,10 @@ mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a
     def layout(self, k, n, bits, group_size):
         if bits != 8:
             return None
-        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 ```
 
-`layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its `weight` and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there (by MLX in a strict load, by oMLX when the load returns, whatever its `strict`, and a layer the load filled none of at the end of oMLX's own load: see [Load a checkpoint](#load-a-checkpoint)). MLX's load does not check a tensor's dtype, nor its shape when it is not strict: one of another shape or dtype than the layout's is not taken, and leaves the placeholder. A layer that still holds a placeholder when it is first called (that tensor's, or one a load that is not strict lacked) refuses to compute, naming itself, the tensor and the shape and dtype it was offered or `never loaded`: it never computes on a placeholder, and neither its decode nor `formats.dot` reads one. Only a load fills a placeholder: an array assigned while no checkpoint loads on that thread (a recast, `set_dtype` before or after the load, code of one's own) is stored, and leaves each tensor loaded or not as it was; and a load's array of another shape or dtype, not taken, leaves that tensor unloaded even in a layer loaded before, which then refuses to compute until a load gives it one.
+`layout` gives the shape and the dtype of each tensor a checkpoint keeps of one `(n, k)` matrix: its codes (`codes_name`) and the format's `tensors`, by name. A switch layer's stack has its axis ahead of each. The layer is built over placeholders of those shapes, with the bias of the layer it replaces, and the load fills them: a checkpoint whose tensors have other names or other shapes is refused there (by MLX in a strict load, by oMLX when the load returns, whatever its `strict`, and a layer the load filled none of at the end of oMLX's own load: see [Load a checkpoint](#load-a-checkpoint)). MLX's load does not check a tensor's dtype, nor its shape when it is not strict: one of another shape or dtype than the layout's is not taken, and leaves the placeholder. A layer that still holds a placeholder when it is first called (that tensor's, or one a load that is not strict lacked) refuses to compute, naming itself, the tensor and the shape and dtype it was offered or `never loaded`: it never computes on a placeholder, and neither its decode nor `formats.dot` reads one. Only a load fills a placeholder: an array assigned while no checkpoint loads on that thread (a recast, `set_dtype` before or after the load, code of one's own) is stored, and leaves each tensor loaded or not as it was; and a load's array of another shape or dtype, not taken, leaves that tensor unloaded even in a layer loaded before, which then refuses to compute until a load gives it one.
 
 `layout` returns None for a matrix the format does not keep (bits it has no codes for, a K its groups do not divide). The load then fails in words: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): it lays out no (16, 64) matrix of 4 bits in groups of 2`. A built-in format of one of MLX's own modes returns None for the matrices that stay MLX's layers; affine does for all.
 
@@ -214,7 +216,7 @@ A checkpoint's layers of a format are read with the record oQ stored for it (`om
 ```
 
 - Each load hands the record to `accept` of its own copy of the registered format (`copy.deepcopy`), and every layer of the checkpoint is built with the object `accept` returns, and keeps it (`layer.fmt`): its `layout` gives the layer's tensors, and its `decode` and `dot` run them. `accept` returns the format itself (the copy) by default; None means the copy too.
-- A format whose checkpoints differ by what their record holds (a table of levels, say) configures its copy from it, or returns a new object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors` and `contract`; anything else is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): accept returned 'myformat', not a format of its mode, tensors and contract: report it to my-package 0.1.0`. Make it immutable once accepted, with no unevaluated arrays: the layers of several threads read it.
+- A format whose checkpoints differ by what their record holds (a table of levels, say) configures its copy from it, or returns a new object configured from it: its faces can hold the record's values as constants. The object is a `QuantFormat` of the same `mode`, `tensors`, codes and `contract`; anything else is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): accept returned 'myformat', not a format of its mode, tensors, codes and contract: report it to my-package 0.1.0`. Make it immutable once accepted, with no unevaluated arrays: the layers of several threads read it.
 - Nothing `accept` does reaches the registered format, so checkpoints of several records load and run side by side, each layer with its own checkpoint's object. The registered format is copied once per load and checkpoint, so it holds nothing `copy.deepcopy` refuses (a lock, an MLX dtype; define `__deepcopy__` for anything else) and nothing large; a format that cannot be copied is refused: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): the format cannot be copied for the load (cannot pickle '_thread.lock' object): accept runs on a copy of the registered format, which holds no lock, dtype or other object that copy.deepcopy refuses; report it to my-package 0.1.0`. A format keeps what it caches (its faces) outside the object: `functools.cache` on a function (or a `staticmethod`), as the built-in affine format does (on a method it would key on, and keep, the format object).
 - `accept` raises a ValueError in the format's own words to refuse a checkpoint. The load raises them as its reason: `quant format 'myformat' of the checkpoint at /models/my-model (written by my-package 0.2.0; installed: my-package 0.1.0): written in layout 2; this plugin reads layout 1`.
 - A plugin may hold oMLX's `Table`, `Dot` and `Tile` objects. Copies of those
@@ -266,7 +268,7 @@ The record is that of the checkpoint the load reads. oMLX wraps the libraries' f
 - When the load returns, whatever its `strict`, a layer it filled in part is refused (a
   tensor of the checkpoint renamed, or missing): `quant format 'myformat' of the
   checkpoint at /models/my-model (written by my-package 0.1.0; installed: my-package
-  0.1.0): the load filled model.layers.0.mlp.gate_proj but its scales: the checkpoint
+  0.1.0): the load filled model.layers.0.mlp.gate_proj but its group_scales: the checkpoint
   holds no such tensor, or holds it under another name`. So is a tensor of another shape
   or dtype than the layout's, or no array at all (tensors nested under its name), and an
   entry of the quantization config (its own and its text model's, under either key) in a
@@ -284,7 +286,7 @@ The record is that of the checkpoint the load reads. oMLX wraps the libraries' f
   (`format_load.check_loaded` in the LLM and VLM engines, in the prefill helper after
   it selects its layers, and in oQ's checked calibration and sensitivity loads): `quant format 'myformat' of the checkpoint at
   /models/my-model (written by my-package 0.1.0; installed: my-package 0.1.0): the
-  loaded model holds model.layers.0.mlp.gate_proj without its weight, scales: the
+  loaded model holds model.layers.0.mlp.gate_proj without its codes, group_scales: the
   checkpoint holds no such tensor, or holds it under another name`.
 
 Distributed readers, including cluster workers and tensor- and pipeline-parallel
@@ -331,7 +333,7 @@ oQ writes a checkpoint's matrices in a format that encodes them:
         rows = w.astype(mx.float32)
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
         codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
-        return {"weight": codes.astype(mx.uint8), "scales": scales}
+        return {"codes": codes.astype(mx.uint8), "group_scales": scales}
 ```
 
 ```python
@@ -416,9 +418,9 @@ What oQ writes:
 oQ checks each answer against the layout, which is what the checkpoint loads by. Tensors of other names, shapes or dtypes stop the run:
 
 ```
-quant format 'myformat' encoded model.layers.0.mlp.gate_proj.weight as {'weight': ((16, 64),
-mlx.core.uint8)}, and lays it out as {'weight': ((16, 64), mlx.core.uint8), 'scales': ((16,),
-mlx.core.float32)}: the checkpoint would not load
+quant format 'myformat' encoded model.layers.0.mlp.gate_proj.weight as {'codes': ((16, 64),
+mlx.core.uint8)}, and lays it out as {'codes': ((16, 64), mlx.core.uint8), 'group_scales':
+((16,), mlx.core.float32)}: the checkpoint would not load
 ```
 
 oQ gives each layer its bits within a budget of bits per weight, which it counts in what affine costs at `(bits, group_size)`. A format that costs about as much keeps the level's size. One that costs more writes a larger checkpoint than the level states.
@@ -470,7 +472,7 @@ A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the 
 - a layer with a tensor of fewer than 8 elements. MLX binds such an input as constants, not as the device pointer a face holds,
 - a layer with a float64 tensor: the GPU takes none.
 
-Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (`weight` and each of the face's `tensors`, among its format's `tensors`, of 8 elements or more each and none of float64, which the GPU does not take), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` or a `tile()` was defective in it (an exception of the block's body is raised in its place):
+Kernels ask through `omlx.formats.dot(layer, k, n)`, inside a model's forward, and keep the answer with what they build for the layer (until one of its tensors is replaced). A forward runs on one of oMLX's threads (each loaded model's engine has its own, and the loads, the embeddings and the rerankers share another): `dot()` is called from any of them, and what a format keeps between calls (its faces) is shared by all (see [Kernels over faces](#kernels-over-faces)). A `dot()` that raises an exception there, or that returns anything but `None` or a `Dot` of arrays the layer has (its codes and each of the face's `tensors`, among its format's `tensors`, of 8 elements or more each and none of float64, which the GPU does not take), counts as `None`: the layer keeps its composed path. Each such defect of a format is logged once (`quant format MODE gave no usable dot face ...`, with the traceback). A format's own tests call `FORMAT.dot` directly and take the operands from the layer by the face's `tensors` (see [Test a format](#test-a-format)), so that these defects fail them. Tests that run a model do it inside `omlx.formats.testing.no_dot_defects()`, which fails on leaving the block when a `dot()` or a `tile()` was defective in it (an exception of the block's body is raised in its place):
 
 ```python
 import pytest
@@ -492,7 +494,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 | `key` | An identifier. Names the face in kernel names and compiler messages. |
 | `source` | Metal at global scope that declares the face's struct, in its own namespace (`omlx_<key>`, or one that the faces sharing the source share: the affine tile face's bf16 and fp16 keys share `omlx_affine_tile_b{bits}g{group_size}`). A kernel includes each distinct source once. |
 | `type` | The struct, as a type expression for a kernel body, where `T` names the activations' float type. For example `omlx_myformat_b8::Dot`. A `Tile`'s struct is in a namespace of its own, apart from its format's `Dot`: a kernel includes the source of the faces it reads, and no other. |
-| `tensors` | The layer's parameters beside `weight` and `bias` that the face reads, as a tuple, among its format's `tensors`. They become kernel inputs in this order. Identifiers, each named once, as a format's `tensors` are. |
+| `tensors` | The layer's side parameters beside its codes and `bias` that the face reads, as a tuple, among its format's `tensors`. They become kernel inputs in this order. Identifiers, each named once, as a format's `tensors` are. |
 | `vpt` | `Dot` only. `Lanes<K>::VPT`, the inputs a lane reads a block: a shared-rows kernel sizes its launch by it and asserts that the struct agrees. 0 (the default) for a face that no such kernel reads; a kernel refuses to share one. |
 | `shared` | `Dot` only. Metal that a kernel which applies one block's weights to several inputs includes after `source`, and no other kernel does: where a face defines `decode` and `apply` out of its struct (its struct declares them), so that the kernels that never call them do not carry them. MLX hashes a kernel's whole source at every launch, about 0.05 µs a KB. Empty (the default) for a face whose struct defines them. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype` among `float16`, `bfloat16` and `float32`; empty (the default) for those three (`formats.FLOATS`). Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
@@ -500,7 +502,7 @@ The block's value is the set of the defects met so far, each as `(mode, repr(err
 
 ## The dot face
 
-The struct named by `type` holds the matrix. Its aggregate members are the weight as bytes, one device pointer per name in `tensors`, then one `omlx_table<T, N>` per entry in `tables`. Both tuples set the order of their members. Each tensor pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). A layer's tensors keep their dtypes when the activations are recast (see [Layers](#layers)), so a pointer typed `T` reads its tensor right only for the activation dtypes the face lists in `dtypes`: a face whose pointers are `T` lists its tensors' dtype there, or names their type, `bfloat16_t` for one. Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
+The struct named by `type` holds the matrix. Its aggregate members are the codes as bytes, one device pointer per name in `tensors`, then one `omlx_table<T, N>` per entry in `tables`. Both tuples set the order of their members. Each tensor pointer has its tensor's element type (`float` for float32, `T` for a tensor in the activations' dtype). A layer's tensors keep their dtypes when the activations are recast (see [Layers](#layers)), so a pointer typed `T` reads its tensor right only for the activation dtypes the face lists in `dtypes`: a face whose pointers are `T` lists its tensors' dtype there, or names their type, `bfloat16_t` for one. Ahead of them it states the revision of this page the face is written for, as the constant `CONTRACT` (see [Versions](#versions)).
 
 ```cpp
 struct Dot {
@@ -626,7 +628,7 @@ Dot(
     key="myformat_b8",
     source=SOURCE,
     type="omlx_myformat_b8::Dot",
-    tensors=("scales",),
+    tensors=("group_scales",),
 )
 ```
 
@@ -780,7 +782,7 @@ Its `decode`, the same products in the same order:
 
 ```python
     def decode(self, tensors, bits, group_size):
-        levels = tensors["weight"].astype(mx.float32) - 128.0
+        levels = tensors["codes"].astype(mx.float32) - 128.0
         scales = tensors["group_scales"] * tensors["row_scales"][..., None]
         return levels * mx.repeat(scales, 32, axis=-1)[..., : levels.shape[-1]]
 ```
@@ -796,7 +798,7 @@ Dot(
     key="mytable_b2",
     source=metal_source,
     type="omlx_mytable_b2::Dot",
-    tensors=("scales",),
+    tensors=("group_scales",),
     tables=(Table("levels", mx.float32, (-1.5, -0.5, 0.5, 1.5)),),
 )
 ```
@@ -844,7 +846,7 @@ import mlx.core as mx
 from omlx.formats import kernels
 
 matrices = kernels.Matrices()
-inputs = ["x", *matrices.add("m", face)]  # ["x", "m_weight", "m_scales"]
+inputs = ["x", *matrices.add("m", face)]  # ["x", "m_weight", "m_group_scales"]
 # matrices.add("m", face, shared=True): the shared-rows skeleton instead
 
 kernel = mx.fast.metal_kernel(
@@ -971,7 +973,7 @@ from omlx.formats import testing
 
 def test_rows_are_the_dequantized_products():
     face = FORMAT.dot(layer, k, n)
-    operands = [layer[name] for name in ("weight", *face.tensors)]
+    operands = [layer[name] for name in (FORMAT.codes_name, *face.tensors)]
     y = testing.dot_rows(face, operands, x, n, packs=(2, 2))
     assert mx.array_equal(y, dequantize(layer) @ x)
 ```
@@ -1027,7 +1029,7 @@ Worth testing for every layout a format gives a face for:
 ```python
 def test_the_tile_face_is_the_decode_in_float32():
     face = FORMAT.tile(layer, k, n)
-    operands = [layer[name] for name in ("weight", *face.tensors)]
+    operands = [layer[name] for name in (FORMAT.codes_name, *face.tensors)]
     exact, rounded = testing.tile_rows(face, operands, k, range(n), mx.bfloat16)
     want = decode_in_float32(layer)  # (n, k)
     assert mx.array_equal(exact, want).item()

@@ -119,7 +119,7 @@ def _can_fuse(switch_mlp: Any) -> bool:
         # The declaration covers one matrix. Both expert stacks must actually
         # store it, with the same concrete dtype even for a floating placeholder.
         layout = fmt.layout(k, n, gate.bits, gate.group_size)
-        if layout.keys() != {"weight", *fmt.tensors}:
+        if layout.keys() != {fmt.codes_name, *fmt.tensors}:
             return False
         for name, (shape, dtype) in layout.items():
             a, b = gate.get(name), up.get(name)
@@ -140,7 +140,8 @@ def _can_fuse(switch_mlp: Any) -> bool:
         return False
     if ("bias" in gate) != ("bias" in up):
         return False
-    gate_w, up_w = gate["weight"], up["weight"]
+    gate_w = gate[formats.tensor_names(gate)[0]]
+    up_w = up[formats.tensor_names(up)[0]]
     if gate_w.shape != up_w.shape or gate_w.dtype != up_w.dtype:
         return False
     if isinstance(gate, FormatSwitchLinear):

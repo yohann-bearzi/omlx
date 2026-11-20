@@ -2418,7 +2418,7 @@ def _load_toy(layer, n, k, seed, stack=None):
     (codes, scales), _, _ = _matrix((stack or 1) * n, k, seed=seed)
     if stack is not None:
         codes, scales = codes.reshape(stack, n, k), scales.reshape(stack, n)
-    layer.load_weights([("weight", codes), ("scales", scales)], strict=True)
+    layer.load_weights([("codes", codes), ("group_scales", scales)], strict=True)
 
 
 def format_block(hidden, inter, shared, top_k=8, experts=EXPERTS):
@@ -2495,3 +2495,27 @@ def test_a_format_stack_with_a_bias_keeps_the_composed_body(monkeypatch):
     assert _plan(block, x) is not None
     block.switch_mlp.down_proj["bias"] = mx.zeros((EXPERTS, hidden), mx.bfloat16)
     assert _plan(block, x) is None
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_format_router_of_another_width_keeps_the_composed_body(monkeypatch):
+    """A router that scores more experts than the stacks hold is not the
+    block's plan, whatever its layer: the width guard reads the router's
+    packed tensor by its own name (D11)."""
+    from omlx.formats.linear import FormatLinear
+    from tests.test_formats_kernels import _toy
+
+    load_toy_format(monkeypatch, replace(_toy("router_width"), dtypes=(mx.bfloat16,)))
+    block = format_block(1024, 320, "affine")
+    width = block.num_experts + 8
+    block.gate = FormatLinear(
+        "toy",
+        8,
+        1,
+        1024,
+        {
+            "codes": mx.zeros((width, 1024), mx.uint8),
+            "group_scales": mx.ones((width,), mx.float32),
+        },
+    )
+    assert routed._build_plan(block) is None

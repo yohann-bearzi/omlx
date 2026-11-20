@@ -22,9 +22,11 @@ thread_local bool row_exact_armed = false;
 class FormatLinearFast {
  public:
   FormatLinearFast(nb::object weight, nb::object bias,
-                   std::vector<nb::object> operands, nb::dict proof_state)
+                   std::vector<nb::object> operands, nb::dict proof_state,
+                   nb::str weight_key)
       : weight_(std::move(weight)), bias_(std::move(bias)),
-        operands_(std::move(operands)), proof_state_(std::move(proof_state)) {}
+        operands_(std::move(operands)), proof_state_(std::move(proof_state)),
+        weight_key_(std::move(weight_key)) {}
 
   void register_signature(nb::tuple key) {
     if (operands_.size() >= kArgCount) {
@@ -168,6 +170,9 @@ class FormatLinearFast {
   PyTypeObject* array_type_ = reinterpret_cast<PyTypeObject*>(
       nb::type<mlx::core::array>().ptr());
   nb::str replay_key_{"replay"}, graph_key_{"graph"};
+  // The layer-dict key of its packed tensor: "weight" for MLX's affine, the
+  // format's codes name for a plugin's layer (passed by Python; a caller that
+  // predates D11 gets "weight").
   nb::str weight_key_{"weight"}, bias_key_{"bias"}, kept_key_{"_kept"};
   std::vector<std::shared_ptr<Entry>> entries_;
   std::shared_ptr<Entry> last_;
@@ -182,8 +187,12 @@ class FormatLinearFast {
 void register_format_dispatch(nb::module_& m) {
   m.def("set_row_exact_armed", [](bool armed) { row_exact_armed = armed; });
   nb::class_<FormatLinearFast>(m, "FormatLinearFast")
-      .def(nb::init<nb::object, nb::object, std::vector<nb::object>, nb::dict>(),
-           "weight"_a, "bias"_a.none(), "operands"_a, "proof_state"_a)
+      .def(nb::init<nb::object, nb::object, std::vector<nb::object>, nb::dict,
+                    nb::str>(),
+           "weight"_a, "bias"_a.none(), "operands"_a, "proof_state"_a,
+           // Optional so an older Python that predates D11 still binds; the
+           // product's own wrapper requires it (fail closed there).
+           "weight_key"_a = "weight")
       .def("register", &FormatLinearFast::register_signature)
       .def("bind", &FormatLinearFast::bind);
 }

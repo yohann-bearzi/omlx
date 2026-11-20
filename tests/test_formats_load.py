@@ -59,6 +59,9 @@ class _Loadable(_ToyFormat):
     reads a checkpoint of a record (None: the load's copy of the format,
     unless a test says otherwise)."""
 
+    codes_name = "codes"
+    tensors = ("group_scales",)
+
     def __init__(self, mode="toy"):
         super().__init__()
         self.mode, self.refusal = mode, None
@@ -91,7 +94,7 @@ class _Loadable(_ToyFormat):
         self.asked.append((k, n, bits, group_size))
         if bits != 8:
             return None
-        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 
 
 @pytest.fixture
@@ -247,20 +250,20 @@ def test_a_named_linear_loads_as_the_formats_layer(by_hand, toy):
     assert toy.asked == [(k, n, 8, 1)] * 2
     # Placeholders of the layout's shapes and dtypes, and the layer's bias.
     assert _kept(layer) == {
-        "weight": ((n, k), mx.uint8),
-        "scales": ((n,), mx.float32),
+        "codes": ((n, k), mx.uint8),
+        "group_scales": ((n,), mx.float32),
         "bias": ((n,), mx.float32),
     }
     assert mx.array_equal(layer["bias"], random)
-    weights = {"toy.weight": codes, "toy.scales": scales, "toy.bias": bias}
+    weights = {"toy.codes": codes, "toy.group_scales": scales, "toy.bias": bias}
     weights["dense.weight"] = dense
     model.load_weights(list(weights.items()), strict=True)
-    assert mx.array_equal(layer["weight"], codes)
+    assert mx.array_equal(layer["codes"], codes)
     assert mx.array_equal(layer(x), want + bias)
     # The load checks a checkpoint's tensors against the layout.
-    with pytest.raises(ValueError, match="for parameter toy.scales"):
+    with pytest.raises(ValueError, match="for parameter toy.group_scales"):
         model.load_weights(
-            list({**weights, "toy.scales": scales[:-1]}.items()), strict=True
+            list({**weights, "toy.group_scales": scales[:-1]}.items()), strict=True
         )
     with pytest.raises(ValueError, match="toy.biases"):
         model.load_weights(list({**weights, "toy.biases": scales}.items()), strict=True)
@@ -279,18 +282,18 @@ def test_a_named_switch_layer_loads_as_the_formats_stack(by_hand, toy, switch):
     assert toy.asked == [(k, n, 8, 1)] * 2
     # The stack's axis is ahead of each tensor the layout gives.
     assert _kept(layer) == {
-        "weight": ((EXPERTS, n, k), mx.uint8),
-        "scales": ((EXPERTS, n), mx.float32),
+        "codes": ((EXPERTS, n, k), mx.uint8),
+        "group_scales": ((EXPERTS, n), mx.float32),
         "bias": ((EXPERTS, n), mx.float32),
     }
     assert mx.array_equal(layer["bias"], dense["bias"])
-    weights = {"weight": codes, "scales": scales, "bias": bias}
+    weights = {"codes": codes, "group_scales": scales, "bias": bias}
     layer.load_weights(list(weights.items()), strict=True)
     x, indices = _ints((5, 1, k)), mx.array([4, 0, 5, 5, 2], dtype=mx.uint32)
     assert np.array_equal(np.array(layer(x, indices)), _want(layer, x, indices))
     # Without a bias.
     layer = switch.SwitchLinear(k, n, EXPERTS, bias=False).to_quantized(**_TOY)
-    assert sorted(layer.keys()) == ["scales", "weight"]
+    assert sorted(layer.keys()) == ["codes", "group_scales"]
 
 
 def _for_load(switch, n=16, k=64):
@@ -301,14 +304,14 @@ def _for_load(switch, n=16, k=64):
     if switch is None:
         (codes, scales), _, _ = _matrix(n, k)
         layer = nn.Linear(k, n).to_quantized(**_TOY)
-        weights = {"weight": codes, "scales": scales}
+        weights = {"codes": codes, "group_scales": scales}
         weights["bias"] = mx.arange(n).astype(mx.float32)
         return layer, weights, (_ints((3, k)),)
     (codes, scales), _, _ = _matrix(EXPERTS * n, k)
     layer = switch.SwitchLinear(k, n, EXPERTS, bias=True).to_quantized(**_TOY)
     weights = {
-        "weight": codes.reshape(EXPERTS, n, k),
-        "scales": scales.reshape(EXPERTS, n),
+        "codes": codes.reshape(EXPERTS, n, k),
+        "group_scales": scales.reshape(EXPERTS, n),
         "bias": mx.arange(EXPERTS * n).reshape(EXPERTS, n).astype(mx.float32),
     }
     indices = mx.array([4, 0, 5, 5, 2], dtype=mx.uint32)
@@ -335,12 +338,13 @@ def test_a_checkpoint_s_tensor_of_another_dtype_is_refused_at_the_first_call(
     another dtype than the layout's is not loaded, and the layer refuses to
     compute on the placeholder it leaves, never on zeros."""
     layer, weights, args = _for_load(switch)
-    half = weights["scales"].astype(mx.float16)
-    layer.load_weights(list({**weights, "scales": half}.items()), strict=True)
-    assert layer["scales"].dtype == mx.float32 and not mx.any(layer["scales"]).item()
-    shape = weights["scales"].shape
+    half = weights["group_scales"].astype(mx.float16)
+    layer.load_weights(list({**weights, "group_scales": half}.items()), strict=True)
+    assert layer["group_scales"].dtype == mx.float32
+    assert not mx.any(layer["group_scales"]).item()
+    shape = weights["group_scales"].shape
     offered = (
-        f"scales (offered {shape} mlx.core.float16, not the layout's {shape} "
+        f"group_scales (offered {shape} mlx.core.float16, not the layout's {shape} "
         "mlx.core.float32)"
     )
     with pytest.raises(ValueError, match=_refused(layer, offered)):
@@ -356,10 +360,12 @@ def test_a_tensor_a_load_lacks_is_refused_at_the_first_call(toy, by_hand, switch
     (here a tensor a sanitize named wrong) and leaves the layer's
     placeholder: the layer refuses to compute on it."""
     layer, weights, args = _for_load(switch)
-    weights["scale"] = weights.pop("scales")
+    weights["scale"] = weights.pop("group_scales")
     layer.load_weights(list(weights.items()), strict=False)
-    assert mx.array_equal(layer["weight"], weights["weight"])
-    with pytest.raises(ValueError, match=_refused(layer, "scales (never loaded)")):
+    assert mx.array_equal(layer["codes"], weights["codes"])
+    with pytest.raises(
+        ValueError, match=_refused(layer, "group_scales (never loaded)")
+    ):
         layer(*args)
 
 
@@ -369,11 +375,11 @@ def test_a_tensor_of_another_shape_is_refused_at_the_first_call(toy, by_hand, sw
     shape than the layout's is not taken either, and the layer refuses to
     compute rather than read past it."""
     layer, weights, args = _for_load(switch)
-    shape = weights["scales"].shape
-    short = weights["scales"][..., :8]
-    layer.load_weights(list({**weights, "scales": short}.items()), strict=False)
+    shape = weights["group_scales"].shape
+    short = weights["group_scales"][..., :8]
+    layer.load_weights(list({**weights, "group_scales": short}.items()), strict=False)
     offered = (
-        f"scales (offered {short.shape} mlx.core.float32, not the layout's "
+        f"group_scales (offered {short.shape} mlx.core.float32, not the layout's "
         f"{shape} mlx.core.float32)"
     )
     with pytest.raises(ValueError, match=_refused(layer, offered)):
@@ -387,9 +393,9 @@ def test_codes_a_recast_hands_back_are_no_load(toy, by_hand, switch):
     that lacks the codes leaves them refused."""
     layer, weights, args = _for_load(switch)
     layer.set_dtype(mx.float16)
-    del weights["weight"]
+    del weights["codes"]
     layer.load_weights(list(weights.items()), strict=False)
-    with pytest.raises(ValueError, match=_refused(layer, "weight (never loaded)")):
+    with pytest.raises(ValueError, match=_refused(layer, "codes (never loaded)")):
         layer(*args)
 
 
@@ -403,7 +409,7 @@ class _HalfScales(_Loadable):
 
     def layout(self, k, n, bits, group_size):
         layout = super().layout(k, n, bits, group_size)
-        return {**layout, "scales": ((n,), mx.bfloat16)}
+        return {**layout, "group_scales": ((n,), mx.bfloat16)}
 
 
 @pytest.mark.parametrize("when", ["before", "after"])
@@ -420,10 +426,10 @@ def test_a_recast_around_a_load_leaves_a_format_layer_its_checkpoint_s_tensors(
     scales = scales.astype(mx.bfloat16)
     mx.random.seed(7)
     bias = mx.random.randint(-64, 64, (EXPERTS, n)).astype(mx.bfloat16)
-    matrix = {"weight": codes[:n], "scales": scales[:n]}
+    matrix = {"codes": codes[:n], "group_scales": scales[:n]}
     stack = {
-        "weight": codes.reshape(EXPERTS, n, k),
-        "scales": scales.reshape(EXPERTS, n),
+        "codes": codes.reshape(EXPERTS, n, k),
+        "group_scales": scales.reshape(EXPERTS, n),
     }
     weights = {f"linear.{name}": value for name, value in matrix.items()}
     weights.update({f"switch.{name}": value for name, value in stack.items()})
@@ -483,7 +489,10 @@ def test_a_layout_packed_along_n_is_refused_where_the_layer_is_built(
     row of a one-row matrix, and one that lays out even Ns alone."""
 
     def packed(k, n, bits, group_size):
-        return {"weight": ((n // 2, 2 * k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {
+            "codes": ((n // 2, 2 * k), mx.uint8),
+            "group_scales": ((n,), mx.float32),
+        }
 
     def even(k, n, bits, group_size):
         return None if n % 2 else packed(k, n, bits, group_size)
@@ -821,15 +830,15 @@ def _hand_built(kind, fmt="toy"):
     """A toy layer of ``kind`` built by hand."""
     stack = (2,) if kind is FormatSwitchLinear else ()
     tensors = {
-        "weight": mx.zeros((*stack, 128, 64), mx.uint8),
-        "scales": mx.zeros((*stack, 128), mx.float32),
+        "codes": mx.zeros((*stack, 128, 64), mx.uint8),
+        "group_scales": mx.zeros((*stack, 128), mx.float32),
     }
     return kind(fmt, 8, 1, 64, tensors)
 
 
 @pytest.mark.parametrize("kind", [FormatLinear, FormatSwitchLinear])
 @pytest.mark.parametrize(
-    "fmt", [None, SimpleNamespace(mode="toy", tensors=("scales",))]
+    "fmt", [None, SimpleNamespace(mode="toy", tensors=("group_scales",))]
 )
 def test_a_hand_built_layer_requires_a_mode_or_quant_format(toy, kind, fmt):
     assert _hand_built(kind, toy).fmt is toy
@@ -1591,7 +1600,8 @@ def _llama(path, **written):
     (codes, scales), _, _ = _matrix(128, 64)
     scales = scales * 2.0**-10
     weights = dict(tree_flatten(reference.parameters()))
-    weights[f"{name}.weight"], weights[f"{name}.scales"] = codes, scales
+    del weights[f"{name}.weight"]
+    weights[f"{name}.codes"], weights[f"{name}.group_scales"] = codes, scales
     mx.save_safetensors(str(path / "model.safetensors"), weights)
     # A checkpoint names each layer of the format; the top-level mode is
     # MLX's, for the layers it finds by their scales.
@@ -1608,13 +1618,13 @@ def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
     mlp = model.model.layers[0].mlp
     assert type(mlp.gate_proj) is FormatLinear and mlp.gate_proj.mode == "toy"
     assert _kept(mlp.gate_proj) == {
-        "weight": ((128, 64), mx.uint8),
-        "scales": ((128,), mx.float32),
+        "codes": ((128, 64), mx.uint8),
+        "group_scales": ((128,), mx.float32),
     }
-    assert mx.array_equal(mlp.gate_proj["weight"], codes)
+    assert mx.array_equal(mlp.gate_proj["codes"], codes)
     assert type(mlp.up_proj) is nn.Linear and type(mlp.down_proj) is nn.Linear
     # The model computes what the same model does over the decoded weights.
-    dense = toy.decode({"weight": codes, "scales": scales}, 8, 1)
+    dense = toy.decode({"codes": codes, "group_scales": scales}, 8, 1)
     reference.model.layers[0].mlp.gate_proj.weight = dense
     tokens = mx.array([[1, 5, 9, 2, 30]])
     logits = model(tokens)
@@ -1655,8 +1665,9 @@ def test_one_checkpoint_accepts_each_formats_own_record(toy, tmp_path, monkeypat
     config_path.write_text(json.dumps(config))
     weights_path = tmp_path / "model.safetensors"
     weights = mx.load(str(weights_path))
-    weights[name + ".weight"] = codes
-    weights[name + ".scales"] = scales * 2
+    del weights[name + ".weight"]
+    weights[name + ".codes"] = codes
+    weights[name + ".group_scales"] = scales * 2
     out = tmp_path / "two-modes.safetensors"
     mx.save_safetensors(str(out), weights)
     out.replace(weights_path)
@@ -1669,7 +1680,7 @@ def test_one_checkpoint_accepts_each_formats_own_record(toy, tmp_path, monkeypat
     ):
         assert [value for value, _ in registered.accepted] == [record]
         assert layer.mode == registered.mode and layer.fmt is not registered
-        assert mx.array_equal(layer.scales, expected)
+        assert mx.array_equal(layer.group_scales, expected)
     assert mlp.gate_proj.fmt is not mlp.up_proj.fmt
 
 
@@ -1689,7 +1700,7 @@ def test_a_checkpoint_s_layers_keep_what_its_format_reads_them_with(toy, tmp_pat
     # The hook asks both; the layer reuses its accepted layout.
     assert layer.fmt.asked == toy.asked == [(64, 128, 8, 1)]
     assert formats.get("toy") is toy and not hasattr(toy, "levels")
-    tensors = {name: layer[name] for name in ("weight", "scales")}
+    tensors = {name: layer[name] for name in ("codes", "group_scales")}
     assert mx.array_equal(layer._decoded(), toy.decode(tensors, 8, 1) * 0.5)
     asked = []
     layer.fmt.dot = lambda layer, k, n: asked.append((k, n))
@@ -1879,7 +1890,7 @@ def test_a_format_s_own_refusal_names_the_checkpoint(toy, tmp_path):
 
 
 class _Other(_Loadable):
-    tensors = ("scales", "levels")
+    tensors = ("group_scales", "levels")
 
 
 @pytest.mark.parametrize(
@@ -1902,8 +1913,8 @@ def test_what_accept_returns_is_a_format_of_the_same_kind(
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path)
     said = (
-        f"accept returned {returned!r}, not a format of its mode, tensors and "
-        "contract: report it to "
+        f"accept returned {returned!r}, not a format of its mode, tensors, codes "
+        "and contract: report it to "
     )
     assert str(refusal.value) == _refusal(said + "the plugin", tmp_path)
     # Named by its distribution when a plugin's.
@@ -2027,7 +2038,7 @@ def test_accept_compares_the_readers_contract_with_the_registered_format(
     monkeypatch.setattr(type(toy), "accept", change_mode)
     (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))
     with pytest.raises(
-        formats.FormatRefusedError, match="its mode, tensors and contract"
+        formats.FormatRefusedError, match="its mode, tensors, codes and contract"
     ):
         format_load._Checkpoint(tmp_path).read(toy)
     assert toy.mode == "toy"
@@ -2253,7 +2264,7 @@ class _Wide(_Loadable):
 
     def layout(self, k, n, bits, group_size):
         self.asked.append((k, n, bits, group_size))
-        return {"weight": ((n, k), mx.uint8), "scales": ((n, 2), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n, 2), mx.float32)}
 
 
 def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
@@ -2266,7 +2277,7 @@ def test_the_checkpoint_s_format_lays_its_matrices_out(toy, tmp_path):
     # laid it out.
     assert toy.asked == [(64, 128, 8, 1)]
     assert wide.asked == [(64, 128, 8, 1)]
-    assert layer.fmt is wide and _kept(layer)["scales"] == ((128, 2), mx.float32)
+    assert layer.fmt is wide and _kept(layer)["group_scales"] == ((128, 2), mx.float32)
     # One the registered format lays out none of is refused before an
     # unrecorded checkpoint's record is read, while a recorded checkpoint
     # still validates its record once per load.
@@ -2331,15 +2342,16 @@ _GATE = "model.layers.0.mlp.gate_proj"
 
 
 def _renamed(weights):
-    weights[f"{_GATE}.scalez"] = weights.pop(f"{_GATE}.scales")
+    weights[f"{_GATE}.scalez"] = weights.pop(f"{_GATE}.group_scales")
 
 
 def _float16(weights):
-    weights[f"{_GATE}.scales"] = weights[f"{_GATE}.scales"].astype(mx.float16)
+    held = weights[f"{_GATE}.group_scales"]
+    weights[f"{_GATE}.group_scales"] = held.astype(mx.float16)
 
 
 def _short(weights):
-    weights[f"{_GATE}.scales"] = weights[f"{_GATE}.scales"][:64]
+    weights[f"{_GATE}.group_scales"] = weights[f"{_GATE}.group_scales"][:64]
 
 
 @pytest.mark.parametrize(
@@ -2348,20 +2360,22 @@ def _short(weights):
         (
             _renamed,
             False,
-            f"the load filled {_GATE} but its scales: the checkpoint holds no such "
+            f"the load filled {_GATE} but its group_scales: the checkpoint holds "
+            "no such "
             "tensor, or holds it under another name",
         ),
         (
             _float16,
             True,
-            f"{_GATE}.scales is (128,) {mx.float16}, where the format lays out "
+            f"{_GATE}.group_scales is (128,) {mx.float16}, where the format lays "
+            "out "
             f"(128,) {mx.float32}",
         ),
         (
             _short,
             False,
-            f"{_GATE}.scales is (64,) {mx.float32}, where the format lays out "
-            f"(128,) {mx.float32}",
+            f"{_GATE}.group_scales is (64,) {mx.float32}, where the format lays "
+            f"out (128,) {mx.float32}",
         ),
     ],
     ids=["a key renamed", "another dtype", "another shape"],
@@ -2477,7 +2491,7 @@ def test_a_format_entry_of_a_load_that_built_no_layer_is_refused(toy, tmp_path):
     del config["quantization"][_GATE]
     config["quantization"]["model.layers.0.mlp.gate"] = _TOY
     (tmp_path / "config.json").write_text(json.dumps(config))
-    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.scales"))
+    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.group_scales"))
     with pytest.raises(
         formats.FormatRefusedError, match="names model.layers.0.mlp.gate,"
     ):
@@ -2491,20 +2505,21 @@ def test_a_load_that_leaves_no_array_where_the_layout_has_one_is_refused(toy, tm
     _rewritten(
         tmp_path,
         lambda weights: weights.update(
-            {f"{_GATE}.scales.0": weights.pop(f"{_GATE}.scales")}
+            {f"{_GATE}.group_scales.0": weights.pop(f"{_GATE}.group_scales")}
         ),
     )
     with pytest.raises(formats.FormatRefusedError) as refusal:
         load_model(tmp_path, strict=False)
     assert refusal.value.reason == (
-        f"the load left {_GATE}.scales list, where the format lays out an array: "
+        f"the load left {_GATE}.group_scales list, where the format lays out an "
+        "array: "
         "the checkpoint holds tensors under that name"
     )
     assert (refusal.value.mode, refusal.value.path) == ("toy", tmp_path)
 
 
 @pytest.mark.parametrize("exit_check", [False, True], ids=["library", "omlx"])
-@pytest.mark.parametrize("removed", [("scales",), ("weight", "scales")])
+@pytest.mark.parametrize("removed", [("group_scales",), ("codes", "group_scales")])
 def test_a_layer_that_loses_a_declared_tensor_names_it_in_the_refusal(
     toy, tmp_path, exit_check, removed
 ):
@@ -2526,7 +2541,7 @@ def test_a_stock_load_is_not_walked(toy, tmp_path, monkeypatch):
     config = json.loads((tmp_path / "config.json").read_text())
     del config["quantization"][_GATE]
     (tmp_path / "config.json").write_text(json.dumps(config))
-    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.scales"))
+    _rewritten(tmp_path, lambda weights: weights.pop(f"{_GATE}.group_scales"))
 
     def walked(self):
         raise AssertionError("a stock load's model walked")
@@ -2664,7 +2679,7 @@ def test_a_load_joins_only_a_running_loader_s_load_on_its_thread(toy, tmp_path):
     with format_load.loading(partial) as bare:
         # A block no library's loader opened (oMLX's helpers, a test's): the
         # load nested in it is its own, and checks what it loaded.
-        with pytest.raises(formats.FormatRefusedError, match="but its scales"):
+        with pytest.raises(formats.FormatRefusedError, match="but its group_scales"):
             load_model(partial, strict=False)
         assert bare.built == []
     with format_load.loading(partial, by_loader=True) as outer:
@@ -2734,7 +2749,7 @@ def test_a_load_nested_in_another_checkpoint_s_checks_its_own(toy, tmp_path):
     partial = _renamed_scales(tmp_path / "partial")
     with (
         format_load.loading(tmp_path / "outer", by_loader=True),
-        pytest.raises(formats.FormatRefusedError, match="but its scales"),
+        pytest.raises(formats.FormatRefusedError, match="but its group_scales"),
     ):
         load_model(partial, strict=False)
 
@@ -2832,7 +2847,7 @@ def _without_gate(tmp_path):
     _tiny(tmp_path, [1.0])
 
     def partial(weights):
-        del weights[f"{_GATE}.weight"], weights[f"{_GATE}.scales"]
+        del weights[f"{_GATE}.codes"], weights[f"{_GATE}.group_scales"]
 
     _rewritten(tmp_path, partial)
     return tmp_path
@@ -2861,7 +2876,7 @@ def test_omlx_s_own_load_refuses_a_layer_the_checkpoint_does_not_hold(
 
     path = _without_gate(tmp_path / "partial")
     said = _refusal(
-        f"the loaded model holds {_GATE} without its weight, scales: the "
+        f"the loaded model holds {_GATE} without its codes, group_scales: the "
         "checkpoint holds no such tensor, or holds it under another name",
         path,
     )
@@ -2884,12 +2899,12 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     path = _without_gate(tmp_path / "partial")
     model, _ = load_model(path, strict=False)
     layer = model.model.layers[0].mlp.gate_proj
-    with pytest.raises(formats.FormatRefusedError, match="without its weight") as no:
+    with pytest.raises(formats.FormatRefusedError, match="without its codes") as no:
         format_load.check_loaded(model)
     # Named by the checkpoint the layer was built for.
     assert (no.value.path, no.value.written) == (path, "omlx-toy 0.3.1")
     # A check of it again (another thread's, a later caller's) refuses again.
-    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+    with pytest.raises(formats.FormatRefusedError, match="without its codes"):
         format_load.check_loaded(model)
     # What this process does not hold is dropped before (a prefill helper's
     # later layers, a pipeline rank's others): no refusal.
@@ -2901,7 +2916,7 @@ def test_check_loaded_lets_a_layer_dropped_by_the_load_go(toy, tmp_path):
     _llama(full, **_written({}))
     model, _ = load_model(full)
     layer = model.model.layers[0].mlp.gate_proj
-    assert set(layer._load_origin[0]) == {"weight", "scales"}
+    assert set(layer._load_origin[0]) == {"codes", "group_scales"}
     format_load.check_loaded(model)
     assert not hasattr(layer, "_load_origin")
     format_load.check_loaded(model)
@@ -2911,7 +2926,7 @@ def test_check_loaded_refuses_placeholders_reassigned_after_loading(toy, tmp_pat
     path = _without_gate(tmp_path / "partial")
     model, _ = load_model(path, strict=False)
     layer = _gate_proj(model)
-    for name in ("weight", "scales"):
+    for name in ("codes", "group_scales"):
         held = layer[name]
         layer[name] = mx.zeros_like(held)
         assert layer[name] is not held
@@ -2919,7 +2934,7 @@ def test_check_loaded_refuses_placeholders_reassigned_after_loading(toy, tmp_pat
         with pytest.raises(formats.FormatRefusedError) as refusal:
             format_load.check_loaded(model)
         assert (refusal.value.path, refusal.value.written) == (path, "omlx-toy 0.3.1")
-        assert f"{_GATE} without its weight, scales" in str(refusal.value)
+        assert f"{_GATE} without its codes, group_scales" in str(refusal.value)
 
 
 def test_library_exit_refuses_a_missing_scale_reassigned_after_its_load(toy, tmp_path):
@@ -2927,13 +2942,13 @@ def test_library_exit_refuses_a_missing_scale_reassigned_after_its_load(toy, tmp
     with format_load.loading(path, by_loader=True) as outer:
         model, _ = load_model(path, strict=False)
     layer = _gate_proj(model)
-    scale = layer["scales"]
-    layer["scales"] = mx.zeros_like(scale)
-    assert layer["scales"] is not scale
+    scale = layer["group_scales"]
+    layer["group_scales"] = mx.zeros_like(scale)
+    assert layer["group_scales"] is not scale
     with pytest.raises(formats.FormatRefusedError) as refusal:
         outer.check(model)
     assert refusal.value.path == path
-    assert f"the load filled {_GATE} but its scales" in refusal.value.reason
+    assert f"the load filled {_GATE} but its group_scales" in refusal.value.reason
 
 
 def test_a_process_that_built_no_format_layer_walks_no_model(monkeypatch):
@@ -3153,7 +3168,7 @@ def test_a_partial_load_leaves_the_layers_it_does_not_hold(toy, tmp_path):
     _llama(tmp_path, **_written({}))
 
     def partial(weights):
-        del weights[f"{_GATE}.weight"], weights[f"{_GATE}.scales"]
+        del weights[f"{_GATE}.codes"], weights[f"{_GATE}.group_scales"]
 
     _rewritten(tmp_path, partial)
     # An entry of one of MLX's modes is MLX's to bind, or not.
@@ -3166,7 +3181,8 @@ def test_a_partial_load_leaves_the_layers_it_does_not_hold(toy, tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config))
     model, _ = load_model(tmp_path, strict=False)
     layer = model.model.layers[0].mlp.gate_proj
-    assert type(layer) is FormatLinear and not mx.any(layer["scales"]).item()
+    assert type(layer) is FormatLinear
+    assert not mx.any(layer["group_scales"]).item()
     # A stock checkpoint loads as it did.
     stock = tmp_path / "stock"
     stock.mkdir()
@@ -4173,7 +4189,7 @@ def test_oq_s_vlm_loads_refuse_a_layer_they_left_unfilled(
     _rewritten(
         path,
         lambda weights: [
-            weights.pop(f"{_GATE}.{name}") for name in ("weight", "scales")
+            weights.pop(f"{_GATE}.{name}") for name in ("codes", "group_scales")
         ],
     )
     config = json.loads((path / "config.json").read_text())
@@ -4187,7 +4203,7 @@ def test_oq_s_vlm_loads_refuse_a_layer_they_left_unfilled(
     }
     # A partial load leaves the layer: oQ's own load refuses it, and lets the
     # refusal through as it is.
-    with pytest.raises(formats.FormatRefusedError, match="without its weight"):
+    with pytest.raises(formats.FormatRefusedError, match="without its codes"):
         calls[load]()
 
 
@@ -4469,7 +4485,8 @@ def test_mlx_embeddings_refuses_at_the_resolved_checkpoint(levels, tmp_path):
         if type(module) is nn.Linear and module.weight.shape == (128, 64)
     )
     (codes, scales), _, _ = _matrix(128, 64)
-    weights[f"{name}.weight"], weights[f"{name}.scales"] = codes, scales
+    del weights[f"{name}.weight"]
+    weights[f"{name}.codes"], weights[f"{name}.group_scales"] = codes, scales
     mx.save_safetensors(str(tmp_path / "model.safetensors"), weights)
     config["quantization"] = {"group_size": 64, "bits": 4, name: _TOY}
     config["omlx_quant_formats"] = _written({"levels": [19.0]})
@@ -4551,7 +4568,7 @@ def test_progressive_loading_refuses_a_format_layer_before_sharding_or_evaluatio
     (weight, scales), _, _ = _matrix(8, 64)
     with testing.verified("llama"):
         marked.model.projection = FormatLinear(
-            toy, 8, 1, 64, {"weight": weight, "scales": scales}
+            toy, 8, 1, 64, {"codes": weight, "group_scales": scales}
         )
 
     def read(*_args, **_kwargs):
@@ -4726,7 +4743,9 @@ def test_an_adapter_cannot_shard_the_language_model_of_a_recorded_vlm(
     elif container == "raw-first":
         (weight, scales), _, _ = _matrix(8, 64)
         with testing.verified("llama"):
-            bare = FormatLinear(toy, 8, 1, 64, {"weight": weight, "scales": scales})
+            bare = FormatLinear(
+                toy, 8, 1, 64, {"codes": weight, "group_scales": scales}
+            )
         modules = [("bare", bare), ("text", root.language_model)]
         target = SimpleNamespace(
             model_type="llama", named_modules=lambda: iter(modules)

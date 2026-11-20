@@ -139,7 +139,7 @@ _PAIR_SOURCE = """
 
 
 @cache
-def pair_kernel(dot, tile):
+def pair_kernel(dot, tile, packed="weight"):
     matrices = kernels.Matrices()
     inputs = ["layout", "x", *matrices.add("w", tile), *matrices.add("d", dot)]
     mm = mx.fast.metal_kernel(
@@ -150,7 +150,7 @@ def pair_kernel(dot, tile):
         header=matrices.header + kernels.STORE_ROWS + _HEADER,
         source=matrices.declarations + _PAIR_SOURCE,
     )
-    names = ("weight", *tile.tensors, "weight", *dot.tensors)
+    names = (packed, *tile.tensors, packed, *dot.tensors)
     unique = tuple(dict.fromkeys(names))
     indices = tuple(unique.index(name) for name in names)
 

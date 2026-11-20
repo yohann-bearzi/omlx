@@ -467,7 +467,7 @@ def test_a_layer_s_calls_through_two_faces_are_told_apart(toy):
     with testing.layer_calls() as calls:
         assert _equal(layer(x), want)
         layer.fmt.face = second
-        layer["scales"] = layer["scales"] * 1  # a new tensor: a new plan
+        layer["group_scales"] = layer["group_scales"] * 1  # a new tensor
         assert _equal(layer(x), want)
     assert calls == [_call(layer, first, mx.float32), _call(layer, second, mx.float32)]
     assert calls[0] != calls[1]
@@ -487,7 +487,9 @@ class _OwnDecode(FormatLinear):
     """A layer whose decode is its own: it calls no decode of the format."""
 
     def _decoded(self, indices=None):
-        return (self["weight"].astype(mx.float32) - 128.0) * self["scales"][:, None]
+        return (self["codes"].astype(mx.float32) - 128.0) * self["group_scales"][
+            :, None
+        ]
 
 
 def test_rows_are_recorded_where_they_ran(toy):
@@ -495,7 +497,7 @@ def test_rows_are_recorded_where_they_ran(toy):
     toy(face)
     _, x, want = _toy_linear(40, 320)
     (codes, scales), _, _ = _matrix(40, 320)
-    layer = _OwnDecode("toy", 8, 1, 320, {"weight": codes, "scales": scales})
+    layer = _OwnDecode("toy", 8, 1, 320, {"codes": codes, "group_scales": scales})
     more = _ints((MAX_ROWS + 1, 320))
     with testing.layer_calls() as calls:
         assert _equal(layer(x), want)
@@ -536,7 +538,7 @@ def test_outside_a_call_a_proof_s_graphs_are_as_they_are(toy):
         graphs = proof.graphs
         assert type(graphs) is dict and proof.graphs is graphs
         graph = graphs[(x.shape, x.dtype)]
-        assert _equal(graph(x, layer["weight"], layer["scales"]), want)
+        assert _equal(graph(x, layer["codes"], layer["group_scales"]), want)
         assert calls == [_call(layer, face, mx.float32)]
         graphs.clear()
         assert proof.graphs == {}
@@ -1060,7 +1062,7 @@ def test_blocks_that_admit_no_defect_end_in_any_order_in_any_thread(monkeypatch)
 
 def test_dot_rows_refuses_operands_beyond_the_face_s():
     operands, x, _ = _matrix(8, 512)
-    with pytest.raises(ValueError, match="weight, scales; operands given: 3"):
+    with pytest.raises(ValueError, match="weight, group_scales; operands given: 3"):
         testing.dot_rows(_toy("a"), (*operands, operands[1]), x, 8)
 
 
@@ -1087,3 +1089,47 @@ def test_the_defects_are_swapped_under_the_lock_a_defect_is_noted_under():
         assert not started.wait(timeout=0.2)
     assert started.wait(timeout=30)
     thread.join(timeout=30)
+
+
+def test_face_helpers_report_custom_codes_name_on_operand_mismatch():
+    """Each of the six face helpers names a layer's operands by its format's
+    codes name, in the refusal it gives for a count that is not the face's."""
+    face = _toy("codes_name")
+    one = [mx.zeros((8,), mx.uint8)]
+    calls = (
+        lambda: testing.dot_rows(
+            face, one, mx.zeros((8,), mx.float32), 8, (1, 0), codes_name="packed_bytes"
+        ),
+        lambda: testing.shared_rows(
+            face, one, mx.zeros((1, 8), mx.float32), 8, codes_name="packed_bytes"
+        ),
+        lambda: testing.lane_parts(
+            face, one, mx.zeros((8,), mx.float32), 8, codes_name="packed_bytes"
+        ),
+        lambda: testing.finish_rows(
+            face,
+            one,
+            8,
+            8,
+            mx.zeros((8,), mx.float32),
+            mx.float32,
+            codes_name="packed_bytes",
+        ),
+        lambda: testing.staged_tables(
+            replace(face, tables=(formats.Table("lut", mx.float32, (1.0,)),)),
+            one,
+            mx.float32,
+            codes_name="packed_bytes",
+        ),
+        lambda: testing.tile_rows(
+            formats.Tile("t", "", "T", ("group_scales",)),
+            one,
+            8,
+            range(8),
+            mx.float32,
+            codes_name="packed_bytes",
+        ),
+    )
+    for call in calls:
+        with pytest.raises(ValueError, match="packed_bytes"):
+            call()

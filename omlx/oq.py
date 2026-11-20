@@ -6931,7 +6931,8 @@ def _row_chunks(t, max_elems):
 # it). Every other is refused, under any spelling (lower case, "-" for "_"):
 # the gate fails closed. Families served by mlx-lm's own code alone come back
 # after the proof of concept (DEFERRED.md row 22).
-_QUANT_FORMAT_VERIFIED: frozenset[str] = frozenset()
+# Match the whole config. The text backbone is admitted only in this wrapper.
+_QUANT_FORMAT_VERIFIED = frozenset({("qwen4_exp", "qwen4_exp_text")})
 # The families tests take as verified (omlx.formats.testing.verified), while
 # one of their blocks is open, in any thread.
 _TEST_VERIFIED: frozenset[str] = frozenset()
@@ -7024,21 +7025,23 @@ def _unverified_family(config: dict) -> tuple[str, str] | None:
     model_type = config.get("model_type")
     if not isinstance(model_type, str) or not model_type.strip():
         return "untyped", "its config names no model type"
-    verified = _QUANT_FORMAT_VERIFIED | _TEST_VERIFIED
     text_config = config.get("text_config")
-    families = [
+    families = tuple(
         _family(name)
         for name in (
             config.get("model_type"),
             text_config.get("model_type") if isinstance(text_config, dict) else None,
         )
         if isinstance(name, str) and name.strip()
-    ]
+    )
     if any(
         isinstance(section, dict) and section.get("model_file") is not None
         for section in (config, text_config)
     ):
         return families[0], "its model_file selects a custom model implementation"
+    if families in _QUANT_FORMAT_VERIFIED:
+        return None
+    verified = _TEST_VERIFIED
     for family in families:
         if family in _QUANT_FORMAT_MISREAD and family not in verified:
             return family, _QUANT_FORMAT_MISREAD[family]
@@ -7114,8 +7117,13 @@ def _format_reader(registered, record):
     formats._check_reader_isolation(registered, read, stage="accept")
     if not (
         isinstance(read, formats.QuantFormat)
-        and (read.mode, read.tensors, read.contract)
-        == (mode, registered.tensors, registered.contract)
+        and (read.mode, read.tensors, read.codes_name, read.contract)
+        == (
+            mode,
+            registered.tensors,
+            registered.codes_name,
+            registered.contract,
+        )
     ):
         raise ValueError(
             f"quant format {mode!r}'s accept returns {read!r} for the record it "
@@ -7660,14 +7668,18 @@ def _open_oq_run(
                     f"{type(quant_fmt).__name__}, not {type(quant_format).__name__}: "
                     "pass an object of the registered class"
                 )
-            if (quant_format.tensors, quant_format.contract) != (
-                quant_fmt.tensors,
-                quant_fmt.contract,
-            ):
+            if (
+                quant_format.tensors,
+                quant_format.codes_name,
+                quant_format.contract,
+            ) != (quant_fmt.tensors, quant_fmt.codes_name, quant_fmt.contract):
                 raise ValueError(
                     f"quant format {mode!r} is configured with tensors "
-                    f"{quant_format.tensors} at contract {quant_format.contract}, "
-                    f"registered with {quant_fmt.tensors} at {quant_fmt.contract}: "
+                    f"{quant_format.tensors} and codes "
+                    f"{quant_format.codes_name!r} at contract "
+                    f"{quant_format.contract}, registered with "
+                    f"{quant_fmt.tensors} and codes {quant_fmt.codes_name!r} at "
+                    f"{quant_fmt.contract}: "
                     "the checkpoint would not load; report it to the plugin"
                 )
             registered, quant_fmt = quant_fmt, quant_format

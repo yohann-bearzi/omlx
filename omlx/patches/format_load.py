@@ -209,12 +209,12 @@ class _Checkpoint:
             raise _refused(str(said), fmt.mode, self) from error
         if not (
             isinstance(read, formats.QuantFormat)
-            and (read.mode, read.tensors, read.contract)
-            == (fmt.mode, fmt.tensors, fmt.contract)
+            and (read.mode, read.tensors, read.codes_name, read.contract)
+            == (fmt.mode, fmt.tensors, fmt.codes_name, fmt.contract)
         ):
             raise _refused(
                 f"accept returned {read!r}, not a format of its mode, "
-                f"tensors and contract: report it to {plugin}",
+                f"tensors, codes and contract: report it to {plugin}",
                 fmt.mode,
                 self,
             )

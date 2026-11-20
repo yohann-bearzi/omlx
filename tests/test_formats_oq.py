@@ -50,10 +50,6 @@ def _quoted(message, name="toy"):
     return message.replace(name, "myformat") in _QUOTED
 
 
-# The families verified with quant formats, as this oMLX ships them.
-_VERIFIED = oq._QUANT_FORMAT_VERIFIED
-
-
 @pytest.fixture(autouse=True)
 def verified():
     """The toy checkpoint's family taken as verified: oMLX patches Qwen3.5
@@ -95,14 +91,16 @@ class _Codec(_ToyFormat):
         self.offered.append((k, n, bits, group_size))
         if not self.lays_out:
             return None
-        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 
     def encode(self, w, importance, bits, group_size):
         self.encoded.append((w, importance, bits, group_size))
         rows = w.astype(mx.float32)
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
         codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
-        return self.answer({"weight": codes.astype(mx.uint8), "scales": scales}, w)
+        return self.answer(
+            {"codes": codes.astype(mx.uint8), "group_scales": scales}, w
+        )
 
     def accept(self, record):
         self.accepted.append(record)
@@ -180,7 +178,7 @@ def test_a_stack_is_offered_in_runs_of_its_matrices(toy, monkeypatch, own):
         assert weighed.shape == want.shape and mx.array_equal(weighed, want)
         assert (bits, group_size) == (3, 64)
     # The layer keeps the runs' tensors, joined along the stack.
-    assert kept["weight"].shape == (e, n, k) and kept["scales"].shape == (e, n)
+    assert kept["codes"].shape == (e, n, k) and kept["group_scales"].shape == (e, n)
     assert _same(kept, _Codec().encode(w, importance, 3, 64))
 
 
@@ -198,8 +196,8 @@ def test_what_is_no_matrix_or_fits_no_launch_is_not_offered(toy, monkeypatch):
     assert toy.encoded == []
     # A matrix of a launch's size is, and a stack of them one at a time.
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", _matrix_bytes(8, 64))
-    assert offer(8, 64).keys() == {"weight", "scales"}
-    assert offer(3, 8, 64)["weight"].shape == (3, 8, 64)
+    assert offer(8, 64).keys() == {"codes", "group_scales"}
+    assert offer(3, 8, 64)["codes"].shape == (3, 8, 64)
     assert [given.shape[0] for given, *_ in toy.encoded] == [8, 1, 1, 1]
     # MLX's own limit on a launch holds whatever the buffer's.
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 40)
@@ -233,7 +231,7 @@ def test_a_stack_whose_tensor_would_not_fit_a_metal_buffer_is_not_offered(
     assert toy.encoded == []
     monkeypatch.setattr(oq, "_METAL_MAX_BUFFER", 3 * 8 * 64)
     kept = oq._encode_in_format(toy, "experts.weight", w, importance, 4, 64)
-    assert kept["weight"].shape == (3, 8, 64)
+    assert kept["codes"].shape == (3, 8, 64)
 
 
 def test_a_stack_s_runs_are_let_go_one_by_one(toy, monkeypatch):
@@ -325,7 +323,7 @@ def test_a_name_s_runs_are_let_go_once_it_is_joined(toy, monkeypatch):
     kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((512,)), 4, 64)
     mx.synchronize()
     before = mx.get_active_memory()
-    mx.eval(kept["weight"])
+    mx.eval(kept["codes"])
     mx.synchronize()
     # The codes, a byte a weight, joined and their runs let go: as much held.
     assert mx.get_active_memory() - before < 4 * 64 * 512 // 2
@@ -801,7 +799,7 @@ def test_a_format_declines_a_matrix_or_a_whole_stack(toy, monkeypatch):
     "answer",
     [
         lambda tensors: list(tensors.values()),
-        lambda tensors: {**tensors, "scales": 1.0},
+        lambda tensors: {**tensors, "group_scales": 1.0},
     ],
     ids=["a list", "a float"],
 )
@@ -819,10 +817,13 @@ def test_an_answer_that_is_no_dict_of_arrays_is_refused(toy, answer):
 @pytest.mark.parametrize(
     "answer",
     [
-        lambda tensors: {**tensors, "biases": tensors["scales"]},
-        lambda tensors: {"weight": tensors["weight"]},
-        lambda tensors: {**tensors, "scales": tensors["scales"][..., None]},
-        lambda tensors: {**tensors, "scales": tensors["scales"].astype(mx.float16)},
+        lambda tensors: {**tensors, "biases": tensors["group_scales"]},
+        lambda tensors: {"codes": tensors["codes"]},
+        lambda tensors: {**tensors, "group_scales": tensors["group_scales"][..., None]},
+        lambda tensors: {
+            **tensors,
+            "group_scales": tensors["group_scales"].astype(mx.float16),
+        },
         lambda tensors: {name: tensor[0] for name, tensor in tensors.items()},
     ],
     ids=["a tensor more", "a tensor fewer", "a shape", "a dtype", "an axis fewer"],
@@ -833,8 +834,8 @@ def test_tensors_that_are_not_the_layout_s_are_refused(toy, answer, shape):
     with pytest.raises(
         ValueError,
         match=r"quant format 'toy' encoded a\.weight as \{.*\}, and lays it out "
-        r"as \{'weight': \(\(.*8, 64\), mlx\.core\.uint8\), 'scales': .*\}: the "
-        "checkpoint would not load",
+        r"as \{'codes': \(\(.*8, 64\), mlx\.core\.uint8\), 'group_scales': .*\}: "
+        "the checkpoint would not load",
     ):
         oq._encode_in_format(toy, "a.weight", _weights(*shape), mx.ones((64,)), 4, 64)
 
@@ -844,25 +845,28 @@ def test_tensors_that_are_not_the_layout_s_are_refused(toy, answer, shape):
 _UNHELD = {
     "a tensor more": (
         lambda n, k: {
-            "weight": ((n, k), mx.uint8),
-            "scales": ((n,), mx.float32),
+            "codes": ((n, k), mx.uint8),
+            "group_scales": ((n,), mx.float32),
             "biases": ((n,), mx.float32),
         },
-        "quant format 'toy' lays out a (8, 64) matrix as biases, scales, weight: "
-        "a layer holds weight, scales",
+        "quant format 'toy' lays out a (8, 64) matrix as biases, codes, "
+        "group_scales: a layer holds codes, group_scales",
     ),
     "one axis": (
-        lambda n, k: {"weight": ((n * k,), mx.uint8), "scales": ((n,), mx.float32)},
-        "quant format 'toy' lays out the weight of a (8, 64) matrix as (512,): a "
-        "weight has two axes, N and the format's own",
+        lambda n, k: {
+            "codes": ((n * k,), mx.uint8),
+            "group_scales": ((n,), mx.float32),
+        },
+        "quant format 'toy' lays out the tensor 'codes' of a (8, 64) matrix as "
+        "(512,): it has two axes, N and the format's own",
     ),
     "packed along N": (
         lambda n, k: {
-            "weight": ((n // 2, 2 * k), mx.uint8),
-            "scales": ((n,), mx.float32),
+            "codes": ((n // 2, 2 * k), mx.uint8),
+            "group_scales": ((n,), mx.float32),
         },
-        "quant format 'toy' lays out the weight of a (8, 64) matrix as (4, 128): "
-        "its first axis is N (8); a format packs along K, never along N",
+        "quant format 'toy' lays out the tensor 'codes' of a (8, 64) matrix as "
+        "(4, 128): its first axis is N (8); a format packs along K, never along N",
     ),
 }
 
@@ -910,7 +914,7 @@ def test_the_contract_page_says_who_refuses_a_layout():
 
 def test_the_contract_page_quotes_the_refusal_of_other_tensors(toy, monkeypatch):
     monkeypatch.setattr(toy, "mode", "myformat")
-    toy.answer = lambda tensors, w: {"weight": tensors["weight"]}
+    toy.answer = lambda tensors, w: {"codes": tensors["codes"]}
     name = "model.layers.0.mlp.gate_proj.weight"
     with pytest.raises(ValueError) as refusal:
         oq._encode_in_format(toy, name, _weights(16, 64), mx.ones((64,)), 8, 1)
@@ -933,7 +937,7 @@ def test_the_contract_page_s_codec_is_the_toy_s():
 
 def test_a_run_s_tensors_have_the_stack_s_axis(toy):
     toy.answer = lambda tensors, w: {name: t[0] for name, t in tensors.items()}
-    with pytest.raises(ValueError, match=r"as \{'weight': \(\(1, 8, 64\), mlx"):
+    with pytest.raises(ValueError, match=r"as \{'codes': \(\(1, 8, 64\), mlx"):
         oq._encode_in_format(toy, "a.weight", _weights(1, 8, 64), mx.ones((64,)), 4, 64)
 
 
@@ -1074,7 +1078,7 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
     # Each matrix that oQe has an importance for, the stacks of experts among
     # them, at the bits and group size that oQ gives it without the format.
     assert sorted(entries) == applied
-    stacks = {name for name in entries if tensors[f"{name}.weight"].ndim == 3}
+    stacks = {name for name in entries if tensors[f"{name}.codes"].ndim == 3}
     assert len(stacks) == 6 and len(entries) > 12
     plain_tensors, plain_config, plain_applied = plain
     assert plain_applied == applied
@@ -1089,12 +1093,12 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
         }
         # The format's tensors, and nothing of the affine's.
         w = weights[f"{name.removeprefix('language_model.')}.weight"]
-        codes, scales = tensors[f"{name}.weight"], tensors[f"{name}.scales"]
+        codes, scales = tensors[f"{name}.codes"], tensors[f"{name}.group_scales"]
         assert (codes.shape, codes.dtype) == (w.shape, mx.uint8)
         assert (scales.shape, scales.dtype) == (w.shape[:-1], mx.float32)
         assert f"{name}.biases" not in tensors
         # They keep this layer's weights, to the half scale of the codec.
-        kept = {"weight": codes, "scales": scales}
+        kept = {"codes": codes, "group_scales": scales}
         decoded = toy.decode(kept, entry["bits"], entry["group_size"])
         error = mx.abs(decoded - w.astype(mx.float32))
         assert mx.all(error <= 0.5001 * mx.expand_dims(scales, -1))
@@ -1108,7 +1112,7 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
         assert importance.shape == (*w.shape[:-2], w.shape[-1])
         offers.append((w.shape, bits, group_size))
     assert sorted(offers) == sorted(
-        (tensors[f"{name}.weight"].shape, entry["bits"], entry["group_size"])
+        (tensors[f"{name}.codes"].shape, entry["bits"], entry["group_size"])
         for name, entry in entries.items()
     )
     # The checkpoint names what reads it, and everything else is as without.
@@ -1135,8 +1139,10 @@ def test_oq_writes_the_matrices_oqe_weighs_in_the_format(
             entries[name]["bits"],
             entries[name]["group_size"],
         )
-        assert mx.array_equal(layer["weight"], tensors[f"{name}.weight"])
-        assert mx.array_equal(layer["scales"], tensors[f"{name}.scales"])
+        assert mx.array_equal(layer["codes"], tensors[f"{name}.codes"])
+        assert mx.array_equal(
+            layer["group_scales"], tensors[f"{name}.group_scales"]
+        )
     logits = model(mx.array([[1, 2, 3, 4]]))
     assert logits.shape == (1, 4, 64) and mx.isfinite(logits).all()
 
@@ -1149,7 +1155,7 @@ def test_what_a_format_declines_is_written_as_without_it(source, plain, toy, tmp
     )
     entries = _in_format(config)
     assert len(entries) == 6 and len(toy.encoded) == len(applied) > 6
-    assert all(tensors[f"{name}.weight"].dtype == mx.uint8 for name in entries)
+    assert all(tensors[f"{name}.codes"].dtype == mx.uint8 for name in entries)
     assert config[_RECORD] == {"toy": {"plugin": None, "contract": 1, "record": {}}}
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
 
@@ -1580,7 +1586,7 @@ def test_a_verified_type_with_an_alternate_model_file_cannot_be_written_in_a_for
     assert not output.exists()
 
 
-def test_no_family_is_verified_but_by_a_test(tmp_path, monkeypatch):
+def test_unlisted_families_need_a_test_block(monkeypatch):
     # Outside every block (this file's tests take llama as verified).
     monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
     for model_type in ("llama", " Llama ", "qwen2"):
@@ -1634,10 +1640,8 @@ def test_one_of_mlx_s_modes_is_written_without_a_quant_format(tmp_path, mode):
 
 
 def test_the_families_oq_writes_in_a_format(tmp_path):
-    # Verified ones only, and none is yet: Qwen3.8 Flash-Next enters with the
-    # run that verifies it. Families mlx-lm's own code serves come back after
-    # the proof of concept (DEFERRED.md row 22).
-    assert not _VERIFIED and not hasattr(oq, "_QUANT_FORMAT_STOCK")
+    assert not hasattr(oq, "_QUANT_FORMAT_STOCK")
+
     def unverified(config):
         return oq._unverified_family(config)
 
@@ -1715,7 +1719,7 @@ def test_blocks_of_verified_close_in_any_order_in_any_thread(tmp_path):
     assert not written("qwen4_exp") and not written("minimax_m3_vl")
 
 
-def test_verified_decorates_test_functions_only(monkeypatch, tmp_path):
+def test_verified_decorates_test_functions_only():
     with pytest.raises(TypeError, match="decorates a test function"):
 
         @testing.verified("qwen4_exp")
@@ -1727,8 +1731,10 @@ def test_verified_decorates_test_functions_only(monkeypatch, tmp_path):
     with pytest.raises(TypeError, match="not a bare"):
         testing.verified(" ")
     # What oMLX ships as verified stays so, inside a block and out.
-    monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen4_exp"}))
-    config = {"model_type": "qwen4_exp"}
+    config = {
+        "model_type": "qwen4_exp",
+        "text_config": {"model_type": "qwen4_exp_text"},
+    }
     assert oq._unverified_family(config) is None
     with testing.verified("qwen4_exp"):
         assert oq._unverified_family(config) is None
@@ -1981,16 +1987,18 @@ def test_a_format_object_of_another_class_is_refused(source, toy, tmp_path):
     "configured,words",
     [
         (
-            {"tensors": ("scales", "extra")},
-            "quant format 'toy' is configured with tensors ('scales', 'extra') at "
-            "contract 1, registered with ('scales',) at 1: the checkpoint would not "
-            "load; report it to the plugin",
+            {"tensors": ("group_scales", "extra")},
+            "quant format 'toy' is configured with tensors ('group_scales', 'extra') "
+            "and codes 'codes' at contract 1, registered with ('group_scales',) and "
+            "codes 'codes' at 1: the checkpoint would not load; report it to the "
+            "plugin",
         ),
         (
             {"contract": 2},
-            "quant format 'toy' is configured with tensors ('scales',) at contract 2, "
-            "registered with ('scales',) at 1: the checkpoint would not load; report "
-            "it to the plugin",
+            "quant format 'toy' is configured with tensors ('group_scales',) and "
+            "codes 'codes' at contract 2, registered with ('group_scales',) and "
+            "codes 'codes' at 1: the checkpoint would not load; report it to the "
+            "plugin",
         ),
     ],
 )
@@ -2104,8 +2112,8 @@ def test_a_configured_object_laid_out_otherwise_than_it_loads_stops_the_run(
         class _OtherLayout(_Codec):
             def layout(self, k, n, bits, gs):
                 return {
-                    "weight": ((n, k), mx.uint8),
-                    "scales": ((n,), mx.float16),
+                    "codes": ((n, k), mx.uint8),
+                    "group_scales": ((n,), mx.float16),
                 }
 
         monkeypatch.setattr(type(toy), "accept", lambda self, record: _OtherLayout())
@@ -3374,7 +3382,7 @@ def test_a_matrix_the_format_declines_outside_oq_s_groups_is_written_as_without(
     )
     entries = _in_format(config)
     assert entries and all(
-        tensors[f"{name}.weight"].shape[-1] == 128 for name in entries
+        tensors[f"{name}.codes"].shape[-1] == 128 for name in entries
     )
     for name in (unheld, unloaded):
         assert tensors[f"{name}.weight"].shape[-1] == 64
@@ -3441,7 +3449,7 @@ def test_a_stack_outside_oq_s_groups_that_the_format_takes_is_in_the_report(
         quant_format="toy",
         imatrix_cache_path=str(cache),
     )
-    assert tensors[f"{gate}.weight"].shape == (4, 128, 64)
+    assert tensors[f"{gate}.codes"].shape == (4, 128, 64)
     assert gate in _in_format(config) and gate in applied
     report = json.loads((output / "oq_imatrix_report.json").read_text())
     assert report["zero_count_experts"] == 1

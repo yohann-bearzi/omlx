@@ -130,7 +130,7 @@ def test_a_repeated_layout_uses_the_accepted_format_once_per_matrix_at_most(
     with format_load.loading(tmp_path):
         for _ in range(4):
             result = nn.Linear(64, 128).to_quantized(**_TOY)
-            assert result.scales.shape == (128, 2)
+            assert result["group_scales"].shape == (128, 2)
         assert toy.asked == [(64, 128, 8, 1)]
         assert wide.asked == [(64, 128, 8, 1)]
         assert len(toy.accepted) == 1

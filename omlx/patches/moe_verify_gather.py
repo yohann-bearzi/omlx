@@ -208,14 +208,20 @@ def projection(linear, k: int) -> Projection | None:
     tiles of 8 outputs."""
     if not isinstance(linear, nn.Module) or "bias" in linear:
         return None
-    weight = linear.get("weight")
+    names = formats.tensor_names(linear)
+    # A format layer that still holds a load's placeholder has nothing to
+    # read: refused here, where the plan is built (D11).
+    refuse = getattr(linear, "refuse_placeholders", None)
+    if refuse is not None:
+        refuse()
+    weight = linear.get(names[0])
     if not isinstance(weight, mx.array) or weight.ndim != 3 or weight.shape[1] % 8:
         return None
     n = weight.shape[1]
     face = formats.dot(linear, k, n)
     if face is None:
         return None
-    operands = tuple(linear[name] for name in ("weight", *face.tensors))
+    operands = tuple(linear[name] for name in (names[0], *face.tensors))
     return Projection(face, _kernel(face), _ordered_kernel(face), operands, n)
 
 

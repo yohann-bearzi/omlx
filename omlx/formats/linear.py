@@ -36,6 +36,14 @@ from .mlx import traversal
 
 logger = logging.getLogger(__name__)
 
+
+def packed_name(layer) -> str:
+    """The name of ``layer``'s packed tensor: its format's codes name for a
+    format layer, ``weight`` for MLX's own quantized layers
+    (``formats.tensor_names``)."""
+    return formats.tensor_names(layer)[0]
+
+
 # Maximum number of serial-exact rows in one dense Dot launch. A longer
 # explicitly row-exact Qwen call uses several such groups.
 MAX_ROWS = 16
@@ -265,7 +273,7 @@ def _tile(layer, plan: _Plan) -> _Tile | None:
         f"quant format face {face.key}: tile kernel engaged",
         f"quant format face {face.key}: tile kernel failed; rows kernel fallback",
     )
-    operands = tuple(layer[name] for name in ("weight", *face.tensors))
+    operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
     dtypes = tuple(a.dtype for a in operands)
     proof = kernels.proof(route, face, dtypes)
     return _Tile(face, kernel, operands, proof, said)
@@ -278,7 +286,7 @@ def _ordinary_tile(layer, k, n, route, build_kernel):
     kernel = build_kernel(face)
     if kernel is None:
         return None
-    operands = tuple(layer[name] for name in ("weight", *face.tensors))
+    operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
     proof = kernels.proof(
         f"format_linear_{route}", face, tuple(a.dtype for a in operands), k, n
     )
@@ -293,7 +301,7 @@ def _decode_pair(layer, plan):
     tile = formats.tile(layer, plan.k, plan.n)
     if tile is None or kernels.table_bytes(plan.face, tile) > formats.TABLE_BYTES:
         return None
-    names, kernel = tile_wide.pair_kernel(plan.face, tile)
+    names, kernel = tile_wide.pair_kernel(plan.face, tile, packed_name(layer))
     # These weight buffers are fixed until a layer write retires the plan.
     operands = tuple(mx.contiguous(layer[name]) for name in names)
     proof = kernels.proof(
@@ -362,8 +370,8 @@ def _plan(layer) -> _Plan | None:
     face = formats.dot(layer, k, n)
     if face is None:
         return None
-    operands = tuple(layer[name] for name in ("weight", *face.tensors))
-    stacked = layer["weight"].ndim == 3
+    operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
+    stacked = operands[0].ndim == 3
     # The one-row and the stack's launches are whole tiles of 8 outputs; a
     # matrix's N that is not runs in the shared-rows launch alone.
     if n % 8 and (stacked or face.vpt < 1):
@@ -821,27 +829,27 @@ class _FormatLayer(nn.Module):
         """Initialize an admitted reader at the geometry of these tensors."""
         super().__init__()
         mode = fmt.mode
-        names = ("weight", *fmt.tensors)
+        names = (fmt.codes_name, *fmt.tensors)
         if set(tensors) != set(names):
             raise ValueError(
                 f"quant format {mode!r} keeps a matrix as {', '.join(names)}, "
                 f"not as {', '.join(sorted(tensors))}"
             )
-        weight = tensors["weight"]
-        if weight.ndim != self._STACK + 2:
+        packed = tensors[fmt.codes_name]
+        if packed.ndim != self._STACK + 2:
             raise ValueError(
                 f"{type(self).__name__}: the weight has {self._STACK + 2} axes, "
-                f"not the shape {weight.shape}"
+                f"not the shape {packed.shape}"
             )
         # What the format lays out for the matrix the layer holds: a layer's
         # N is its weight's first axis.
-        n = weight.shape[-2]
+        n = packed.shape[-2]
         if layout is None:
             layout = fmt.layout(input_dims, n, bits, group_size)
         if layout is not None:
             formats.check_layout(fmt, n, input_dims, layout)
         # What lets a stack's matrices be gathered, tensor by tensor.
-        stack = weight.shape[: self._STACK]
+        stack = packed.shape[: self._STACK]
         ragged = [name for name in names if tensors[name].shape[: self._STACK] != stack]
         if ragged:
             raise ValueError(
@@ -944,7 +952,7 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        kept = self.__dict__[_KEPT] = (_plan(self), bias, self["weight"])
+        kept = self.__dict__[_KEPT] = (_plan(self), bias, self[self._tensors[0]])
         return kept
 
     def __delitem__(self, key: str) -> None:
@@ -989,7 +997,7 @@ class _FormatLayer(nn.Module):
         ``indices`` of the stack."""
         self.refuse_placeholders()
         fmt = self.fmt
-        tensors = {name: self[name] for name in ("weight", *fmt.tensors)}
+        tensors = {name: self[name] for name in self._tensors}
         if indices is not None:
             tensors = {name: tensor[indices] for name, tensor in tensors.items()}
         return fmt.decode(tensors, self.bits, self.group_size)
@@ -1068,7 +1076,8 @@ def _exact_rows(plan, x):
 
 class FormatLinear(_FormatLayer):
     """``x @ W.T + bias`` for a matrix ``W`` kept in format ``mode``:
-    ``tensors`` are its ``weight`` and the format's tensors, by name."""
+    ``tensors`` are its codes (``mode``'s format's ``codes_name``) and the
+    format's tensors, by name."""
 
     _qwen_row_exact = None
     _fast = None
@@ -1172,7 +1181,7 @@ class FormatLinear(_FormatLayer):
                 _log_native_fallback()
                 return
             fast = native.format_linear_fast(
-                kept[2], kept[1], tile.operands, vars(tile.proof)
+                kept[2], kept[1], tile.operands, vars(tile.proof), self._tensors[0]
             )
             if fast is None:
                 _log_native_fallback()
@@ -1189,7 +1198,7 @@ class FormatLinear(_FormatLayer):
                 return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self["weight"]:
+        if kept is None or kept[2] is not self[self._tensors[0]]:
             kept = self._keep()
         plan, bias = kept[0], kept[1]
         row_exact = self._qwen_row_exact
@@ -1240,7 +1249,7 @@ class FormatSwitchLinear(_FormatLayer):
 
     @property
     def num_experts(self) -> int:
-        return self["weight"].shape[0]
+        return self[self._tensors[0]].shape[0]
 
     def _stacked_outputs(self, other: FormatSwitchLinear) -> FormatSwitchLinear:
         """Join two admitted, row-stackable projections after checkpoint load.
@@ -1360,7 +1369,7 @@ class FormatSwitchLinear(_FormatLayer):
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept[2] is not self["weight"]:
+        if kept is None or kept[2] is not self[self._tensors[0]]:
             kept = self._keep()
         plan, bias = kept[0], kept[1]
         y = None

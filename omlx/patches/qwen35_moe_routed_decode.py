@@ -512,7 +512,8 @@ def _plain(layer, *classes) -> bool:
 
 
 def _operands(layer, face: Dot) -> tuple:
-    return tuple(layer[name] for name in ("weight", *face.tensors))
+    names = formats.tensor_names(layer)
+    return tuple(layer[name] for name in (names[0], *face.tensors))
 
 
 def _address(a: mx.array) -> int:
@@ -590,7 +591,7 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     if not all(_plain(layer, nn.QuantizedLinear, FormatLinear) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
-    width = gate_proj["weight"].shape[0]
+    width = gate_proj[formats.tensor_names(gate_proj)[0]].shape[0]
     gu_fmt = formats.dot(gate_proj, hidden, width)
     d_fmt = formats.dot(down_proj, width, hidden)
     g_fmt = formats.dot(gate, hidden, 1)
@@ -631,15 +632,16 @@ def _build_plan(block) -> _Plan | None:
         and _plain(down, QuantizedSwitchLinear, FormatSwitchLinear)
     ):
         return None
-    hidden = down["weight"].shape[1]
-    inter = gate_up["weight"].shape[1] // 2
+    hidden = down[formats.tensor_names(down)[0]].shape[1]
+    inter = gate_up[formats.tensor_names(gate_up)[0]].shape[1] // 2
     gu_fmt = formats.dot(gate_up, hidden, 2 * inter)
     d_fmt = formats.dot(down, inter, hidden)
     rows = _GATE_UP_ROWS * _GATE_UP_SIMDGROUPS
     if (
         gu_fmt is None
         or d_fmt is None
-        or gate_up["weight"].shape[0] != down["weight"].shape[0]
+        or gate_up[formats.tensor_names(gate_up)[0]].shape[0]
+        != down[formats.tensor_names(down)[0]].shape[0]
         or len(gu_fmt.dtypes) != 1
         or not d_fmt.exact_for(gu_fmt.dtypes[0])
         # The launches cover whole groups of rows.
@@ -648,9 +650,11 @@ def _build_plan(block) -> _Plan | None:
     ):
         return None
     gate, experts = block.get("gate"), block.num_experts
-    scores = gate.get("weight") if isinstance(gate, nn.Module) else None
+    scores = (
+        gate.get(formats.tensor_names(gate)[0]) if isinstance(gate, nn.Module) else None
+    )
     # The router scores the experts the stacks hold, and the block says so.
-    if gate_up["weight"].shape[0] != experts or (
+    if gate_up[formats.tensor_names(gate_up)[0]].shape[0] != experts or (
         isinstance(scores, mx.array) and scores.shape[:1] != (experts,)
     ):
         return None

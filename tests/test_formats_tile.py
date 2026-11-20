@@ -840,12 +840,12 @@ def test_the_pages_decode_is_the_tile_faces_weights():
     (decode,) = (
         text
         for language, text in _BLOCKS
-        if language == "python" and "def decode(" in text and "group_scales" in text
+        if language == "python" and "def decode(" in text and "row_scales" in text
     )
     scope = {"mx": mx}
     exec("class Format:\n" + decode, scope)
     codes, group_scales, row_scales = _toy_matrix(8, 40, seed=5)
-    tensors = {"weight": codes, "group_scales": group_scales, "row_scales": row_scales}
+    tensors = {"codes": codes, "group_scales": group_scales, "row_scales": row_scales}
     want = scope["Format"]().decode(tensors, 8, 32)
     exact, _ = testing.tile_rows(
         _toy("page"), list(tensors.values()), 40, range(8), mx.float32

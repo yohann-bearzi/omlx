@@ -65,6 +65,28 @@ def _identifier(name) -> bool:
     return isinstance(name, str) and name.isascii() and name.isidentifier()
 
 
+# MLX's own names on a quantized layer (D11): a plugin's format keeps no
+# tensor of one of them, so a reader that indexes ``.weight``, ``.scales``,
+# ``.biases`` or ``.bias`` fails loudly on a format layer of any family.
+_MLX_TENSORS: tuple[str, ...] = ("weight", "scales", "biases", "bias")
+
+
+def tensor_names(layer) -> tuple[str, ...]:
+    """The names of ``layer``'s packed tensor and its side tensors:
+    ``(fmt.codes_name, *fmt.tensors)`` for a format layer, or ``("weight",)``
+    for MLX's quantized layer, whose other tensors a face reads by name.
+
+    oMLX's kernels read a layer that may be either through this, never by
+    indexing ``weight``: on a format layer of a plugin that name is not
+    there (D11). A kernel built from a face takes ``tensor_names(layer)[0]``
+    for the packed tensor and then the face's own ``tensors``, which may be a
+    subset of the format's or another order."""
+    names = getattr(layer, "_tensors", None)
+    if names and isinstance(names, tuple):
+        return names
+    return ("weight",)
+
+
 def _check_tensors(owner: str, tensors) -> None:
     """Refuses ``tensors`` unless they are what a format keeps beside
     ``weight`` and ``bias``, as kernels splice them into Metal: a tuple of
@@ -324,10 +346,17 @@ class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
     ``contract``, and overrides ``decode``, ``layout`` (what loads its
     checkpoints), ``encode`` (what writes them) and the faces it has; a
-    kernel whose face a format lacks keeps its composed path."""
+    kernel whose face a format lacks keeps its composed path.
+
+    The tensor that holds the packed codes is ``codes_name``: ``weight`` for
+    the built-in affine format, and a name of the plugin's own for a plugin
+    (D11: a format layer has no tensor called ``weight``, ``scales``,
+    ``biases`` or ``bias``, so code that reads one by hand fails loudly on
+    every family)."""
 
     mode: str  # a linear's "mode" in the quantization config
-    tensors: tuple[str, ...]  # its parameters beside "weight" (and "bias")
+    codes_name: str = "weight"  # its packed tensor's name: its codes
+    tensors: tuple[str, ...]  # its side parameters beside "bias"
     contract: int  # the revision of the contract it is written for
 
     def dot(self, layer, k: int, n: int) -> Dot | None:
@@ -342,17 +371,18 @@ class QuantFormat:
         self, tensors: dict[str, mx.array], bits: int, group_size: int
     ) -> mx.array:
         """A matrix's weights as floats, ``(..., n, k)``. ``tensors`` are its
-        ``weight`` and the format's tensors, by name: one matrix's, or those
-        of several, with the same axes ahead of the matrix's in each."""
+        codes (``codes_name``) and the format's tensors, by name: one matrix's,
+        or those of several, with the same axes ahead of the matrix's in
+        each."""
         raise NotImplementedError(f"quant format {self.mode!r} has no decode")
 
     def layout(
         self, k: int, n: int, bits: int, group_size: int
     ) -> dict[str, tuple[tuple[int, ...], mx.Dtype]] | None:
         """How a checkpoint keeps one ``(n, k)`` matrix: the shape and dtype
-        of its ``weight`` and of each of the format's tensors, by name. None
-        when the format keeps no such matrix, or when its layers are MLX's
-        to build (affine)."""
+        of its codes (``codes_name``) and of each of the format's tensors, by
+        name. None when the format keeps no such matrix, or when its layers
+        are MLX's to build (affine)."""
         return None
 
     def encode(
@@ -426,29 +456,31 @@ class FormatRefusedError(ValueError):
 
 def check_layout(fmt: QuantFormat, n: int, k: int, layout: dict) -> None:
     """Refuse, in words, a ``layout`` that ``fmt`` gives for an ``(n, k)``
-    matrix and that no layer holds: tensors of other names than the weight
-    and the format's ``tensors``, a weight of other than two axes, or a
-    weight whose first axis is not N (a layer's N is its weight's first
-    axis: a format packs along K, never along N). oQ checks a layout before
-    it encodes a matrix in it, and a layer the layout of the matrix it
+    matrix and that no layer holds: tensors of other names than the codes
+    (``fmt.codes_name``) and the format's ``tensors``, codes of other than
+    two axes, or codes whose first axis is not N (a layer's N is its codes'
+    first axis: a format packs along K, never along N). oQ checks a layout
+    before it encodes a matrix in it, and a layer the layout of the matrix it
     holds."""
-    names = ("weight", *fmt.tensors)
+    codes = fmt.codes_name
+    names = (codes, *fmt.tensors)
     if set(layout) != set(names):
         raise ValueError(
             f"quant format {fmt.mode!r} lays out a ({n}, {k}) matrix as "
             f"{', '.join(sorted(layout))}: a layer holds {', '.join(names)}"
         )
-    shape = tuple(layout["weight"][0])
+    shape = tuple(layout[codes][0])
     if len(shape) != 2:
         raise ValueError(
-            f"quant format {fmt.mode!r} lays out the weight of a ({n}, {k}) "
-            f"matrix as {shape}: a weight has two axes, N and the format's own"
+            f"quant format {fmt.mode!r} lays out the tensor {codes!r} of a "
+            f"({n}, {k}) matrix as {shape}: it has two axes, N and the "
+            "format's own"
         )
     if shape[0] != n:
         raise ValueError(
-            f"quant format {fmt.mode!r} lays out the weight of a ({n}, {k}) "
-            f"matrix as {shape}: its first axis is N ({n}); a format packs "
-            "along K, never along N"
+            f"quant format {fmt.mode!r} lays out the tensor {codes!r} of a "
+            f"({n}, {k}) matrix as {shape}: its first axis is N ({n}); a format "
+            "packs along K, never along N"
         )
 
 
@@ -626,6 +658,8 @@ def _may_build(mode) -> None:
         "checkpoint with mlx-lm's or mlx-vlm's load_model",
         mode=mode,
     )
+
+
 # The checkpoint whose layers the calling thread is loading, if any: set by
 # omlx.patches.format_load around the libraries' loads, read by the layers.
 # A copied context can keep an ended checkpoint. Only an active one owns layers.
@@ -664,6 +698,7 @@ def register(fmt: QuantFormat) -> None:
     if modes is not None:
         modes.add(mode)
     _check_tensors(f"quant format {mode!r}", tensors)
+    builtin = getattr(_REGISTERING_BUILTINS, "registering", False)
     contract = getattr(fmt, "contract", None)
     if type(contract) is not int:
         raise ValueError(
@@ -671,7 +706,6 @@ def register(fmt: QuantFormat) -> None:
             f"contract it is written for, an int, not {contract!r} "
             f"({type(contract).__name__})"
         )
-    builtin = getattr(_REGISTERING_BUILTINS, "registering", False)
     if _mlx_runs(mode) and not builtin:
         raise ValueError(
             f"quant format {mode!r}: {mode!r} is one of MLX's own modes, which "
@@ -689,6 +723,28 @@ def register(fmt: QuantFormat) -> None:
             f"format contract; this oMLX runs {runs}: update "
             f"{'oMLX' if contract > CONTRACT else 'the format'}"
         )
+    codes = getattr(fmt, "codes_name", "weight")
+    if not _identifier(codes):
+        raise ValueError(
+            f"quant format {mode!r}: codes_name is the name of the tensor that "
+            f"holds its codes, an identifier, not {codes!r}"
+        )
+    if codes == "bias" or codes in tensors:
+        raise ValueError(
+            f"quant format {mode!r} keeps its codes as {codes!r}: name its "
+            f"packed tensor apart from 'bias' and {tensors!r}"
+        )
+    if not builtin:
+        # D11: a plugin's format layer has no tensor named like MLX's, so
+        # every by-hand reader of a layer fails loudly on every family.
+        reserved = [name for name in (codes, *tensors) if name in _MLX_TENSORS]
+        if reserved:
+            raise ValueError(
+                f"quant format {mode!r}: {', '.join(sorted(set(reserved)))} is "
+                f"one of MLX's tensor names ({', '.join(_MLX_TENSORS)}), which a "
+                "plugin's format keeps none of: name its codes (codes_name) and "
+                "its tensors as it keeps them"
+            )
     load()
     if builtin:
         _BUILTIN_MODES.add(mode)
@@ -832,7 +888,7 @@ def _stackable_layout(fmt: QuantFormat, k: int, n: int, bits: int, group_size: i
         return None
     try:
         one = fmt.layout(k, n, bits, group_size)
-        if not isinstance(one, dict) or one.keys() != {"weight", *fmt.tensors}:
+        if not isinstance(one, dict) or one.keys() != {fmt.codes_name, *fmt.tensors}:
             return None
         two = fmt.layout(k, 2 * n, bits, group_size)
         if (
@@ -959,7 +1015,7 @@ def _asked(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str, keeps
                 f"face {face.key}: {', '.join(stray)} is no tensor of quant "
                 f"format {mode}"
             )
-        names = ("weight", *face.tensors)
+        names = (fmt.codes_name, *face.tensors)
         lacking = [name for name in names if not isinstance(layer.get(name), mx.array)]
         if lacking:
             raise ValueError(

@@ -803,7 +803,8 @@ class _FormatLog:
 
 
 class _ToyFormat(formats.QuantFormat):
-    mode, tensors, contract = "toy", ("scales",), formats.CONTRACT
+    mode, codes_name = "toy", "codes"
+    tensors, contract = ("group_scales",), formats.CONTRACT
 
     def __init__(self, face=None):
         self.face = face
@@ -812,8 +813,8 @@ class _ToyFormat(formats.QuantFormat):
         return self.face
 
     def decode(self, tensors, bits, group_size):
-        codes = tensors["weight"].astype(mx.float32) - 128.0
-        return codes * mx.expand_dims(tensors["scales"], -1)
+        codes = tensors["codes"].astype(mx.float32) - 128.0
+        return codes * mx.expand_dims(tensors["group_scales"], -1)
 
 
 @pytest.fixture
@@ -829,15 +830,15 @@ def toy(monkeypatch):
 
 def _toy_linear(n, k, seed=0, bias=None):
     (codes, scales), x, want = _matrix(n, k, seed)
-    tensors = {"weight": codes, "scales": scales}
+    tensors = {"codes": codes, "group_scales": scales}
     return FormatLinear("toy", 8, 1, k, tensors, bias=bias), x, want
 
 
 def _toy_switch(n, k, seed=0, bias=None):
     (codes, scales), _, _ = _matrix(EXPERTS * n, k, seed)
     tensors = {
-        "weight": codes.reshape(EXPERTS, n, k),
-        "scales": scales.reshape(EXPERTS, n),
+        "codes": codes.reshape(EXPERTS, n, k),
+        "group_scales": scales.reshape(EXPERTS, n),
     }
     return FormatSwitchLinear("toy", 8, 1, k, tensors, bias=bias)
 
@@ -854,8 +855,8 @@ def _ints(shape, seed=0):
 def _want(layer, x, indices=None):
     """NumPy's products of ``x``'s rows with the toy layer's matrices: with
     the one, or with those at ``indices`` of the stack."""
-    weight = np.array(layer["weight"]).astype(np.float32) - 128.0
-    weight = weight * np.array(layer["scales"])[..., None]
+    weight = np.array(layer["codes"]).astype(np.float32) - 128.0
+    weight = weight * np.array(layer["group_scales"])[..., None]
     if indices is None:
         want = np.array(x) @ weight.T
         return want + np.array(layer["bias"]) if "bias" in layer else want
@@ -879,18 +880,26 @@ def test_a_tensor_of_float64_is_no_face_and_the_layer_runs_composed(
     with mx.stream(mx.cpu), caplog.at_level(logging.ERROR, logger=formats.__name__):
         # The layout is fixed at construction, so supply float64 at that point.
         layer = FormatLinear(
-            "toy", 8, 1, 320, {**layer, "scales": layer["scales"].astype(mx.float64)}
+            "toy",
+            8,
+            1,
+            320,
+            {**layer, "group_scales": layer["group_scales"].astype(mx.float64)},
         )
         switch = FormatSwitchLinear(
-            "toy", 8, 1, 320, {**switch, "scales": switch["scales"].astype(mx.float64)}
+            "toy",
+            8,
+            1,
+            320,
+            {**switch, "group_scales": switch["group_scales"].astype(mx.float64)},
         )
         got, stacked = layer(x), switch(rows, indices)
         mx.eval(got, stacked)
     assert np.allclose(np.array(got), _want(layer, x))
     assert np.allclose(np.array(stacked), _want(switch, rows, indices))
     defect = (
-        "ValueError('face toy_linear: scales of float64, which the GPU does not "
-        "take')"
+        "ValueError('face toy_linear: group_scales of float64, which the GPU "
+        "does not take')"
     )
     assert dot_defects == {("toy", defect)} and len(caplog.records) == 1
     assert not kernels._PROOFS
@@ -901,14 +910,14 @@ class _StackableToy(_ToyFormat):
     """The toy with its layout: codes (n, k), one float32 scale a row."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 
 
 class _ColumnScaled(_StackableToy):
     """Scales of each column: not a row's alone."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n, k), mx.uint8), "scales": ((k,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((k,), mx.float32)}
 
 
 class _GlobalScaled(_StackableToy):
@@ -916,7 +925,7 @@ class _GlobalScaled(_StackableToy):
     once stacked."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n, k), mx.uint8), "scales": ((1,), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((1,), mx.float32)}
 
 
 class _RowsLeak(_StackableToy):
@@ -924,28 +933,31 @@ class _RowsLeak(_StackableToy):
     matrix's largest scale."""
 
     def decode(self, tensors, bits, group_size):
-        codes = tensors["weight"].astype(mx.float32) - 128.0
-        return codes * mx.max(tensors["scales"])
+        codes = tensors["codes"].astype(mx.float32) - 128.0
+        return codes * mx.max(tensors["group_scales"])
 
 
 class _PaddedScales(_StackableToy):
     """Scales padded to 100 rows: doubled, the layout reads as a stack."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n, k), mx.uint8), "scales": ((max(n, 100),), mx.float32)}
+        return {
+            "codes": ((n, k), mx.uint8),
+            "group_scales": ((max(n, 100),), mx.float32),
+        }
 
 
 class _SquareScales(_StackableToy):
     """Scales (n, n): N first, and not the same with 2N."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n, k), mx.uint8), "scales": ((n, n), mx.float32)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n, n), mx.float32)}
 
 
 class _HalfScalesWhenStacked(_StackableToy):
     def layout(self, k, n, bits, group_size):
         dtype = mx.float16 if n > 100 else mx.float32
-        return {"weight": ((n, k), mx.uint8), "scales": ((n,), dtype)}
+        return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), dtype)}
 
 
 class _OneMoreWhenStacked(_StackableToy):
@@ -977,7 +989,7 @@ def test_stackable_refuses_nonpositive_rows_without_asking_layout(n):
     assert calls == []
 
 
-@pytest.mark.parametrize("mismatch", ["weight", "scales", "undeclared"])
+@pytest.mark.parametrize("mismatch", ["codes", "group_scales", "undeclared"])
 def test_stackable_requires_the_declared_matrix_tensors(mismatch):
     class Reader(_StackableToy):
         def layout(self, k, n, bits, group_size):
@@ -995,20 +1007,23 @@ def test_stackable_requires_the_declared_matrix_tensors(mismatch):
 @pytest.mark.parametrize(
     "change",
     [
-        pytest.param(lambda m: {"scales": m["scales"]}, id="missing-weight"),
-        pytest.param(lambda m: {"weight": m["weight"]}, id="missing-side"),
-        pytest.param(lambda m: {**m, "extra": m["scales"]}, id="extra"),
-        pytest.param(lambda m: {**m, "weight": m["weight"][:, :4]}, id="width"),
-        pytest.param(lambda m: {**m, "scales": m["scales"][:1]}, id="side-shape"),
+        pytest.param(lambda m: {"group_scales": m["group_scales"]}, id="missing-codes"),
+        pytest.param(lambda m: {"codes": m["codes"]}, id="missing-side"),
+        pytest.param(lambda m: {**m, "extra": m["group_scales"]}, id="extra"),
+        pytest.param(lambda m: {**m, "codes": m["codes"][:, :4]}, id="width"),
         pytest.param(
-            lambda m: {**m, "scales": m["scales"].astype(mx.float16)}, id="dtype"
+            lambda m: {**m, "group_scales": m["group_scales"][:1]}, id="side-shape"
         ),
-        pytest.param(lambda m: {**m, "weight": mx.array(0)}, id="scalar-weight"),
-        pytest.param(lambda m: {**m, "scales": None}, id="non-array"),
+        pytest.param(
+            lambda m: {**m, "group_scales": m["group_scales"].astype(mx.float16)},
+            id="dtype",
+        ),
+        pytest.param(lambda m: {**m, "codes": mx.array(0)}, id="scalar-codes"),
+        pytest.param(lambda m: {**m, "group_scales": None}, id="non-array"),
     ],
 )
 def test_rows_stack_checks_both_inputs_against_the_declared_layout(sides, change):
-    matrix = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    matrix = {"codes": mx.ones((2, 8), mx.uint8), "group_scales": mx.ones((2,))}
     matrices = [matrix, matrix]
     for side in sides:
         matrices[side] = change(matrix)
@@ -1017,7 +1032,7 @@ def test_rows_stack_checks_both_inputs_against_the_declared_layout(sides, change
 
 
 def test_rows_stack_requires_two_matrices_with_the_same_row_count():
-    first = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    first = {"codes": mx.ones((2, 8), mx.uint8), "group_scales": mx.ones((2,))}
     second = {k: v[:1] for k, v in first.items()}
     with pytest.raises(AssertionError, match="quant format toy: second matrix"):
         testing.rows_stack(_StackableToy(), first, second, 8, 8, 1)
@@ -1026,14 +1041,14 @@ def test_rows_stack_requires_two_matrices_with_the_same_row_count():
 def test_rows_stack_accepts_a_single_row_and_list_shapes():
     class Reader(_StackableToy):
         def layout(self, k, n, bits, group_size):
-            return {"weight": ([n, k], mx.uint8), "scales": ([n], mx.float32)}
+            return {"codes": ([n, k], mx.uint8), "group_scales": ([n], mx.float32)}
 
-    matrix = {"weight": mx.ones((1, 8), mx.uint8), "scales": mx.ones((1,))}
+    matrix = {"codes": mx.ones((1, 8), mx.uint8), "group_scales": mx.ones((1,))}
     testing.rows_stack(Reader(), matrix, matrix, 8, 8, 1)
 
 
 def test_rows_stack_with_activations_requires_a_dot_face():
-    matrix = {"weight": mx.ones((2, 8), mx.uint8), "scales": mx.ones((2,))}
+    matrix = {"codes": mx.ones((2, 8), mx.uint8), "group_scales": mx.ones((2,))}
     with pytest.raises(AssertionError, match="no dot face to compare"):
         testing.rows_stack(_StackableToy(), matrix, matrix, 8, 8, 1, mx.ones((8,)))
 
@@ -1046,7 +1061,7 @@ def test_stackable_compares_declared_tensor_shapes_without_a_defect(kind):
             if kind == "nondict" and n == 16:
                 return None
             if kind == "scalar":
-                layout["scales"] = ((), mx.float32)
+                layout["group_scales"] = ((), mx.float32)
             if kind == "lists":
                 layout = {key: (list(shape), dt) for key, (shape, dt) in layout.items()}
             return layout
@@ -1059,14 +1074,14 @@ def test_stackable_compares_declared_tensor_shapes_without_a_defect(kind):
 def test_rows_stack_compares_the_bits_and_dtype_of_decoded_rows(kind):
     class Reader(_StackableToy):
         def decode(self, tensors, bits, group_size):
-            n, k = tensors["weight"].shape
+            n, k = tensors["codes"].shape
             if kind == "dtype":
                 return mx.zeros((n, k), mx.uint8 if n == 16 else mx.int8)
             value = float("nan") if kind == "nan" else (-0.0 if n == 16 else 0.0)
             return mx.full((n, k), value, mx.float32)
 
     arrays = _matrix(8, 320)[0]
-    matrix = dict(zip(("weight", "scales"), arrays, strict=True))
+    matrix = dict(zip(("codes", "group_scales"), arrays, strict=True))
     if kind == "nan":
         testing.rows_stack(Reader(), matrix, matrix, 320, 8, 1)
     else:
@@ -1115,7 +1130,7 @@ def test_rows_stack_builds_each_layer_with_the_format_being_checked(
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", registered)
     matrices = [
-        dict(zip(("weight", "scales"), _matrix(8, 320, seed)[0], strict=True))
+        dict(zip(("codes", "group_scales"), _matrix(8, 320, seed)[0], strict=True))
         for seed in (1, 2)
     ]
     testing.rows_stack(fmt, *matrices, 320, 8, 1, _ints((320,)))
@@ -1128,10 +1143,10 @@ def test_rows_stack_checks_a_format_s_promise(toy, monkeypatch):
     and so does one its layout does not let stack."""
     face = _toy("stack")
     first, second = (
-        dict(zip(("weight", "scales"), _matrix(8, 320, seed)[0], strict=True))
+        dict(zip(("codes", "group_scales"), _matrix(8, 320, seed)[0], strict=True))
         for seed in (1, 2)
     )
-    second["scales"] = second["scales"] * 4  # another largest scale
+    second["group_scales"] = second["group_scales"] * 4  # another largest scale
     x = _ints((320,))
     toy(face)
     fmt = _StackableToy(face)
@@ -1314,7 +1329,7 @@ def test_the_plan_follows_the_layer_s_tensors(toy, monkeypatch):
     layer, x, want = _toy_linear(40, 320)
     assert _equal(layer(x), want) and _equal(layer(x), want)
     assert asked == [id(layer)]
-    layer["scales"] = layer["scales"] * 2
+    layer["group_scales"] = layer["group_scales"] * 2
     assert _equal(layer(x), 2 * want) and _equal(layer(x), 2 * want)
     assert asked == [id(layer)] * 2
     switch = _toy_switch(40, 320)
@@ -1322,7 +1337,7 @@ def test_the_plan_follows_the_layer_s_tensors(toy, monkeypatch):
     before = np.array(switch(rows, indices))
     assert np.array_equal(np.array(switch(rows, indices)), before)
     assert asked == [id(layer)] * 2 + [id(switch)]
-    switch["scales"] = switch["scales"] * 2
+    switch["group_scales"] = switch["group_scales"] * 2
     assert np.array_equal(np.array(switch(rows, indices)), 2 * before)
     assert asked == [id(layer)] * 2 + [id(switch)] * 2
 
@@ -1349,13 +1364,13 @@ def test_a_call_finds_its_plan_and_bias_kept_on_the_layer(toy, monkeypatch):
     assert planned == [layer]
     # Each way MLX changes a layer: an assignment, a removal, an update, an
     # attribute's write.
-    layer["scales"] = layer["scales"] * 2
+    layer["group_scales"] = layer["group_scales"] * 2
     assert _equal(layer(x), 2 * want + bias) and len(planned) == 2
     layer.pop("bias")
     assert _equal(layer(x), 2 * want) and len(planned) == 3
     layer.bias = bias
     assert _equal(layer(x), 2 * want + bias) and len(planned) == 4
-    layer.update({"scales": layer["scales"] / 2})
+    layer.update({"group_scales": layer["group_scales"] / 2})
     assert _equal(layer(x), want + bias) and len(planned) == 5
     del layer["bias"]
     assert _equal(layer(x), want) and len(planned) == 6
@@ -1877,13 +1892,13 @@ def _gain(width=2):
     ):
         assert source.count(old) == 1
         source = source.replace(old, new)
-    return replace(_toy(f"gain{width}", source), tensors=("scales", "gains"))
+    return replace(_toy(f"gain{width}", source), tensors=("group_scales", "gains"))
 
 
 class _GainFormat(_ToyFormat):
     """Its layers run through the face, or fail the test."""
 
-    mode, tensors = "gain", ("scales", "gains")
+    mode, codes_name, tensors = "gain", "codes", ("group_scales", "gains")
 
     def decode(self, tensors, bits, group_size):
         pytest.fail("decoded")
@@ -1896,8 +1911,8 @@ def _gain_stack(monkeypatch, width=2):
     monkeypatch.setitem(formats._FORMATS, "gain", _GainFormat(_gain(width)))
     (codes, scales), _, _ = _matrix(EXPERTS * 40, 320)
     tensors = {
-        "weight": codes.reshape(EXPERTS, 40, 320),
-        "scales": scales.reshape(EXPERTS, 40),
+        "codes": codes.reshape(EXPERTS, 40, 320),
+        "group_scales": scales.reshape(EXPERTS, 40),
         "gains": mx.array(
             [[3.0, 2.0 ** (e % 3 - 1)] + [5.0] * (width - 2) for e in range(EXPERTS)]
         ),
@@ -2308,7 +2323,7 @@ def test_a_face_that_does_not_compile_in_a_function_that_mlx_compiles_is_the_dec
     decode, decoded = _ToyFormat.decode, []
 
     def recorded(self, tensors, bits, group_size):
-        decoded.append(tensors["weight"].shape)
+        decoded.append(tensors["codes"].shape)
         return decode(self, tensors, bits, group_size)
 
     monkeypatch.setattr(_ToyFormat, "decode", recorded)
@@ -2581,7 +2596,7 @@ def test_a_graph_s_end_leaves_no_thread_the_launch_of_its_face(
     monkeypatch.setitem(formats._FORMATS, "twice", _TwiceFormat(twice))
     first, x, want = _toy_linear(40, 320)
     (codes, scales), _, _ = _matrix(40, 320, seed=1)
-    second = FormatLinear("twice", 8, 1, 320, {"weight": codes, "scales": scales})
+    second = FormatLinear("twice", 8, 1, 320, {"codes": codes, "group_scales": scales})
     more, half = _ints((3, 320)), x.astype(mx.float16)
     mx.eval(first.parameters(), second.parameters(), x, more, half)
     doubled = 2 * _want(second, x)
@@ -2814,15 +2829,18 @@ def test_two_threads_that_meet_an_unproven_launch_each_prove_it(
 def test_a_layer_holds_a_registered_format_s_tensors(toy):
     toy()
     (codes, scales), _, _ = _matrix(8, 64)
-    matrix = {"weight": codes, "scales": scales}
-    stack = {"weight": codes.reshape(2, 4, 64), "scales": scales.reshape(2, 4)}
+    matrix = {"codes": codes, "group_scales": scales}
+    stack = {
+        "codes": codes.reshape(2, 4, 64),
+        "group_scales": scales.reshape(2, 4),
+    }
     with pytest.raises(ValueError, match="no quant format is registered for mode 'x'"):
         FormatLinear("x", 8, 1, 64, matrix)
-    names = "quant format 'toy' keeps a matrix as weight, scales, not as "
-    with pytest.raises(ValueError, match=names + "biases, scales, weight"):
+    names = "quant format 'toy' keeps a matrix as codes, group_scales, not as "
+    with pytest.raises(ValueError, match=names + "biases, codes, group_scales"):
         FormatLinear("toy", 8, 1, 64, {**matrix, "biases": scales})
-    with pytest.raises(ValueError, match=names + "weight"):
-        FormatSwitchLinear("toy", 8, 1, 64, {"weight": stack["weight"]})
+    with pytest.raises(ValueError, match=names + "codes"):
+        FormatSwitchLinear("toy", 8, 1, 64, {"codes": stack["codes"]})
     axes = re.escape("FormatLinear: the weight has 2 axes, not the shape (2, 4, 64)")
     with pytest.raises(ValueError, match=axes):
         FormatLinear("toy", 8, 1, 64, stack)
@@ -2830,12 +2848,16 @@ def test_a_layer_holds_a_registered_format_s_tensors(toy):
     with pytest.raises(ValueError, match=axes):
         FormatSwitchLinear("toy", 8, 1, 64, matrix)
     ragged = re.escape(
-        "FormatSwitchLinear: scales does not open with the weight's stack of (2,)"
+        "FormatSwitchLinear: group_scales does not open with the weight's stack of (2,)"
     )
     with pytest.raises(ValueError, match=ragged):
-        FormatSwitchLinear("toy", 8, 1, 64, {**stack, "scales": scales.reshape(4, 2)})
+        FormatSwitchLinear(
+            "toy", 8, 1, 64, {**stack, "group_scales": scales.reshape(4, 2)}
+        )
     # A matrix's tensors are the format's own beyond that.
-    assert FormatLinear("toy", 8, 1, 64, {**matrix, "scales": scales.reshape(2, 4)})
+    assert FormatLinear(
+        "toy", 8, 1, 64, {**matrix, "group_scales": scales.reshape(2, 4)}
+    )
 
 
 # The toy face over row scales kept as bfloat16.
@@ -2856,11 +2878,11 @@ def _recast_model(dtype):
     mx.random.seed(7)
     bias = mx.random.randint(-64, 64, (EXPERTS, 40)).astype(dtype)
     model = nn.Module()
-    matrix = {"weight": codes[:40], "scales": scales[:40]}
+    matrix = {"codes": codes[:40], "group_scales": scales[:40]}
     model.linear = FormatLinear("toy", 8, 1, 320, matrix, bias=bias[0])
     stack = {
-        "weight": codes.reshape(EXPERTS, 40, 320),
-        "scales": scales.reshape(EXPERTS, 40),
+        "codes": codes.reshape(EXPERTS, 40, 320),
+        "group_scales": scales.reshape(EXPERTS, 40),
     }
     model.switch = FormatSwitchLinear("toy", 8, 1, 320, stack, bias=bias)
     model["_private"] = mx.ones((8,), dtype)
@@ -2913,7 +2935,7 @@ def test_a_recast_of_the_model_casts_a_format_layer_s_bias_alone(
         ("switch", FormatSwitchLinear, (rows16, indices)),
     ):
         layer = model[name]
-        tensors = {key: layer[key] for key in ("weight", "scales")}
+        tensors = {key: layer[key] for key in ("codes", "group_scales")}
         built = layer_cls("toy", 8, 1, 320, tensors, bias=layer["bias"])
         out = layer(*inputs)
         assert out.dtype == mx.float16 and _equal(out, built(*inputs))
@@ -2958,7 +2980,7 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(
     toy()
     (codes, scales), x, want = _matrix(36, 320)
     # Given in another order than the format's: named in the format's.
-    stand_ins = {"scales": mx.zeros_like(scales), "weight": mx.zeros_like(codes)}
+    stand_ins = {"group_scales": mx.zeros_like(scales), "codes": mx.zeros_like(codes)}
     bias = mx.zeros((36,))
     layer = FormatLinear("toy", 8, 1, 320, stand_ins, bias=bias, placeholders=True)
     # What follows is a checkpoint's load, until the layer computes.
@@ -2972,7 +2994,7 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(
     def refused(placeholders):
         return f"^{re.escape(refusal + placeholders)}$"
 
-    lacking = refused("weight (never loaded), scales (never loaded)")
+    lacking = refused("codes (never loaded), group_scales (never loaded)")
     faces, dot = [], _ToyFormat.dot
     monkeypatch.setattr(_ToyFormat, "dot", lambda self, *a: faces.append(a))
     for compute in (
@@ -2986,52 +3008,52 @@ def test_a_layer_over_placeholders_computes_once_each_is_loaded(
     assert faces == []
     monkeypatch.setattr(_ToyFormat, "dot", dot)
     # The array it holds, assigned again, is no load.
-    layer["weight"] = layer["weight"]
+    layer["codes"] = layer["codes"]
     with pytest.raises(ValueError, match=lacking):
         layer(x)
     # The tensor named is the one offered.
-    layer["weight"] = codes[:8]
+    layer["codes"] = codes[:8]
     weight = (
-        "weight (offered (8, 320) mlx.core.uint8, not the layout's (36, 320) "
-        "mlx.core.uint8), scales (never loaded)"
+        "codes (offered (8, 320) mlx.core.uint8, not the layout's (36, 320) "
+        "mlx.core.uint8), group_scales (never loaded)"
     )
     with pytest.raises(ValueError, match=refused(weight)):
         layer(x)
     # The last array offered in another dtype or shape is named.
-    layer["scales"] = scales.astype(mx.float16)
-    layer["scales"] = scales.astype(mx.bfloat16)
-    assert layer["scales"] is stand_ins["scales"]
-    layer["weight"] = codes
+    layer["group_scales"] = scales.astype(mx.float16)
+    layer["group_scales"] = scales.astype(mx.bfloat16)
+    assert layer["group_scales"] is stand_ins["group_scales"]
+    layer["codes"] = codes
     offered = (
-        "scales (offered (36,) mlx.core.bfloat16, not the layout's (36,) "
+        "group_scales (offered (36,) mlx.core.bfloat16, not the layout's (36,) "
         "mlx.core.float32)"
     )
     with pytest.raises(ValueError, match=refused(offered)):
         layer(x)
-    layer["scales"] = scales[:8]
+    layer["group_scales"] = scales[:8]
     offered = (
-        "scales (offered (8,) mlx.core.float32, not the layout's (36,) "
+        "group_scales (offered (8,) mlx.core.float32, not the layout's (36,) "
         "mlx.core.float32)"
     )
     with pytest.raises(ValueError, match=refused(offered)):
         layer(x)
     # As many elements, in another shape.
-    layer["scales"] = scales.reshape(36, 1)
+    layer["group_scales"] = scales.reshape(36, 1)
     offered = (
-        "scales (offered (36, 1) mlx.core.float32, not the layout's (36,) "
+        "group_scales (offered (36, 1) mlx.core.float32, not the layout's (36,) "
         "mlx.core.float32)"
     )
     with pytest.raises(ValueError, match=refused(offered)):
         layer(x)
-    layer["scales"] = scales
+    layer["group_scales"] = scales
     assert _equal(layer(x), want)
     load.close()
     # Loaded, it takes an array of its shape and dtype, and no other (outside
     # a load: it stays loaded); it knows its format's tensors by their names,
     # not by the dict it was built from.
-    layer["scales"] = 2 * scales
-    layer["scales"] = scales.astype(mx.bfloat16)
-    layer["scales"] = mx.concatenate([scales, scales])
+    layer["group_scales"] = 2 * scales
+    layer["group_scales"] = scales.astype(mx.bfloat16)
+    layer["group_scales"] = mx.concatenate([scales, scales])
     stand_ins["bias"] = bias
     layer.set_dtype(mx.float16)
     assert layer["bias"].dtype == mx.float16
@@ -3054,7 +3076,7 @@ def _over_placeholders(toy):
     is built for."""
     toy()
     (codes, scales), x, want = _matrix(36, 320)
-    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    stand_ins = {"codes": mx.zeros_like(codes), "group_scales": mx.zeros_like(scales)}
     layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
     return layer, (codes, scales), x, want
 
@@ -3069,10 +3091,10 @@ def test_a_tensor_a_load_unloads_drops_the_plan_built_over_it(toy, tmp_path):
     assert _equal(layer(x), want) and _equal(layer(x), want)
     assert layer.__dict__[linear._KEPT][0] is not None
     with format_load.loading(tmp_path):
-        layer["scales"] = layer["scales"].astype(mx.float16)
+        layer["group_scales"] = layer["group_scales"].astype(mx.float16)
     offered = _refusal(
         layer,
-        "scales (offered (40,) mlx.core.float16, not the layout's (40,) "
+        "group_scales (offered (40,) mlx.core.float16, not the layout's (40,) "
         "mlx.core.float32)",
     )
     with pytest.raises(ValueError, match=offered):
@@ -3092,12 +3114,12 @@ def test_only_a_load_takes_a_placeholder(toy, tmp_path):
     layer, (codes, scales), x, want = _over_placeholders(toy)
     # The scales are float32: set_dtype hands back a new float32 array.
     layer.set_dtype(mx.float32)
-    layer["weight"] = mx.zeros_like(codes)
-    lacking = _refusal(layer, "weight (never loaded), scales (never loaded)")
+    layer["codes"] = mx.zeros_like(codes)
+    lacking = _refusal(layer, "codes (never loaded), group_scales (never loaded)")
     with pytest.raises(ValueError, match=lacking):
         layer(x)
     with format_load.loading(tmp_path):
-        layer["weight"], layer["scales"] = codes, scales
+        layer["codes"], layer["group_scales"] = codes, scales
     assert _equal(layer(x), want)
     # Loaded, a recast's array keeps it loaded.
     layer.set_dtype(mx.float32)
@@ -3110,32 +3132,32 @@ def test_a_load_s_array_not_taken_unloads_a_loaded_tensor(toy, tmp_path):
     it one; outside a load such an array changes nothing."""
     layer, (codes, scales), x, want = _over_placeholders(toy)
     with format_load.loading(tmp_path):
-        layer["weight"], layer["scales"] = codes, scales
-    layer["scales"] = scales.astype(mx.float16)
+        layer["codes"], layer["group_scales"] = codes, scales
+    layer["group_scales"] = scales.astype(mx.float16)
     assert _equal(layer(x), want)
     with format_load.loading(tmp_path):
-        layer["scales"] = scales.astype(mx.float16)
+        layer["group_scales"] = scales.astype(mx.float16)
     offered = _refusal(
         layer,
-        "scales (offered (36,) mlx.core.float16, not the layout's (36,) "
+        "group_scales (offered (36,) mlx.core.float16, not the layout's (36,) "
         "mlx.core.float32)",
     )
     with pytest.raises(ValueError, match=offered):
         layer(x)
     with format_load.loading(tmp_path):
         # A new array: the very one the layer holds is no load.
-        layer["scales"] = scales * 1
+        layer["group_scales"] = scales * 1
     assert _equal(layer(x), want)
 
 
 def test_a_recast_after_a_failed_load_keeps_what_the_load_offered(toy, tmp_path):
     layer, (codes, scales), x, _ = _over_placeholders(toy)
     with format_load.loading(tmp_path):
-        layer["weight"], layer["scales"] = codes, scales[:8]
+        layer["codes"], layer["group_scales"] = codes, scales[:8]
     layer.set_dtype(mx.float16)
     offered = _refusal(
         layer,
-        "scales (offered (8,) mlx.core.float32, not the layout's (36,) "
+        "group_scales (offered (8,) mlx.core.float32, not the layout's (36,) "
         "mlx.core.float32)",
     )
     with pytest.raises(ValueError, match=offered):
@@ -3147,32 +3169,32 @@ def test_an_ended_load_cannot_fill_or_unload_a_tensor(toy, tmp_path, loaded):
     layer, (codes, scales), x, want = _over_placeholders(toy)
     with format_load.loading(tmp_path):
         if loaded:
-            layer["weight"], layer["scales"] = codes, scales
+            layer["codes"], layer["group_scales"] = codes, scales
         stale = contextvars.copy_context()
 
     def write():
-        layer["weight"] = codes
-        layer["scales"] = scales.astype(mx.float16) if loaded else scales
+        layer["codes"] = codes
+        layer["group_scales"] = scales.astype(mx.float16) if loaded else scales
 
     stale.run(write)
     if loaded:
         assert _equal(layer(x), want)
     else:
-        with pytest.raises(ValueError, match="weight .never loaded"):
+        with pytest.raises(ValueError, match="codes .never loaded"):
             layer(x)
 
 
 def test_a_layer_updated_by_dict_union_keeps_its_layout_and_load_proof(toy, tmp_path):
     layer, (codes, scales), x, want = _over_placeholders(toy)
-    held = layer["scales"]
-    layer |= {"scales": scales.astype(mx.float16)}
-    assert layer["scales"] is held
+    held = layer["group_scales"]
+    layer |= {"group_scales": scales.astype(mx.float16)}
+    assert layer["group_scales"] is held
     with format_load.loading(tmp_path):
-        layer |= [("weight", codes), ("scales", scales)]
+        layer |= [("codes", codes), ("group_scales", scales)]
     assert _equal(layer(x), want)
     with format_load.loading(tmp_path):
-        layer |= {"scales": scales[:1]}
-    with pytest.raises(ValueError, match="scales .offered"):
+        layer |= {"group_scales": scales[:1]}
+    with pytest.raises(ValueError, match="group_scales .offered"):
         layer(x)
 
 
@@ -3181,11 +3203,11 @@ def test_a_nested_value_leaves_its_tensor_unloaded_until_an_array_replaces_it(
 ):
     layer, (codes, scales), x, want = _over_placeholders(toy)
     with format_load.loading(tmp_path):
-        layer["weight"] = codes
-        layer["scales"] = [scales]
+        layer["codes"] = codes
+        layer["group_scales"] = [scales]
         with pytest.raises(ValueError, match=r"scales \(offered list, not an array\)"):
             layer(x)
-        layer["scales"] = scales
+        layer["group_scales"] = scales
     assert _equal(layer(x), want)
 
 
@@ -3203,9 +3225,9 @@ def _pending(toy, kind="linear"):
     (codes, scales), x, _ = _matrix(36 * math.prod(stack), 320)
     codes, scales = codes.reshape(*stack, 36, 320), scales.reshape(*stack, 36)
     cls = FormatSwitchLinear if stack else FormatLinear
-    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    stand_ins = {"codes": mx.zeros_like(codes), "group_scales": mx.zeros_like(scales)}
     layer = cls("toy", 8, 1, 320, stand_ins, placeholders=True)
-    layer["scales"] = scales.astype(mx.float16)
+    layer["group_scales"] = scales.astype(mx.float16)
     if stack:
         xs, indices = mx.stack([x, -x])[:, None], mx.array([1, 0])
 
@@ -3217,10 +3239,10 @@ def _pending(toy, kind="linear"):
         def call(module):
             return module(x)
 
-    want = call(cls("toy", 8, 1, 320, {"weight": codes, "scales": scales}))
+    want = call(cls("toy", 8, 1, 320, {"codes": codes, "group_scales": scales}))
     shape = (*stack, 36)
     refusal = re.escape(
-        f"weight (never loaded), scales (offered {shape} mlx.core.float16, not "
+        f"codes (never loaded), group_scales (offered {shape} mlx.core.float16, not "
         f"the layout's {shape} mlx.core.float32)"
     )
     return layer, (codes, scales), call, want, refusal
@@ -3238,8 +3260,9 @@ def test_a_tensor_is_stored_before_its_placeholder_is_cleared(toy, a_load, monke
         return store(self, key, value)
 
     monkeypatch.setattr(nn.Module, "__setitem__", stored)
-    layer["scales"] = scales
-    assert seen == [("scales", True)] and "scales" not in layer._placeholders
+    layer["group_scales"] = scales
+    assert seen == [("group_scales", True)]
+    assert "group_scales" not in layer._placeholders
 
 
 @pytest.mark.parametrize("kind", ["linear", "switch"])
@@ -3256,7 +3279,7 @@ def test_a_pending_layer_copies_and_pickles_with_what_it_lacks(
     assert type(clone) is type(layer)
     with pytest.raises(ValueError, match=refusal):
         call(clone)
-    clone["weight"], clone["scales"] = codes, scales
+    clone["codes"], clone["group_scales"] = codes, scales
     assert _equal(call(clone), want)
     with pytest.raises(ValueError, match=refusal):
         call(layer)
@@ -3269,10 +3292,10 @@ def test_a_copy_of_a_pending_layer_loads_into_itself_alone(toy, a_load, kind):
     and stays frozen when the copy is not."""
     layer, (codes, scales), call, want, refusal = _pending(toy, kind)
     clone = copy.copy(layer)
-    assert type(clone) is type(layer) and clone["weight"] is layer["weight"]
+    assert type(clone) is type(layer) and clone["codes"] is layer["codes"]
     with pytest.raises(ValueError, match=refusal):
         call(clone)
-    clone["weight"], clone["scales"] = codes, scales
+    clone["codes"], clone["group_scales"] = codes, scales
     assert _equal(call(clone), want)
     with pytest.raises(ValueError, match=refusal):
         call(layer)
@@ -3302,17 +3325,17 @@ def test_a_refusal_names_the_placeholders_it_read_while_a_load_goes_on(toy, a_lo
     names them: the refusal names those it read, and raises nothing else."""
     toy()
     (codes, scales), x, _ = _matrix(36, 320)
-    stand_ins = {"weight": mx.zeros_like(codes), "scales": mx.zeros_like(scales)}
+    stand_ins = {"codes": mx.zeros_like(codes), "group_scales": mx.zeros_like(scales)}
     layer = FormatLinear("toy", 8, 1, 320, stand_ins, placeholders=True)
 
     class Loading:
         def __repr__(self):
             # The other thread's load lands while the refusal is written.
-            layer["scales"] = scales
+            layer["group_scales"] = scales
             return "36"
 
-    layer._placeholders["weight"] = ((Loading(),), str(mx.float16))
-    with pytest.raises(ValueError, match=re.escape("scales (never loaded)")):
+    layer._placeholders["codes"] = ((Loading(),), str(mx.float16))
+    with pytest.raises(ValueError, match=re.escape("group_scales (never loaded)")):
         layer(x)
 
 
@@ -3320,7 +3343,10 @@ class _PackedAlongN(_ToyFormat):
     """The toy, with a layout that packs two rows of a matrix into one."""
 
     def layout(self, k, n, bits, group_size):
-        return {"weight": ((n // 2, 2 * k), mx.uint8), "scales": ((n,), mx.float32)}
+        return {
+            "codes": ((n // 2, 2 * k), mx.uint8),
+            "group_scales": ((n,), mx.float32),
+        }
 
 
 def test_a_layer_whose_format_lays_out_no_such_layer_is_refused(monkeypatch):
@@ -3330,10 +3356,10 @@ def test_a_layer_whose_format_lays_out_no_such_layer_is_refused(monkeypatch):
     formats.load()
     monkeypatch.setitem(formats._FORMATS, "toy", _PackedAlongN())
     (codes, scales), _, _ = _matrix(8, 64)
-    packed = {"weight": codes.reshape(4, 128), "scales": scales}
+    packed = {"codes": codes.reshape(4, 128), "group_scales": scales}
     refusal = re.escape(
-        "quant format 'toy' lays out the weight of a (4, 128) matrix as (2, 256): "
-        "its first axis is N (4); a format packs along K, never along N"
+        "quant format 'toy' lays out the tensor 'codes' of a (4, 128) matrix as "
+        "(2, 256): its first axis is N (4); a format packs along K, never along N"
     )
     with pytest.raises(ValueError, match=refusal):
         FormatLinear("toy", 8, 1, 128, packed)
@@ -3345,11 +3371,11 @@ def test_a_layer_whose_format_lays_out_no_such_layer_is_refused(monkeypatch):
         _PackedAlongN,
         "layout",
         lambda self, k, n, bits, group_size: {
-            "weight": ((n, k), mx.uint8),
-            "scales": ((n,), mx.float32),
+            "codes": ((n, k), mx.uint8),
+            "group_scales": ((n,), mx.float32),
         },
     )
-    layer = FormatLinear("toy", 8, 1, 64, {"weight": codes, "scales": scales})
+    layer = FormatLinear("toy", 8, 1, 64, {"codes": codes, "group_scales": scales})
     assert layer.output_dims == 8
 
 
@@ -3394,7 +3420,7 @@ def test_x_of_another_width_is_refused():
 def test_a_matrix_of_no_input_is_its_decode(toy):
     """K = 0: no launch takes it, and x of no element has rows of none."""
     toy(_toy("linear"))
-    tensors = {"weight": mx.zeros((8, 0), mx.uint8), "scales": mx.ones((8,))}
+    tensors = {"codes": mx.zeros((8, 0), mx.uint8), "group_scales": mx.ones((8,))}
     layer = FormatLinear("toy", 8, 1, 0, tensors)
     got = layer(mx.zeros((2, 0)))
     assert got.shape == (2, 8) and not mx.any(got).item()
@@ -3499,8 +3525,8 @@ def _wide_toy_switch(experts=128):
     """A toy stack of more matrices than an int8 index can count."""
     (codes, scales), _, _ = _matrix(experts * 8, 320)
     tensors = {
-        "weight": codes.reshape(experts, 8, 320),
-        "scales": scales.reshape(experts, 8),
+        "codes": codes.reshape(experts, 8, 320),
+        "group_scales": scales.reshape(experts, 8),
     }
     return FormatSwitchLinear("toy", 8, 1, 320, tensors)
 
@@ -3548,7 +3574,7 @@ def _mutated(layer, how, bias):
     elif how == "popitem":
         layer.popitem()  # the bias, the last item
     elif how == "ior":
-        layer |= {"scales": layer["scales"] * 2}
+        layer |= {"group_scales": layer["group_scales"] * 2}
     elif how == "delattr":
         del layer.group_size
     return layer
@@ -3648,8 +3674,8 @@ def _toy_stack(experts, n, k, exact=True, seed=0):
         mx.random.seed(seed)
         scales = mx.random.uniform(0.001, 0.01, scales.shape)
     tensors = {
-        "weight": codes.reshape(experts, n, k),
-        "scales": scales.reshape(experts, n),
+        "codes": codes.reshape(experts, n, k),
+        "group_scales": scales.reshape(experts, n),
     }
     layer = FormatSwitchLinear("toy", 8, 1, k, tensors)
     mx.eval(layer.parameters())
@@ -3754,7 +3780,7 @@ def test_a_stack_a_piece_holds_is_decoded_whole(toy, monkeypatch):
     decode, pieces = _ToyFormat.decode, []
 
     def recorded(self, tensors, bits, group_size):
-        pieces.append(tensors["weight"].shape[:-2])
+        pieces.append(tensors["codes"].shape[:-2])
         return decode(self, tensors, bits, group_size)
 
     monkeypatch.setattr(_ToyFormat, "decode", recorded)
@@ -3789,7 +3815,7 @@ def test_a_call_of_no_product_decodes_no_matrix(toy, monkeypatch, shape, batch):
     decode, decoded = _ToyFormat.decode, []
 
     def recorded(self, tensors, bits, group_size):
-        decoded.append(tensors["weight"].shape)
+        decoded.append(tensors["codes"].shape)
         return decode(self, tensors, bits, group_size)
 
     monkeypatch.setattr(_ToyFormat, "decode", recorded)
@@ -3802,8 +3828,8 @@ def test_a_call_of_no_product_decodes_no_matrix(toy, monkeypatch, shape, batch):
 def test_a_stack_of_matrices_of_no_rows_gives_no_outputs(toy):
     toy()
     tensors = {
-        "weight": mx.zeros((EXPERTS, 0, 320), mx.uint8),
-        "scales": mx.zeros((EXPERTS, 0)),
+        "codes": mx.zeros((EXPERTS, 0, 320), mx.uint8),
+        "group_scales": mx.zeros((EXPERTS, 0)),
     }
     layer = FormatSwitchLinear("toy", 8, 1, 320, tensors)
     assert layer(_ints((2, 1, 320)), _experts((2,))).shape == (2, 1, 0)
@@ -3847,7 +3873,7 @@ def test_a_decode_holds_a_piece_of_its_matrices_at_once(toy, monkeypatch):
     decode, decoded = _ToyFormat.decode, []
 
     def recorded(self, tensors, bits, group_size):
-        decoded.append(tensors["weight"].shape[:-2])
+        decoded.append(tensors["codes"].shape[:-2])
         return decode(self, tensors, bits, group_size)
 
     monkeypatch.setattr(_ToyFormat, "decode", recorded)
@@ -3900,7 +3926,7 @@ def test_a_stack_is_decoded_whole_from_enough_pairs_within_its_budget(
     decode, pieces = _ToyFormat.decode, []
 
     def typed(self, tensors, bits, group_size):
-        pieces.append(tensors["weight"].shape[:-2])
+        pieces.append(tensors["codes"].shape[:-2])
         return decode(self, tensors, bits, group_size).astype(decoded)
 
     monkeypatch.setattr(_ToyFormat, "decode", typed)
@@ -3948,3 +3974,62 @@ def test_the_page_says_a_decode_is_at_once_or_in_pieces():
     )
     assert "a call costs pieces × the gather's work" in page
     assert "With a decode that works element by element" in page
+
+
+def test_rows_stack_passes_only_the_face_s_tensors_in_face_order(monkeypatch):
+    """The rows rule's check reads a layer through the face, not through
+    every tensor the layer keeps: a face that takes one side tensor of a
+    format that keeps two must be given that one (and the format's codes
+    name), in the face's order."""
+
+    class TwoSides(_StackableToy):
+        tensors = ("group_scales", "row_scales")
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "codes": ((n, k), mx.uint8),
+                "group_scales": ((n,), mx.float32),
+                "row_scales": ((n,), mx.float32),
+            }
+
+        def dot(self, layer, k, n):
+            return replace(_toy("rows_subset"), tensors=("group_scales",))
+
+    seen = []
+    rows = testing.dot_rows
+
+    def recorded(face, operands, x, n, packs=(1, 1), **named):
+        seen.append((len(operands), named.get("codes_name"), face.tensors))
+        return rows(face, operands, x, n, packs, **named)
+
+    monkeypatch.setattr(testing, "dot_rows", recorded)
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    fmt = TwoSides()
+    formats.register(fmt)
+    (codes, scales), _, _ = _matrix(8, 320)
+    one = {
+        "codes": codes,
+        "group_scales": scales,
+        "row_scales": scales * 0.5,
+    }
+    testing.rows_stack(fmt, one, one, 320, 8, 1, _ints((320,)))
+    assert seen and seen[0] == (2, "codes", ("group_scales",))
+
+
+def test_a_format_linear_call_does_not_resolve_tensor_names_per_forward(
+    toy, monkeypatch
+):
+    """The layer's packed name is frozen in `_tensors` at construction: a
+    warm call reads the dict, not the registry."""
+    toy(_toy("linear"))
+    layer, x, _ = _toy_linear(40, 320)
+    switch = _toy_switch(8, 320)
+    rows, indices = _ints((2, 1, 320)), _experts((2,))
+    mx.eval(layer(x), switch(rows, indices))
+
+    def walked(*args, **kwargs):
+        raise AssertionError("resolved a layer's tensor names in a forward")
+
+    monkeypatch.setattr(formats, "tensor_names", walked)
+    mx.eval(layer(x), switch(rows, indices))

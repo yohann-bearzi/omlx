@@ -14,6 +14,9 @@ from .._loader import load_extension
 from .._loader import native_stream_kwargs as _native_stream_kwargs
 
 logger = logging.getLogger(__name__)
+
+# Set once when a native build without the packed-key argument is met.
+_STALE_PACKED_KEY_WARNED = False
 _ext, _IMPORT_ERROR = load_extension(__package__, Path(__file__).parent)
 
 
@@ -62,11 +65,35 @@ def set_row_exact_armed(armed: bool) -> None:
         _SET_ROW_EXACT_ARMED(bool(armed))
 
 
-def format_linear_fast(weight, bias, operands, proof_state):
-    """Return a native warm FormatLinear dispatcher, or None when unavailable."""
+def format_linear_fast(weight, bias, operands, proof_state, weight_key):
+    """Return a native warm FormatLinear dispatcher, or None when unavailable.
+
+    ``weight_key`` is the name the layer keeps its packed tensor under: the
+    format's codes name, which the replay reads the layer's dict by (D11: a
+    plugin's layer has no ``weight``)."""
     if _FORMAT_LINEAR_FAST is None or not hasattr(_FORMAT_LINEAR_FAST, "bind"):
         return None
-    return _FORMAT_LINEAR_FAST(weight, bias, operands, proof_state).bind()
+    if not isinstance(weight_key, str):
+        raise TypeError(f"weight_key must be str, not {type(weight_key).__name__}")
+    try:
+        fast = _FORMAT_LINEAR_FAST(weight, bias, operands, proof_state, weight_key)
+    except TypeError:
+        # An extension built before D11 has no packed-key argument: the layer
+        # keeps its Python lookup, as it does when the symbol is missing. One
+        # warning says so, naming what to rebuild.
+        doc = getattr(getattr(_FORMAT_LINEAR_FAST, "__init__", None), "__doc__", None)
+        if "weight_key" not in (doc or ""):
+            global _STALE_PACKED_KEY_WARNED
+            if not _STALE_PACKED_KEY_WARNED:
+                _STALE_PACKED_KEY_WARNED = True
+                logger.warning(
+                    "the native quant_matmul extension predates the format packed-key "
+                    "argument: a format layer keeps its Python lookup, not a native "
+                    "replay; rebuild the custom kernels with `make dev`"
+                )
+            return None
+        raise
+    return fast.bind()
 
 
 # Extensions built before the NAX split reject the use_nax/nax_variant kwargs,
@@ -540,9 +567,7 @@ def oq_a8_decode_weights(
     in device memory.
     """
     if _ext is None or not hasattr(_ext, "oq_a8_decode_weights"):
-        raise RuntimeError(
-            "oq_a8_decode_weights native kernel is unavailable"
-        )
+        raise RuntimeError("oq_a8_decode_weights native kernel is unavailable")
     return _ext.oq_a8_decode_weights(
         weight,
         bits,
@@ -617,9 +642,7 @@ def mxfp4_gather_qmm_pair_blocks(
             variant,
             **_native_stream_kwargs(stream),
         )
-    raise RuntimeError(
-        "mxfp4_gather_qmm_pair_blocks native kernel is unavailable"
-    )
+    raise RuntimeError("mxfp4_gather_qmm_pair_blocks native kernel is unavailable")
 
 
 def mxfp4_gather_qmm_pair_concat_blocks(
@@ -634,9 +657,7 @@ def mxfp4_gather_qmm_pair_concat_blocks(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(
-        _ext, "mxfp4_gather_qmm_pair_concat_blocks"
-    ):
+    if _ext is not None and hasattr(_ext, "mxfp4_gather_qmm_pair_concat_blocks"):
         return _ext.mxfp4_gather_qmm_pair_concat_blocks(
             x,
             weight0,
@@ -698,9 +719,7 @@ def affine_gather_qmm_pair_concat_blocks(
     *,
     stream=None,
 ) -> mx.array:
-    if _ext is not None and hasattr(
-        _ext, "affine_gather_qmm_pair_concat_blocks"
-    ):
+    if _ext is not None and hasattr(_ext, "affine_gather_qmm_pair_concat_blocks"):
         return _ext.affine_gather_qmm_pair_concat_blocks(
             x,
             weight0,
