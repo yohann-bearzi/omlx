@@ -577,6 +577,36 @@ def test_a_fused_format_stack_keeps_no_plan_of_its_parts(loaded_format, lm):
         assert format_linear._KEPT not in vars(glu[name]), name
 
 
+def test_vlm_kept_gate_up_views_share_the_fused_buffer(loaded_format):
+    """mlx-vlm keeps gate/up for the verifier: ``mx.split`` returns views
+    of the fused stack (MLX 0.32.4), so the routed gate/up bytes stay
+    resident once: each view reports the fused buffer, the three report
+    one buffer together, and active memory does not grow."""
+    glu = _format_glu()
+    mx.eval(glu.parameters())
+    mx.synchronize()
+    gate, up = glu.gate_proj, glu.up_proj
+    names = sorted(gate._tensors)
+    before = mx.get_active_memory()
+    model = _FakeQwen4Model()
+    model.named_modules = lambda: [("experts", glu)]
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    mx.synchronize()
+    fused = glu.gate_up_proj
+    assert mx.get_active_memory() == before
+    for name in names:
+        assert fused[name].nbytes == gate[name].nbytes + up[name].nbytes
+        assert mx.get_array_buffer_size(gate[name]) == mx.get_array_buffer_size(
+            fused[name]
+        )
+        assert mx.get_array_buffer_size(up[name]) == mx.get_array_buffer_size(
+            fused[name]
+        )
+        assert mx.get_array_buffer_size(
+            fused[name], gate[name], up[name]
+        ) == mx.get_array_buffer_size(fused[name])
+
+
 def test_a_batched_verify_of_a_fused_format_stack_never_runs_its_views(
     loaded_format, monkeypatch
 ):
