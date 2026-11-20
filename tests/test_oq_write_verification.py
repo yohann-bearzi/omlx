@@ -31,12 +31,9 @@ def test_writer_keeps_a_broken_reload_unverified(
             tensors = dict(tensors)
             if damage == "missing-scale":
                 down = "model.layers.0.mlp.down_proj."
-                for name in ("group_scales", "scales"):
-                    if down + name in tensors:
-                        tensors.pop(down + name)
-                        break
-                else:
-                    raise AssertionError("the shard has no down_proj scale tensor")
+                names = [down + name for name in toy.tensors if down + name in tensors]
+                assert names, "the format's scale tensor is missing from the shard"
+                tensors.pop(names[0])
             elif damage == "missing-norm":
                 tensors.pop("model.norm.weight")
             else:
@@ -370,17 +367,7 @@ def test_writer_failure_preserves_cause_on_bad_config_or_io_error(
     def patches(path, config, **kwargs):
         yield True
 
-    for name in (
-        "_strip_audio_config_if_orphaned",
-        "_strip_vision_config_if_orphaned",
-        "_drop_gemma4_mlx_shared_kv_extras_on_load",
-        "_derive_gemma4_global_kv_on_load",
-        "_preserve_gemma4_unified_image_processor_on_load",
-        "_force_minimax_m3_moe_sanitize_on_load",
-        "_force_qwen4_exp_sanitize_on_load",
-        "_remap_nested_visual_on_load",
-        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-    ):
+    for name in _VLM_CONTEXTS:
         monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
 
     def refuse(loaded):
@@ -489,7 +476,6 @@ def _stub_vlm_verification(monkeypatch, model):
 
 
 def test_refused_empty_prompt_leaves_staged_config_untouched(tmp_path):
-    import numpy as np
 
     from omlx import oq_verify
 
@@ -517,7 +503,6 @@ def test_empty_prompt_or_logits_fails_verification(tmp_path, monkeypatch):
     from contextlib import contextmanager, nullcontext
 
     import mlx.nn as nn
-    import numpy as np
 
     import omlx.engine.vlm as engine_vlm
     from omlx import oq, oq_verify
@@ -533,17 +518,7 @@ def test_empty_prompt_or_logits_fails_verification(tmp_path, monkeypatch):
         def close(self):
             pass
 
-    for name in (
-        "_strip_audio_config_if_orphaned",
-        "_strip_vision_config_if_orphaned",
-        "_drop_gemma4_mlx_shared_kv_extras_on_load",
-        "_derive_gemma4_global_kv_on_load",
-        "_preserve_gemma4_unified_image_processor_on_load",
-        "_force_minimax_m3_moe_sanitize_on_load",
-        "_force_qwen4_exp_sanitize_on_load",
-        "_remap_nested_visual_on_load",
-        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-    ):
+    for name in _VLM_CONTEXTS:
         monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
 
     @contextmanager
@@ -656,7 +631,6 @@ def test_non_array_logits_names_the_type(tmp_path, monkeypatch):
 )
 def test_refused_bad_rank_prompt_leaves_config_untouched(tmp_path, monkeypatch, prompt):
     import mlx.nn as nn
-    import numpy as np
 
     from omlx import oq_verify
 
@@ -668,8 +642,11 @@ def test_refused_bad_rank_prompt_leaves_config_untouched(tmp_path, monkeypatch, 
     )
     before = config.read_bytes()
 
+    calls = []
+
     class Model(nn.Module):
         def __call__(self, x):
+            calls.append(True)
             return mx.zeros((1, 2, 4))
 
         def close(self):
@@ -680,11 +657,19 @@ def test_refused_bad_rank_prompt_leaves_config_untouched(tmp_path, monkeypatch, 
         oq_verify.verify_written_format_checkpoint(output, prompt=prompt())
     assert config.read_bytes() == before
     assert not (output / "VERIFY-FAILED.txt").exists()
+    assert calls == []
 
 
-def test_empty_snapshot_prompt_fails_verification(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("prompt", "match"),
+    [
+        pytest.param(np.array([], dtype=np.int32), "at least one token", id="empty"),
+        pytest.param(np.array(5, dtype=np.int32), "1-D or 2-D", id="0d"),
+        pytest.param(np.ones((1, 1, 2), dtype=np.int32), "1-D or 2-D", id="3d"),
+    ],
+)
+def test_empty_snapshot_prompt_fails_verification(tmp_path, monkeypatch, prompt, match):
     import mlx.nn as nn
-    import numpy as np
 
     from omlx import oq_verify
 
@@ -692,7 +677,7 @@ def test_empty_snapshot_prompt_fails_verification(tmp_path, monkeypatch):
     output.mkdir()
     (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
     (output / "verify").mkdir()
-    np.savez(output / "verify" / "reference.npz", prompt=np.array([], dtype=np.int32))
+    np.savez(output / "verify" / "reference.npz", prompt=prompt)
 
     class Model(nn.Module):
         def __call__(self, x):
@@ -702,13 +687,12 @@ def test_empty_snapshot_prompt_fails_verification(tmp_path, monkeypatch):
             pass
 
     _stub_vlm_verification(monkeypatch, Model())
-    with pytest.raises(ValueError, match="at least one token"):
+    with pytest.raises(ValueError, match=match):
         oq_verify.verify_written_format_checkpoint(output)
-    assert "at least one token" in (output / "VERIFY-FAILED.txt").read_text()
+    assert match in (output / "VERIFY-FAILED.txt").read_text()
 
 
 def test_refused_empty_prompt_does_not_read_config(tmp_path):
-    import numpy as np
 
     from omlx import oq_verify
 
@@ -718,6 +702,65 @@ def test_refused_empty_prompt_does_not_read_config(tmp_path):
             absent, prompt=np.array([], dtype=np.int32)
         )
     assert not absent.exists()
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_logits_fails_verification(tmp_path, monkeypatch, value):
+    import mlx.nn as nn
+
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model(nn.Module):
+        def __call__(self, x):
+            return mx.full((1, 2, 4), value)
+
+        def close(self):
+            pass
+
+    _stub_vlm_verification(monkeypatch, Model())
+    with pytest.raises(RuntimeError, match="non-finite logits"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert "non-finite logits" in (output / "VERIFY-FAILED.txt").read_text()
+    record = json.loads((output / "config.json").read_text())["omlx_verification"]
+    assert "non-finite logits" in record["reason"]
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param(lambda: np.arange(6).reshape(2, 3), id="np"),
+        pytest.param(lambda: mx.arange(6).reshape(2, 3), id="mx"),
+    ],
+)
+def test_two_dimensional_caller_prompt_is_passed_through(tmp_path, monkeypatch, prompt):
+    import mlx.nn as nn
+
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir()
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.seen = None
+
+        def __call__(self, x):
+            self.seen = tuple(x.shape)
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    model = Model()
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output, prompt=prompt())
+    assert model.seen == (2, 3)
 
 
 def test_vlm_verification_uses_the_remapped_loader(tmp_path, monkeypatch):
@@ -800,17 +843,7 @@ def test_loads_forward_trust_remote_code(tmp_path, monkeypatch, is_vlm):
     (output / "config.json").write_text(json.dumps({"model_type": model_type}))
     seen = {}
 
-    for name in (
-        "_strip_audio_config_if_orphaned",
-        "_strip_vision_config_if_orphaned",
-        "_drop_gemma4_mlx_shared_kv_extras_on_load",
-        "_derive_gemma4_global_kv_on_load",
-        "_preserve_gemma4_unified_image_processor_on_load",
-        "_force_minimax_m3_moe_sanitize_on_load",
-        "_force_qwen4_exp_sanitize_on_load",
-        "_remap_nested_visual_on_load",
-        "_transpose_qwen35_mlx_vision_patch_embed_on_load",
-    ):
+    for name in _VLM_CONTEXTS:
         monkeypatch.setattr(engine_vlm, name, lambda path: nullcontext())
 
     class Model(nn.Module):
