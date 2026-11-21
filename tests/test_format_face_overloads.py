@@ -12,6 +12,10 @@ deprecation window with a ``DeprecationWarning`` and const skeleton calls.
 from __future__ import annotations
 
 import copy
+import hashlib
+import os
+import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 
@@ -34,6 +38,7 @@ from omlx.formats import (
     TileReads,
     TypeParam,
     WeightRead,
+    affine,
     kernels,
     testing,
 )
@@ -1377,3 +1382,392 @@ def test_declared_face_supports_replace_deepcopy_and_concurrent_construction():
         for i, f in enumerate(built)
     )
     assert formats.DotReads is DotReads
+
+
+# --- Shipped faces: built-in affine (219) and oQeL plugin (15) -------------
+
+
+def _digest_records(records) -> str:
+    h = hashlib.sha256()
+    for rec in records:
+        for part in rec:
+            h.update(part.encode() + b"\0")
+    return f"{len(records)} {h.hexdigest()}"
+
+
+# Baseline digests captured from untouched wip/3 head ba421f5c.
+_AFFINE_ALL_219_DIGEST = (
+    "219 36620c98ea01019f350d2f87aa9931cf8fc8ad26499a8c1d2e6a6448403dccb5"
+)
+_AFFINE_WIDE_AND_SG8_DIGEST = (
+    "294 f7278ceacc58a45f410c3012954ff81e2046f04dbf4d0458c1e0c2e355a21e18"
+)
+_OQEL_15_DIGESTS = {
+    False: "15 4f9de11638dc50371f7955ab38c36245cecf107296f180283f2d02898372d44b",
+    True: "15 a9abe62585311fd08e87cea5b043d416ebd0689e66663aa547b72719308b8c80",
+}
+_OQEL_BUILDER_DIGESTS = {
+    False: "123 2fe1f16b24dff3b1301daa6309ea977b42347b366f2b2e23181a361e3691a1ed",
+    True: "123 8c14fba93f1eb82b69038ccfbc20cb0bf1b299380f9c97b22c1640e787c79fa7",
+}
+
+
+def test_every_shipped_affine_face_declares_reads_without_deprecation():
+    affine.face.cache_clear()
+    affine.tile_face.cache_clear()
+    affine.codes_face.cache_clear()
+    faces = 0
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        for bits in affine._BITS:
+            for gs in affine._GROUP_SIZES:
+                for fast in (False, True):
+                    for dtype in (mx.bfloat16, mx.float16):
+                        f = affine.face(bits, gs, fast, dtype)
+                        assert isinstance(f.reads, DotReads)
+                        assert "__OMLX_READ_LOAD__" in f.source
+                        assert "__OMLX_READ_MADD__" in f.source
+                        assert "__OMLX_READ_APPLY__" in f.source
+                        assert "__OMLX_READ_APPLY_SHARED__" in f.shared
+                        assert "static float load(" in f.emitted_source
+                        assert "Dot<T>::Lanes<K>::apply(" in f.emitted_shared
+                        faces += 1
+        for bits in affine._TILE_BITS:
+            for gs in affine._GROUP_SIZES:
+                for dtype in (mx.bfloat16, mx.float16):
+                    f = affine.tile_face(bits, gs, dtype)
+                    assert isinstance(f.reads, TileReads)
+                    assert "__OMLX_READ_WEIGHT__" in f.source
+                    assert "static float weight(" in f.emitted_source
+                    faces += 1
+        for bits in affine._CODE_BITS:
+            for gs in affine._GROUP_SIZES:
+                for sd in affine._CODE_TYPES:
+                    for bd in affine._CODE_TYPES:
+                        f = affine.codes_face(bits, gs, sd, bd)
+                        assert isinstance(f.reads, CodesReads)
+                        assert "__OMLX_READ_PAIR__" in f.source
+                        assert "static uint pair(" in f.emitted_source
+                        faces += 1
+    assert faces == 219
+    assert [w for w in caught if issubclass(w.category, DeprecationWarning)] == []
+
+
+def test_all_shipped_affine_faces_and_builders_are_byte_identical_to_ba421f5c(
+    monkeypatch,
+):
+    from omlx.formats import tile_wide
+    from omlx.patches import qwen35_verify_qmm as verify_qmm
+
+    face_records = []
+    for bits in affine._BITS:
+        for gs in affine._GROUP_SIZES:
+            for fast in (False, True):
+                for dtype in (mx.bfloat16, mx.float16):
+                    f = affine.face(bits, gs, fast, dtype)
+                    m_plain = kernels.Matrices()
+                    m_plain.add("m", f)
+                    m_sh = kernels.Matrices()
+                    m_sh.add("m", f, shared=True)
+                    m_unr = kernels.Matrices(unrolled=True)
+                    m_unr.add("m", f, shared=True)
+                    m_pair = kernels.Matrices(unroll_pairs=True)
+                    m_pair.add("m", f, pair=True)
+                    face_records.append(
+                        (
+                            f.key,
+                            f.emitted_source,
+                            f.emitted_shared,
+                            m_plain.header,
+                            m_plain.declarations,
+                            m_sh.header,
+                            m_sh.declarations,
+                            m_unr.header,
+                            m_unr.declarations,
+                            m_pair.header,
+                            m_pair.declarations,
+                        )
+                    )
+    for bits in affine._TILE_BITS:
+        for gs in affine._GROUP_SIZES:
+            for dtype in (mx.bfloat16, mx.float16):
+                f = affine.tile_face(bits, gs, dtype)
+                m = kernels.Matrices()
+                m.add("m", f)
+                face_records.append((f.key, f.emitted_source, m.header, m.declarations))
+    for bits in affine._CODE_BITS:
+        for gs in affine._GROUP_SIZES:
+            for sd in affine._CODE_TYPES:
+                for bd in affine._CODE_TYPES:
+                    f = affine.codes_face(bits, gs, sd, bd)
+                    m = kernels.Matrices()
+                    m.add("m", f)
+                    face_records.append(
+                        (f.key, f.emitted_source, m.header, m.declarations)
+                    )
+    assert _digest_records(face_records) == _AFFINE_ALL_219_DIGEST
+
+    builder_records = []
+
+    def rec_mk(**kw):
+        builder_records.append((kw["name"], kw.get("header", ""), kw["source"]))
+        return lambda *a, **k: None
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", rec_mk)
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    for bits in affine._TILE_BITS:
+        for gs in affine._GROUP_SIZES:
+            for dtype in (mx.bfloat16, mx.float16):
+                tf = affine.tile_face(bits, gs, dtype)
+                tile_wide.kernel(tf)
+                df = affine.face(bits, gs, True, dtype)
+                tile_wide.pair_kernel.__wrapped__(df, tf)
+    for bits in affine._CODE_BITS:
+        for gs in affine._GROUP_SIZES:
+            for sd in affine._CODE_TYPES:
+                for bd in affine._CODE_TYPES:
+                    cf = affine.codes_face(bits, gs, sd, bd)
+                    for dtype in (mx.bfloat16, mx.float16):
+                        verify_qmm._sg8_launch.__wrapped__(
+                            (cf,), 4, 512, 512, gs, dtype, False
+                        )
+    assert _digest_records(builder_records) == _AFFINE_WIDE_AND_SG8_DIGEST
+
+
+def _oqel():
+    """The oQeL plugin's face module, from the installed package or the
+    checkout ``OMLX_OQEL_SRC`` names."""
+    try:
+        import omlx_oqel.face as face
+        from omlx_oqel import codebook
+
+        return face, codebook
+    except ImportError:
+        pass
+    source = os.environ.get("OMLX_OQEL_SRC")
+    if not source:
+        pytest.skip("omlx-oqel is not installed (set OMLX_OQEL_SRC to its src/)")
+    sys.path.insert(0, source)
+    try:
+        import omlx_oqel.face as face
+        from omlx_oqel import codebook
+
+        return face, codebook
+    finally:
+        sys.path.remove(source)
+
+
+_OQEL_AUX = AuxType("Aux")
+_OQEL_DOT_READS = DotReads(
+    load=LoadRead(input=TypeParam("XP"), returns=_OQEL_AUX, params=("x", "xt")),
+    madd=MaddRead(aux=_OQEL_AUX, params=("acc", "r", "xt", "")),
+    apply=ApplyRead(
+        aux=_OQEL_AUX,
+        params=("acc", "d", "xt", ""),
+        wrap=True,
+        wrap_indent="",
+    ),
+)
+_OQEL_TILE_READS = TileReads(WeightRead(params=("p", "codes", "i")))
+
+
+def _migrate_oqel_dot(legacy: Dot) -> Dot:
+    """Port an oQeL a6480a5 Dot face to declared read signatures."""
+    src = legacy.source
+    replacements = (
+        (
+            "template <typename XP>\nstatic Aux load(XP x, thread float* xt) {",
+            "__OMLX_READ_LOAD__ {",
+        ),
+        (
+            "static float apply(\n"
+            "float acc, thread const Decoded& d, thread const float* xt, Aux) {",
+            "__OMLX_READ_APPLY__ {",
+        ),
+        (
+            "static float madd(float acc, Row r, thread const float* xt, Aux) {",
+            "__OMLX_READ_MADD__ {",
+        ),
+    )
+    for old, new in replacements:
+        assert src.count(old) == 1, old
+        src = src.replace(old, new)
+    return Dot(
+        key=legacy.key,
+        source=src,
+        type=legacy.type,
+        tensors=legacy.tensors,
+        dtypes=legacy.dtypes,
+        tables=legacy.tables,
+        shared=legacy.shared,
+        vpt=legacy.vpt,
+        reads=_OQEL_DOT_READS,
+    )
+
+
+def _migrate_oqel_tile(legacy: Tile) -> Tile:
+    """Port an oQeL a6480a5 Tile face to declared read signatures."""
+    old = "    static float weight(thread const P& p, Codes codes, int i) {"
+    assert legacy.source.count(old) == 1
+    return Tile(
+        key=legacy.key,
+        source=legacy.source.replace(old, "    __OMLX_READ_WEIGHT__ {"),
+        type=legacy.type,
+        tensors=legacy.tensors,
+        dtypes=legacy.dtypes,
+        tables=legacy.tables,
+        reads=_OQEL_TILE_READS,
+    )
+
+
+def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool, *, migrate: bool):
+    from omlx.formats import linear as format_linear
+    from omlx.formats import tile_gather, tile_wide
+    from omlx.patches import m5_gather_qmm_nax as nax
+    from omlx.patches import moe_verify_gather as gather
+    from omlx.patches import qwen35_moe_routed_decode as routed
+
+    monkeypatch.setattr(kernels, "_small_tables_as_selects", lambda: selects)
+    monkeypatch.setattr(nax, "_read_mlx_headers", lambda names: "")
+    monkeypatch.setattr(nax, "_kernels", {})
+    monkeypatch.setattr(nax, "_header_failed", False)
+    monkeypatch.setattr(tile_gather, "_headers", lambda: "")
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+
+    shared = affine.face(8, 128, True, mx.bfloat16)
+    gate = affine.face(8, 64, True, mx.bfloat16)
+    other = codebook.Layout(tables=tuple(reversed(codebook.FLASH_NEXT)))
+
+    builder_records = []
+
+    def rec_mk(**kw):
+        builder_records.append((kw["name"], kw.get("header", ""), kw["source"]))
+        return lambda *a, **k: None
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", rec_mk)
+
+    face_records = []
+    for bits in (2, 3, 4):
+        for vpt in (8, 16):
+            for layout in (codebook.DEFAULT, other):
+                legacy = face_mod.dot(bits, layout, vpt)
+                f = _migrate_oqel_dot(legacy) if migrate else legacy
+                if migrate:
+                    assert f.emitted_source == legacy.source
+                m_plain = kernels.Matrices()
+                m_plain.add("m", f)
+                m_sh = kernels.Matrices()
+                m_sh.add("m", f, shared=True)
+                m_unr = kernels.Matrices(unrolled=True)
+                m_unr.add("m", f, shared=True)
+                m_pair = kernels.Matrices(unroll_pairs=True)
+                m_pair.add("m", f, pair=True)
+                face_records.append(
+                    (
+                        f.key,
+                        f.emitted_source,
+                        f.emitted_shared,
+                        m_plain.header,
+                        m_plain.declarations,
+                        m_sh.header,
+                        m_sh.declarations,
+                        m_unr.header,
+                        m_unr.declarations,
+                        m_pair.header,
+                        m_pair.declarations,
+                    )
+                )
+                format_linear._kernel.__wrapped__(f, False)
+                format_linear._kernel.__wrapped__(f, True)
+                format_linear._shared_kernel.__wrapped__(f)
+                gather._kernel.__wrapped__(f)
+                gather._ordered_kernel.__wrapped__(f)
+                routed._gate_up_kernel.__wrapped__(f, None, None)
+                routed._down_kernel.__wrapped__(f, None)
+                routed._gate_up_window_kernel.__wrapped__(f, shared, gate)
+                routed._down_window_kernel.__wrapped__(f, shared)
+        legacy_t = face_mod.tile(bits, codebook.DEFAULT)
+        tf = _migrate_oqel_tile(legacy_t) if migrate else legacy_t
+        if migrate:
+            assert tf.emitted_source == legacy_t.source
+        m = kernels.Matrices()
+        m.add("m", tf)
+        face_records.append((tf.key, tf.emitted_source, m.header, m.declarations))
+        tile_gather._build.__wrapped__(tf)
+        tile_wide.kernel(tf)
+        for kind in ("plain", "act", "act_map"):
+            nax._face_kernel(tf, kind)
+    return _digest_records(face_records), _digest_records(builder_records)
+
+
+@pytest.mark.parametrize("selects", [False, True], ids=["staged", "selects"])
+def test_every_oqel_plugin_face_is_byte_identical_legacy_and_migrated(
+    monkeypatch, selects
+):
+    face_mod, codebook = _oqel()
+    face_mod.dot.cache_clear()
+    face_mod.tile.cache_clear()
+    with warnings.catch_warnings(record=True) as legacy_warns:
+        warnings.simplefilter("always", DeprecationWarning)
+        legacy_faces, legacy_builders = _oqel_digests(
+            monkeypatch, face_mod, codebook, selects, migrate=False
+        )
+    assert (
+        len([w for w in legacy_warns if issubclass(w.category, DeprecationWarning)])
+        == 15
+    )
+    assert legacy_faces == _OQEL_15_DIGESTS[selects]
+    assert legacy_builders == _OQEL_BUILDER_DIGESTS[selects]
+
+    # Migrated oQeL faces (using DotReads / TileReads) warn zero times and
+    # emit byte-identical Metal across all 15 faces and all 123 served builders.
+    with warnings.catch_warnings(record=True) as migrated_warns:
+        warnings.simplefilter("always", DeprecationWarning)
+        migrated_faces, migrated_builders = _oqel_digests(
+            monkeypatch, face_mod, codebook, selects, migrate=True
+        )
+    assert [
+        w for w in migrated_warns if issubclass(w.category, DeprecationWarning)
+    ] == []
+    assert migrated_faces == _OQEL_15_DIGESTS[selects]
+    assert migrated_builders == _OQEL_BUILDER_DIGESTS[selects]
+
+
+@pytest.mark.parametrize("bits, k", [(2, 256), (3, 256), (4, 256), (2, 512), (4, 512)])
+def test_migrated_oqel_dot_face_runs_bit_identically(bits, k):
+    face_mod, codebook = _oqel()
+    plugin = pytest.importorskip("omlx_oqel")
+    vpt = 16 if k == 512 else 8
+    legacy = face_mod.dot(bits, codebook.DEFAULT, vpt)
+    migrated = _migrate_oqel_dot(legacy)
+    layout = plugin.FORMAT.layout(k, 8, bits, 64)
+    operands = (
+        mx.full(layout["codes"][0], 0x5A, layout["codes"][1]),
+        mx.full(layout["group_scales"][0], 0x20, mx.uint8),
+        mx.ones(layout["row_scales"][0], mx.bfloat16),
+    )
+    x = mx.ones((k,), mx.bfloat16)
+    want = testing.dot_rows(legacy, operands, x, 8)
+    got = testing.dot_rows(migrated, operands, x, 8)
+    _assert_bits(got, want)
+    xs = mx.stack([x, x * 2])
+    want_sh = testing.shared_rows(legacy, operands, xs, 8, rps=2)
+    got_sh = testing.shared_rows(migrated, operands, xs, 8, rps=2)
+    _assert_bits(got_sh, want_sh)
+
+
+@pytest.mark.parametrize("bits, k", [(2, 256), (3, 256), (4, 256)])
+def test_migrated_oqel_tile_face_runs_bit_identically(bits, k):
+    face_mod, codebook = _oqel()
+    plugin = pytest.importorskip("omlx_oqel")
+    legacy = face_mod.tile(bits, codebook.DEFAULT)
+    migrated = _migrate_oqel_tile(legacy)
+    layout = plugin.FORMAT.layout(k, 8, bits, 64)
+    operands = (
+        mx.full(layout["codes"][0], 0x5A, layout["codes"][1]),
+        mx.full(layout["group_scales"][0], 0x20, mx.uint8),
+        mx.ones(layout["row_scales"][0], mx.bfloat16),
+    )
+    want, _ = testing.tile_rows(legacy, operands, k, range(8), mx.bfloat16)
+    got, _ = testing.tile_rows(migrated, operands, k, range(8), mx.bfloat16)
+    _assert_bits(got, want)

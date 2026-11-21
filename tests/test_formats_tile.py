@@ -216,7 +216,7 @@ def test_a_kernel_of_both_kinds_has_both_skeletons():
     matrices.add("t", tile)
     matrices.add("u", replace(tile, key="toy_both_again"))
     assert matrices.header == _header(
-        (dot.key, dot.source), (tile.key, tile.source), rows=True
+        (dot.key, dot.emitted_source), (tile.key, tile.emitted_source), rows=True
     )
 
 
@@ -904,6 +904,7 @@ def test_affine_gives_its_4_and_8_bit_layers_a_tile_face(
         type=f"omlx_affine_tile_b{bits}g{group_size}::Tile<{metal_type}>",
         tensors=("scales", "biases"),
         dtypes=(dtype,),
+        reads=affine._TILE_READS,
     )
     # One source for both types of scales.
     other = affine.tile_face(bits, group_size, _DTYPES[dtype == mx.bfloat16])

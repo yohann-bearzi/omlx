@@ -29,7 +29,22 @@ from functools import cache
 
 import mlx.core as mx
 
-from . import Codes, Dot, QuantFormat, Tile
+from . import (
+    ApplyRead,
+    Codes,
+    CodesReads,
+    Dot,
+    DotReads,
+    LoadRead,
+    MaddRead,
+    PairRead,
+    Pointer,
+    QuantFormat,
+    Tile,
+    TileReads,
+    TypeParam,
+    WeightRead,
+)
 
 _BITS = (2, 3, 4, 5, 6, 8)
 _GROUP_SIZES = (32, 64, 128)
@@ -457,19 +472,17 @@ __LAYOUT_CHECK__
       b += BLOCK_SIZE / GS;
     }
 
-    template <typename XP>
-    static float load(XP x, thread float* x_thread) {
+    __OMLX_READ_LOAD__ {
       return load_vector(x, x_thread);
     }
 
-    static float madd(float acc, Row r, const thread float* x_thread, float sum) {
+    __OMLX_READ_MADD__ {
       return acc + qdot(r.w, x_thread, r.s, r.b, sum);
     }
 
     struct Decoded;
     static Decoded decode(Row r);
-    static float apply(
-        float acc, thread const Decoded& d, const thread float* x_thread, float sum);
+    __OMLX_READ_APPLY__;
 
     float finish(int, float sum) const { return sum; }
   };
@@ -499,13 +512,32 @@ METAL_FUNC typename Dot<T>::template Lanes<K>::Decoded Dot<T>::Lanes<K>::decode(
   return d;
 }
 
-template <typename T>
-template <int K>
-METAL_FUNC float Dot<T>::Lanes<K>::apply(
-    float acc, thread const Decoded& d, const thread float* x_thread, float sum) {
+__OMLX_READ_APPLY_SHARED__ {
   return acc + (d.s * wdot(d.wq, x_thread) + sum * d.b);
 }
 """
+
+_AFFINE_SCRATCH = Pointer("thread", "float", const=True, const_first=True)
+_DOT_READS = DotReads(
+    load=LoadRead(
+        input=TypeParam("XP"),
+        scratch=Pointer("thread", "float", const=False),
+        returns="float",
+        params=("x", "x_thread"),
+    ),
+    madd=MaddRead(
+        scratch=_AFFINE_SCRATCH,
+        params=("acc", "r", "x_thread", "sum"),
+    ),
+    apply=ApplyRead(
+        scratch=_AFFINE_SCRATCH,
+        params=("acc", "d", "x_thread", "sum"),
+        shared_slot="apply_shared",
+        shared_owner="Dot<T>::Lanes<K>",
+        shared_templates=("typename T", "int K"),
+        wrap=True,
+    ),
+)
 
 
 def values_per_thread(bits: int, fast: bool) -> int:
@@ -545,6 +577,7 @@ def face(
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
         dtypes=(dtype,),
+        reads=_DOT_READS,
     )
 
 
@@ -638,7 +671,7 @@ __RUNS__
     Codes fetch(int run) const {
       return Codes(c[run]);
     }
-    static float weight(thread const P& p, Codes q, int i) {
+    __OMLX_READ_WEIGHT__ {
       return p.s * float(code_at(q, i)) + p.b;
     }
   };
@@ -707,6 +740,9 @@ def _tile_source(bits: int, group_size: int) -> str:
     return f"namespace {namespace} {{\n{tile}\n}}  // namespace {namespace}\n"
 
 
+_TILE_READS = TileReads(WeightRead(params=("p", "q", "i")))
+
+
 @cache
 def tile_face(bits: int, group_size: int, dtype: mx.Dtype) -> Tile:
     """The tile face of ``bits``-bit weights with ``group_size`` groups and
@@ -724,6 +760,7 @@ def tile_face(bits: int, group_size: int, dtype: mx.Dtype) -> Tile:
         type=f"omlx_affine_tile_b{bits}g{group_size}::Tile<{_METAL_TYPES[dtype]}>",
         tensors=AffineFormat.tensors,
         dtypes=(dtype,),
+        reads=_TILE_READS,
     )
 
 
@@ -742,7 +779,7 @@ _PACKED_RUN = """
       v >>= shift;
       return uint2(uint(v), uint(v >> (4 * BITS)));
     }
-    static uint pair(uint2 q, int j) {
+    __OMLX_READ_PAIR__ {
       constexpr uint MASK = (1u << BITS) - 1;
       uint2 p = (q >> (BITS * j)) & MASK;
       return p.x | (p.y << 16);
@@ -750,7 +787,10 @@ _PACKED_RUN = """
 
 _NIBBLE_RUN = """
     uint fetch(int run) const { return w[run]; }
-    static uint pair(uint q, int j) { return (q >> (4 * j)) & 0x000f000fu; }"""
+    __OMLX_READ_PAIR__ { return (q >> (4 * j)) & 0x000f000fu; }"""
+
+_NIBBLE_READS = CodesReads(PairRead(pack="uint", params=("q", "j")))
+_PACKED_READS = CodesReads(PairRead(pack="uint2", params=("q", "j")))
 
 
 @cache
@@ -793,6 +833,7 @@ struct Codes {{
         f"omlx_{key}::Codes",
         AffineFormat.tensors,
         (mx.bfloat16, mx.float16),
+        reads=_NIBBLE_READS if bits == 4 else _PACKED_READS,
     )
 
 
