@@ -13,8 +13,6 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import os
-import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -1668,26 +1666,16 @@ def test_all_shipped_affine_faces_and_builders_are_byte_identical_to_ba421f5c(
 
 
 def _oqel():
-    """The oQeL plugin's face module, from the installed package or the
-    checkout ``OMLX_OQEL_SRC`` names."""
+    """The oQeL plugin's face module, from the installed package."""
     try:
         import omlx_oqel.face as face
         from omlx_oqel import codebook
 
         return face, codebook
     except ImportError:
-        pass
-    source = os.environ.get("OMLX_OQEL_SRC")
-    if not source:
-        pytest.skip("omlx-oqel is not installed (set OMLX_OQEL_SRC to its src/)")
-    sys.path.insert(0, source)
-    try:
-        import omlx_oqel.face as face
-        from omlx_oqel import codebook
-
-        return face, codebook
-    finally:
-        sys.path.remove(source)
+        pytest.skip(
+            "omlx-oqel is not installed (stage it with tools/integ/stage-plugin.sh)"
+        )
 
 
 _OQEL_AUX = AuxType("Aux")
