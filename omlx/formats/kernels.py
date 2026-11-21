@@ -412,12 +412,13 @@ struct omlx_tile_face<F, K, true, FACE, true> {
 # product with row `row + r`; with PARTIAL the pack holds `valid` rows (the
 # last tile of an N that is not whole packs). Every vector's inputs of a
 # block are loaded ahead of the rows. A kernel that asks for a full unroll
-# (Matrices(unrolled=True)) folds the block over its inputs and its rows, and
-# unrolls the skeleton's other loops (OMLX_SHARED_UNROLL), each array then
-# living in registers; any other kernel keeps the block's loops. A kernel
-# calls qmv_shared, which asserts what the compiler would not report, as
-# qmv_rows does, and that the face's vpt is its Lanes<K>::VPT: a launch is
-# sized by it.
+# (Matrices(unrolled=True)) unrolls the block's three loops and the
+# skeleton's other loops with clang's full-unroll pragma (except ROWS == 3,
+# which keeps the pack-fold where pragma unrolling loses +0.65-0.90% on
+# M5 Max 8-bit shared rows); any other kernel keeps the block's loops. A
+# kernel calls qmv_shared, which asserts what the compiler would not report,
+# as qmv_rows does, and that the face's vpt is its Lanes<K>::VPT: a launch
+# is sized by it.
 _SHARED_LOOPED = _compact(r"""
 template <int K, int ROWS, int RPS, bool PARTIAL, typename L, typename XP>
 METAL_FUNC void omlx_shared_block(
@@ -440,7 +441,7 @@ METAL_FUNC void omlx_shared_block(
 }
 """)
 
-_SHARED_FOLDED = _compact(r"""
+_SHARED_UNROLLED = _compact(r"""
 template <int R, int RPS, bool PARTIAL, typename L, typename A, int... I>
 METAL_FUNC void omlx_shared_row(
     thread const L& a, int valid, thread const float (*xs)[L::VPT],
@@ -465,8 +466,29 @@ METAL_FUNC void omlx_shared_folded(
 template <int K, int ROWS, int RPS, bool PARTIAL, typename L, typename XP>
 METAL_FUNC void omlx_shared_block(
     thread const L& a, int valid, XP x, thread float* result) {
-  omlx_shared_folded<K, RPS, PARTIAL>(
-      a, valid, x, result, omlx_iota<ROWS>(), omlx_iota<RPS>());
+  if constexpr (ROWS == 3) {
+    omlx_shared_folded<K, RPS, PARTIAL>(
+        a, valid, x, result, omlx_iota<ROWS>(), omlx_iota<RPS>());
+  } else {
+    float xs[ROWS][L::VPT];
+    decltype(L::load(x, xs[0])) aux[ROWS];
+    OMLX_SHARED_UNROLL
+    for (int i = 0; i < ROWS; i++) {
+      aux[i] = L::load(x + i * K, xs[i]);
+    }
+    OMLX_SHARED_UNROLL
+    for (int r = 0; r < RPS; r++) {
+      if (PARTIAL && r >= valid) {
+        break;
+      }
+      const auto d = L::decode(a.row(r));
+      OMLX_SHARED_UNROLL
+      for (int i = 0; i < ROWS; i++) {
+        thread const float* xt = xs[i];
+        result[i * RPS + r] = L::apply(result[i * RPS + r], d, xt, aux[i]);
+      }
+    }
+  }
 }
 """)
 
@@ -615,11 +637,12 @@ def unrolled_tile_ok(vpt: int, rps: int, rows_per_group: int) -> bool:
 
 
 def _qmv_shared(unrolled: bool) -> str:
-    if unrolled:
-        block, unroll = _SHARED_FOLDED, '_Pragma("clang loop unroll(full)")'
-    else:
-        block, unroll = _SHARED_LOOPED, ""
-    return block + _QMV_SHARED.replace("OMLX_SHARED_UNROLL", unroll)
+    # Pragma-unroll all three block loops (wins -0.37-0.67% at ROWS==4 on both
+    # Macs and emits bit-identical AGX code at 2..6-bit ROWS==2), while keeping
+    # the pack-fold strictly for ROWS==3 where pragma loses +0.65-0.90% on M5.
+    block = _SHARED_UNROLLED if unrolled else _SHARED_LOOPED
+    unroll = '_Pragma("clang loop unroll(full)")' if unrolled else ""
+    return (block + _QMV_SHARED).replace("OMLX_SHARED_UNROLL", unroll)
 
 
 # The shared-rows skeleton, rolled and unrolled, as a kernel carries it.

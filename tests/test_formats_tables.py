@@ -290,7 +290,7 @@ def _metal_digest(recorded):
 # The 144 verify-gather builders use wide offsets. Bounded ordered blocks
 # add 72 kernels using 32-bit input and output offsets, and bounded blocks'
 # unordered gathers add the other 72.
-_METAL_DIGEST = "604 40ccf77eaa5bcda8076e6c32dfca77cb136cf8292858db24a0db754def01056a"
+_METAL_DIGEST = "604 2cf655a1ca8b425edb5362e96e042326fce36783b794e74acd545fac2902ab60"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):

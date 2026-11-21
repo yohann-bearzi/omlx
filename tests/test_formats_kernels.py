@@ -913,7 +913,7 @@ def test_the_skeletons_are_carried_compact():
         kernels._QMV_ROWS,
         kernels._TILE_FACE,
         kernels._SHARED_LOOPED,
-        kernels._SHARED_FOLDED,
+        kernels._SHARED_UNROLLED,
         kernels._QMV_SHARED,
         kernels.STORE_ROWS,
     ):
@@ -924,6 +924,13 @@ def test_the_skeletons_are_carried_compact():
     assert kernels._compact("  a;  \n") == "a;\n"
 
 
+def test_rolled_shared_block_has_no_dead_unroll_lines():
+    """The rolled block carries no unroll placeholder lines: only the unrolled
+    variant has them (rule 29: no dead lines)."""
+    assert "OMLX_SHARED_UNROLL" not in kernels._SHARED_LOOPED
+    assert "\n\n" not in kernels._SHARED_LOOPED
+
+
 def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     face = _toy("unroll")
     rolled, unrolled = kernels.Matrices(), kernels.Matrices(unrolled=True)
@@ -931,12 +938,13 @@ def test_a_kernel_that_shares_unrolls_its_skeleton_when_asked():
     unrolled.add("m", face, shared=True)
     pragma = '_Pragma("clang loop unroll(full)")'
     assert pragma not in rolled.header and pragma in unrolled.header
-    # The block is folds over the vectors and the rows when unrolled, loops
-    # otherwise; the walk over the blocks stays a loop.
-    assert "omlx_shared_folded" in unrolled.header
+    # Rolled keeps the looped block with no fold helper; unrolled pragma-unrolls
+    # all three inner loops and keeps the pack-fold strictly for ROWS == 3.
     assert "omlx_shared_folded" not in rolled.header
+    assert "if constexpr (ROWS == 3)" in unrolled.header
+    assert "omlx_shared_folded<K, RPS, PARTIAL>" in unrolled.header
     assert "aux[i] = L::load" in rolled.header
-    assert "aux[i] = L::load" not in unrolled.header
+    assert "aux[i] = L::load" in unrolled.header
     assert "\nfor (int k = 0; k < WHOLE; k += L::BLOCK) {\n" in unrolled.header
 
 
