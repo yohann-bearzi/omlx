@@ -3741,9 +3741,7 @@ def test_the_writer_rebases_and_skips_optiq_sidecar(source, tmp_path):
     assert not (tmp_path / "text" / "optiq").exists()
 
 
-def test_a_qwen35_moe_write_verifies_after_reload(
-    source, toy, tmp_path, no_family_verified
-):
+def test_a_qwen35_moe_write_verifies_after_reload(source, toy, tmp_path):
     output = tmp_path / "qwen35-oq4e"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config["omlx_verification"]["verified"] is True

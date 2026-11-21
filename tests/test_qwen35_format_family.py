@@ -1,43 +1,51 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Production admission for the Qwen3.5/3.6 MoE family."""
+"""The Qwen3.5/3.6 MoE family: not shipped; a test block admits a tiny one."""
 
 import json
 
 import pytest
 
 from omlx import formats, oq
+from omlx.formats import testing
 from omlx.model_discovery import detect_model_type
 from omlx.patches import format_load
 
+_PAIRS = [
+    ({"model_type": "qwen3_5_moe_text"}, "batched"),
+    ({"model_type": "qwen3_5_moe"}, "batched"),
+    (
+        {
+            "model_type": "qwen3_5_moe",
+            "text_config": {"model_type": "qwen3_5_moe_text"},
+            "vision_config": {"depth": 1},
+        },
+        "vlm",
+    ),
+]
 
-@pytest.mark.parametrize(
-    ("config", "loader"),
-    [
-        ({"model_type": "qwen3_5_moe_text"}, "batched"),
-        ({"model_type": "qwen3_5_moe"}, "batched"),
-        (
-            {
-                "model_type": "qwen3_5_moe",
-                "text_config": {"model_type": "qwen3_5_moe_text"},
-                "vision_config": {"depth": 1},
-            },
-            "vlm",
-        ),
-    ],
-)
-def test_qwen35_moe_writer_and_checked_loader_admit_its_format_record(
-    tmp_path, config, loader
-):
+
+@pytest.mark.parametrize(("config", "loader"), _PAIRS)
+def test_the_shipped_gate_refuses_the_qwen35_family(tmp_path, config, loader):
     config = {**config, "omlx_quant_formats": {"example": {}}}
-    assert oq._unverified_family(config) is None
+    assert oq._unverified_family(config) is not None
     (tmp_path / "config.json").write_text(json.dumps(config))
-    format_load.check_engine_loader(tmp_path, loader)
-    assert detect_model_type(tmp_path) == ("vlm" if loader == "vlm" else "llm")
-    with format_load.loading(tmp_path) as checkpoint:
-        assert checkpoint.verified
-    if loader == "vlm":
-        with pytest.raises(formats.FormatRefusedError, match="embedding"):
-            format_load.check_engine_loader(tmp_path, "embedding")
+    with pytest.raises(formats.FormatRefusedError):
+        format_load.check_engine_loader(tmp_path, loader)
+
+
+@pytest.mark.parametrize(("config", "loader"), _PAIRS)
+def test_a_test_block_admits_the_qwen35_family(tmp_path, config, loader):
+    config = {**config, "omlx_quant_formats": {"example": {}}}
+    with testing.verified("qwen3_5_moe", "qwen3_5_moe_text"):
+        assert oq._unverified_family(config) is None
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        format_load.check_engine_loader(tmp_path, loader)
+        assert detect_model_type(tmp_path) == ("vlm" if loader == "vlm" else "llm")
+        with format_load.loading(tmp_path) as checkpoint:
+            assert checkpoint.verified
+        if loader == "vlm":
+            with pytest.raises(formats.FormatRefusedError, match="embedding"):
+                format_load.check_engine_loader(tmp_path, "embedding")
 
 
 @pytest.mark.parametrize(

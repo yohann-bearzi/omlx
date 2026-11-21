@@ -7200,9 +7200,6 @@ def _row_chunks(t, max_elems):
 _QUANT_FORMAT_VERIFIED = frozenset(
     {
         ("qwen4_exp", "qwen4_exp_text"),
-        ("qwen3_5_moe", "qwen3_5_moe_text"),
-        ("qwen3_5_moe",),
-        ("qwen3_5_moe_text",),
     }
 )
 # The families tests take as verified (omlx.formats.testing.verified), while
