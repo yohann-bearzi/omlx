@@ -50,7 +50,7 @@ once.
 from __future__ import annotations
 
 import logging
-from functools import wraps
+from functools import cache, wraps
 
 import mlx.core as mx
 
@@ -305,6 +305,50 @@ def topk_header(dtype: mx.Dtype) -> str:
         declared = "\ntemplate <typename T, int NE>\nstruct omlx_router_topk;\n"
         return _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + declared + _TOPK_BF16
     return _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + _TOPK_GENERIC
+
+
+_TOPK_INDICES_TG_HEADER = """
+template <typename T, int NE, int K>
+METAL_FUNC void omlx_router_topk_indices_tg(
+    const device T* logits, uint lane, threadgroup uint* tg_ind) {
+  using TK = omlx_router_topk<T, NE>;
+  if constexpr (metal::is_same_v<T, bfloat16_t>) {
+    uint key[TK::PER];
+    TK::keys(logits, lane, key);
+    uint head[3];
+    TK::top3(key, 0xffffffffu, head);
+    int left = 3;
+    for (int j = 0; j < K; ++j) {
+      const uint sel = TK::step(key, head, left);
+      if (lane == 0) {
+        tg_ind[j] = sel == 0u ? uint(NE) : (sel & 0xffffu);
+      }
+    }
+  } else {
+    float vals[TK::PER];
+    omlx_router_softmax_row<T, NE>(logits, lane, vals);
+    bool taken[TK::PER];
+    for (uint k = 0; k < TK::PER; ++k) {
+      taken[k] = false;
+    }
+    for (int j = 0; j < K; ++j) {
+      float p;
+      uint idx;
+      TK::select(vals, taken, lane, p, idx);
+      if (lane == 0) {
+        tg_ind[j] = idx;
+      }
+    }
+  }
+}
+"""
+
+
+def topk_indices_header(dtype: mx.Dtype) -> str:
+    """``topk_header(dtype)`` plus ``omlx_router_topk_indices_tg`` for folded
+    verify-window kernels that write each row's selected expert indices into
+    threadgroup memory to coalesce shared experts across rows."""
+    return topk_header(dtype) + _TOPK_INDICES_TG_HEADER
 
 _SOFTMAX_TOPK_SOURCE = """
     const uint lane = thread_position_in_threadgroup.x;
@@ -622,6 +666,134 @@ def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
         threadgroup=(32, 1, 1),
         output_shapes=[(*lead, top_k), (*lead, top_k)],
         output_dtypes=[mx.uint32, logits.dtype],
+    )
+
+
+_COALESCE_MAX_PAIRS = 64
+_TOPK_WRITE_TG_HEADER = """
+template <typename T, int NE, int K>
+METAL_FUNC void omlx_router_topk_write_tg(
+    const device T* logits, uint lane,
+    device uint32_t* indices, device T* scores, threadgroup uint* tg_ind) {
+  using TK = omlx_router_topk<T, NE>;
+  float sel_p[K];
+  uint sel_i[K];
+  if constexpr (metal::is_same_v<T, bfloat16_t>) {
+    uint key[TK::PER];
+    TK::keys(logits, lane, key);
+    uint head[3];
+    TK::top3(key, 0xffffffffu, head);
+    int left = 3;
+    for (int j = 0; j < K; ++j) {
+      const uint sel = TK::step(key, head, left);
+      sel_p[j] = sel == 0u ? -INFINITY : as_type<float>(((sel >> 16) - 1u) << 16);
+      sel_i[j] = sel == 0u ? uint(NE) : (sel & 0xffffu);
+    }
+  } else {
+    float vals[TK::PER];
+    omlx_router_softmax_row<T, NE>(logits, lane, vals);
+    bool taken[TK::PER];
+    for (uint k = 0; k < TK::PER; ++k) {
+      taken[k] = false;
+    }
+    for (int j = 0; j < K; ++j) {
+      TK::select(vals, taken, lane, sel_p[j], sel_i[j]);
+    }
+  }
+  if (lane == 0) {
+    float total = 0.0f;
+    for (uint j = 0; j < K; ++j) {
+      total += sel_p[j];
+    }
+    float inv = 1.0f / total;
+    for (uint j = 0; j < K; ++j) {
+      indices[j] = sel_i[j];
+      tg_ind[j] = sel_i[j];
+      scores[j] = T(sel_p[j] * inv);
+    }
+  }
+}
+"""
+
+_SOFTMAX_TOPK_COALESCE_SOURCE = """
+    const uint sg = simdgroup_index_in_threadgroup;
+    const uint lane = thread_index_in_simdgroup;
+    constexpr uint P = uint(M * K);
+    threadgroup uint experts[64];
+    threadgroup uint sorted_p[64];
+    omlx_router_topk_write_tg<T, NE, K>(
+        logits + sg * uint(NE), lane,
+        indices + sg * uint(K), scores + sg * uint(K),
+        experts + sg * uint(K));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint tid = sg * 32u + lane;
+    if (tid < P) {
+      const uint e = experts[tid];
+      uint r = 0;
+      for (uint q = 0; q < P; ++q) {
+        const uint f = experts[q];
+        r += (f < e || (f == e && q < tid)) ? 1u : 0u;
+      }
+      sorted_p[r] = tid;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+      uint g = 0, i = 0;
+      while (i < P) {
+        const uint p0 = sorted_p[i];
+        const uint e = experts[p0];
+        meta[g * 4 + 0] = e;
+        meta[g * 4 + 2] = p0;
+        if (i + 1u < P && experts[sorted_p[i + 1u]] == e) {
+          meta[g * 4 + 3] = sorted_p[i + 1u];
+          meta[g * 4 + 1] = 2u;
+          i += 2u;
+        } else {
+          meta[g * 4 + 1] = 1u;
+          i += 1u;
+        }
+        ++g;
+      }
+      ucount[0] = g;
+    }
+"""
+
+
+@cache
+def _softmax_topk_coalesce_kernel(dtype: mx.Dtype):
+    selection = "bf16" if dtype == mx.bfloat16 else "scan"
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_router_softmax_topk_coalesce_{selection}",
+        input_names=["logits"],
+        output_names=["indices", "scores", "meta", "ucount"],
+        header=topk_header(dtype) + _TOPK_WRITE_TG_HEADER,
+        source=_SOFTMAX_TOPK_COALESCE_SOURCE,
+    )
+
+
+def softmax_topk_coalesce(logits, top_k: int, max_rows: int = _MAX_ROWS):
+    """``softmax_topk_rows`` plus pair-coalesced expert work groups in one
+    threadgroup launch (``2 <= rows <= max_rows`` and ``rows * top_k <= 64``).
+
+    Returns ``(indices, scores, meta, ucount)`` where ``meta`` holds
+    ``ucount[0]`` 4-word records ``(expert, count in {1, 2}, p0, p1)`` with
+    ``p = row * top_k + slot``, or None outside the supported geometry."""
+    ne = logits.shape[-1]
+    rows = logits.size // ne
+    if (
+        rows < 2
+        or rows * top_k > _COALESCE_MAX_PAIRS
+        or not softmax_topk_eligible(logits, max_rows)
+    ):
+        return None
+    lead = logits.shape[:-1]
+    return _softmax_topk_coalesce_kernel(logits.dtype)(
+        inputs=[logits],
+        template=[("T", logits.dtype), ("NE", ne), ("M", rows), ("K", top_k)],
+        grid=(32, rows, 1),
+        threadgroup=(32, rows, 1),
+        output_shapes=[(*lead, top_k), (*lead, top_k), (rows * top_k * 4,), (1,)],
+        output_dtypes=[mx.uint32, logits.dtype, mx.uint32, mx.uint32],
     )
 
 

@@ -635,6 +635,108 @@ _ROWS_SKELETONS = (
     ),
 )
 
+_QMV_PAIR_ROWS = _compact(r"""
+template <int R, typename L, typename A>
+METAL_FUNC void omlx_pair_row(
+    thread const L& m,
+    thread const float* xs0,
+    thread const float* xs1,
+    A aux0,
+    A aux1,
+    thread float* r0,
+    thread float* r1) {
+  const auto d = L::decode(m.row(R));
+  r0[R] = L::apply(r0[R], d, xs0, aux0);
+  r1[R] = L::apply(r1[R], d, xs1, aux1);
+}
+
+template <int K, int RPS, typename D, typename XP, int... R>
+METAL_FUNC void omlx_qmv_pair_rows(
+    omlx_ints<R...>,
+    D ma,
+    size_t row_a,
+    D mb,
+    size_t row_b,
+    XP x0,
+    XP x1,
+    uint simd_lid,
+    thread float* r0,
+    thread float* r1) {
+  using L = typename D::template Lanes<K>;
+  constexpr int WHOLE = K - K % L::BLOCK;
+  constexpr int LAST = K % L::BLOCK / L::VPT;
+  L a(ma, row_a, simd_lid);
+  L b(mb, row_b, simd_lid);
+  const int lane_off = int(simd_lid) * L::VPT;
+  x0 += lane_off;
+  x1 += lane_off;
+  float xs0[L::VPT], xs1[L::VPT];
+  ((r0[R] = 0.0f, r1[R] = 0.0f, r0[RPS + R] = 0.0f, r1[RPS + R] = 0.0f), ...);
+  for (int k = 0; k < WHOLE; k += L::BLOCK) {
+    const auto aux0 = L::load(x0, xs0);
+    const auto aux1 = L::load(x1, xs1);
+    (omlx_pair_row<R>(a, xs0, xs1, aux0, aux1, r0, r1), ...);
+    (omlx_pair_row<R>(b, xs0, xs1, aux0, aux1, r0 + RPS, r1 + RPS), ...);
+    a.step();
+    b.step();
+    x0 += L::BLOCK;
+    x1 += L::BLOCK;
+  }
+  if constexpr (LAST > 0) {
+    if (simd_lid < uint(LAST)) {
+      const auto aux0 = L::load(x0, xs0);
+      const auto aux1 = L::load(x1, xs1);
+      (omlx_pair_row<R>(a, xs0, xs1, aux0, aux1, r0, r1), ...);
+      (omlx_pair_row<R>(b, xs0, xs1, aux0, aux1, r0 + RPS, r1 + RPS), ...);
+    }
+  }
+  ((r0[R] = a.finish(R, metal::simd_sum(r0[R])),
+    r1[R] = a.finish(R, metal::simd_sum(r1[R])),
+    r0[RPS + R] = b.finish(R, metal::simd_sum(r0[RPS + R])),
+    r1[RPS + R] = b.finish(R, metal::simd_sum(r1[RPS + R]))),
+   ...);
+}
+
+template <typename T, int K, int RPS, typename D, typename XP>
+METAL_FUNC void qmv_pair_rows(
+    D ma,
+    size_t row_a,
+    D mb,
+    size_t row_b,
+    XP x0,
+    XP x1,
+    uint simd_lid,
+    thread float* r0,
+    thread float* r1) {
+  const auto xc0 = omlx_inputs<T>(x0);
+  const auto xc1 = omlx_inputs<T>(x1);
+  constexpr int FACE = D::CONTRACT;
+  (void)sizeof(omlx_revision<FACE>);
+  if constexpr (FACE <= OMLX_CONTRACT && FACE >= OMLX_OLDEST_CONTRACT) {
+    using L = typename D::template Lanes<K>;
+    static_assert(
+        L::VPT >= 1,
+        "dot face: Lanes<K>::VPT must be one input or more");
+    if constexpr (L::VPT >= 1) {
+      static_assert(
+          L::BLOCK == 32 * L::VPT,
+          "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
+          "lanes");
+      static_assert(
+          K % L::VPT == 0,
+          "dot face: K must be a whole number of a lane's VPT inputs");
+      omlx_qmv_pair_rows<K, RPS>(
+          omlx_iota<RPS>(), ma, row_a, mb, row_b, xc0, xc1, simd_lid, r0, r1);
+    }
+  }
+}
+""")
+
+# Pair-unrolled single-input row skeleton for short-K verify-window down
+# launches: identical arithmetic and contract checks to qmv_rows, with
+# unroll_count(2) on the K-block walk. Kept separate from _QMV_ROWS so existing
+# non-window kernels keep their exact Metal text and line numbers.
+
 
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
 # kernel that stores rows adds this to its header.
@@ -1138,16 +1240,25 @@ class Matrices:
         self._staged: dict[str, tuple[str, ...]] = {}
         self._shared: set[Dot] = set()
         self._shared_names: set[str] = set()
+        self._pair: set[Dot] = set()
         self._unrolled = unrolled
         self._unroll_pairs = unroll_pairs
 
-    def add(self, name: str, face: Dot | Tile, shared: bool = False) -> list[str]:
+    def add(
+        self,
+        name: str,
+        face: Dot | Tile,
+        shared: bool = False,
+        pair: bool = False,
+    ) -> list[str]:
         """Add matrix ``name``, read through ``face``, a ``Dot`` or a
         ``Tile``. Returns its kernel inputs: the weight, then the face's
         tensors in order. With ``shared``, the kernel applies one block's
         weights to several inputs (``decode`` and ``apply``, in the
         shared-rows skeleton ``qmv_shared``, which the header then holds)
-        and includes the dot face's shared source too. Refuses a name that
+        and includes the dot face's shared source too. With ``pair``, the
+        kernel calls ``qmv_pair_rows`` (and may also call ``qmv_rows``) and
+        includes the dot face's shared source too. Refuses a name that
         is not an identifier, a face of another type, a shared tile or a
         shared face of no ``vpt``, and a matrix whose name or inputs repeat
         those of a matrix added before: the kernel's other names are the
@@ -1156,9 +1267,9 @@ class Matrices:
             raise ValueError(f"matrix {name!r}: its name is not an identifier")
         if not isinstance(face, (Dot, Tile)):
             raise TypeError(f"matrix {name!r}: {face!r} is not a Dot or a Tile")
-        if shared and not isinstance(face, Dot):
+        if (shared or pair) and not isinstance(face, Dot):
             raise TypeError(f"matrix {name!r}: a tile face has no shared source")
-        if shared and face.vpt < 1:
+        if (shared or pair) and face.vpt < 1:
             raise ValueError(
                 f"matrix {name!r}: face {face.key} states no vpt, which sizes a "
                 "shared-rows launch"
@@ -1182,6 +1293,8 @@ class Matrices:
         if shared:
             self._shared.add(face)
             self._shared_names.add(name)
+        if pair:
+            self._pair.add(face)
         return inputs
 
     @property
@@ -1203,7 +1316,11 @@ class Matrices:
         # Shared definitions follow every declaration they may depend on.
         for phase in ("main", "shared"):
             for face in self._faces.values():
-                if phase == "shared" and face not in self._shared:
+                if (
+                    phase == "shared"
+                    and face not in self._shared
+                    and face not in self._pair
+                ):
                     continue
                 for name, when, source in face._metal_parts():
                     if when == phase and (source or name == "source"):
@@ -1232,6 +1349,7 @@ class Matrices:
             (_ROWS_SKELETONS[self._unroll_pairs], _ROWS_LINE, rows),
             (_TILE_FACE, _TILE_LINE, tiles),
             (_SHARED_SKELETONS[self._unrolled], _SHARED_LINE, bool(self._shared)),
+            (_QMV_PAIR_ROWS, _PAIR_LINE, bool(self._pair)),
         ):
             if wanted:
                 header += _named(_SKELETONS, piece, line)
@@ -1282,6 +1400,7 @@ _REVISIONS_LINE = _INDEX_PACKS.count("\n") + 1
 _ROWS_LINE = _REVISIONS_LINE + 1 + _CHECKS.count("\n")
 _TILE_LINE = _ROWS_LINE + _QMV_ROWS.count("\n")
 _SHARED_LINE = _TILE_LINE + _TILE_FACE.count("\n")
+_PAIR_LINE = _SHARED_LINE + _SHARED_SKELETONS[0].count("\n")
 
 # The skeletons' asserts hold the numbers by now. What follows (a face's
 # type, a kernel's header and body) does not read the macros.

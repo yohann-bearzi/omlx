@@ -159,6 +159,9 @@ _BUILDERS = (
     "_down_kernel",
     "_gate_up_window_kernel",
     "_down_window_kernel",
+    "_gate_up_window_coalesced_kernel",
+    "_gate_up_topk_coalesced_kernel",
+    "_down_window_unrolled_kernel",
     "_gate_up_topk_kernel",
 )
 _ROUTER_KERNELS = (

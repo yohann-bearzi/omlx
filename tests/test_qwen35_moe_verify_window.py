@@ -586,3 +586,90 @@ def test_a_window_of_format_layers_equals_one_token_decode(monkeypatch, engaged)
     for rows in (1, 2, 3, 8):
         for step in range(2):
             _check(block, _inputs(rows, step, hidden=1024), engaged)
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("rows", [2, 3, 4])
+def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows):
+    """Pair-coalesced verify-window kernels (3-launch folded and 4-launch
+    meta-driven, decoding each shared expert block once for two rows via the
+    dot face's decode/apply contract) and the unrolled window down kernel
+    reproduce one-token decode bit for bit across dtypes and overlap regimes."""
+    hidden, inter, top_k = (2560, 640, 10) if dtype == mx.bfloat16 else (2048, 512, 8)
+    block = _block(7, bits=4, hidden=hidden, inter=inter, top_k=top_k, dtype=dtype)
+    plan = _plan(block, mx.zeros((1, 1, hidden), dtype))
+    launches = plan.launches
+    assert launches.window_coalesced_kernel is not None
+    assert launches.window_topk_coalesced_kernel is not None
+    assert launches.window_down_unrolled_kernel is not None
+    w, gu_op, dn_op, sgu_op, sdn_op = plan.operands
+    for step in range(3):
+        x = _inputs(rows, step, hidden=hidden, dtype=dtype)
+        ref = _serial(block, x).reshape(rows, hidden)
+        x2d = mx.reshape(x, (rows, hidden))
+        logits = launches.router(x2d, *w)
+        # 4-launch coalesced gate+up + unrolled down
+        ind, sc, meta, ucount = router.softmax_topk_coalesce(logits, top_k)
+        h_c2 = routed._window_gate_up_coalesced(launches, x2d, meta, ucount, gu_op, sgu_op)
+        y_c2 = routed._window_down(launches, h_c2, ind, sc, dn_op, sdn_op)
+        # 3-launch folded pair-coalesced gate+up + unrolled down
+        h_fc, ind_fc, sc_fc = routed._window_gate_up_topk_coalesced(
+            launches, x2d, logits, gu_op, sgu_op
+        )
+        y_fc = routed._window_down(launches, h_fc, ind_fc, sc_fc, dn_op, sdn_op)
+        mx.eval(ref, y_c2, y_fc, ind, ind_fc, sc, sc_fc)
+        assert mx.array_equal(ind, ind_fc).item()
+        assert _same_bits(sc, sc_fc)
+        assert _same_bits(y_c2, ref)
+        assert _same_bits(y_fc, ref)
+
+
+def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
+    monkeypatch, engaged
+):
+    """A tabled dot face engages the coalesced window kernels at M=2 and M=4
+    (matching one-token serial decode bit for bit), and the new builders carry
+    no uncalled Metal functions or hand-written lookup tables."""
+    from tests.test_formats_tables import tabled_dot
+    from tests.test_metal_tables import hand_tables
+    from tests.test_qwen35_moe_routed_decode import uncalled
+
+    built = {}
+    make = mx.fast.metal_kernel
+
+    def spy_kernel(**spec):
+        built[spec["name"]] = (spec.get("header", ""), spec["source"])
+        return make(**spec)
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", spy_kernel)
+    for builder in (
+        routed._gate_up_window_coalesced_kernel,
+        routed._gate_up_topk_coalesced_kernel,
+        routed._down_window_unrolled_kernel,
+        router._softmax_topk_coalesce_kernel,
+    ):
+        builder.cache_clear()
+    tabled_dot(monkeypatch)
+    block = _block(0, bits=4)
+    for rows in (2, 3, 4):
+        for step in range(3):
+            _check(block, _inputs(rows, step), engaged)
+    names = list(built)
+    assert any("gate_up_window_coalesced" in n for n in names), names
+    assert any("down_combine_window_unrolled" in n for n in names), names
+    for name, (header, source) in built.items():
+        if name.startswith("omlx_qwen35_moe_gate_up_") or name.startswith(
+            "omlx_qwen35_moe_down_"
+        ):
+            assert uncalled(header + source) == [], name
+    # Table-free affine builds of the new builders carry no hand-written tables.
+    face = partial(affine.face, dtype=mx.bfloat16)
+    gu, dn, sh, gt = face(4, 64, True), face(4, 64, False), face(8, 128, True), face(8, 64, True)
+    built.clear()
+    routed._gate_up_window_coalesced_kernel.__wrapped__(gu, sh, gt)
+    routed._gate_up_topk_coalesced_kernel.__wrapped__(gu, sh, gt, mx.bfloat16)
+    routed._down_window_unrolled_kernel.__wrapped__(dn, sh)
+    for name, (header, source) in built.items():
+        assert uncalled(header + source) == [], name
+        assert not hand_tables(header), name
+        assert not hand_tables(source), name

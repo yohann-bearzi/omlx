@@ -107,9 +107,11 @@ from .qwen35_moe_router import (
     fused_router_topk,
     router_eligible,
     router_gemv,
+    softmax_topk_coalesce,
     softmax_topk_eligible,
     softmax_topk_rows,
     topk_header,
+    topk_indices_header,
 )
 from .qwen35_verify_qmm import is_row_exact_armed
 
@@ -119,12 +121,17 @@ logger = logging.getLogger(__name__)
 TOP_KS = (8, 10)
 _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
 _GATE_UP_SIMDGROUPS = 2
+_GATE_UP_COALESCE_TOPK_SIMDGROUPS = 4
 _DOWN_ROWS = 4  # down rows per simdgroup unless tuned by window width
 # Every gate+up simdgroup recomputes its row's selection, so the folded
 # routing's ALU grows with the rows while the launch it saves does not: from
 # four rows on the gate+up launch runs out of ALU headroom and the separate
 # routing launch is as fast or faster (M5 Ultra, oQ5e shapes).
 _TOPK_FOLD_MAX_ROWS = 3
+# Pair-coalesced verify-window launches decode each shared expert block once
+# for two window rows via the dot face's decode/apply contract (qmv_pair_rows).
+_COALESCE_MAX_ROWS = 4
+_COALESCE_MAX_PAIRS = 64
 # Row-exact verify windows up to the hyper-connection and GDN verify
 # kernels' 16-row ceiling; the kernels index rows from the grid.
 WINDOW_MAX_ROWS = 16
@@ -359,6 +366,175 @@ _GATE_UP_TOPK_ROUTED = _GATE_UP_ROUTED.replace(
     "size_t(rhs[slot])", "size_t(omlx_router_topk<T, NE>::nth(logits, simd_lid, slot))"
 )
 
+# Pair-coalesced verify-window gate+up launch (after softmax_topk_coalesce):
+# shared-expert rows are paired across consecutive window rows and routed
+# experts are paired per meta[g] = (expert, count in {1, 2}, p0, p1), decoding
+# each block once via qmv_pair_rows and applying it to both rows with the exact
+# one-token arithmetic.
+_GATE_UP_WINDOW_COALESCED = r"""
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    constexpr int ROWS = NSG * RPS;
+    constexpr int YW = TOPK * NI + NS + 1;
+    int b = int(threadgroup_position_in_grid.y);
+    float r0[2 * RPS], r1[2 * RPS];
+    if (b == 0) {
+      for (int m = int(simd_gid); m < M; m += NSG) {
+        qmv_rows<T, K, 1, 0>(gt, 0, gt, 0, x + m * K, simd_lid, r0);
+        if (simd_lid == 0) {
+          y[m * YW + TOPK * NI + NS] = static_cast<T>(r0[0]);
+        }
+      }
+      return;
+    }
+    b -= 1;
+    constexpr int SH_TILES = NS / ROWS;
+    constexpr int SH_PAIRS = (M + 1) / 2;
+    if (b < SH_PAIRS * SH_TILES) {
+      const int pair = b % SH_PAIRS;
+      const int tile = b / SH_PAIRS;
+      const int out_row = tile * ROWS + int(simd_gid) * RPS;
+      const int m0 = pair * 2;
+      const int m1 = m0 + 1;
+      if (m1 < M) {
+        qmv_pair_rows<T, K, RPS>(
+            sg, out_row, su, out_row, x + m0 * K, x + m1 * K, simd_lid, r0, r1);
+        swiglu_store<T, RPS>(r0, y + m0 * YW + TOPK * NI + out_row, simd_lid);
+        swiglu_store<T, RPS>(r1, y + m1 * YW + TOPK * NI + out_row, simd_lid);
+      } else {
+        qmv_rows<T, K, RPS, RPS>(sg, out_row, su, out_row, x + m0 * K, simd_lid, r0);
+        swiglu_store<T, RPS>(r0, y + m0 * YW + TOPK * NI + out_row, simd_lid);
+      }
+      return;
+    }
+    b -= SH_PAIRS * SH_TILES;
+    constexpr int RT_TILES = NI / ROWS;
+    const uint g = uint(b / RT_TILES);
+    if (g >= ucount[0]) {
+      return;
+    }
+    const int out_row = (b % RT_TILES) * ROWS + int(simd_gid) * RPS;
+    const size_t e = size_t(meta[g * 4 + 0]);
+    const uint cnt = meta[g * 4 + 1];
+    const uint p0 = meta[g * 4 + 2];
+    const int m0 = int(p0 / uint(TOPK));
+    const int k0 = int(p0 % uint(TOPK));
+    if (cnt == 2u) {
+      const uint p1 = meta[g * 4 + 3];
+      const int m1 = int(p1 / uint(TOPK));
+      const int k1 = int(p1 % uint(TOPK));
+      qmv_pair_rows<T, K, RPS>(
+          rt, e * (2 * NI) + out_row, rt, e * (2 * NI) + NI + out_row,
+          x + m0 * K, x + m1 * K, simd_lid, r0, r1);
+      swiglu_store<T, RPS>(r0, y + m0 * YW + size_t(k0) * NI + out_row, simd_lid);
+      swiglu_store<T, RPS>(r1, y + m1 * YW + size_t(k1) * NI + out_row, simd_lid);
+    } else {
+      qmv_rows<T, K, RPS, RPS>(
+          rt, e * (2 * NI) + out_row, rt, e * (2 * NI) + NI + out_row,
+          x + m0 * K, simd_lid, r0);
+      swiglu_store<T, RPS>(r0, y + m0 * YW + size_t(k0) * NI + out_row, simd_lid);
+    }
+"""
+
+# Folded 3-launch pair-coalesced verify-window gate+up launch (no separate
+# routing launch): each routed threadgroup computes all M rows' top-k indices
+# into threadgroup memory in parallel across its NSG simdgroups, pairs
+# duplicate experts across rows via qmv_pair_rows, and returns immediately on
+# the second member of each pair.
+_GATE_UP_TOPK_COALESCED = r"""
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    constexpr int ROWS = NSG * RPS;
+    constexpr int YW = TOPK * NI + NS + 1;
+    int b = int(threadgroup_position_in_grid.y);
+    float r0[2 * RPS], r1[2 * RPS];
+    if (b < M) {
+      const int row = b;
+      if (simd_gid == 0) {
+        qmv_rows<T, K, 1, 0>(gt, 0, gt, 0, x + row * K, simd_lid, r0);
+        if (simd_lid == 0) {
+          y[row * YW + TOPK * NI + NS] = static_cast<T>(r0[0]);
+        }
+      } else if (simd_gid == 1) {
+        omlx_router_topk<T, NE>::template write<TOPK>(
+            logits + row * NE, simd_lid, indices + row * TOPK, scores + row * TOPK);
+      }
+      return;
+    }
+    b -= M;
+    constexpr int SH_TILES = NS / ROWS;
+    constexpr int SH_PAIRS = (M + 1) / 2;
+    if (b < SH_PAIRS * SH_TILES) {
+      const int pair = b % SH_PAIRS;
+      const int tile = b / SH_PAIRS;
+      const int out_row = tile * ROWS + int(simd_gid) * RPS;
+      const int m0 = pair * 2;
+      const int m1 = m0 + 1;
+      if (m1 < M) {
+        qmv_pair_rows<T, K, RPS>(
+            sg, out_row, su, out_row, x + m0 * K, x + m1 * K, simd_lid, r0, r1);
+        swiglu_store<T, RPS>(r0, y + m0 * YW + TOPK * NI + out_row, simd_lid);
+        swiglu_store<T, RPS>(r1, y + m1 * YW + TOPK * NI + out_row, simd_lid);
+      } else {
+        qmv_rows<T, K, RPS, RPS>(sg, out_row, su, out_row, x + m0 * K, simd_lid, r0);
+        swiglu_store<T, RPS>(r0, y + m0 * YW + TOPK * NI + out_row, simd_lid);
+      }
+      return;
+    }
+    b -= SH_PAIRS * SH_TILES;
+    constexpr int RT_TILES = NI / ROWS;
+    const int p = b / RT_TILES;
+    const int tile = b % RT_TILES;
+    const int m = p / TOPK;
+    const int k = p % TOPK;
+    threadgroup uint tg_ind[M * TOPK];
+    for (int r = int(simd_gid); r < M; r += NSG) {
+      omlx_router_topk_indices_tg<T, NE, TOPK>(
+          logits + r * NE, simd_lid, tg_ind + r * TOPK);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint e = tg_ind[m * TOPK + k];
+    int prev = 0;
+    if (e < uint(NE)) {
+      for (int r = 0; r < m; ++r) {
+        for (int j = 0; j < TOPK; ++j) {
+          if (tg_ind[r * TOPK + j] == e) {
+            ++prev;
+            break;
+          }
+        }
+      }
+      if ((prev & 1) == 1) {
+        return;
+      }
+    }
+    int m2 = -1, k2 = -1;
+    if (e < uint(NE)) {
+      for (int r = m + 1; r < M && m2 < 0; ++r) {
+        for (int j = 0; j < TOPK; ++j) {
+          if (tg_ind[r * TOPK + j] == e) {
+            m2 = r;
+            k2 = j;
+            break;
+          }
+        }
+      }
+    }
+    const int out_row = tile * ROWS + int(simd_gid) * RPS;
+    if (m2 >= 0) {
+      qmv_pair_rows<T, K, RPS>(
+          rt, size_t(e) * (2 * NI) + out_row, rt, size_t(e) * (2 * NI) + NI + out_row,
+          x + m * K, x + m2 * K, simd_lid, r0, r1);
+      swiglu_store<T, RPS>(r0, y + m * YW + size_t(k) * NI + out_row, simd_lid);
+      swiglu_store<T, RPS>(r1, y + m2 * YW + size_t(k2) * NI + out_row, simd_lid);
+    } else {
+      qmv_rows<T, K, RPS, RPS>(
+          rt, size_t(e) * (2 * NI) + out_row, rt, size_t(e) * (2 * NI) + NI + out_row,
+          x + m * K, simd_lid, r0);
+      swiglu_store<T, RPS>(r0, y + m * YW + size_t(k) * NI + out_row, simd_lid);
+    }
+"""
+
 
 def _add_shared_gate_up(
     matrices: kernels.Matrices, shared: Dot, gate: Dot
@@ -413,9 +589,9 @@ def _down_kernel(routed: Dot, shared: Dot | None):
         source = (
             _DOWN_HEAD
             + _DOWN_SHARED_ROWS
-            + _DOWN_TAIL.replace("SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]").replace(
-                "GATE_VALUE", "x[TOPK * K + KS]"
-            )
+            + _DOWN_TAIL.replace(
+                "SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]"
+            ).replace("GATE_VALUE", "x[TOPK * K + KS]")
         )
         name += f"_shared_{shared.key}"
     return mx.fast.metal_kernel(
@@ -462,9 +638,9 @@ def _down_window_kernel(routed: Dot, shared: Dot):
         "rhs",
         "scores",
     ]
-    tail = _DOWN_TAIL.replace("SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]").replace(
-        "GATE_VALUE", "x[TOPK * K + KS]"
-    )
+    tail = _DOWN_TAIL.replace(
+        "SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]"
+    ).replace("GATE_VALUE", "x[TOPK * K + KS]")
     return mx.fast.metal_kernel(
         name=f"omlx_qwen35_moe_down_combine_window_{routed.key}_shared_{shared.key}",
         input_names=inputs,
@@ -503,6 +679,88 @@ def _gate_up_topk_kernel(
         output_names=["y", "indices", "scores"],
         header=_COMMON + _SWIGLU + topk_header(dtype) + matrices.header,
         source=matrices.declarations + source + _GATE_UP_TOPK_ROUTED + "    }\n",
+    )
+
+
+@cache
+def _gate_up_window_coalesced_kernel(routed: Dot, shared: Dot, gate: Dot):
+    """Pair-coalesced verify-window gate+up/SwiGLU launch reading expert pairs
+    from ``softmax_topk_coalesce`` and applying each decoded block to two
+    window rows via ``qmv_pair_rows``."""
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", routed, pair=True), "meta", "ucount"]
+    inputs += (
+        matrices.add("sg", shared, pair=True)
+        + matrices.add("su", shared, pair=True)
+        + matrices.add("gt", gate)
+    )
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_window_coalesced_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
+        ),
+        input_names=inputs,
+        output_names=["y"],
+        header=_COMMON + _SWIGLU + matrices.header,
+        source=matrices.declarations + _GATE_UP_WINDOW_COALESCED,
+    )
+
+
+@cache
+def _gate_up_topk_coalesced_kernel(
+    routed: Dot, shared: Dot, gate: Dot, dtype: mx.Dtype
+):
+    """Folded 3-launch pair-coalesced verify-window gate+up/SwiGLU launch."""
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("rt", routed, pair=True), "logits"]
+    inputs += (
+        matrices.add("sg", shared, pair=True)
+        + matrices.add("su", shared, pair=True)
+        + matrices.add("gt", gate)
+    )
+    selection = "bf16" if dtype == mx.bfloat16 else "scan"
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_topk_coalesced_{selection}_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
+        ),
+        input_names=inputs,
+        output_names=["y", "indices", "scores"],
+        header=_COMMON + _SWIGLU + topk_indices_header(dtype) + matrices.header,
+        source=matrices.declarations + _GATE_UP_TOPK_COALESCED,
+    )
+
+
+@cache
+def _down_window_unrolled_kernel(routed: Dot, shared: Dot):
+    """Verify-window down/combine launch with K-loop pairs unrolled."""
+    # One unroll mechanism, the framework's: Matrices(unroll_pairs=True)
+    # hands this kernel the rows skeleton with its K-loop pairs unrolled.
+    matrices = kernels.Matrices(unroll_pairs=True)
+    inputs = [
+        "x",
+        *matrices.add("rd", routed),
+        *matrices.add("sd", shared),
+        "rhs",
+        "scores",
+    ]
+    shared_rows = _DOWN_SHARED_ROWS
+    tail = _DOWN_TAIL.replace(
+        "SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]"
+    ).replace("GATE_VALUE", "x[TOPK * K + KS]")
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_down_combine_window_unrolled_{routed.key}"
+            f"_shared_{shared.key}"
+        ),
+        input_names=inputs,
+        output_names=["y"],
+        header=_COMMON + matrices.header,
+        source=matrices.declarations
+        + _DOWN_WINDOW_HEAD
+        + shared_rows
+        + tail
+        + "    }\n",
     )
 
 
@@ -565,6 +823,12 @@ class _Launches(NamedTuple):
     down_threadgroup: tuple
     window_gate_up_kernel: object = None  # verify-window launches (fold)
     window_down_kernel: object = None
+    window_coalesced_kernel: object = None
+    window_topk_coalesced_kernel: object = None
+    window_down_unrolled_kernel: object = None
+    window_inter: int = 0
+    window_shared_width: int = 0
+    routed_tables: bool = False
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
@@ -602,7 +866,12 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     shared, gate = block.get("shared_expert"), block.get("shared_expert_gate")
     if type(shared) is not Qwen3_5MLP:
         return None
-    layers = (shared.get("gate_proj"), shared.get("up_proj"), shared.get("down_proj"), gate)
+    layers = (
+        shared.get("gate_proj"),
+        shared.get("up_proj"),
+        shared.get("down_proj"),
+        gate,
+    )
     if not all(_plain(layer, nn.QuantizedLinear, FormatLinear) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
@@ -755,6 +1024,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             proof=proof,
         )
     width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
+    can_coalesce = gu_fmt.vpt >= 1 and sgu_fmt.vpt >= 1
     launches = _Launches(
         hidden=hidden,
         dtype=dtype,
@@ -774,6 +1044,20 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         down_threadgroup=(32, top_k + 1, 1),
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
         window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
+        window_coalesced_kernel=(
+            _gate_up_window_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt)
+            if can_coalesce
+            else None
+        ),
+        window_topk_coalesced_kernel=(
+            _gate_up_topk_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt, dtype)
+            if can_coalesce
+            else None
+        ),
+        window_down_unrolled_kernel=_down_window_unrolled_kernel(d_fmt, sd_fmt),
+        window_inter=inter,
+        window_shared_width=width,
+        routed_tables=bool(gu_fmt.tables),
         topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
@@ -884,10 +1168,73 @@ def _window_gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
     )[0]
 
 
+def _window_gate_up_coalesced(
+    launches: _Launches, x, meta, ucount, gate_up, shared_gate_up
+):
+    rows = x.shape[0]
+    nsg = _GATE_UP_SIMDGROUPS
+    rows_per_tg = nsg * _GATE_UP_ROWS
+    sh_pairs = (rows + 1) // 2
+    n_blocks = (
+        1
+        + sh_pairs * (launches.window_shared_width // rows_per_tg)
+        + rows * launches.top_k * (launches.window_inter // rows_per_tg)
+    )
+    return launches.window_coalesced_kernel(
+        inputs=[x, *gate_up, meta, ucount, *shared_gate_up],
+        template=launches.gate_up_template + [("M", rows)],
+        grid=(32, nsg * n_blocks, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(rows, *launches.gate_up_output)],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _window_gate_up_topk_coalesced(
+    launches: _Launches, x, logits, gate_up, shared_gate_up
+):
+    rows = x.shape[0]
+    nsg = (
+        _GATE_UP_COALESCE_TOPK_SIMDGROUPS
+        if (
+            launches.window_inter % (_GATE_UP_COALESCE_TOPK_SIMDGROUPS * _GATE_UP_ROWS)
+            == 0
+            and launches.window_shared_width
+            % (_GATE_UP_COALESCE_TOPK_SIMDGROUPS * _GATE_UP_ROWS)
+            == 0
+        )
+        else _GATE_UP_SIMDGROUPS
+    )
+    rows_per_tg = nsg * _GATE_UP_ROWS
+    sh_pairs = (rows + 1) // 2
+    n_blocks = (
+        rows
+        + sh_pairs * (launches.window_shared_width // rows_per_tg)
+        + rows * launches.top_k * (launches.window_inter // rows_per_tg)
+    )
+    template = [
+        ("NSG", nsg) if k == "NSG" else (k, v) for k, v in launches.gate_up_template
+    ] + [("NE", logits.shape[-1]), ("M", rows)]
+    top_k, width = launches.top_k, launches.topk_width
+    return launches.window_topk_coalesced_kernel(
+        inputs=[x, *gate_up, logits, *shared_gate_up],
+        template=template,
+        grid=(32, nsg * n_blocks, 1),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
+        output_dtypes=[launches.dtype, mx.uint32, launches.dtype],
+    )
+
+
 def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
     rows = indices.shape[0]
     rps = _down_rows(rows)
-    return launches.window_down_kernel(
+    kernel = (
+        launches.window_down_unrolled_kernel
+        if launches.routed_tables and launches.window_down_unrolled_kernel is not None
+        else launches.window_down_kernel
+    )
+    return kernel(
         inputs=[h, *down, *shared_down, indices, scores],
         template=launches.down_template + [("RPS", rps), ("M", rows)],
         grid=(32, launches.down_threadgroup[1] * launches.hidden // rps * rows, 1),
@@ -907,14 +1254,46 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
     shared expert's output and its gate's, where the launches do not fold
     them (one token)."""
     _, gate_up, down, shared_gate_up, shared_down = operands
-    if folded:
+    one_token = x.size == launches.hidden
+    if one_token:
+        if folded:
+            h, indices, scores = _gate_up_topk(
+                launches, x, logits, gate_up, shared_gate_up
+            )
+        else:
+            indices, scores = _routing(logits, launches.top_k)
+            h = _gate_up(launches, x, indices, gate_up, shared_gate_up)
+        return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
+    rows = x.shape[0]
+    gen = kernels.gpu_generation()
+    can_unfolded_coal = (
+        launches.routed_tables
+        and launches.window_coalesced_kernel is not None
+        and 2 <= rows <= _COALESCE_MAX_ROWS
+        and rows * launches.top_k <= _COALESCE_MAX_PAIRS
+        and softmax_topk_eligible(logits, WINDOW_MAX_ROWS)
+    )
+    if can_unfolded_coal and ((gen >= 17 and rows >= 3) or rows == 4):
+        indices, scores, meta, ucount = softmax_topk_coalesce(
+            logits, launches.top_k, WINDOW_MAX_ROWS
+        )
+        h = _window_gate_up_coalesced(
+            launches, x, meta, ucount, gate_up, shared_gate_up
+        )
+    elif (
+        launches.routed_tables
+        and folded
+        and rows == 2
+        and launches.window_topk_coalesced_kernel is not None
+    ):
+        h, indices, scores = _window_gate_up_topk_coalesced(
+            launches, x, logits, gate_up, shared_gate_up
+        )
+    elif folded:
         h, indices, scores = _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
     else:
         indices, scores = _routing(logits, launches.top_k)
-        gate_up_launch = _gate_up if x.size == launches.hidden else _window_gate_up
-        h = gate_up_launch(launches, x, indices, gate_up, shared_gate_up)
-    if x.size == launches.hidden:
-        return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
+        h = _window_gate_up(launches, x, indices, gate_up, shared_gate_up)
     return _window_down(launches, h, indices, scores, down, shared_down)
 
 
