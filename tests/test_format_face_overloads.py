@@ -18,6 +18,7 @@ import sys
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 
 import mlx.core as mx
 import pytest
@@ -1771,3 +1772,34 @@ def test_migrated_oqel_tile_face_runs_bit_identically(bits, k):
     want, _ = testing.tile_rows(legacy, operands, k, range(8), mx.bfloat16)
     got, _ = testing.tile_rows(migrated, operands, k, range(8), mx.bfloat16)
     _assert_bits(got, want)
+
+
+def test_docs_specify_declared_read_signatures_and_migration():
+    page = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
+    assert "A face may also define a mutable overload." not in page
+    assert "omlx/formats/reads.py" in page
+    for slot in (
+        "__OMLX_READ_LOAD__",
+        "__OMLX_READ_MADD__",
+        "__OMLX_READ_APPLY__",
+        "__OMLX_READ_WEIGHT__",
+        "__OMLX_READ_PAIR__",
+    ):
+        assert slot in page
+    assert "DeprecationWarning" in page
+    assert "revision 2" in page
+    versions = page.split("\n## Versions\n")[1].split("\n## ")[0]
+    for symbol in (
+        "DotReads",
+        "TileReads",
+        "CodesReads",
+        "LoadRead",
+        "MaddRead",
+        "ApplyRead",
+        "WeightRead",
+        "PairRead",
+        "Pointer",
+        "TypeParam",
+        "AuxType",
+    ):
+        assert f"`{symbol}`" in versions
