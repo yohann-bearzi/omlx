@@ -7,7 +7,10 @@ from functools import wraps
 import mlx.nn as nn
 from mlx_vlm.speculative.ops import linear as verify_linear
 
+from ...formats.linear import FormatLinear
 from .. import qwen35_packed_linear, qwen35_verify_qmm, row_exact_qmv
+
+_QUANTIZED_LINEAR_TYPES = (nn.QuantizedLinear, FormatLinear)
 
 
 def _routes_quantized_linear() -> bool:
@@ -24,7 +27,10 @@ def apply():
     def use_verify_dense(linear, x):
         if x.ndim == 3 and (
             x.shape[0] > 1
-            or (_routes_quantized_linear() and isinstance(linear, nn.QuantizedLinear))
+            or (
+                _routes_quantized_linear()
+                and isinstance(linear, _QUANTIZED_LINEAR_TYPES)
+            )
         ):
             return False
         return original(linear, x)
@@ -44,7 +50,7 @@ def apply():
             qwen35_verify_qmm.is_row_exact_armed()
             and x.ndim == 3
             and x.shape[0] * x.shape[1] > 1
-            and all(isinstance(linear, nn.QuantizedLinear) for linear in linears)
+            and all(isinstance(linear, _QUANTIZED_LINEAR_TYPES) for linear in linears)
         ):
             return row_exact_qmv.quantized_linears(linears, x)
         if x.ndim == 3 and (

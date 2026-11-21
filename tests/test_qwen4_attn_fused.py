@@ -19,6 +19,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import pytest
 
+from omlx.formats import testing
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from omlx.patches.qwen35_yarn import apply_qwen35_yarn_patch
 
@@ -461,3 +462,57 @@ def test_decode_prep_matches_mlx_path(monkeypatch, context, positions):
         monkeypatch.setattr(attn_fused, "_DISABLED", False)
         assert _bit_equal(got, want)
         assert all(_bit_equal(g, w) for g, w in zip(got_state, want_state))
+
+
+@requires_kernels
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@testing.verified("qwen4_exp")
+def test_format_attention_projections_fuse_and_match_the_generic_path(
+    monkeypatch, rows
+):
+    from omlx import formats
+    from omlx.formats.linear import FormatLinear
+    from tests.test_formats_kernels import _toy
+    from tests.test_formats_linear import _ToyFormat
+
+    formats.load()
+    face = dataclasses.replace(_toy("attention_rows"), dtypes=(mx.bfloat16,))
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(face))
+    attn = _attention(seed=147)
+    for i, (owner, name) in enumerate(
+        (
+            (attn, "q_proj"),
+            (attn, "k_proj"),
+            (attn, "v_proj"),
+            (attn.indexer, "index_qk_proj"),
+            (attn, "o_proj"),
+        )
+    ):
+        projection = owner[name]
+        n, groups = projection.scales.shape
+        k = groups * projection.group_size
+        mx.random.seed(194 + i)
+        codes = mx.random.randint(126, 131, (n, k)).astype(mx.uint8)
+        scales = mx.full((n,), 2.0**-6)
+        owner[name] = FormatLinear(
+            "toy", 8, 1, k, {"codes": codes, "group_scales": scales}
+        )
+
+    tiled = language.row_exact_qmv.quantized_linears_tiled
+    observed = []
+
+    def record(projections, x, *tile):
+        out = tiled(projections, x, *tile)
+        if out is not None:
+            observed.append(tuple(id(p) for p in projections))
+        return out
+
+    monkeypatch.setattr(language.row_exact_qmv, "quantized_linears_tiled", record)
+    cache = _prefill(attn, 0, seed=2)
+    assert _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (19,)) == [rows]
+    assert observed == [
+        tuple(
+            map(id, (attn.q_proj, attn.k_proj, attn.v_proj, attn.indexer.index_qk_proj))
+        ),
+        (id(attn.o_proj),),
+    ]

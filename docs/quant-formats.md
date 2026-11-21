@@ -125,6 +125,8 @@ placeholder. Once both are loaded, the same reader serves a new projection
 with twice the output width. It concatenates each tensor in gate, then up
 order along its rows and can take the verify gather.
 
+Qwen4 GDN uses the declared row layout to stack its four input projections, in QKV, Z, B, A order. After load, GDN and gate/up fusion both build the combined layer with the checkpoint’s reader and the sum of the source widths. Every source must have received its checkpoint tensors. The GDN decode and verify plans share the resulting tensors. The single-row input and output tiles use two and one output columns per simdgroup respectively. Verify blocks use the same row-count-specific geometry as the MLX projection plans. The dot face must be exact for the compute dtype. Verify can use a uniform four-bit allocation even when its auxiliary projections fall outside the single-row decode recipe. Built-in affine continues to load through MLX while its format has no declared layout.
+
 A switch layer's indices are integers of any integer dtype (mlx-vlm's are `uint32`); others are refused. A negative index counts from the end of the stack, as MLX's indexing does, on every route. A call of 2^30 pairs or more runs through `decode`: MLX's grid is int32.
 
 A layer keeps the format's tensors in the shapes and dtypes it is built with, which the face reads: an array of another shape or dtype assigned to one of them is not taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 activations recast a format layer's bias alone.
@@ -1304,6 +1306,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 | Sorted prefill for format switch layers | tile | `omlx/formats/linear.py` |
 | M3 sorted gather for format switch layers | tile | `omlx/formats/tile_gather.py` |
 | M5 sorted prefill and fused SwiGLU | tile | `omlx/patches/m5_gather_qmm_nax.py` |
+| Row-exact verify projections | dot (shared rows) | `omlx/patches/row_exact_qmv.py` |
 
 The Qwen4 hyper-connection decode preserves the original kernel's summation order
 for MLX affine projections at 4, 5, 6 and 8 bits with groups of 32 or 64.
@@ -1317,6 +1320,31 @@ It decodes each chunk as it adds it to the row.
 The routed decode plans its launches for a bf16 or fp16 activation when both the gate+up and down faces are exact for it. A face with an empty `dtypes` accepts all three types in `formats.FLOATS`. The activation dtype selects the top-k kernel and is part of the proof shared between blocks. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches. A block whose fused gate+up width is odd keeps its composed path: halving it would shift every expert past the first.
 
 A face that does not compile does not fail the model. One token's launches (the router's, gate+up and down) are one graph of the token and the block's arrays: built once on a thread for the token's shape and dtype and the router's width, kept in the proof of the block's faces, tensor dtypes and shapes (see [Kernels over faces](#kernels-over-faces)), and replayed by every block that shares the proof, over its own arrays. Before the graph is first built its Metal is proven on a stand-in, as a format layer's is: zeros for the token, the router's weight, each shared matrix and what the block computes outside the launches, as many matrices of each stack as a token selects, and router logits that rank the experts, so that it selects those, all made on the GPU's stream and evaluated by the proof ahead of the launch (what fails there is raised by the call and fails no proof). Nothing of the call is evaluated (once, as a block's plan is built outside a trace, a view of each stack's first matrix is, to learn whether it shares the stack's buffer): a failure in the block's input or tensors is raised where the caller evaluates the result, and a block's first call is safe inside a function that `mx.compile` traces, over the model's state too (the stacks are then bound whole). If the stand-in fails, the compiler's messages are logged (`fused routed-expert decode failed; composed fallback`) and those blocks keep their composed path, for one token, verify windows and batched rows. A verify window or batched rows of 2 rows or more are a graph of the same kind, kept in the window's own proof for the window's shape and dtype and the router's width, and proven on a stand-in of the window's rows; a window of one row is one token's call. If a window's stand-in fails (`fused verify-window experts failed; verifier fallback`), those blocks keep the composed path for windows and batched rows, and the fused one for one token. Blocks of other faces or shapes are not affected.
+
+Qwen4 attention and GDN, the Qwen 3.5 verify runtimes, GLM and MiniMax use row-exact
+projections. The row-exact projection runs 2 to 16 rows of one projection, or of several
+of one input, in one launch through the shared-rows skeleton, over each layer's dot face
+(`formats.dot`): each K block of a column is decoded once and applied to every row, and
+each row gets the bits of the layer's one-row call. It takes MLX's affine layers of 4,
+5, 6 and 8 bits (a subclass of `nn.QuantizedLinear` too) and any format layer whose dot
+face is exact for the rows' dtype and reads K in whole lanes; projections launched
+together have faces of one `vpt` and no bias. Other layers, and more than 16 rows, run
+one one-row call per row. A 2-D matrix of K 64 or 128 at 4 or 8 bits has no dot face
+(MLX's one-row call there is `qmv_quad`), so it runs its one-row calls: the bits of the
+serial decode step. Where a threadgroup applies its tile to several rows (outputs of
+2048 tiles or more, the vocabulary head) the skeleton runs unrolled inside
+`kernels.unrolled_tile_ok`, once the GPU's bits for that shape are checked against the
+layers' one-row calls; a shape that differs runs rolled.
+A group whose distinct tables total more than 4096 bytes runs each projection
+separately. Equal tables count once toward the limit.
+A format projection's input width must match the layer's declared K. Verify
+rechecks its plan when the checkpoint reader or stored tensors change. Adding
+a bias to any member of a warmed group sends it through its own projection.
+
+During armed row-exact verification, mlx-vlm groups eligible format projections
+that share an input. Qwen4 fused attention requests its explicit tile for the query,
+key, value and index projections together. If the output tile is unavailable,
+a format output projection runs through its own layer.
 
 On the M5 Max and later, MLX's affine switch layers use the affine tile face
 for sorted prompt rows. The gather can apply SwiGLU to fused gate/up outputs

@@ -8,6 +8,7 @@ next conv-state slice) at every verify width it claims (S in 3..9).
 
 from __future__ import annotations
 
+import sys
 from types import ModuleType, SimpleNamespace
 
 import mlx.core as mx
@@ -1694,3 +1695,349 @@ def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify)
         )
         transaction.abort()
     assert qwen4_verify == [1]
+
+
+@pytest.fixture
+def format_gdn(monkeypatch):
+    """A Qwen4 GDN with row-coded inputs of four different output sizes."""
+    from dataclasses import replace
+
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatLinear
+    from tests.test_formats_kernels import _toy
+    from tests.test_formats_linear import _StackableToy
+
+    face = replace(_toy("gdn"), dtypes=(mx.bfloat16, mx.float16))
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _StackableToy(face))
+
+    def build(bits, dtype):
+        def projection(k, n, width, group, compute):
+            # Row- and column-dependent codes, with a different seed for
+            # each projection. No dense copy of a checkpoint is needed.
+            col = mx.random.randint(0, 5, (1, k), dtype=mx.uint32)
+            row = mx.random.randint(0, 5, (n, 1), dtype=mx.uint32)
+            codes = (126 + (col + row) % 5).astype(mx.uint8)
+            scales = mx.random.randint(1, 5, (n,)).astype(mx.float32) / 256
+            return FormatLinear(
+                "toy", width, group, k, {"weight": codes, "scales": scales}
+            )
+
+        monkeypatch.setattr(sys.modules[__name__], "_random_projection", projection)
+        module = _real_qwen4_decode_module(((bits, 64),) * 4, 21, dtype)
+        module.out_proj = projection(HV * DV, 2560, bits, 64, dtype)
+        return module
+
+    with testing.verified("qwen4_exp"):
+        yield build
+
+
+def test_gdn_affine_stacking_waits_for_its_load_layout():
+    from omlx import formats
+
+    affine = formats.get("affine")
+    assert affine.layout(2560, C, 8, 64) is None
+    assert not formats.stackable(affine, 2560, C, 8, 64)
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+def test_gdn_format_plan_uses_the_decode_recipe_and_the_verify_geometry(
+    format_gdn, bits
+):
+    module = format_gdn(bits, mx.bfloat16)
+    decode = prework_mod._qwen4_decode_plan(module)
+    if bits == 4:
+        assert decode is None
+    else:
+        assert decode is not None and all(callable(f) for f in decode[-2:])
+        assert prework_mod._qwen4_decode_plan(module) is decode
+    verify = prework_mod._qwen4_verify_plan(module)
+    assert verify is not None and all(callable(f) for f in verify[:2])
+    assert prework_mod._qwen4_verify_plan(module) is verify
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("bits,rows", [(8, 1), (8, 3), (8, 16), (4, 8)])
+def test_gdn_format_projections_match_independent_serial_calls(
+    format_gdn, dtype, bits, rows
+):
+    module = format_gdn(bits, dtype)
+    plan = (
+        prework_mod._qwen4_decode_plan(module)
+        if rows == 1
+        else prework_mod._qwen4_verify_plan(module)
+    )
+    assert plan is not None
+    run_in, run_out = plan[-2:] if rows == 1 else plan[:2]
+    parts = (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a)
+    for run, linears, k in (
+        (run_in, parts, 2560),
+        (run_out, (module.out_proj,), HV * DV),
+    ):
+        x = mx.random.randint(-8, 9, (1, rows, k)).astype(dtype)
+        expected = mx.concatenate(
+            [
+                mx.concatenate([linear(x[:, i : i + 1]) for linear in linears], axis=-1)
+                for i in range(rows)
+            ],
+            axis=1,
+        )
+        actual = run(x)
+        assert actual.shape == expected.shape and actual.dtype == expected.dtype
+        assert mx.array_equal(_bits(actual), _bits(expected)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [1, 3])
+@pytest.mark.parametrize("projection", ["input", "output"])
+def test_warm_gdn_format_projection_replays_without_a_python_launch(
+    format_gdn, monkeypatch, rows, projection
+):
+    from omlx.patches import row_exact_qmv
+
+    module = format_gdn(8, mx.bfloat16)
+    if rows == 1:
+        run_in, run_out = prework_mod._qwen4_decode_plan(module)[-2:]
+    else:
+        run_in, run_out = prework_mod._qwen4_verify_plan(module)[:2]
+    if projection == "input":
+        run = run_in
+        layers = (
+            module.in_proj_qkv,
+            module.in_proj_z,
+            module.in_proj_b,
+            module.in_proj_a,
+        )
+    else:
+        run = run_out
+        layers = (module.out_proj,)
+
+    shape = (1, rows, layers[0].input_dims)
+    mx.eval(run(mx.zeros(shape, mx.bfloat16)))
+    x = mx.random.randint(-8, 9, shape).astype(mx.bfloat16)
+    want = mx.concatenate(
+        [
+            mx.concatenate([layer(x[:, i : i + 1]) for layer in layers], axis=-1)
+            for i in range(rows)
+        ],
+        axis=1,
+    )
+    mx.eval(x, want)
+
+    def unexpected_launch(*args, **kwargs):
+        pytest.fail("warm format projection re-entered its Python Metal launch")
+
+    monkeypatch.setattr(row_exact_qmv._Launch, "__call__", unexpected_launch)
+    got = run(x)
+    assert got.shape == want.shape and got.dtype == want.dtype
+    assert mx.array_equal(_bits(got), _bits(want)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_format_gdn_decode_keeps_composed_state_and_rebuilds_the_stack(
+    format_gdn, patched_decode, monkeypatch
+):
+    module = format_gdn(8, mx.bfloat16)
+    plan = prework_mod._qwen4_decode_plan(module)
+    assert plan is not None
+    x = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+    conv = mx.zeros((1, 3, C), mx.bfloat16)
+    state = mx.zeros((1, HV, DV, DK))
+    for _ in range(2):
+        monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_QMV", False)
+        expected, reference_state = _decode_steps(module, [x, x], conv, state)
+        monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_QMV", True)
+        actual, new_state = _decode_steps(module, [x, x], conv, state)
+        for got, want in zip(
+            (*actual, *new_state), (*expected, *reference_state), strict=True
+        ):
+            assert got.shape == want.shape and got.dtype == want.dtype
+            assert mx.array_equal(_bits(got), _bits(want)).item()
+        module.in_proj_a.scales = -module.in_proj_a.scales
+        module.out_proj.scales = 2 * module.out_proj.scales
+        new_plan = prework_mod._qwen4_decode_plan(module)
+        assert new_plan is not None and new_plan is not plan
+        plan = new_plan
+
+
+def test_gdn_format_tiles_bind_the_served_projection_geometry(format_gdn, monkeypatch):
+    from omlx.patches import row_exact_qmv
+
+    module = format_gdn(8, mx.bfloat16)
+    seen = []
+
+    def kernel(faces, unrolled, constants):
+        assert len(faces) == 1
+
+        def call(*, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
+            assert template == [("T", mx.bfloat16)]
+            dims = dict(constants)
+            seen.append((dims, unrolled, grid, threadgroup))
+            return [
+                mx.zeros(shape, dtype=d)
+                for shape, d in zip(output_shapes, output_dtypes)
+            ]
+
+        return call
+
+    monkeypatch.setattr(row_exact_qmv, "_kernel", kernel)
+    monkeypatch.setattr(row_exact_qmv, "unrolled_tile_verified", lambda *args: True)
+    decode = prework_mod._qwen4_decode_plan(module)
+    verify = prework_mod._qwen4_verify_plan(module)
+    assert decode is not None and verify is not None
+    for rows in range(1, 17):
+        pair = decode[-2:] if rows == 1 else verify[:2]
+        for run, size, width, tile in zip(
+            pair,
+            (16480, 2560),
+            (2560, 6144),
+            (prework_mod._qwen4_verify_in_tile, prework_mod._qwen4_verify_out_tile),
+        ):
+            rps, group = tile(rows)
+            y = run(mx.zeros((1, rows, width), mx.bfloat16))
+            assert y.shape == (1, rows, size) and y.dtype == mx.bfloat16
+            dims, unrolled, grid, threads = seen.pop()
+            assert dims == {
+                "K": width,
+                "ROWS": group,
+                "RPS": rps,
+                "VPT": 8,
+                "N_0": size,
+            }
+            assert grid == (32, 2 * (rows // group), (size + 2 * rps - 1) // (2 * rps))
+            assert threads == (32, 2, 1)
+            assert unrolled == (
+                rows > 1 and row_exact_qmv.kernels.unrolled_tile_ok(8, rps, group)
+            )
+    assert not seen
+
+
+@pytest.mark.parametrize("part", ["in_proj_b", "out_proj"])
+@pytest.mark.parametrize("attribute", ["bias", "dtype", "extent", "k"])
+def test_gdn_checks_each_format_projection_before_planning(format_gdn, part, attribute):
+    from omlx.formats.linear import FormatLinear
+
+    module = format_gdn(8, mx.bfloat16)
+    layer = module[part]
+    if attribute == "bias":
+        layer.bias = mx.zeros((layer.output_dims,), mx.bfloat16)
+    elif attribute in ("dtype", "extent"):
+        scales = (
+            layer.scales.astype(mx.bfloat16)
+            if attribute == "dtype"
+            else layer.scales[:-1]
+        )
+        module[part] = FormatLinear(
+            layer.fmt,
+            layer.bits,
+            layer.group_size,
+            layer.input_dims,
+            {"weight": layer.weight, "scales": scales},
+        )
+        assert module[part].scales is scales
+    else:
+        layer.input_dims = layer.input_dims // 2
+    assert prework_mod._qwen4_decode_plan(module) is None
+    assert prework_mod._qwen4_verify_plan(module) is None
+
+
+def test_gdn_checks_the_layout_of_the_unequal_input_stack(format_gdn, monkeypatch):
+    from omlx import formats
+
+    module = format_gdn(8, mx.bfloat16)
+    fmt = formats.get("toy")
+    layout = fmt.layout
+
+    def padded(k, n, bits, group):
+        shape = layout(k, n, bits, group)
+        if n in (16480, 32960):
+            shape["weight"] = ((n, k + 8), mx.uint8)
+        return shape
+
+    monkeypatch.setattr(fmt, "layout", padded)
+    decode = prework_mod._qwen4_decode_plan(module)
+    assert decode is not None and decode[-2] is None and decode[-1] is not None
+    assert prework_mod._qwen4_verify_plan(module) is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_two_engines_share_the_gdn_stack_and_keep_their_projection_bits(format_gdn):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier, get_ident
+
+    module = format_gdn(8, mx.bfloat16)
+    parts = (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a)
+
+    # Warm the constituent layers before either engine stacks them. Each engine
+    # has its own inputs and a serial, one-row reference for each projection.
+    def job():
+        result = []
+        for layers, k in ((parts, 2560), ((module.out_proj,), HV * DV)):
+            x = mx.random.randint(-8, 9, (1, 3, k)).astype(mx.bfloat16)
+            want = mx.concatenate(
+                [
+                    mx.concatenate([layer(x[:, i : i + 1]) for layer in layers], -1)
+                    for i in range(3)
+                ],
+                axis=1,
+            )
+            mx.eval(x, want)
+            result.append((x, want))
+        return result
+
+    jobs = (job(), job())
+    together = Barrier(2, timeout=20)
+
+    def engine(operands):
+        together.wait()
+        plan = prework_mod._qwen4_verify_plan(module)
+        assert plan is not None
+        for _ in range(2):
+            for run, (x, want) in zip(plan[:2], operands, strict=True):
+                got = run(x)
+                assert got.shape == want.shape and got.dtype == want.dtype
+                assert mx.array_equal(_bits(got), _bits(want)).item()
+        return get_ident()
+
+    with ThreadPoolExecutor(max_workers=2) as engines:
+        assert len(set(engines.map(engine, jobs))) == 2
+
+
+def test_gdn_plans_from_the_checkpoint_reader_after_the_registry_changes(
+    format_gdn, monkeypatch
+):
+    from omlx import formats
+    from tests.test_formats_linear import _ToyFormat
+
+    module = format_gdn(8, mx.bfloat16)
+    bound = module.in_proj_qkv.fmt
+    # Registration describes the mode. Its reader owns the loaded tensors.
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(bound.face))
+    decode = prework_mod._qwen4_decode_plan(module)
+    verify = prework_mod._qwen4_verify_plan(module)
+    assert decode is not None and all(callable(run) for run in decode[-2:])
+    assert verify is not None and all(callable(run) for run in verify[:2])
+
+
+def test_gdn_keeps_input_projections_of_two_checkpoint_readers_apart(format_gdn):
+    from copy import copy
+
+    from omlx.formats.linear import FormatLinear
+
+    module = format_gdn(8, mx.bfloat16)
+    source = module.in_proj_a
+    # Two accepted readers can keep different encodings under the same mode.
+    other = copy(source.fmt)
+    assert other is not source.fmt and other.mode == source.fmt.mode
+    module.in_proj_a = FormatLinear(
+        other,
+        source.bits,
+        source.group_size,
+        source.input_dims,
+        {name: source[name] for name in ("weight", *other.tensors)},
+    )
+    decode = prework_mod._qwen4_decode_plan(module)
+    assert decode is not None and decode[-2] is None and decode[-1] is not None
+    assert prework_mod._qwen4_verify_plan(module) is None

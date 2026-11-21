@@ -24,6 +24,7 @@ from mlx_vlm.speculative.drafters.dflash2.config import DFlash2Config
 from mlx_vlm.speculative.drafters.dflash2.dflash2 import DFlash2DraftModel
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
+from omlx.formats import testing
 from omlx.model_settings import ModelSettings
 from omlx.patches import batched_decode_qmm, mlx_lm_mtp, qwen35_verify_qmm
 from omlx.patches.laguna import laguna_model
@@ -6803,3 +6804,48 @@ def test_rows_rebuilt_under_a_lowered_policy_depth_keep_tokens(monkeypatch):
     actual, _ = generate(model, prompts, limits)
     assert fired
     assert actual == expected
+
+
+@pytest.mark.parametrize("rows", [1, 3, 8])
+@testing.verified("qwen4_exp")
+def test_row_exact_verify_helpers_group_format_projections(monkeypatch, rows):
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.speculative.ops import linear as ops
+
+    from omlx import formats
+    from omlx.patches import qwen35_verify_qmm, row_exact_qmv
+    from tests.test_formats_kernels import _toy
+    from tests.test_formats_linear import _toy_linear, _ToyFormat
+
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("mtp_group")))
+    layers = tuple(_toy_linear(n, 320, seed=n)[0] for n in (40, 72, 16))
+    mx.random.seed(43)
+    x = mx.random.randint(-8, 9, (1, rows, 320)).astype(mx.float32)
+    serial = tuple(
+        mx.concatenate([layer(x[:, i : i + 1]) for i in range(rows)], axis=1)
+        for layer in layers
+    )
+    mx.eval(*serial)
+    launches = []
+    run = row_exact_qmv._Launch.__call__
+
+    def record(launch, values, operands):
+        if len(launch.faces) == len(layers):
+            launches.append(values.shape)
+        return run(launch, values, operands)
+
+    monkeypatch.setattr(row_exact_qmv._Launch, "__call__", record)
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(qwen35_verify_qmm, "is_row_exact_armed", lambda: True)
+    verifier = Qwen3_5BatchInvariantForward()
+    for call in (ops._target_verify_linears, verifier._linears):
+        # The first call can prove an unrolled tile. Count the warmed group only.
+        mx.eval(*call(layers, x))
+        launches.clear()
+        outputs = call(layers, x)
+        assert len(outputs) == len(serial)
+        for got, want in zip(outputs, serial):
+            assert got.shape == want.shape and got.dtype == want.dtype
+            assert mx.array_equal(got.view(mx.uint32), want.view(mx.uint32)).item()
+        assert launches == ([(rows, 320)] if rows > 1 else [])

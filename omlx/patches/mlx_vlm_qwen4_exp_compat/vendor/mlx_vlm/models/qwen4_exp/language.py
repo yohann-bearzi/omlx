@@ -23,6 +23,7 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from omlx.formats.linear import FormatLinear
 from omlx.memory_monitor import qwen4_gathered_prefill_route
 from omlx.memory_monitor import (
     qwen4_text_mrope_broadcast as _broadcast_text_mrope_position_ids,
@@ -2893,11 +2894,6 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 rotary.dim,
                 3 if position_ids is None else position_ids.ndim,
             )
-            # The grouped launch reads quantized weights; dense projections keep the MLX ops.
-            and all(
-                isinstance(proj, nn.QuantizedLinear)
-                for proj in (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj)
-            )
             and row_exact_qmv._group_plan(
                 (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
                 x,
@@ -2937,7 +2933,9 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         if projected is not None:
             return projected[0]
-        return self.o_proj(output) if rows == 1 else _VERIFIER._linear(self.o_proj, output)
+        if rows == 1 or isinstance(self.o_proj, FormatLinear):
+            return self.o_proj(output)
+        return _VERIFIER._linear(self.o_proj, output)
 
     def _fused_forward(
         self,

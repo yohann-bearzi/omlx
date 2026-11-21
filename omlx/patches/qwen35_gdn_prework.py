@@ -41,10 +41,13 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.gated_delta import normalize_qk
 
+from .. import formats
+from ..formats import kernels
+from ..formats.linear import FormatLinear
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
 from .qwen35_verify_qmm import is_row_exact_armed
-from .row_exact_qmv import one_row_qmv, rows_qmv
+from .row_exact_qmv import format_rows_qmv, one_row_qmv, rows_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -1360,9 +1363,49 @@ def _qwen4_gdn_geometry_ok(module) -> bool:
     )
 
 
+def _matches_format_rows(linear, layout):
+    """Check the stored rows against a declared layout with the same row contents."""
+    return all(
+        isinstance(linear.get(name), mx.array)
+        and linear[name].shape == (linear.output_dims, *shape[1:])
+        and (
+            mx.issubdtype(linear[name].dtype, mx.floating)
+            if dtype is None
+            else linear[name].dtype == dtype
+        )
+        for name, (shape, dtype) in layout.items()
+    )
+
+
+def _format_projection(linear, n, k, dtype):
+    if "bias" in linear or (linear.input_dims, linear.output_dims) != (k, n):
+        return False
+    layout = formats._stackable_layout(linear.fmt, k, n, linear.bits, linear.group_size)
+    return (
+        layout is not None
+        and _matches_format_rows(linear, layout)
+        and _exact_format_face(linear, k, n, dtype)
+    )
+
+
+def _exact_format_face(linear, k, n, dtype):
+    face = formats.dot(linear, k, n)
+    return (
+        face is not None
+        and face.exact_for(dtype)
+        and face.vpt > 0
+        and k % face.vpt == 0
+        and kernels.table_bytes(face) <= formats.TABLE_BYTES
+    )
+
+
 def _canonical_projection(linear, rows, signatures, dtype, in_dim=_QWEN4_HIDDEN_SIZE):
     # The q4 prefill routing reclasses these projections to a QuantizedLinear
     # subclass; the fused decode reads their packed storage, not their forward.
+    if isinstance(linear, FormatLinear):
+        return (
+            signatures is None or (linear.bits, linear.group_size) in signatures
+        ) and _format_projection(linear, rows, in_dim, dtype)
     if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
         return False
     signature = (linear.bits, linear.group_size)
@@ -1486,11 +1529,47 @@ def _one_row_fused_projections(linears, dtype):
     )
 
 
+def _stack_format_inputs(module):
+    """Stack the GDN's unequal input projections once for decode and verify."""
+    layers = (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a)
+    first = layers[0]
+    if not all(
+        isinstance(layer, FormatLinear)
+        and layer.fmt is first.fmt
+        and (layer.input_dims, layer.bits, layer.group_size)
+        == (first.input_dims, first.bits, first.group_size)
+        for layer in layers
+    ):
+        return None
+    k = first.input_dims
+    n = sum(layer.output_dims for layer in layers)
+    layout = formats._stackable_layout(first.fmt, k, n, first.bits, first.group_size)
+    if layout is None or not all(
+        _matches_format_rows(layer, layout) for layer in layers
+    ):
+        return None
+    if any(
+        layer[name].dtype != first[name].dtype
+        for layer in layers[1:]
+        for name in layout
+    ):
+        return None
+    stacked = first._stacked_outputs(*layers[1:], layout=layout)
+    if not _exact_format_face(stacked, k, n, module.conv1d.weight.dtype):
+        return None
+    return stacked
+
+
+def _stacked_format_inputs(module):
+    return cached_per_module(module, "_omlx_gdn_format_inputs", _stack_format_inputs)
+
+
 # Output columns per simdgroup of the planned one-row projections (stock
 # qmv_fast owns 4): the tiles that measured fastest in a chain of 36 decode
 # layers on M5 Ultra.
 _QWEN4_IN_QMV_RPS = 2
 _QWEN4_OUT_QMV_RPS = 1
+_QWEN4_GDN_SPLITS = (10240, 16384, 16432)
 
 
 def _build_qwen4_decode_plan(module):
@@ -1506,22 +1585,29 @@ def _build_qwen4_decode_plan(module):
     )
     fused = _one_row_fused_projections(projections, dtype)
     in_qmv = None
-    if fused is not None:
+    if isinstance(projections[0], FormatLinear):
+        stacked = _stacked_format_inputs(module)
+        if stacked is not None:
+            in_qmv = format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
+    elif fused is not None:
         weights, scales, biases, _, group_size, bits, mode = fused
         in_qmv = one_row_qmv(
             weights, scales, biases, bits, group_size, mode, dtype, _QWEN4_IN_QMV_RPS
         )
     out = module.out_proj
-    out_qmv = one_row_qmv(
-        out.weight,
-        out.scales,
-        out.biases,
-        out.bits,
-        out.group_size,
-        out.mode,
-        dtype,
-        _QWEN4_OUT_QMV_RPS,
-    )
+    if isinstance(out, FormatLinear):
+        out_qmv = format_rows_qmv(out, dtype, _qwen4_verify_out_geometry)
+    else:
+        out_qmv = one_row_qmv(
+            out.weight,
+            out.scales,
+            out.biases,
+            out.bits,
+            out.group_size,
+            out.mode,
+            dtype,
+            _QWEN4_OUT_QMV_RPS,
+        )
     return (
         projections,
         fused,
@@ -1657,33 +1743,41 @@ def _build_qwen4_verify_plan(module):
         and _canonical_projection(out, _QWEN4_HIDDEN_SIZE, None, dtype, in_dim=48 * 128)
     ):
         return None
-    fused = _one_row_fused_projections(projections, dtype)
-    if fused is None:
-        return None
-    weights, scales, biases, _, group_size, bits, mode = fused
-    # 2..8-row projections use the unrolled row-exact tile for their row count.
-    in_rows = rows_qmv(
-        weights,
-        scales,
-        biases,
-        bits,
-        group_size,
-        mode,
-        dtype,
-        _qwen4_verify_in_tile,
-        unrolled=True,
-    )
-    out_rows = rows_qmv(
-        out.weight,
-        out.scales,
-        out.biases,
-        out.bits,
-        out.group_size,
-        out.mode,
-        dtype,
-        _qwen4_verify_out_tile,
-        unrolled=True,
-    )
+    if isinstance(projections[0], FormatLinear):
+        stacked = _stacked_format_inputs(module)
+        if stacked is None:
+            return None
+        in_rows = format_rows_qmv(stacked, dtype, _qwen4_verify_in_tile)
+    else:
+        fused = _one_row_fused_projections(projections, dtype)
+        if fused is None:
+            return None
+        weights, scales, biases, _, group_size, bits, mode = fused
+        in_rows = rows_qmv(
+            weights,
+            scales,
+            biases,
+            bits,
+            group_size,
+            mode,
+            dtype,
+            _qwen4_verify_in_tile,
+            unrolled=True,
+        )
+    if isinstance(out, FormatLinear):
+        out_rows = format_rows_qmv(out, dtype, _qwen4_verify_out_tile)
+    else:
+        out_rows = rows_qmv(
+            out.weight,
+            out.scales,
+            out.biases,
+            out.bits,
+            out.group_size,
+            out.mode,
+            dtype,
+            _qwen4_verify_out_tile,
+            unrolled=True,
+        )
     if in_rows is None or out_rows is None:
         return None
     return (
@@ -2013,23 +2107,23 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             in_qmv,
             out_qmv,
         ) = plan
-        if fused is None:
+        if in_qmv is not None and _QWEN4_DECODE_QMV:
+            projected = in_qmv(inputs)
+            mixed_qkv, z, b, a = mx.split(projected, _QWEN4_GDN_SPLITS, axis=-1)
+        elif fused is None:
             mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
         else:
             weights, w_scales, w_biases, split_indices, group_size, bits, mode = fused
-            if in_qmv is not None and _QWEN4_DECODE_QMV:
-                projected = in_qmv(inputs)
-            else:
-                projected = mx.quantized_matmul(
-                    inputs,
-                    weights,
-                    scales=w_scales,
-                    biases=w_biases,
-                    transpose=True,
-                    group_size=group_size,
-                    bits=bits,
-                    mode=mode,
-                )
+            projected = mx.quantized_matmul(
+                inputs,
+                weights,
+                scales=w_scales,
+                biases=w_biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
+                mode=mode,
+            )
             mixed_qkv, z, b, a = mx.split(projected, split_indices, axis=-1)
         if _QWEN4_DECODE_STEP_FUSED:
             conv_state, state, gated = qwen4_decode_step_fused(

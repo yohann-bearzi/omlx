@@ -1149,6 +1149,37 @@ class _FormatLayer(nn.Module):
             f"holds the load's placeholder of {held}"
         )
 
+    def _stacked_outputs(
+        self, other: _FormatLayer, *others: _FormatLayer, layout: dict | None = None
+    ) -> _FormatLayer:
+        """Join admitted projections along their output axis after layout checks."""
+        sources = (self, other, *others)
+        for source in sources:
+            source.refuse_placeholders()
+        tensors = {
+            name: mx.concatenate([source[name] for source in sources], axis=self._STACK)
+            for name in self._tensors
+        }
+        bias = (
+            mx.concatenate([source["bias"] for source in sources], axis=-1)
+            if "bias" in self
+            else None
+        )
+        cls = FormatSwitchLinear if self._STACK else FormatLinear
+        layer = cls.__new__(cls)
+        layer._init_tensors(
+            self.fmt,
+            self.bits,
+            self.group_size,
+            self.input_dims,
+            tensors,
+            bias,
+            layout=layout,
+        )
+        layer.train(self.training)
+        layer._no_grad = set(self._no_grad)
+        return layer
+
     def _keep(self) -> _Kept:
         """The layer's plan and bias, worked out and kept."""
         self.__dict__.pop(_FAST, None)
@@ -1481,31 +1512,6 @@ class FormatSwitchLinear(_FormatLayer):
     @property
     def num_experts(self) -> int:
         return self[packed_name(self)].shape[0]
-
-    def _stacked_outputs(self, other: FormatSwitchLinear) -> FormatSwitchLinear:
-        """Join two admitted, row-stackable projections after checkpoint load.
-
-        The fusion has checked their layouts. Only the layers themselves
-        supply the reader, dimensions and arrays for the derived projection.
-        """
-        self.refuse_placeholders()
-        other.refuse_placeholders()
-        tensors = {
-            name: mx.concatenate([self[name], other[name]], axis=1)
-            for name in self._tensors
-        }
-        bias = (
-            mx.concatenate([self["bias"], other["bias"]], axis=-1)
-            if "bias" in self
-            else None
-        )
-        layer = FormatSwitchLinear.__new__(FormatSwitchLinear)
-        layer._init_tensors(
-            self.fmt, self.bits, self.group_size, self.input_dims, tensors, bias
-        )
-        layer.train(self.training)
-        layer._no_grad = set(self._no_grad)
-        return layer
 
     def _through_decode(self, x, indices, sorted_indices):
         """``x`` times the matrices at ``indices``, decoded: what the rows

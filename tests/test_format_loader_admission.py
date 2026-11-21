@@ -11,6 +11,7 @@ import pytest
 from omlx import formats
 from omlx.engine_pool import EngineEntry, EnginePool
 from omlx.formats import testing
+from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.model_discovery import EngineType
 from omlx.model_settings import ModelSettings
 from omlx.models.embedding import MLXEmbeddingModel
@@ -352,3 +353,53 @@ def test_a_checked_loader_cannot_replace_the_disk_format_layout(
     with testing.verified("llama"), pytest.raises(formats.FormatRefusedError) as error:
         mlx_lm.utils.load_model(tmp_path, model_config=override)
     assert error.value.mode == "toy" and field in error.value.reason
+
+
+@pytest.mark.parametrize(
+    "layer_type,widths,pending",
+    [
+        (cls, widths, pending)
+        for cls, widths in (
+            (FormatLinear, (64, 32, 8, 8)),
+            (FormatSwitchLinear, (32, 32)),
+        )
+        for pending in (None, *range(len(widths)))
+    ],
+)
+def test_loaded_projections_stack_along_their_output_axis(layer_type, widths, pending):
+    from tests.test_formats_linear import _StackableToy
+
+    reader = _StackableToy()
+    experts = (4,) if layer_type is FormatSwitchLinear else ()
+    layers = []
+    with testing.verified("qwen4_exp"):
+        for i, n in enumerate(widths):
+            data = {
+                "codes": mx.full((*experts, n, 128), i + 127, mx.uint8),
+                "group_scales": mx.full((*experts, n), i + 1, mx.float32),
+            }
+            bias = mx.full((*experts, n), -i, mx.float32)
+            layers.append(
+                layer_type(reader, 8, 64, 128, data, bias, placeholders=i == pending)
+            )
+
+    first, *others = layers
+    first.eval()
+    first.unfreeze(keys=["group_scales"])
+    with pytest.raises(formats.FormatRefusedError):
+        layer_type(reader, 8, 64, 128, data)
+    if pending is not None:
+        with pytest.raises(ValueError, match="placeholder"):
+            first._stacked_outputs(*others)
+        return
+
+    joined = first._stacked_outputs(*others)
+    assert type(joined) is layer_type and joined.fmt is reader
+    assert (joined.input_dims, joined.output_dims) == (128, sum(widths))
+    assert [part.output_dims for part in layers] == list(widths)
+    assert not joined.training and set(joined.trainable_parameters()) == {
+        "group_scales"
+    }
+    for name in ("codes", "group_scales", "bias"):
+        expected = mx.concatenate([layer[name] for layer in layers], axis=len(experts))
+        assert mx.array_equal(joined[name], expected).item()
