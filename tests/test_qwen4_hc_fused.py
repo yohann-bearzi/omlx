@@ -1003,6 +1003,10 @@ def _decode_both_ways(hc_fused, monkeypatch, module, hyper, write):
     that normally keep the three-launch kernels for speed.
     """
     monkeypatch.setattr(hc_fused, "_V2_MAX_ROWS", hc_fused.MAX_ROWS)
+    if hasattr(getattr(hc_fused, "_decode_launch", None), "__wrapped__"):
+        monkeypatch.setattr(
+            hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__
+        )
     outputs = []
     for two_launch in (False, True):
         monkeypatch.setattr(hc_fused, "_DECODE_V2", two_launch)

@@ -556,6 +556,8 @@ struct HcFma {
     hyper, _ = _inputs(3, 256, mx.float32, 2561)
     monkeypatch.setattr(live, "_DECODE_V2", True)
     monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
+        monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
     staged = live.fused_forward(module, hyper)
     assert staged is not None
     mx.eval(staged)
