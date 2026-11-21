@@ -1249,7 +1249,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 
 | | Covered |
 |---|---|
-| Bits | 4, 8: a run of 8 codes is one 32-bit word, or two. 2- and 3-bit runs are 2 and 3 bytes, which the face's `fetch` does not read: `affine.tile_face` refuses them. |
+| Bits | `AffineFormat.tile` and `affine.tile_face`, which the verify kernels use, both take 4 and 8 bits: a run of 8 codes is one 32-bit word, or two. |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
 | Weights | 32-bit words, a matrix or a stack of them, K whole groups (its `Runs<K>` asserts it), scales of 8 elements or more |

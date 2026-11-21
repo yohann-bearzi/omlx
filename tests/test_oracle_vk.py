@@ -6,12 +6,16 @@ their rows apart bit for bit."""
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 
 import mlx.core as mx
 import pytest
 
+from omlx.formats import affine
+from omlx.formats import kernels
 from omlx.patches import qwen35_verify_qmm as live
 from tests.oracles import vk as oracle
+from tests.test_formats_tables import tabled_tile
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -113,10 +117,10 @@ def test_a_head_whose_scales_no_tile_face_reads_is_left_to_the_stock_qmm():
 
 # The dispatch's boundaries: 100000 columns (a multiple of 32) take the head
 # kernel, 99968 the split-K; 4096 columns two K parts, 4092 four.
-@pytest.mark.parametrize("n", [100000, 99968, 4096, 4092])
+@pytest.mark.parametrize("n", [100004, 100000, 99968, 4096, 4092])
 def test_the_dispatch_boundaries_are_the_oracle_s(n):
     w = _linear(n, 256, 4, 64, mx.bfloat16, seed=n)
-    for rows in (2, 4, 6):
+    for rows in (1, 2, 4, 6):
         x = _x(rows, 256, mx.bfloat16, seed=rows)
         kw = dict(bits=4, group_size=64)
         assert _same(live.vk_qmm(x, *w, **kw), oracle.vk_qmm(x, *w, **kw))
@@ -128,3 +132,49 @@ def test_a_shape_the_kernels_do_not_take_is_refused(rows, n):
     x = mx.zeros((rows, 256), mx.bfloat16)
     with pytest.raises(ValueError, match="vk_qmm takes 1 to 6 rows and N in fours"):
         live.vk_qmm(x, *w, bits=4, group_size=64)
+
+
+def _msg_source(monkeypatch, m, face):
+    live._msg_kernel.cache_clear()
+    seen = []
+
+    def record(*args, **kwargs):
+        seen.append(args[-1] if args else kwargs.get("source"))
+        return None
+
+    monkeypatch.setattr(kernels, "face_kernel", record)
+    try:
+        live._msg_kernel(m, face, live._MSG_NSG)
+    finally:
+        live._msg_kernel.cache_clear()
+    assert seen
+    return seen[0]
+
+
+def test_msg_kernel_specializes_builtin_affine_faces_only(monkeypatch):
+    four = affine.tile_face(4, 64, mx.bfloat16)
+    assert "const F four" not in _msg_source(monkeypatch, 4, tabled_tile(four))
+    eight = replace(
+        affine.tile_face(8, 64, mx.bfloat16), key="affine_tile_b8g64_custom"
+    )
+    assert "const R rj(w," not in _msg_source(monkeypatch, 6, eight)
+
+
+def test_msg_kernel_source_selection(monkeypatch):
+    b8 = affine.tile_face(8, 64, mx.bfloat16)
+    assert "const R rj(w," in _msg_source(monkeypatch, 6, b8)
+    m4 = _msg_source(monkeypatch, 4, b8)
+    assert "const R r3(w," in m4 and "const F four" not in m4
+    b4 = affine.tile_face(4, 64, mx.bfloat16)
+    for m in (4, 6):
+        assert "const F four" in _msg_source(monkeypatch, m, b4)
+
+
+def test_a_head_with_biases_of_another_dtype_is_left_to_the_stock_qmm():
+    weight, scales, biases = _linear(100352, 512, 4, 64, mx.bfloat16, seed=1)
+    x = _x(4, 512, mx.bfloat16, seed=1)
+    for dtype in (mx.float32, mx.float16):
+        assert (
+            live.vk_qmm(x, weight, scales, biases.astype(dtype), bits=4, group_size=64)
+            is None
+        )

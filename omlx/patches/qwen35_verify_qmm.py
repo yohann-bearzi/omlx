@@ -237,6 +237,22 @@ __DECODE__
 
 
 @cache
+def _affine_tile_faces(bits: int) -> frozenset:
+    """The builtin affine tile faces of ``bits`` for every group and scale
+    type. The msg kernel specializes those only; a tabled or plugin face
+    keeps the generic loop."""
+    import mlx.core as mx
+
+    from omlx.formats import affine
+
+    return frozenset(
+        affine.tile_face(bits, group, dtype)
+        for group in (32, 64, 128)
+        for dtype in (mx.bfloat16, mx.float16)
+    )
+
+
+@cache
 def _msg_kernel(m: int, face, nsg: int):
     """The msg kernel of ``m`` input rows over the tile face ``face``."""
     from omlx.formats import kernels
@@ -244,8 +260,7 @@ def _msg_kernel(m: int, face, nsg: int):
     xloads = "".join(
         f"        Vec8 v{r} = xv[{r} * (K / 8) + run];\n" for r in range(m)
     )
-    key = getattr(face, "key", "")
-    if m == 6 and key.startswith("affine_tile_b8g"):
+    if m == 6 and face in _affine_tile_faces(8):
         # Six activation rows need 24 accumulators. Consume both packed
         # words of one output column before fetching the next column.
         cursors = ""
@@ -255,7 +270,7 @@ def _msg_kernel(m: int, face, nsg: int):
         )
     else:
         cursors = _MSG_CURSORS
-        if key.startswith("affine_tile_b4g"):
+        if face in _affine_tile_faces(4):
             # Keep full-width row arithmetic, rebasing at n0 only once.
             cursors = """\
       const R r0(w, size_t(n0));
@@ -1083,7 +1098,10 @@ def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
     if N >= 100000 and N % (4 * _MSG_NSG) == 0:
         from omlx.formats import affine
 
-        if scales.dtype not in (mx.bfloat16, mx.float16):
+        if (
+            scales.dtype not in (mx.bfloat16, mx.float16)
+            or biases.dtype != scales.dtype
+        ):
             return None  # no tile face reads such scales
         xm, M0 = _pad_rows(mx, x2, m)
         face = affine.tile_face(bits, group_size, scales.dtype)
