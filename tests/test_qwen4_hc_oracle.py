@@ -140,9 +140,34 @@ def _modules(bits, group_size, dtype, hidden=2560, seed=0, lowrank=LOWRANK):
 def _decode(monkeypatch, module, hyper, write, gpu_class):
     hc_fused = _live()
     monkeypatch.setattr(hc_fused, "_gpu_class", lambda: gpu_class)
+    if hasattr(getattr(hc_fused, "_decode_launch", None), "__wrapped__"):
+        monkeypatch.setattr(
+            hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__
+        )
     live = hc_fused.fused_forward(module, hyper, write)
     assert live is not None
     return live, oracle.decode(module, hyper, write, gpu_class=gpu_class)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_decode_helper_switches_gpu_class_geometry(monkeypatch):
+    """The helper's class switch rebuilds the launches: the 's' geometry runs."""
+    hidden, dtype = 256, mx.bfloat16
+    mx.random.seed(2564)
+    module = _module(8, False, hidden=hidden)
+    hyper = (mx.random.normal((1, 4, HC * hidden)) * 2).astype(dtype)
+    live = _live()
+    seen = []
+    original = live._down_rps
+
+    def record(rows):
+        seen.append(original(rows))
+        return seen[-1]
+
+    monkeypatch.setattr(live, "_down_rps", record)
+    _decode(monkeypatch, module, hyper, None, "d")
+    _decode(monkeypatch, module, hyper, None, "s")
+    assert set(seen) == {2, 4}, seen
 
 
 def _assert_decode(
@@ -623,7 +648,6 @@ def _kernel_recorder(live, monkeypatch, rows, width, hidden, lowrank, dtype):
     can be read without compiling or running Metal.
     """
     builds = []
-    build = mx.fast.metal_kernel
 
     def record(**spec):
         name = spec["name"]
@@ -659,7 +683,7 @@ def _kernel_recorder(live, monkeypatch, rows, width, hidden, lowrank, dtype):
     monkeypatch.setattr(mx.fast, "metal_kernel", record)
     monkeypatch.setattr(live, "_KERNELS", {})
     monkeypatch.setattr(live, "_VALIDATED", set())
-    if hasattr(live, "_decode_launch"):
+    if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
         monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
         monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
     return builds
@@ -739,8 +763,6 @@ def test_other_faces_and_small_rows_keep_the_generic_up(
 def test_affine_serial_up_streams_an_equal_face_copy(monkeypatch):
     """An equal but distinct face still streams: concurrent cold starts,
     ``affine.face.cache_clear()`` and deep copies hand one out."""
-    from dataclasses import replace
-
     hidden, dtype = 256, mx.bfloat16
     width = HC * hidden
     module = _module(8, False, hidden=hidden)
@@ -778,6 +800,68 @@ def test_decode_v2_accounts_for_face_table_bytes(monkeypatch):
     hidden_up = (1, HC, 256, 3264, 204, False)
     assert live._decode_v2(*hidden_up, 2)
     assert not live._decode_v2(*hidden_up, 2, table_bytes_up=64)
+    # A table that fits exactly is still served; four bytes more are not.
+    row_fit = (1, HC, 16320, 504, 63, True)
+    assert live._decode_v2(*row_fit, 2, table_bytes_down=96)
+    assert not live._decode_v2(*row_fit, 2, table_bytes_down=100)
+    up_fit = (1, HC, 256, 3200, 200, False)
+    assert live._decode_v2(*up_fit, 2, table_bytes_up=640)
+    assert not live._decode_v2(*up_fit, 2, table_bytes_up=644)
+
+
+def test_decode_launch_accounts_for_face_tables(monkeypatch):
+    """A face's staged tables reach the form's bounds through the launch."""
+    from omlx.formats import Table
+
+    hidden, rows = 16320, 1
+    width = HC * hidden
+    module = _module(8, True, hidden=hidden, lowrank=512)
+    module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+    live = _live()
+    stock_face = live._decode_face
+
+    def with_table(values):
+        table = Table("t", mx.float32, (0.0,) * values)
+        return lambda projection, inject: replace(
+            stock_face(projection, inject), tables=(table,)
+        )
+
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    for values, expected in ((24, "decode_up"), (25, "fused_up")):
+        monkeypatch.setattr(live, "_decode_face", with_table(values))
+        builds = _kernel_recorder(
+            live, monkeypatch, rows, width, hidden, 512, module.hc_norm.weight.dtype
+        )
+        out = live.fused_forward(
+            module, mx.ones((1, rows, width), module.hc_norm.weight.dtype)
+        )
+        assert out is not None
+        assert expected in _up_builds(builds)[0], (values, [b[0] for b in builds])
+
+    hidden, lowrank, rows = 256, 3200, 1
+    width = HC * hidden
+    module = _module(4, False, hidden=hidden, lowrank=lowrank)
+    module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+    up = module.input_mix_weight_up
+
+    def with_up_table(values):
+        table = Table("t", mx.float32, (0.0,) * values)
+        return lambda projection, inject: (
+            replace(stock_face(projection, inject), tables=(table,))
+            if projection is up
+            else stock_face(projection, inject)
+        )
+
+    for values, expected in ((160, "decode_up"), (161, "fused_up")):
+        monkeypatch.setattr(live, "_decode_face", with_up_table(values))
+        builds = _kernel_recorder(
+            live, monkeypatch, rows, width, hidden, lowrank, module.hc_norm.weight.dtype
+        )
+        out = live.fused_forward(
+            module, mx.ones((1, rows, width), module.hc_norm.weight.dtype)
+        )
+        assert out is not None
+        assert expected in _up_builds(builds)[0], (values, [b[0] for b in builds])
 
 
 @pytest.mark.parametrize("rows", [1, 7])
