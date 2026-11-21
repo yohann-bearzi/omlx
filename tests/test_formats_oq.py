@@ -1292,7 +1292,7 @@ def test_a_format_that_takes_no_layer_is_said_so(
         "oQ4: quant format toy took no layer: the output is as without it"
     ]
     assert _quoted(warnings[0])
-    assert not any("layers in quant format" in message for message in caplog.messages)
+    assert not any("oQe refine:" in message for message in caplog.messages)
     assert _RECORD not in config
     # As without it, but for the record of its verification: a run in a
     # format is checked whatever the format took.
@@ -3733,6 +3733,8 @@ def test_skipped_refinement_omits_format_layers_report(
 ):
     """A refinement that did not run says nothing about format layers."""
 
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+
     def skipped(*args, **kwargs):
         return {"status": "skipped", "reason": "calibrated through a proxy"}
 
@@ -3741,10 +3743,7 @@ def test_skipped_refinement_omits_format_layers_report(
     _quantize(source, output, quant_format="toy")
     refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
     assert "format_layers" not in refine
-    assert not any(
-        "layers in quant format" in message and "skipped" in message
-        for message in caplog.messages
-    )
+    assert not any("layers in quant format" in message for message in caplog.messages)
 
 
 def test_refinement_error_status_omits_format_layers_report(
@@ -3766,6 +3765,53 @@ def test_refinement_error_status_omits_format_layers_report(
         "layers in quant format" in message and "skipped" in message
         for message in caplog.messages
     )
+
+
+def test_stock_and_declined_layers_never_probe_faces_while_format_layers_do(
+    source, tmp_path, monkeypatch
+):
+    """Stock builds and declined affine layers never enter _probe_faces or
+    _checked_face; format-encoded layers probe Dot, Tile and Codes."""
+    probed: list[str] = []
+    checked_kinds: list[type] = []
+    real_probe = oq._probe_faces
+    real_checked = formats._checked_face
+
+    def fail_probe(*args, **kwargs):
+        raise AssertionError(f"stock build must never probe faces: {args}")
+
+    monkeypatch.setattr(oq, "_probe_faces", fail_probe)
+    monkeypatch.setattr(formats, "_checked_face", fail_probe)
+    _quantize(source, tmp_path / "stock")
+
+    class NoWide(_Codec):
+        def layout(self, k, n, bits, group_size):
+            if n == 128:
+                return None
+            return super().layout(k, n, bits, group_size)
+
+    def record_probe(layer, tensor_name, k, n):
+        probed.append(tensor_name)
+        return real_probe(layer, tensor_name, k, n)
+
+    def record_checked(reader, layer, k, n, kind, name):
+        checked_kinds.append((reader.mode, kind))
+        return real_checked(reader, layer, k, n, kind, name)
+
+    monkeypatch.setattr(oq, "_probe_faces", record_probe)
+    monkeypatch.setattr(formats, "_checked_face", record_checked)
+    monkeypatch.setitem(formats._FORMATS, "toy", NoWide())
+    _, config, applied = _quantize(source, tmp_path / "mixed", quant_format="toy")
+    entries = _in_format(config)
+    assert entries
+    assert set(applied) - set(entries), "no layer was declined: the pin is vacuous"
+    probed_bases = {name.removesuffix(".weight") for name in probed}
+    assert probed_bases == set(entries)
+    assert set(checked_kinds) == {
+        ("toy", formats.Dot),
+        ("toy", formats.Tile),
+        ("toy", formats.Codes),
+    }
 
 
 def test_the_refinement_writer_leaves_the_layers_it_is_told_to_skip(tmp_path):

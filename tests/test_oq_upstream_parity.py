@@ -1,35 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
-"""A stock oQe build of the merged tree is upstream's, byte for byte.
+"""A stock oQe/oQh build of this tree is upstream e1a402cf's, byte for byte.
 
 The merge of upstream main e1a402cf ported upstream's changes of the
 monolithic quantize_oq_streaming (oQh #5317, the oQe code refinement #5292,
 streamed Qwen3.5 calibration #5332/#5459, per-round embedding #5269, the
 discovery lock #5447) into this branch's split writer (_open_oq_run, the run
 object, the format writer). A build without a quant format must come out as
-upstream's own: the same tensors, config and report, from the same source and
-the same calibration tokens.
+upstream's own: the same stored tensor bytes (dtype, shape, sha256), files,
+config and report, from the same source and the same calibration tokens.
 
-Upstream's tree is ``OMLX_UPSTREAM_TREE`` (a directory holding upstream's
-``omlx`` package), or else the package archived from this repository's
-history at e1a402cf. Each build runs in a fresh interpreter with only its
-tree on the path.
+Goldens are generated from upstream e1a402cf archived from this repository's
+git history (tools/gen_oq_upstream_parity.py) with MLX_ENABLE_TF32=0 (matching
+tests/conftest.py) and keyed by GPU architecture, because upstream e1a402cf
+itself differs on near-tie #5292 refinement codes across Apple GPU generations
+(steel on M3 vs NAX on M5). On an unlisted architecture in a git checkout, the
+test archives upstream e1a402cf directly and compares live.
 """
 
 from __future__ import annotations
 
+import copy
 import io
 import json
-import os
+import struct
 import subprocess
 import sys
 import tarfile
 from pathlib import Path
 
-import mlx.core as mx
 import pytest
-from mlx.utils import tree_flatten
 
-pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+from tests.safetensors_bytes import tensor_bytes
+
+try:
+    import mlx.core as mx
+    from mlx.utils import tree_flatten
+
+    _HAS_METAL = mx.metal.is_available()
+except ImportError:
+    mx = None
+    tree_flatten = None
+    _HAS_METAL = False
+
+_REQUIRES_METAL = pytest.mark.skipif(not _HAS_METAL, reason="requires Metal")
 
 UPSTREAM = "e1a402cf7b8e36599a3c1689b9d12cec5da79ade"
 _REPO = Path(__file__).resolve().parents[1]
@@ -40,7 +53,7 @@ _DRIVER = r"""
 import sys
 from pathlib import Path
 
-tree, source, output, level, hadamard = sys.argv[1:6]
+tree, source, output, level, hadamard, preserve_mtp = sys.argv[1:7]
 import mlx.core as mx
 import omlx.oq as oq
 
@@ -59,6 +72,7 @@ oq.quantize_oq_streaming(
     imatrix_cache_path=str(out.parent / f"{out.name}.npz"),
     sensitivity_map_override={0: 0.1, 1: 0.2},
     hadamard=hadamard == "1",
+    preserve_mtp=preserve_mtp == "1",
 )
 """
 
@@ -71,35 +85,60 @@ _VOLATILE_PLAN = (
     "live_available_bytes",
     "remaining_available_bytes",
     "system_available_bytes",
+    # Runtime facts of the Mac, not the writer's output.
+    "metal_available_bytes",
+    "capture_budget_bytes",
 )
 
 
-@pytest.fixture(scope="module")
-def upstream_tree(tmp_path_factory) -> Path:
-    given = os.environ.get("OMLX_UPSTREAM_TREE")
-    if given:
-        tree = Path(given)
-    else:
-        try:
-            archived = subprocess.run(
-                ["git", "-C", str(_REPO), "archive", "--format=tar", UPSTREAM, "omlx"],
-                check=True,
-                capture_output=True,
-            ).stdout
-        except (OSError, subprocess.CalledProcessError):
-            pytest.skip(
-                f"upstream {UPSTREAM[:8]} is not in this tree's history: set "
-                "OMLX_UPSTREAM_TREE to a directory holding its omlx package"
-            )
-        tree = tmp_path_factory.mktemp("upstream")
-        with tarfile.open(fileobj=io.BytesIO(archived)) as tar:
-            tar.extractall(tree, filter="data")
-    oq_source = (tree / "omlx" / "oq.py").read_text()
-    # Upstream's own writer: the refinement and oQh, and no quant format.
-    assert "def _refine_oqe_output(" in oq_source
-    assert "def _write_oqh_output(" in oq_source
-    assert "quant_format" not in oq_source
-    return tree
+def _child_env(tree: Path) -> dict[str, str]:
+    """Deterministic child-process environment shared by test and generator.
+
+    Pins MLX_ENABLE_TF32=0 to match tests/conftest.py so M5-class tensor units
+    run fp32 matmuls identically in both golden generation and pytest.
+    """
+    return {
+        "PYTHONPATH": str(tree),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HF_HUB_OFFLINE": "1",
+        "PATH": "/usr/bin:/bin",
+        "MLX_ENABLE_TF32": "0",
+    }
+
+
+def _goldens() -> dict:
+    return json.loads(
+        (Path(__file__).parent / "data" / "oq_upstream_parity.json").read_text()
+    )
+
+
+def _tensor_hashes(output: Path) -> dict[str, dict]:
+    hashes = {}
+    for shard in sorted(output.glob("*.safetensors")):
+        for name, entry in tensor_bytes(shard).items():
+            hashes[f"{shard.name}:{name}"] = entry
+    return hashes
+
+
+def _snapshot(output: Path) -> dict:
+    index = output / "model.safetensors.index.json"
+    return {
+        "files": sorted(path.name for path in output.iterdir()),
+        "tensors": _tensor_hashes(output),
+        "config": json.loads((output / "config.json").read_text()),
+        "report": _report(output / "oq_imatrix_report.json"),
+        "index": json.loads(index.read_text()) if index.exists() else None,
+    }
+
+
+def _assert_parity(output: Path, case: dict) -> None:
+    assert sorted(path.name for path in output.iterdir()) == case["files"]
+    assert _tensor_hashes(output) == case["tensors"]
+    assert json.loads((output / "config.json").read_text()) == case["config"]
+    assert _report(output / "oq_imatrix_report.json") == case["report"]
+    index = output / "model.safetensors.index.json"
+    got = json.loads(index.read_text()) if index.exists() else None
+    assert got == case["index"]
 
 
 def _llama_source(path: Path) -> None:
@@ -140,32 +179,40 @@ def _llama_source(path: Path) -> None:
     )
 
 
-def _qwen3_5_moe_source(path: Path, monkeypatch) -> None:
+def _qwen3_5_moe_source(path: Path, monkeypatch, *, mtp: bool = False) -> None:
     """Upstream's tiny Qwen3.5 MoE (tests/test_oq.py), widened as upstream's
-    refinement test widens it: routed experts the refinement re-picks."""
+    refinement test widens it: routed experts, shared expert, and optional MTP."""
     from tests import test_oq
 
     monkeypatch.setitem(test_oq._QWEN3_5_STREAM_TEXT, "hidden_size", 256)
     monkeypatch.setitem(test_oq._QWEN3_5_STREAM_TEXT, "intermediate_size", 512)
     for key in ("moe_intermediate_size", "shared_expert_intermediate_size"):
         monkeypatch.setitem(test_oq._QWEN3_5_STREAM_EXPERTS, key, 256)
-    test_oq._qwen3_5_stream_source(path, "qwen3_5_moe", vlm=False, mtp=False)
+    test_oq._qwen3_5_stream_source(path, "qwen3_5_moe", vlm=False, mtp=mtp)
 
 
 def _build(
-    tree: Path, source: Path, output: Path, level: int, workdir: Path, *, hadamard=False
+    tree: Path,
+    source: Path,
+    output: Path,
+    level: int,
+    workdir: Path,
+    *,
+    hadamard: bool = False,
+    preserve_mtp: bool = False,
 ) -> str:
-    env = {
-        **os.environ,
-        "PYTHONPATH": str(tree),
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "HF_HUB_OFFLINE": "1",
-    }
-    args = [str(tree), str(source), str(output), str(level), "1" if hadamard else "0"]
+    args = [
+        str(tree),
+        str(source),
+        str(output),
+        str(level),
+        "1" if hadamard else "0",
+        "1" if preserve_mtp else "0",
+    ]
     done = subprocess.run(
         [sys.executable, "-c", _DRIVER, *args],
         cwd=workdir,
-        env=env,
+        env=_child_env(tree),
         capture_output=True,
         text=True,
     )
@@ -173,8 +220,9 @@ def _build(
     return done.stderr
 
 
-def _report(path: Path) -> dict:
-    report = json.loads(path.read_text())
+def _stripped(report: dict) -> dict:
+    """``report`` without the run's volatile facts (both sides of a compare)."""
+    report = copy.deepcopy(report)
     for key in _VOLATILE:
         report.pop(key, None)
     for key in _VOLATILE_REFINE:
@@ -186,76 +234,354 @@ def _report(path: Path) -> dict:
     return report
 
 
+def _report(path: Path) -> dict:
+    return _stripped(json.loads(path.read_text()))
+
+
+def _archive_upstream(destination: Path) -> bool:
+    try:
+        archived = subprocess.run(
+            ["git", "-C", str(_REPO), "archive", "--format=tar", UPSTREAM, "omlx"],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return False
+    with tarfile.open(fileobj=io.BytesIO(archived)) as tar:
+        tar.extractall(destination, filter="data")
+    oq_source = (destination / "omlx" / "oq.py").read_text()
+    assert "def _refine_oqe_output(" in oq_source
+    assert "def _write_oqh_output(" in oq_source
+    assert "quant_format" not in oq_source
+    return True
+
+
+def _expected_case(
+    case_name: str,
+    source: Path,
+    level: int,
+    tmp_path: Path,
+    *,
+    hadamard: bool = False,
+    preserve_mtp: bool = False,
+) -> dict:
+    goldens = _goldens()
+    assert goldens["upstream"] == UPSTREAM
+    assert goldens["numerics"]["tf32"] == "off"
+    arch = str(mx.device_info().get("architecture", ""))
+    by_arch = goldens.get("architectures") or {}
+    if arch in by_arch and case_name in by_arch[arch]:
+        assert goldens["numerics"]["mlx"] == mx.__version__
+        return by_arch[arch][case_name]
+    upstream_tree = tmp_path / "upstream_tree"
+    upstream_tree.mkdir()
+    if not _archive_upstream(upstream_tree):
+        pytest.fail(
+            f"no golden for GPU architecture {arch!r} case {case_name!r} and git "
+            f"archive of {UPSTREAM[:8]} is unavailable; run "
+            "tools/gen_oq_upstream_parity.py"
+        )
+    up_work = tmp_path / "upstream_work"
+    up_work.mkdir()
+    theirs = tmp_path / "upstream_out"
+    _build(
+        upstream_tree,
+        source,
+        theirs,
+        level,
+        up_work,
+        hadamard=hadamard,
+        preserve_mtp=preserve_mtp,
+    )
+    return _snapshot(theirs)
+
+
+def _write_raw_safetensors(
+    path: Path, tensors: dict[str, tuple[str, list[int], bytes]]
+) -> None:
+    header = {}
+    payload = bytearray()
+    for name, (dtype, shape, data) in tensors.items():
+        lo = len(payload)
+        payload.extend(data)
+        header[name] = {
+            "dtype": dtype,
+            "shape": shape,
+            "data_offsets": [lo, len(payload)],
+        }
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    path.write_bytes(
+        struct.pack("<Q", len(header_bytes)) + header_bytes + bytes(payload)
+    )
+
+
+def test_safetensors_bytes_detects_flipped_byte_dtype_and_shape(tmp_path):
+    """CPU-only negative control: a single flipped byte, dtype or shape change
+    in stored safetensors bytes fails parity."""
+    k_bytes = bytes(range(32))
+    s_bytes = bytes(range(16))
+    base_tensors = {
+        "model.layers.0.self_attn.k_proj.weight": ("U32", [2, 4], k_bytes),
+        "model.layers.0.self_attn.k_proj.scales": ("BF16", [2, 4], s_bytes),
+    }
+
+    def write_case(directory: Path, tensors: dict) -> None:
+        directory.mkdir()
+        _write_raw_safetensors(directory / "model.safetensors", tensors)
+        (directory / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (directory / "oq_imatrix_report.json").write_text(
+            json.dumps({"refine": {"status": "done", "tensors": 1}})
+        )
+
+    good = tmp_path / "good"
+    write_case(good, base_tensors)
+    expected = _snapshot(good)
+    _assert_parity(good, expected)
+
+    # Flipped-byte negative control: flip one bit in k_proj.weight's payload.
+    flipped = tmp_path / "flipped"
+    bad_bytes = bytearray(k_bytes)
+    bad_bytes[7] ^= 0x01
+    write_case(
+        flipped,
+        {
+            **base_tensors,
+            "model.layers.0.self_attn.k_proj.weight": ("U32", [2, 4], bytes(bad_bytes)),
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_parity(flipped, expected)
+
+    # Dtype mismatch control: same stored bytes, different header dtype.
+    wrong_dtype = tmp_path / "wrong_dtype"
+    write_case(
+        wrong_dtype,
+        {
+            **base_tensors,
+            "model.layers.0.self_attn.k_proj.weight": ("I32", [2, 4], k_bytes),
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_parity(wrong_dtype, expected)
+
+    # Shape mismatch control: same stored bytes and dtype, different shape.
+    wrong_shape = tmp_path / "wrong_shape"
+    write_case(
+        wrong_shape,
+        {
+            **base_tensors,
+            "model.layers.0.self_attn.k_proj.weight": ("U32", [4, 2], k_bytes),
+        },
+    )
+    with pytest.raises(AssertionError):
+        _assert_parity(wrong_shape, expected)
+
+    # Corrupt byte length in header fails closed.
+    bad_len = tmp_path / "bad_len.safetensors"
+    _write_raw_safetensors(
+        bad_len,
+        {"model.layers.0.self_attn.k_proj.weight": ("U32", [2, 4], k_bytes[:-4])},
+    )
+    with pytest.raises(ValueError, match="byte length"):
+        tensor_bytes(bad_len)
+
+
+def test_parity_child_env_pins_tf32_off_and_uses_no_custom_env_vars():
+    """Both test and generator pin MLX_ENABLE_TF32=0 (matching conftest.py)
+    and never read environment variables."""
+    env = _child_env(_REPO)
+    assert env["MLX_ENABLE_TF32"] == "0"
+    assert env["PYTHONPATH"] == str(_REPO)
+    for rel in ("tests/test_oq_upstream_parity.py", "tools/gen_oq_upstream_parity.py"):
+        text = (_REPO / rel).read_text()
+        assert "os." + "environ" not in text, rel
+        assert "os." + "getenv" not in text, rel
+
+
+@_REQUIRES_METAL
 @pytest.mark.parametrize("level", [4, 3], ids=["oQ4e", "oQ3e"])
 @pytest.mark.parametrize("family", ["llama", "qwen3_5_moe"])
 def test_a_stock_oqe_build_is_upstream_s_byte_for_byte(
-    upstream_tree, tmp_path, monkeypatch, family, level
+    tmp_path, monkeypatch, family, level
 ):
     source = tmp_path / "source"
     if family == "llama":
         _llama_source(source)
     else:
-        _qwen3_5_moe_source(source, monkeypatch)
+        _qwen3_5_moe_source(source, monkeypatch, mtp=False)
     work = tmp_path / "work"
     work.mkdir()
-    theirs = tmp_path / "upstream" / "out"
     ours = tmp_path / "merged" / "out"
-    _build(upstream_tree, source, theirs, level, work)
     _build(_REPO, source, ours, level, work)
-
-    their_files = sorted(p.name for p in theirs.iterdir())
-    assert sorted(p.name for p in ours.iterdir()) == their_files
-    report = "oq_imatrix_report.json"
-    for name in their_files:
-        if name == report:
-            continue
-        assert (ours / name).read_bytes() == (theirs / name).read_bytes(), name
-    # The report too, but where its cache is and how long the refinement took.
-    mine, upstream = _report(ours / report), _report(theirs / report)
-    differing = {
-        (key, sub)
-        for key in mine.keys() | upstream.keys()
-        for sub in (
-            (mine.get(key) or {}).keys() | (upstream.get(key) or {}).keys()
-            if isinstance(mine.get(key), dict) and isinstance(upstream.get(key), dict)
-            else [None]
-        )
-        if (mine.get(key) if sub is None else mine[key].get(sub))
-        != (upstream.get(key) if sub is None else upstream[key].get(sub))
-    }
-    assert not differing, {
-        f"{key}.{sub}": (
-            (mine.get(key) if sub is None else mine[key].get(sub)),
-            (upstream.get(key) if sub is None else upstream[key].get(sub)),
-        )
-        for key, sub in differing
-    }
+    case = _expected_case(f"{family}-oQ{level}e", source, level, tmp_path)
+    _assert_parity(ours, case)
     # Upstream refined this build: the parity covers the refinement's codes.
-    refine = json.loads((theirs / report).read_text())["refine"]
+    refine = case["report"]["refine"]
     assert refine["status"] == "done" and refine["tensors"] > 0, refine
 
 
-@pytest.mark.parametrize("level", [4, 3], ids=["oQ4h", "oQ3h"])
-def test_a_stock_oqh_build_is_upstream_s_byte_for_byte(
-    upstream_tree, tmp_path, monkeypatch, level
+@_REQUIRES_METAL
+@pytest.mark.parametrize("level", [4, 3, 2], ids=["oQ4e", "oQ3e", "oQ2e"])
+def test_a_stock_moe_mtp_oqe_build_is_upstream_s_byte_for_byte(
+    tmp_path, monkeypatch, level
 ):
+    """A tiny MoE + MTP build (routed experts, shared expert, preserved MTP
+    layer) at oQ4e/oQ3e/oQ2e matches upstream e1a402cf on all stored tensors."""
     source = tmp_path / "source"
-    _qwen3_5_moe_source(source, monkeypatch)
+    _qwen3_5_moe_source(source, monkeypatch, mtp=True)
     work = tmp_path / "work"
     work.mkdir()
-    theirs = tmp_path / "upstream" / "out"
     ours = tmp_path / "merged" / "out"
-    _build(upstream_tree, source, theirs, level, work, hadamard=True)
-    _build(_REPO, source, ours, level, work, hadamard=True)
+    _build(_REPO, source, ours, level, work, preserve_mtp=True)
+    case = _expected_case(
+        f"qwen3_5_moe_mtp-oQ{level}e",
+        source,
+        level,
+        tmp_path,
+        preserve_mtp=True,
+    )
+    _assert_parity(ours, case)
+    tensor_names = case["tensors"]
+    assert any(".switch_mlp." in name for name in tensor_names)
+    assert any(".shared_expert." in name for name in tensor_names)
+    assert any(".mtp." in name for name in tensor_names)
+    refine = case["report"]["refine"]
+    assert refine["status"] == "done" and refine["tensors"] > 0, refine
 
-    their_files = sorted(p.name for p in theirs.iterdir())
-    assert sorted(p.name for p in ours.iterdir()) == their_files
-    report = "oq_imatrix_report.json"
-    for name in their_files:
-        if name == report:
-            continue
-        assert (ours / name).read_bytes() == (theirs / name).read_bytes(), name
-    mine, upstream = _report(ours / report), _report(theirs / report)
-    assert mine == upstream
-    assert "refine" not in mine
-    assert mine["oqh"]["status"] == "done" and mine["oqh"]["tensors"] > 0
+
+@_REQUIRES_METAL
+@pytest.mark.parametrize("level", [4, 3], ids=["oQ4h", "oQ3h"])
+def test_a_stock_oqh_build_is_upstream_s_byte_for_byte(tmp_path, monkeypatch, level):
+    source = tmp_path / "source"
+    _qwen3_5_moe_source(source, monkeypatch, mtp=False)
+    work = tmp_path / "work"
+    work.mkdir()
+    ours = tmp_path / "merged" / "out"
+    _build(_REPO, source, ours, level, work, hadamard=True)
+    case = _expected_case(
+        f"qwen3_5_moe-oQ{level}h", source, level, tmp_path, hadamard=True
+    )
+    _assert_parity(ours, case)
+    assert "refine" not in case["report"]
+    assert case["report"]["oqh"]["status"] == "done"
+    assert case["report"]["oqh"]["tensors"] > 0
+
+
+@pytest.mark.skipif(mx is None, reason="requires mlx")
+def test_expected_case_fails_loudly_on_unlisted_arch_without_git(tmp_path, monkeypatch):
+    """An architecture with no golden must fail, never skip, git or not."""
+    import sys
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "mx",
+        SimpleNamespace(
+            device_info=lambda: {"architecture": "applegpu_g99z"},
+            __version__="0.0.0",
+        ),
+    )
+    monkeypatch.setattr(
+        "tests.test_oq_upstream_parity._archive_upstream", lambda destination: False
+    )
+    with pytest.raises(pytest.fail.Exception, match=r"applegpu_g99z.*llama-oQ4e"):
+        _expected_case("llama-oQ4e", tmp_path, 4, tmp_path)
+
+
+@pytest.mark.skipif(mx is None, reason="requires mlx")
+def test_gen_drops_stale_arch_when_mlx_version_changes():
+    """Preserved architectures are reused only under the same numerics."""
+    from tools.gen_oq_upstream_parity import _merge_architectures
+
+    loaded = {
+        "upstream": UPSTREAM,
+        "numerics": {"tf32": "off", "mlx": "0.0.0"},
+        "architectures": {"applegpu_g17s": {"llama-oQ4e": {"report": {}}}},
+    }
+    merged = _merge_architectures(
+        loaded, "applegpu_g15d", {"llama-oQ4e": {"report": {}}}, "0.32.4"
+    )
+    assert "applegpu_g17s" not in merged
+    assert "applegpu_g15d" in merged
+
+
+@pytest.mark.skipif(mx is None, reason="requires mlx")
+def test_gen_preserves_matching_arch_and_strips_volatile_report():
+    """A preserved arch under the same numerics is kept, with its report stripped."""
+    from tools.gen_oq_upstream_parity import _merge_architectures
+
+    report = {
+        "collection": {
+            "batch_plan": {
+                "metal_available_bytes": 1,
+                "capture_budget_bytes": 2,
+                "micro_batch_size": 4,
+            }
+        }
+    }
+    loaded = {
+        "upstream": UPSTREAM,
+        "numerics": {"tf32": "off", "mlx": "0.32.4"},
+        "architectures": {"applegpu_g17s": {"llama-oQ4e": {"report": report}}},
+    }
+    merged = _merge_architectures(
+        loaded, "applegpu_g15d", {"llama-oQ4e": {"report": {}}}, "0.32.4"
+    )
+    assert "applegpu_g17s" in merged and "applegpu_g15d" in merged
+    plan = merged["applegpu_g17s"]["llama-oQ4e"]["report"]["collection"]["batch_plan"]
+    assert "metal_available_bytes" not in plan
+    assert "capture_budget_bytes" not in plan
+    dropped = _merge_architectures(
+        {**loaded, "upstream": "0" * 40}, "applegpu_g15d", {}, "0.32.4"
+    )
+    assert "applegpu_g17s" not in dropped
+
+
+def _parity_directory(directory: Path) -> Path:
+    directory.mkdir()
+    _write_raw_safetensors(
+        directory / "model.safetensors",
+        {"model.layers.0.self_attn.k_proj.weight": ("U32", [2, 4], bytes(range(32)))},
+    )
+    (directory / "config.json").write_text(json.dumps({"model_type": "llama"}))
+    (directory / "oq_imatrix_report.json").write_text(
+        json.dumps(
+            {
+                "refine": {"status": "done", "tensors": 1},
+                "collection": {
+                    "batch_plan": {
+                        "metal_available_bytes": 524287998672,
+                        "capture_budget_bytes": 805306368,
+                        "micro_batch_size": 4,
+                    }
+                },
+            }
+        )
+    )
+    return directory
+
+
+def test_assert_parity_detects_corrupt_index(tmp_path):
+    """A multi-shard index's weight_map is part of the golden, not just names."""
+    good = _parity_directory(tmp_path / "good")
+    (good / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "metadata": {"total_size": 32},
+                "weight_map": {
+                    "model.layers.0.self_attn.k_proj.weight": "model.safetensors"
+                },
+            }
+        )
+    )
+    expected = _snapshot(good)
+    _assert_parity(good, expected)
+    expected.pop("index")
+    with pytest.raises(KeyError):
+        _assert_parity(good, expected)
+    expected = _snapshot(good)
+    expected["index"]["weight_map"][
+        "model.layers.0.self_attn.k_proj.weight"
+    ] = "other.safetensors"
+    with pytest.raises(AssertionError):
+        _assert_parity(good, expected)
