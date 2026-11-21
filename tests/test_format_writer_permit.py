@@ -17,6 +17,11 @@ from tests.test_formats_oq import source as source
 def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
     source, tmp_path, monkeypatch
 ):
+    """The write admits two readers, distinct by identity: ``_format_reader``'s
+    for the write's dot and tile probes, and the one ``verify_written_format_
+    checkpoint``'s reload admits. The write probes both faces of every
+    persisted layer on the first; the reload then probes every layer's dot
+    face once on the second, and no tile face."""
     assert not formats._TESTING and not oq._TEST_VERIFIED
     assert formats._LOADING.get() is None
     # oQ accepts the text source and writes the Qwen3.5 MoE model type that
@@ -29,6 +34,7 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
     )
     write_readers = []
     probes = []
+    probe_readers = []
     writing = True
 
     class Codec(_Codec):
@@ -60,10 +66,14 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
             assert layer.fmt is self
             assert self is not writer and self is not prototype
             if writing:
+                assert write_readers and self is write_readers[-1][0]
                 assert formats._LOADING.get() is None and not formats._TESTING
-                inputs = {name: layer[name] for name in (self.codes_name, *self.tensors)}
+                inputs = {
+                    name: layer[name] for name in (self.codes_name, *self.tensors)
+                }
                 with pytest.raises(formats.FormatRefusedError):
                     type(layer)(self, layer.bits, layer.group_size, k, inputs)
+            probe_readers.append(self)
             probes.append(
                 (
                     face,
@@ -95,10 +105,14 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
     writing = False
     entries = _in_format(config, writer.mode)
     assert entries and sorted(entries) == applied
-    assert write_readers
+    assert len(write_readers) == 2
+    write_reader, write_record = write_readers[0]
+    verify_reader, verify_record = write_readers[1]
+    assert write_reader is not verify_reader
     saved = config["omlx_quant_formats"][writer.mode]
-    records = [record for _, record in write_readers]
-    assert saved["record"] in records and saved["contract"] == writer.contract
+    assert saved["record"] == write_record == verify_record and (
+        saved["contract"] == writer.contract
+    )
     expected = []
     for name, entry in entries.items():
         shape = tensors[f"{name}.codes"].shape
@@ -116,12 +130,15 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
                 )
             )
     assert {item[1] for item in expected} == {FormatLinear, FormatSwitchLinear}
-    # io's verify-on-finalize reload probes every persisted layer's dot face
-    # once more through the accepted reader; the tile faces come from the
-    # write alone. Each layer and geometry is otherwise the write's.
-    dot_faces = Counter(item for item in expected if item[0] == "dot")
-    tile_faces = Counter(item for item in expected if item[0] == "tile")
-    assert Counter(probes) == dot_faces + dot_faces + tile_faces
+    # The write probes both faces of every persisted layer; the
+    # verify-on-finalize reload then probes every layer's dot face once on
+    # the verify reader and never a tile face.
+    dot_faces = [item for item in expected if item[0] == "dot"]
+    assert len(probes) == len(expected) + len(dot_faces)
+    assert Counter(probes[: len(expected)]) == Counter(expected)
+    assert all(reader is write_reader for reader in probe_readers[: len(expected)])
+    assert Counter(probes[len(expected) :]) == Counter(dot_faces)
+    assert all(reader is verify_reader for reader in probe_readers[len(expected) :])
 
     maybe_apply_pre_load_patches(str(output))
     model, _ = load_model(output, strict=True)
