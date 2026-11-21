@@ -7195,7 +7195,8 @@ def _row_chunks(t, max_elems):
 # it). Every other is refused, under any spelling (lower case, "-" for "_"):
 # the gate fails closed. Families served by mlx-lm's own code alone come back
 # after the proof of concept (DEFERRED.md row 22).
-# Match the whole config. The text backbone is admitted only in this wrapper.
+# Match the whole config. A text backbone is admitted bare only where verified
+# standalone (qwen3_5_moe_text); else only inside its wrapper.
 _QUANT_FORMAT_VERIFIED = frozenset(
     {
         ("qwen4_exp", "qwen4_exp_text"),
@@ -7215,19 +7216,10 @@ _TEST_VERIFIED: frozenset[str] = frozenset()
 # declining a format's layer verifies it. Keyed by model type (of the
 # checkpoint or of its text_config), or by the decision family a decision
 # model's loader serves it as (format_load.refuse_family).
-_GLM5_NEXT_MISREAD = (
-    # Glm5NextLinearAttention._fused_in_proj concatenates q, k, v, f_a, g_a
-    # and b: as affine when the first has "scales", else as float weights
-    # (mlx_vlm_glm5_next_compat/vendor/mlx_vlm/models/glm5_next/language.py).
-    "its linear attention fuses its input projections by hand, as MLX's "
-    "affine layers or as floats"
-)
 _DEEPSEEK_V4_MISREAD = (
     "its DSpark draft reads the output head's weight by hand, as floats"
 )
 _QUANT_FORMAT_MISREAD = {
-    "glm5_next": _GLM5_NEXT_MISREAD,
-    "glm5_next_text": _GLM5_NEXT_MISREAD,
     # Clef pools rows of its output head (models/clef.py) that
     # DecisionBackbone.output_rows dequantizes for MLX's quantized layers
     # and reads as float weights from any other (models/decision.py).
@@ -7310,7 +7302,9 @@ def _unverified_family(config: dict) -> tuple[str, str] | None:
         for section in (config, text_config)
     ):
         return families[0], "its model_file selects a custom model implementation"
-    if families in _QUANT_FORMAT_VERIFIED:
+    if families in _QUANT_FORMAT_VERIFIED and not (
+        len(families) == 1 and isinstance(text_config, dict)
+    ):
         return None
     verified = _TEST_VERIFIED
     for family in families:

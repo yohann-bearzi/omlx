@@ -6,6 +6,7 @@ in a toy format and loaded back.
 
 from __future__ import annotations
 
+import copy
 import inspect
 import json
 import logging
@@ -1471,20 +1472,12 @@ def test_each_run_reads_the_classes_of_the_model_it_writes(
     }
 
 
-_GLM5_NEXT = (
-    "its linear attention fuses its input projections by hand, as MLX's affine "
-    "layers or as floats"
-)
-
-
 _DEEPSEEK_V4 = "its DSpark draft reads the output head's weight by hand, as floats"
 _NOT_VERIFIED = "it is no family verified with quant formats end to end"
 # The page quotes these of the same family, or of one of their kind.
-_PAGE_FAMILY = {"glm5_next_text": "glm5_next", "deepseek_v4_mtp": "deepseek_v4"}
+_PAGE_FAMILY = {"deepseek_v4_mtp": "deepseek_v4"}
 # The pages quote the refusals of these families.
 _QUOTED_FAMILIES = {
-    "glm5_next",
-    "glm5_next_text",
     "raon1_mini",
     "deepseek_v4",
     "deepseek_v4_mtp",
@@ -1497,12 +1490,6 @@ _QUOTED_FAMILIES = {
 @pytest.mark.parametrize(
     "family, config, why",
     [
-        ("glm5_next", {"model_type": "glm5_next"}, _GLM5_NEXT),
-        (
-            "glm5_next_text",
-            {"model_type": "glm5", "text_config": {"model_type": "GLM5-Next-Text"}},
-            _GLM5_NEXT,
-        ),
         (
             "raon1_mini",
             {"model_type": "raon1_mini"},
@@ -1563,8 +1550,6 @@ _QUOTED_FAMILIES = {
         ),
     ],
     ids=[
-        "model type",
-        "text model type",
         "raon1_mini",
         "deepseek_v4",
         "deepseek_v4_mtp",
@@ -3762,15 +3747,24 @@ def test_a_qwen35_moe_write_verifies_after_reload(
     output = tmp_path / "qwen35-oq4e"
     _, config, _ = _quantize(source, output, quant_format="toy")
     assert config["omlx_verification"]["verified"] is True
+    assert config["model_type"] == "qwen3_5_moe"
+    assert "toy" in config["omlx_quant_formats"]
+    routed = [
+        entry
+        for name, entry in config["quantization"].items()
+        if "down_proj" in name
+        and "shared_expert" not in name
+        and ("switch_mlp" in name or "experts" in name)
+    ]
+    assert routed and all(entry["bits"] == 4 for entry in routed)
     maybe_apply_pre_load_patches(str(output))
     model, _ = load_model(output, strict=True)
     out = model(mx.array([[1, 2, 3, 4]]))
     logits = getattr(out, "logits", out)
     assert mx.isfinite(logits).all()
 
-def test_a_text_only_run_ignores_a_broken_optiq_declaration(source, tmp_path):
-    import shutil
 
+def test_a_text_only_run_ignores_a_broken_optiq_declaration(source, tmp_path):
     src = tmp_path / "src"
     shutil.copytree(source, src)
     config = json.loads((src / "config.json").read_text())
@@ -3778,3 +3772,152 @@ def test_a_text_only_run_ignores_a_broken_optiq_declaration(source, tmp_path):
     (src / "config.json").write_text(json.dumps(config))
     _, written, _ = _quantize(src, tmp_path / "text", text_only=True)
     assert "optiq_vision" not in written
+
+
+def test_the_glm53_fused_in_proj_declines_a_format_layer(toy):
+    """Glm5NextLinearAttention._fused_in_proj concatenates its projections'
+    weights by hand; a format's layer has no MLX affine weight to concatenate,
+    so it must fall back to the format's own call, per projection."""
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    from mlx_vlm.models.glm5_next import language
+
+    hidden, heads = 32, 2
+    qkv = heads * 128
+    layer = language.Glm5NextLinearAttention(
+        SimpleNamespace(
+            hidden_size=hidden,
+            linear_num_heads=heads,
+            linear_head_dim=128,
+            linear_conv_kernel_dim=4,
+            linear_lower_bound=-5.0,
+            rms_norm_eps=1e-5,
+        )
+    )
+
+    def format_proj(out_dims, in_dims, seed):
+        mx.random.seed(seed)
+        weight = mx.random.normal((out_dims, in_dims)).astype(mx.bfloat16)
+        tensors = toy.encode(weight, mx.ones((in_dims,), mx.float32), 4, 32)
+        return FormatLinear("toy", 4, 32, in_dims, tensors)
+
+    layer.q_proj = format_proj(qkv, hidden, 1)
+    layer.k_proj = format_proj(qkv, hidden, 2)
+    layer.v_proj = format_proj(qkv, hidden, 3)
+    layer.forget_gate.f_a_proj = format_proj(128, hidden, 4)
+    layer.g_a_proj = format_proj(128, hidden, 5)
+    layer.b_proj = format_proj(heads, hidden, 6)
+    mods = [
+        layer.q_proj,
+        layer.k_proj,
+        layer.v_proj,
+        layer.forget_gate.f_a_proj,
+        layer.g_a_proj,
+        layer.b_proj,
+    ]
+    x = mx.random.normal((1, 1, hidden)).astype(mx.bfloat16)
+    got = layer._fused_in_proj(x)
+    want = tuple(language.linear_forward(m, x) for m in mods)
+    assert isinstance(got, tuple) and len(got) == len(want)
+    for part, expected in zip(got, want):
+        assert mx.array_equal(part, expected)
+
+
+def test_a_glm53_pair_write_verifies_after_reload(
+    toy, tmp_path, monkeypatch, caplog
+):
+    """A tiny GLM-5.3 pair, marked verified for the test, written through the
+    level's budget plan: its routed experts stay affine (no format layer is
+    built for their SwitchLinear), and the writer verifies after reload."""
+    from mlx.utils import tree_flatten
+
+    from omlx.patches.mlx_vlm_glm5_next_compat import (
+        apply_mlx_vlm_glm5_next_compat_patch,
+    )
+    from omlx.patches.mlx_vlm_mtp import glm5_next_vlm_runtime
+    from tests.test_glm5_next_mtp import TINY_TEXT_CONFIG
+    from tests.test_mlx_vlm_glm5_next_compat import _tiny_config, _tiny_config_dict
+
+    apply_mlx_vlm_glm5_next_compat_patch()
+    glm5_next_vlm_runtime.apply()
+    # After the patch: imported before it, the name is installed mlx-vlm's
+    # own glm5_next, whose sanitize fuses q/k/v, f_a/b/g_a and gate/up
+    # (qkv_proj, fbg_a_proj, gate_up_proj): a source built from it holds
+    # names oMLX's vendored model, which writes and serves GLM-5.3, has not.
+    from mlx_vlm.models import glm5_next
+
+    assert "vendor" in glm5_next.__file__
+    text = copy.deepcopy(TINY_TEXT_CONFIG)
+    text.update(
+        num_hidden_layers=2,
+        qk_nope_head_dim=64,
+        v_head_dim=64,
+        index_head_dim=64,
+        layer_types=["linear_attention", "linear_attention"],
+        mlp_layer_types=["dense", "sparse"],
+        first_k_dense_replace=1,
+        num_nextn_predict_layers=0,
+        max_position_embeddings=128,
+    )
+    text["linear_attn_config"].update(kda_layers=[0, 1], full_attn_layers=[])
+    config = _tiny_config(with_vision=True)
+    config.text_config = glm5_next.TextConfig.from_dict(text)
+    model = glm5_next.Model(config)
+    weights = dict(tree_flatten(model.parameters()))
+    sparse = [
+        i
+        for i, kind in enumerate(text["layer_types"])
+        if kind == "deepseek_sparse_attention"
+    ]
+    for i in sparse:
+        prefix = f"language_model.model.layers.{i}.self_attn."
+        wk = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
+        wv = weights.pop(prefix + "unembed_out.weight")
+        weights[prefix + "kv_b_proj.weight"] = mx.concatenate(
+            [wk, wv], axis=1
+        ).reshape(-1, text["kv_lora_rank"])
+    raw = {}
+    for key, value in weights.items():
+        key = key.replace("language_model.model.", "model.language_model.")
+        key = key.replace("language_model.lm_head.", "lm_head.")
+        key = key.replace("vision_model.", "model.visual.")
+        key = key.replace(".forget_gate.", ".")
+        raw[key] = value.astype(mx.bfloat16)
+    source = tmp_path / "glm53-source"
+    source.mkdir()
+    payload = _tiny_config_dict(with_vision=True)
+    payload.update(text_config=text, eos_token_id=[2])
+    (source / "config.json").write_text(json.dumps(payload))
+    mx.save_safetensors(str(source / "model.safetensors"), raw)
+    monkeypatch.setattr(
+        "mlx_lm.tokenizer_utils.load", lambda *a, **kw: object()
+    )
+    output = tmp_path / "glm53-oq4e"
+    with testing.verified("glm5_next", "glm5_next_text"):
+        with caplog.at_level(logging.WARNING, logger="omlx.oq"):
+            tensors, written, applied = _quantize(source, output, quant_format="toy")
+    assert written["model_type"] == "glm5_next"
+    assert written["text_config"]["model_type"] == "glm5_next_text"
+    assert written["omlx_verification"]["verified"] is True
+    assert "toy" in written["omlx_quant_formats"]
+    quantization = written["quantization"]
+    assert quantization["language_model.model.layers.1.self_attn.q_proj"] == {
+        "bits": 4,
+        "group_size": 64,
+        "mode": "toy",
+    }
+    # GLM-5.3's routed experts are oMLX's deepseek_v4 SwitchLinear, for which
+    # no format's layer is built: they stay oQ's affine, at the level's base
+    # bits the budget plan gives routed down_proj (the top-level entry).
+    assert not [name for name in quantization if ".switch_mlp." in name]
+    assert (quantization["bits"], quantization["mode"]) == (4, "affine")
+    down = "language_model.model.layers.1.mlp.switch_mlp.down_proj"
+    assert tensors[f"{down}.weight"].dtype == mx.uint32
+    assert tensors[f"{down}.weight"].shape[-1] * 32 // 4 == (
+        text["moe_intermediate_size"]
+    )
+    assert f"{down}.scales" in tensors
+    assert "omlx.patches.deepseek_v4.switch_layers.SwitchLinear" in caplog.text

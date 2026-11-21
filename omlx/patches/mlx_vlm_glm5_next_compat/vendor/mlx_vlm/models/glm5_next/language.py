@@ -449,6 +449,12 @@ class Glm5NextLinearAttention(nn.Module):
                 self.g_a_proj,
                 self.b_proj,
             ]
+            from omlx.formats.linear import _FormatLayer
+
+            if any(isinstance(m, _FormatLayer) for m in mods):
+                if not split:
+                    return None
+                return tuple(linear_forward(m, inputs) for m in mods)
             quantized = [hasattr(m, "scales") for m in mods]
             if any(quantized) and not all(quantized):
                 if not split:

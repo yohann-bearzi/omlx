@@ -4421,9 +4421,13 @@ class TestBuildProxyForSensitivity:
             output_path.mkdir()
 
         monkeypatch.setattr(_oq, "_build_streaming_proxy_for_sensitivity", _fake_build)
-        _build_proxy_for_sensitivity(
-            str(tmp_path / "src_model"), dtype="bfloat16", text_only=True
+        proxy = _build_proxy_for_sensitivity(
+            str(tmp_path / "src_model"),
+            dtype="bfloat16",
+            text_only=True,
+            working_dir=str(tmp_path),
         )
+        assert proxy.parent == tmp_path
         assert captured["text_only"] is True
 
     @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

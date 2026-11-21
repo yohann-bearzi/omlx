@@ -437,6 +437,7 @@ oQ refuses a format before it reads a weight:
   enters with the run that verifies it; one has so far, Qwen3.8 Flash-Next (`qwen4_exp`
   with its text model `qwen4_exp_text`). Families mlx-lm's own code serves come back
   after the proof of concept. The family is read from the config alone,
+GLM-5.3's `glm5_next` pair is not yet verified: its fused input projections decline a format layer, but its routed experts stay oQ's affine until the family port; a test marks a tiny checkpoint verified with `omlx.formats.testing.verified`. The family is read from the config alone,
   never from a directory's name; a decision model identified by its declared family,
   architecture or sidecar is refused before the format walk, as are native embedding,
   reranking and audio models, MiMo v2 and MiMo v2 Flash. Stock writes use their usual writer. Any other is refused with
@@ -444,10 +445,7 @@ oQ refuses a format before it reads a weight:
   checkpoint in it: it is no family verified with quant formats end to end; write it
   without a quant format, or have the family verified`. For a family whose own code the
   audits found reading a layer's quantized tensors by hand, which would take a format's
-  layer for MLX's or for floats, the refusal names that reader: GLM-5.3, `quant format
-  'myformat': oQ writes no glm5_next checkpoint in it: its linear attention fuses its
-  input projections by hand, as MLX's affine layers or as floats; write it without a
-  quant format, or have the family verified`; Inkling 2, `quant format 'myformat': oQ
+  layer for MLX's or for floats, the refusal names that reader: Inkling 2, `quant format 'myformat': oQ
   writes no inkling2 checkpoint in it: its DSpark draft folds the output head into its
   own projection by hand, as MLX's quantized layer or as floats; write it without a
   quant format, or have the family verified`; Raon-1 mini, `quant format 'myformat': oQ
