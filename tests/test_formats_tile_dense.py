@@ -16,7 +16,12 @@ from omlx.patches import m5_gather_qmm_nax as nax
 from omlx.patches import qwen35_verify_qmm as verify
 from omlx.patches.format_load import loading
 from tests.test_formats_linear import _composed, _pair, _x
-from tests.test_formats_tile_prefill import _stack, _tile_toy, needs_nax
+from tests.test_formats_tile_prefill import (
+    _stack,
+    _tile_toy,
+    needs_nax,
+    needs_steel,
+)
 from tests.test_formats_tile_prefill import toy as toy
 from tests.test_qwen35_moe_routed_decode import _same_bits
 
@@ -86,7 +91,6 @@ def qwen_layer(tmp_path):
     return build
 
 
-@needs_nax
 @pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (8, mx.float16)])
 @pytest.mark.parametrize("leading", [(17,), (2, 20)])
 def test_dense_format_prefill_matches_one_mlx_expert(monkeypatch, bits, dtype, leading):
@@ -100,7 +104,6 @@ def test_dense_format_prefill_matches_one_mlx_expert(monkeypatch, bits, dtype, l
         assert got.dtype == dtype and _same_bits(got, want)
 
 
-@needs_nax
 def test_compiled_dense_prefill_reads_the_current_toy_matrix(toy, monkeypatch):
     k, n = 256, 64
     fmt = toy(_tile_toy("dense"))
@@ -130,7 +133,6 @@ def test_compiled_dense_prefill_reads_the_current_toy_matrix(toy, monkeypatch):
         assert _same_bits(layer(x), want)
 
 
-@needs_nax
 def test_sixteen_rows_keep_the_dot_launch(monkeypatch):
     k, n = 512, 128
     quantized, layer = _pair(k, n, bits=4, bias=True)
@@ -145,7 +147,6 @@ def test_sixteen_rows_keep_the_dot_launch(monkeypatch):
     assert _same_bits(layer(x), serial)
 
 
-@needs_nax
 def test_sixteen_rows_without_a_dot_face_still_decode(toy, monkeypatch):
     k, n = 256, 64
     fmt = toy(_tile_toy("tile_only_16"))
@@ -162,7 +163,6 @@ def test_sixteen_rows_without_a_dot_face_still_decode(toy, monkeypatch):
     assert _same_bits(layer(x), want)
 
 
-@needs_nax
 @pytest.mark.parametrize("rows", [33, 40])
 @pytest.mark.parametrize("armed_first", [True, False])
 def test_the_same_dense_shape_selects_row_exact_or_prefill(
@@ -184,7 +184,6 @@ def test_the_same_dense_shape_selects_row_exact_or_prefill(
         verify.set_verify_qmm_armed(False)
 
 
-@needs_nax
 def test_two_threads_can_prefill_and_verify_the_same_dense_layer(
     monkeypatch, qwen_layer
 ):
@@ -235,7 +234,6 @@ def test_dense_prefill_declines_unsupported_columns_or_dtype(monkeypatch, n, dty
     assert seen == [True]
 
 
-@needs_nax
 def test_dense_prefill_binds_a_tile_without_a_dot_face(toy, monkeypatch):
     k = 256
     fmt = toy(_tile_toy("tile_only"))
@@ -253,7 +251,6 @@ def test_dense_prefill_binds_a_tile_without_a_dot_face(toy, monkeypatch):
         assert _same_bits(layer(x), want)
 
 
-@needs_nax
 def test_failed_dense_tile_decodes_and_preserves_the_row_exact_route(
     toy, caplog, tmp_path
 ):
@@ -334,7 +331,6 @@ def test_dense_prefill_declines_unavailable_tiles(toy, monkeypatch, reason):
         assert _same_bits(layer(x), want)
 
 
-@needs_nax
 def test_a_declined_dense_route_is_not_built_again(toy, monkeypatch):
     from omlx.formats import linear
 
@@ -454,9 +450,9 @@ def test_dense_prefill_handles_ragged_k_and_proves_both_n_alignments(monkeypatch
     tiles = []
     project = tile_dense.project
 
-    def record(tile, z):
+    def record(tile, z, **kwargs):
         tiles.append(tile)
-        return project(tile, z)
+        return project(tile, z, **kwargs)
 
     monkeypatch.setattr(tile_dense, "project", record)
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
@@ -484,10 +480,10 @@ def test_one_expert_ragged_k_oracle_does_not_read_past_scales(monkeypatch):
     x = _x((33, 160))
     reference = _one_expert(quantized, x)
     assert not mx.any(mx.isnan(reference)).item()
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
     assert _same_bits(layer(x), reference)
 
 
-@needs_nax
 def test_dense_prefill_does_not_import_its_module_per_call(monkeypatch):
     k, n = 512, 128
     _, layer = _pair(k, n, bits=4, bias=True)
@@ -505,3 +501,180 @@ def test_dense_prefill_does_not_import_its_module_per_call(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", record)
     mx.eval(layer(x))
     assert imports == []
+
+
+@needs_steel
+@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
+@pytest.mark.parametrize("n", [40, 41])
+def test_dense_steel_tile_covers_the_final_columns(toy, monkeypatch, dtype, n):
+    from omlx.formats import tile_gather
+
+    k = 256
+    fmt = toy(_tile_toy("dense_steel_ragged"))
+    weights = {key: a[0] for key, a in _stack(n, k, seed=31).items()}
+    layer = FormatLinear("tiletoy", 8, 1, k, weights)
+    x = _x((3, 17, k), dtype)
+    ids = mx.zeros((51,), mx.uint32)
+    want = mx.gather_mm(
+        x.reshape(51, 1, k),
+        fmt.decode(weights, 8, 1).astype(dtype).T[None],
+        rhs_indices=ids,
+        sorted_indices=True,
+    ).reshape(3, 17, n)
+    seen = []
+    build = tile_gather.kernel
+
+    def observed(face):
+        kernel = build(face)
+
+        def record(**kwargs):
+            inputs = kwargs["inputs"]
+            seen.append((inputs[0].shape, inputs[1].shape))
+            return kernel(**kwargs)
+
+        return record
+
+    monkeypatch.setattr(tile_gather, "kernel", observed)
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for _ in range(2):
+        assert _same_bits(layer(x), want)
+    assert seen == [((16, 1, k), (1, n, k)), ((51, 1, k), (1, n, k))]
+
+
+@needs_steel
+@pytest.mark.parametrize("reason", ["k_tail", "no_kernel", "inexact"])
+def test_dense_steel_declines_unsupported_weights(toy, monkeypatch, reason):
+    from dataclasses import replace
+
+    from omlx.formats import tile_gather
+
+    k, n = (264 if reason == "k_tail" else 256), 40
+    face = _tile_toy("dense_steel_declined")
+    if reason == "inexact":
+        face = replace(face, dtypes=(mx.float16,))
+    fmt = toy(face)
+    weights = {key: a[0] for key, a in _stack(n, k).items()}
+    layer = FormatLinear("tiletoy", 8, 1, k, weights)
+    x = _x((17, k), mx.bfloat16)
+    want = x @ fmt.decode(weights, 8, 1).astype(x.dtype).T
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("unsupported steel tile was launched")
+
+    monkeypatch.setattr(
+        tile_gather,
+        "kernel",
+        lambda face: None if reason == "no_kernel" else unexpected,
+    )
+    assert _same_bits(layer(x), want)
+
+
+@needs_steel
+def test_steel_dense_grid_limit_uses_the_number_of_rows(monkeypatch):
+    from omlx.formats import tile_dense
+
+    class DecodedError(Exception):
+        pass
+
+    def decode(self):
+        raise DecodedError
+
+    _, layer = _pair(256, 64)
+    x = _x((1, 256))
+    accepted = mx.zeros((1,))
+    monkeypatch.setattr(tile_dense, "project", lambda *a, **kw: accepted)
+    monkeypatch.setattr(FormatLinear, "_decoded", decode)
+    # A broadcast view costs one row. Intercept both routes before they can allocate.
+    assert layer(mx.broadcast_to(x, (2**30 - 1, 256))) is accepted
+    with pytest.raises(DecodedError):
+        layer(mx.broadcast_to(x, (2**30, 256)))
+
+
+@needs_steel
+def test_failed_dense_steel_proof_leaves_the_sorted_stack_available(toy, monkeypatch):
+    from omlx.formats import tile_gather
+    from omlx.formats.linear import FormatSwitchLinear
+    from tests.test_formats_tile_prefill import _TILE, _rows, _want
+
+    k, n = 256, 64
+    fmt = toy(_tile_toy("separate_steel_proofs"))
+    tensors = _stack(n, k, seed=43)
+    weights = {key: a[0] for key, a in tensors.items()}
+    dense = FormatLinear("tiletoy", 8, 1, k, weights)
+    switch = FormatSwitchLinear("tiletoy", 8, 1, k, tensors)
+    x = _x((33, k))
+    xs, indices = _rows(k)
+    real = tile_gather.kernel
+    bad = real(_tile_toy("dense_bad_canary", _TILE.replace("RUN = 8;", "RUN = 16;")))
+    experts = []
+
+    def build(face):
+        kernel = real(face)
+
+        def launch(**kw):
+            count = kw["inputs"][1].shape[0]
+            experts.append(count)
+            if len(experts) == 1:
+                return bad(**kw)
+            return kernel(**kw)
+
+        return launch
+
+    monkeypatch.setattr(tile_gather, "kernel", build)
+    assert _same_bits(dense(x), x @ fmt.decode(weights, 8, 1).astype(x.dtype).T)
+    assert experts == [1]
+    count = switch.num_experts
+    assert _same_bits(
+        switch(xs, indices, sorted_indices=True), _want(tensors, xs, indices)
+    )
+    assert experts == [1, 1, count]
+
+
+@needs_steel
+def test_dense_steel_proves_both_n_alignments(toy, monkeypatch):
+    k, rows = 256, 17
+    fmt = toy(_tile_toy("steel_align"))
+    tiles = []
+    project = tile_dense.project
+
+    def record(tile, z, **kwargs):
+        tiles.append(tile)
+        return project(tile, z, **kwargs)
+
+    monkeypatch.setattr(tile_dense, "project", record)
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for n in (32, 40):
+        weights = {key: a[0] for key, a in _stack(n, k, seed=n).items()}
+        layer = FormatLinear("tiletoy", 8, 1, k, weights)
+        x = _x((rows, k), mx.float16)
+        ids = mx.zeros((rows,), mx.uint32)
+        want = mx.gather_mm(
+            x.reshape(rows, 1, k),
+            fmt.decode(weights, 8, 1).astype(x.dtype).T[None],
+            rhs_indices=ids,
+            sorted_indices=True,
+        ).reshape(rows, n)
+        assert _same_bits(layer(x), want)
+    assert len(tiles) == 2 and tiles[0].proof is tiles[1].proof
+    assert len(tiles[0].proof.ran) == 2
+
+
+@needs_steel
+@pytest.mark.parametrize("rows", [17, 193])
+def test_dense_steel_one_run_needs_no_expert_offsets_scan(monkeypatch, rows):
+    quantized, layer = _pair(512, 96, bits=4, bias=True)
+    x = _x((rows, 1024), seed=rows)[..., ::2]
+    want = _one_expert(quantized, x)
+    mx.eval(want)
+    scans = []
+    cumsum = mx.cumsum
+
+    def scanned(counts, *args, **kwargs):
+        scans.append(counts.shape)
+        return cumsum(counts, *args, **kwargs)
+
+    monkeypatch.setattr(mx, "cumsum", scanned)
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for _ in range(2):
+        assert _same_bits(layer(x), want)
+    assert scans == []

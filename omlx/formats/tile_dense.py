@@ -8,15 +8,20 @@ import logging
 import mlx.core as mx
 
 from ..patches import m5_gather_qmm_nax as nax
-from . import kernels
+from . import kernels, tile_gather
 
 logger = logging.getLogger(__name__)
 
 
 def one_run(kernel, config, x, operands):
-    """Apply a dense NAX tile plan to one matrix, preserving x's batch axes."""
+    """Apply a dense plan to one matrix, with a NAX plan or the steel tile."""
     n, k = operands[0].shape[0], x.shape[-1]
     rows = x.size // k
+    if config is None:
+        matrices = tuple(a[None] for a in operands)
+        y = tile_gather.launch(kernel, x.reshape(rows, 1, k), matrices, None)
+        return y.reshape(*x.shape[:-1], n)
+
     bm = config.bm
     params = mx.array([n, rows], dtype=mx.uint32)
     y = kernel(
@@ -38,7 +43,7 @@ def one_run(kernel, config, x, operands):
     return y[0]
 
 
-def project(tile, x):
+def project(tile, x, *, tensor_units):
     """Prove the selected tile and replay this thread's dense graph."""
     if tile is None or tile.proof.failed or not tile.face.exact_for(x.dtype):
         return None
@@ -47,8 +52,12 @@ def project(tile, x):
     graph = tile.proof.graphs.get(signature)
     if graph is not None:
         return graph(x, *tile.operands)
-    config = nax.face_plan(x.size // k, 1, k, n)
-    metal = (x.dtype, k, config, n % 64 == 0)
+    if tensor_units:
+        config = nax.face_plan(x.size // k, 1, k, n)
+        metal = (x.dtype, k, config, n % 64 == 0)
+    else:
+        config = None
+        metal = (x.dtype, k, n % 32 == 0)
     kernel = tile.kernel
 
     def graph(x, *operands):

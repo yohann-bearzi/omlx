@@ -162,11 +162,17 @@ def kernel(face: Tile):
 
 
 def launch(mm, x, operands, indices):
-    """One 16 × 32 tile per group; MLX schedules rows from expert offsets."""
+    """One 16 × 32 tile per group; MLX schedules rows from expert offsets.
+    ``indices`` None is a dense call's one run of expert zero."""
     rows, _, k = x.shape
     experts, n = operands[0].shape[:2]
-    counts = mx.zeros((max(8, experts),), mx.int32).at[indices].add(1)
-    offsets = mx.cumsum(counts, inclusive=False)
+    if indices is None:
+        if experts != 1:
+            raise ValueError("a steel gather without indices needs exactly one expert")
+        offsets = mx.array([0] + [rows] * 7, dtype=mx.int32)
+    else:
+        counts = mx.zeros((max(8, experts),), mx.int32).at[indices].add(1)
+        offsets = mx.cumsum(counts, inclusive=False)
     meta = mx.array([rows, n, experts], dtype=mx.int32)
     return mm(
         inputs=[x, *operands, offsets, meta],

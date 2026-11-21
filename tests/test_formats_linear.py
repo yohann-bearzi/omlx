@@ -412,12 +412,14 @@ def test_the_page_names_the_rows_a_linear_launches():
     assert f"| `FormatLinear`, 1 to {MAX_ROWS} rows of `x` (`linear.MAX_ROWS`:" in _PAGE
 
 
-def test_more_rows_are_the_decode_and_mlx_s_matmul():
+def test_more_rows_outside_dense_prefill_are_the_decode_and_mlx_s_matmul():
+    """The dense tile takes fp16 and bf16 activations; others decode, and a
+    K, N or row count it declines does too (its tests build those)."""
     k, n = 320, 72
     quantized, layer = _pair(k, n, bias=True)
     for shape in ((MAX_ROWS + 1, k), (3, MAX_ROWS, k)):
-        x = _x(shape)
-        assert _same_bits(layer(x), _composed(quantized, x))
+        x = _x(shape, mx.float32)
+        assert _equal(layer(x), _composed(quantized, x))
     # No row at all.
     assert layer(_x((2, k))[:0]).shape == (0, n)
     (proof,) = kernels._PROOFS.values()

@@ -12,9 +12,6 @@ from omlx.formats import kernels, linear, testing, tile_dense
 from omlx.formats.linear import FormatLinear
 from omlx.patches.format_load import loading
 from tests.test_formats_stock_dense import _equivalent_layer
-from tests.test_formats_tile_prefill import needs_nax
-
-pytestmark = needs_nax
 
 
 def _dense_route() -> str:

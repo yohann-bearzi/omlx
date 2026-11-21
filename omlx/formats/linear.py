@@ -14,8 +14,8 @@ asks the registry how to run them:
   through MLX's steel matrix kernels, from 16 rows and four rows per expert
   on average. Below that threshold it uses its decode rows kernel;
 - a matrix above 16 rows with no ordinary route takes its tile face as one
-  expert on tensor units; during row-exact verification its dot face handles
-  up to 16 rows at once;
+  expert, on tensor units or through MLX's steel matrix kernels; during
+  row-exact verification its dot face handles up to 16 rows at once;
 - everything else (a layout the face does not cover, activations of a type
   it is not exact for, a format without the face, a face that did not
   compile) is the format's ``decode``, cast to the activations' type, then
@@ -1337,16 +1337,17 @@ class FormatLinear(_FormatLayer):
         """A dense call above MAX_ROWS over the format's tile face, as one
         run of expert zero; None where the call decodes instead."""
         n = self.output_dims
+        tensor_units = _nax_host()
         if (
             x.dtype not in (mx.float16, mx.bfloat16)
             or self.input_dims % 32
             or n <= 0
-            or n % 32
-            or rows >= 2**31
+            or (tensor_units and n % 32)
+            or rows >= (2**31 if tensor_units else 2**30)
         ):
             return None
         tile = kept.dense if kept.dense is not _UNBUILT else self._dense_tile(kept)
-        return tile_dense.project(tile, x)
+        return tile_dense.project(tile, x, tensor_units=tensor_units)
 
     def __call__(self, x: mx.array) -> mx.array:
         fast = self._fast
@@ -1393,7 +1394,7 @@ class FormatLinear(_FormatLayer):
             rows = x.size // k if k else 0
             if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
-            elif rows > MAX_ROWS and _nax_host():
+            elif rows > MAX_ROWS:
                 y = self._prefill(kept, x, rows)
             if y is None:
                 y = x @ self._decoded().astype(dtype).T
