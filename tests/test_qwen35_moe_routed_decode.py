@@ -396,7 +396,12 @@ def test_a_launch_holds_the_swiglu_only_where_it_applies_it(monkeypatch):
     ):
         kernel.__wrapped__(*faces)
     assert len(built) == 8
+    pragma = '_Pragma("clang loop unroll_count(2)")'
+    loop = "for (int k = 0; k < WHOLE; k += L::BLOCK) {"
     for name, metal in built.items():
+        unrolls_down_pairs = f"{pragma} {loop}" in metal
+        assert unrolls_down_pairs == ("_down_combine_decode_" in name), name
+        assert "OMLX_QMV_UNROLL_PAIRS" not in metal, name
         assert ("swiglu_store" in metal) == ("_gate_up_" in name), name
         assert uncalled(metal) == [], name
 

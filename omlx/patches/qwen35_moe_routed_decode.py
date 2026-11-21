@@ -399,7 +399,7 @@ def _down_kernel(routed: Dot, shared: Dot | None):
     """Down/combine launch over the stacked down rows (``rd``); with
     ``shared`` it also runs the shared expert's down rows (``sd``),
     otherwise the shared expert's output is an input."""
-    matrices = kernels.Matrices()
+    matrices = kernels.Matrices(unroll_pairs=True)
     routed_inputs = matrices.add("rd", routed)
     name = f"omlx_qwen35_moe_down_combine_decode_{routed.key}"
     if shared is None:

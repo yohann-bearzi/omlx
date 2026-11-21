@@ -92,7 +92,8 @@ METAL_FUNC const threadgroup T* omlx_inputs(const threadgroup T* x) { return x; 
 # in the face's blocks; result[row] ends as the row's product. The rows are
 # packs (RA, RB), so every block is straight-line code over them. The walk
 # stays a loop: unrolled over a pack of blocks, the fused Qwen decode ran
-# 3-8% slower (M5 Max). Where K ends inside a block, the lanes with inputs
+# 3-8% slower (M5 Max); the one-token down asks for pairs unrolled two at a
+# time. Where K ends inside a block, the lanes with inputs
 # in that last block are known when the kernel is compiled.
 #
 # qmv_rows is what a kernel calls. It states the parts of the contract the
@@ -621,6 +622,19 @@ def _qmv_shared(unrolled: bool) -> str:
 # The shared-rows skeleton, rolled and unrolled, as a kernel carries it.
 _SHARED_SKELETONS = (_qmv_shared(False), _qmv_shared(True))
 
+# The rows skeleton as it is, and with its K loop's pairs unrolled two at a
+# time for a kernel that asks (the one-token down): the loop line replaced,
+# never a second copy of the skeleton.
+_ROWS_SKELETONS = (
+    _QMV_ROWS,
+    _QMV_ROWS.replace(
+        "for (int k = 0; k < WHOLE; k += L::BLOCK) {",
+        '_Pragma("clang loop unroll_count(2)") '
+        "for (int k = 0; k < WHOLE; k += L::BLOCK) {",
+        1,
+    ),
+)
+
 
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
 # kernel that stores rows adds this to its header.
@@ -1114,9 +1128,10 @@ _LOOP_FILL = (
 class Matrices:
     """The matrices a kernel reads, each under the name its body uses."""
 
-    def __init__(self, unrolled: bool = False) -> None:
+    def __init__(self, unrolled: bool = False, unroll_pairs: bool = False) -> None:
         """``unrolled``: the shared-rows skeleton's loops are unrolled in full,
-        where a kernel's arrays then live in registers."""
+        where a kernel's arrays then live in registers. ``unroll_pairs``: the
+        rows skeleton's K loop takes the two-at-a-time pragma."""
         self._faces: dict[str, Dot | Tile] = {}
         self._names: set[str] = set()
         self._tables = Tables()
@@ -1124,6 +1139,7 @@ class Matrices:
         self._shared: set[Dot] = set()
         self._shared_names: set[str] = set()
         self._unrolled = unrolled
+        self._unroll_pairs = unroll_pairs
 
     def add(self, name: str, face: Dot | Tile, shared: bool = False) -> list[str]:
         """Add matrix ``name``, read through ``face``, a ``Dot`` or a
@@ -1213,7 +1229,7 @@ class Matrices:
             _SKELETONS, _revisions() + (_CHECKS if dots else ""), _REVISIONS_LINE
         )
         for piece, line, wanted in (
-            (_QMV_ROWS, _ROWS_LINE, rows),
+            (_ROWS_SKELETONS[self._unroll_pairs], _ROWS_LINE, rows),
             (_TILE_FACE, _TILE_LINE, tiles),
             (_SHARED_SKELETONS[self._unrolled], _SHARED_LINE, bool(self._shared)),
         ):

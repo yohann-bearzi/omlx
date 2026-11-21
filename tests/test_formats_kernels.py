@@ -666,6 +666,21 @@ def test_a_source_two_faces_share_is_cited_under_the_first():
     assert '#line 1 "<quant format toy_a>"' in header and "toy_other" not in header
 
 
+def test_qmv_rows_unrolls_pairs_only_when_asked():
+    """The rows skeleton takes the two-at-a-time pragma on its K loop only in
+    a kernel that asks: the one-token down, never a default skeleton."""
+    face = _toy("unroll_pairs")
+    plain = kernels.Matrices()
+    plain.add("m", face)
+    pairs = kernels.Matrices(unroll_pairs=True)
+    pairs.add("m", face)
+    pragma = '_Pragma("clang loop unroll_count(2)")'
+    loop = "for (int k = 0; k < WHOLE; k += L::BLOCK) {"
+    assert pragma not in plain.header
+    assert f"{pragma} {loop}" in pairs.header
+    assert "OMLX_QMV_UNROLL_PAIRS" not in plain.header + pairs.header
+
+
 def test_a_source_need_not_end_with_a_newline():
     face = _toy("a")
     matrices = kernels.Matrices()

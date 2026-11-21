@@ -255,7 +255,7 @@ def _metal_digest(recorded):
 # builders (the format linear's shared-rows kernels among them) and 36
 # plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
 # preserve their Metal byte for byte when the face declares none.
-_METAL_DIGEST = "460 98edb02fd856202a0515edf9a9eb6f092c84b9701e276975dcc1c29adc717a12"
+_METAL_DIGEST = "460 b7a4a469a789fbfcd5b9547543b62d8a56e07524fa2b3376373679dbb1974033"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
