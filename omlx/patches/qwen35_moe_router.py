@@ -307,12 +307,14 @@ def topk_header(dtype: mx.Dtype) -> str:
     return _TOPK_STORE_HEADER + _SOFTMAX_ROW_HEADER + _TOPK_GENERIC
 
 
-_TOPK_INDICES_TG_HEADER = """
+_TOPK_INDICES_TG_HEAD = """
 template <typename T, int NE, int K>
 METAL_FUNC void omlx_router_topk_indices_tg(
     const device T* logits, uint lane, threadgroup uint* tg_ind) {
   using TK = omlx_router_topk<T, NE>;
-  if constexpr (metal::is_same_v<T, bfloat16_t>) {
+"""
+
+_TOPK_INDICES_TG_BF16 = """  {
     uint key[TK::PER];
     TK::keys(logits, lane, key);
     uint head[3];
@@ -324,7 +326,10 @@ METAL_FUNC void omlx_router_topk_indices_tg(
         tg_ind[j] = sel == 0u ? uint(NE) : (sel & 0xffffu);
       }
     }
-  } else {
+  }
+"""
+
+_TOPK_INDICES_TG_SCAN = """  {
     float vals[TK::PER];
     omlx_router_softmax_row<T, NE>(logits, lane, vals);
     bool taken[TK::PER];
@@ -340,15 +345,16 @@ METAL_FUNC void omlx_router_topk_indices_tg(
       }
     }
   }
-}
 """
 
 
 def topk_indices_header(dtype: mx.Dtype) -> str:
     """``topk_header(dtype)`` plus ``omlx_router_topk_indices_tg`` for folded
     verify-window kernels that write each row's selected expert indices into
-    threadgroup memory to coalesce shared experts across rows."""
-    return topk_header(dtype) + _TOPK_INDICES_TG_HEADER
+    threadgroup memory to coalesce shared experts across rows: only the
+    selection that dtype compiles (MLX hashes a kernel's whole source)."""
+    arm = _TOPK_INDICES_TG_BF16 if dtype == mx.bfloat16 else _TOPK_INDICES_TG_SCAN
+    return topk_header(dtype) + _TOPK_INDICES_TG_HEAD + arm + "}\n"
 
 
 _SOFTMAX_TOPK_SOURCE = """
@@ -671,7 +677,7 @@ def softmax_topk_rows(logits, top_k: int, max_rows: int = _MAX_ROWS):
 
 
 _COALESCE_MAX_PAIRS = 64
-_TOPK_WRITE_TG_HEADER = """
+_TOPK_WRITE_TG_HEAD = """
 template <typename T, int NE, int K>
 METAL_FUNC void omlx_router_topk_write_tg(
     const device T* logits, uint lane,
@@ -679,7 +685,9 @@ METAL_FUNC void omlx_router_topk_write_tg(
   using TK = omlx_router_topk<T, NE>;
   float sel_p[K];
   uint sel_i[K];
-  if constexpr (metal::is_same_v<T, bfloat16_t>) {
+"""
+
+_TOPK_WRITE_TG_BF16 = """  {
     uint key[TK::PER];
     TK::keys(logits, lane, key);
     uint head[3];
@@ -690,7 +698,10 @@ METAL_FUNC void omlx_router_topk_write_tg(
       sel_p[j] = sel == 0u ? -INFINITY : as_type<float>(((sel >> 16) - 1u) << 16);
       sel_i[j] = sel == 0u ? uint(NE) : (sel & 0xffffu);
     }
-  } else {
+  }
+"""
+
+_TOPK_WRITE_TG_SCAN = """  {
     float vals[TK::PER];
     omlx_router_softmax_row<T, NE>(logits, lane, vals);
     bool taken[TK::PER];
@@ -701,7 +712,9 @@ METAL_FUNC void omlx_router_topk_write_tg(
       TK::select(vals, taken, lane, sel_p[j], sel_i[j]);
     }
   }
-  if (lane == 0) {
+"""
+
+_TOPK_WRITE_TG_TAIL = """  if (lane == 0) {
     float total = 0.0f;
     for (uint j = 0; j < K; ++j) {
       total += sel_p[j];
@@ -715,6 +728,29 @@ METAL_FUNC void omlx_router_topk_write_tg(
   }
 }
 """
+
+
+def _topk_write_tg_header(dtype: mx.Dtype) -> str:
+    """``omlx_router_topk_write_tg`` for one activation dtype: only the
+    selection that dtype compiles (MLX hashes a kernel's whole source)."""
+    arm = _TOPK_WRITE_TG_BF16 if dtype == mx.bfloat16 else _TOPK_WRITE_TG_SCAN
+    return _TOPK_WRITE_TG_HEAD + arm + _TOPK_WRITE_TG_TAIL
+
+
+def _coalesce_header(dtype: mx.Dtype) -> str:
+    """The coalesced routing launch's header: its dtype's selection structs
+    and the threadgroup write, without the store helper its source never
+    calls (member ``write``s are not instantiated here)."""
+    if dtype == mx.bfloat16:
+        structs = (
+            "\ntemplate <typename T, int NE>\nstruct omlx_router_topk;\n"
+            + _SOFTMAX_ROW_HEADER
+            + _TOPK_BF16
+        )
+    else:
+        structs = _SOFTMAX_ROW_HEADER + _TOPK_GENERIC
+    return structs + _topk_write_tg_header(dtype)
+
 
 _SOFTMAX_TOPK_COALESCE_SOURCE = """
     const uint sg = simdgroup_index_in_threadgroup;
@@ -767,14 +803,15 @@ def _softmax_topk_coalesce_kernel(dtype: mx.Dtype):
         name=f"omlx_qwen35_moe_router_softmax_topk_coalesce_{selection}",
         input_names=["logits"],
         output_names=["indices", "scores", "meta", "ucount"],
-        header=topk_header(dtype) + _TOPK_WRITE_TG_HEADER,
+        header=_coalesce_header(dtype),
         source=_SOFTMAX_TOPK_COALESCE_SOURCE,
     )
 
 
 def softmax_topk_coalesce(logits, top_k: int, max_rows: int = _MAX_ROWS):
     """``softmax_topk_rows`` plus pair-coalesced expert work groups in one
-    threadgroup launch (``2 <= rows <= max_rows`` and ``rows * top_k <= 64``).
+    threadgroup launch (``2 <= rows <= min(max_rows, 32)``, ``top_k >= 1``
+    and ``rows * top_k <= 64``).
 
     Returns ``(indices, scores, meta, ucount)`` where ``meta`` holds
     ``ucount[0]`` 4-word records ``(expert, count in {1, 2}, p0, p1)`` with
@@ -783,6 +820,8 @@ def softmax_topk_coalesce(logits, top_k: int, max_rows: int = _MAX_ROWS):
     rows = logits.size // ne
     if (
         rows < 2
+        or rows > 32
+        or top_k < 1
         or rows * top_k > _COALESCE_MAX_PAIRS
         or not softmax_topk_eligible(logits, max_rows)
     ):

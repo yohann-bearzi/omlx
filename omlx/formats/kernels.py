@@ -732,12 +732,6 @@ METAL_FUNC void qmv_pair_rows(
 }
 """)
 
-# Pair-unrolled single-input row skeleton for short-K verify-window down
-# launches: identical arithmetic and contract checks to qmv_rows, with
-# unroll_count(2) on the K-block walk. Kept separate from _QMV_ROWS so existing
-# non-window kernels keep their exact Metal text and line numbers.
-
-
 # What a kernel does with qmv_rows' result, in one lane of the simdgroup. A
 # kernel that stores rows adds this to its header.
 STORE_ROWS = _compact(r"""

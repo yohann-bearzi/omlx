@@ -744,6 +744,7 @@ def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
             _check(block, _inputs(rows, step), engaged)
     names = list(built)
     assert any("gate_up_window_coalesced" in n for n in names), names
+    assert any("gate_up_topk_coalesced" in n for n in names), names
     assert any("down_combine_window_unrolled" in n for n in names), names
     for name, (header, source) in built.items():
         if name.startswith("omlx_qwen35_moe_gate_up_") or name.startswith(
@@ -766,3 +767,99 @@ def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
         assert uncalled(header + source) == [], name
         assert not hand_tables(header), name
         assert not hand_tables(source), name
+
+
+def test_mixed_dtype_quantized_router_skips_window_plan(monkeypatch):
+    """A quantized gate whose scales are not the activation dtype is not a
+    window router: ``row_exact_linear`` would promote in its tile and every
+    window would decline after paying the gate's work."""
+    hidden = 2048
+    block = _block(
+        8,
+        bits=4,
+        hidden=hidden,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    block.gate.scales = block.gate.scales.astype(mx.float16)
+    block.gate.biases = block.gate.biases.astype(mx.float16)
+    mx.eval(block.parameters())
+    plan = _plan(block, _inputs(1, 0, hidden=hidden))
+    assert plan is not None and plan.quantized_router is False
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError("row_exact_linear ran for a mixed-dtype gate")
+
+    monkeypatch.setattr(routed, "row_exact_linear", forbidden)
+    assert routed.routed_verify_window(block, _inputs(2, 0, hidden=hidden)) is None
+    assert calls == []
+
+
+def test_a_shared_router_less_proof_keeps_the_window_variants_apart():
+    """A quantized-router plan and a declined plain gate can share the window
+    proof (the router's absence is in its key). The kept graph still names its
+    variant: the declined plan must not replay the external-logits graph with
+    two arguments."""
+    hidden = 2048
+    quantized = _block(
+        6,
+        bits=4,
+        hidden=hidden,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    plain = _block(
+        7, bits=4, hidden=hidden, inter=512, top_k=8, shared_bits=4, shared_group=64
+    )
+    plain.gate.bias = mx.zeros((plain.num_experts,), mx.bfloat16)
+    mx.eval(plain.parameters())
+    rows = _inputs(3, 0, hidden=hidden)
+    assert routed.routed_verify_window(quantized, rows) is not None
+    q_plan = _plan(quantized, _inputs(1, 0, hidden=hidden))
+    p_plan = _plan(plain, _inputs(1, 0, hidden=hidden))
+    assert p_plan is not None and p_plan.quantized_router is False
+    assert q_plan.window is p_plan.window
+    assert routed.routed_verify_window(plain, rows) is None
+
+
+def test_softmax_topk_coalesce_rejects_bad_bounds():
+    """The coalesced routing launch declines bounds its threadgroup cannot
+    hold or its selection cannot index: top_k < 1 and more than 32 rows."""
+    logits = mx.zeros((2, 128), mx.bfloat16)
+    assert router.softmax_topk_coalesce(logits, 0) is None
+    assert router.softmax_topk_coalesce(logits, -1) is None
+    assert (
+        router.softmax_topk_coalesce(mx.zeros((33, 128), mx.bfloat16), 1, max_rows=64)
+        is None
+    )
+
+
+def test_the_router_coalesce_kernel_carries_only_its_own_selection(monkeypatch):
+    """The coalesced routing launch compiles one dtype's selection: no
+    ``if constexpr`` arm of the other dtype, and nothing its source does not
+    call."""
+    from tests.test_formats_affine import uncalled
+
+    built = {}
+    make = mx.fast.metal_kernel
+
+    def spy_kernel(**spec):
+        built[spec["name"]] = (spec.get("header", ""), spec["source"])
+        return make(**spec)
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", spy_kernel)
+    router._softmax_topk_coalesce_kernel.cache_clear()
+    logits = mx.zeros((2, 128), mx.bfloat16)
+    assert router.softmax_topk_coalesce(logits, 8, max_rows=8) is not None
+    name, (header, source) = next(iter(built.items()))
+    assert "softmax_topk_coalesce" in name
+    assert "if constexpr (metal::is_same_v<T, bfloat16_t>)" not in header
+    assert uncalled(header + source) == [], name

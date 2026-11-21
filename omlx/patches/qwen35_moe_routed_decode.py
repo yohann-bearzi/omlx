@@ -787,19 +787,21 @@ def _plain(layer, *classes) -> bool:
     return type(layer) in classes and "bias" not in layer
 
 
-def _window_router_ok(gate) -> bool:
+def _window_router_ok(gate, dtype: mx.Dtype) -> bool:
     """Whether a verify window takes the block's quantized gate through
     ``row_exact_linear``: exactly a plain quantized linear of an affine
     layout that tiles (its other layouts fall back to one stock call a
-    row), without a bias, in the dtype the launches are compiled for. These
-    are the affine widths and group sizes ``row_exact_qmv`` tiles."""
+    row), without a bias, whose scales and biases are the dtype the
+    launches are compiled for (a mixed dtype would promote in the tile and
+    every window would decline after its gate work). These are the affine
+    widths and group sizes ``row_exact_qmv`` tiles."""
     return (
         _plain(gate, nn.QuantizedLinear)
         and "biases" in gate
         and gate.mode == "affine"
         and gate.bits in (4, 5, 6, 8)
         and gate.group_size in (32, 64, 128)
-        and gate["scales"].dtype in (mx.bfloat16, mx.float16)
+        and gate["scales"].dtype == dtype
         and gate["biases"].dtype == gate["scales"].dtype
     )
 
@@ -855,13 +857,15 @@ class _Launches(NamedTuple):
     down_template: list
     down_threadgroup: tuple
     window_gate_up_kernel: object = None  # verify-window launches (fold)
-    window_down_kernel: object = None
+    window_down_kernel: object = None  # the rolled down kernel (not built when fast)
+    window_down: object = None  # the down kernel the window launches
     window_coalesced_kernel: object = None
     window_topk_coalesced_kernel: object = None
     window_down_unrolled_kernel: object = None
     window_inter: int = 0
     window_shared_width: int = 0
-    window_fast: bool = False
+    window_fast: bool = False  # the measured fast path (for the plan's report)
+    window_coalesced: bool = False  # launches.window_coalesced_kernel runs
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
@@ -931,6 +935,20 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
         + _operands(up_proj, gu_fmt)
         + _operands(gate, g_fmt),
         _operands(down_proj, d_fmt),
+    )
+
+
+def _window_fast(gate_up, gu_fmt, hidden: int, inter: int) -> bool:
+    """Whether a folded block takes the measured verify-window fast path: a
+    table-backed routed gate+up face and a ``(hidden, inter, bits)`` the
+    allowlist names. The bits are the layer's own (never the face's name),
+    and the allowlist is the only width filter: adding a measured width is
+    editing the tuple, not a second condition."""
+    bits = getattr(gate_up, "bits", None)
+    return (
+        bool(gu_fmt.tables)
+        and type(bits) is int
+        and (hidden, inter, bits) in _WINDOW_FAST_SHAPES
     )
 
 
@@ -1004,7 +1022,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         weight = (gate["weight"],)
     # A quantized gate's verify rows run its own one-row arithmetic
     # (``row_exact_linear``) outside the window's launches.
-    quantized_router = router is None and _window_router_ok(gate)
+    quantized_router = router is None and _window_router_ok(gate, dtype)
     # What the launches are compiled from, beside a launch's rows and routing.
     operands = gate_up_operands + down_operands
     if shared is not None:
@@ -1065,12 +1083,15 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     # The fast path is decided once, from the layer's own bit width (never the
     # face's name: a key is a name) and the shapes it was measured on. Its
     # kernels are built only inside this decision: a block that never launches
-    # them builds no pipeline for them, which would otherwise move the
+    # them constructs no kernel object for them, which would otherwise move the
     # per-process placement draw of a path whose launches did not change.
-    window_fast = (
-        bool(gu_fmt.tables)
-        and getattr(gate_up, "bits", None) in (2, 3, 4)
-        and (hidden, inter, gate_up.bits) in _WINDOW_FAST_SHAPES
+    window_fast = _window_fast(gate_up, gu_fmt, hidden, inter)
+    window_coalesced = can_coalesce and window_fast
+    window_down_unrolled = (
+        _down_window_unrolled_kernel(d_fmt, sd_fmt) if window_fast else None
+    )
+    window_down = (
+        window_down_unrolled if window_fast else _down_window_kernel(d_fmt, sd_fmt)
     )
     launches = _Launches(
         hidden=hidden,
@@ -1090,23 +1111,25 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         down_template=down_template + [("KS", width), ("NPART", top_k + 1)],
         down_threadgroup=(32, top_k + 1, 1),
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
-        window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
+        # The window launch reads the chosen callable; the rolled kernel is
+        # not built when the unrolled one runs.
+        window_down_kernel=None if window_fast else window_down,
+        window_down=window_down,
         window_coalesced_kernel=(
             _gate_up_window_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt)
-            if can_coalesce and window_fast
+            if window_coalesced
             else None
         ),
         window_topk_coalesced_kernel=(
             _gate_up_topk_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt, dtype)
-            if can_coalesce and window_fast
+            if window_coalesced
             else None
         ),
-        window_down_unrolled_kernel=(
-            _down_window_unrolled_kernel(d_fmt, sd_fmt) if window_fast else None
-        ),
+        window_down_unrolled_kernel=window_down_unrolled,
         window_inter=inter,
         window_shared_width=width,
         window_fast=window_fast,
+        window_coalesced=window_coalesced,
         topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
@@ -1117,7 +1140,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         experts=experts,
         outside=router is None,
         proof=proof,
-        window=kernels.proof("routed_window", *key),
+        window=kernels.proof("routed_window", *key, window_fast),
         quantized_router=quantized_router,
     )
 
@@ -1279,12 +1302,7 @@ def _window_gate_up_topk_coalesced(
 def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
     rows = indices.shape[0]
     rps = _down_rows(rows)
-    kernel = (
-        launches.window_down_unrolled_kernel
-        if launches.window_fast and launches.window_down_unrolled_kernel is not None
-        else launches.window_down_kernel
-    )
-    return kernel(
+    return launches.window_down(
         inputs=[h, *down, *shared_down, indices, scores],
         template=launches.down_template + [("RPS", rps), ("M", rows)],
         grid=(32, launches.down_threadgroup[1] * launches.hidden // rps * rows, 1),
@@ -1317,8 +1335,7 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
     rows = x.shape[0]
     gen = kernels.gpu_generation()
     can_unfolded_coal = (
-        launches.window_fast
-        and launches.window_coalesced_kernel is not None
+        launches.window_coalesced
         and 2 <= rows <= _COALESCE_MAX_ROWS
         and rows * launches.top_k <= _COALESCE_MAX_PAIRS
         and softmax_topk_eligible(logits, WINDOW_MAX_ROWS)
@@ -1330,12 +1347,7 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
         h = _window_gate_up_coalesced(
             launches, x, meta, ucount, gate_up, shared_gate_up
         )
-    elif (
-        launches.window_fast
-        and folded
-        and rows == 2
-        and launches.window_topk_coalesced_kernel is not None
-    ):
+    elif launches.window_coalesced and folded and rows == 2:
         h, indices, scores = _window_gate_up_topk_coalesced(
             launches, x, logits, gate_up, shared_gate_up
         )
@@ -1573,6 +1585,20 @@ def routed_verify_window(block, x):
         y = _decode(block, plan, x, plan.proof.graphs.get(signature))
         return None if y is None else mx.reshape(y, (1, -1), stream=mx.gpu)
     rows = x.size // x.shape[-1]
+    # The window's graph is the plan's variant: the fused router's two-argument
+    # call or a quantized gate's external logits. Plans of both can share the
+    # proof (the router's absence is in its key), so the signature names the
+    # variant.
+    window_signature = (*signature, plan.quantized_router)
+    # A verify step's block is the replay of the graph its thread kept.
+    graph = plan.window.graphs.get(window_signature)
+    if graph is not None:
+        if plan.quantized_router:
+            logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+            if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+                return None
+            return graph(x, logits, plan.operands)
+        return graph(x, plan.operands)
     if plan.window.failed or not _windows(plan, x):
         return None
     # A quantized gate's logits are its own one-row arithmetic per row
@@ -1582,12 +1608,6 @@ def routed_verify_window(block, x):
         logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
         if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
             return None
-    # A verify step's block is the replay of the graph its thread kept.
-    graph = plan.window.graphs.get(signature)
-    if graph is not None:
-        if logits is None:
-            return graph(x, plan.operands)
-        return graph(x, logits, plan.operands)
     ranked = _ranked(rows, plan.experts, launches.dtype)
     folded = _topk_folds(launches, ranked)
     outside = () if logits is None else (ranked,)
@@ -1604,7 +1624,7 @@ def routed_verify_window(block, x):
     else:
         graph = mx.compile(_window_logits(launches, folded))
         y = graph(x, logits, plan.operands)
-    plan.window.keep(signature, graph)
+    plan.window.keep(window_signature, graph)
     return y
 
 

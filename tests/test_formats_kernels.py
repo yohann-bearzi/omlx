@@ -1928,3 +1928,9 @@ def test_finish_rows_refuses_sums_it_cannot_bind_and_no_rows():
     for k, n in ((64, 0), (64, -1), (0, 16), (-1, 16)):
         with pytest.raises(ValueError, match=f"k={k}, n={n}"):
             testing.finish_rows(face, (codes, scales), k, n, _SUMS, mx.float32)
+
+
+def test_the_row_skeleton_comment_names_no_deleted_skeleton():
+    """The comment above the row skeleton describes the skeleton in the
+    source, not one a rebase removed."""
+    assert "Kept separate from _QMV_ROWS" not in Path(kernels.__file__).read_text()

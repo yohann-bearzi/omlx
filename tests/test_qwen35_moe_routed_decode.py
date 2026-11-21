@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from functools import partial
+from pathlib import Path
 from types import SimpleNamespace
 
 import mlx.core as mx
@@ -855,7 +856,15 @@ def test_the_window_fast_path_does_not_read_the_face_s_name(monkeypatch):
 def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch):
     """The coalesced and unrolled verify-window kernels ship for Flash-Next's
     4-bit routed windows; the 35B-A3B shape, which drifts on them (M5 fan
-    1.0060-1.0176), keeps the f0968c13 kernels."""
+    1.0060-1.0176), keeps the f0968c13 kernels. A face without tables stays
+    off the path at the measured shape."""
+    plain = _block(2560, 640, bits=4)
+    plain_plan = _plan(plain, mx.random.normal((1, 1, 2560)).astype(mx.bfloat16))
+    assert plain_plan is not None and not plain_plan.launches.window_fast
+    assert plain_plan.launches.window_coalesced_kernel is None
+    assert plain_plan.launches.window_topk_coalesced_kernel is None
+    assert plain_plan.launches.window_down_unrolled_kernel is None
+    assert plain_plan.launches.window_down_kernel is not None
     from tests.test_formats_tables import tabled_dot
 
     tabled_dot(monkeypatch)
@@ -867,15 +876,102 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     assert launches.window_coalesced_kernel is not None
     assert launches.window_topk_coalesced_kernel is not None
     assert launches.window_down_unrolled_kernel is not None
+    # The unrolled callable is what runs; the rolled one is not built.
+    assert launches.window_down_kernel is None
     other = _block(2048, 512, top_k=8, bits=4)
     other_x = mx.random.normal((1, 1, 2048)).astype(mx.bfloat16)
     other_plan = _plan(other, other_x)
     assert other_plan is not None and not other_plan.launches.window_fast
-    # Built only inside the decision: a block that never launches them builds
-    # no pipeline for them, so it cannot move that path's placement draw.
+    # Built only inside the decision: a block that never launches them
+    # constructs no kernel object for them, so it cannot move that path's
+    # placement draw.
     assert other_plan.launches.window_coalesced_kernel is None
     assert other_plan.launches.window_topk_coalesced_kernel is None
     assert other_plan.launches.window_down_unrolled_kernel is None
+    assert other_plan.launches.window_down_kernel is not None
+
+
+def test_the_window_proof_separates_window_fast(monkeypatch):
+    """Two blocks returning the same tabled dot face, one on the measured
+    allowlist and one off it, must not share the window proof or its
+    graphs: the kernels their graphs close over differ. Release-1 serves one
+    shape, so only another allowlist can make the pair."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    x = mx.zeros((1, 1, 2560), mx.bfloat16)
+    rows = mx.zeros((1, 3, 2560), mx.bfloat16)
+    fast_block = _block(2560, 640, experts=256)
+    fast = _plan(fast_block, x)
+    assert fast is not None and fast.launches.window_fast
+    with monkeypatch.context() as patch:
+        patch.setattr(routed, "_WINDOW_FAST_SHAPES", frozenset())
+        slow_block = _block(2560, 640, experts=256, seed=1)
+        slow = _plan(slow_block, x)
+        assert slow is not None and not slow.launches.window_fast
+        assert slow.window is not fast.window
+        assert routed.routed_verify_window(fast_block, rows) is not None
+        assert routed.routed_verify_window(slow_block, rows) is not None
+    signature = (rows.shape, rows.dtype, fast.experts, fast.quantized_router)
+    assert fast.window.graphs[signature] is not slow.window.graphs[signature]
+
+
+def test_the_window_fast_decision_reads_the_allowlist_bits(monkeypatch):
+    """The allowlist names the bit width: a measured 5-bit shape engages
+    without a hardcoded 2-4 bit filter, and a non-integer width never does."""
+    tables = SimpleNamespace(tables=("lut",))
+    monkeypatch.setattr(routed, "_WINDOW_FAST_SHAPES", frozenset({(2560, 640, 5)}))
+    assert routed._window_fast(SimpleNamespace(bits=5), tables, 2560, 640)
+    assert not routed._window_fast(SimpleNamespace(bits=4), tables, 2560, 640)
+    assert not routed._window_fast(SimpleNamespace(bits=True), tables, 2560, 640)
+    assert not routed._window_fast(
+        SimpleNamespace(bits=5), SimpleNamespace(tables=()), 2560, 640
+    )
+
+
+def test_the_cached_window_call_path_reads_no_window_fast(monkeypatch):
+    """A 35B-shaped (non-fast) window's host call path reads no window_fast:
+    the plan chose its down callable and its coalesced branch once, at
+    build, so the per-call Python carries neither the flag nor a kernel
+    None test."""
+    block = _block(2048, 512, top_k=8, experts=256)
+    rows = mx.zeros((1, 3, 2048), mx.bfloat16)
+    plan = routed._cached_plan(block, rows.dtype)
+    assert plan is not None and not plan.launches.window_fast
+    assert routed.routed_verify_window(block, rows) is not None
+
+    class _NoFast(routed._Launches):
+        def __getattribute__(self, name):
+            if name == "window_fast":
+                raise AssertionError("the window call path read window_fast")
+            return super().__getattribute__(name)
+
+    wrapped = plan._replace(launches=_NoFast(*plan.launches))
+    monkeypatch.setattr(routed, "_cached_plan", lambda block, dtype: wrapped)
+    for count in (4, 5, 6):
+        y = routed.routed_verify_window(block, mx.zeros((1, count, 2048), mx.bfloat16))
+        assert y is not None
+
+
+def test_a_kept_window_graph_replays_without_the_window_check(monkeypatch):
+    """A replay is the thread's kept graph, not a fresh look at the shape:
+    the window's decision (``_windows``) runs once, when the graph is
+    built."""
+    block = _block(2048, 512, top_k=8, experts=256)
+    rows = mx.zeros((1, 3, 2048), mx.bfloat16)
+    assert routed.routed_verify_window(block, rows) is not None
+
+    def forbidden(plan, x):
+        raise AssertionError("a replay re-checked the window")
+
+    monkeypatch.setattr(routed, "_windows", forbidden)
+    assert routed.routed_verify_window(block, rows) is not None
+
+
+def test_the_source_does_not_call_a_kernel_object_a_pipeline():
+    """``mx.fast.metal_kernel`` constructs a closure, not a pipeline; the
+    words follow the code."""
+    assert "builds no pipeline" not in Path(routed.__file__).read_text()
 
 
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
@@ -1855,16 +1951,16 @@ def test_a_window_s_launches_are_built_once_for_a_signature_and_replayed(
     assert len(launched.built) == 6
     assert [graph.calls for graph in compiled] == [6]
     plan = _plan(block, _rows_of(block, 1, 1))
-    assert set(plan.window.graphs) == {((1, 3, 512), mx.bfloat16, 128)}
+    assert set(plan.window.graphs) == {((1, 3, 512), mx.bfloat16, 128, False)}
     # A verify window of 8 rows, and 4 requests' decode rows through the
     # block's call.
     window, rows = more
     assert _same_bits(routed.routed_verify_window(block, window), more_wants[0])
     assert _same_bits(block(rows).reshape(-1, 512), more_wants[1])
     assert set(plan.window.graphs) == {
-        ((1, 3, 512), mx.bfloat16, 128),
-        ((1, 8, 512), mx.bfloat16, 128),
-        ((4, 1, 512), mx.bfloat16, 128),
+        ((1, 3, 512), mx.bfloat16, 128, False),
+        ((1, 8, 512), mx.bfloat16, 128, False),
+        ((4, 1, 512), mx.bfloat16, 128, False),
     }
     assert plan.window.ran == {(3, 128, True), (8, 128, False), (4, 128, False)}
     assert len(compiled) == 3
@@ -1914,7 +2010,9 @@ def test_windows_of_routers_of_other_widths_are_graphs_of_their_own():
         assert _same_bits(routed.routed_verify_window(block, x), _one_by_one(block, x))
     window = _plan(blocks[0], _rows_of(blocks[0], 1, 1)).window
     assert _plan(blocks[1], _rows_of(blocks[1], 1, 1)).window is window
-    assert set(window.graphs) == {((1, 3, 512), mx.bfloat16, e) for e in (128, 256)}
+    assert set(window.graphs) == {
+        ((1, 3, 512), mx.bfloat16, e, False) for e in (128, 256)
+    }
     assert window.ran == {(3, 128, True), (3, 256, True)}
 
 
