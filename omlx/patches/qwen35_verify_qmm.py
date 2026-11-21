@@ -235,8 +235,21 @@ def _msg_kernel(m: int, face, nsg: int):
         .replace("__M__", str(m))
         .replace("__FACE__", face.type)
         .replace("__XLOADS__\n", xloads)
-        .replace("__FMAS__\n", fmas)
     )
+    key = getattr(face, "key", "")
+    if key.startswith("affine_tile_b4g"):
+        # Rebase the four rows' pointers once at n0 and step the cursor by
+        # compile-time row offsets: two 64-bit row products, not eight.
+        source = source.replace(
+            "      const R r1(w, size_t(n0 + 1));\n"
+            "      const R r2(w, size_t(n0 + 2));\n"
+            "      const R r3(w, size_t(n0 + 3));\n",
+            "      const F four{(const device uint8_t*)r0.c, r0.s, r0.b};\n"
+            "      const R r1(four, size_t(1));\n"
+            "      const R r2(four, size_t(2));\n"
+            "      const R r3(four, size_t(3));\n",
+        )
+    source = source.replace("__FMAS__\n", fmas)
     return kernels.face_kernel(
         f"omlx_vk_m{m}_nsg{nsg}", ("x", "w", "N_size"), {"w": face}, ("y",), "", source
     )
