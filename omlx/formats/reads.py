@@ -313,8 +313,10 @@ class LoadRead:
 
     def __post_init__(self) -> None:
         forbidden: set[str] = set()
+        input_tparam: str | None = None
         if isinstance(self.input, TypeParam):
             forbidden.add(self.input.name)
+            input_tparam = self.input.name
         elif isinstance(self.input, Pointer):
             if self.input.space not in _ACTIVATION_SPACES:
                 raise ValueError(
@@ -328,6 +330,7 @@ class LoadRead:
                 )
             if isinstance(self.input.element, TypeParam):
                 forbidden.add(self.input.element.name)
+                input_tparam = self.input.element.name
         else:
             raise ValueError(
                 "load input must be TypeParam(...) or a const device/threadgroup "
@@ -346,6 +349,11 @@ class LoadRead:
         if self.returns == "float":
             pass
         elif isinstance(self.returns, AuxType):
+            if input_tparam is not None and self.returns.name == input_tparam:
+                raise ValueError(
+                    f"load return AuxType {self.returns.name!r} cannot collide "
+                    "with input TypeParam"
+                )
             forbidden.add(self.returns.name)
         else:
             raise ValueError(
@@ -559,6 +567,16 @@ class ApplyRead:
             if tname in template_names:
                 raise ValueError(
                     f"apply shared_templates has duplicate parameter {tname!r}"
+                )
+            if aux_name is not None and tname == aux_name:
+                raise ValueError(
+                    f"apply shared_templates parameter {tname!r} cannot "
+                    "collide with aux"
+                )
+            if tname in self.params:
+                raise ValueError(
+                    f"apply shared_templates parameter {tname!r} cannot "
+                    "collide with parameter name"
                 )
             if aux_tparam is not None and tname == aux_tparam:
                 raise ValueError(
@@ -829,12 +847,13 @@ def _expand_slot(
 ) -> str:
     """Replace ``marker`` in ``text`` once, requiring line-start placement and
     a legal declaration/definition suffix on its line."""
-    count = text.count(marker)
-    if count == 0:
+    pattern = rf"(?<![A-Za-z0-9_]){re.escape(marker)}(?![A-Za-z0-9_])"
+    matches = list(re.finditer(pattern, text))
+    if not matches:
         raise ValueError(f"{owner}: {part} is missing read slot {marker}")
-    if count > 1:
+    if len(matches) > 1:
         raise ValueError(f"{owner}: {part} repeats read slot {marker}")
-    at = text.index(marker)
+    at = matches[0].start()
     line_start = text.rfind("\n", 0, at) + 1
     prefix = text[line_start:at]
     if not all(ch in " \t" for ch in prefix):
@@ -932,6 +951,12 @@ def emit_parts(
             reads.madd.render,
             decl_only=False,
         )
+        if reads.apply is None:
+            if (type(face.vpt) is int and face.vpt > 0) or by_name.get("shared"):
+                raise ValueError(
+                    f"{owner}: Dot face with vpt > 0 or shared source must "
+                    "declare DotReads.apply"
+                )
         if reads.apply is not None:
             has_shared = bool(reads.apply.shared_slot)
             source = _expand_slot(

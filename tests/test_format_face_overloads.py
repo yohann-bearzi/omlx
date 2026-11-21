@@ -444,6 +444,19 @@ def test_primitives_refuse_unsafe_types(name, build, fragment):
             lambda: LoadRead(slot="LOAD"),
             "slot",
         ),
+        (
+            "load_aux_shadow_input_typeparam",
+            lambda: LoadRead(input=TypeParam("Aux"), returns=AuxType("Aux")),
+            "collide",
+        ),
+        (
+            "load_aux_shadow_pointer_typeparam",
+            lambda: LoadRead(
+                input=Pointer("device", TypeParam("Aux"), const=True),
+                returns=AuxType("Aux"),
+            ),
+            "collide",
+        ),
     ],
 )
 def test_load_declaration_refuses_unsafe_forms(name, build, fragment):
@@ -673,6 +686,26 @@ def test_madd_declaration_refuses_unsafe_forms(name, build, fragment):
                 shared_qualifiers=("static",),
             ),
             "shared_qualifiers",
+        ),
+        (
+            "apply_shared_template_shadows_parameter",
+            lambda: ApplyRead(
+                params=("acc", "d", "xt", "K"),
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T", "int K"),
+            ),
+            "collide",
+        ),
+        (
+            "apply_shared_template_shadows_aux",
+            lambda: ApplyRead(
+                aux=AuxType("K"),
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T", "int K"),
+            ),
+            "collide",
         ),
     ],
 )
@@ -1091,6 +1124,67 @@ def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
         )
 
 
+def _dot_source_without_a_declared_apply() -> str:
+    source = dot._TOY
+    source = source.replace(
+        "    template <typename XP>\n"
+        "    static float load(XP x, thread float* xt) {",
+        "    __OMLX_READ_LOAD__ {",
+    )
+    return source.replace(
+        "    static float madd(float acc, Row r, thread const float* xt, float) {",
+        "    __OMLX_READ_MADD__ {",
+    )
+
+
+def test_dot_with_vpt_or_shared_requires_declared_apply():
+    reads = DotReads(load=LoadRead(), madd=MaddRead())
+    source = _dot_source_without_a_declared_apply()
+    with pytest.raises(ValueError, match="DotReads.apply"):
+        Dot("vpt_without_apply", source, "T", (), vpt=8, reads=reads)
+    with pytest.raises(ValueError, match="DotReads.apply"):
+        Dot("shared_without_apply", source, "T", (), shared="int x;", reads=reads)
+    # A dot-rows-only face needs no apply.
+    face = Dot("plain_without_apply", source, "T", (), reads=reads)
+    assert "static float madd(" in face.emitted_source
+
+
+def test_expand_slot_handles_prefix_overlapping_slot_names():
+    def source(load_marker: str, madd_marker: str) -> str:
+        return (
+            _declared_dot_source()
+            .replace("    __OMLX_READ_LOAD__ {", f"    {load_marker} {{")
+            .replace("    __OMLX_READ_MADD__ {", f"    {madd_marker} {{")
+        )
+
+    apply = _declared_dot_reads().apply
+    first = Dot(
+        "overlap_load_first",
+        source("__OMLX_READ_LOAD__", "__OMLX_READ_LOAD__MADD__"),
+        "T",
+        (),
+        reads=DotReads(
+            load=LoadRead(slot="load"),
+            madd=MaddRead(slot="load__madd"),
+            apply=apply,
+        ),
+    )
+    second = Dot(
+        "overlap_madd_first",
+        source("__OMLX_READ_LOAD__MADD__", "__OMLX_READ_LOAD__"),
+        "T",
+        (),
+        reads=DotReads(
+            load=LoadRead(slot="load__madd"),
+            madd=MaddRead(slot="load"),
+            apply=apply,
+        ),
+    )
+    for face in (first, second):
+        assert "static float load(" in face.emitted_source
+        assert "static float madd(" in face.emitted_source
+
+
 def test_omitting_reads_emits_deprecation_warning_for_every_face_kind():
     with pytest.warns(DeprecationWarning, match="DotReads"):
         Dot("warn_dot", "struct D {};", "D", ())
@@ -1439,9 +1533,15 @@ _OQEL_15_DIGESTS = {
     False: "15 4f9de11638dc50371f7955ab38c36245cecf107296f180283f2d02898372d44b",
     True: "15 a9abe62585311fd08e87cea5b043d416ebd0689e66663aa547b72719308b8c80",
 }
+# Captured on release/3 (7e230438). The oQeL face sources are unchanged from
+# ba421f5c (the 15-face digests above), but these 123 builder records include
+# the gather and routed patch sources, which the release-2 fixes changed
+# (moe_verify_gather, qwen35_moe_routed_decode, qwen35_moe_router). A base
+# change re-pins this snapshot; the emission itself is pinned by the face
+# digests and by legacy == migrated inside the test.
 _OQEL_BUILDER_DIGESTS = {
-    False: "123 2fe1f16b24dff3b1301daa6309ea977b42347b366f2b2e23181a361e3691a1ed",
-    True: "123 8c14fba93f1eb82b69038ccfbc20cb0bf1b299380f9c97b22c1640e787c79fa7",
+    False: "123 ffcf3fdbb73c7a13576ea09d3299490350022a334016cebc6cba7018b7a6a202",
+    True: "123 374125617b12a61d3e6cc9ab4436ab7200f8dbb11f4df3977bd4aef8ecda7b5d",
 }
 
 
