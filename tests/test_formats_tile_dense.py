@@ -214,6 +214,8 @@ def test_two_threads_can_prefill_and_verify_the_same_dense_layer(
     "n,dtype", [pytest.param(40, mx.bfloat16, marks=needs_nax), (128, mx.float32)]
 )
 def test_dense_prefill_declines_unsupported_columns_or_dtype(monkeypatch, n, dtype):
+    from omlx.formats import linear
+
     k = 320
     quantized, layer = _pair(k, n, bias=True)
     x = _x((33, k), dtype)
@@ -228,7 +230,7 @@ def test_dense_prefill_declines_unsupported_columns_or_dtype(monkeypatch, n, dty
     def unexpected(*args):
         pytest.fail("an unsupported call tried to build the tile")
 
-    monkeypatch.setattr(nax, "_face_kernel", unexpected)
+    monkeypatch.setattr(linear, "_tile", unexpected)
     monkeypatch.setattr(FormatLinear, "_decoded", observe)
     assert mx.array_equal(layer(x), want).item()
     assert seen == [True]
@@ -631,6 +633,72 @@ def test_failed_dense_steel_proof_leaves_the_sorted_stack_available(toy, monkeyp
 
 
 @needs_steel
+def test_dense_steel_ragged_k_prefills(monkeypatch):
+    quantized, layer = _pair(160, 40, bits=4)
+    x = _x((33, 160), seed=5)
+    want = _one_expert(quantized, x)
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for _ in range(2):
+        assert _same_bits(layer(x), want)
+
+
+@needs_steel
+def test_dense_steel_grid_has_no_extra_expert_row(toy, monkeypatch):
+    from omlx.formats import tile_gather
+
+    k, rows = 256, 17
+    toy(_tile_toy("dense_steel_grid"))
+    tensors = {key: a[0] for key, a in _stack(64, k).items()}
+    layer = FormatLinear("tiletoy", 8, 1, k, tensors)
+    x = _x((rows, k), mx.float16)
+    launches = []
+    build = tile_gather.kernel
+
+    def observed(face):
+        kernel = build(face)
+
+        def record(**kwargs):
+            meta = kwargs["inputs"][-1]
+            launches.append((int(meta[0]), kwargs["grid"]))
+            return kernel(**kwargs)
+
+        return record
+
+    monkeypatch.setattr(tile_gather, "kernel", observed)
+    mx.eval(layer(x))
+    assert launches and all(grid[1] == (count + 15) // 16 for count, grid in launches)
+
+
+def test_dense_steel_launch_requires_one_expert():
+    from omlx.formats import tile_gather
+
+    x = mx.zeros((17, 1, 32), mx.float16)
+    operands = (mx.zeros((2, 32, 32), mx.uint8),)
+    with pytest.raises(ValueError, match="exactly one expert"):
+        tile_gather.launch(lambda **kwargs: pytest.fail("launched"), x, operands, None)
+
+
+@needs_nax
+def test_nax_dense_grid_limit_uses_the_number_of_rows(monkeypatch):
+    from omlx.formats import tile_dense
+
+    class DecodedError(Exception):
+        pass
+
+    def decode(self):
+        raise DecodedError
+
+    _, layer = _pair(256, 64)
+    x = _x((1, 256))
+    accepted = mx.zeros((1,))
+    monkeypatch.setattr(tile_dense, "project", lambda *a, **kw: accepted)
+    monkeypatch.setattr(FormatLinear, "_decoded", decode)
+    assert layer(mx.broadcast_to(x, (2**31 - 1, 256))) is accepted
+    with pytest.raises(DecodedError):
+        layer(mx.broadcast_to(x, (2, 2**30, 256)))
+
+
+@needs_steel
 def test_dense_steel_proves_both_n_alignments(toy, monkeypatch):
     k, rows = 256, 17
     fmt = toy(_tile_toy("steel_align"))
@@ -643,7 +711,7 @@ def test_dense_steel_proves_both_n_alignments(toy, monkeypatch):
 
     monkeypatch.setattr(tile_dense, "project", record)
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
-    for n in (32, 40):
+    for n in (32, 48):
         weights = {key: a[0] for key, a in _stack(n, k, seed=n).items()}
         layer = FormatLinear("tiletoy", 8, 1, k, weights)
         x = _x((rows, k), mx.float16)

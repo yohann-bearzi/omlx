@@ -177,7 +177,11 @@ def launch(mm, x, operands, indices):
     return mm(
         inputs=[x, *operands, offsets, meta],
         template=[("T", x.dtype), ("K", k), ("ALIGN_N", n % 32 == 0)],
-        grid=(64 * ((n + 31) // 32), (rows + 15) // 16 + min(experts, rows), 1),
+        grid=(
+            64 * ((n + 31) // 32),
+            (rows + 15) // 16 + (0 if indices is None else min(experts, rows)),
+            1,
+        ),
         threadgroup=(64, 1, 1),
         output_shapes=[(rows, 1, n)],
         output_dtypes=[x.dtype],
