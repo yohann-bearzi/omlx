@@ -4856,6 +4856,26 @@ class Qwen4ExpMTPModule(nn.Module):
 
     def __init__(self, args: TextConfig):
         super().__init__()
+        # The head reuses the trunk's embeddings and reads the trunk's last
+        # hidden state. A checkpoint that asks for another wiring is refused
+        # here, once, at construction: nothing later could serve it.
+        mtp = getattr(args, "mtp", None) or {}
+        if getattr(args, "mtp_use_dedicated_embeddings", False) or mtp.get(
+            "mtp_use_dedicated_embeddings", False
+        ):
+            raise ValueError(
+                "qwen4 MTP with mtp_use_dedicated_embeddings=True is not "
+                "implemented: the draft head reuses the trunk's embeddings"
+            )
+        from_layer = mtp.get("mtp_use_hidden_state_from_layer")
+        if from_layer is None:
+            from_layer = getattr(args, "mtp_use_hidden_state_from_layer", None)
+        if from_layer is not None:
+            raise ValueError(
+                "qwen4 MTP with mtp_use_hidden_state_from_layer="
+                f"{from_layer!r} is not implemented: the draft head reads the "
+                "trunk's last hidden state"
+            )
         self.hidden_size = args.hidden_size
         self.hc_count = args.hc_count
         hc_hidden_size = self.hc_count * self.hidden_size

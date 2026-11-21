@@ -65,6 +65,7 @@ class TextConfig(BaseModelConfig):
     mtp_num_experts: Optional[int] = None
     mtp_num_experts_per_tok: Optional[int] = None
     mtp_use_dedicated_embeddings: bool = False
+    mtp_use_hidden_state_from_layer: Optional[int] = None
     mtp: Optional[Dict] = None
     eos_token_id: Optional[Union[int, List[int]]] = None
     tie_word_embeddings: bool = False
