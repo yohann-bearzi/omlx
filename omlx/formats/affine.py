@@ -583,7 +583,11 @@ def serial_up_header(face: Dot) -> str:
     )
 
 
+# The widths a tile kernel over format layers takes (AffineFormat.tile), and
+# the widths a tile face has (tile_face: the verify kernels read every width
+# MLX quantizes to).
 _TILE_BITS = (4, 8)
+_TILE_FACE_BITS = (2, 3, 4, 5, 6, 8)
 
 # A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8, read
 # where they lie (an 8-bit run is two words, which a weight's slice aligns to
@@ -642,7 +646,36 @@ __RUNS__
 """
 
 # A run's type as a kernel holds it, as it is stored, and its code i, by width.
+# Below 8 bits but 4, a run's BITS bytes become one 64-bit word as MLX's
+# affine loaders and the vk_mma kernel read them (two bytes at 2 bits, three
+# 16-bit halves at 6, byte by byte at 3 and 5).
+_RUN64 = r"""    struct Codes {
+      uint64_t q;
+      Codes() = default;
+      Codes(const device Stored& run) : q(__LOAD__) {}
+    };
+    const device Stored* c;
+    static uint code_at(Codes run, int i) {
+      return uint((run.q >> (BITS * i)) & ((1ul << BITS) - 1ul));
+    }"""
 _RUNS = {
+    2: "    using Stored = ushort;\n" + _RUN64.replace("__LOAD__", "uint64_t(run)"),
+    3: "    struct Stored {\n      uint8_t b[3];\n    };\n"
+    + _RUN64.replace(
+        "__LOAD__",
+        "uint64_t(run.b[0]) | (uint64_t(run.b[1]) << 8) | (uint64_t(run.b[2]) << 16)",
+    ),
+    5: "    struct Stored {\n      uint8_t b[5];\n    };\n"
+    + _RUN64.replace(
+        "__LOAD__",
+        "uint64_t(run.b[0]) | (uint64_t(run.b[1]) << 8) | (uint64_t(run.b[2]) << 16)"
+        " | (uint64_t(run.b[3]) << 24) | (uint64_t(run.b[4]) << 32)",
+    ),
+    6: "    struct Stored {\n      ushort h[3];\n    };\n"
+    + _RUN64.replace(
+        "__LOAD__",
+        "uint64_t(run.h[0]) | (uint64_t(run.h[1]) << 16) | (uint64_t(run.h[2]) << 32)",
+    ),
     4: r"""    using Codes = uint;
     using Stored = uint;
     const device Stored* c;
@@ -662,7 +695,7 @@ _METAL_TYPES = {mx.bfloat16: "bfloat16_t", mx.float16: "float16_t"}
 
 
 def _tile_source(bits: int, group_size: int) -> str:
-    """The Metal of the affine tile face of ``bits``-bit codes (4 or 8) in
+    """The Metal of the affine tile face of ``bits``-bit codes in
     groups of ``group_size``: ``omlx_affine_tile_b{bits}g{group_size}::Tile<S>``,
     S the scales' type. One source serves both types of scales."""
     namespace = f"omlx_affine_tile_b{bits}g{group_size}"
@@ -678,7 +711,7 @@ def _tile_source(bits: int, group_size: int) -> str:
 def tile_face(bits: int, group_size: int, dtype: mx.Dtype) -> Tile:
     """The tile face of ``bits``-bit weights with ``group_size`` groups and
     scales and biases of ``dtype``, exact for activations of that dtype."""
-    if bits not in _TILE_BITS or group_size not in _GROUP_SIZES:
+    if bits not in _TILE_FACE_BITS or group_size not in _GROUP_SIZES:
         raise ValueError(
             f"affine tile face: no runs of {bits} bits in groups of {group_size}"
         )

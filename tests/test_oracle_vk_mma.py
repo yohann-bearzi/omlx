@@ -16,7 +16,10 @@ from tests.test_oracle_vk import _linear, _same, _x
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
-_FUNCTIONS = ("_build_mma_kernel", "_pad_rows", "vk_qmm_mma")
+# What the oracle copies of the live module that the live module still has.
+# The kernel (_build_mma_kernel) moved onto the tile face, and vk_qmm_mma
+# with it: they are the oracle's alone, and the rows below compare them.
+_FUNCTIONS = ("_pad_rows",)
 _CONSTANTS = ("_MMA_BN", "_MMA_BK", "_MMA_NSG")
 
 
@@ -56,3 +59,20 @@ def test_a_long_k_and_a_wide_n_are_the_oracle_s():
         x = _x(11, k, mx.bfloat16, seed=k)
         kw = dict(bits=4, group_size=64)
         assert _same(live.vk_qmm_mma(x, *w, **kw), oracle.vk_qmm_mma(x, *w, **kw))
+
+
+@pytest.mark.parametrize(
+    "rows,k,n", [(25, 256, 4096), (0, 256, 4096), (8, 128, 4096), (8, 256, 4104)]
+)
+def test_a_shape_the_kernel_does_not_take_is_refused(rows, k, n):
+    w = _linear(n, k, 4, 64, mx.bfloat16, seed=1)
+    x = mx.zeros((rows, k), mx.bfloat16)
+    with pytest.raises(ValueError, match="vk_qmm_mma takes 1 to 24 rows"):
+        live.vk_qmm_mma(x, *w, group_size=64, bits=4)
+
+
+def test_scales_no_tile_face_reads_are_left_to_the_stock_qmm():
+    weight, scales, biases = _linear(4096, 256, 4, 64, mx.bfloat16, seed=1)
+    x = _x(8, 256, mx.bfloat16, seed=1)
+    wide = (scales.astype(mx.float32), biases.astype(mx.float32))
+    assert live.vk_qmm_mma(x, weight, *wide, group_size=64, bits=4) is None

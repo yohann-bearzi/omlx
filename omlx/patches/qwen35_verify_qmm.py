@@ -456,155 +456,125 @@ _MMA_BK = 32
 _MMA_NSG = 8
 
 
-def _build_mma_kernel(
-    row_tiles: int, k_val: int, group_size: int, dtype, bits: int = 4
-):
-    """Rows padded to ``8 * row_tiles`` x 16 columns per threadgroup.
+# The simdgroup-matrix tile kernel (mma) of 7 to 24 rows over the tile face
+# ``F`` of its matrix ``w``: a threadgroup takes BN = 16 columns, its eight
+# simdgroups a K chunk each. Per 32-deep step a lane decodes two runs of 8
+# weights of its column into its simdgroup's tile, rounded to T; the
+# simdgroup multiplies the tile against every row tile; the parts are summed
+# once at the end, in simdgroup order.
+_MMA_SOURCE = """
+    constexpr int BM = __BM__;
+    constexpr int BN = __BN__;
+    constexpr int BK = __BK__;
+    constexpr int BK_SUB = 8;
+    constexpr int NSG = __NSG__;
+    constexpr int K_chunk = K / NSG;
+    using F = __FACE__;
 
-    Eight simdgroups each own one K chunk: they dequantize their BK x BN
-    weight tile into a private threadgroup buffer and multiply it against
-    every row tile with simdgroup matrices, so no cross-simdgroup barrier
-    sits in the K loop. Partial sums are reduced once at the end. K is a
-    template constant so the chunking folds into the code.
-    """
-    import mlx.core as mx
+    uint tid = thread_position_in_threadgroup.x;
+    uint sg_id = tid / 32;
+    uint lane = tid % 32;
+    uint tg_n = threadgroup_position_in_grid.y;
 
-    key = ("mma", row_tiles, int(k_val), group_size, dtype, bits)
-    if key in _KERNEL_CACHE:
-        return _KERNEL_CACHE[key]
+    int N = int(N_size);
+    int n0 = int(tg_n) * BN;
+    int k_begin = int(sg_id) * K_chunk;
+    int k_end = k_begin + K_chunk;
 
-    if bits == 4:
-        # One uint32 holds the pack's eight nibbles.
-        unpack = """
-                uint32_t packed = w_q[n_global * K_by_8 + (k_base >> 3)];
-                _Pragma("unroll")
-                for (int ki = 0; ki < 8; ++ki) {
-                    uint32_t nib = (packed >> (ki * 4)) & 0xFu;
-                    B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
-                }"""
-    else:
-        # MLX affine packs eight values into ``bits`` little-endian bytes.
-        load = {
-            2: "uint64_t packed = uint64_t(*(const device ushort*)wb);",
-            6: "const device ushort* wh = (const device ushort*)wb;\n"
-            "                uint64_t packed = uint64_t(wh[0]) | (uint64_t(wh[1]) << 16)"
-            " | (uint64_t(wh[2]) << 32);",
-            8: "uint2 w2 = *(const device uint2*)wb;\n"
-            "                uint64_t packed = uint64_t(w2.x) | (uint64_t(w2.y) << 32);",
-        }.get(
-            bits,
-            "uint64_t packed = 0;\n"
-            '                _Pragma("unroll")\n'
-            f"                for (int i = 0; i < {bits}; ++i) "
-            "packed |= uint64_t(wb[i]) << (8 * i);",
-        )
-        unpack = f"""
-                const device uchar* wb = ((const device uchar*)w_q)
-                    + (long(n_global) * K_by_8 + (k_base >> 3)) * {bits};
-                {load}
-                _Pragma("unroll")
-                for (int ki = 0; ki < 8; ++ki) {{
-                    uint32_t nib = uint32_t((packed >> (ki * {bits})) & {(1 << bits) - 1}u);
-                    B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(float(nib) * s + b);
-                }}"""
+    threadgroup T B_tile[NSG][BK * BN];
+    threadgroup float tg_partials[NSG][BM * BN];
 
-    decl = "\n        ".join(
-        f"simdgroup_matrix<T, 8, 8> a{r};"
-        f" simdgroup_matrix<float, 8, 8> c{r}L = simdgroup_matrix<float, 8, 8>(0.0f);"
-        f" simdgroup_matrix<float, 8, 8> c{r}R = simdgroup_matrix<float, 8, 8>(0.0f);"
-        for r in range(row_tiles)
+    if constexpr (omlx_tile_face<F, K>::value) {
+      using R = typename F::template Runs<K>;
+      metal::simdgroup_matrix<T, 8, 8> b_L, b_R;
+__DECL__
+      int dq_n = int(lane) % BN;
+      int dq_k_lane = int(lane) / BN;
+      const R runs(w, size_t(n0 + dq_n));
+
+      for (int k0 = k_begin; k0 < k_end; k0 += BK) {
+        _Pragma("unroll")
+        for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {
+          int dq_k = pack_idx * 2 + dq_k_lane;
+          int k_base = k0 + dq_k * 8;
+          const auto p = runs.params(k_base / R::GROUP);
+          const auto c = runs.fetch(k_base / 8);
+          _Pragma("unroll")
+          for (int ki = 0; ki < 8; ++ki) {
+            B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(R::weight(p, c, ki));
+          }
+        }
+        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+        for (int ks = 0; ks < BK / BK_SUB; ++ks) {
+__LOADS__
+          metal::simdgroup_load(b_L, B_tile[sg_id] + ks * BK_SUB * BN, BN);
+          metal::simdgroup_load(b_R, B_tile[sg_id] + ks * BK_SUB * BN + 8, BN);
+__MACS__
+        }
+        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+      }
+
+__STORES__
+      metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+      for (int off = int(tid); off < BM * BN; off += NSG * 32) {
+        float acc = 0.0f;
+        _Pragma("unroll")
+        for (int g = 0; g < NSG; ++g) {
+          acc += tg_partials[g][off];
+        }
+        int row = off / BN;
+        int col = off - row * BN;
+        y[row * N + n0 + col] = T(acc);
+      }
+    }
+"""
+
+
+@cache
+def _mma_kernel(row_tiles: int, face):
+    """The mma kernel of ``row_tiles`` tiles of 8 rows over ``face``."""
+    from omlx.formats import kernels
+
+    rows = range(row_tiles)
+    decl = "".join(
+        f"      metal::simdgroup_matrix<T, 8, 8> a{r};\n"
+        f"      metal::simdgroup_matrix<float, 8, 8> c{r}L(0.0f), c{r}R(0.0f);\n"
+        for r in rows
     )
-    loads = "\n                ".join(
-        f"simdgroup_load(a{r}, x + {r} * 8 * K + k0 + ks * BK_SUB, K);"
-        for r in range(row_tiles)
+    loads = "".join(
+        f"          metal::simdgroup_load(a{r}, x + {r} * 8 * K + k0 + ks * BK_SUB, K);\n"
+        for r in rows
     )
-    macs = "\n                ".join(
-        f"simdgroup_multiply_accumulate(c{r}L, a{r}, b_L, c{r}L);"
-        f" simdgroup_multiply_accumulate(c{r}R, a{r}, b_R, c{r}R);"
-        for r in range(row_tiles)
+    macs = "".join(
+        f"          metal::simdgroup_multiply_accumulate(c{r}L, a{r}, b_L, c{r}L);\n"
+        f"          metal::simdgroup_multiply_accumulate(c{r}R, a{r}, b_R, c{r}R);\n"
+        for r in rows
     )
-    stores = "\n        ".join(
-        f"simdgroup_store(c{r}L, tg_partials[sg_id] + {r} * 8 * BN, BN);"
-        f" simdgroup_store(c{r}R, tg_partials[sg_id] + {r} * 8 * BN + 8, BN);"
-        for r in range(row_tiles)
+    stores = "".join(
+        f"      metal::simdgroup_store(c{r}L, tg_partials[sg_id] + {r} * 8 * BN, BN);\n"
+        f"      metal::simdgroup_store(c{r}R, tg_partials[sg_id] + {r} * 8 * BN + 8, BN);\n"
+        for r in rows
     )
-    source = f"""
-        using namespace metal;
-        constexpr int BM = {8 * row_tiles};
-        constexpr int BN = {_MMA_BN};
-        constexpr int BK = {_MMA_BK};
-        constexpr int BK_SUB = 8;
-        constexpr int NSG = {_MMA_NSG};
-        constexpr int GS = {group_size};
-        constexpr int K = {int(k_val)};
-        constexpr int K_by_8 = K / 8;
-        constexpr int K_by_gs = K / GS;
-        constexpr int K_chunk = K / NSG;
-
-        uint tid = thread_position_in_threadgroup.x;
-        uint sg_id = tid / 32;
-        uint lane = tid % 32;
-        uint tg_n = threadgroup_position_in_grid.y;
-
-        int N = int(N_size);
-        int n0 = int(tg_n) * BN;
-        int k_begin = int(sg_id) * K_chunk;
-        int k_end = k_begin + K_chunk;
-
-        threadgroup T B_tile[NSG][BK * BN];
-        threadgroup float tg_partials[NSG][BM * BN];
-
-        simdgroup_matrix<T, 8, 8> b_L, b_R;
-        {decl}
-
-        int dq_n = int(lane) % BN;
-        int dq_k_lane = int(lane) / BN;
-
-        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
-            _Pragma("unroll")
-            for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {{
-                int dq_k = pack_idx * 2 + dq_k_lane;
-                int n_global = n0 + dq_n;
-                int k_base = k0 + dq_k * 8;
-                float s = float(scales[n_global * K_by_gs + (k_base / GS)]);
-                float b = float(biases[n_global * K_by_gs + (k_base / GS)]);
-                {unpack}
-            }}
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-            for (int ks = 0; ks < BK / BK_SUB; ++ks) {{
-                {loads}
-                simdgroup_load(b_L, B_tile[sg_id] + ks * BK_SUB * BN, BN);
-                simdgroup_load(b_R, B_tile[sg_id] + ks * BK_SUB * BN + 8, BN);
-                {macs}
-            }}
-            simdgroup_barrier(mem_flags::mem_threadgroup);
-        }}
-
-        {stores}
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
-            float acc = 0.0f;
-            _Pragma("unroll")
-            for (int g = 0; g < NSG; ++g) {{
-                acc += tg_partials[g][off];
-            }}
-            int row = off / BN;
-            int col = off - row * BN;
-            y[row * N + n0 + col] = T(acc);
-        }}
-    """
-
-    dtype_tag = {mx.bfloat16: "bf16", mx.float16: "fp16"}.get(dtype, "unk")
-    kernel = mx.fast.metal_kernel(
-        name=f"omlx_vk_mma_rt{row_tiles}_k{int(k_val)}_q{bits}_gs{group_size}_"
-        f"{dtype_tag}",
-        input_names=["x", "w_q", "scales", "biases", "N_size"],
-        output_names=["y"],
-        source=source,
+    source = (
+        _MMA_SOURCE.replace("__BM__", str(8 * row_tiles))
+        .replace("__BN__", str(_MMA_BN))
+        .replace("__BK__", str(_MMA_BK))
+        .replace("__NSG__", str(_MMA_NSG))
+        .replace("__FACE__", face.type)
+        .replace("__DECL__\n", decl)
+        .replace("__LOADS__\n", loads)
+        .replace("__MACS__\n", macs)
+        .replace("__STORES__\n", stores)
     )
-    _KERNEL_CACHE[key] = kernel
-    return kernel
+    return kernels.face_kernel(
+        f"omlx_vk_mma_rt{row_tiles}",
+        ("x", "w", "N_size"),
+        {"w": face},
+        ("y",),
+        "",
+        source,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1063,19 +1033,29 @@ def mma_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
 
 
 def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
-    """(M, K) x (N, K)^T -> (M, N) for M in 7..24 through the mma tile kernel."""
+    """(M, K) x (N, K)^T -> (M, N) for M in 7..24 through the mma tile kernel
+    over the affine tile face; None for scales no tile face reads."""
     import mlx.core as mx
+
+    from omlx.formats import affine
 
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
+    if not 1 <= M <= 24 or K % (_MMA_BK * _MMA_NSG) or N % _MMA_BN:
+        raise ValueError(
+            f"vk_qmm_mma takes 1 to 24 rows, K in {_MMA_BK * _MMA_NSG}s and N in "
+            f"{_MMA_BN}s, not {M} x {K} x {N}"
+        )
+    if scales.dtype not in (mx.bfloat16, mx.float16):
+        return None  # no tile face reads such scales
     row_tiles = (M + 7) // 8
     bm = 8 * row_tiles
     xm, M0 = _pad_rows(mx, x2, bm)
-    kernel = _build_mma_kernel(row_tiles, K, group_size, x2.dtype, bits)
+    kernel = _mma_kernel(row_tiles, affine.tile_face(bits, group_size, scales.dtype))
     (y,) = kernel(
         inputs=[xm, w_q, scales, biases, N],
-        template=[("T", x2.dtype)],
+        template=[("T", x2.dtype), ("K", K)],
         grid=(32 * _MMA_NSG, N // _MMA_BN, 1),
         threadgroup=(32 * _MMA_NSG, 1, 1),
         output_shapes=[(bm, N)],

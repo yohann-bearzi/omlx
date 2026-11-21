@@ -1009,9 +1009,7 @@ def test_the_affine_tile_face_is_exact_for_its_scales_dtype_only():
             )
 
 
-@pytest.mark.parametrize(
-    "bits, group_size", [(2, 64), (3, 64), (5, 64), (4, 16), (8, 256)]
-)
+@pytest.mark.parametrize("bits, group_size", [(7, 64), (1, 64), (4, 16), (8, 256)])
 def test_a_tile_face_built_by_hand_is_one_affine_has(bits, group_size):
     with pytest.raises(
         ValueError, match=f"no runs of {bits} bits in groups of {group_size}"
@@ -1065,6 +1063,26 @@ def test_affine_tile_weights_are_mlx_dequantize_in_float32(bits, group_size, dty
     layer = _layer(512, 24, bits, group_size, dtype, experts=3, seed=bits + group_size)
     want = _float32_decode(layer).reshape(72, 512)
     exact, rounded = _affine_rows(layer, 512, dtype)
+    assert _same(exact, want)
+    assert _same(rounded, want.astype(dtype))
+
+
+# The widths the verify kernels read that no tile kernel over format layers
+# takes (AffineFormat.tile gives 4 and 8 bits): their runs of 2, 3, 5 and 6
+# bytes as one 64-bit word.
+@metal
+@pytest.mark.parametrize("dtype", _DTYPES)
+@pytest.mark.parametrize("bits", [2, 3, 5, 6])
+@pytest.mark.parametrize("group_size", [32, 64, 128])
+def test_every_width_s_tile_weights_are_mlx_dequantize_in_float32(
+    bits, group_size, dtype
+):
+    layer = _layer(512, 24, bits, group_size, dtype, experts=3, seed=bits + group_size)
+    want = _float32_decode(layer).reshape(72, 512)
+    assert formats.tile(layer, 512, 24) is None
+    face = affine.tile_face(bits, group_size, dtype)
+    operands = [layer[name] for name in ("weight", *face.tensors)]
+    exact, rounded = testing.tile_rows(face, operands, 512, range(72), dtype)
     assert _same(exact, want)
     assert _same(rounded, want.astype(dtype))
 
