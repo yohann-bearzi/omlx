@@ -624,6 +624,73 @@ def _switch_stand_in(plan: _Plan, metal):
     return kernels.zeros(*specs), launch
 
 
+# The activation dtypes oMLX serves a format's layers with: bfloat16, and
+# float16 when activations are recast. A load builds their Metals ahead.
+_WARM_DTYPES = (mx.bfloat16, mx.float16)
+
+
+def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
+    """Build, in a worker thread, the dot Metal that the first call of a
+    layer of ``layer_cls`` would prove: one build for each served
+    activation dtype its face is exact for, on a zero stand-in the call's
+    own Metal reads whole -- a row of ``k`` and every tensor at the shape
+    the layout declares -- from the declared tensors alone. The stand-in
+    layer made here is dropped, so no tensor of the checkpoint's is kept by
+    a warm-up.
+
+    Returns the futures of the builds, or None when the call would take
+    its composed path:
+    a stack (its route builds with the served experts' geometry), a k or
+    an n the rows kernel does not take, no face for the matrix, or no
+    served activation dtype the face is exact for."""
+    if getattr(layer_cls, "_STACK", 0) or k < 8:
+        return None
+    codes = tensors.get(fmt.codes_name)
+    if codes is not None and codes.ndim >= 2 and codes.shape[-2] % 8:
+        return None
+    stand_in = layer_cls(
+        fmt,
+        bits,
+        group_size,
+        k,
+        tensors,
+        None,
+        placeholders=False,
+        _load_layout=layout,
+    )
+    plan = _plan(stand_in)
+    if plan is None:
+        return None
+    dtypes = tuple(dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype))
+    if not dtypes:
+        return None
+    n = plan.n
+    shapes = ((k,), *(operand.shape for operand in plan.operands))
+    slots = tuple((operand.shape, operand.dtype) for operand in plan.operands)
+
+    def recipe():
+        # One tile of outputs: the rows kernel's first 8, in one threadgroup.
+        return kernels.StandIn(
+            input_shapes=shapes,
+            output_shapes=((8,),),
+            grid=(32, 2, 1),
+            threadgroup=(32, 2, 1),
+        )
+
+    built = kernels.warm(
+        {
+            kernels.planned(
+                plan.kernel,
+                ((shapes[0], dtype), *slots),
+                [dtype],
+                template=[("T", dtype), ("K_SIZE", k), ("N_SIZE", n)],
+            ): recipe
+            for dtype in dtypes
+        }
+    )
+    return built
+
+
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     """``arrays`` (x, then a stack's indices) through the rows kernel, the
     first time for ``signature``, or None: the layer has no plan, its proof

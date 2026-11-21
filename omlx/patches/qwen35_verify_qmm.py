@@ -808,7 +808,7 @@ def sg8_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
 
 
 @cache
-def _sg8_launch(faces, rows, k, n, group_size, dtype, summed):
+def _sg8_launch(faces, rows, k, n, group_size, dtype, summed, operand_dtypes=None):
     """Bind the Metal constants and launch dimensions for one input signature."""
     import mlx.core as mx
 
@@ -832,8 +832,20 @@ def _sg8_launch(faces, rows, k, n, group_size, dtype, summed):
     if half:
         name += "_fp16"
     kernel = kernels.face_kernel(name, inputs, matrices, ("y",), "", constants + source)
+    recorded = [False]
+
+    def launch(**call):
+        # The first call records the Metal; the wrapper's per-launch record
+        # is not paid on stock affine checkpoints' verify windows. Latch only
+        # after kernel(**call) succeeds so a failed first call still records.
+        if recorded[0]:
+            return kernel.native(**call)
+        result = kernel(**call)
+        recorded[0] = True
+        return result
+
     return partial(
-        kernel,
+        launch,
         template=[("T", dtype)],
         grid=(32 * nsg, n // (8 * ct), 1),
         threadgroup=(32 * nsg, 1, 1),
@@ -845,10 +857,19 @@ def _sg8_launch(faces, rows, k, n, group_size, dtype, summed):
 def _sg8_call(x2, faces, weights, n, group_size, sums):
     rows, k = x2.shape
     summed = group_size == _SUM_GROUP and sums is not None
-    launch = _sg8_launch(faces, rows, k, n, group_size, x2.dtype, summed)
     inputs = [x2, *weights]
     if summed:
         inputs.append(sums)
+    launch = _sg8_launch(
+        faces,
+        rows,
+        k,
+        n,
+        group_size,
+        x2.dtype,
+        summed,
+        operand_dtypes=tuple(a.dtype for a in inputs[1:]),
+    )
     return launch(inputs=inputs)[0]
 
 

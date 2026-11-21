@@ -1631,6 +1631,54 @@ def test_mlx_lm_loads_a_checkpoint_of_the_format(toy, tmp_path):
     assert logits.shape == (1, 5, 32) and mx.array_equal(logits, reference(tokens))
 
 
+def test_a_plugin_load_joins_its_metal_builds_before_it_returns(
+    toy, tmp_path, monkeypatch
+):
+    from omlx.formats import kernels
+
+    toy.face = _toy("plugin_load_join")
+    _llama(tmp_path, **_written())
+    joined = []
+
+    class Future:
+        def result(self, timeout=None):
+            joined.append(True)
+
+    def warm(instances):
+        assert instances
+        return tuple(Future() for _ in instances)
+
+    monkeypatch.setattr(kernels, "warm", warm)
+    load_model(tmp_path)
+    assert joined, "the load returned before its Metal builds were joined"
+
+
+def test_plugin_load_builds_the_served_dot_before_return(toy, tmp_path):
+    from tests.warm_library_probe import build_counter
+
+    toy.face = _toy("plugin_load_ready")
+    _, codes, scales = _llama(tmp_path, **_written())
+    builds, restore = build_counter(b"omlx_format_linear_toy_plugin_load_ready")
+    try:
+        model, _ = load_model(tmp_path)
+        ready = tuple(builds)
+        layer = model.model.layers[0].mlp.gate_proj
+        assert type(layer) is FormatLinear
+        x = (mx.arange(64) == 0).astype(mx.bfloat16)
+        expected = ((codes[:, 0].astype(mx.float32) - 128) * scales).astype(mx.bfloat16)
+        assert mx.any(expected != 0).item()
+        assert mx.array_equal(layer(x), expected).item()
+        first = tuple(builds)
+        assert mx.array_equal(layer(x), expected).item()
+        assert tuple(builds) == first
+        assert first, "the plugin fixture did not execute the tracked Metal"
+        assert ready, f"plugin dot compiled after load returned: ready={ready}, first={first}"
+        assert first == ready, "first request built a specialization missing at ready"
+    finally:
+        restore()
+
+
+
 class _Levels(_Loadable):
     """The toy format as a checkpoint's record configures it: its levels,
     the first of which scales what it decodes."""

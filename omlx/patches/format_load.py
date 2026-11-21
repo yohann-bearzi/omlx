@@ -40,6 +40,7 @@ import importlib
 import importlib.abc
 import inspect
 import json
+import logging
 import os
 import sys
 import threading
@@ -57,8 +58,10 @@ import mlx.nn as nn
 
 from .. import formats
 from ..formats import FormatRefusedError, LoadHookError
-from ..formats.linear import FormatLinear, FormatSwitchLinear
+from ..formats.linear import FormatLinear, FormatSwitchLinear, warm_dot
 from ..model_discovery import VERIFICATION, unverified_reason
+
+logger = logging.getLogger(__name__)
 
 # The modules whose SwitchLinear holds a stack of matrices, (E, N, K).
 _SWITCH_MODULES = ("mlx_lm.models.switch_layers", "mlx_vlm.models.switch_layers")
@@ -189,6 +192,35 @@ class _Checkpoint:
         self._accepting = threading.RLock()
         self.built: list[nn.Module] = []
         self._pruned = []
+        # The Metals started for its layers' first calls, and the faces and
+        # geometries started (a layer of the same builds nothing).
+        self.warmers: list = []
+        self.warmed: set = set()
+        # Geometries whose warm-up planned nothing (no face, an n outside
+        # whole tiles, no served dtype): asked once, like the others.
+        self._checked: set = set()
+        # One lock for both: a layer's planning adds to a set and a list a
+        # join reads, and a join waits under it so a second join does not
+        # return while the first is still waiting for a build.
+        self._warming = threading.Lock()
+
+    def join_warmers(self) -> None:
+        """Wait, before the load returns, for the Metals started for its
+        layers' first calls. A build that failed is logged and dropped: the
+        layer's first call proves its Metal then, and serves its composed
+        path if it cannot run, as it would have without a warm-up."""
+        with self._warming:
+            pending, self.warmers = self.warmers, []
+            for future in pending:
+                try:
+                    future.result()
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "a format layer's Metal did not build while its checkpoint "
+                        "loaded; its first call proves it, and its format's composed "
+                        "path serves it if it cannot run",
+                        exc_info=True,
+                    )
 
     def read(self, fmt: formats.QuantFormat) -> formats.QuantFormat:
         """The object that reads this checkpoint's layers of ``fmt``'s mode:
@@ -725,11 +757,20 @@ def check_loaded(model) -> None:
     if not _BUILT_ANY or not isinstance(model, nn.Module):
         # No process that built no format layer walks a model.
         return
-    for name, module in model.named_modules():
-        held = module.__dict__.get("_load_origin")
-        if held is None:
+    loaded = [
+        (name, module, held)
+        for name, module in model.named_modules()
+        if (held := module.__dict__.get("_load_origin")) is not None
+    ]
+    # The Metals its layers' first calls would prove, built before the load
+    # returned (a warm-up joined where the load already returned).
+    joined = set()
+    for _, _, (_, checkpoint) in loaded:
+        if id(checkpoint) in joined:
             continue
-        tensors, checkpoint = held
+        joined.add(id(checkpoint))
+        checkpoint.join_warmers()
+    for name, module, (tensors, checkpoint) in loaded:
         pending = getattr(module, "_placeholders", {})
         left = _unfilled(module, tensors, pending, name, checkpoint)
         if left:
@@ -1102,8 +1143,15 @@ def loading(path, *, by_loader: bool = False) -> Iterator[_Checkpoint]:
     try:
         yield checkpoint
     finally:
-        checkpoint.active = False
+        # Under the warming lock: a copied context's thread inside warm_dot
+        # must not build a stand-in after this says the load ended (its
+        # constructor refuses outside an active load).
+        with checkpoint._warming:
+            checkpoint.active = False
         formats._LOADING.reset(token)
+        # Joined here, where it runs whether the load returned or raised:
+        # a failed load must not leave its builds running.
+        checkpoint.join_warmers()
 
 
 def _refused(reason: str, mode, checkpoint=None) -> FormatRefusedError:
@@ -1260,7 +1308,57 @@ def _format_layer(layer, layer_cls, signature, arguments):
     object.__setattr__(built, "_load_origin", (tensors, checkpoint))
     global _BUILT_ANY
     _BUILT_ANY = True
+    _warm_layer(built, fmt, layout, k, tensors, checkpoint)
     return built
+
+
+def _warm_layer(built, fmt, layout, k, tensors, checkpoint) -> None:
+    """Start building the dot Metal ``built``'s first call would prove, so
+    that a load's first request finds it built: one build for each face,
+    geometry and served activation dtype of the checkpoint's format layers.
+    From the declared tensors alone (``linear.warm_dot``): a load keeps no
+    array of them in a warm-up."""
+    key = (
+        type(built).__name__,
+        fmt.mode,
+        k,
+        built.output_dims,
+        built.bits,
+        built.group_size,
+    )
+    if _is_verifying(checkpoint.shown):
+        # A writer's verification load: its contract reads the reader's
+        # faces only after the write. The serving load warms.
+        return
+    # One thread at a time: a second thread's layer of the same face joins
+    # the first's build, and a layer built after its load ended (a copied
+    # context's) adds nothing a join would miss.
+    with checkpoint._warming:
+        if (
+            not checkpoint.active
+            or key in checkpoint.warmed
+            or key in checkpoint._checked
+        ):
+            return
+        try:
+            planned = warm_dot(
+                type(built), fmt, built.bits, built.group_size, k, tensors, layout
+            )
+        except Exception:  # noqa: BLE001
+            # A warm-up is no gate: a defect here leaves the layer its first
+            # call's proof and its format's composed path, as without one.
+            logger.warning(
+                "a format layer's Metal could not be planned while its checkpoint "
+                "loaded; its first call proves it",
+                exc_info=True,
+            )
+            checkpoint.warmed.add(key)
+            return
+        if planned is None:
+            checkpoint._checked.add(key)
+            return
+        checkpoint.warmed.add(key)
+        checkpoint.warmers.extend(planned)
 
 
 def _patch(cls, layer_cls) -> None:

@@ -21,6 +21,7 @@ import logging
 import math
 import re
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cache
 
@@ -749,7 +750,7 @@ METAL_FUNC void store_rows(omlx_ints<R...>, thread const float* result, device T
 _ONE_BUFFER = 2**31
 
 
-def zeros(*specs) -> list[mx.array]:
+def zeros(*specs, stream=mx.gpu) -> list[mx.array]:
     """Zeros of each ``(shape, dtype)`` of ``specs``, a stand-in's inputs,
     not evaluated: ``Proof.prove`` evaluates them. They are made on the
     GPU's stream, the launch's. Each op is given the stream: the default
@@ -758,19 +759,18 @@ def zeros(*specs) -> list[mx.array]:
     first byte: one fill and, where MLX's buffer cache is empty (oMLX clears
     it after each prefill chunk), one new buffer. One of 2 GiB or more is
     zeros of its own: MLX's shapes are int32."""
-    gpu = mx.gpu
     sizes = [math.prod(shape) * dtype.size for shape, dtype in specs]
     below = [size for size in sizes if size < _ONE_BUFFER]
     if below:
-        buffer = mx.zeros((max(below),), mx.uint8, stream=gpu)
+        buffer = mx.zeros((max(below),), mx.uint8, stream=stream)
     made = []
     for (shape, dtype), size in zip(specs, sizes, strict=True):
         if size < _ONE_BUFFER:
-            raw = mx.as_strided(buffer, (size,), stream=gpu)
-            typed = mx.view(raw, dtype, stream=gpu)
-            made.append(mx.reshape(typed, shape, stream=gpu))
+            raw = mx.as_strided(buffer, (size,), stream=stream)
+            typed = mx.view(raw, dtype, stream=stream)
+            made.append(mx.reshape(typed, shape, stream=stream))
         else:
-            made.append(mx.zeros(shape, dtype, stream=gpu))
+            made.append(mx.zeros(shape, dtype, stream=stream))
     return made
 
 
@@ -994,6 +994,173 @@ def _kernel_names(kernel, parameter, names):
     )
 
 
+@dataclass(frozen=True)
+class StandIn:
+    """The smallest safe zero launch supplied by a kernel's route."""
+
+    input_shapes: tuple
+    output_shapes: tuple
+    grid: tuple[int, int, int]
+    threadgroup: tuple[int, int, int]
+
+
+def _input_kind(scalar, size):
+    # MLX generates a constant reference, a constant pointer or a device pointer.
+    return "scalar" if scalar else "constant" if size < 8 else "device"
+
+
+def _input_metal(x):
+    if not isinstance(x, mx.array):
+        x = mx.array(x)
+    return x.dtype, _input_kind(x.ndim == 0, x.size)
+
+
+@dataclass(frozen=True)
+class _Instance:
+    kernel: _FaceKernel
+    inputs: tuple
+    outputs: tuple
+    template: tuple
+
+    def build(self, describe):
+        if self in self.kernel._built:
+            return
+        stand_in = describe()
+        shapes = stand_in.input_shapes
+        if len(shapes) != len(self.inputs) or any(
+            _input_kind(len(shape) == 0, math.prod(shape)) != kind
+            for shape, (_, kind) in zip(shapes, self.inputs)
+        ):
+            raise ValueError("stand-in inputs would generate different Metal")
+        stream = _warm_stream()
+        inputs = zeros(
+            *((shape, dtype) for shape, (dtype, _) in zip(shapes, self.inputs)),
+            stream=stream,
+        )
+        outputs = self.kernel.native(
+            inputs=inputs,
+            template=[(name, value) for name, _, value in self.template],
+            output_shapes=stand_in.output_shapes,
+            output_dtypes=self.outputs,
+            grid=stand_in.grid,
+            threadgroup=stand_in.threadgroup,
+            stream=stream,
+        )
+        mx.eval(*outputs)
+        self.kernel._built.add(self)
+
+
+def _template_metal(name, value):
+    # bool and int compare equal in Python but instantiate different MSL.
+    if isinstance(value, bool):
+        return str(name), bool, value
+    if isinstance(value, int):
+        return str(name), int, int(value)
+    if isinstance(value, mx.Dtype):
+        return str(name), mx.Dtype, value
+    raise TypeError(f"invalid Metal template argument {name!r}")
+
+
+class _FaceKernel:
+    def __init__(self, native):
+        self.native = native
+        self._instances = {}
+        self._built = set()
+
+    def __call__(self, **launch):
+        # MLX reads each argument whole. Materialize one a caller may pass
+        # as a generator before it does, so the record below is not of an
+        # exhausted iterator.
+        for name in ("inputs", "output_dtypes", "template"):
+            value = launch.get(name)
+            if value is not None and not isinstance(value, (list, tuple)):
+                launch[name] = tuple(value)
+        result = self.native(**launch)
+        # MLX checks the arguments first. Keep only the parts of its signature
+        # that generate Metal, never arrays, their shapes or a launch closure.
+        inputs = tuple(map(_input_metal, launch["inputs"]))
+        self._record(inputs, launch["output_dtypes"], launch.get("template"))
+        return result
+
+    def _record(self, inputs, output_dtypes, template):
+        outputs = tuple(output_dtypes)
+        template = tuple(_template_metal(k, v) for k, v in template) if template else ()
+        key = inputs, outputs, template
+        instance = self._instances.get(key)
+        if instance is None:
+            instance = self._instances.setdefault(
+                key, _Instance(self, inputs, outputs, template)
+            )
+        return instance
+
+    def instance(self, input_specs, output_dtypes, *, template=()):
+        """Register the Metal for (shape, dtype) input specs without launching."""
+        inputs = tuple(
+            (dtype, _input_kind(len(shape) == 0, math.prod(shape)))
+            for shape, dtype in input_specs
+        )
+        return self._record(inputs, output_dtypes, template)
+
+    def instances(self):
+        """A snapshot of the distinct Metal specializations observed so far."""
+        return tuple(self._instances.values())
+
+
+def instances():
+    """Snapshot all Metal instances registered through face_kernel."""
+    return tuple(
+        i for kernel in tuple(_FACE_KERNELS.values()) for i in kernel.instances()
+    )
+
+
+_WARM_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="omlx-metal")
+
+
+# The registry of the raw MLX kernels a route plans Metals for: one per
+# kernel, so two plans of one kernel are instances of one registry.
+_RAW_KERNELS: dict = {}
+
+
+def planned(kernel, input_specs, output_dtypes, *, template=()):
+    """The Metal ``kernel`` (an MLX metal kernel, or a face kernel's) builds
+    for these input specs, recorded as a launch's is, without launching: a
+    route that builds ahead of its first call records the same Metal. Raw
+    kernels share one registry, so planning one twice records one
+    instance."""
+    if not isinstance(kernel, _FaceKernel):
+        kernel = _RAW_KERNELS.setdefault(kernel, _FaceKernel(kernel))
+    return kernel.instance(input_specs, output_dtypes, template=template)
+
+
+_WARM_STREAM = None
+_WARM_STREAM_LOCK = threading.Lock()
+
+
+def _warm_stream():
+    global _WARM_STREAM
+    stream = _WARM_STREAM
+    if stream is None:
+        with _WARM_STREAM_LOCK:
+            if _WARM_STREAM is None:
+                _WARM_STREAM = mx.new_thread_local_stream(mx.gpu)
+            stream = _WARM_STREAM
+    return stream
+
+
+def warm(instances):
+    """Start building the specified Metals and return one future per entry.
+
+    Map each recorded instance to a zero-argument builder of its StandIn.
+    The route knows the minimum legal input and output extents and the
+    threadgroup its kernel needs. Each worker owns the zeros it constructs
+    and evaluates the actual kernel. Future.result() raises any build error.
+    """
+    return tuple(
+        _WARM_POOL.submit(instance.build, build)
+        for instance, build in instances.items()
+    )
+
+
 def face_kernel(
     name: str,
     inputs,
@@ -1011,7 +1178,9 @@ def face_kernel(
     matrices' declarations, then ``source``. Its source is written and MLX's
     kernel made once for each name, inputs, faces, outputs, header and
     source; every call after finds it. Threads: two that build one kernel at
-    once each build it, and the first kept is the one every call finds."""
+    once each build it, and the first kept is the one every call finds.
+    The callable records its distinct Metals in instances(). Its instance()
+    method describes the same Metal from input specs without a launch."""
     inputs = _kernel_names(name, "inputs", inputs)
     outputs = _kernel_names(name, "outputs", outputs)
     key = (name, inputs, frozenset(matrices.items()), outputs, header, source)
@@ -1036,7 +1205,7 @@ def face_kernel(
         header=built.header + header,
         source=built.declarations + source,
     )
-    return _FACE_KERNELS.setdefault(key, kernel)
+    return _FACE_KERNELS.setdefault(key, _FaceKernel(kernel))
 
 
 # The source name used in Metal diagnostics for the generated table section.
