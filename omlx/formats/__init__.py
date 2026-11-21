@@ -36,13 +36,14 @@ import types
 import weakref
 from contextvars import ContextVar
 from dataclasses import dataclass, field, fields
-from functools import cache
+from functools import cache, cached_property
 from importlib.metadata import EntryPoint, entry_points
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from ..patches.module_cache import cached_per_module
+from ..patches.module_cache import epoch as cache_epoch
+from ..patches.module_cache import publish as cache_publish
 
 logger = logging.getLogger(__name__)
 
@@ -331,6 +332,22 @@ class _Face:
         for name, phase in _metal_fields(type(self)):
             yield name, phase, getattr(self, name)
 
+    @cached_property
+    def _hash_key(self):
+        # frozenset caches its hash and rehashes its contents on unpickling
+        # in another interpreter. Keep the order of the face fields inside it.
+        # A dataclass with eq=False inherits the fields its parent compares.
+        owner = next(cls for cls in type(self).__mro__ if "__eq__" in vars(cls))
+        values = tuple(
+            getattr(self, f.name)
+            for f in fields(owner)
+            if (f.compare if f.hash is None else f.hash)
+        )
+        return frozenset((values,))
+
+    def __hash__(self):
+        return hash(self._hash_key)
+
     def exact_for(self, dtype) -> bool:
         """Whether the face computes its format's rows for ``dtype``
         activations."""
@@ -368,6 +385,8 @@ class Dot(_Face):
         if type(self.vpt) is not int or self.vpt < 0:
             raise ValueError(f"{owner}: vpt is a count of inputs, not {self.vpt!r}")
 
+    __hash__ = _Face.__hash__
+
 
 @dataclass(frozen=True)
 class Tile(_Face):
@@ -379,6 +398,8 @@ class Tile(_Face):
     ``docs/quant-formats.md`` specifies: a row's cursor that reads a group's
     parameters and runs of 8 codes, and gives each weight as a float32.
     """
+
+    __hash__ = _Face.__hash__
 
 
 @dataclass(frozen=True)
@@ -999,15 +1020,28 @@ def codes(layer, k: int, n: int) -> Codes | None:
     """The layer's codes face, with the same checks and fallback as tile()."""
     return _face(layer, k, n, Codes, "codes", "the layer keeps its other kernels")
 
+# What a layer has no attribute at, apart from a None it holds there.
+_MISSING = object()
+
+
+def _same_width(a, b):
+    # A format may use "bits" or "group_size" as a tensor name. Comparing
+    # two such arrays, or containers that hold arrays, for equality would
+    # build and evaluate a graph.
+    return a is b or (
+        type(a) is type(b)
+        and not isinstance(a, (mx.array, dict, list, tuple))
+        and a == b
+    )
+
 
 def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
     """The face of class ``kind`` that ``layer``'s format gives, from its
     method ``name``, or None.
 
     A layer (an ``nn.Module``) asks its format once for each kind and
-    (k, n): the answer is kept on the layer (``module_cache``) until one of
-    its arrays is another or is kept under another name, its bits or group
-    size change (in value or in type), or its mode is another format's. That
+    (k, n): the layer keeps its answer until its training state, tensor
+    bindings, widths (in value or type), or registered format change. That
     is what a format's face is a function of (docs/quant-formats.md, Faces).
     A defect is not kept: the format is asked again at the next call, which
     notes it again in a block of ``testing.no_dot_defects``. A kernel that
@@ -1027,28 +1061,40 @@ def _face(layer, k: int, n: int, kind: type, name: str, keeps: str):
     if not isinstance(layer, nn.Module):
         return _asked(fmt, layer, k, n, kind, name, keeps)[0]
     slot = f"_omlx_{name}_face_{k}_{n}"
-    bits = getattr(layer, "bits", None)
-    group_size = getattr(layer, "group_size", None)
-    face, defective = cached_per_module(
-        layer,
-        slot,
-        lambda layer: _asked(fmt, layer, k, n, kind, name, keeps),
-        depth=0,
-        # The format object and its identity (equal formats are two), the
-        # widths with their types (4 == 4.0), and the tensors' names (the
-        # module cache keys their arrays alone).
-        flags=(
-            id(fmt),
-            fmt,
-            type(bits),
-            bits,
-            type(group_size),
-            group_size,
-            tuple(dict.keys(layer)),
-        ),
-    )
-    if defective:
-        layer.__dict__.pop(slot, None)
+    entry = layer.__dict__.get(slot)
+    if entry is not None:
+        owner, trained, old_bits, old_group, old_items, face = entry
+        if (
+            owner is fmt
+            and trained == layer._training
+            and _same_width(old_bits, getattr(layer, "bits", _MISSING))
+            and _same_width(old_group, getattr(layer, "group_size", _MISSING))
+        ):
+            # The bindings after the widths: a width's own comparison may
+            # change the layer (a format's property, a test's), and the
+            # answer must match the names and objects read here.
+            items = tuple(dict.items(layer))
+            if len(old_items) == len(items) and all(
+                old_key == key and old_value is value
+                for (old_key, old_value), (key, value) in zip(old_items, items)
+            ):
+                return face
+
+    # Keep the objects used for this request alive. Publish only a complete,
+    # successful answer: another thread can ask this layer while a defect
+    # is being reported. A failed request must never erase its answer. The
+    # clear generation is read before anything the answer depends on, so a
+    # clear that lands after it refuses the publish below.
+    since = cache_epoch(layer)
+    bits = getattr(layer, "bits", _MISSING)
+    group_size = getattr(layer, "group_size", _MISSING)
+    training = layer._training
+    items = tuple(dict.items(layer))
+    face, defective = _asked(fmt, layer, k, n, kind, name, keeps)
+    if not defective:
+        cache_publish(
+            layer, slot, since, (fmt, training, bits, group_size, items, face)
+        )
     return face
 
 

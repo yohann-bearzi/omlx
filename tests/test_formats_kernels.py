@@ -1950,3 +1950,114 @@ def test_the_row_skeleton_comment_names_no_deleted_skeleton():
     """The comment above the row skeleton describes the skeleton in the
     source, not one a rebase removed."""
     assert "Kept separate from _QMV_ROWS" not in Path(kernels.__file__).read_text()
+
+
+@pytest.mark.parametrize(
+    "unread, message",
+    [
+        (True, "matrices b are not among its inputs"),
+        (False, "would repeat a name of the kernel"),
+    ],
+)
+def test_repeated_matrix_inputs_report_the_unread_or_repeated_name(unread, message):
+    matrices = {"a": _toy("repeat_a")}
+    if unread:
+        matrices["b"] = _toy("repeat_b")
+    with pytest.raises(ValueError, match=message):
+        kernels.face_kernel("pair", ("a", "a"), matrices, ("y",), "", "")
+
+
+def test_a_kernel_cannot_reuse_a_face_at_a_different_input_name(monkeypatch):
+    built, _ = _counted(monkeypatch)
+    face = _toy("same_face")
+    inputs = ("a", "b")
+    for name in inputs:
+        kernels.face_kernel("pair", inputs, {name: face}, ("y",), "", "y[0] = 0;")
+    assert [kw["input_names"] for kw in built] == [
+        ["a_weight", *(f"a_{t}" for t in face.tensors), "b"],
+        ["a", "b_weight", *(f"b_{t}" for t in face.tensors)],
+    ]
+
+
+@pytest.mark.parametrize("tile", [False, True], ids=["dot", "tile"])
+def test_a_warm_kernel_lookup_does_not_rehash_the_face_source(monkeypatch, tile):
+    from omlx.formats.affine import tile_face
+
+    class Source(str):
+        hashes = 0
+
+        def __hash__(self):
+            self.hashes += 1
+            return super().__hash__()
+
+    built, _ = _counted(monkeypatch)
+    face = tile_face(4, 64, mx.bfloat16) if tile else _toy("source_hash")
+    source = Source(face.source)
+    face = replace(face, source=source)
+    args = ("held", ("m",), {"m": face}, ("y",), "", "y[0] = 0;")
+    first = kernels.face_kernel(*args)
+    cold_hashes = source.hashes
+    for _ in range(3):
+        assert kernels.face_kernel(*args) is first
+    assert source.hashes == cold_hashes
+    assert len(built) == 1
+
+
+def test_two_cache_misses_return_the_same_face_kernel(monkeypatch):
+    built, _ = _counted(monkeypatch)
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", _Missed())
+    args = ("concurrent", ("m",), {"m": _toy("threads")}, ("y",), "", "y[0] = 0;")
+    assert kernels.face_kernel(*args) is kernels.face_kernel(*args)
+    assert len(built) == 2
+
+
+@pytest.mark.parametrize("which", ["inputs", "outputs"])
+@pytest.mark.parametrize(
+    "bad_names",
+    [
+        pytest.param(lambda s: s.encode(), id="bytes"),
+        pytest.param(lambda s: iter([s]), id="iterator"),
+        pytest.param(lambda s: {s}, id="set"),
+        pytest.param(lambda s: {s: None}, id="mapping"),
+        pytest.param(lambda s: [s, 2], id="mixed-list"),
+        pytest.param(lambda s: (s, None), id="mixed-tuple"),
+    ],
+)
+def test_kernel_names_must_be_a_list_or_tuple_of_strings(monkeypatch, which, bad_names):
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(kernels, "Matrices", lambda: pytest.fail("started building"))
+    args = {"inputs": ("x",), "outputs": ("y",)}
+    args[which] = bad_names(args[which][0])
+    with pytest.raises(TypeError, match=rf"kernel 'names': {which} .*list or tuple"):
+        kernels.face_kernel("names", matrices={}, header="", source="", **args)
+
+
+def test_string_subclasses_name_a_kernel_input_or_output(monkeypatch):
+    class Name(str):
+        pass
+
+    built, _ = _counted(monkeypatch)
+    first = kernels.face_kernel("names", [Name("x")], {}, (Name("y"),), "", "")
+    assert kernels.face_kernel("names", ("x",), {}, ["y"], "", "") is first
+    assert len(built) == 1
+
+
+@pytest.mark.parametrize("which", ["inputs", "outputs"])
+def test_a_cached_kernel_cannot_admit_a_nonstring_equal_to_a_name(monkeypatch, which):
+    class EqualName:
+        def __init__(self, value):
+            self.value = value
+
+        def __hash__(self):
+            return hash(self.value)
+
+        def __eq__(self, other):
+            return self.value == other
+
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(mx.fast, "metal_kernel", lambda **kwargs: object())
+    args = {"inputs": ("x",), "outputs": ("y",)}
+    kernels.face_kernel("names", matrices={}, header="", source="", **args)
+    args[which] = (EqualName(args[which][0]),)
+    with pytest.raises(TypeError, match=rf"kernel 'names': {which} .*list or tuple"):
+        kernels.face_kernel("names", matrices={}, header="", source="", **args)

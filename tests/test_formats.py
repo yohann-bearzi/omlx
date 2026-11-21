@@ -10,7 +10,7 @@ import inspect
 import logging
 import re
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, fields, replace
 from functools import cache
 from pathlib import Path
 from types import SimpleNamespace
@@ -672,6 +672,10 @@ def test_a_lookup_from_another_thread_waits_for_the_load(plugins):
     assert plugins[0].loaded == 1
 
 
+class _Integer(int):
+    """An int the type check must not mistake for a plain one."""
+
+
 def _layer(mode="toy", tensors=("codes", "group_scales")):
     """A quantized linear: its mode, and its parameters by name, each of the
     fewest elements that MLX binds as a buffer."""
@@ -1156,6 +1160,39 @@ def test_equal_faces_are_one_cache_key():
     assert len({same, _FACE}) == 1
 
 
+@pytest.mark.parametrize("kind", [formats.Dot, formats.Tile])
+def test_kernel_keys_distinguish_each_field_of_the_concrete_face(kind):
+    face = kind("first", "struct F {};", "F", ())
+    alternatives = {
+        "key": "second",
+        "source": "struct F { int i; };",
+        "type": "G",
+        "tensors": ("group_scales",),
+        "dtypes": (mx.float16,),
+        "tables": (formats.Table("levels", mx.uint32, (1,)),),
+        "shared": "// another implementation of the shared dot product",
+        "vpt": 8,
+    }
+    cache = {face: "first"}
+    for item in fields(face):
+        if item.compare:
+            other = replace(face, **{item.name: alternatives[item.name]})
+            assert other not in cache, item.name
+            cache[other] = item.name
+            assert cache[replace(other)] == item.name
+
+
+def test_inherited_face_equality_and_hash_cover_the_same_fields():
+    @dataclass(frozen=True, eq=False)
+    class LabeledDot(formats.Dot):
+        label: str = ""
+
+    face = LabeledDot("first", "struct F {};", "F", ())
+    renamed = replace(face, label="second")
+    assert face == renamed
+    assert {face: "compiled"}[renamed] == "compiled"
+
+
 def test_faces_compare_by_their_dtypes_too():
     half = replace(_FACE, dtypes=(mx.float16,))
     # A dtype read off an array, not the module's constant.
@@ -1393,3 +1430,321 @@ def test_equal_formats_are_two(plugins, monkeypatch):
     monkeypatch.setitem(formats._FORMATS, "toy", again)
     assert formats.dot(layer, 64, 8) is _FACE
     assert (fmt.dots, again.dots) == (1, 1)
+
+
+def test_a_defective_face_is_never_published_to_another_thread(plugins, dot_defects):
+    from concurrent.futures import ThreadPoolExecutor
+
+    reached, second_done = threading.Event(), threading.Event()
+
+    class Attributes(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if not reached.is_set():
+                # Let another thread ask after publication and before cleanup.
+                reached.set()
+                assert second_done.wait(10)
+
+    formats.register(_Raises())
+    layer = _layer()
+    object.__setattr__(layer, "__dict__", Attributes(layer.__dict__))
+
+    def first_call():
+        try:
+            return formats.dot(layer, 64, 8)
+        finally:
+            # A defect that is never published simply returns from the call.
+            reached.set()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(first_call)
+            try:
+                assert reached.wait(10)
+                with (
+                    pytest.raises(AssertionError, match="no biases"),
+                    testing.no_dot_defects(),
+                ):
+                    assert formats.dot(layer, 64, 8) is None
+            finally:
+                second_done.set()
+            assert first.result(timeout=10) is None
+    finally:
+        dot_defects.clear()
+
+
+@pytest.mark.parametrize("name", ["bits", "group_size"])
+def test_a_rebound_tensor_named_like_a_width_is_compared_by_identity(plugins, name):
+    face = replace(_FACE, tensors=(name,))
+
+    class NamedTensor(_Format):
+        calls = 0
+
+        def dot(self, layer, k, n):
+            self.calls += 1
+            return face
+
+    fmt = NamedTensor(tensors=(name,))
+    formats.register(fmt)
+    layer = _layer(tensors=("codes", name))
+    assert formats.dot(layer, 64, 8) is face
+    layer[name] = mx.ones((8,))
+    assert formats.dot(layer, 64, 8) is face
+    assert formats.dot(layer, 64, 8) is face
+    assert fmt.calls == 2
+
+
+@pytest.mark.parametrize("name", ["bits", "group_size"])
+def test_each_missing_scalar_width_differs_from_zero(plugins, name):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    setattr(layer, name, 0)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_shapes_with_the_same_sum_have_separate_face_entries(plugins):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    for k, n in [(64, 16), (72, 8), (64, 16), (72, 8)]:
+        assert formats.dot(layer, k, n) is _FACE
+    assert fmt.dots == 2
+
+
+def test_changed_tensors_in_an_unread_child_do_not_rebuild_a_face(plugins):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    layer.child = _layer()
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert "weight" not in layer.child
+    layer.child[fmt.codes_name] = mx.ones((8,))
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 1
+
+
+def test_the_memo_keeps_its_format_alive_until_it_sees_a_replacement(plugins):
+    import weakref
+
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    held = weakref.ref(fmt)
+    del fmt
+    formats._FORMATS["toy"] = _Counting()
+    assert held() is not None
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert held() is None
+
+
+def test_a_warm_face_lookup_does_not_call_id(plugins, monkeypatch):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+
+    def audited_id(value):
+        pytest.fail("warm format lookup called id(), which emits builtins.id")
+
+    monkeypatch.setattr(formats, "id", audited_id, raising=False)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 1
+
+
+def test_clear_cached_drops_a_kept_face(plugins):
+    from omlx.patches.module_cache import clear_cached
+
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    clear_cached(layer)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_a_clear_during_a_lookup_keeps_no_face(plugins):
+    from omlx.patches.module_cache import clear_cached
+
+    class Clearing(_Counting):
+        def dot(self, layer, k, n):
+            self.dots += 1
+            clear_cached(layer)
+            return _FACE
+
+    fmt, layer = Clearing(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_a_clear_during_snapshot_keeps_no_face(plugins):
+    from omlx.patches.module_cache import clear_cached
+
+    class BitLayer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mode = "toy"
+            for name in ("codes", "group_scales"):
+                self[name] = mx.zeros((8,))
+
+        @property
+        def bits(self):
+            clear_cached(self)
+            return 4
+
+    fmt = _Counting()
+    formats.register(fmt)
+    layer = BitLayer()
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert "_omlx_dot_face_64_8" not in layer.__dict__
+
+
+def test_a_shrunk_layer_between_keys_and_values_does_not_hit(plugins, dot_defects):
+    class Width:
+        def __init__(self, pops=None):
+            self.pops = pops
+
+        def __eq__(self, other):
+            if self.pops is not None:
+                self.pops.pop("group_scales", None)
+            return True
+
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    layer.bits = Width(layer)
+    assert formats.dot(layer, 64, 8) is _FACE
+    layer.bits = Width()
+    assert formats.dot(layer, 64, 8) is None
+    dot_defects.clear()
+
+
+def test_rebound_container_width_with_arrays_does_not_compare_values(plugins):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    layer.bits = [mx.zeros((8,))]
+    assert formats.dot(layer, 64, 8) is _FACE
+    layer.bits = [mx.ones((8,))]
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+@pytest.mark.parametrize("first, second", [(True, 1), (_Integer(8), 8)])
+def test_a_width_of_another_type_is_not_the_same_width(plugins, first, second):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    layer.bits = first
+    assert formats.dot(layer, 64, 8) is _FACE
+    layer.bits = second
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+@pytest.mark.parametrize("name", ["bits", "group_size"])
+def test_each_missing_scalar_width_differs_from_none(plugins, name):
+    fmt, layer = _Counting(), _layer()
+    formats.register(fmt)
+    assert formats.dot(layer, 64, 8) is _FACE
+    setattr(layer, name, None)
+    assert formats.dot(layer, 64, 8) is _FACE
+    assert fmt.dots == 2
+
+
+def test_publish_waits_for_the_registry_lock(plugins):
+    from omlx.patches import module_cache
+
+    layer = _layer()
+    finished = threading.Event()
+
+    def publish():
+        module_cache.publish(
+            layer, "_omlx_test_lock", module_cache.epoch(layer), "entry"
+        )
+        finished.set()
+
+    with module_cache._SLOTS_LOCK:
+        thread = threading.Thread(target=publish)
+        thread.start()
+        assert not finished.wait(0.2)
+    assert finished.wait(5)
+    thread.join(5)
+    assert layer.__dict__["_omlx_test_lock"] == "entry"
+
+
+def test_a_late_defect_cannot_discard_another_threads_good_face(plugins, dot_defects):
+    from concurrent.futures import ThreadPoolExecutor
+
+    entered, second_done = threading.Event(), threading.Event()
+
+    class SometimesFails(_Counting):
+        def dot(self, layer, k, n):
+            self.dots += 1
+            if self.dots == 1:
+                entered.set()
+                assert second_done.wait(10)
+                raise _DefectError("first request")
+            return _FACE
+
+    fmt, layer = SometimesFails(), _layer()
+    formats.register(fmt)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(formats.dot, layer, 64, 8)
+            try:
+                assert entered.wait(10)
+                assert formats.dot(layer, 64, 8) is _FACE
+            finally:
+                second_done.set()
+            assert first.result(timeout=10) is None
+        assert formats.dot(layer, 64, 8) is _FACE
+        assert fmt.dots == 2
+    finally:
+        dot_defects.clear()
+
+
+def test_an_ordinary_absent_face_is_kept_for_equal_widths_and_training(plugins):
+    class NoDot(_Counting):
+        def dot(self, layer, k, n):
+            self.dots += 1
+            return None
+
+    fmt, layer = NoDot(), _layer()
+    formats.register(fmt)
+    old_width = int("1024")
+    layer.group_size = old_width
+    assert formats.dot(layer, 64, 8) is None
+    layer.group_size = int("1024")
+    assert layer.group_size is not old_width
+    assert formats.dot(layer, 64, 8) is None
+    assert fmt.dots == 1
+    layer.train(not layer.training)
+    for _ in range(2):
+        assert formats.dot(layer, 64, 8) is None
+    assert fmt.dots == 2
+
+
+def test_faces_sent_to_another_interpreter_share_its_hash_seed():
+    import os
+    import pickle
+    import subprocess
+    import sys
+
+    faces = [cls("face", "metal", "F", ()) for cls in (formats.Dot, formats.Tile)]
+    for face in faces:
+        hash(face)
+    # A worker can receive an already hashed face and build an equal one locally.
+    check = """\
+import pickle
+import sys
+from dataclasses import replace
+
+for face in pickle.load(sys.stdin.buffer):
+    other = replace(face)
+    assert face == other and {face: "found"}[other] == "found"
+"""
+    seed = "17" if os.environ.get("PYTHONHASHSEED") != "17" else "18"
+    subprocess.run(
+        [sys.executable, "-c", check],
+        input=pickle.dumps(faces),
+        env={**os.environ, "PYTHONHASHSEED": seed},
+        check=True,
+    )

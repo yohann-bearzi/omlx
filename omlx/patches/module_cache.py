@@ -28,9 +28,10 @@ clear returns without publishing.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from itertools import chain
 from operator import is_
-from typing import Any, Callable
+from typing import Any
 
 import mlx.nn as nn
 
@@ -86,6 +87,23 @@ def cached_per_module(
             # build must not be overwritten by the pre-clear references.
             module.__dict__[slot] = entry
     return value
+
+
+def epoch(module: nn.Module) -> int:
+    """The module's clear generation: read it before a build whose answer
+    ``publish`` keeps, so a clear that lands during the build wins."""
+    return module.__dict__.get(_EPOCH_SLOT, 0)
+
+
+def publish(module: nn.Module, slot: str, since: int, entry) -> None:
+    """Publish ``entry`` as ``module.__dict__[slot]``, a slot ``clear_cached``
+    drops, unless the module was cleared since ``since`` (its epoch read
+    before the build): a build that overlapped a clear does not land behind
+    it. The caller keeps the entry's shape; only the slot's name is kept."""
+    with _SLOTS_LOCK:
+        if module.__dict__.get(_EPOCH_SLOT, 0) == since:
+            _SLOTS.add(slot)
+            module.__dict__[slot] = entry
 
 
 def clear_cached(module: nn.Module) -> None:
