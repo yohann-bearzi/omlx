@@ -55,7 +55,11 @@ from ..custom_kernels.moe_staging import EXPERTS, MAX_BYTES, Staging
 from ..custom_kernels.moe_staging import NATIVE_AVAILABLE as STAGING_AVAILABLE
 from ..formats.linear import _FormatLayer
 from ..scheduler import _sync_and_clear_cache
-from .moe_offload_compat import IN_QUANT_FORMAT, in_quant_format
+from .moe_offload_compat import (
+    IN_QUANT_FORMAT,
+    in_ported_family,
+    in_quant_format,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1121,13 +1125,23 @@ def apply_moe_expert_offload(
         return 0
     config_path = Path(model_dir) / "config.json"
     config = json.loads(config_path.read_text()) if config_path.exists() else {}
-    if in_quant_format(config) or any(
-        isinstance(module, _FormatLayer) for module in model.modules()
+    if (
+        in_quant_format(config)
+        or in_ported_family(config)
+        or any(isinstance(module, _FormatLayer) for module in model.modules())
     ):
         # Its slots would hold a format's tensors, which no slot matmul reads
         # (DEFERRED row 14): the whole model stays resident, as admission
         # counted it.
-        logger.warning("moe expert offload: %s", IN_QUANT_FORMAT)
+        if in_quant_format(config) or not in_ported_family(config):
+            said = IN_QUANT_FORMAT
+        else:
+            said = (
+                f"the stock switch loads {config.get('model_type', 'this family')}"
+                "'s experts as format layers: every expert stays resident "
+                "(DEFERRED row 14)."
+            )
+        logger.warning("moe expert offload: %s", said)
         return 0
     minimum = _minimum_experts(model_dir, config)
     kind = config.get("model_type")
@@ -1257,7 +1271,7 @@ def estimate_offload_admission_bytes(
         config_path = Path(model_dir) / "config.json"
         # Read once, for every question asked of it below.
         config = json.loads(config_path.read_text()) if config_path.exists() else {}
-        if in_quant_format(config):
+        if in_quant_format(config) or in_ported_family(config):
             # Its load offloads none of its experts (apply_moe_expert_offload).
             return full_size
         minimum = _minimum_experts(model_dir, config)

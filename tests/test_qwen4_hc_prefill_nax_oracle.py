@@ -65,10 +65,10 @@ def test_the_oracle_s_metal_and_constants_are_the_live_ones(name):
     assert getattr(oracle, name) == getattr(_live(), name)
 
 
-def test_the_oracle_s_inject_header_is_hc_projection_s():
-    from mlx_vlm.models.qwen4_exp import hc_projection
+def test_the_oracle_s_inject_header_is_hc_fused_s():
+    from mlx_vlm.models.qwen4_exp import hc_fused
 
-    assert oracle._QDOT_HEADER == hc_projection._HEADER
+    assert oracle._QDOT_HEADER == hc_fused._HEADER
 
 
 @pytest.mark.parametrize("name", _LAUNCHES)

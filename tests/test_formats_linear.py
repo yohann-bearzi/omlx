@@ -443,17 +443,33 @@ def test_an_n_of_part_of_a_tile_runs_in_the_shared_launch(n):
 
 
 def test_what_a_face_does_not_cover_is_the_decode_and_mlx_s_matmul():
-    # A layout the format has no face for (MLX's qmv_quad).
+    # A layout the format has no face for (MLX's qmv_quad): a stock affine
+    # layer keeps MLX's own matmul; a plugin format runs decode then matmul.
     quantized, layer = _pair(64, 8)
     x = _x((1, 64))
     assert formats.dot(layer, 64, 8) is None
-    assert _same_bits(layer(x), _composed(quantized, x))
+    assert _same_bits(layer(x), quantized(x))
     assert not kernels._PROOFS
-    # Activations of a dtype the face is not exact for.
+
+    class _NoDotPlugin(affine.AffineFormat):
+        mode = "no_dot_test_plugin"
+
+    plugin = FormatLinear(
+        _NoDotPlugin(), 4, 32, 64, _tensors(quantized), bias=quantized.get("bias")
+    )
+    assert formats.dot(plugin, 64, 8) is None
+    assert _same_bits(plugin(x), _composed(quantized, x))
+    assert not kernels._PROOFS
+    # Activations of a dtype the face is not exact for: stock affine keeps
+    # MLX's own matmul; a plugin format runs decode then matmul.
     quantized, layer = _pair(320, 72, bias=True)
     x = _x((2, 320), mx.float32)
     assert not formats.dot(layer, 320, 72).exact_for(mx.float32)
-    assert _equal(layer(x), _composed(quantized, x))
+    assert _equal(layer(x), quantized(x))
+    plugin = FormatLinear(
+        _NoDotPlugin(), 4, 32, 320, _tensors(quantized), bias=quantized.get("bias")
+    )
+    assert _equal(plugin(x), _composed(quantized, x))
     (proof,) = kernels._PROOFS.values()
     assert not proof.ran and not proof.failed
 
@@ -2491,7 +2507,10 @@ class _Thread:
 
     def __call__(self, fn, *args):
         # Threads that wait for each other fail a test: they do not hang it.
-        return self.pool.submit(fn, *args).result(timeout=30)
+        # The caller's context travels with the job: a thread loading or
+        # serving inside a testing.verified block sees its families.
+        context = contextvars.copy_context()
+        return self.pool.submit(context.run, fn, *args).result(timeout=30)
 
     def end(self):
         self.pool.shutdown()
@@ -2956,7 +2975,7 @@ def test_the_page_says_a_recast_casts_a_format_layer_s_bias_alone():
     assert (
         "an array of another shape or dtype assigned to one of them is not "
         "taken, and raises nothing, so MLX's `set_dtype` and oMLX's float16 "
-        "activations recast a format layer's bias alone" in page
+        "activations recast a plugin format layer's bias alone" in page
     )
 
 

@@ -854,6 +854,25 @@ class AffineFormat(QuantFormat):
     tensors = ("scales", "biases")
     contract = 1
 
+    def layout(self, k: int, n: int, bits: int, group_size: int):
+        """MLX's own layout: codes in 32-bit words, a scale and a bias per
+        group. A matrix MLX cannot pack (another width, group size or a K
+        that is not whole groups) has none: the stock layer stays MLX's."""
+        if (
+            k <= 0
+            or n <= 0
+            or bits not in _BITS
+            or group_size not in _GROUP_SIZES
+            or k % group_size
+        ):
+            return None
+        groups = (n, k // group_size)
+        return {
+            "weight": ((n, k * bits // 32), mx.uint32),
+            "scales": (groups, None),
+            "biases": (groups, None),
+        }
+
     def dot(self, layer, k: int, n: int) -> Dot | None:
         if (
             layer.bits not in _BITS

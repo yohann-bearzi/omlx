@@ -1700,10 +1700,12 @@ def apply_activation_fp16(model: Any, model_settings: Any = None) -> None:
         return
     import mlx.nn as nn
 
-    from ..formats.linear import FormatLinear, FormatSwitchLinear
+    from ..formats import _BUILTIN_MODES
+    from ..formats.linear import FormatEmbedding, FormatLinear, FormatSwitchLinear
 
     if isinstance(model, nn.Module) and any(
-        isinstance(module, (FormatLinear, FormatSwitchLinear))
+        isinstance(module, (FormatLinear, FormatSwitchLinear, FormatEmbedding))
+        and module.mode not in _BUILTIN_MODES
         for _, module in model.named_modules()
     ):
         logger.warning("Skipping activation_fp16 because the model has format layers")

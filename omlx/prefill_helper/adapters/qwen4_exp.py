@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx_vlm.utils as vlm_utils
 import numpy as np
 
@@ -117,26 +116,50 @@ def _host_view(array: mx.array) -> tuple[np.ndarray, str]:
 _SAFETENSORS_DTYPES = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}
 
 
-def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], tuple]:
-    """Packed rows of this Mac's PLE table by global row, without the GPU.
+def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], list]:
+    """This Mac's PLE rows by global row, as floats.
 
-    Returns ``read(rows) -> (arrays, settings)``; ``settings`` is
-    [bits, group_size, cast_to_scale_dtype, fp8], as the helper decodes them.
+    Returns ``read(rows) -> arrays``: the rows decoded here, where the table's
+    reader lives (MLX's packed affine, or the format's own decode), so the
+    helper needs neither the format nor a kernel. The decode runs on the
+    GPU's stream (the device a served model's lookup runs on): MLX's CPU
+    kernels round differently, and the wire must carry the served bits.
     """
     if isinstance(table, language.DiskBackedShardedEmbedding):
 
-        def read_disk(rows: np.ndarray) -> tuple:
+        def read_disk(rows: np.ndarray) -> list:
+            if rows.size == 0:
+                return [
+                    wire.to_host(mx.zeros((0, table.dims), table.weight_scale.dtype))
+                ]
             plan = table._plan(rows)
             if plan is None:
                 raise RuntimeError("PLE shards with mixed formats are not supported")
             buffers = table._assemble(rows, plan)
             _, _, _, _, families, dtypes, bits, group_size = plan
-            arrays = [
-                (buffers[f], _SAFETENSORS_DTYPES.get(dtypes[f], dtypes[f].lower()))
-                for f in families
+            names = [
+                _SAFETENSORS_DTYPES.get(dtypes[f], dtypes[f].lower()) for f in families
             ]
-            fp8 = int(str(dtypes[0]).upper().startswith("F8"))
-            return arrays, [bits or 0, group_size or 0, 1, fp8]
+            tensors = [
+                wire.from_host(buffers[f], name) for f, name in zip(families, names)
+            ]
+            with mx.stream(mx.gpu if mx.is_available(mx.gpu) else mx.default_device()):
+                if bits:
+                    value = mx.dequantize(
+                        tensors[0],
+                        tensors[1],
+                        tensors[2],
+                        group_size=group_size,
+                        bits=bits,
+                        mode="affine",
+                    )
+                elif tensors[0].dtype == mx.uint8:
+                    value = mx.from_fp8(tensors[0], dtype=mx.bfloat16)
+                else:
+                    value = tensors[0]
+                # What the model's own lookup multiplies, it casts first.
+                value = value.astype(table.weight_scale.dtype)
+            return [wire.to_host(value)]
 
         return read_disk
     fused = getattr(table, "fused", None)
@@ -145,26 +168,49 @@ def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], tuple]:
         [0, table.shard_offsets[-1]] if fused is not None else table.shard_offsets,
         dtype=np.int64,
     )
-    quantized = isinstance(shards[0], nn.QuantizedEmbedding)
-    families = ("weight", "scales", "biases") if quantized else ("weight",)
-    views = [[_host_view(getattr(s, f)) for f in families] for s in shards]
-    fp8 = int(views[0][0][1] == "uint8")
-    settings = [
-        shards[0].bits if quantized else 0,
-        shards[0].group_size if quantized else 0,
-        0,
-        fp8,
-    ]
+    first = shards[0]
+    if hasattr(first, "fmt") or hasattr(first, "scales"):
+        # A format's embedding, or one of MLX's quantized ones: its own
+        # lookup decodes the rows it names.
+        def decode(shard, ids):
+            return shard._decoded(ids) if hasattr(shard, "fmt") else shard(ids)
 
-    def read_resident(rows: np.ndarray) -> tuple:
+        def read_format(rows: np.ndarray) -> list:
+            if rows.size == 0:
+                return [
+                    wire.to_host(mx.zeros((0, table.dims), table.weight_scale.dtype))
+                ]
+            shard = np.searchsorted(offsets, rows, side="right") - 1
+            local = rows - offsets[shard]
+            pieces = []
+            with mx.stream(mx.gpu if mx.is_available(mx.gpu) else mx.default_device()):
+                for index in np.unique(shard):
+                    positions = np.flatnonzero(shard == index)
+                    value = decode(shards[index], mx.array(local[positions]))
+                    mx.eval(value)
+                    pieces.append((positions, _host_view(value)))
+            _, (first_values, name) = pieces[0]
+            out = np.empty((rows.size, first_values.shape[1]), first_values.dtype)
+            for positions, (values, _) in pieces:
+                out[positions] = values
+            return [(out, name)]
+
+        return read_format
+    # MLX's own embedding rows: they are already values (float or float8).
+    views = [_host_view(shard.weight) for shard in shards]
+
+    def read_resident(rows: np.ndarray) -> list:
         shard = np.searchsorted(offsets, rows, side="right") - 1
         local = rows - offsets[shard]
-        out = [np.empty((rows.size, view.shape[1]), view.dtype) for view, _ in views[0]]
+        out = np.empty((rows.size, views[0][0].shape[1]), views[0][0].dtype)
         for index in np.unique(shard):
             positions = np.flatnonzero(shard == index)
-            for family, (view, _) in enumerate(views[index]):
-                out[family][positions] = view[local[positions]]
-        return [(o, name) for o, (_, name) in zip(out, views[0])], settings
+            out[positions] = views[index][0][local[positions]]
+        if views[0][1] == "uint8":
+            with mx.stream(mx.gpu if mx.is_available(mx.gpu) else mx.default_device()):
+                value = mx.from_fp8(mx.array(out), dtype=mx.bfloat16)
+            return [wire.to_host(value)]
+        return [(out, views[0][1])]
 
     return read_resident
 
@@ -183,16 +229,13 @@ class _HostPLERows:
         name = f"p{layer}."
         if name + "ids" not in inputs:
             raise RuntimeError(f"No PLE rows for layer {layer}")
-        data = [
-            wire.from_host(*inputs[f"{name}{n}"])
-            for n in range(3)
-            if f"{name}{n}" in inputs
-        ]
+        data = []
+        while f"{name}{len(data)}" in inputs:
+            data.append(wire.from_host(*inputs[f"{name}{len(data)}"]))
         self.rows = (
             inputs[name + "ids"][0],
             data,
             wire.from_host(*inputs[name + "ws"]),
-            inputs[name + "q"][0].tolist(),
         )
 
     def __call__(self, indices: mx.array) -> mx.array:
@@ -202,22 +245,8 @@ class _HostPLERows:
             return mx.zeros((*host.shape, self.dims), self.dtype)
         if rows is None or not np.array_equal(rows[0], host):
             raise RuntimeError("PLE rows were sent for other ids")
-        _, data, scale, (bits, group_size, cast, fp8) = rows
-        values = data[0]
-        if fp8:
-            values = mx.from_fp8(values, dtype=mx.bfloat16)
-        if bits:
-            values = mx.dequantize(
-                values,
-                data[1],
-                data[2],
-                group_size=group_size,
-                bits=bits,
-                mode="affine",
-            )
-        if cast:
-            values = values.astype(scale.dtype)
-        return (values * scale).reshape(*host.shape, self.dims)
+        _, data, scale = rows
+        return (data[0] * scale).reshape(*host.shape, self.dims)
 
 
 @contextmanager
@@ -248,7 +277,7 @@ def _cache_state(i: int, item: Any, since: int | None) -> Arrays:
 
 class Qwen4ExpAdapter(StageAdapter):
     model_types = ("qwen4_exp",)
-    contract = 1
+    contract = 2
 
     def layer_count(self, lm: Any) -> int:
         return len(_layers(lm))
@@ -344,10 +373,9 @@ class Qwen4ExpAdapter(StageAdapter):
 
         def feed(chunk: int) -> HostArrays:
             ids_chunk = rows[:, starts[chunk] : starts[chunk + 1]]
-            arrays, settings = read(ids_chunk.reshape(-1))
+            arrays = read(ids_chunk.reshape(-1))
             out: HostArrays = {
                 name + "ids": (ids_chunk, "int64"),
-                name + "q": (np.array(settings, dtype=np.int64), "int64"),
                 name + "ws": scale,
             }
             for n, value in enumerate(arrays):

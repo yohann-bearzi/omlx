@@ -3037,3 +3037,94 @@ def test_qwen4_resident_ple_fusion_top_level_affine_mode_checks_and_refuses_shar
     with pytest.raises(formats.FormatRefusedError) as refused:
         holder._omlx_refuse_sharding()
     assert refused.value.mode == "affine"
+
+
+def test_qwen4_windowed_ple_rebinds_recast_shards(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    mx.random.seed(41)
+    dims, rows = 64, 4
+    shards = []
+    with testing.verified("qwen4_exp"):
+        for _ in range(2):
+            dense = nn.Embedding(rows, dims)
+            dense.set_dtype(mx.bfloat16)
+            stock = dense.to_quantized(group_size=32, bits=4)
+            tensors = {name: stock[name] for name in ("weight", "scales", "biases")}
+            shards.append(
+                formats_linear.FormatEmbedding("affine", 4, 32, dims, tensors)
+            )
+    table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    table.shards = shards
+    indices = mx.array([[1, rows + 2]])
+    ranges = ((0, rows), (rows, 2 * rows))
+
+    def _expected():
+        full = mx.concatenate(
+            [
+                mx.dequantize(
+                    shard.weight,
+                    shard.scales,
+                    shard.biases,
+                    group_size=32,
+                    bits=4,
+                )
+                for shard in shards
+            ],
+            axis=0,
+        )
+        return full[indices]
+
+    before = table._windowed_lookup(indices, ranges)
+    expected_bf16 = _expected()
+    assert before is not None and before.dtype == mx.bfloat16
+    assert mx.array_equal(
+        before.view(mx.uint16), expected_bf16.view(mx.uint16)
+    ).item()
+    weight_before = [shard.weight for shard in shards]
+    for shard in shards:
+        shard.set_dtype(mx.float16)
+    assert all(shard.weight is orig for shard, orig in zip(shards, weight_before))
+    after = table._windowed_lookup(indices, ranges)
+    expected_fp16 = _expected()
+    assert after is not None and after.dtype == mx.float16
+    assert not mx.array_equal(
+        before.view(mx.uint16), expected_fp16.view(mx.uint16)
+    ).item()
+    assert mx.array_equal(
+        after.view(mx.uint16), expected_fp16.view(mx.uint16)
+    ).item()
+
+
+def test_qwen4_resident_ple_fusion_preserves_eval_and_no_grad(monkeypatch):
+    from omlx import formats
+    from omlx.formats import linear as formats_linear
+    from omlx.formats import testing
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import language as vendored_language
+
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    dims, rows = 32, 4
+    shards = []
+    with testing.verified("qwen4_exp"):
+        for _ in range(2):
+            stock = nn.Embedding(rows, dims).to_quantized(group_size=32, bits=4)
+            tensors = {name: stock[name] for name in ("weight", "scales", "biases")}
+            shard = formats_linear.FormatEmbedding("affine", 4, 32, dims, tensors)
+            shard.eval()
+            shard.unfreeze(keys=["scales"], recurse=False)
+            shards.append(shard)
+    table = vendored_language.ShardedEmbedding(2 * rows, dims, 2)
+    table.shards = shards
+    assert table.fuse_quantized_shards() is True
+    assert table.fused.training is False
+    assert table.fused._no_grad == {"weight", "biases"}

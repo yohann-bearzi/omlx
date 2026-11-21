@@ -67,8 +67,18 @@ def no_family_verified(verified):
     autouse monkeypatch is set up before the block, so undoing a setattr of
     it would run once the block has closed and publish the block's families
     again, for every test that follows in the process."""
+    import contextvars
+
+    from omlx.formats import testing as format_testing
+
     with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(oq, "_TEST_VERIFIED", frozenset())
+        patch.setattr(
+            format_testing,
+            "_VERIFIED_EXTRA",
+            contextvars.ContextVar(
+                "omlx_verified_extra", default=frozenset()
+            ),
+        )
         yield
 
 
@@ -1699,7 +1709,7 @@ def test_the_families_oq_writes_in_a_format(tmp_path):
 def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
     import asyncio
 
-    before = oq._TEST_VERIFIED
+    before = testing.verified_extra()
     config = {"model_type": "qwen4_exp"}
 
     @testing.verified("QWEN4-EXP")
@@ -1712,11 +1722,14 @@ def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
         return oq._unverified_family(config)
 
     assert written() is None and asyncio.run(written_async()) is None
-    assert before == oq._TEST_VERIFIED
+    assert before == testing.verified_extra()
     with pytest.raises(RuntimeError), testing.verified("qwen4_exp", "d1"):
-        assert before | {"qwen4_exp", "d1"} == oq._TEST_VERIFIED
+        assert before | {
+            ("qwen4_exp", None),
+            ("d1", None),
+        } == testing.verified_extra()
         raise RuntimeError
-    assert before == oq._TEST_VERIFIED
+    assert before == testing.verified_extra()
     assert oq._unverified_family(config)[0] == "qwen4_exp"
     # A family the audits found misread is written too, when a test says so.
     with testing.verified("raon1_mini"):
@@ -1748,7 +1761,9 @@ def test_blocks_of_verified_close_in_any_order_in_any_thread(tmp_path):
             with testing.verified("qwen4_exp"):
                 running = pool.submit(other)
                 assert opened.wait(60)
-                assert written("qwen4_exp") and written("minimax_m3_vl")
+                # The worker's block lives in the worker's context: this
+                # thread sees only its own families.
+                assert written("qwen4_exp") and not written("minimax_m3_vl")
         finally:
             closed.set()
         assert running.result(timeout=60) == (True, False)
@@ -3919,3 +3934,92 @@ def test_a_glm53_pair_write_verifies_after_reload(
     )
     assert f"{down}.scales" in tensors
     assert "omlx.patches.deepseek_v4.switch_layers.SwitchLinear" in caplog.text
+
+
+def test_encode_in_format_accepts_stored_float_layout():
+    from omlx import formats, oq
+
+    class StoredFloat(formats.QuantFormat):
+        mode, codes_name, tensors, contract = "stored_float", "weight", ("scales",), 1
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, 1), None),
+            }
+
+        def encode(self, w, importance, bits, group_size):
+            n, k = w.shape[0], w.shape[1]
+            return {
+                "weight": mx.zeros((n, k * bits // 32), mx.uint32),
+                "scales": mx.ones((n, 1), mx.bfloat16),
+            }
+
+    w = mx.zeros((4, 128), mx.bfloat16)
+    out = oq._encode_in_format(
+        StoredFloat(), "weight", w, mx.zeros((4,)), 4, 64
+    )
+    assert out is not None and out["scales"].dtype == mx.bfloat16
+
+
+def test_encode_in_format_rejects_non_float_or_mismatched_stored_float_chunks(
+    monkeypatch,
+):
+    from omlx import formats, oq
+
+    class BadIntFloat(formats.QuantFormat):
+        mode, codes_name, tensors, contract = "bad_int", "weight", ("scales",), 1
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, 1), None),
+            }
+
+        def encode(self, w, importance, bits, group_size):
+            n, k = w.shape[-2], w.shape[-1]
+            return {
+                "weight": mx.zeros((n, k * bits // 32), mx.uint32),
+                "scales": mx.ones((n, 1), mx.int32),
+            }
+
+    w = mx.zeros((4, 128), mx.bfloat16)
+    with pytest.raises(ValueError, match="would not load"):
+        oq._encode_in_format(BadIntFloat(), "weight", w, mx.zeros((4,)), 4, 64)
+
+    class MixedChunkFloat(formats.QuantFormat):
+        mode, codes_name, tensors, contract = "mixed_float", "weight", ("scales",), 1
+
+        def __init__(self):
+            self.calls = 0
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, 1), None),
+            }
+
+        def encode(self, w, importance, bits, group_size):
+            lead, n, k = w.shape
+            dtype = mx.bfloat16 if self.calls == 0 else mx.float16
+            self.calls += 1
+            return {
+                "weight": mx.zeros((lead, n, k * bits // 32), mx.uint32),
+                "scales": mx.ones((lead, n, 1), dtype),
+            }
+
+    monkeypatch.setattr(oq, "_LAUNCH_WEIGHTS", 4 * 128)
+    stack = mx.zeros((2, 4, 128), mx.bfloat16)
+    with pytest.raises(ValueError, match="dtype"):
+        oq._encode_in_format(
+            MixedChunkFloat(), "weight", stack, mx.zeros((2, 4)), 4, 64
+        )
+    # Chunk budget counts dtype=None tensors at 4 bytes per element (float32),
+    # not 2: weight 1024 + packed 256 + scales 16 = 1296 > 1290 > 1288.
+    monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1290)
+    assert (
+        oq._encode_in_format(
+            MixedChunkFloat(), "weight", w, mx.zeros((4,)), 4, 64
+        )
+        is None
+    )

@@ -114,7 +114,7 @@ def progressive_sharded_load(
             "*.jinja",
         ],
     )
-    from ..patches.format_load import refuse_format_checkpoint
+    from ..patches.format_load import refuse_format_checkpoint, sharded_loading
     from ..utils.model_loading import ensure_model_code_trusted
 
     metadata_config = utils_module.load_config(model_path)
@@ -165,13 +165,17 @@ def progressive_sharded_load(
         from ..patches.muse_spark.model import load_kwargs as muse_spark_kwargs
 
         load_kwargs = muse_spark_kwargs(model_path, text_only=True)
-    model, config = utils_module.load_model(
-        model_path,
-        lazy=True,
-        strict=False,
-        trust_remote_code=trust_remote_code,
-        **load_kwargs,
-    )
+    # A rank keeps MLX's own packed layers for a stock checkpoint of a ported
+    # family (DEFERRED 29); a plugin checkpoint was refused above, before any
+    # weight was read.
+    with sharded_loading(model_path, "progressive sharded_load"):
+        model, config = utils_module.load_model(
+            model_path,
+            lazy=True,
+            strict=False,
+            trust_remote_code=trust_remote_code,
+            **load_kwargs,
+        )
     _refuse_format_layers(model, operation="progressive loading")
     has_pipeline = hasattr(model, "model") and hasattr(model.model, "pipeline")
     has_native_tensor = callable(getattr(model, "shard", None))
@@ -220,13 +224,14 @@ def progressive_sharded_load(
     else:
         utils_module._download(repo)
 
-    model, _ = utils_module.load_model(
-        model_path,
-        lazy=True,
-        strict=False,
-        trust_remote_code=trust_remote_code,
-        **load_kwargs,
-    )
+    with sharded_loading(model_path, "progressive sharded_load"):
+        model, _ = utils_module.load_model(
+            model_path,
+            lazy=True,
+            strict=False,
+            trust_remote_code=trust_remote_code,
+            **load_kwargs,
+        )
     from ..patches.format_load import check_loaded
 
     _refuse_format_layers(model, operation="progressive loading")

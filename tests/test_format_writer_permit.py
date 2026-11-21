@@ -1,13 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """R2 integration case. Collect under tests/ outside test_formats_oq's fixtures."""
 
+import contextvars
 from collections import Counter
+
+from omlx.formats import testing as format_testing
 
 import mlx.core as mx
 import pytest
 
 from omlx import formats, oq
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+from omlx.patches import format_load
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
 from tests.test_formats_oq import _Codec, _in_format, _quantize, load_model
 from tests.test_formats_oq import source as source
@@ -22,7 +26,7 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
     checkpoint``'s reload admits. The write probes both faces of every
     persisted layer on the first; the reload then probes every layer's dot
     face once on the second, and no tile face."""
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     # oQ accepts the text source and writes the Qwen3.5 MoE model type that
     # the loader checks. Both spellings belong to this fixture.
@@ -30,7 +34,20 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
         oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
     monkeypatch.setattr(
-        oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset(
+                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST
+        | {("qwen3_5_moe_text", "toy"), ("qwen3_5_moe", "toy")},
     )
     write_readers = []
     probes = []
@@ -67,7 +84,7 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
             assert self is not writer and self is not prototype
             if writing:
                 assert write_readers and self is write_readers[-1][0]
-                assert formats._LOADING.get() is None and not formats._TESTING
+                assert formats._LOADING.get() is None and not formats._TESTING.get()
                 inputs = {
                     name: layer[name] for name in (self.codes_name, *self.tensors)
                 }

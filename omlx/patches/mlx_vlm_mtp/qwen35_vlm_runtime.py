@@ -99,7 +99,11 @@ def _patch_vlm_outer_model_load_weights() -> None:
     if getattr(cls, "_omlx_mtp_norm_repair_patched", False):
         return
 
-    original_load_weights = cls.load_weights
+    # Resolve the layer below this wrapper at call time: a hook installed
+    # later (oQh's nn.Module.load_weights swap, another patch) must compose
+    # with this one whatever the order the two were applied in. Capturing
+    # the original here froze the order.
+    own = cls.__dict__.get("load_weights")
 
     def load_weights(self, weights, strict=True):
         from ..mlx_lm_mtp.norm_repair import repair_legacy_head_norms
@@ -109,7 +113,9 @@ def _patch_vlm_outer_model_load_weights() -> None:
             weights, _ = repair_legacy_head_norms(weights)
         except Exception:
             logger.warning("MTP head-norm repair failed", exc_info=True)
-        return original_load_weights(self, weights, strict=strict)
+        if own is not None:
+            return own(self, weights, strict=strict)
+        return nn.Module.load_weights(self, weights, strict=strict)
 
     cls.load_weights = load_weights
     cls._omlx_mtp_norm_repair_patched = True

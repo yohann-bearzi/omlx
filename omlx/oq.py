@@ -24,6 +24,7 @@ import shutil
 import struct as _struct
 import sys
 import tempfile
+import contextvars
 import threading
 import time as _time
 from dataclasses import dataclass
@@ -7202,9 +7203,6 @@ _QUANT_FORMAT_VERIFIED = frozenset(
         ("qwen4_exp", "qwen4_exp_text"),
     }
 )
-# The families tests take as verified (omlx.formats.testing.verified), while
-# one of their blocks is open, in any thread.
-_TEST_VERIFIED: frozenset[str] = frozenset()
 
 # What the audits found a family's own code to read wrongly of a format's
 # layer: a layer's quantized tensors read by hand, taken for MLX's layer or
@@ -7303,7 +7301,9 @@ def _unverified_family(config: dict) -> tuple[str, str] | None:
         len(families) == 1 and isinstance(text_config, dict)
     ):
         return None
-    verified = _TEST_VERIFIED
+    from .formats import testing as format_testing
+
+    verified = {family for family, _ in format_testing.verified_extra()}
     for family in families:
         if family in _QUANT_FORMAT_MISREAD and family not in verified:
             return family, _QUANT_FORMAT_MISREAD[family]
@@ -7451,7 +7451,10 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
         return None
     formats.check_layout(fmt, n, k, layout)
     # What one matrix holds while it is encoded: its input, and its tensors.
-    sizes = [math.prod(shape) * dtype.size for shape, dtype in layout.values()]
+    sizes = [
+        math.prod(shape) * (4 if dtype is None else dtype.size)
+        for shape, dtype in layout.values()
+    ]
     matrix = w.nbytes // count + sum(sizes)
     if matrix > _QUANTIZE_CHUNK_BYTES or max(sizes) * count > _METAL_MAX_BUFFER:
         return None
@@ -7485,11 +7488,34 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
             name: ((*lead, *shape), dtype) for name, (shape, dtype) in layout.items()
         }
         kept = {name: (tuple(t.shape), t.dtype) for name, t in tensors.items()}
-        if kept != want:
+        correct = set(kept) == set(want)
+        for name, (shape, dtype) in want.items():
+            if not correct or name not in kept:
+                correct = False
+                break
+            got_shape, got_dtype = kept[name]
+            if got_shape != shape or (
+                got_dtype != dtype
+                if dtype is not None
+                else not mx.issubdtype(got_dtype, mx.floating)
+            ):
+                correct = False
+                break
+        if not correct:
             raise ValueError(
                 f"quant format {fmt.mode!r} encoded {tensor_name} as {kept}, and "
                 f"lays it out as {want}: the checkpoint would not load"
             )
+        if parts:
+            for name in layout:
+                first_dtype = parts[0][name].dtype
+                got_dtype = tensors[name].dtype
+                if got_dtype != first_dtype:
+                    raise ValueError(
+                        f"quant format {fmt.mode!r} encoded {tensor_name}.{name} "
+                        f"with inconsistent chunk dtypes ({first_dtype} vs "
+                        f"{got_dtype}): the checkpoint would not load"
+                    )
         mx.eval(*tensors.values())
         parts.append(tensors)
         mx.synchronize()
@@ -13623,11 +13649,15 @@ def _on_mlx_thread(load):
         return load()
     from .engine_core import get_mlx_executor
 
+    # The job's context travels with it: a testing.verified block's families
+    # (a contextvar) are visible to a writer's verification load, and to
+    # nothing else on the executor.
+    context = contextvars.copy_context()
     try:
-        future = get_mlx_executor().submit(load)
+        future = get_mlx_executor().submit(context.run, load)
     except RuntimeError:
         # Shut down between the two (the pool's shutdown): the next one.
-        future = get_mlx_executor().submit(load)
+        future = get_mlx_executor().submit(context.run, load)
     return future.result()
 
 

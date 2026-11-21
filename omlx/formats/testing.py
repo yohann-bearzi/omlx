@@ -19,6 +19,7 @@ them it wraps for the length of a block.
 
 from __future__ import annotations
 
+import contextvars
 import inspect
 import threading
 from collections.abc import Mapping
@@ -75,20 +76,27 @@ _SHARED_ROWS = r"""
 _THREADGROUP_BYTES = 32768
 
 
-# The families of the open blocks of verified, in any thread.
-_VERIFYING: list[frozenset[str]] = []
-_VERIFYING_LOCK = threading.Lock()
+# The families the calling context's open blocks take as verified, as
+# (family, None) pairs: a load on another thread has none of them.
+_VERIFIED_EXTRA = contextvars.ContextVar("omlx_verified_extra", default=frozenset())
+
+
+def verified_extra() -> frozenset:
+    """The (family, None) pairs of the open ``testing.verified`` blocks on
+    this thread's context, and only those: a load on another thread has the
+    default, empty set."""
+    return _VERIFIED_EXTRA.get()
 
 
 def verified(*families: str) -> _Verified:
-    """While a block of it is open, in any thread, oQ writes and oMLX loads
-    checkpoints of ``families`` in a quant format as it does those verified
-    with them. Name the top-level and nested text model types. A test can
-    also construct format layers by hand within this block. Loader admission
-    still applies to embedding, reranking and other dedicated readers.
-    The decorator covers the whole test, including async tests. In a
-    fixture, use ``with verified(...): yield``.
-    Blocks of several threads open and close in any order."""
+    """While a block of it is open on this thread's context, oQ writes and
+    oMLX loads checkpoints of ``families`` in a quant format as it does those
+    verified with them. Name the top-level and nested text model types. A
+    test can also construct format layers by hand within this block. Loader
+    admission still applies to embedding, reranking and other dedicated
+    readers. The decorator covers the whole test, including async tests. In
+    a fixture, use ``with verified(...): yield``. Each thread's context has
+    its own blocks: a load on another thread does not see this one's."""
     return _Verified(*families)
 
 
@@ -106,17 +114,39 @@ class _Verified:
         from .. import oq
 
         self._families = frozenset(oq._family(family) for family in families)
+        # This instance's entries in each context, innermost last: the
+        # tokens belong to the context that made them, so one instance may
+        # be entered in several contexts (and re-entered) without sharing
+        # any mutable state.
+        self._entries = contextvars.ContextVar(
+            f"omlx_verified_entries_{id(self)}", default=()
+        )
 
     def __enter__(self):
-        with _VERIFYING_LOCK:
-            _VERIFYING.append(self._families)
-            _publish()
+        extra_var = _VERIFIED_EXTRA
+        testing_var = formats._TESTING
+        prev = self._entries.get()
+        entry = (
+            extra_var,
+            extra_var.set(
+                extra_var.get() | frozenset((f, None) for f in self._families)
+            ),
+            testing_var,
+            testing_var.set(True),
+        )
+        # The token that removes this instance's variable from the context on
+        # exit travels with the entry, so the context keeps no dead key.
+        token = self._entries.set(prev + (entry,))
+        self._entries.set(prev + ((*entry, token),))
         return self
 
     def __exit__(self, *raised):
-        with _VERIFYING_LOCK:
-            _VERIFYING.remove(self._families)
-            _publish()
+        extra_var, extra_token, testing_var, testing_token, token = (
+            self._entries.get()[-1]
+        )
+        testing_var.reset(testing_token)
+        extra_var.reset(extra_token)
+        self._entries.reset(token)
 
     def __call__(self, test):
         if not inspect.isfunction(test) or hasattr(test, "_pytestfixturefunction"):
@@ -144,14 +174,6 @@ class _Verified:
                     return test(*args, **kwargs)
 
         return run
-
-
-def _publish() -> None:
-    """oQ's test-verified families: those of the open blocks."""
-    from .. import oq
-
-    oq._TEST_VERIFIED = frozenset().union(*_VERIFYING)
-    formats._TESTING = bool(_VERIFYING)
 
 
 @contextmanager
@@ -568,10 +590,26 @@ def rows_stack(
             name: (t.shape, t.dtype) if isinstance(t, mx.array) else type(t).__name__
             for name, t in matrix.items()
         }
-        if actual != expected:
+        ok = set(matrix) == set(expected) and all(
+            isinstance(matrix[name], mx.array)
+            and tuple(matrix[name].shape) == shape
+            and (
+                matrix[name].dtype == dtype
+                if dtype is not None
+                else mx.issubdtype(matrix[name].dtype, mx.floating)
+            )
+            for name, (shape, dtype) in expected.items()
+        )
+        if not ok:
             raise AssertionError(
                 f"quant format {fmt.mode}: {side} matrix has {actual}, "
                 f"expected {expected}"
+            )
+    for name in expected:
+        if first[name].dtype != second[name].dtype:
+            raise AssertionError(
+                f"quant format {fmt.mode}: {name!r} has {first[name].dtype} "
+                f"in first and {second[name].dtype} in second"
             )
     stacked = {
         name: mx.concatenate([first[name], second[name]], axis=0) for name in first

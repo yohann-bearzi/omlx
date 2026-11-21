@@ -17,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ... import checkpoint, oqh
-from ...tensors import from_host, unpack
+from ...tensors import from_host
 from ...wire import HostArray
 from . import kernels
 from .attention import Attention, QSACache
@@ -286,17 +286,7 @@ def ple_rows(inputs: dict[str, HostArray], name: str, rows: int) -> mx.array:
         raise RuntimeError(f"No PLE rows for this chunk ({name}ids)")
     data = [from_host(inputs[f"{name}{n}"]) for n in range(3) if f"{name}{n}" in inputs]
     scale = from_host(inputs[name + "ws"])
-    bits, group_size, cast, fp8 = (int(v) for v in inputs[name + "q"][0])
-    values = data[0]
-    if fp8:
-        values = mx.from_fp8(values, dtype=mx.bfloat16)
-    if bits:
-        values = unpack(
-            values, data[1], data[2], {"group_size": group_size, "bits": bits}
-        )
-    if cast:
-        values = values.astype(scale.dtype)
-    return (values * scale).reshape(1, rows, -1)
+    return (data[0] * scale).reshape(1, rows, -1)
 
 
 class PLE:

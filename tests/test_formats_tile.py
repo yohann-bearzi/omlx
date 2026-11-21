@@ -975,7 +975,11 @@ def _no_tile(name):
 # teardown on one (tests/conftest.py, dot_defects).
 @pytest.mark.parametrize("name", _NO_TILE)
 def test_affine_has_no_tile_face_for_what_it_does_not_read(name):
-    assert formats.tile(_no_tile(name), 256, 16) is None
+    layer = _no_tile(name)
+    if name in ("1 bit", "7 bits"):
+        assert layer.weight.shape == (16, 256 * layer.bits // 32)
+        assert layer.weight.dtype == mx.uint32
+    assert formats.tile(layer, 256, 16) is None
 
 
 def test_affine_has_no_tile_face_for_a_k_that_ends_inside_a_group():

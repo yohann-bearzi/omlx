@@ -50,7 +50,7 @@ def test_streaming_writer_refuses_a_reader_that_shares_the_registered_format(
                 return None
             return self.aliased_reader() if stage == "accept" else self
 
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     formats.load()
     registered = Codec()

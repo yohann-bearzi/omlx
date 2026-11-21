@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import inspect
+import contextvars
 import json
 import re
 import sys
@@ -28,6 +29,7 @@ from mlx_lm.models import switch_layers as lm_switch
 from mlx_vlm.models import switch_layers as vlm_switch
 
 from omlx import formats, oq
+from omlx.formats import testing as format_testing
 from omlx.formats import kernels, testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
@@ -509,9 +511,12 @@ def test_a_layout_packed_along_n_is_refused_where_the_layer_is_built(
 
 
 def test_mlx_s_modes_load_as_mlx_s_layers(toy):
-    # Affine is a registered format that lays out no matrix: its layers are
-    # MLX's to build.
-    assert formats.get("affine").layout(64, 16, 4, 32) is None
+    # Affine lays MLX's own layout out; outside a load its layers are MLX's.
+    assert formats.get("affine").layout(64, 16, 4, 32) == {
+        "weight": ((16, 8), mx.uint32),
+        "scales": ((16, 2), None),
+        "biases": ((16, 2), None),
+    }
     dense = nn.Linear(64, 16)
     for arguments, cls in (
         ({}, nn.QuantizedLinear),
@@ -871,17 +876,20 @@ def test_a_format_s_layer_is_built_only_in_a_load_that_passed_the_gate(
 ):
     import contextvars
 
-    # No family verified, and no block open but this file's own.
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset())
-    monkeypatch.setattr(formats, "_TESTING", False)
+    # No family verified, and the test facility off in this context (the
+    # file's own block still stands).
+    token = formats._TESTING.set(False)
     said = (
         "quant format 'toy': a format's layer is built only while oMLX loads a "
         "checkpoint of a family verified with quant formats, and this one is "
         "built outside such a load (by a family's own loader, or by hand): load "
         "the checkpoint with mlx-lm's or mlx-vlm's load_model"
     )
-    with pytest.raises(formats.FormatRefusedError) as no:
-        _hand_built(kind)
+    try:
+        with pytest.raises(formats.FormatRefusedError) as no:
+            _hand_built(kind)
+    finally:
+        formats._TESTING.reset(token)
     assert str(no.value) == said and no.value.path is None
     assert said.replace("'toy'", "'myformat'") in " ".join(_PAGE.split())
     stock, named = tmp_path / "stock", tmp_path / "named"
@@ -891,46 +899,58 @@ def test_a_format_s_layer_is_built_only_in_a_load_that_passed_the_gate(
         (path / "config.json").write_text(json.dumps(config))
     # The load of a checkpoint the gate never passed (it names no format),
     # one block outside a load, or a load the gate refused.
-    with format_load.loading(stock), pytest.raises(formats.FormatRefusedError):
-        _hand_built(kind)
-    with (
-        pytest.raises(formats.FormatRefusedError, match="loads no llama"),
-        format_load.loading(named),
-    ):
-        pass
+    extra_token = format_testing._VERIFIED_EXTRA.set(frozenset())
+    try:
+        with format_load.loading(stock), pytest.raises(
+            formats.FormatRefusedError
+        ):
+            _hand_built(kind)
+        with (
+            pytest.raises(formats.FormatRefusedError, match="loads no llama"),
+            format_load.loading(named),
+        ):
+            pass
+    finally:
+        format_testing._VERIFIED_EXTRA.reset(extra_token)
     # Verified for its block: the load of a checkpoint the gate passed.
     with testing.verified("llama"), format_load.loading(named) as checkpoint:
         assert checkpoint.verified
         # Its own layer, on its thread and on one that copied its context.
-        monkeypatch.setattr(formats, "_TESTING", False)
         assert type(_hand_built(kind)) is kind
         context = contextvars.copy_context()
         assert type(context.run(_hand_built, kind)) is kind
-        with format_load.outside_load(), pytest.raises(formats.FormatRefusedError):
-            _hand_built(kind)
+        token = formats._TESTING.set(False)
+        try:
+            with format_load.outside_load(), pytest.raises(
+                formats.FormatRefusedError
+            ):
+                _hand_built(kind)
+        finally:
+            formats._TESTING.reset(token)
     # Once its load has ended, a thread that copied its context builds none.
-    monkeypatch.setattr(formats, "_TESTING", False)
     with pytest.raises(formats.FormatRefusedError):
         context.run(_hand_built, kind)
-    # In a test's block, by hand; not once the last is closed.
-    with monkeypatch.context() as blocks:
-        blocks.setattr(testing, "_VERIFYING", [])
+    # In a test's block, by hand; not once it closes with the facility off.
+    token = formats._TESTING.set(False)
+    try:
         with testing.verified("qwen3_5"):
             assert type(_hand_built(kind)) is kind
-        assert formats._TESTING is False
+        assert formats._TESTING.get() is False
         with pytest.raises(formats.FormatRefusedError):
             _hand_built(kind)
+    finally:
+        formats._TESTING.reset(token)
 
 
 @pytest.mark.parametrize(
     "mode, written, reason",
     [
-        # The built-in affine format lays out no matrix: a checkpoint that
-        # records a format of affine is not read as MLX's.
+        # A checkpoint that records a format of affine is not read as MLX's.
         (
             "affine",
             {"affine": {"plugin": "shadow 0.1.0", "contract": 1, "record": {}}},
-            "it lays out no (16, 64) matrix of 4 bits in groups of 32",
+            "affine is one of MLX's modes, which a plugin does not write: its "
+            "record says 'shadow 0.1.0'",
         ),
         (
             "affine",
@@ -953,8 +973,8 @@ def test_a_record_of_one_of_mlx_s_modes_is_never_read_as_mlx_s(
     config = _typed(written)
     (tmp_path / "config.json").write_text(json.dumps(config))
     with (
-        format_load.loading(tmp_path),
         pytest.raises(formats.FormatRefusedError) as refusal,
+        format_load.loading(tmp_path),
     ):
         nn.Linear(64, 16).to_quantized(group_size=32, bits=4, mode=mode)
     assert refusal.value.reason == reason
@@ -1112,7 +1132,7 @@ def test_an_entry_binds_one_layer_and_a_layer_one_entry(toy, tmp_path):
 
 
 def test_a_recorded_affine_layer_without_a_mode_still_binds(toy, tmp_path):
-    config = _typed({"affine": {}})
+    config = {"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}}
     config["quantization"] = {"mode": "mxfp4", "proj": {"bits": 4}}
     (tmp_path / "config.json").write_text(json.dumps(config))
     with (
@@ -2838,7 +2858,11 @@ def test_loads_of_one_format_accept_on_copies_of_their_own(toy, tmp_path, monkey
         except BaseException as exc:
             errors.append(exc)
 
-    threads = [threading.Thread(target=build, args=(path,)) for path in paths]
+    base = contextvars.copy_context()
+    threads = [
+        threading.Thread(target=base.copy().run, args=(build, path))
+        for path in paths
+    ]
     for thread in threads:
         thread.start()
     for thread in threads:
@@ -3431,7 +3455,8 @@ def test_a_load_reads_its_own_checkpoint_on_its_own_thread(toy, tmp_path):
             loaded.wait(60)
             seen["late"] = nn.Linear(64, 128).to_quantized(**_TOY).fmt.levels
 
-    worker = threading.Thread(target=other_thread)
+    context = contextvars.copy_context()
+    worker = threading.Thread(target=context.run, args=(other_thread,))
     worker.start()
     assert built.wait(60)
     # A load is active on that thread only.

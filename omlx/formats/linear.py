@@ -38,7 +38,6 @@ import mlx.nn as nn
 from .. import formats
 from ..patches.module_cache import cached_per_module
 from . import Dot, Tile, kernels, tile_dense, tile_wide
-from .affine import AffineFormat
 from .mlx import traversal
 
 logger = logging.getLogger(__name__)
@@ -656,47 +655,63 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
         codes.shape[-2] < 8 or codes.shape[-2] % 8
     ):
         return None
-    stand_in = layer_cls(
-        fmt,
-        bits,
-        group_size,
-        k,
-        tensors,
-        None,
-        placeholders=False,
-        _load_layout=layout,
+    stored = tuple(
+        name for name, (_, dtype) in (layout or {}).items() if dtype is None
     )
-    plan = _plan(stand_in)
-    if plan is None:
-        return None
-    dtypes = tuple(dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype))
-    if not dtypes:
-        return None
-    n = plan.n
-    shapes = ((k,), *(operand.shape for operand in plan.operands))
-    slots = tuple((operand.shape, operand.dtype) for operand in plan.operands)
-
-    def recipe():
-        # One tile of outputs: the rows kernel's first 8, in one threadgroup.
-        return kernels.StandIn(
-            input_shapes=shapes,
-            output_shapes=((8,),),
-            grid=(32, 2, 1),
-            threadgroup=(32, 2, 1),
+    probes = (
+        (
+            {
+                name: mx.zeros(t.shape, dtype) if name in stored else t
+                for name, t in tensors.items()
+            }
+            for dtype in _WARM_DTYPES
         )
-
-    built = kernels.warm(
-        {
-            kernels.planned(
-                plan.kernel,
-                ((shapes[0], dtype), *slots),
-                [dtype],
-                template=[("T", dtype), ("K_SIZE", k), ("N_SIZE", n)],
-            ): recipe
-            for dtype in dtypes
-        }
+        if stored
+        else (tensors,)
     )
-    return built
+    instances = {}
+    for probe in probes:
+        stand_in = layer_cls(
+            fmt,
+            bits,
+            group_size,
+            k,
+            probe,
+            None,
+            placeholders=False,
+            _load_layout=layout,
+        )
+        plan = _plan(stand_in)
+        if plan is None:
+            continue
+        dtypes = tuple(
+            dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype)
+        )
+        if not dtypes:
+            continue
+        n = plan.n
+        shapes = ((k,), *(operand.shape for operand in plan.operands))
+        slots = tuple((operand.shape, operand.dtype) for operand in plan.operands)
+
+        def recipe(shapes=shapes):
+            # One tile of outputs: the rows kernel's first 8, one threadgroup.
+            return kernels.StandIn(
+                input_shapes=shapes,
+                output_shapes=((8,),),
+                grid=(32, 2, 1),
+                threadgroup=(32, 2, 1),
+            )
+
+        for dtype in dtypes:
+            instances[
+                kernels.planned(
+                    plan.kernel,
+                    ((shapes[0], dtype), *slots),
+                    [dtype],
+                    template=[("T", dtype), ("K_SIZE", k), ("N_SIZE", n)],
+                )
+            ] = recipe
+    return kernels.warm(instances) if instances else None
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
@@ -920,7 +935,7 @@ def _log_native_fallback() -> None:
         )
 
 
-def _unloaded(name: str, held, offered) -> str:
+def _unloaded(name: str, held, offered, expected) -> str:
     """A placeholder ``held`` of tensor ``name``, as a refusal names it: with
     the shape and dtype last offered in its place, or as never loaded."""
     if offered is None:
@@ -930,7 +945,7 @@ def _unloaded(name: str, held, offered) -> str:
         return f"{name} (offered {dtype}, not an array)"
     return (
         f"{name} (offered {shape} {dtype}, not the layout's {held.shape} "
-        f"{held.dtype})"
+        f"{expected})"
     )
 
 
@@ -1072,11 +1087,17 @@ class _FormatLayer(nn.Module):
         object.__setattr__(self, "fmt", fmt)
         self.mode, self.bits, self.group_size = mode, bits, group_size
         self.input_dims, self.output_dims = input_dims, n
-        # The format's tensors, and those that still hold a load's
-        # placeholders, each with the shape and dtype last offered in its
-        # place (None: none was). Kept beside the parameters, not among them.
+        # The format's tensors, those a checkpoint stores in a floating dtype
+        # of its own, and those that still hold a load's placeholders, each
+        # with the shape and dtype last offered in its place (None: none
+        # was). Kept beside the parameters, not among them.
         self.__dict__.update(
-            _tensors=names, _placeholders=dict.fromkeys(names if placeholders else ())
+            _tensors=names,
+            _stock=mode in formats._BUILTIN_MODES,
+            _stored_floats=tuple(
+                name for name, (_, dtype) in (layout or {}).items() if dtype is None
+            ),
+            _placeholders=dict.fromkeys(names if placeholders else ()),
         )
         if not self._STACK and _loading_qwen():
             from ..patches.qwen35_verify_qmm import is_row_exact_armed
@@ -1087,6 +1108,21 @@ class _FormatLayer(nn.Module):
         if bias is not None:
             self["bias"] = bias
         self.freeze()
+
+    def _load_dtype(self, name: str, expected):
+        """The dtype ``name`` loads as: ``expected``, or None for a stored
+        float, which any floating dtype may fill."""
+        return None if name in self._stored_floats else expected
+
+    def _matches_load_tensor(self, name: str, tensor, held) -> bool:
+        """Whether ``tensor`` takes the placeholder ``held``: its shape, and
+        its dtype (or any floating one, for a stored float)."""
+        if tensor.shape != held.shape:
+            return False
+        expected = self._load_dtype(name, held.dtype)
+        if expected is None:
+            return mx.issubdtype(tensor.dtype, mx.floating)
+        return tensor.dtype == expected
 
     def __setitem__(self, key: str, value: Any) -> None:
         # Over a tensor of the format the layer holds: an array of its shape
@@ -1105,7 +1141,10 @@ class _FormatLayer(nn.Module):
             checkpoint = formats._LOADING.get()
             loading = checkpoint is not None and checkpoint.active
             array = isinstance(value, mx.array)
-            if not array or value.shape != held.shape or value.dtype != held.dtype:
+            matches = array and self._matches_load_tensor(key, value, held)
+            if not matches or (
+                not loading and value.dtype != held.dtype and keeps_dtype(self, key)
+            ):
                 if loading:
                     unloads = key not in self._placeholders
                     # The dtype's name: a Dtype neither pickles nor copies.
@@ -1147,9 +1186,18 @@ class _FormatLayer(nn.Module):
         pending = tuple(self._placeholders.items())
         if not pending:
             return
-        held = ", ".join(
-            _unloaded(name, self[name], offered) for name, offered in pending
-        )
+        said = []
+        for name, offered in pending:
+            expected = self._load_dtype(name, self[name].dtype)
+            said.append(
+                _unloaded(
+                    name,
+                    self[name],
+                    offered,
+                    "floating dtype" if expected is None else expected,
+                )
+            )
+        held = ", ".join(said)
         raise ValueError(
             f"{self!r} computes on its checkpoint's tensors alone; it still "
             f"holds the load's placeholder of {held}"
@@ -1276,8 +1324,12 @@ def _decoded_size(layer: FormatSwitchLinear, dtype: mx.Dtype) -> int:
 def keeps_dtype(module, key: str) -> bool:
     """Whether ``module``'s array ``key`` keeps its dtype through a recast
     of the model: a format layer's tensors (not its bias) are in the dtypes
-    of the format's layout, which its face reads."""
-    return isinstance(module, _FormatLayer) and key in module._tensors
+    of the format's layout, which its face reads. The built-in affine's
+    stored floats are the exception: the checkpoint fixes their dtype, and
+    the face is exact for float16 activations once they are float16."""
+    if not isinstance(module, _FormatLayer) or key not in module._tensors:
+        return False
+    return not (module.mode in formats._BUILTIN_MODES and key in module._stored_floats)
 
 
 def _exact_rows(plan, x):
@@ -1329,6 +1381,27 @@ class FormatLinear(_FormatLayer):
     _qwen_row_exact = None
     _fast = None
 
+    def _stock_matmul(self, x):
+        """MLX's own affine matmul over the layer's tensors, for a stock
+        checkpoint's matrix: the route a stock layer ran before the switch.
+        None for a plugin's format, whose tensors MLX cannot run."""
+        if not self._stock or self._STACK:
+            return None
+        weight = self[packed_name(self)]
+        if weight.ndim != 2:
+            return None
+        # The caller adds the bias, as it does for every route here.
+        return mx.quantized_matmul(
+            x,
+            weight,
+            self["scales"],
+            self["biases"],
+            transpose=True,
+            bits=self.bits,
+            group_size=self.group_size,
+            mode=self.mode,
+        )
+
     def _ordinary(self, kept, x, signature):
         plan = kept.plan
         architecture = _metal_architecture()
@@ -1337,7 +1410,7 @@ class FormatLinear(_FormatLayer):
         rows = x.size // plan.k
         geometry = (plan.n, plan.k, self.group_size, architecture)
         folded = traversal(rows, *geometry, bits=self.bits)
-        if folded[0] in ("fallback", "quad"):
+        if folded[0] not in ("rows", "wide"):
             return None
         if (
             signature[0][:-1] == (2, 1)
@@ -1362,13 +1435,19 @@ class FormatLinear(_FormatLayer):
                     return y
         single = x.ndim < 3 or rows == x.shape[-2]
         route_sig = signature if single else ("batched", *signature)
+        batched = None
+        if not single:
+            # MLX folds the leading axes if the input is row-contiguous or it
+            # must copy each matrix. A gap between intact matrices keeps M per
+            # matrix instead. The same trace can receive either physical
+            # layout. A per-matrix route with no face returns the composed
+            # path for the whole call, so the folded launch would be wasted.
+            batched = traversal(x.shape[-2], *geometry, bits=self.bits, batched=True)
+            if batched[0] not in ("rows", "wide"):
+                return None
         result = self._project_route(kept, x, route_sig, folded)
         if result is None or single:
             return result
-        # MLX folds the leading axes if the input is row-contiguous or it
-        # must copy each matrix. A gap between intact matrices keeps M per
-        # matrix instead. The same trace can receive either physical layout.
-        batched = traversal(x.shape[-2], *geometry, bits=self.bits, batched=True)
         if batched == folded:
             return result
         separate = self._project_route(kept, x, route_sig, batched)
@@ -1500,10 +1579,45 @@ class FormatLinear(_FormatLayer):
             rows = x.size // k if k else 0
             if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
-            elif rows > MAX_ROWS:
+            # No row materializes a matrix, stock or plugin.
+            if y is None and rows == 0:
+                y = mx.zeros((*shape[:-1], self.output_dims), dtype=dtype)
+            exact = row_exact is not None and row_exact()
+            if y is None and rows > 0 and self._stock and (rows <= MAX_ROWS or exact):
+                # A short call whose matrix has no plan (qmv_quad's K 64 or
+                # 128, too few scales for a face) keeps MLX's own matmul, as
+                # it ran before the switch; an armed verification step takes
+                # it a row at a time (at any row count, as row_exact_qmv
+                # does), never the dense tile or decoded fallback. Unarmed
+                # calls above MAX_ROWS go to the format's dense route below.
+                if exact and rows > 1:
+                    flat = x.reshape(rows, k)
+                    first = self._stock_matmul(flat[:1])
+                    if first is not None:
+                        parts = [
+                            first,
+                            *(
+                                self._stock_matmul(flat[r : r + 1])
+                                for r in range(1, rows)
+                            ),
+                        ]
+                        y = mx.concatenate(parts, axis=0).reshape(
+                            *shape[:-1], self.output_dims
+                        )
+                else:
+                    y = self._stock_matmul(x)
+            if y is None and rows > MAX_ROWS and not exact:
                 y = self._prefill(kept, x, rows)
             if y is None:
-                y = x @ self._decoded().astype(dtype).T
+                decoded = self._decoded().astype(dtype).T
+                if exact and rows > 1:
+                    flat = x.reshape(rows, k)
+                    y = mx.concatenate(
+                        [flat[r : r + 1] @ decoded for r in range(rows)],
+                        axis=0,
+                    ).reshape(*shape[:-1], self.output_dims)
+                else:
+                    y = x @ decoded
         return y if bias is None else y + bias
 
 
@@ -1530,19 +1644,6 @@ class FormatEmbedding(_FormatLayer):
         placeholders=False,
         layout=None,
     ) -> None:
-        n = tensors[fmt.codes_name].shape[-2]
-        # The built-in affine's rows are independent by construction (its
-        # layout is MLX's, which the format does not declare yet, L1). Any
-        # other format promises it through the rows rule, or is refused.
-        if type(fmt) is not AffineFormat and not formats.stackable(
-            fmt, input_dims, n, bits, group_size
-        ):
-            raise ValueError(
-                f"quant format {fmt.mode!r} cannot hold a token embedding: its "
-                f"rows are not independent, so a lookup could not decode the "
-                f"rows it names (a layout with N first promises it, "
-                f"formats.stackable)"
-            )
         super()._init_tensors(
             fmt,
             bits,
@@ -1553,6 +1654,19 @@ class FormatEmbedding(_FormatLayer):
             placeholders=placeholders,
             layout=layout,
         )
+        # A lookup decodes just the rows it names, which a format may only
+        # promise through the rows rule (its layout with N first). Checked
+        # after the tensor validation above, so a missing or 1-D codes
+        # tensor is the ValueError it is for every format layer.
+        if not formats.stackable(
+            fmt, input_dims, self.output_dims, bits, group_size
+        ):
+            raise ValueError(
+                f"quant format {fmt.mode!r} cannot hold a token embedding: its "
+                f"rows are not independent, so a lookup could not decode the "
+                f"rows it names (a layout with N first promises it, "
+                f"formats.stackable)"
+            )
         # A dense view over the same reader and arrays, built at the first
         # as_linear and dropped by every write to the layer (the setters drop
         # the kept view), as a FormatLinear's plan is.
@@ -1581,7 +1695,8 @@ class FormatEmbedding(_FormatLayer):
     def as_linear(self, x: mx.array) -> mx.array:
         self.refuse_placeholders()
         view = self.__dict__.get(_KEPT)
-        if view is None:
+        codes = self._tensors[0]
+        if view is None or view.get(codes) is not self[codes]:
             view = copy(self._linear_prototype)
             for name in self._tensors:
                 view[name] = self[name]

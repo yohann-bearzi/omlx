@@ -4041,12 +4041,24 @@ class ShardedEmbedding(nn.Module):
                 if getattr(shard, "_placeholders", None):
                     return None
                 entry = bound.get(index)
-                if entry is None or entry[0] is not shard.weight:
+                if (
+                    entry is None
+                    or entry[0] is not shard.weight
+                    or entry[1] is not shard.scales
+                    or entry[2] is not shard.biases
+                ):
+                    # A recast replaces scales/biases in place: key on all
+                    # three so an fp16 recast never reuses bf16 views.
                     entry = bound[index] = (
                         shard.weight,
-                        *(_bound_rows(a) for a in (shard.weight, shard.scales, shard.biases)),
+                        shard.scales,
+                        shard.biases,
+                        *(
+                            _bound_rows(a)
+                            for a in (shard.weight, shard.scales, shard.biases)
+                        ),
                     )
-                views.append(entry[1:])
+                views.append(entry[3:])
             offsets = offset_arrays.get((start, stop))
             if offsets is None:
                 offsets = offset_arrays[start, stop] = mx.array(

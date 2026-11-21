@@ -261,7 +261,7 @@ def test_failed_dense_tile_decodes_and_preserves_the_row_exact_route(
     k, n = 256, 64
     fmt = toy(_tile_toy("bad_dense", _TILE.replace("RUN = 8;", "RUN = 16;")))
     weights = {key: a[0] for key, a in _stack(n, k).items()}
-    config = {"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}}
+    config = {"model_type": "qwen4_exp", "omlx_quant_formats": {"tiletoy": {}}}
     (tmp_path / "config.json").write_text(json.dumps(config))
     with loading(tmp_path):
         layer = FormatLinear("tiletoy", 8, 1, k, weights)

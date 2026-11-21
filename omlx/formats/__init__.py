@@ -31,6 +31,7 @@ import math
 import numbers
 import struct
 import sys
+import contextvars
 import threading
 import types
 import weakref
@@ -513,11 +514,13 @@ class QuantFormat:
 
     def layout(
         self, k: int, n: int, bits: int, group_size: int
-    ) -> dict[str, tuple[tuple[int, ...], mx.Dtype]] | None:
+    ) -> dict[str, tuple[tuple[int, ...], mx.Dtype | None]] | None:
         """How a checkpoint keeps one ``(n, k)`` matrix: the shape and dtype
         of its codes (``codes_name``) and of each of the format's tensors, by
-        name. None when the format keeps no such matrix, or when its layers
-        are MLX's to build (affine)."""
+        name. A tensor's dtype may be None: a floating tensor whose dtype the
+        checkpoint fixes, which the load accepts as any floating dtype (the
+        built-in affine's scales and biases, in the source's). None for the
+        whole layout when the format keeps no such matrix."""
         return None
 
     def encode(
@@ -782,9 +785,14 @@ def _may_build(mode) -> None:
     loader, a family's own, a script by hand), a family whose code may read
     the format's layers wrongly never holds one."""
     checkpoint = _LOADING.get()
-    if checkpoint is not None and checkpoint.active and checkpoint.verified:
+    if (
+        checkpoint is not None
+        and checkpoint.active
+        and checkpoint.verified
+        and mode in checkpoint.verified_modes
+    ):
         return
-    if _TESTING and checkpoint is None:
+    if _TESTING.get() and checkpoint is None:
         return
     raise FormatRefusedError(
         "a format's layer is built only while oMLX loads a checkpoint of a "
@@ -799,9 +807,10 @@ def _may_build(mode) -> None:
 # omlx.patches.format_load around the libraries' loads, read by the layers.
 # A copied context can keep an ended checkpoint. Only an active one owns layers.
 _LOADING: ContextVar = ContextVar("omlx_formats_loading", default=None)
-# Whether a block of omlx.formats.testing.verified is open, in any thread: a
-# test builds a format's layers by hand in it.
-_TESTING = False
+# Whether a block of omlx.formats.testing.verified is open on this thread's
+# context: a test builds a format's layers by hand in it. Context-local, so a
+# load on another thread does not inherit it.
+_TESTING = contextvars.ContextVar("omlx_formats_testing", default=False)
 # The plugin that registered each mode: its distribution's name and version.
 _ORIGINS: dict[str, str] = {}
 # Each mode of an installed plugin that did not load: what is said of it.

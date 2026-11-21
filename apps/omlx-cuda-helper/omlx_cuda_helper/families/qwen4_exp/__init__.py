@@ -11,7 +11,7 @@ from typing import Any
 
 from ... import checkpoint
 
-CONTRACT = 1
+CONTRACT = 2
 # The embedding and the PLE layer stay on the first stage: only that stage
 # takes the host-fed PLE rows and keeps the token history.
 FIRST_STAGE_MIN = 2

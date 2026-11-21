@@ -65,6 +65,7 @@ from ..formats.linear import (
     warm_dot,
 )
 from ..model_discovery import VERIFICATION, unverified_reason
+from ..oqh import format as oqh_format
 
 logger = logging.getLogger(__name__)
 
@@ -188,6 +189,11 @@ class _Checkpoint:
         # Whether the family gate passed it for a format: only then may its
         # load build a format's layer (formats._may_build).
         self.verified = False
+        # The format modes this verified load may build (formats._may_build).
+        self.verified_modes: frozenset[str] = frozenset()
+        # Disabled when model_config or get_model_classes replaces a ported
+        # stock family with an unported or custom model.
+        self._allow_stock_switch = True
         # A view of links to a checkpoint's files (a family's loader's, a
         # decision model's) is named by the checkpoint its config is.
         self._config = config
@@ -340,17 +346,25 @@ class _Checkpoint:
         supplied = _Checkpoint(self.path, config=effective)
         supplied.refuse_unverified()
         supplied_mode = supplied._marked_mode()
-        mode = recorded or supplied_mode
-        if mode is None:
+        if recorded is None and supplied_mode is None:
+            if not ported_family(effective) or oqh_format.is_oqh_config(effective):
+                self._allow_stock_switch = False
+                self.verified = False
+                self.verified_modes = frozenset()
             return
-        _refuse_family(supplied, mode)
+        _refuse_family(supplied)
+        formats.load()
         if recorded is None:
             # A format introduced by the caller also has to belong to the
             # on-disk family. Its record must reach accept and the outer check.
-            _refuse_family(self, mode)
+            for wanted in _checkpoint_modes(effective, None, supplied_mode):
+                _refuse_family(self, wanted)
             self._config = effective
             self._declaration = supplied._declaration
+            self.verified = supplied.verified
+            self.verified_modes = supplied.verified_modes
             return
+        mode = _checkpoint_modes(effective, None, recorded)[0]
 
         # The loader may spell a layer under its runtime path as well. Keep the
         # disk config for accept and for counting the original entries once.
@@ -941,43 +955,108 @@ def _format_mode(config) -> str | None:
     return _format_declaration(config)[0]
 
 
-# The families whose stock checkpoints the switch loads as format layers
-# (the built-in format's own layout, read by oMLX's layers). It gains a
-# family with the commit that verifies it end to end.
+# Stock-switch allowlist: the model families whose stock affine checkpoints
+# (and built-in affine format records) load through format layers instead
+# of MLX's own quantized layers. Checked once at load before any layer is
+# built; fail-closed on format-marked checkpoints of unlisted families.
 PORTED: frozenset[str] = frozenset({"qwen4_exp"})
+
+# Plugin-format allowlist: the (model family, format mode) pairs verified
+# end to end to load through plugin format layers. A checkpoint outside
+# this allowlist is refused at load before any layer is built.
+PLUGIN_ALLOWLIST: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("qwen4_exp", "oqel"),
+    }
+)
+
+
+def _family_name(value) -> str | None:
+    return (
+        value.strip().lower().replace("-", "_")
+        if isinstance(value, str) and value.strip()
+        else None
+    )
+
+
+def _config_family(config: dict) -> tuple[str | None, str | None]:
+    """Return normalized ``(top, inner)`` model types from ``config``."""
+    top = _family_name(config.get("model_type"))
+    text = config.get("text_config")
+    inner = _family_name(text.get("model_type")) if isinstance(text, dict) else None
+    return top, inner
+
+
+def _has_model_file(config: dict) -> bool:
+    text = config.get("text_config")
+    return any(
+        isinstance(holder, dict) and holder.get("model_file") is not None
+        for holder in (config, text)
+    )
 
 
 def ported_family(config) -> bool:
     """Whether a checkpoint's config names a family the stock switch has
     ported: its ``model_type`` or its text model's, lower case and with "-"
-    read as "_" (the spellings oQ and the gate normalise alike)."""
-    if not isinstance(config, dict):
+    read as "_" (the spellings oQ and the gate normalise alike), with no
+    custom ``model_file`` and no mismatched ``text_config.model_type``."""
+    if not isinstance(config, dict) or _has_model_file(config):
         return False
-    text = config.get("text_config")
-    names = [config.get("model_type")]
-    if isinstance(text, dict):
-        names.append(text.get("model_type"))
-    for name in names:
-        if isinstance(name, str) and name.strip().lower().replace("-", "_") in PORTED:
-            return True
-    return False
+    top, inner = _config_family(config)
+    if top is not None:
+        # A wrapper's model type is the family's, with its text model's its
+        # own spelling (or absent); another text model is another family.
+        return top in PORTED and (
+            inner is None or inner in PORTED or inner == f"{top}_text"
+        )
+    return inner in PORTED
 
 
 def _ported(checkpoint: _Checkpoint) -> bool:
     """Whether the checkpoint's family is one the stock switch has ported."""
+    if not checkpoint._allow_stock_switch:
+        return False
     try:
         config = checkpoint._read_config()
     except (OSError, ValueError):
         return False
+    if not isinstance(config, dict):
+        return False
+    if oqh_format.is_oqh_config(config):
+        # The oQh loader swaps its own modules over MLX's quantized layers.
+        return False
     return ported_family(config)
 
 
+def _checkpoint_modes(
+    config: dict, mode: str | None, declared: str | None
+) -> tuple[str, ...]:
+    """Every format mode declared by ``config`` or requested by ``mode``,
+    non-built-in modes first so a plugin mode beside a built-in record is
+    checked and reported first."""
+    found: set[str] = set()
+    recorded = config.get("omlx_quant_formats")
+    if isinstance(recorded, dict):
+        found.update(k for k in recorded if isinstance(k, str) and k.strip())
+    for path, name in _format_markers(config):
+        if path != ("omlx_quant_formats",) and isinstance(name, str) and name.strip():
+            found.add(name)
+    if mode is not None:
+        found.add(mode)
+    if not found and declared is not None:
+        found.add(declared)
+    return tuple(sorted(found, key=lambda name: (name in formats._BUILTIN_MODES, name)))
+
+
 def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
-    """Refuse a checkpoint of a quant format (one it records, or names in its
-    quantization config, or ``mode``, a format's layer being built for it)
-    whose family is not verified: whoever wrote it (a plugin's own writer, a
-    config edited by hand), the family's own code would read the format's
-    layers wrongly. A load asks before the library reads a weight."""
+    """Two fail-closed positive allowlists, checked once at load before any
+    weight is read or layer is built:
+    - Stock switch (`PORTED`): families whose stock affine checkpoints (and
+      built-in affine layers) load through format layers.
+    - Plugin formats (`PLUGIN_ALLOWLIST` + `oq._unverified_family`): verified
+      `(family, mode)` pairs allowed through plugin format layers.
+    Specific refusals (sharded, untyped, model_file, MLX-mode plugin claim,
+    damaged or blank record, missing plugin) precede the allowlist refusal."""
     try:
         config = checkpoint._read_config()
     except (OSError, ValueError):
@@ -987,42 +1066,168 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     declared = checkpoint._marked_mode()
     if not isinstance(config, dict):
         return
-    if mode is None:
-        mode = declared
-    if mode is None:
-        return
+    is_oqh = oqh_format.is_oqh_config(config)
     sharded = getattr(_SHARDED, "entry", None)
+    stock_allowed = (
+        checkpoint._allow_stock_switch
+        and sharded is None
+        and not is_oqh
+        and ported_family(config)
+    )
+    if mode is None and declared is None:
+        # Stock checkpoint (no format record and no non-MLX mode): never
+        # refused here; only a stock-switch-allowlisted family opens built-in
+        # affine layer construction.
+        if stock_allowed:
+            checkpoint.verified = True
+            checkpoint.verified_modes = frozenset({"affine"})
+        return
+    formats.load()
+    modes = _checkpoint_modes(config, mode, declared)
+    primary = modes[0]
     if sharded is not None:
         # A distributed rank shards MLX's layers (DEFERRED 29) even when the
         # checkpoint's family is ported and its config records the built-in.
         raise _refused(
             f"the {sharded[1]} loader cannot read a quant format checkpoint",
-            mode,
+            primary,
             checkpoint,
         )
-    if mode in formats._BUILTIN_MODES and _ported(checkpoint):
-        # The switch's own list: a ported family's checked load builds the
-        # built-in format's layers, with no plugin's record to verify. The
-        # plugin roster is what a plugin's checkpoint asks of its family.
-        checkpoint.verified = True
-        return
     from .. import oq
 
-    # Its config alone names its family, wherever the load found it.
-    refused = oq._unverified_family(config)
-    if refused is not None:
-        family, why = refused
-        fix = (
-            "name its model type in its config"
-            if family == "untyped"
-            else "have the family verified"
-        )
+    top, inner = _config_family(config)
+    if top is None and inner is None:
         raise _refused(
-            f"oMLX loads no {family} checkpoint in a quant format: {why}; {fix}",
-            mode,
+            "oMLX loads no untyped checkpoint in a quant format: "
+            "its config names no model type; name its model type in its config",
+            primary,
             checkpoint,
         )
+    if _has_model_file(config):
+        refused = oq._unverified_family(config)
+        name, why = (
+            refused
+            if refused is not None
+            else (
+                top or inner,
+                "its model_file selects a custom model implementation",
+            )
+        )
+        raise _refused(
+            f"oMLX loads no {name} checkpoint in a quant format: {why}; "
+            "have the family verified",
+            primary,
+            checkpoint,
+        )
+    check_families = (
+        (
+            (top,)
+            if inner is None or inner in (top, f"{top}_text")
+            else (top, inner)
+        )
+        if top is not None
+        else (inner,)
+    )
+    for wanted in modes:
+        if wanted in formats._BUILTIN_MODES:
+            # Gate 1 (stock switch): validate built-in record specifics before
+            # checking the stock switch's positive family allowlist.
+            written = checkpoint._written(wanted)[0]
+            if isinstance(written, dict) and written.get("plugin") is not None:
+                raise _refused(
+                    f"{wanted} is one of MLX's modes, which a plugin does not "
+                    f"write: its record says {written['plugin']!r}",
+                    wanted,
+                    checkpoint,
+                )
+            if written is not _ABSENT:
+                checkpoint._record(wanted)
+            if is_oqh:
+                raise _refused(
+                    "oQh checkpoints cannot declare built-in quant format records",
+                    wanted,
+                    checkpoint,
+                )
+            if stock_allowed:
+                continue
+            refused = oq._unverified_family(config)
+            if refused is not None:
+                name, why = refused
+                fix = (
+                    "name its model type in its config"
+                    if name == "untyped"
+                    else "have the family verified"
+                )
+                raise _refused(
+                    f"oMLX loads no {name} checkpoint in a quant format: "
+                    f"{why}; {fix}",
+                    wanted,
+                    checkpoint,
+                )
+            missing = next(
+                (family for family in check_families if family not in PORTED),
+                check_families[0],
+            )
+            raise _refused(
+                f"the family {missing!r} is not in oMLX's stock "
+                "switch allowlist: only ported families load built-in "
+                f"{wanted!r} through format layers",
+                wanted,
+                checkpoint,
+            )
+        # Gate 2 (plugin formats): check oQ's verified-family gate and
+        # PLUGIN_ALLOWLIST, surfacing damaged/layout/missing-plugin refusals
+        # before the allowlist refusal.
+        from ..formats import testing as format_testing
+
+        extra = format_testing.verified_extra()
+        unverified = oq._unverified_family(config)
+        missing = next(
+            (
+                family
+                for family in check_families
+                if (family, wanted) not in PLUGIN_ALLOWLIST
+                and (family, None) not in extra
+            ),
+            None,
+        )
+        if missing is not None or unverified is not None:
+            if unverified is not None:
+                name, why = unverified
+                fix = (
+                    "name its model type in its config"
+                    if name == "untyped"
+                    else "have the family verified"
+                )
+                raise _refused(
+                    f"oMLX loads no {name} checkpoint in a quant format: "
+                    f"{why}; {fix}",
+                    wanted,
+                    checkpoint,
+                )
+            if wanted == "unknown":
+                if _damaged(config):
+                    checkpoint._record("unknown")
+                checkpoint._check_layout(config, "unknown")
+            if checkpoint.records(wanted):
+                checkpoint._record(wanted)
+            if formats.get(wanted) is None:
+                raise _refused(
+                    _not_installed(wanted, checkpoint), wanted, checkpoint
+                )
+            family = missing if missing is not None else check_families[0]
+            raise _refused(
+                f"the family {family!r} with format {wanted!r} is not "
+                "in oMLX's plugin format allowlist: only families and "
+                "formats verified end to end load through format layers",
+                wanted,
+                checkpoint,
+            )
+    admitted = frozenset(modes) | (
+        frozenset({"affine"}) if stock_allowed else frozenset()
+    )
     checkpoint.verified = True
+    checkpoint.verified_modes = checkpoint.verified_modes | admitted
 
 
 def _quantizations(config: dict) -> list[dict]:
@@ -1277,14 +1482,15 @@ def _recorded(mode) -> bool:
     return checkpoint is not None and checkpoint.records(mode)
 
 
-def _not_installed(mode) -> str:
+def _not_installed(mode, checkpoint=None) -> str:
     """Why no format of ``mode`` reads a checkpoint's layers: its plugin
     did not load, or is not installed (the one the checkpoint being loaded
     records, when it records one)."""
     skipped = formats._SKIPPED.get(mode)
     if skipped is not None:
         return skipped
-    checkpoint = _current()
+    if checkpoint is None:
+        checkpoint = _current()
     written = checkpoint.writer(mode) if checkpoint is not None else None
     if written in (None, "an unknown writer", "a format registered by hand"):
         written = "the plugin the checkpoint was written with"
@@ -1346,17 +1552,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
         )
         if kept_record:
             # A record of a built-in mode is read where it was written, or
-            # refused as damaged: the switch's list does not hide it. No
-            # plugin writes one of MLX's modes, so a record that names a
-            # plugin is not this format's.
-            written = checkpoint._written(mode)[0]
-            if isinstance(written, dict) and written.get("plugin") is not None:
-                raise _refused(
-                    f"{mode} is one of MLX's modes, which a plugin does not "
-                    f"write: its record says {written['plugin']!r}",
-                    mode,
-                    checkpoint,
-                )
+            # refused as damaged: the switch's list does not hide it.
             checkpoint._record(mode)
         # A built-in format builds its layers only in the families the stock
         # switch has ported (a plugin's own record always builds its); every
@@ -1676,6 +1872,9 @@ def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> Non
                             mode,
                             checkpoint,
                         )
+                    checkpoint._allow_stock_switch = False
+                    checkpoint.verified = False
+                    checkpoint.verified_modes = frozenset()
             loaded = own(*args, **kwargs)
         if checkpoint is not outer:
             # A load joined to an outer one of the checkpoint is checked by

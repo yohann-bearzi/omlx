@@ -32,6 +32,14 @@ IN_QUANT_FORMAT = (
 )
 
 
+def in_ported_family(config) -> bool:
+    """Whether the stock switch loads this family's matrices as format layers:
+    its experts then stay resident too (DEFERRED row 14)."""
+    from .format_load import ported_family
+
+    return ported_family(config)
+
+
 def in_quant_format(config) -> bool:
     """Whether a checkpoint's config records or names a quant format (its
     text model's too), or keeps a damaged record of them: a model with any
@@ -47,7 +55,7 @@ def moe_offload_compatibility(model_path):
         path = Path(model_path).expanduser().resolve()
         config = path / "config.json"
         raw = json.loads(config.read_text())
-        if in_quant_format(raw):
+        if in_quant_format(raw) or in_ported_family(raw):
             return False, IN_QUANT_FORMAT
         if raw.get("model_type") not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."

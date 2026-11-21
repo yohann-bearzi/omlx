@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from omlx import formats
-from omlx.formats import dot, kernels, testing, tile
+from omlx.formats import dot, kernels, linear, testing, tile
 from omlx.formats.affine import AffineFormat
 from omlx.formats.linear import FormatLinear
 from omlx.patches.format_load import loading
@@ -24,13 +24,20 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 
 @pytest.fixture
-def build_layer(tmp_path):
+def build_layer(tmp_path, monkeypatch):
+    from omlx.patches import format_load
+
     def build(fmt, bits, group, k, tensors, family="qwen4_exp"):
         mode = fmt if isinstance(fmt, str) else fmt.mode
         config = {"model_type": family, "omlx_quant_formats": {mode: {}}}
         (tmp_path / "config.json").write_text(json.dumps(config))
-        with testing.verified(family), loading(tmp_path):
-            return FormatLinear(fmt, bits, group, k, tensors)
+        with monkeypatch.context() as patch:
+            if mode == "affine":
+                patch.setattr(
+                    format_load, "PORTED", format_load.PORTED | {family}
+                )
+            with testing.verified(family), loading(tmp_path):
+                return FormatLinear(fmt, bits, group, k, tensors)
 
     return build
 
@@ -129,6 +136,25 @@ def _equivalent_layer(mode, build_layer, n, k, family="qwen4_exp", *, dtype=mx.f
     return layer, packed, keys[1]
 
 
+class _StockLayoutPlugin(AffineFormat):
+    """The affine layout and faces under a mode of the plugin's own: the stock
+    switch does not claim it, so its dense route runs the format's tile."""
+
+    mode = "stock_layout_control"
+
+
+def _affine_plugin(build, n, k, bits, dtype):
+    keys = mx.random.split(mx.random.key(161 + n + bits))
+    w = mx.random.normal((n, k), key=keys[0]).astype(dtype)
+    packed = mx.quantize(w, group_size=64, bits=bits)
+    layer = build(
+        _StockLayoutPlugin(),
+        bits,
+        64,
+        k,
+        dict(zip(("weight", "scales", "biases"), packed)),
+    )
+    return layer, packed, keys[1]
 @pytest.mark.parametrize("mode", ["stock", "plugin"])
 def test_ordinary_and_row_exact_calls_keep_separate_arithmetic(mode, build_layer):
     k, n, rows = 2560, 160, 5
@@ -647,7 +673,9 @@ def test_native_graph_adds_the_loaded_bias(build_layer):
     np.testing.assert_array_equal(y.view(mx.uint16), expected.view(mx.uint16))
 
 
-def test_nested_qwen_text_config_selects_ordinary_traversal(tmp_path):
+def test_nested_qwen_text_config_selects_ordinary_traversal(tmp_path, monkeypatch):
+    from omlx.patches import format_load
+
     config = {
         "model_type": "wrapper",
         "text_config": {"model_type": "qwen4_exp"},
@@ -656,6 +684,7 @@ def test_nested_qwen_text_config_selects_ordinary_traversal(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps(config))
     w = mx.zeros((16, 2560), mx.float16)
     arrays = dict(zip(("weight", "scales", "biases"), mx.quantize(w, bits=4)))
+    monkeypatch.setattr(format_load, "PORTED", format_load.PORTED | {"wrapper"})
     with testing.verified("wrapper", "qwen4_exp"), loading(tmp_path):
         layer = FormatLinear("affine", 4, 64, 2560, arrays)
     assert layer._qwen_row_exact is not None
@@ -788,3 +817,276 @@ def test_decode_pair_first_binds_inside_a_compiled_layer_call(build_layer):
     want = _stock(x, (packed[0], packed[1], replacement), 8)
     for call in (step, layer):
         np.testing.assert_array_equal(call(x).view(mx.uint16), want.view(mx.uint16))
+
+
+def test_planless_stock_affine_row_exact_matches_serial_decode(
+    build_layer, monkeypatch
+):
+    # K 128 at 8 bits is MLX's qmv_quad: the affine format has no dot face,
+    # so the layer has no plan. An armed verification step still keeps MLX's
+    # own matmul, a row at a time (as row_exact_qmv does), never the decoded
+    # matrix.
+    for dtype in (mx.bfloat16, mx.float16):
+        w = mx.random.normal((256, 128), key=mx.random.key(211)).astype(dtype)
+        packed = mx.quantize(w, group_size=128, bits=8)
+        names = ("weight", "scales", "biases")
+        layer = build_layer("affine", 8, 128, 128, dict(zip(names, packed)))
+        assert linear._plan(layer) is None
+        object.__setattr__(layer, "_qwen_row_exact", lambda: True)
+
+        def trap(self, *_args, **_kwargs):
+            raise AssertionError("a row-exact stock layer decoded its matrix")
+
+        monkeypatch.setattr(FormatLinear, "_decoded", trap)
+        for shape in ((128,), (4, 128), (1, 3, 128)):
+            x = mx.random.normal(shape, key=mx.random.key(7)).astype(dtype)
+            rows = x.reshape(-1, 128)
+            want = mx.concatenate(
+                [
+                    mx.quantized_matmul(
+                        rows[r : r + 1],
+                        *packed,
+                        transpose=True,
+                        bits=8,
+                        group_size=128,
+                    )
+                    for r in range(rows.shape[0])
+                ],
+                axis=0,
+            ).reshape(*shape[:-1], 256)
+            y = layer(x)
+            assert y.shape == (*shape[:-1], 256)
+            assert mx.array_equal(y, want).item()
+def test_plugin_qmm_returns_before_allocating_routes(build_layer):
+    # 513 rows at N 512 / K 2560 traverse one part (qmm), a route no plugin
+    # face serves: the call returns before it keeps a routes slot.
+    layer, _, _ = _affine_plugin(build_layer, 512, 2560, 4, mx.float16)
+    got = layer(mx.zeros((513, 2560), mx.float16))
+    mx.eval(got)
+    assert vars(layer)[linear._KEPT].routes == {}
+def test_plugin_rows_traversal_keeps_the_rows_route(build_layer, monkeypatch):
+    # On a g13/g14 GPU two rows traverse the rows route; a plugin layer must
+    # keep it (the shared-rows launch whose rows have their one-row bits).
+    from omlx.formats import linear as linear_mod
+
+    layer, _, _ = _affine_plugin(build_layer, 64, 2560, 4, mx.float16)
+    monkeypatch.setattr(linear_mod, "_metal_architecture", lambda: "applegpu_g13s")
+    x = mx.random.normal((2, 2560)).astype(mx.float16)
+    serial = mx.concatenate([layer(x[i : i + 1]) for i in range(2)])
+    got = layer(x)
+    mx.eval(got, serial)
+    np.testing.assert_array_equal(
+        np.asarray(got.view(mx.uint16)), np.asarray(serial.view(mx.uint16))
+    )
+    plan = vars(layer)[linear._KEPT].plan
+    assert any(
+        isinstance(key, tuple) and key and key[0] == "ordinary_rows"
+        for key in plan.proof.graphs
+    )
+
+
+def test_planless_stock_affine_row_exact_empty_input_avoids_decode(
+    build_layer, monkeypatch
+):
+    w = mx.random.normal((256, 128), key=mx.random.key(311)).astype(mx.float16)
+    packed = mx.quantize(w, group_size=128, bits=8)
+    names = ("weight", "scales", "biases")
+    layer = build_layer("affine", 8, 128, 128, dict(zip(names, packed)))
+    object.__setattr__(layer, "_qwen_row_exact", lambda: True)
+
+    def trap(self, *_args, **_kwargs):
+        raise AssertionError("an empty row-exact stock call decoded its matrix")
+
+    monkeypatch.setattr(FormatLinear, "_decoded", trap)
+    y = layer(mx.zeros((0, 128), mx.float16))
+    assert y.shape == (0, 256) and y.dtype == mx.float16
+
+
+def test_plugin_format_linear_empty_input_avoids_decode(build_layer, monkeypatch):
+    layer, _, _ = _affine_plugin(build_layer, 256, 128, 4, mx.float16)
+    monkeypatch.setattr(
+        FormatLinear,
+        "_decoded",
+        lambda self, *a, **k: pytest.fail("an empty plugin call decoded"),
+    )
+    y = layer(mx.zeros((0, 128), mx.float16))
+    assert y.shape == (0, 256) and y.dtype == mx.float16
+
+
+def test_planless_stock_affine_row_exact_above_max_rows_matches_serial_decode(
+    build_layer, monkeypatch
+):
+    # Armed verification on a plan-less qmv_quad stock layer must stay
+    # row-exact even above MAX_ROWS (16), never taking _prefill or _decoded,
+    # and without building a discarded full-batch _stock_matmul first.
+    monkeypatch.setattr(
+        FormatLinear,
+        "_decoded",
+        lambda self, *a, **k: pytest.fail("row-exact stock call decoded"),
+    )
+    monkeypatch.setattr(
+        FormatLinear,
+        "_prefill",
+        lambda self, *a, **k: pytest.fail("row-exact stock call took _prefill"),
+    )
+    calls = []
+    orig_stock = FormatLinear._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return orig_stock(self, x)
+
+    monkeypatch.setattr(FormatLinear, "_stock_matmul", counted)
+    for dtype in (mx.bfloat16, mx.float16):
+        w = mx.random.normal((256, 128), key=mx.random.key(223)).astype(dtype)
+        packed = mx.quantize(w, group_size=128, bits=8)
+        names = ("weight", "scales", "biases")
+        layer = build_layer("affine", 8, 128, 128, dict(zip(names, packed)))
+        assert linear._plan(layer) is None
+        object.__setattr__(layer, "_qwen_row_exact", lambda: True)
+
+        for rows_count in (4, 17):
+            calls.clear()
+            x = mx.random.normal((rows_count, 128), key=mx.random.key(19)).astype(dtype)
+            want = mx.concatenate(
+                [
+                    mx.quantized_matmul(
+                        x[r : r + 1],
+                        *packed,
+                        transpose=True,
+                        bits=8,
+                        group_size=128,
+                    )
+                    for r in range(rows_count)
+                ],
+                axis=0,
+            )
+            y = layer(x)
+            assert y.shape == (rows_count, 256)
+            assert mx.array_equal(y, want).item()
+            assert len(calls) == rows_count
+
+
+def test_planless_stock_affine_short_batch_uses_stock_matmul_up_to_max_rows(
+    build_layer, monkeypatch
+):
+    # Unarmed calls up to MAX_ROWS (16) on a plan-less stock layer keep MLX's
+    # quantized_matmul instead of falling through to _decoded.
+    w = mx.random.normal((256, 128), key=mx.random.key(227)).astype(mx.bfloat16)
+    packed = mx.quantize(w, group_size=128, bits=8)
+    names = ("weight", "scales", "biases")
+    layer = build_layer("affine", 8, 128, 128, dict(zip(names, packed)))
+    assert linear._plan(layer) is None
+    object.__setattr__(layer, "_qwen_row_exact", None)
+
+    monkeypatch.setattr(
+        FormatLinear,
+        "_decoded",
+        lambda self, *a, **k: pytest.fail("short plan-less stock call decoded"),
+    )
+    monkeypatch.setattr(
+        FormatLinear,
+        "_prefill",
+        lambda self, *a, **k: pytest.fail("short plan-less stock call took _prefill"),
+    )
+    for rows_count in (12, linear.MAX_ROWS):
+        x = mx.random.normal((rows_count, 128), key=mx.random.key(23)).astype(
+            mx.bfloat16
+        )
+        want = mx.quantized_matmul(
+            x, *packed, transpose=True, bits=8, group_size=128
+        )
+        y = layer(x)
+        assert y.shape == (rows_count, 256)
+        assert mx.array_equal(y.view(mx.uint16), want.view(mx.uint16)).item()
+
+
+def test_planless_plugin_skips_stock_matmul_under_row_exact(build_layer, monkeypatch):
+    # A plugin format with no dot face never calls _stock_matmul, even under
+    # armed verification; and rows == MAX_ROWS stays on the non-prefill path.
+    layer, _, _ = _affine_plugin(build_layer, 128, 64, 4, mx.bfloat16)
+    assert linear._plan(layer) is None
+    object.__setattr__(layer, "_qwen_row_exact", lambda: True)
+    calls = []
+    orig_stock = FormatLinear._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return orig_stock(self, x)
+
+    monkeypatch.setattr(FormatLinear, "_stock_matmul", counted)
+    monkeypatch.setattr(
+        FormatLinear,
+        "_prefill",
+        lambda self, *a, **k: pytest.fail("rows == MAX_ROWS took _prefill"),
+    )
+    for rows_count in (8, linear.MAX_ROWS):
+        y = layer(mx.zeros((rows_count, 64), mx.bfloat16))
+        mx.eval(y)
+        assert y.shape == (rows_count, 128)
+    assert calls == []
+
+
+def test_planless_stock_affine_unarmed_above_max_rows_skips_stock_matmul(
+    build_layer, monkeypatch
+):
+    # Unarmed calls above MAX_ROWS on plan-less stock affine take _prefill /
+    # _decoded, not _stock_matmul (kills mutating rows <= MAX_ROWS to True).
+    w = mx.random.normal((256, 128), key=mx.random.key(229)).astype(mx.bfloat16)
+    packed = mx.quantize(w, group_size=128, bits=8)
+    names = ("weight", "scales", "biases")
+    layer = build_layer("affine", 8, 128, 128, dict(zip(names, packed)))
+    assert linear._plan(layer) is None
+    object.__setattr__(layer, "_qwen_row_exact", None)
+
+    monkeypatch.setattr(
+        FormatLinear,
+        "_stock_matmul",
+        lambda self, *a, **k: pytest.fail("unarmed rows > MAX_ROWS took _stock_matmul"),
+    )
+    x = mx.random.normal((linear.MAX_ROWS + 1, 128), key=mx.random.key(29)).astype(
+        mx.bfloat16
+    )
+    y = layer(x)
+    mx.eval(y)
+    assert y.shape == (linear.MAX_ROWS + 1, 256)
+
+
+def test_planless_plugin_row_exact_above_max_rows_skips_prefill_and_matches_serial(
+    build_layer, monkeypatch
+):
+    class _PlanlessPlugin(_StockLayoutPlugin):
+        mode = "planless_control"
+
+        def dot(self, layer, k, n):
+            return None
+
+    k, n, rows = 512, 128, linear.MAX_ROWS + 1
+    keys = mx.random.split(mx.random.key(707), 2)
+    w_half = mx.random.normal((n, k // 2), key=keys[0]).astype(mx.bfloat16)
+    w = mx.concatenate([w_half, w_half], axis=1)
+    packed = mx.quantize(w, group_size=64, bits=4)
+    layer = build_layer(
+        _PlanlessPlugin(),
+        4,
+        64,
+        k,
+        dict(zip(("weight", "scales", "biases"), packed)),
+    )
+    object.__setattr__(layer, "_qwen_row_exact", lambda: True)
+    monkeypatch.setattr(
+        FormatLinear,
+        "_prefill",
+        lambda *arguments, **keywords: pytest.fail(
+            "a row-exact plugin call took the dense prefill"
+        ),
+    )
+    half = mx.random.normal((rows, k // 2), key=keys[1]).astype(mx.bfloat16)
+    x = mx.concatenate([half, -half], axis=1)
+    y = layer(x)
+    serial = mx.concatenate([layer(x[r : r + 1]) for r in range(rows)], axis=0)
+    batched = x @ layer._decoded().astype(mx.bfloat16).T
+    assert not mx.array_equal(
+        batched.view(mx.uint16), serial.view(mx.uint16)
+    ).item(), "fixture must distinguish batched matmul from 1-row serial matmul"
+    assert mx.array_equal(y.view(mx.uint16), serial.view(mx.uint16)).item()

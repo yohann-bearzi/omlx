@@ -2,12 +2,14 @@
 """A write permits exactly its probe layer, outside a verified model load."""
 
 from concurrent.futures import ThreadPoolExecutor
+import contextvars
 from contextvars import copy_context
 
 import mlx.core as mx
 import pytest
 
 from omlx import formats, oq
+from omlx.formats import testing as format_testing
 from omlx.formats import linear
 from tests.test_formats_oq import _Codec, _quantize
 from tests.test_formats_oq import source as source
@@ -20,13 +22,20 @@ def _refused(cls, args, **kwargs):
 
 def _observe_write(source, tmp_path, monkeypatch, inspect, codec=_Codec):
     """Observe the first actual writer constructor with its exact arguments."""
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     monkeypatch.setattr(
         oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
     monkeypatch.setattr(
-        oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset(
+                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
+            ),
+        ),
     )
     formats.load()
     writer = codec()
@@ -178,13 +187,20 @@ def test_writer_revokes_an_unused_permit_when_construction_raises(
 def test_writer_rejects_a_bad_face_from_the_persisted_reader(
     source, tmp_path, monkeypatch, kind, defect
 ):
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     monkeypatch.setattr(
         oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
     monkeypatch.setattr(
-        oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset(
+                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
+            ),
+        ),
     )
 
     slots = {
@@ -242,7 +258,7 @@ def test_writer_rejects_a_bad_face_from_the_persisted_reader(
 
 @pytest.mark.parametrize("native", [False, True], ids=["family", "native"])
 def test_writer_refuses_before_issuing_a_probe_permit(tmp_path, monkeypatch, native):
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     src = tmp_path / "checkpoint"
     src.mkdir()
@@ -253,7 +269,14 @@ def test_writer_refuses_before_issuing_a_probe_permit(tmp_path, monkeypatch, nat
         (src / "joint_head_config.json").write_text("{}")
     families = {"qwen3_5"} if native else set()
     monkeypatch.setattr(oq, "_QUANT_FORMAT_VERIFIED", frozenset(families))
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset(families))
+    monkeypatch.setattr(
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset((family, None) for family in families),
+        ),
+    )
 
     def premature(*args, **kwargs):
         pytest.fail("issued a construction permit before oQ admitted the checkpoint")

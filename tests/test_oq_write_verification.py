@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """A format write must verify the bytes it will publish."""
 
+import contextvars
 import json
 from pathlib import Path
 
@@ -9,6 +10,8 @@ import numpy as np
 import pytest
 
 from omlx import oq
+from omlx.formats import testing as format_testing
+from omlx.patches import format_load
 from tests.test_formats_oq import _SETTINGS, _calibration
 from tests.test_formats_oq import llama_source as llama_source
 from tests.test_formats_oq import toy as toy
@@ -34,7 +37,12 @@ def test_writer_keeps_a_broken_reload_unverified(
 ):
     output = tmp_path / "result"
     staging = output.with_suffix(".unverified")
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(format_testing, "_VERIFIED_EXTRA", contextvars.ContextVar("omlx_verified_extra", default=frozenset((("llama", None),))))
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST | {("llama", "toy")},
+    )
     _calibration(monkeypatch)
     save = mx.save_safetensors
     damaged = []
@@ -77,6 +85,7 @@ def test_writer_keeps_a_broken_reload_unverified(
     assert damaged, "the saved checkpoint must contain the injected corruption"
     assert not output.exists(), "the writer published a damaged checkpoint"
     assert error is not None
+    assert "allowlist" not in str(error)
     record = json.loads((staging / "config.json").read_text())["omlx_verification"]
     assert record["verified"] is False
     assert record["mode"] == "toy"
@@ -91,7 +100,12 @@ def test_writer_runs_the_saved_model_before_marking_it_verified(
 
     output = tmp_path / "result"
     staging = output.with_suffix(".unverified")
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(format_testing, "_VERIFIED_EXTRA", contextvars.ContextVar("omlx_verified_extra", default=frozenset((("llama", None),))))
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST | {("llama", "toy")},
+    )
     _calibration(monkeypatch)
     forward = FormatLinear.__call__
     observed = []
@@ -194,7 +208,12 @@ def test_writer_forwards_trust_remote_code(llama_source, toy, tmp_path, monkeypa
     from omlx import oq_verify
 
     output = tmp_path / "trust"
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(format_testing, "_VERIFIED_EXTRA", contextvars.ContextVar("omlx_verified_extra", default=frozenset((("llama", None),))))
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST | {("llama", "toy")},
+    )
     _calibration(monkeypatch)
     seen = {}
 
@@ -881,7 +900,12 @@ def test_writer_verification_streams_layer_by_layer(
     from omlx.formats.linear import FormatLinear
 
     output = tmp_path / "streamed"
-    monkeypatch.setattr(oq, "_TEST_VERIFIED", frozenset({"llama"}))
+    monkeypatch.setattr(format_testing, "_VERIFIED_EXTRA", contextvars.ContextVar("omlx_verified_extra", default=frozenset((("llama", None),))))
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST | {("llama", "toy")},
+    )
     _calibration(monkeypatch)
     streamed = []
     original = oq_verify.layer_by_layer
@@ -974,3 +998,41 @@ def test_vlm_verification_injects_declared_optiq_sidecar(tmp_path, monkeypatch):
     monkeypatch.setattr(oq, "check_loaded", lambda model: None)
     oq_verify.verify_written_format_checkpoint(output)
     assert seen["model"].vision_tower.w.tolist() == [1.0, 1.0]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_writer_verification_inside_verified_carries_its_context_to_the_executor(
+    llama_source, toy, tmp_path, monkeypatch
+):
+    from omlx.formats import testing
+
+    _calibration(monkeypatch)
+    output = tmp_path / "result"
+    with testing.verified("llama"):
+        oq.quantize_oq_streaming(
+            str(llama_source),
+            str(output),
+            4,
+            enhanced=True,
+            quant_format=toy.mode,
+            **_SETTINGS,
+        )
+    assert (output / "config.json").is_file()
+    from omlx.engine_core import get_mlx_executor
+    from omlx.formats import FormatRefusedError
+
+    leaked = get_mlx_executor().submit(
+        lambda: format_testing.verified_extra()
+    ).result(timeout=30)
+    assert leaked == frozenset()
+    refused = tmp_path / "refused"
+    with pytest.raises(FormatRefusedError):
+        oq.quantize_oq_streaming(
+            str(llama_source),
+            str(refused),
+            4,
+            enhanced=True,
+            quant_format=toy.mode,
+            **_SETTINGS,
+        )
+    assert not (refused / "config.json").exists()

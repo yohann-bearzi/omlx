@@ -249,12 +249,11 @@ def test_ineligible_model_is_logged_once(monkeypatch, caplog):
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_fused_path_takes_precedence_over_exact_hybrid_projection(monkeypatch):
-    # Fused dispatch takes precedence over the compiled hybrid decode path.
+def test_fused_path_takes_precedence_over_compiled_forward(monkeypatch):
+    # Fused dispatch takes precedence over the compiled single-token path.
     from mlx_vlm.models.qwen4_exp import hc_fused
 
     module = _module(4)
-    module._omlx_exact_hybrid_projection = True
     module._compiled_forward = lambda h: pytest.fail(
         "compiled single-token path must not run"
     )
@@ -1562,3 +1561,16 @@ def test_hc_fused_refuses_unfilled_format_linear_placeholder():
     assert hc_fused._quantized_ok(placeholder, mx.bfloat16) is False
     with pytest.raises(ValueError, match="placeholder"):
         module(mx.zeros((1, 1, WIDTH), mx.bfloat16))
+
+
+def test_hc_fused_declines_quantized_linear_subclass():
+    from mlx_vlm.models.qwen4_exp import hc_fused
+
+    module = _module(4)
+
+    class Sub(nn.QuantizedLinear):
+        pass
+
+    projection = module.input_mix_weight_down
+    projection.__class__ = Sub
+    assert hc_fused._quantized_ok(projection, mx.bfloat16) is False

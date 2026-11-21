@@ -803,6 +803,7 @@ def test_loading_exit_waits_before_deactivating_in_flight_warm_dot(tmp_path, cap
     def load_side():
         with format_load.loading(tmp_path) as checkpoint:
             checkpoint.verified = True
+            checkpoint.verified_modes = frozenset({fmt.mode})
             seen_checkpoint.append(checkpoint)
             context = contextvars.copy_context()
             worker = threading.Thread(
@@ -1278,3 +1279,29 @@ def test_warm_dot_skips_format_embedding(monkeypatch):
     )
     with testing.verified("llama"):
         assert warm_dot(FormatEmbedding, fmt, 8, 1, 320, tensors, layout) is None
+
+
+def test_warm_dot_warms_stored_float_affine_placeholders(monkeypatch):
+    from omlx.formats.affine import AffineFormat
+
+    fmt = AffineFormat()
+    layout = fmt.layout(256, 32, 4, 64)
+    tensors = {
+        name: mx.zeros(shape, mx.uint32 if dtype is mx.uint32 else mx.float32)
+        for name, (shape, dtype) in layout.items()
+    }
+    captured = {}
+    monkeypatch.setattr(
+        "omlx.formats.linear.kernels.warm",
+        lambda instances: captured.setdefault("instances", instances),
+    )
+    with testing.verified("qwen4_exp"):
+        result = warm_dot(FormatLinear, fmt, 4, 64, 256, tensors, layout)
+    assert result is not None and len(captured["instances"]) == 2
+    warmed_dtypes = {key.outputs[0] for key in captured["instances"]}
+    assert warmed_dtypes == {mx.bfloat16, mx.float16}
+    for key in captured["instances"]:
+        act_dtype = key.outputs[0]
+        assert key.inputs[0][0] == act_dtype
+        assert key.inputs[2][0] == act_dtype
+        assert key.inputs[3][0] == act_dtype

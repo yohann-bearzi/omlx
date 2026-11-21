@@ -1737,8 +1737,10 @@ def test_gdn_affine_stacking_waits_for_its_load_layout():
     from omlx import formats
 
     affine = formats.get("affine")
-    assert affine.layout(2560, C, 8, 64) is None
-    assert not formats.stackable(affine, 2560, C, 8, 64)
+    # The stock switch's built-in affine declares MLX's layout (N first), so
+    # the GDN prework may stack it: its rows are independent by layout.
+    assert affine.layout(2560, C, 8, 64) is not None
+    assert formats.stackable(affine, 2560, C, 8, 64)
 
 
 @pytest.mark.parametrize("bits", [4, 8])
@@ -2104,3 +2106,50 @@ def test_gdn_declines_stack_when_input_projections_have_mixed_tensor_dtypes(
         },
     )
     assert prework_mod._stacked_format_inputs(module) is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [1, 3])
+def test_gdn_stock_affine_plan_matches_serial_calls(monkeypatch, rows):
+    from omlx import formats
+    from omlx.formats import testing
+    from omlx.formats.linear import FormatLinear
+
+    formats.load()
+
+    def projection(k, n, width, group, compute):
+        mx.random.seed(5 + width)
+        w = (mx.random.normal((n, k)) * 0.05).astype(compute)
+        packed = mx.quantize(w, group_size=64, bits=8)
+        names = ("weight", "scales", "biases")
+        return FormatLinear("affine", 8, 64, k, dict(zip(names, packed)))
+
+    monkeypatch.setattr(sys.modules[__name__], "_random_projection", projection)
+    with testing.verified("qwen4_exp"):
+        module = _real_qwen4_decode_module(((8, 64),) * 4, 21, mx.bfloat16)
+        module.out_proj = projection(HV * DV, 2560, 8, 64, mx.bfloat16)
+        plan = (
+            prework_mod._qwen4_decode_plan(module)
+            if rows == 1
+            else prework_mod._qwen4_verify_plan(module)
+        )
+        assert plan is not None
+        run = plan[-2] if rows == 1 else plan[0]
+        parts = (
+            module.in_proj_qkv,
+            module.in_proj_z,
+            module.in_proj_b,
+            module.in_proj_a,
+        )
+        x = mx.random.randint(-8, 9, (1, rows, 2560)).astype(mx.bfloat16)
+        expected = mx.concatenate(
+            [
+                mx.concatenate(
+                    [linear(x[:, i : i + 1]) for linear in parts], axis=-1
+                )
+                for i in range(rows)
+            ],
+            axis=1,
+        )
+        actual = run(x)
+        assert mx.array_equal(_bits(actual), _bits(expected)).item()

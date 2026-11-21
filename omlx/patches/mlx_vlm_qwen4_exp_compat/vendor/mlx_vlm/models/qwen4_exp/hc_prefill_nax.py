@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import mlx.core as mx
 
-from .hc_projection import _HEADER as _QDOT_HEADER
+from .hc_fused import _HEADER as _QDOT_HEADER
 
 _KERNELS: dict[str, object] = {}
 
@@ -323,7 +323,7 @@ inline T hcn_sigmoid(T x) {
 }
 """
 
-# hc_projection's hc_load_vector reading from threadgroup memory (same
+# hc_fused's hc_load_vector reading from threadgroup memory (same
 # arithmetic on the same bf16 values).
 _TG_LOAD = r"""
 template <typename T, int N, int bits>

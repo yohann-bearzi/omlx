@@ -86,6 +86,13 @@ def _checkpoint(path, kind="qwen4_exp", per_expert=False):
 def test_supported_layouts_use_headers_only(tmp_path, monkeypatch, kind, per_expert):
     _checkpoint(tmp_path, kind, per_expert)
     monkeypatch.setattr(mx, "load", lambda *a, **kw: pytest.fail("Loaded tensor data"))
+    if kind == "qwen4_exp":
+        # The stock switch loads its experts as format layers: they stay
+        # resident (DEFERRED row 14).
+        from omlx.patches.moe_offload_compat import IN_QUANT_FORMAT
+
+        assert moe_offload_compatibility(tmp_path) == (False, IN_QUANT_FORMAT)
+        return
     assert moe_offload_compatibility(tmp_path) == (True, "")
 
 
@@ -234,7 +241,7 @@ def test_dense_gemma_is_hidden(tmp_path):
 
 
 def test_checkpoint_replacement_invalidates_eligibility(tmp_path):
-    tensors = _checkpoint(tmp_path)
+    tensors = _checkpoint(tmp_path, "olmoe")
     assert moe_offload_compatibility(tmp_path)[0] is True
     tensors.pop(next(iter(tensors)))
     mx.save_safetensors(str(tmp_path / "model.safetensors"), tensors)

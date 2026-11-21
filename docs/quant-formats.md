@@ -1115,9 +1115,9 @@ loads a tiny checkpoint of any family (Llama's too), to test a format with, take
 verified for the test with `omlx.formats.testing.verified(*model_types)` (include the
 top-level backbone type and its nested text model type). Tests that build layers by hand
 use the same block. Dedicated decision and embedding readers still refuse format
-checkpoints. During verification, while one of its blocks is open, in any thread, oQ
-writes and oMLX loads the family as a verified one. Blocks of several threads open and
-close in any order. It decorates a test, async too, and a fixture opens a block of it (a
+checkpoints. During verification, while one of its blocks is open on the calling
+context, oQ writes and oMLX loads the family as a verified one; another thread does
+not see the block unless it copies the context (as oQ's executor hand-off does). It decorates a test, async too, and a fixture opens a block of it (a
 bare `@verified` is refused):
 
 ```python

@@ -69,7 +69,7 @@ def test_affine_embedding_matches_mlx_lookup_and_tied_projection(dtype, bits):
 
 
 @pytest.mark.parametrize("rows", [1, 8])
-def test_k64_affine_tied_projection_keeps_the_dense_quad_parity_exception(rows):
+def test_k64_stock_affine_tied_projection_keeps_mlx_s_quad_bits(rows, monkeypatch):
     mx.random.seed(300)
     source = nn.Embedding(128, 64)
     source.set_dtype(mx.bfloat16)
@@ -79,11 +79,18 @@ def test_k64_affine_tied_projection_keeps_the_dense_quad_parity_exception(rows):
         embedding = linear.FormatEmbedding("affine", 4, 32, 64, tensors)
         dense = linear.FormatLinear("affine", 4, 32, 64, tensors)
 
+    monkeypatch.setattr(
+        linear.FormatLinear,
+        "_decoded",
+        lambda self, *a, **k: pytest.fail("stock affine qmv_quad decoded its matrix"),
+    )
     x = mx.random.normal((rows, 64)).astype(mx.bfloat16)
     tied = embedding.as_linear(x)
+    # A stock layer keeps MLX's own matmul at qmv_quad shapes (U36), so the
+    # workaround's parity exception is not reachable for one; a plugin's
+    # layer still takes its dense face. Revisit with GLM C6b's quad face.
+    assert _same_bits(tied, stock.as_linear(x))
     assert _same_bits(tied, dense(x))
-    # Revisit this witness when GLM C6b adds the qmv_quad face.
-    assert not _same_bits(tied, stock.as_linear(x))
 
 
 @pytest.mark.parametrize("shape", [(), (1,), (2, 2), (2, 0)])
@@ -124,6 +131,20 @@ def test_a_format_whose_rows_are_not_independent_is_refused(declared):
         with pytest.raises(ValueError, match="rows are not independent"):
             linear.FormatEmbedding(reader, 4, 8, 8, tensors)
     assert reader.reads == []
+
+
+def test_builtin_affine_embedding_refuses_non_stackable_geometry():
+    tensors = {
+        "weight": mx.zeros((8, 4), mx.uint32),
+        "scales": mx.ones((8, 1), mx.bfloat16),
+        "biases": mx.zeros((8, 1), mx.bfloat16),
+    }
+    assert not formats.stackable(formats.get("affine"), 32, 8, 4, 64)
+    with (
+        testing.verified("llama"),
+        pytest.raises(ValueError, match="rows are not independent"),
+    ):
+        linear.FormatEmbedding("affine", 4, 64, 32, tensors)
 
 
 def test_builtin_affine_decodes_only_selected_token_rows(monkeypatch):
@@ -289,3 +310,62 @@ def test_embedding_invalid_tensors_raise_value_error():
                     "biases": mx.zeros((4, 1), mx.bfloat16),
                 },
             )
+
+
+def test_docs_describe_stock_qmv_quad_parity():
+    from pathlib import Path
+
+    page = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
+    assert "exhibits the difference" not in page
+    assert "can differ from MLX's quantized embedding projection" not in page
+    assert "stock affine layers keep MLX's own `quantized_matmul`" in page
+
+
+def test_non_stackable_embedding_load_raises_format_refused_error(
+    tmp_path, monkeypatch
+):
+    import json
+
+    from omlx.patches import format_load
+
+    class CenteredReader(RowReader):
+        mode = "centered_embed_test"
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "codes": ((n, k), mx.float32),
+                "offset": ((1, 1), mx.float32),
+            }
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "omlx_quant_formats": {"centered_embed_test": {}},
+            }
+        )
+    )
+    formats.load()
+    monkeypatch.setattr(formats, "_FORMATS", dict(formats._FORMATS))
+    formats.register(CenteredReader())
+    format_load.apply_format_load_patch()
+    with (
+        testing.verified("llama"),
+        format_load.loading(tmp_path),
+        pytest.raises(formats.FormatRefusedError) as refused,
+    ):
+        nn.Embedding(64, 8).to_quantized(
+            group_size=8, bits=4, mode="centered_embed_test"
+        )
+    assert refused.value.mode == "centered_embed_test"
+
+
+def test_as_linear_with_bias_adds_embedding_bias():
+    reader = RowReader()
+    tensors = _packed()
+    bias = mx.arange(9, dtype=mx.float32) * 0.5
+    with testing.verified("llama"):
+        layer = linear.FormatEmbedding(reader, 4, 8, 8, tensors, bias=bias)
+    x = mx.ones((2, 8), mx.float32)
+    want = x @ (tensors["codes"] + tensors["offset"]).T + bias
+    assert _same_bits(layer.as_linear(x), want)

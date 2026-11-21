@@ -549,6 +549,34 @@ def test_qwen_vlm_outer_load_weights_remaps_root_mtp(monkeypatch):
     assert model.received_strict is False
 
 
+def test_qwen_vlm_outer_load_weights_composes_with_later_module_hook(monkeypatch):
+    import mlx.nn as nn
+    from mlx_vlm.models import qwen3_5 as q35_outer
+
+    from omlx.patches.mlx_vlm_mtp import qwen35_vlm_runtime
+
+    class InheritingModel(nn.Module):
+        pass
+
+    monkeypatch.setattr(q35_outer, "Model", InheritingModel)
+    qwen35_vlm_runtime._patch_vlm_outer_model_load_weights()
+
+    seen = []
+
+    def later_module_hook(self, weights, strict=True):
+        seen.append((self, weights, strict))
+        return "hooked"
+
+    monkeypatch.setattr(nn.Module, "load_weights", later_module_hook)
+    model = InheritingModel()
+    model.language_model = SimpleNamespace(mtp=object())
+    assert model.load_weights([("mtp.fc.weight", object())], strict=True) == "hooked"
+    assert len(seen) == 1
+    assert seen[0][0] is model
+    assert seen[0][1][0][0] == "language_model.mtp.fc.weight"
+    assert seen[0][2] is True
+
+
 def test_dense_vlm_runtime_return_hidden_uses_language_model_output_contract():
     """Dense Qwen3.5 VLM MTP verify must satisfy mlx-vlm's output contract."""
     from mlx_vlm.models.base import LanguageModelOutput

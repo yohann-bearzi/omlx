@@ -43,15 +43,9 @@ def _live():
     return hc_fused
 
 
-def _projection():
-    from mlx_vlm.models.qwen4_exp import hc_projection
-
-    return hc_projection
-
-
 # Each source the oracle runs, by the live module and name it is kept under.
 _SOURCES = {
-    "HEADER": ("projection", "_HEADER"),
+    "HEADER": ("fused", "_HEADER"),
     "TG_HEADER": ("fused", "_TG_HEADER"),
     "N_SOURCE": ("fused", "_N_SOURCE"),
     "NP_SOURCE": ("fused", "_NP_SOURCE"),
@@ -64,7 +58,7 @@ _SOURCES = {
 @pytest.mark.parametrize("name", sorted(_SOURCES))
 def test_oracle_sources_are_the_live_ones(name):
     module, live = _SOURCES[name]
-    source = getattr(_live() if module == "fused" else _projection(), live)
+    source = getattr(_live(), live)
     assert getattr(oracle, name) == source
 
 

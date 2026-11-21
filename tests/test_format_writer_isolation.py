@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """The probe's permit and tensors stay private to an admitted oQ write."""
 
+import contextvars
 from contextvars import copy_context
 from copy import copy, deepcopy
 
@@ -8,7 +9,9 @@ import mlx.core as mx
 import pytest
 
 from omlx import formats, oq
+from omlx.formats import testing as format_testing
 from omlx.formats import linear
+from omlx.patches import format_load
 from tests.test_format_writer_permit_guards import _observe_write, _refused
 from tests.test_formats_oq import _Codec, _in_format, _quantize
 from tests.test_formats_oq import source as source
@@ -47,13 +50,26 @@ def test_copies_of_a_write_permit_expire_together(
 def test_face_tensor_writes_preserve_dense_and_switch_checkpoint_bytes(
     monkeypatch, source, tmp_path
 ):
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     monkeypatch.setattr(
         oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
     monkeypatch.setattr(
-        oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset(
+                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST
+        | {("qwen3_5_moe_text", "toy"), ("qwen3_5_moe", "toy")},
     )
     changed = set()
     mutate = False
@@ -111,13 +127,26 @@ def test_probe_reads_joined_stack_after_the_writer_releases_its_source(
 ):
     from weakref import ref
 
-    assert not formats._TESTING and not oq._TEST_VERIFIED
+    assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     monkeypatch.setattr(
         oq, "_QUANT_FORMAT_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
     monkeypatch.setattr(
-        oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
+        format_testing,
+        "_VERIFIED_EXTRA",
+        contextvars.ContextVar(
+            "omlx_verified_extra",
+            default=frozenset(
+                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        format_load,
+        "PLUGIN_ALLOWLIST",
+        format_load.PLUGIN_ALLOWLIST
+        | {("qwen3_5_moe_text", "toy"), ("qwen3_5_moe", "toy")},
     )
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1 << 16)
     joined_source = None

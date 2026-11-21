@@ -1553,7 +1553,9 @@ def test_qwen38_flash_next_routing_and_eviction(tmp_path, length, batch):
     (tmp_path / "config.json").write_text(
         json.dumps(
             {
-                "model_type": "qwen4_exp",
+                # The runtime under test is not U36's switch: a ported stock
+                # family keeps every expert resident (DEFERRED row 14).
+                "model_type": "olmoe",
                 "text_config": vars(config),
             }
         )
@@ -1673,6 +1675,9 @@ def test_staging_matches_bytes_transport(tmp_path, monkeypatch, buffers):
     """Staged and bytes reads give the same output and cache state, mixed or not."""
     glu = _make_glu(seed=34)
     _save_checkpoint(tmp_path, _glu_tensors(glu, "layers.0.experts.switch_glu"))
+    # The staging transport is below U36's policy: a ported stock family keeps
+    # every expert resident, so relax the policy here to exercise it.
+    monkeypatch.setattr(offload_module, "in_ported_family", lambda config: False)
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
     mx.random.seed(37)
     calls = [

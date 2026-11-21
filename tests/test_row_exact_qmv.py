@@ -249,7 +249,9 @@ def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps)
 def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
     weight, scales, biases = _quantized(k, n, 8, 64, mx.bfloat16, 1)
     assert (
-        row_exact_qmv.one_row_qmv(weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps)
+        row_exact_qmv.one_row_qmv(
+            weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps
+        )
         is None
     )
 
@@ -315,8 +317,13 @@ def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
     expected = mx.concatenate(
         [
             mx.quantized_matmul(
-                x[:, r : r + 1], weight, scales, biases, transpose=True,
-                group_size=group_size, bits=bits,
+                x[:, r : r + 1],
+                weight,
+                scales,
+                biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
             )
             for r in range(rows)
         ],
@@ -326,7 +333,13 @@ def test_rows_qmv_every_geometry_equals_one_row_quantized_matmul(
     for rps in (1, 2, 4):
         for per_group in (d for d in (1, 2, 3, 4) if rows % d == 0):
             launch = row_exact_qmv.rows_qmv(
-                weight, scales, biases, bits, group_size, "affine", dtype,
+                weight,
+                scales,
+                biases,
+                bits,
+                group_size,
+                "affine",
+                dtype,
                 lambda _, g=(rps, per_group): g,
             )
             observed = launch(x)
@@ -359,8 +372,13 @@ def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
     expected = mx.concatenate(
         [
             mx.quantized_matmul(
-                x[:, r : r + 1], weight, scales, biases, transpose=True,
-                group_size=group_size, bits=bits,
+                x[:, r : r + 1],
+                weight,
+                scales,
+                biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
             )
             for r in range(rows)
         ],
@@ -375,8 +393,15 @@ def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
     ]
     for tile in tiles:
         launch = row_exact_qmv.rows_qmv(
-            weight, scales, biases, bits, group_size, "affine", dtype,
-            lambda _, g=tile: g, unrolled=True,
+            weight,
+            scales,
+            biases,
+            bits,
+            group_size,
+            "affine",
+            dtype,
+            lambda _, g=tile: g,
+            unrolled=True,
         )
         observed = launch(x)
         assert observed.shape == expected.shape and observed.dtype == dtype
@@ -384,17 +409,27 @@ def test_unrolled_rows_qmv_tiles_equal_one_row_quantized_matmul(
 
 
 # Tiles past the envelope compiled to wrong bits (5-bit 8x4, 4-bit 2x8).
-@pytest.mark.parametrize("k, n, bits, group_size, tile", [
-    (6144, 2560, 5, 128, (8, 4)),
-    (2560, 1024, 4, 64, (2, 8)),
-])
+@pytest.mark.parametrize(
+    "k, n, bits, group_size, tile",
+    [
+        (6144, 2560, 5, 128, (8, 4)),
+        (2560, 1024, 4, 64, (2, 8)),
+    ],
+)
 def test_unrolled_rows_qmv_refuses_tiles_past_the_register_envelope(
     k, n, bits, group_size, tile
 ):
     weight, scales, biases = _quantized(k, n, bits, group_size, mx.bfloat16, 3)
     launch = row_exact_qmv.rows_qmv(
-        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
-        lambda _: tile, unrolled=True,
+        weight,
+        scales,
+        biases,
+        bits,
+        group_size,
+        "affine",
+        mx.bfloat16,
+        lambda _: tile,
+        unrolled=True,
     )
     with pytest.raises(ValueError):
         launch(mx.zeros((1, 8, k), dtype=mx.bfloat16))
@@ -438,8 +473,13 @@ def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypa
     expected = mx.concatenate(
         [
             mx.quantized_matmul(
-                x[:, r : r + 1], weight, scales, biases, transpose=True,
-                group_size=group_size, bits=bits,
+                x[:, r : r + 1],
+                weight,
+                scales,
+                biases,
+                transpose=True,
+                group_size=group_size,
+                bits=bits,
             )
             for r in range(rows)
         ],
@@ -451,14 +491,23 @@ def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypa
         _miscompiled(row_exact_skeleton.compile_kernel),
     )
     launch = row_exact_qmv.rows_qmv(
-        weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
-        lambda _: (2, 2), unrolled=True,
+        weight,
+        scales,
+        biases,
+        bits,
+        group_size,
+        "affine",
+        mx.bfloat16,
+        lambda _: (2, 2),
+        unrolled=True,
     )
     assert _bit_equal(launch(x), expected)
     assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]
 
 
-def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
+def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(
+    monkeypatch,
+):
     linears = [_linear(2560, n, 4, 64, seed) for seed, n in enumerate((1024, 512))]
     x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
     monkeypatch.setattr(
