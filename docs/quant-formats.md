@@ -1283,7 +1283,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 | Armed sg8 single projection and dense gate/up SwiGLU | codes | `omlx/patches/qwen35_verify_qmm.py` |
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 | Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
-| Qwen4 hyper-connection decode and verify, 1–16 rows | dot | `qwen4_exp/hc_fused.py` |
+| Qwen4 hyper-connection decode and verify, 1–16 rows (stock affine weights; 7–16 rows stream the 8-bit/g64 up) | dot | `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py` |
 | A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |
 | Sorted prefill for format switch layers | tile | `omlx/formats/linear.py` |
 | M3 sorted gather for format switch layers | tile | `omlx/formats/tile_gather.py` |

@@ -320,8 +320,8 @@ _WRITE_NORM_DOWN = _NORM_DOWN_TEMPLATE.replace("// LOAD", _NDN_WRITE_LOAD).repla
 # Every threadgroup combines the slice sums as _DOWN does (part[0] + part[1]
 # + part[2] + part[3], then / HC and the BF16-rounded silu; 2 * sigmoid for the
 # inject rows in threadgroup 0) into threadgroup memory. Thread t then owns chunk
-# c = t % NC of rows j = t / NC, t / NC + TGS / NC, ... and stages each hc_qdot;
-# one thread per output adds its NC chunks in chunk order from 0.0f, and the
+# c = t % NC of rows j = t / NC, t / NC + TGS / NC, ... and stages each chunk's
+# `madd` in q; one thread per output adds its NC chunks in chunk order, and the
 # sigmoid gate / shuffle-down stream mix is _UP's.
 _DECODE_UP = r"""
     using L = typename decltype(up)::template Lanes<R>;
@@ -850,6 +850,8 @@ def _decode_v2(
     chunks: int,
     inject: bool,
     itemsize: int = 2,
+    table_bytes_down: int = 0,
+    table_bytes_up: int = 0,
 ) -> bool:
     """Whether the two-launch decode kernels apply: four streams, one stored
     256-element strip per norm/down threadgroup, and each kernel's threadgroup
@@ -861,8 +863,8 @@ def _decode_v2(
         and hc == 4
         and lowrank % (8 * rps) == 0
         and -(-hidden // 256) <= _down_row_groups(lowrank, inject, rps)
-        and hidden * itemsize + 32 <= _TG_MEMORY_BYTES
-        and lowrank * itemsize + _up_outputs(rows) * (chunks + 1) * 4
+        and hidden * itemsize + 32 + table_bytes_down <= _TG_MEMORY_BYTES
+        and lowrank * itemsize + _up_outputs(rows) * (chunks + 1) * 4 + table_bytes_up
         <= _TG_MEMORY_BYTES
         and 0 < chunks <= _V2_UP_THREADS
     )
@@ -885,14 +887,30 @@ def _kernel_norm_down(launch, module, flat, operands, weights):
 
 @functools.cache
 def _decode_launch(
-    rows, hc, hidden, lowrank, dtype, down_face, up_face, inj_face, write, two, rps, no
+    rows, hc, hidden, lowrank, dtype, down_face, up_face, inj_face, write
 ):
-    """Specialize the two weight-reading launches for one geometry and layout.
-    This callable holds kernel arguments shared by layers and threads. Each
-    call reads its own layer's arrays, including replacements after a load.
+    """Choose the decode form and specialize its launches for one geometry and
+    layout. This callable holds kernel arguments shared by layers and threads.
+    Each call reads its own layer's arrays, including replacements after a load.
     """
     width = hc * hidden
     inject = inj_face is not None
+    chunks = lowrank // up_face.vpt
+    two = _decode_v2(
+        rows,
+        hc,
+        hidden,
+        lowrank,
+        chunks,
+        inject,
+        dtype.size,
+        table_bytes_down=kernels.table_bytes(
+            down_face, *((inj_face,) if inject else ())
+        ),
+        table_bytes_up=kernels.table_bytes(up_face),
+    )
+    rps = _down_rps(rows) if two else 0
+    no = _up_outputs(rows) if two else 0
     matrices = {"down": down_face}
     down_inputs = _matrix_reader(down_face)
     up_inputs = _matrix_reader(up_face)
@@ -921,7 +939,6 @@ def _decode_launch(
             output_shapes=shapes,
             output_dtypes=[dtype] * (1 + int(write)) + [mx.float32],
         )
-        chunks = lowrank // up_face.vpt
         threads = chunks * (_V2_UP_THREADS // chunks)
         up_kernel = kernels.face_kernel(
             "omlx_qwen4_hc_decode_up",
@@ -963,7 +980,7 @@ def _decode_launch(
             output_dtypes=[dtype, dtype],
         )
         # Only the stock 8-bit g64 up shares these group scalars.
-        streaming = 7 <= rows <= 16 and up_face is affine.face(
+        streaming = 7 <= rows <= 16 and up_face == affine.face(
             8, 64, True, dtype, partial_blocks=True
         )
         up_kernel = kernels.face_kernel(
@@ -1273,10 +1290,6 @@ def fused_forward(module, hyper_input, write=None):
         down_face = _decode_face(down, False)
         up_face = _decode_face(up, False)
         inject_face = _decode_face(inject, True) if inject is not None else None
-        chunks = lowrank // up_face.vpt
-        two = _decode_v2(
-            rows, hc, hidden, lowrank, chunks, inject is not None, dtype.size
-        )
         launch = _decode_launch(
             rows,
             hc,
@@ -1287,9 +1300,6 @@ def fused_forward(module, hyper_input, write=None):
             up_face,
             inject_face,
             write is not None,
-            two,
-            _down_rps(rows) if two else 0,
-            _up_outputs(rows) if two else 0,
         )
         written, mixed, injection = launch(module, flat, operands, down, up, inject)
         if written is not None:

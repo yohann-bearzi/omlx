@@ -371,7 +371,7 @@ def test_the_oracle_s_geometry_is_hc_fused_s(monkeypatch):
             face = affine.face(bits, 64, True, mx.bfloat16, partial_blocks=True)
             chunks = lowrank // face.vpt
             assert oracle.up_chunks(bits, lowrank) == chunks
-            # hc_fused's _kernel_up_mix: whole chunk rows within its threads.
+            # hc_fused's two-launch up: whole chunk rows within its threads.
             threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
             assert oracle.up_threads(bits, lowrank) == threads
     for lowrank, inject, rps in ((320, True, 1), (320, False, 2), (512, True, 4)):
@@ -614,50 +614,40 @@ def test_affine_serial_up_streams_chunks_in_order(rows, monkeypatch):
     assert "hc_stream_up<R>(up, n, a)" in up_sources[0], "up did not stream the group"
 
 
-@pytest.mark.parametrize("gpu_class", ["d", "s"])
-@pytest.mark.parametrize("rows", [4, 5, 6, 7, 16])
-def test_affine_serial_up_route_by_row(rows, gpu_class, monkeypatch):
-    """Six rows keep the two-launch decode; from seven, the serial up streams.
+def _kernel_recorder(live, monkeypatch, rows, width, hidden, lowrank, dtype):
+    """Record each kernel build; return its (name, header, source).
 
-    The two-launch up re-reads its weight for every row and wins the small
-    row counts; from seven rows the three-launch up, which streams one affine
-    group's scales through all of a row's chunks, is as fast or faster (it
-    measured 0.9993 against the parent at seven rows on the M3 Ultra). The
-    kernels are recorded, not run: both routes' numbers are checked against
-    the canonical path and against each other by their own tests.
+    Every build gets a canned output of the right shape and dtype, so a route
+    can be read without compiling or running Metal.
     """
-    hidden, dtype = 256, mx.bfloat16
-    width = HC * hidden
-    module = _module(8, False, hidden=hidden)
-    module.hc_norm.weight = mx.zeros((width,), dtype)
-    live = _live()
     builds = []
+    build = mx.fast.metal_kernel
 
     def record(**spec):
         name = spec["name"]
-        builds.append((name, spec.get("source", "")))
+        builds.append((name, spec.get("header", ""), spec.get("source", "")))
         if "fused_write_norm" in name:
             return lambda **kwargs: [
-                mx.zeros((rows, hidden), dtype),
+                mx.zeros((rows, width), dtype),
                 mx.zeros((rows, width), dtype),
             ]
         if "fused_norm" in name:
             return lambda **kwargs: [mx.zeros((rows, width), dtype)]
         if "hc_fused_down" in name:
             return lambda **kwargs: [
-                mx.zeros((rows, LOWRANK), dtype),
+                mx.zeros((rows, lowrank), dtype),
                 mx.zeros((rows, HC), dtype),
             ]
         if "decode_write_norm_down" in name:
             return lambda **kwargs: [
                 mx.zeros((rows, width), dtype),
                 mx.zeros((rows, width), dtype),
-                mx.zeros((rows, HC, LOWRANK + HC), mx.float32),
+                mx.zeros((rows, HC, lowrank + HC), mx.float32),
             ]
         if "decode_norm_down" in name:
             return lambda **kwargs: [
                 mx.zeros((rows, width), dtype),
-                mx.zeros((rows, HC, LOWRANK + HC), mx.float32),
+                mx.zeros((rows, HC, lowrank + HC), mx.float32),
             ]
         return lambda **kwargs: [
             mx.zeros((rows, hidden), dtype),
@@ -667,23 +657,125 @@ def test_affine_serial_up_route_by_row(rows, gpu_class, monkeypatch):
     monkeypatch.setattr(mx.fast, "metal_kernel", record)
     monkeypatch.setattr(live, "_KERNELS", {})
     monkeypatch.setattr(live, "_VALIDATED", set())
-    monkeypatch.setattr(live, "_gpu_class", lambda: gpu_class)
     if hasattr(live, "_decode_launch"):
         monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
         monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+    return builds
+
+
+def _up_builds(builds):
+    ups = [(name, header, source) for name, header, source in builds if "up" in name]
+    assert len(ups) == 1, [name for name, _, _ in builds]
+    return ups[0]
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
+@pytest.mark.parametrize("rows", [4, 5, 6, 7, 16])
+def test_affine_serial_up_route_by_row(rows, gpu_class, dtype, monkeypatch):
+    """Six rows keep the two-launch decode; from seven, the serial up streams.
+
+    The two-launch up re-reads its weight for every row and wins the small row
+    counts; from seven rows the three-launch up, which streams one affine
+    group's scales through all of a row's chunks, is as fast or faster (it
+    measured 0.9993 against the parent at seven rows on the M3 Ultra). Both
+    activation dtypes' faces stream. The kernels are recorded, not run: both
+    routes' numbers are checked against the canonical path and against each
+    other by their own tests.
+    """
+    hidden = 256
+    width = HC * hidden
+    module = _module(8, False, hidden=hidden, dtype=dtype)
+    module.hc_norm.weight = mx.zeros((width,), dtype)
+    live = _live()
+    monkeypatch.setattr(live, "_gpu_class", lambda: gpu_class)
+    builds = _kernel_recorder(live, monkeypatch, rows, width, hidden, LOWRANK, dtype)
 
     mixed = live.fused_forward(module, mx.ones((1, rows, width), dtype))
     assert mixed is not None
-    names = [name for name, _ in builds]
-    ups = [(name, source) for name, source in builds if "up" in name]
-    assert len(ups) == 1, names
+    name, header, source = _up_builds(builds)
+    names = [built for built, _, _ in builds]
     if rows <= 6:
-        assert "decode_up" in ups[0][0], names
-        assert any("decode_norm_down" in name for name in names), names
+        assert "decode_up" in name, names
+        assert any("decode_norm_down" in built for built in names), names
+        assert "hc_stream_up" not in header + source
     else:
-        assert "fused_up" in ups[0][0], names
-        assert any("hc_fused_down" in name for name in names), names
-        assert "hc_stream_up<R>(up, n, a)" in ups[0][1], "up did not stream the group"
+        assert "fused_up" in name, names
+        assert any("hc_fused_down" in built for built in names), names
+        assert "hc_stream_up" in header, "the streamed up's header is missing"
+        assert "hc_stream_up<R>(up, n, a)" in source, "up did not stream the group"
+
+
+@pytest.mark.parametrize(
+    "bits,group,rows,hidden",
+    [(4, 64, 7, 256), (8, 32, 7, 256), (8, 64, 6, 5440)],
+)
+def test_other_faces_and_small_rows_keep_the_generic_up(
+    bits, group, rows, hidden, monkeypatch
+):
+    """Only the stock 8-bit/g64 face at 7-16 rows streams the group.
+
+    A 4-bit or 32-group face and a row count below seven (here forced out of
+    the two-launch form by the strip limit) keep the generic serial up.
+    """
+    width = HC * hidden
+    module = _module(bits, False, hidden=hidden, group_size=group)
+    module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+    live = _live()
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    builds = _kernel_recorder(
+        live, monkeypatch, rows, width, hidden, LOWRANK, module.hc_norm.weight.dtype
+    )
+
+    mixed = live.fused_forward(module, mx.ones((1, rows, width), mx.bfloat16))
+    assert mixed is not None
+    name, header, source = _up_builds(builds)
+    assert "fused_up" in name, [built for built, _, _ in builds]
+    assert "hc_stream_up" not in header + source
+
+
+def test_affine_serial_up_streams_an_equal_face_copy(monkeypatch):
+    """An equal but distinct face still streams: concurrent cold starts,
+    ``affine.face.cache_clear()`` and deep copies hand one out."""
+    from dataclasses import replace
+
+    hidden, dtype = 256, mx.bfloat16
+    width = HC * hidden
+    module = _module(8, False, hidden=hidden)
+    module.hc_norm.weight = mx.zeros((width,), dtype)
+    up = module.input_mix_weight_up
+    live = _live()
+    stock_face = live._decode_face
+    copied = replace(stock_face(up, False))
+    assert copied == stock_face(up, False) and copied is not stock_face(up, False)
+    monkeypatch.setattr(
+        live,
+        "_decode_face",
+        lambda projection, inject: (
+            copied if projection is up else stock_face(projection, inject)
+        ),
+    )
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    builds = _kernel_recorder(live, monkeypatch, 7, width, hidden, LOWRANK, dtype)
+
+    mixed = live.fused_forward(module, mx.ones((1, 7, width), dtype))
+    assert mixed is not None
+    name, header, source = _up_builds(builds)
+    assert "fused_up" in name, [built for built, _, _ in builds]
+    assert "hc_stream_up" in header, "an equal face's header is missing"
+    assert "hc_stream_up<R>(up, n, a)" in source, "an equal face did not stream"
+
+
+def test_decode_v2_accounts_for_face_table_bytes(monkeypatch):
+    """A face with staged tables spends threadgroup memory the form must fit."""
+    live = _live()
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    hidden_row = (1, HC, 16368, 504, 63, True)
+    assert live._decode_v2(*hidden_row, 2)
+    assert not live._decode_v2(*hidden_row, 2, table_bytes_down=64)
+    hidden_up = (1, HC, 256, 3264, 204, False)
+    assert live._decode_v2(*hidden_up, 2)
+    assert not live._decode_v2(*hidden_up, 2, table_bytes_up=64)
 
 
 @pytest.mark.parametrize("rows", [1, 7])
