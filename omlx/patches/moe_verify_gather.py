@@ -183,7 +183,7 @@ def _kernel(face: Dot, small_offsets: bool = False):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("rt", face), "rhs"]
     suffix = "_u32" if small_offsets else ""
-    body = _SOURCE.replace("OFFSET", "" if small_offsets else "size_t")
+    body = _SOURCE.replace("OFFSET", "uint" if small_offsets else "size_t")
     return mx.fast.metal_kernel(
         name=f"omlx_moe_verify_gather_{face.key}{suffix}",
         input_names=inputs,

@@ -1075,6 +1075,9 @@ def test_the_gate_up_input_bound_is_max_rows(toy):
     assert at.gate_up.ordered is gather._ordered_kernel(at.gate_up.face, True)
     assert over.gate_up.ordered is gather._ordered_kernel(over.gate_up.face, False)
     assert over.down.ordered is gather._ordered_kernel(over.down.face, True)
+    assert at.gate_up.kernel is gather._kernel(at.gate_up.face, True)
+    assert over.gate_up.kernel is gather._kernel(over.gate_up.face, False)
+    assert over.down.kernel is gather._kernel(over.down.face, True)
 
 
 def test_the_largest_whole_pair_grid_reaches_the_launch():
@@ -1144,6 +1147,13 @@ def test_the_ordered_plan_uses_small_offsets_only_when_all_rows_fit(
         (True, True),
         (False, False),
     ]
+    assert [
+        (
+            p.gate_up.kernel is direct_gate.kernel,
+            p.down.kernel is direct_down.kernel,
+        )
+        for p in plans
+    ] == wide
 
 
 def test_a_bounded_block_s_unordered_gather_takes_32_bit_offsets(monkeypatch):
@@ -1165,3 +1175,18 @@ def test_a_bounded_block_s_unordered_gather_takes_32_bit_offsets(monkeypatch):
     wide = gather.projection(_switch().gate_up_proj, HIDDEN)
     assert wide is not None
     assert seen and not any(seen), seen
+
+
+def test_small_unordered_gather_uses_unsigned_32_bit_offsets(monkeypatch):
+    """The small variant's addresses are unsigned 32-bit arithmetic: its plans
+    admit up to 2**32 elements, where signed int would wrap at 2**31."""
+    recorded = []
+
+    def record(**kwargs):
+        recorded.append(kwargs["source"])
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", record)
+    gather._kernel.__wrapped__(affine.face(4, 32, True, mx.bfloat16), True)
+    source = recorded[-1]
+    assert "x + uint(pair / LHS_DIV) * K_SIZE" in source
+    assert "y + uint(pair) * N_SIZE + out_row" in source

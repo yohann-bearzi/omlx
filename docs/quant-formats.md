@@ -1250,7 +1250,7 @@ the block's activation returns that dtype in the shape of the up's rows. From 24
 below, each threadgroup searches for its own. A block of 2 to 8 rows takes it at any bit
 width, but one of 16 pairs or fewer over 64 experts or more, which keeps the composed
 path (measured faster than the composed path everywhere else; 2 rows of a 256-expert
-top-8 block read 1% slower). The grid fits up to 1,073,741,823 pairs. For each ordered
+top-8 block read 1% slower). The grid fits up to 1,073,741,823 pairs. For each
 projection the block plan selects 32-bit input and output offsets when every permitted
 row stays at or below 2**32 elements, and 64-bit offsets otherwise; a direct call
 always uses 64-bit offsets and refuses indices that are not one integer vector, pairs
