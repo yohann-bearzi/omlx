@@ -75,6 +75,7 @@ layers, so the GPU starts while the host still builds the verify.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from functools import cache, partial
 
@@ -532,8 +533,17 @@ __STORES__
 
 
 @cache
-def _mma_kernel(row_tiles: int, face):
-    """The mma kernel of ``row_tiles`` tiles of 8 rows over ``face``."""
+def _mma_face(bits: int, group_size: int, dtype):
+    """The affine tile face of one signature, built once per signature."""
+    from omlx.formats import affine
+
+    return affine.tile_face(bits, group_size, dtype)
+
+
+@cache
+def _mma_face_kernel(row_tiles: int, face):
+    """The generic mma kernel of ``row_tiles`` tiles over ``face`` (plugin and
+    tabled faces; the builtin affine faces take the skeleton below)."""
     from omlx.formats import kernels
 
     rows = range(row_tiles)
@@ -1032,12 +1042,55 @@ def mma_eligible(M: int, K: int, N: int, bits: int, group_size: int, dtype) -> b
     )
 
 
+_AFFINE_MMA = re.compile(r"affine_tile_b([234568])g(32|64|128)_(bf16|fp16)")
+
+
+@cache
+def _mma_plan(row_tiles: int, face, k: int, dtype):
+    """``(kernel, template)`` for one mma signature, built at construction.
+    The builtin affine faces take the byte-identical skeleton with K baked;
+    every other face keeps the generic tile-face kernel and K's template."""
+    import mlx.core as mx
+
+    from omlx.formats import verify_skeleton
+
+    match = _AFFINE_MMA.fullmatch(face.key)
+    if match and face in _affine_tile_faces(int(match[1])):
+        bits, group, tag = int(match[1]), int(match[2]), match[3]
+        ops = verify_skeleton.affine_mma_ops(bits, group)
+        name = f"omlx_vk_mma_rt{row_tiles}_k{k}_q{bits}_gs{group}_{tag}"
+        spec = verify_skeleton.emit_mma_kernel(ops, row_tiles, k, name)
+        return mx.fast.metal_kernel(**spec), [("T", dtype)]
+    return _mma_face_kernel(row_tiles, face), [("T", dtype), ("K", k)]
+
+
+@cache
+def _mma_launch(
+    row_tiles: int, bits: int, group_size: int, scale_dtype, dtype, k: int, n: int
+):
+    """The whole launch descriptor for one signature: one cache lookup on
+    the hot path, the face, kernel, partial and N scalar built once."""
+    import mlx.core as mx
+
+    if k <= 0 or n <= 0:
+        raise ValueError(f"vk_qmm_mma takes K > 0 and N > 0, not {k} x {n}")
+    face = _mma_face(bits, group_size, scale_dtype)
+    kernel, template = _mma_plan(row_tiles, face, k, dtype)
+    launch = partial(
+        kernel,
+        template=template,
+        grid=(32 * _MMA_NSG, n // _MMA_BN, 1),
+        threadgroup=(32 * _MMA_NSG, 1, 1),
+        output_shapes=[(8 * row_tiles, n)],
+        output_dtypes=[dtype],
+    )
+    return launch, mx.array(n, dtype=mx.int32)
+
+
 def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
     """(M, K) x (N, K)^T -> (M, N) for M in 7..24 through the mma tile kernel
     over the affine tile face; None for scales no tile face reads."""
     import mlx.core as mx
-
-    from omlx.formats import affine
 
     M = int(x2.shape[0])
     K = int(x2.shape[1])
@@ -1047,20 +1100,15 @@ def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
             f"vk_qmm_mma takes 1 to 24 rows, K in {_MMA_BK * _MMA_NSG}s and N in "
             f"{_MMA_BN}s, not {M} x {K} x {N}"
         )
-    if scales.dtype not in (mx.bfloat16, mx.float16):
+    if scales.dtype not in (mx.bfloat16, mx.float16) or biases.dtype != scales.dtype:
         return None  # no tile face reads such scales
     row_tiles = (M + 7) // 8
     bm = 8 * row_tiles
     xm, M0 = _pad_rows(mx, x2, bm)
-    kernel = _mma_kernel(row_tiles, affine.tile_face(bits, group_size, scales.dtype))
-    (y,) = kernel(
-        inputs=[xm, w_q, scales, biases, N],
-        template=[("T", x2.dtype), ("K", K)],
-        grid=(32 * _MMA_NSG, N // _MMA_BN, 1),
-        threadgroup=(32 * _MMA_NSG, 1, 1),
-        output_shapes=[(bm, N)],
-        output_dtypes=[x2.dtype],
+    launch, n_scalar = _mma_launch(
+        row_tiles, bits, group_size, scales.dtype, x2.dtype, K, N
     )
+    (y,) = launch(inputs=[xm, w_q, scales, biases, n_scalar])
     return y[:M0, :] if M0 < bm else y
 
 

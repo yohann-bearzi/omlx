@@ -6,12 +6,15 @@ and a reference that tells its rows apart bit for bit."""
 from __future__ import annotations
 
 import inspect
+from dataclasses import replace
 
 import mlx.core as mx
 import pytest
 
+from omlx.formats import affine
 from omlx.patches import qwen35_verify_qmm as live
 from tests.oracles import vk_mma as oracle
+from tests.test_formats_tables import tabled_tile
 from tests.test_oracle_vk import _linear, _same, _x
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -76,3 +79,61 @@ def test_scales_no_tile_face_reads_are_left_to_the_stock_qmm():
     x = _x(8, 256, mx.bfloat16, seed=1)
     wide = (scales.astype(mx.float32), biases.astype(mx.float32))
     assert live.vk_qmm_mma(x, weight, *wide, group_size=64, bits=4) is None
+
+
+def test_mixed_dtypes_and_mismatched_biases():
+    weight, scales, biases = _linear(4096, 256, 4, 64, mx.bfloat16, seed=1)
+    x = _x(8, 256, mx.bfloat16, seed=1)
+    for dtype in (mx.float32, mx.float16):
+        assert (
+            live.vk_qmm_mma(
+                x, weight, scales, biases.astype(dtype), group_size=64, bits=4
+            )
+            is None
+        )
+    wide = _x(8, 256, mx.float32, seed=1)
+    assert _same(
+        live.vk_qmm_mma(wide, weight, scales, biases, group_size=64, bits=4),
+        oracle.vk_qmm_mma(wide, weight, scales, biases, group_size=64, bits=4),
+    )
+
+
+def test_mma_plan_routing_and_forged_keys():
+    four = affine.tile_face(4, 64, mx.bfloat16)
+    live._mma_plan.cache_clear()
+    try:
+        assert live._mma_plan(1, four, 2560, mx.bfloat16)[1] == [("T", mx.bfloat16)]
+        forged = replace(four, key="affine_tile_b7g64_bf16")
+        assert live._mma_plan(1, forged, 2560, mx.bfloat16)[1] == [
+            ("T", mx.bfloat16),
+            ("K", 2560),
+        ]
+        assert live._mma_plan(1, tabled_tile(four), 2560, mx.bfloat16)[1] == [
+            ("T", mx.bfloat16),
+            ("K", 2560),
+        ]
+    finally:
+        live._mma_plan.cache_clear()
+
+
+def test_mma_launch_reuses_the_plan_across_n():
+    live._mma_plan.cache_clear()
+    live._mma_launch.cache_clear()
+    try:
+        live._mma_launch(1, 4, 64, mx.bfloat16, mx.bfloat16, 2560, 4096)
+        live._mma_launch(1, 4, 64, mx.bfloat16, mx.bfloat16, 2560, 8192)
+        assert live._mma_plan.cache_info().misses == 1
+    finally:
+        live._mma_plan.cache_clear()
+        live._mma_launch.cache_clear()
+
+
+def test_zero_k_or_n_is_refused_when_the_plan_is_built():
+    live._mma_launch.cache_clear()
+    try:
+        with pytest.raises(ValueError):
+            live._mma_launch(1, 8, 64, mx.bfloat16, mx.bfloat16, 2560, 0)
+        with pytest.raises(ValueError):
+            live._mma_launch(1, 8, 64, mx.bfloat16, mx.bfloat16, 0, 4096)
+    finally:
+        live._mma_launch.cache_clear()

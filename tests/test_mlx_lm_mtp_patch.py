@@ -6232,11 +6232,15 @@ def test_verify_qmm_routes_batched_rows_through_mma_kernel(
 
     def spy(x2, *args, **kwargs):
         routed.append(tuple(x2.shape))
-        return original(x2, *args, **kwargs)
+        out = original(x2, *args, **kwargs)
+        assert out is not None
+        return out
 
     monkeypatch.setattr(qwen35_verify_qmm, "vk_qmm_mma", spy)
     mx.random.seed(7)
     layer = nn.QuantizedLinear(512, 288, bits=bits, group_size=group_size)
+    layer.scales = layer.scales.astype(dtype)
+    layer.biases = layer.biases.astype(dtype)
     x = (mx.random.normal((batch, length, 512)) * 0.5).astype(dtype)
     expected = mx.quantized_matmul(
         x,
