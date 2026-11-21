@@ -350,6 +350,7 @@ def topk_indices_header(dtype: mx.Dtype) -> str:
     threadgroup memory to coalesce shared experts across rows."""
     return topk_header(dtype) + _TOPK_INDICES_TG_HEADER
 
+
 _SOFTMAX_TOPK_SOURCE = """
     const uint lane = thread_position_in_threadgroup.x;
     omlx_router_topk<T, NE>::template write<K>(logits, lane, indices, scores);
@@ -953,9 +954,7 @@ def apply_qwen35_moe_router_patch() -> bool:
             shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
             return y + shared_y
         except Exception:
-            logger.warning(
-                "fused MoE router failed; composed fallback", exc_info=True
-            )
+            logger.warning("fused MoE router failed; composed fallback", exc_info=True)
             return orig_call(self, x)
 
     cls.__call__ = patched_call

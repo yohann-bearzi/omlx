@@ -117,6 +117,17 @@ from .qwen35_verify_qmm import is_row_exact_armed
 
 logger = logging.getLogger(__name__)
 
+# The verify-window fast path (pair-coalesced gate+up and top-k, unrolled
+# down) ships for the shapes it was measured to win on and no others:
+# Flash-Next's 4-bit routed windows, ``(hidden, expert width, bits)``. The
+# escalation measured the weighted window from 1.153x to 1.0167x and the
+# served 4-prompt adaptive median to 1.0036 (M3 Ultra); every other shape
+# keeps the kernels of f0968c13, because the same kernels cost on another
+# family (35B-A3B drifts 1.0060-1.0176 on the M5 fan). A family that wants
+# them is measured and added here.
+_WINDOW_FAST_SHAPES = frozenset({(2560, 640, 4)})
+
+
 # Top-k widths whose k-sum order in the combine matches MLX's reduction.
 TOP_KS = (8, 10)
 _GATE_UP_ROWS = 2  # gate rows (and as many up rows) per simdgroup
@@ -828,7 +839,7 @@ class _Launches(NamedTuple):
     window_down_unrolled_kernel: object = None
     window_inter: int = 0
     window_shared_width: int = 0
-    routed_tables: bool = False
+    window_fast: bool = False
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
@@ -1025,6 +1036,16 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         )
     width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
     can_coalesce = gu_fmt.vpt >= 1 and sgu_fmt.vpt >= 1
+    # The fast path is decided once, from the layer's own bit width (never the
+    # face's name: a key is a name) and the shapes it was measured on. Its
+    # kernels are built only inside this decision: a block that never launches
+    # them builds no pipeline for them, which would otherwise move the
+    # per-process placement draw of a path whose launches did not change.
+    window_fast = (
+        bool(gu_fmt.tables)
+        and getattr(gate_up, "bits", None) in (2, 3, 4)
+        and (hidden, inter, gate_up.bits) in _WINDOW_FAST_SHAPES
+    )
     launches = _Launches(
         hidden=hidden,
         dtype=dtype,
@@ -1046,18 +1067,20 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         window_down_kernel=_down_window_kernel(d_fmt, sd_fmt),
         window_coalesced_kernel=(
             _gate_up_window_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt)
-            if can_coalesce
+            if can_coalesce and window_fast
             else None
         ),
         window_topk_coalesced_kernel=(
             _gate_up_topk_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt, dtype)
-            if can_coalesce
+            if can_coalesce and window_fast
             else None
         ),
-        window_down_unrolled_kernel=_down_window_unrolled_kernel(d_fmt, sd_fmt),
+        window_down_unrolled_kernel=(
+            _down_window_unrolled_kernel(d_fmt, sd_fmt) if window_fast else None
+        ),
         window_inter=inter,
         window_shared_width=width,
-        routed_tables=bool(gu_fmt.tables),
+        window_fast=window_fast,
         topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
@@ -1231,7 +1254,7 @@ def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
     rps = _down_rows(rows)
     kernel = (
         launches.window_down_unrolled_kernel
-        if launches.routed_tables and launches.window_down_unrolled_kernel is not None
+        if launches.window_fast and launches.window_down_unrolled_kernel is not None
         else launches.window_down_kernel
     )
     return kernel(
@@ -1267,7 +1290,7 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
     rows = x.shape[0]
     gen = kernels.gpu_generation()
     can_unfolded_coal = (
-        launches.routed_tables
+        launches.window_fast
         and launches.window_coalesced_kernel is not None
         and 2 <= rows <= _COALESCE_MAX_ROWS
         and rows * launches.top_k <= _COALESCE_MAX_PAIRS
@@ -1281,7 +1304,7 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
             launches, x, meta, ucount, gate_up, shared_gate_up
         )
     elif (
-        launches.routed_tables
+        launches.window_fast
         and folded
         and rows == 2
         and launches.window_topk_coalesced_kernel is not None

@@ -831,6 +831,53 @@ def test_the_activation_selects_an_exact_dtype_from_the_gate_up_face(
     assert _engaged()
 
 
+def test_the_window_fast_path_does_not_read_the_face_s_name(monkeypatch):
+    """A face's key is a name: renaming it must not turn the fast path off,
+    because the plan reads the layer's own bits."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    installed = formats.dot
+
+    def renamed(layer, k, n):
+        found = installed(layer, k, n)
+        if found is None:
+            return found
+        return replace(found, key="renamed_" + found.key)
+
+    monkeypatch.setattr(formats, "dot", renamed)
+    block = _block(2560, 640, bits=4, seed=7)
+    x = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+    plan = _plan(block, x)
+    assert plan is not None and plan.launches.window_fast
+
+
+def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch):
+    """The coalesced and unrolled verify-window kernels ship for Flash-Next's
+    4-bit routed windows; the 35B-A3B shape, which drifts on them (M5 fan
+    1.0060-1.0176), keeps the f0968c13 kernels."""
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    flash = _block(2560, 640, bits=4)
+    flash_x = mx.random.normal((1, 1, 2560)).astype(mx.bfloat16)
+    flash_plan = _plan(flash, flash_x)
+    assert flash_plan is not None and flash_plan.launches.window_fast
+    launches = flash_plan.launches
+    assert launches.window_coalesced_kernel is not None
+    assert launches.window_topk_coalesced_kernel is not None
+    assert launches.window_down_unrolled_kernel is not None
+    other = _block(2048, 512, top_k=8, bits=4)
+    other_x = mx.random.normal((1, 1, 2048)).astype(mx.bfloat16)
+    other_plan = _plan(other, other_x)
+    assert other_plan is not None and not other_plan.launches.window_fast
+    # Built only inside the decision: a block that never launches them builds
+    # no pipeline for them, so it cannot move that path's placement draw.
+    assert other_plan.launches.window_coalesced_kernel is None
+    assert other_plan.launches.window_topk_coalesced_kernel is None
+    assert other_plan.launches.window_down_unrolled_kernel is None
+
+
 def test_prefill_verify_and_float_rows_keep_the_composed_body():
     block = _block(1024, 320)
     assert _plan(block, mx.zeros((1, 4, 1024), dtype=mx.bfloat16)) is None

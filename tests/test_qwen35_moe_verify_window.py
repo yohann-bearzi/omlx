@@ -120,8 +120,12 @@ def _block(
         setattr(sm, name, layer)
     shared = block.shared_expert
     for name in ("gate_proj", "up_proj", "down_proj"):
-        setattr(shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), 128, 8))
-    block.shared_expert_gate = nn.QuantizedLinear.from_linear(block.shared_expert_gate, 64, 8)
+        setattr(
+            shared, name, nn.QuantizedLinear.from_linear(getattr(shared, name), 128, 8)
+        )
+    block.shared_expert_gate = nn.QuantizedLinear.from_linear(
+        block.shared_expert_gate, 64, 8
+    )
     block.eval()
     model = _FakeQwen4Model()
     model.named_modules = lambda: [("mlp.switch_mlp", sm)]
@@ -133,7 +137,10 @@ def _block(
 
 
 def _same_bits(a, b):
-    return a.shape == b.shape and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+    return (
+        a.shape == b.shape
+        and mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+    )
 
 
 def _does_not_compile(a, shape=None):
@@ -175,6 +182,7 @@ def _verify(block, x, window):
         routed.routed_verify_window = fused
     mx.eval(out)
     return out
+
 
 def _check(block, x, engaged):
     """Window rows == one-token rows == the composed verifier's rows (the
@@ -438,7 +446,11 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps
     f32, top_k, experts, rows = mx.float32, 10, 64, 4
     mx.random.seed(60 + bits)
     fmt = partial(affine.face, dtype=f32)
-    routed_gu, shared_gu, gate_fmt = fmt(bits, 64, True), fmt(8, 128, True), fmt(8, 64, False)
+    routed_gu, shared_gu, gate_fmt = (
+        fmt(bits, 64, True),
+        fmt(8, 128, True),
+        fmt(8, 64, False),
+    )
     routed_d, shared_d = fmt(bits, 64, False), fmt(8, 128, False)
     experts_gate_up = _quantized((experts, 2 * INTER, HIDDEN), 64, bits)
     experts_down = _quantized((experts, HIDDEN, INTER), 64, bits)
@@ -457,7 +469,12 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps
     x = mx.random.normal((rows, HIDDEN))
     scores = mx.softmax(mx.random.normal((rows, top_k)), axis=-1)
     gate_up_template = [
-        ("T", f32), ("K", HIDDEN), ("NI", INTER), ("RPS", 2), ("NSG", 2), ("NS", INTER),
+        ("T", f32),
+        ("K", HIDDEN),
+        ("NI", INTER),
+        ("RPS", 2),
+        ("NSG", 2),
+        ("NS", INTER),
         ("TOPK", top_k),
     ]
     blocks = 1 + INTER // 4 + top_k * INTER // 4
@@ -471,7 +488,11 @@ def test_fp32_window_kernels_equal_one_token_kernels(bits, window_rps, token_rps
         output_dtypes=[f32],
     )[0]
     down_template = [
-        ("T", f32), ("K", INTER), ("N", HIDDEN), ("KS", INTER), ("NPART", top_k + 1),
+        ("T", f32),
+        ("K", INTER),
+        ("N", HIDDEN),
+        ("KS", INTER),
+        ("NPART", top_k + 1),
         ("TOPK", top_k),
     ]
     y = routed._down_window_kernel(routed_d, shared_d)(
@@ -518,7 +539,13 @@ def test_fp32_window_router_equals_one_row_router():
     def gemv(x, rows):
         return router._GEMV_KERNEL(
             inputs=[x, weight],
-            template=[("T", f32), ("K", HIDDEN), ("N", EXPERTS), ("M", rows), ("NSG", 4)],
+            template=[
+                ("T", f32),
+                ("K", HIDDEN),
+                ("N", EXPERTS),
+                ("M", rows),
+                ("NSG", 4),
+            ],
             grid=(32, EXPERTS * rows, 1),
             threadgroup=(32, 4, 1),
             output_shapes=[(rows, EXPERTS)],
@@ -546,9 +573,13 @@ def test_fp32_window_router_equals_one_row_router():
             output_shapes=[(10,), (10,)],
             output_dtypes=[mx.uint32, f32],
         )
-        assert mx.array_equal(logits[r].view(mx.uint32), logits_r.view(mx.uint32)).item()
+        assert mx.array_equal(
+            logits[r].view(mx.uint32), logits_r.view(mx.uint32)
+        ).item()
         assert mx.array_equal(inds[r], inds_r).item()
-        assert mx.array_equal(scores[r].view(mx.uint32), scores_r.view(mx.uint32)).item()
+        assert mx.array_equal(
+            scores[r].view(mx.uint32), scores_r.view(mx.uint32)
+        ).item()
 
 
 def test_a_face_with_a_table_runs_the_window_launches_to_the_bit(monkeypatch, engaged):
@@ -590,15 +621,22 @@ def test_a_window_of_format_layers_equals_one_token_decode(monkeypatch, engaged)
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("rows", [2, 3, 4])
-def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows):
+def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows, monkeypatch):
     """Pair-coalesced verify-window kernels (3-launch folded and 4-launch
     meta-driven, decoding each shared expert block once for two rows via the
     dot face's decode/apply contract) and the unrolled window down kernel
     reproduce one-token decode bit for bit across dtypes and overlap regimes."""
-    hidden, inter, top_k = (2560, 640, 10) if dtype == mx.bfloat16 else (2048, 512, 8)
+    # The coalesced path ships for the measured shape only (Flash-Next's
+    # windows); the other activation type takes the same shape, and a shape
+    # outside the allowlist is covered by its own gating test.
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    hidden, inter, top_k = 2560, 640, 10
     block = _block(7, bits=4, hidden=hidden, inter=inter, top_k=top_k, dtype=dtype)
     plan = _plan(block, mx.zeros((1, 1, hidden), dtype))
     launches = plan.launches
+    assert launches.window_fast
     assert launches.window_coalesced_kernel is not None
     assert launches.window_topk_coalesced_kernel is not None
     assert launches.window_down_unrolled_kernel is not None
@@ -610,7 +648,9 @@ def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows):
         logits = launches.router(x2d, *w)
         # 4-launch coalesced gate+up + unrolled down
         ind, sc, meta, ucount = router.softmax_topk_coalesce(logits, top_k)
-        h_c2 = routed._window_gate_up_coalesced(launches, x2d, meta, ucount, gu_op, sgu_op)
+        h_c2 = routed._window_gate_up_coalesced(
+            launches, x2d, meta, ucount, gu_op, sgu_op
+        )
         y_c2 = routed._window_down(launches, h_c2, ind, sc, dn_op, sdn_op)
         # 3-launch folded pair-coalesced gate+up + unrolled down
         h_fc, ind_fc, sc_fc = routed._window_gate_up_topk_coalesced(
@@ -664,7 +704,12 @@ def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
             assert uncalled(header + source) == [], name
     # Table-free affine builds of the new builders carry no hand-written tables.
     face = partial(affine.face, dtype=mx.bfloat16)
-    gu, dn, sh, gt = face(4, 64, True), face(4, 64, False), face(8, 128, True), face(8, 64, True)
+    gu, dn, sh, gt = (
+        face(4, 64, True),
+        face(4, 64, False),
+        face(8, 128, True),
+        face(8, 64, True),
+    )
     built.clear()
     routed._gate_up_window_coalesced_kernel.__wrapped__(gu, sh, gt)
     routed._gate_up_topk_coalesced_kernel.__wrapped__(gu, sh, gt, mx.bfloat16)
