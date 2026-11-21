@@ -28,19 +28,35 @@ def by_hand():
 
 
 def _one_expert(quantized, x):
+    """The one-expert sorted gather's bits; MLX's gather_qmm reads past the
+    scales on a ragged K, so a K that is not whole 64-deep steps decodes in
+    float32 and takes the bounds-checked gather_mm."""
     k, n = x.shape[-1], quantized.weight.shape[0]
     xrows = x.reshape(-1, 1, k)
-    reference = nax._stock_gather_qmm()(
-        xrows,
-        quantized.weight[None],
-        quantized.scales[None],
-        quantized.biases[None],
-        rhs_indices=mx.zeros((xrows.shape[0],), mx.uint32),
-        transpose=True,
-        sorted_indices=True,
-        bits=quantized.bits,
-        group_size=quantized.group_size,
-    ).reshape(*x.shape[:-1], n)
+    ids = mx.zeros((xrows.shape[0],), mx.uint32)
+    if k % 64:
+        weight = mx.dequantize(
+            quantized.weight,
+            quantized.scales.astype(mx.float32),
+            quantized.biases.astype(mx.float32),
+            group_size=quantized.group_size,
+            bits=quantized.bits,
+        ).astype(x.dtype)
+        reference = mx.gather_mm(
+            xrows, weight.T[None], rhs_indices=ids, sorted_indices=True
+        ).reshape(*x.shape[:-1], n)
+    else:
+        reference = nax._stock_gather_qmm()(
+            xrows,
+            quantized.weight[None],
+            quantized.scales[None],
+            quantized.biases[None],
+            rhs_indices=ids,
+            transpose=True,
+            sorted_indices=True,
+            bits=quantized.bits,
+            group_size=quantized.group_size,
+        ).reshape(*x.shape[:-1], n)
     return reference + quantized.bias if "bias" in quantized else reference
 
 
@@ -409,7 +425,7 @@ def test_dense_nax_one_run_works_without_a_scan_kernel(monkeypatch):
 
 
 @needs_nax
-@pytest.mark.parametrize("rows", [40, 193, 4225])
+@pytest.mark.parametrize("rows", [40, 193, 4224, 4225])
 def test_dense_nax_one_run_covers_the_split_grid(monkeypatch, rows):
     k, n = 2560, 512
     quantized, layer = _pair(k, n, bits=4, bias=True)
@@ -428,6 +444,8 @@ def test_dense_nax_one_run_covers_the_split_grid(monkeypatch, rows):
     for _ in range(2):
         assert _same_bits(layer(x), want)
     assert len(configs) == 1 and configs[0].gx > 0
+    if rows >= 4224:
+        assert -(-rows // configs[0].bm) > configs[0].gx
 
 
 @needs_nax
@@ -451,6 +469,25 @@ def test_dense_prefill_handles_ragged_k_and_proves_both_n_alignments(monkeypatch
 
 
 @needs_nax
+def test_one_expert_ragged_k_oracle_does_not_read_past_scales(monkeypatch):
+    quantized, layer = _pair(160, 64, bits=4)
+
+    def trailed(array):
+        nan = mx.full((64,), float("nan"), dtype=array.dtype)
+        return mx.concatenate([array.reshape(-1), nan])[: array.size].reshape(
+            array.shape
+        )
+
+    for name in ("scales", "biases"):
+        quantized[name] = trailed(quantized[name])
+        layer[name] = trailed(layer[name])
+    x = _x((33, 160))
+    reference = _one_expert(quantized, x)
+    assert not mx.any(mx.isnan(reference)).item()
+    assert _same_bits(layer(x), reference)
+
+
+@needs_nax
 def test_dense_prefill_does_not_import_its_module_per_call(monkeypatch):
     k, n = 512, 128
     _, layer = _pair(k, n, bits=4, bias=True)
@@ -461,7 +498,7 @@ def test_dense_prefill_does_not_import_its_module_per_call(monkeypatch):
 
     def record(name, *args, **kwargs):
         fromlist = kwargs.get("fromlist", args[2] if len(args) > 2 else ())
-        if fromlist and "tile_dense" in fromlist:
+        if "tile_dense" in name or (fromlist and "tile_dense" in fromlist):
             imports.append(name)
         return real(name, *args, **kwargs)
 

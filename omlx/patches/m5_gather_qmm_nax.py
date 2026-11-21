@@ -1635,7 +1635,8 @@ def _face_kernel(face: Tile, kind: str = "plain"):
     """Build (once) the kernel of ``kind`` (``_FACE_KINDS``) over tile face
     ``face``, ``omlx_gqmm_<key>[_one_run|_swiglu[_map]]``: its inputs are
     ``x``, the face's matrix (``w_weight`` and ``w_<tensor>``) and ``params``;
-    all kinds but ``one_run`` also take ``tiles`` and ``tile_count``, and the
+    all kinds but ``one_run`` also take ``tiles`` and ``tile_count`` before
+    ``params``, and the
     activation kinds the epilogue's ``lim``, the mapped one the row map
     ``rmap``. ``one_run`` derives a single expert's run from the grid."""
     global _header_failed, _act_header_failed
