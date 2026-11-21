@@ -1637,7 +1637,7 @@ def test_helper_daemon_checks_and_layers_over_two_gpus(monkeypatch, caplog):
     info = {
         "version": "0.1.0",
         "data_protocol": wire.PROTOCOL,
-        "contracts": {"qwen4_exp": 1},
+        "contracts": {"qwen4_exp": QWEN4.contract},
         "budgets": [40 * gib, 44 * gib],
         "disk_free": 1 << 40,
         "link_mbps": 1000,

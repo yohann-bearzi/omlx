@@ -55,12 +55,12 @@ def moe_offload_compatibility(model_path):
         path = Path(model_path).expanduser().resolve()
         config = path / "config.json"
         raw = json.loads(config.read_text())
+        if is_oqh_config(raw):
+            return False, "MoE expert offload does not read oQh experts."
         if in_quant_format(raw) or in_ported_family(raw):
             return False, IN_QUANT_FORMAT
         if raw.get("model_type") not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
-        if is_oqh_config(raw):
-            return False, "MoE expert offload does not read oQh experts."
         files = [config, *path.glob("*.safetensors")]
         index = path / "model.safetensors.index.json"
         if index.exists():
