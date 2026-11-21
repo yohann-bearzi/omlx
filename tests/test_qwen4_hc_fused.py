@@ -31,6 +31,7 @@ def _module(
     hidden: int = HIDDEN,
     group_size: int = 64,
     dtype=mx.bfloat16,
+    lowrank: int = LOWRANK,
 ):
     compat.apply_mlx_vlm_qwen4_exp_compat_patch()
     from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
@@ -38,14 +39,14 @@ def _module(
     width = HC * hidden
     module = Qwen4ExpGatedResidual.__new__(Qwen4ExpGatedResidual)
     nn.Module.__init__(module)
-    module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, LOWRANK
+    module.hc_count, module.hidden_size, module.hc_lowrank = HC, hidden, lowrank
     module.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
     module.hc_norm.weight = (mx.random.normal((width,)) * 0.05).astype(dtype)
     module.input_mix_weight_down = nn.QuantizedLinear(
-        width, LOWRANK, bias=False, group_size=group_size, bits=bits
+        width, lowrank, bias=False, group_size=group_size, bits=bits
     )
     module.input_mix_weight_up = nn.QuantizedLinear(
-        LOWRANK, width, bias=False, group_size=group_size, bits=bits
+        lowrank, width, bias=False, group_size=group_size, bits=bits
     )
     if use_combine:
         module.block_inject_weight = nn.QuantizedLinear(
@@ -313,10 +314,10 @@ def test_compatible_fails_closed():
     "two_launch,source_name",
     [
         (False, "_N_SOURCE"),
-        (False, "_D_SOURCE"),
-        (False, "_U_SOURCE"),
-        (True, "_NDN_SOURCE"),
-        (True, "_U2_SOURCE"),
+        (False, "_DOWN"),
+        (False, "_UP"),
+        (True, "_NORM_DOWN"),
+        (True, "_DECODE_UP"),
     ],
 )
 @pytest.mark.parametrize("use_combine", [False, True])
@@ -327,6 +328,7 @@ def test_lazy_compilation_failure_returns_canonical_output(
 
     monkeypatch.setattr(hc_fused, "_DECODE_V2", two_launch)
     monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__)
     monkeypatch.setattr(hc_fused, "_VALIDATED", set())
     monkeypatch.setattr(hc_fused, "_FAILURE_LOGGED", False)
     monkeypatch.setattr(
@@ -1027,7 +1029,7 @@ def _two_launch_fits(hc_fused, monkeypatch, module, rows):
         HC,
         module.hidden_size,
         LOWRANK,
-        module.input_mix_weight_up.bits,
+        LOWRANK // hc_fused._decode_face(module.input_mix_weight_up, False).vpt,
         "block_inject_weight" in module,
     )
 
@@ -1162,28 +1164,34 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
     flat = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
     norm_inputs = [flat, module.hc_norm.weight, hc_fused._eps_array(module)]
 
-    _, normed, parts = hc_fused._kernel_norm_down(
-        module, flat, None, rows, HC, HIDDEN, LOWRANK, mx.bfloat16, down, inject
-    )
+    matrices = {
+        "down": hc_fused._decode_face(down, False),
+        "inject": hc_fused._decode_face(inject, True),
+    }
+    up_face = hc_fused._decode_face(up, False)
+    weights = [
+        down.weight,
+        down.scales,
+        down.biases,
+        inject.weight,
+        inject.scales,
+        inject.biases,
+    ]
     rps = hc_fused._down_rps(rows)
-    new_tots = mx.fast.metal_kernel(
-        name="test_hc_norm_down_sums",
-        input_names=["x", "w", "eps", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
-        output_names=["xn", "parts", "tots"],
-        header=hc_fused._V2_HEADER,
-        source=_probe(
-            hc_fused._NDN_SOURCE,
+    normed, parts, new_tots = hc_fused._down_kernel(
+        "test_hc_norm_down_sums",
+        ("x", "w", "eps", "down", "inject"),
+        matrices,
+        ("xn", "parts", "tots"),
+        _probe(
+            hc_fused._NORM_DOWN,
             _NDN_INV,
             _NDN_INV + "    if (t == 0 && g == 0) tots[(size_t)row * HC + s] = tot;\n",
         ),
     )(
-        inputs=[*norm_inputs, down.weight, down.scales, down.biases, inject.weight, inject.scales, inject.biases],
+        inputs=[*norm_inputs, *weights],
         template=[
             ("T", mx.bfloat16),
-            ("BITS_D", bits),
-            ("BITS_I", bits),
-            ("GS_D", group_size),
-            ("GS_I", group_size),
             ("K", WIDTH),
             ("H", HIDDEN),
             ("R", LOWRANK),
@@ -1195,7 +1203,7 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, WIDTH), (rows, HC, LOWRANK + HC), (rows, HC)],
         output_dtypes=[mx.bfloat16, mx.float32, mx.float32],
-    )[2]
+    )
     old_normed, old_tots = mx.fast.metal_kernel(
         name="test_hc_norm_sums",
         input_names=["x", "w", "eps"],
@@ -1216,23 +1224,11 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
     mx.eval(normed, old_normed, new_tots, old_tots)
     assert mx.array_equal(new_tots.view(mx.uint32), old_tots.view(mx.uint32)).item()
     assert mx.array_equal(normed.view(mx.uint16), old_normed.view(mx.uint16)).item()
-    down_inputs = [
-        old_normed,
-        down.weight,
-        down.scales,
-        down.biases,
-        inject.weight,
-        inject.scales,
-        inject.biases,
-    ]
-    down_names = ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"]
+    down_inputs = [old_normed, *weights]
+    down_names = ("xn", "down", "inject")
     down_launch = dict(
         template=[
             ("T", mx.bfloat16),
-            ("BITS_D", bits),
-            ("BITS_I", bits),
-            ("GS_D", group_size),
-            ("GS_I", group_size),
             ("K", WIDTH),
             ("R", LOWRANK),
             ("HC", HC),
@@ -1243,31 +1239,31 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
     )
     probe = _probe(
         _probe(
-            hc_fused._D_SOURCE,
+            hc_fused._DOWN,
             _D_ACT_EPILOGUE,
             "            act[(size_t)row * R + int(tg) * 8 + int(sg) * 4 + r] = v;\n",
         ),
         _D_INJ_EPILOGUE,
         "            inj[(size_t)row * HC + r] = v;\n",
     )
-    down_sums, inject_sums = mx.fast.metal_kernel(
-        name="test_hc_down_sums",
-        input_names=down_names,
-        output_names=["act", "inj"],
-        header=hc_fused._HEADER,
-        source=probe,
+    down_sums, inject_sums = hc_fused._down_kernel(
+        "test_hc_down_sums",
+        down_names,
+        matrices,
+        ("act", "inj"),
+        probe,
     )(
         inputs=down_inputs,
         output_shapes=[(rows, LOWRANK), (rows, HC)],
         output_dtypes=[mx.float32, mx.float32],
         **down_launch,
     )
-    old_act, _ = mx.fast.metal_kernel(
-        name="test_hc_down",
-        input_names=down_names,
-        output_names=["act", "inj"],
-        header=hc_fused._HEADER,
-        source=hc_fused._D_SOURCE,
+    old_act, _ = hc_fused._down_kernel(
+        "test_hc_down",
+        down_names,
+        matrices,
+        ("act", "inj"),
+        hc_fused._DOWN,
     )(
         inputs=down_inputs,
         output_shapes=[(rows, LOWRANK), (rows, HC)],
@@ -1277,20 +1273,19 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
 
     up_template = [
         ("T", mx.bfloat16),
-        ("BITS_U", bits),
-        ("GS_U", group_size),
         ("K", WIDTH),
         ("R", LOWRANK),
         ("HC", HC),
         ("H", HIDDEN),
     ]
     store_acc = "    mixed[(size_t)r * K + n] = acc;\n"
-    old_accs = mx.fast.metal_kernel(
-        name="test_hc_up_sums",
-        input_names=["xn", "act", "up_w", "up_s", "up_b"],
-        output_names=["mixed"],
-        header=hc_fused._HEADER,
-        source=_probe(hc_fused._U_SOURCE, _U_EPILOGUE, store_acc),
+    old_accs = hc_fused.kernels.face_kernel(
+        "test_hc_up_sums",
+        ("xn", "act", "up"),
+        {"up": up_face},
+        ("mixed",),
+        "",
+        _probe(hc_fused._UP, _U_EPILOGUE, store_acc),
     )(
         inputs=[old_normed, old_act, up.weight, up.scales, up.biases],
         template=up_template,
@@ -1298,13 +1293,15 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
         threadgroup=(256, 1, 1),
         output_shapes=[(rows, WIDTH)],
         output_dtypes=[mx.float32],
-    )[0]
-    chunks = hc_fused._up_chunks(bits, LOWRANK)
+    )[
+        0
+    ]
+    chunks = LOWRANK // up_face.vpt
     threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
     outputs = hc_fused._up_outputs(rows)
     up2_probe = _probe(
         _probe(
-            _probe(hc_fused._U2_SOURCE, _U2_EPILOGUE, store_acc),
+            _probe(hc_fused._DECODE_UP, _U2_EPILOGUE, store_acc),
             _U2_ACT_COMBINE,
             "        if (threadgroup_position_in_grid.y == 0) sums[(size_t)r * PR + i] = v;\n"
             + _U2_ACT_COMBINE,
@@ -1312,15 +1309,22 @@ def test_two_launch_decode_keeps_three_launch_fp32_sums(
         _U2_INJ_COMBINE,
         "        sums[(size_t)r * PR + i] = v;\n" + _U2_INJ_COMBINE,
     )
-    new_accs, _, new_sums = mx.fast.metal_kernel(
-        name="test_hc_up2_sums",
-        input_names=["xn", "parts", "up_w", "up_s", "up_b"],
-        output_names=["mixed", "inj", "sums"],
-        header=hc_fused._V2_HEADER,
-        source=up2_probe,
+    new_accs, _, new_sums = hc_fused.kernels.face_kernel(
+        "test_hc_up2_sums",
+        ("xn", "parts", "up"),
+        {"up": up_face},
+        ("mixed", "inj", "sums"),
+        "",
+        up2_probe,
     )(
         inputs=[normed, parts, up.weight, up.scales, up.biases],
-        template=[*up_template, ("INJ", 1), ("NO", outputs), ("TGS", threads)],
+        template=[
+            *up_template,
+            ("INJ", 1),
+            ("NO", outputs),
+            ("NC", chunks),
+            ("TGS", threads),
+        ],
         grid=(threads, WIDTH // outputs, rows),
         threadgroup=(threads, 1, 1),
         output_shapes=[(rows, WIDTH), (rows, HC), (rows, LOWRANK + HC)],

@@ -1283,10 +1283,20 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 | Armed sg8 single projection and dense gate/up SwiGLU | codes | `omlx/patches/qwen35_verify_qmm.py` |
 | Qwen3.5-family one-token MoE decode: routed and shared expert rows | dot | `omlx/patches/qwen35_moe_routed_decode.py` |
 | Qwen3.5-family verify blocks of 2 to 8 rows: routed expert rows, grouped by expert | dot | `omlx/patches/moe_verify_gather.py` |
+| Qwen4 hyper-connection decode and verify, 1–16 rows | dot | `qwen4_exp/hc_fused.py` |
 | A format's own layers: the rows of a decode step or of a short block, a switch layer's pairs | dot | `omlx/formats/linear.py` |
 | Sorted prefill for format switch layers | tile | `omlx/formats/linear.py` |
 | M3 sorted gather for format switch layers | tile | `omlx/formats/tile_gather.py` |
 | M5 sorted prefill and fused SwiGLU | tile | `omlx/patches/m5_gather_qmm_nax.py` |
+
+The Qwen4 hyper-connection decode preserves the original kernel's summation order
+for MLX affine projections at 4, 5, 6 and 8 bits with groups of 32 or 64.
+Down and up read two packs per lane, including partial blocks. Inject reads one.
+Each of the four down or inject slices applies `finish` to its simdgroup sum.
+An up row adds the independently rounded results of `madd(0, …)` in chunk order
+and applies `finish` to the complete sum. At 7–16 rows, the stock 8-bit
+up projection with 64-value groups reads each scale and bias once per group.
+It decodes each chunk as it adds it to the row.
 
 The routed decode plans its launches for a bf16 or fp16 activation when both the gate+up and down faces are exact for it. A face with an empty `dtypes` accepts all three types in `formats.FLOATS`. The activation dtype selects the top-k kernel and is part of the proof shared between blocks. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches. A block whose fused gate+up width is odd keeps its composed path: halving it would shift every expert past the first.
 

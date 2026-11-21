@@ -28,10 +28,12 @@ from __future__ import annotations
 import functools
 import logging
 from itertools import chain
-from operator import is_
+from operator import is_, itemgetter
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from omlx.formats import affine, kernels
 
 from . import hc_prefill_nax
 from .hc_projection import _HEADER
@@ -54,7 +56,7 @@ _NAX_AVAILABLE: bool | None = None
 _NAX_BROKEN = False
 _DECODE_V2 = True
 _KERNELS: dict[str, object] = {}
-_VALIDATED: set[tuple] = set()
+_VALIDATED: set[object] = set()
 _FAILURE_LOGGED = False
 _INELIGIBLE_LOGGED = False
 
@@ -88,61 +90,55 @@ _N_SOURCE = r"""
     }
 """
 
-_D_SOURCE = r"""
+# The two down kernels traverse the same K slice. Its activations can be a
+# stream staged in threadgroup memory or a slice of the device norm buffer.
+_SLICE_HEADER = r"""
+template <int K, int S, int N, typename Matrix, typename XP>
+METAL_FUNC void hc_slice(Matrix m, int first, int slice, uint lane, XP x,
+                         thread float (&result)[N]) {
+    using L = typename Matrix::template Lanes<K>;
+    static_assert(S % L::VPT == 0, "HC slice must hold whole lanes");
+    constexpr int whole = S - S % L::BLOCK;
+    constexpr int tail = S % L::BLOCK / L::VPT;
+    L cursor(m, first, slice * (S / L::VPT) + lane);
+    x += lane * L::VPT;
+    float xt[L::VPT];
+    for (int k = 0; k < whole; k += L::BLOCK) {
+        const auto aux = L::load(x, xt);
+        for (int r = 0; r < N; ++r)
+            result[r] = L::madd(result[r], cursor.row(r), xt, aux);
+        cursor.step();
+        x += L::BLOCK;
+    }
+    if constexpr (tail > 0) {
+        if (lane < uint(tail)) {
+            const auto aux = L::load(x, xt);
+            for (int r = 0; r < N; ++r)
+                result[r] = L::madd(result[r], cursor.row(r), xt, aux);
+        }
+    }
+    for (int r = 0; r < N; ++r)
+        result[r] = cursor.finish(r, metal::simd_sum(result[r]));
+}
+"""
+
+_DOWN = r"""
     const uint tg = threadgroup_position_in_grid.y;
     const uint row = threadgroup_position_in_grid.z;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     constexpr int KS = 4;
     constexpr int SLICE = K / KS;
-    constexpr int GROUPS = K / GS_D;
     threadgroup float part[KS][8];
     const device T* x = xn + (size_t)row * K;
     const int rg = int(sg & 1);
     const int ks = int(sg >> 1);
     if (tg < R / 8) {
-        constexpr int PF = hc_pack_factor<BITS_D>();
-        constexpr int BP = hc_bytes_per_pack<BITS_D>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int PPT = 2;
-        constexpr int VPT = PF * PPT;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = GS_D / VPT;
         const int out_row = int(tg) * 8 + rg * 4;
-        const device uint8_t* wp = (const device uint8_t*)down_w
-            + out_row * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * PPT * BP;
-        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / GS_D)
-            + int(lane) / SCALE_STEP;
-        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / GS_D)
-            + int(lane) / SCALE_STEP;
-        const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[4] = {0.0f};
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector<T, VPT, BITS_D>(xp, xv);
-            for (int r = 0; r < 4; ++r) {
-                result[r] += hc_qdot<VPT, BITS_D>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
-            }
-            wp += BLOCK * BP / PF;
-            sp += BLOCK / GS_D;
-            bp += BLOCK / GS_D;
-            xp += BLOCK;
-        }
-        // Load only lanes inside the tail; all lanes must join simd_sum.
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector<T, VPT, BITS_D>(xp, xv);
-            for (int r = 0; r < 4; ++r) {
-                result[r] += hc_qdot<VPT, BITS_D>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
-            }
-        }
+        hc_slice<K, SLICE>(down, out_row, ks, lane, x + ks * SLICE, result);
         for (int r = 0; r < 4; ++r) {
-            float v = simd_sum(result[r]);
-            if (lane == 0) part[ks][rg * 4 + r] = v;
+            if (lane == 0) part[ks][rg * 4 + r] = result[r];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg < 2 && lane < 4) {
@@ -157,45 +153,10 @@ _D_SOURCE = r"""
     }
     if (INJ == 0 || rg != 0) return;
     {
-        constexpr int PF = hc_pack_factor<BITS_I>();
-        constexpr int BP = hc_bytes_per_pack<BITS_I>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int PPT = 1;
-        constexpr int VPT = PF;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int GROUPS_I = K / GS_I;
-        constexpr int SCALE_STEP = GS_I / VPT;
-        const device uint8_t* wp = (const device uint8_t*)inject_w
-            + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + ks * (SLICE / GS_I) + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + ks * (SLICE / GS_I) + int(lane) / SCALE_STEP;
-        const device T* xp = x + ks * SLICE + int(lane) * VPT;
         float result[HC] = {0.0f};
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS_I]), float(bp[r * GROUPS_I]), sum);
-            }
-            wp += BLOCK * BP / PF;
-            sp += BLOCK / GS_I;
-            bp += BLOCK / GS_I;
-            xp += BLOCK;
-        }
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector<T, VPT, BITS_I>(xp, xv);
-            for (int r = 0; r < HC; ++r) {
-                result[r] += hc_qdot<VPT, BITS_I>(
-                    wp + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS_I]), float(bp[r * GROUPS_I]), sum);
-            }
-        }
+        hc_slice<K, SLICE>(inject, 0, ks, lane, x + ks * SLICE, result);
         for (int r = 0; r < HC; ++r) {
-            float v = simd_sum(result[r]);
-            if (lane == 0) part[ks][r] = v;
+            if (lane == 0) part[ks][r] = result[r];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (sg == 0 && lane < HC) {
@@ -207,42 +168,40 @@ _D_SOURCE = r"""
     }
 """
 
-_U_SOURCE = r"""
+def _serial_up_source(dot, scratch=""):
+    """Share the serial up kernel's indexing, sigmoid and stream mix."""
+    return f"""
     const uint g = threadgroup_position_in_grid.y;
     const uint t = thread_index_in_threadgroup;
     const int h = int(g) * 64 + int(t >> 2);
     const int s = int(t & 3);
     const int n = s * H + h;
-    constexpr int PF = hc_pack_factor<BITS_U>();
-    constexpr int BP = hc_bytes_per_pack<BITS_U>();
-    constexpr int ROW_BYTES = R * BP / PF;
-    constexpr int GROUPS_R = R / GS_U;
-    constexpr int CH = 2 * PF;
-    constexpr int CPG = GS_U / CH;
-    const device uint8_t* w = (const device uint8_t*)up_w + (size_t)n * ROW_BYTES;
-    const device T* sp = up_s + (size_t)n * GROUPS_R;
-    const device T* bp = up_b + (size_t)n * GROUPS_R;
-    float xv[CH];
-    const int r = threadgroup_position_in_grid.z;
+    using L = typename decltype(up)::template Lanes<R>;
+    static_assert(R % L::VPT == 0, "HC up row must hold whole chunks");
+{scratch}    const int r = threadgroup_position_in_grid.z;
     const device T* a = act + (size_t)r * R;
-    float acc = 0.0f;
-    for (int gq = 0; gq < GROUPS_R; ++gq) {
-        const float sc = float(sp[gq]);
-        const float bi = float(bp[gq]);
-        for (int c = 0; c < CPG; ++c) {
-            const int e = gq * GS_U + c * CH;
-            float sum = hc_load_vector<T, CH, BITS_U>(a + e, xv);
-            acc += hc_qdot<CH, BITS_U>(w + e * BP / PF, xv, sc, bi, sum);
-        }
-    }
-    float gate = 1.0f / (1.0f + metal::exp(-acc));
+{dot}    float gate = 1.0f / (1.0f + metal::exp(-acc));
     float v = gate * float(xn[(size_t)r * K + n]);
     v += simd_shuffle_down(v, 1);
     v += simd_shuffle_down(v, 2);
     if (s == 0) mixed[(size_t)r * H + h] = T(v / float(HC));
 """
 
-# Two-launch decode, bit-identical to _N_SOURCE/_WND_SOURCE -> _D_SOURCE -> _U_SOURCE.
+
+_UP = _serial_up_source(
+    r"""    float acc = 0.0f;
+    for (int c = 0; c < R / L::VPT; ++c) {
+        L cursor(up, n, c);
+        const auto aux = L::load(a + c * L::VPT, xv);
+        acc += L::madd(0.0f, cursor.row(0), xv, aux);
+    }
+    acc = L(up, n, 0).finish(0, acc);
+""",
+    scratch="    float xv[L::VPT];\n",
+)
+_STREAM_UP = _serial_up_source("    float acc = hc_stream_up<R>(up, n, a);\n")
+
+# Two-launch decode, bit-identical to _N_SOURCE/_WND_SOURCE -> _DOWN -> _UP.
 # A dependent launch costs ~2 us of GPU time on its own, and the three-launch
 # kernels ran on 4, 41 and 40 threadgroups of an 80-core GPU. With four streams
 # the down projection's K slice ks is stream ks, so the stream norm folds into
@@ -250,14 +209,14 @@ _U_SOURCE = r"""
 # normalizes only its own stream. Device stores come last in both kernels: a
 # device load after a store the compiler cannot prove disjoint waits for it.
 #
-# _NDN_SOURCE: threadgroup (g, ks) normalizes stream ks (and applies the pending
+# _NORM_DOWN: threadgroup (g, ks) normalizes stream ks (and applies the pending
 # write) exactly like the norm kernels (element k = t + i * 256, simd_sum, then
 # the eight partials in order) into threadgroup memory. Simdgroup sg then runs the
-# _D_SOURCE lanes, block order and simd_sum of down rows g * 8 * RPS + sg * RPS + r
+# _DOWN lanes, block order and simd_sum of down rows g * 8 * RPS + sg * RPS + r
 # over slice ks (RPS only sets how many rows share one pass over x); the extra row
 # group g = R / (8 * RPS) runs the inject rows. Each simd_sum goes to
 # parts[row][ks][out], and threadgroup (g, ks) stores strip i = g of stream ks.
-_NDN_SOURCE_TEMPLATE = r"""
+_NORM_DOWN_TEMPLATE = r"""
     const uint gy = threadgroup_position_in_grid.y;
     const uint row = threadgroup_position_in_grid.z;
     const uint t = thread_index_in_threadgroup;
@@ -268,8 +227,6 @@ _NDN_SOURCE_TEMPLATE = r"""
     constexpr int PER = (H + 255) / 256;
     constexpr int KS = 4;
     constexpr int SLICE = K / KS;
-    constexpr int GROUPS = K / GS_D;
-    constexpr int GROUPS_I = K / GS_I;
     constexpr int PR = R + HC;
     constexpr int ROWS_TG = 8 * RPS;
     constexpr int NDG = R / ROWS_TG;
@@ -310,81 +267,17 @@ _NDN_SOURCE_TEMPLATE = r"""
     const int ks = int(s);
     device float* pp = parts + ((size_t)row * KS + ks) * PR;
     if (down_tg) {
-        constexpr int PF = hc_pack_factor<BITS_D>();
-        constexpr int BP = hc_bytes_per_pack<BITS_D>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int PPT = 2;
-        constexpr int VPT = PF * PPT;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = GS_D / VPT;
         const int out_row = int(g) * ROWS_TG + int(sg) * RPS;
-        const device uint8_t* wq = (const device uint8_t*)down_w
-            + out_row * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * PPT * BP;
-        const device T* sp = down_s + out_row * GROUPS + ks * (SLICE / GS_D)
-            + int(lane) / SCALE_STEP;
-        const device T* bp = down_b + out_row * GROUPS + ks * (SLICE / GS_D)
-            + int(lane) / SCALE_STEP;
-        const threadgroup T* xp = xs + int(lane) * VPT;
         float result[RPS] = {0.0f};
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector_tg<T, VPT, BITS_D>(xp, xv);
-            for (int r = 0; r < RPS; ++r) {
-                result[r] += hc_qdot<VPT, BITS_D>(
-                    wq + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
-            }
-            wq += BLOCK * BP / PF;
-            sp += BLOCK / GS_D;
-            bp += BLOCK / GS_D;
-            xp += BLOCK;
-        }
-        // Load only lanes inside the tail; all lanes must join simd_sum.
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector_tg<T, VPT, BITS_D>(xp, xv);
-            for (int r = 0; r < RPS; ++r) {
-                result[r] += hc_qdot<VPT, BITS_D>(
-                    wq + r * ROW_BYTES, xv,
-                    float(sp[r * GROUPS]), float(bp[r * GROUPS]), sum);
-            }
-        }
+        hc_slice<K, SLICE>(down, out_row, ks, lane, xs, result);
         for (int r = 0; r < RPS; ++r) {
-            float v = simd_sum(result[r]);
-            if (lane == 0) pp[out_row + r] = v;
+            if (lane == 0) pp[out_row + r] = result[r];
         }
     } else if (INJ != 0 && int(sg) < HC) {
-        constexpr int PF = hc_pack_factor<BITS_I>();
-        constexpr int BP = hc_bytes_per_pack<BITS_I>();
-        constexpr int ROW_BYTES = K * BP / PF;
-        constexpr int VPT = PF;
-        constexpr int BLOCK = VPT * 32;
-        constexpr int SCALE_STEP = GS_I / VPT;
         const int r = int(sg);
-        const device uint8_t* wq = (const device uint8_t*)inject_w
-            + r * ROW_BYTES + ks * (SLICE * BP / PF) + int(lane) * BP;
-        const device T* sp = inject_s + r * GROUPS_I + ks * (SLICE / GS_I)
-            + int(lane) / SCALE_STEP;
-        const device T* bp = inject_b + r * GROUPS_I + ks * (SLICE / GS_I)
-            + int(lane) / SCALE_STEP;
-        const threadgroup T* xp = xs + int(lane) * VPT;
-        float result = 0.0f;
-        float xv[VPT];
-        constexpr int TAIL = SLICE % BLOCK;
-        for (int k = 0; k < SLICE - TAIL; k += BLOCK) {
-            float sum = hc_load_vector_tg<T, VPT, BITS_I>(xp, xv);
-            result += hc_qdot<VPT, BITS_I>(wq, xv, float(sp[0]), float(bp[0]), sum);
-            wq += BLOCK * BP / PF;
-            sp += BLOCK / GS_I;
-            bp += BLOCK / GS_I;
-            xp += BLOCK;
-        }
-        if (TAIL > 0 && int(lane) * VPT < TAIL) {
-            float sum = hc_load_vector_tg<T, VPT, BITS_I>(xp, xv);
-            result += hc_qdot<VPT, BITS_I>(wq, xv, float(sp[0]), float(bp[0]), sum);
-        }
-        float v = simd_sum(result);
-        if (lane == 0) pp[R + r] = v;
+        float result[1] = {0.0f};
+        hc_slice<K, SLICE>(inject, r, ks, lane, xs, result);
+        if (lane == 0) pp[R + r] = result[0];
     }
     if (int(g) < PER && int(t) + int(g) * 256 < H) {
         const size_t at = base + int(t) + int(g) * 256;
@@ -418,30 +311,21 @@ _NDN_WRITE_LOAD = r"""
 """
 
 
-def _ndn_source(load: str, write: bool) -> str:
-    return _NDN_SOURCE_TEMPLATE.replace("    // LOAD\n", load).replace(
-        "        // WRITE\n", "        y_out[at] = y_mine;\n" if write else ""
-    )
+_NORM_DOWN = _NORM_DOWN_TEMPLATE.replace("// LOAD", _NDN_LOAD).replace("// WRITE", "")
+_WRITE_NORM_DOWN = _NORM_DOWN_TEMPLATE.replace("// LOAD", _NDN_WRITE_LOAD).replace(
+    "// WRITE", "y_out[at] = y_mine;"
+)
 
-
-_NDN_SOURCE = _ndn_source(_NDN_LOAD, write=False)
-_NDNW_SOURCE = _ndn_source(_NDN_WRITE_LOAD, write=True)
-
-# _U2_SOURCE: threadgroup y owns up rows j = s * HB + hh (n = s * H + y * HB + hh).
-# Every threadgroup combines the slice sums as _D_SOURCE does (part[0] + part[1]
+# _DECODE_UP: threadgroup y owns up rows j = s * HB + hh (n = s * H + y * HB + hh).
+# Every threadgroup combines the slice sums as _DOWN does (part[0] + part[1]
 # + part[2] + part[3], then / HC and the BF16-rounded silu; 2 * sigmoid for the
 # inject rows in threadgroup 0) into threadgroup memory. Thread t then owns chunk
 # c = t % NC of rows j = t / NC, t / NC + TGS / NC, ... and stages each hc_qdot;
 # one thread per output adds its NC chunks in chunk order from 0.0f, and the
-# sigmoid gate / shuffle-down stream mix is _U_SOURCE's.
-_U2_SOURCE = r"""
-    constexpr int PF = hc_pack_factor<BITS_U>();
-    constexpr int BP = hc_bytes_per_pack<BITS_U>();
-    constexpr int ROW_BYTES = R * BP / PF;
-    constexpr int GROUPS_R = R / GS_U;
-    constexpr int CH = 2 * PF;
-    constexpr int CPG = GS_U / CH;
-    constexpr int NC = R / CH;
+# sigmoid gate / shuffle-down stream mix is _UP's.
+_DECODE_UP = r"""
+    using L = typename decltype(up)::template Lanes<R>;
+    static_assert(R == NC * L::VPT, "HC up tile must hold whole chunks");
     constexpr int NCP = NC + 1;
     constexpr int HB = NO / HC;
     constexpr int JS = TGS / NC;
@@ -476,16 +360,12 @@ _U2_SOURCE = r"""
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
         const int c = int(t) % NC;
-        const int gq = c / CPG;
-        const int e = c * CH;
-        float xv[CH];
-        float sum = hc_load_vector_tg<T, CH, BITS_U>(acts + e, xv);
+        float xv[L::VPT];
+        const auto aux = L::load(acts + c * L::VPT, xv);
         for (int j = int(t) / NC; j < NO; j += JS) {
             const int nj = (j / HB) * H + h0 + j % HB;
-            const device uint8_t* w = (const device uint8_t*)up_w + (size_t)nj * ROW_BYTES;
-            const float sc = float(up_s[(size_t)nj * GROUPS_R + gq]);
-            const float bi = float(up_b[(size_t)nj * GROUPS_R + gq]);
-            q[j * NCP + c] = hc_qdot<CH, BITS_U>(w + e * BP / PF, xv, sc, bi, sum);
+            L cursor(up, nj, c);
+            q[j * NCP + c] = L::madd(0.0f, cursor.row(0), xv, aux);
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -495,6 +375,7 @@ _U2_SOURCE = r"""
     for (int c = 0; c < NC; ++c) {
         acc += qp[c];
     }
+    acc = L(up, n, 0).finish(0, acc);
     float gate = 1.0f / (1.0f + metal::exp(-acc));
     float v = gate * xnv;
     v += simd_shuffle_down(v, 1);
@@ -623,9 +504,6 @@ inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
     return sum;
 }
 """
-
-_V2_HEADER = _HEADER + _TG_HEADER
-
 
 def _kernel(
     name: str,
@@ -934,8 +812,20 @@ def _gpu_class() -> str:
         return ""
 
 
-def _up_chunks(bits: int, lowrank: int) -> int:
-    return lowrank // (2 * _pack_factor(bits))
+def _decode_face(layer, inject):
+    return affine.face(
+        layer.bits,
+        layer.group_size,
+        not inject,
+        layer["scales"].dtype,
+        partial_blocks=not inject,
+    )
+
+
+def _matrix_reader(face):
+    if not face.tensors:
+        return lambda layer: (layer["weight"],)
+    return itemgetter("weight", *face.tensors)
 
 
 def _down_rps(rows: int) -> int:
@@ -952,114 +842,169 @@ def _down_row_groups(lowrank: int, inject: bool, rps: int) -> int:
     return lowrank // (8 * rps) + int(inject)
 
 
-def _decode_v2(rows: int, hc: int, hidden: int, lowrank: int, up_bits: int, inject: bool) -> bool:
+def _decode_v2(
+    rows: int,
+    hc: int,
+    hidden: int,
+    lowrank: int,
+    chunks: int,
+    inject: bool,
+    itemsize: int = 2,
+) -> bool:
     """Whether the two-launch decode kernels apply: four streams, one stored
     256-element strip per norm/down threadgroup, and each kernel's threadgroup
     arrays within threadgroup memory."""
     rps = _down_rps(rows)
-    chunks = _up_chunks(up_bits, lowrank)
     return (
         _DECODE_V2
         and rows <= _V2_MAX_ROWS
         and hc == 4
         and lowrank % (8 * rps) == 0
         and -(-hidden // 256) <= _down_row_groups(lowrank, inject, rps)
-        and hidden * 2 + 32 <= _TG_MEMORY_BYTES
-        and lowrank * 2 + _up_outputs(rows) * (chunks + 1) * 4 <= _TG_MEMORY_BYTES
-        and chunks <= _V2_UP_THREADS
+        and hidden * itemsize + 32 <= _TG_MEMORY_BYTES
+        and lowrank * itemsize + _up_outputs(rows) * (chunks + 1) * 4
+        <= _TG_MEMORY_BYTES
+        and 0 < chunks <= _V2_UP_THREADS
     )
 
 
-def _kernel_norm_down(module, flat, operands, rows, hc, hidden, lowrank, dtype, down, inject):
-    """(written or None, normed, parts): the stream norm (with the pending write)
-    and the per-slice down/inject simd sums, parts[row][slice][R + HC], in one launch."""
-    width = hc * hidden
-    tensors = inject if inject is not None else down
-    inputs = [
-        module["hc_norm"]["weight"],
-        _eps_array(module),
-        down["weight"],
-        down["scales"],
-        down["biases"],
-        tensors["weight"],
-        tensors["scales"],
-        tensors["biases"],
-    ]
-    names = ["w", "eps", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"]
-    rps = _down_rps(rows)
-    launch = dict(
-        template=[
-            ("T", dtype),
-            ("BITS_D", down.bits),
-            ("BITS_I", tensors.bits),
-            ("GS_D", down.group_size),
-            ("GS_I", tensors.group_size),
-            ("K", width),
-            ("H", hidden),
-            ("R", lowrank),
-            ("HC", hc),
-            ("INJ", 1 if inject is not None else 0),
-            ("RPS", rps),
-        ],
-        grid=(256, hc * _down_row_groups(lowrank, inject is not None, rps), rows),
-        threadgroup=(256, 1, 1),
-    )
-    shapes = [(rows, width), (rows, hc, lowrank + hc)]
-    types = [dtype, mx.float32]
+def _down_kernel(name, inputs, matrices, outputs, source):
+    if "inject" not in matrices:
+        # INJ is zero and the compiler elides the unused bank.
+        source = "const auto inject = down;\n" + source
+    return kernels.face_kernel(name, inputs, matrices, outputs, _SLICE_HEADER, source)
+
+
+def _kernel_norm_down(launch, module, flat, operands, weights):
+    norm = (module.hc_norm.weight, _eps_array(module))
     if operands is None:
-        normed, parts = _kernel(
-            "omlx_qwen4_hc_decode_norm_down",
-            ["x", *names],
-            ["xn", "parts"],
-            _NDN_SOURCE,
-            header=_V2_HEADER,
-        )(inputs=[flat, *inputs], output_shapes=shapes, output_dtypes=types, **launch)
-        return None, normed, parts
-    written, normed, parts = _kernel(
-        "omlx_qwen4_hc_decode_write_norm_down",
-        ["x", "branch", "gate", *names],
-        ["y_out", "xn", "parts"],
-        _NDNW_SOURCE,
-        header=_V2_HEADER,
-    )(
-        inputs=[flat, *operands, *inputs],
-        output_shapes=[(rows, width), *shapes],
-        output_dtypes=[dtype, *types],
-        **launch,
-    )
-    return written, normed, parts
+        xn, parts = launch(inputs=[flat, *norm, *weights])
+        return None, xn, parts
+    return launch(inputs=[flat, *operands, *norm, *weights])
 
 
-def _kernel_up_mix(normed, parts, rows, hc, hidden, lowrank, dtype, up, inject: bool):
-    """(mixed, inj): slice-sum combine and activations, then the up projection and stream mix."""
-    chunks = _up_chunks(up.bits, lowrank)
-    threads = chunks * (_V2_UP_THREADS // chunks)
-    outputs = _up_outputs(rows)
-    return _kernel(
-        "omlx_qwen4_hc_decode_up",
-        ["xn", "parts", "up_w", "up_s", "up_b"],
-        ["mixed", "inj"],
-        _U2_SOURCE,
-        header=_V2_HEADER,
-    )(
-        inputs=[normed, parts, up["weight"], up["scales"], up["biases"]],
-        template=[
-            ("T", dtype),
-            ("BITS_U", up.bits),
-            ("GS_U", up.group_size),
-            ("K", hc * hidden),
-            ("R", lowrank),
-            ("HC", hc),
-            ("H", hidden),
-            ("INJ", int(inject)),
-            ("NO", outputs),
-            ("TGS", threads),
-        ],
-        grid=(threads, hc * hidden // outputs, rows),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[(rows, hidden), (rows, hc)],
-        output_dtypes=[dtype, dtype],
-    )
+@functools.cache
+def _decode_launch(
+    rows, hc, hidden, lowrank, dtype, down_face, up_face, inj_face, write, two, rps, no
+):
+    """Specialize the two weight-reading launches for one geometry and layout.
+    This callable holds kernel arguments shared by layers and threads. Each
+    call reads its own layer's arrays, including replacements after a load.
+    """
+    width = hc * hidden
+    inject = inj_face is not None
+    matrices = {"down": down_face}
+    down_inputs = _matrix_reader(down_face)
+    up_inputs = _matrix_reader(up_face)
+    if inject:
+        matrices["inject"] = inj_face
+        inj_inputs = _matrix_reader(inj_face)
+
+    shape = [("T", dtype), ("K", width), ("R", lowrank), ("HC", hc)]
+    if two:
+        names = ("x", "branch", "gate") if write else ("x",)
+        results = ("y_out", "xn", "parts") if write else ("xn", "parts")
+        shapes = [(rows, width)] * (1 + int(write)) + [(rows, hc, lowrank + hc)]
+        name = "write_norm_down" if write else "norm_down"
+        down_kernel = _down_kernel(
+            f"omlx_qwen4_hc_decode_{name}",
+            (*names, "w", "eps", *matrices),
+            matrices,
+            results,
+            _WRITE_NORM_DOWN if write else _NORM_DOWN,
+        )
+        down = functools.partial(
+            down_kernel,
+            template=[*shape, ("H", hidden), ("INJ", int(inject)), ("RPS", rps)],
+            grid=(256, hc * _down_row_groups(lowrank, inject, rps), rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=shapes,
+            output_dtypes=[dtype] * (1 + int(write)) + [mx.float32],
+        )
+        chunks = lowrank // up_face.vpt
+        threads = chunks * (_V2_UP_THREADS // chunks)
+        up_kernel = kernels.face_kernel(
+            "omlx_qwen4_hc_decode_up",
+            ("xn", "parts", "up"),
+            {"up": up_face},
+            ("mixed", "inj"),
+            "",
+            _DECODE_UP,
+        )
+        up = functools.partial(
+            up_kernel,
+            template=[
+                *shape,
+                ("H", hidden),
+                ("INJ", int(inject)),
+                ("NO", no),
+                ("NC", chunks),
+                ("TGS", threads),
+            ],
+            grid=(threads, width // no, rows),
+            threadgroup=(threads, 1, 1),
+            output_shapes=[(rows, hidden), (rows, hc)],
+            output_dtypes=[dtype, dtype],
+        )
+    else:
+        down_kernel = _down_kernel(
+            "omlx_qwen4_hc_fused_down",
+            ("xn", *matrices),
+            matrices,
+            ("act", "inj"),
+            _DOWN,
+        )
+        down = functools.partial(
+            down_kernel,
+            template=[*shape, ("INJ", int(inject))],
+            grid=(32, 8 * (lowrank // 8 + 1), rows),
+            threadgroup=(32, 8, 1),
+            output_shapes=[(rows, lowrank), (rows, hc)],
+            output_dtypes=[dtype, dtype],
+        )
+        # Only the stock 8-bit g64 up shares these group scalars.
+        streaming = 7 <= rows <= 16 and up_face is affine.face(
+            8, 64, True, dtype, partial_blocks=True
+        )
+        up_kernel = kernels.face_kernel(
+            "omlx_qwen4_hc_fused_up",
+            ("xn", "act", "up"),
+            {"up": up_face},
+            ("mixed",),
+            affine.serial_up_header(up_face) if streaming else "",
+            _STREAM_UP if streaming else _UP,
+        )
+        up = functools.partial(
+            up_kernel,
+            template=[*shape, ("H", hidden)],
+            grid=(256, hidden // 64, rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, hidden)],
+            output_dtypes=[dtype],
+        )
+
+    def launch(module, flat, operands, down_layer, up_layer, inj_layer):
+        weights = down_inputs(down_layer)
+        if inject:
+            weights += inj_inputs(inj_layer)
+        if two:
+            written, xn, parts = _kernel_norm_down(
+                down, module, flat, operands, weights
+            )
+            mixed, injection = up(inputs=[xn, parts, *up_inputs(up_layer)])
+        else:
+            if write:
+                written, xn = _kernel_write_norm(
+                    module, flat, *operands, rows, hc, hidden, dtype, precise=False
+                )
+            else:
+                written = None
+                xn = _kernel_norm(module, flat, rows, hc, hidden, dtype)
+            act, injection = down(inputs=[xn, *weights])
+            mixed = up(inputs=[xn, act, *up_inputs(up_layer)])[0]
+        return written, mixed, injection
+
+    return launch
 
 
 _TAILS: dict[tuple[int, int], object] = {}
@@ -1325,97 +1270,38 @@ def fused_forward(module, hyper_input, write=None):
             operands = _write_operands(hyper_input, write, hidden, hc)
             if operands is None:
                 return None
-        v2 = _decode_v2(rows, hc, hidden, lowrank, up.bits, inject is not None)
-        if v2:
-            written, normed, parts = _kernel_norm_down(
-                module, flat, operands, rows, hc, hidden, lowrank, dtype, down, inject
-            )
-            mixed, injection = _kernel_up_mix(
-                normed, parts, rows, hc, hidden, lowrank, dtype, up, inject is not None
-            )
-        else:
-            written, normed = (
-                (None, _kernel_norm(module, flat, rows, hc, hidden, dtype))
-                if operands is None
-                else _kernel_write_norm(
-                    module, flat, *operands, rows, hc, hidden, dtype, precise=False
-                )
-            )
-            if inject is not None:
-                inject_tensors = (inject.weight, inject.scales, inject.biases)
-            else:
-                inject_tensors = (down.weight, down.scales, down.biases)
-            act, injection = _kernel(
-                "omlx_qwen4_hc_fused_down",
-                ["xn", "down_w", "down_s", "down_b", "inject_w", "inject_s", "inject_b"],
-                ["act", "inj"],
-                _D_SOURCE,
-                header=_HEADER,
-            )(
-                inputs=[normed, down.weight, down.scales, down.biases, *inject_tensors],
-                template=[
-                    ("T", dtype),
-                    ("BITS_D", down.bits),
-                    ("BITS_I", inject.bits if inject is not None else down.bits),
-                    ("GS_D", down.group_size),
-                    ("GS_I", inject.group_size if inject is not None else down.group_size),
-                    ("K", width),
-                    ("R", lowrank),
-                    ("HC", hc),
-                    ("INJ", 1 if inject is not None else 0),
-                ],
-                grid=(32, 8 * (lowrank // 8 + 1), rows),
-                threadgroup=(32, 8, 1),
-                output_shapes=[(rows, lowrank), (rows, hc)],
-                output_dtypes=[dtype, dtype],
-            )
-            mixed = _kernel(
-                "omlx_qwen4_hc_fused_up",
-                ["xn", "act", "up_w", "up_s", "up_b"],
-                ["mixed"],
-                _U_SOURCE,
-                header=_HEADER,
-            )(
-                inputs=[normed, act, up.weight, up.scales, up.biases],
-                template=[
-                    ("T", dtype),
-                    ("BITS_U", up.bits),
-                    ("GS_U", up.group_size),
-                    ("K", width),
-                    ("R", lowrank),
-                    ("HC", hc),
-                    ("H", hidden),
-                ],
-                grid=(256, hidden // 64, rows),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(rows, hidden)],
-                output_dtypes=[dtype],
-            )[0]
-        if written is not None:
-            hyper_input = written.reshape(hyper_input.shape)
-        signature = (
-            dtype,
+        down_face = _decode_face(down, False)
+        up_face = _decode_face(up, False)
+        inject_face = _decode_face(inject, True) if inject is not None else None
+        chunks = lowrank // up_face.vpt
+        two = _decode_v2(
+            rows, hc, hidden, lowrank, chunks, inject is not None, dtype.size
+        )
+        launch = _decode_launch(
+            rows,
             hc,
             hidden,
             lowrank,
-            rows,
-            down.bits,
-            up.bits,
-            inject.bits if inject is not None else None,
-            down.group_size,
-            up.group_size,
-            inject.group_size if inject is not None else None,
+            dtype,
+            down_face,
+            up_face,
+            inject_face,
             write is not None,
-            v2,
+            two,
+            _down_rps(rows) if two else 0,
+            _up_outputs(rows) if two else 0,
         )
-        if signature not in _VALIDATED:
+        written, mixed, injection = launch(module, flat, operands, down, up, inject)
+        if written is not None:
+            hyper_input = written.reshape(hyper_input.shape)
+        if launch not in _VALIDATED:
             # Metal compilation is lazy. Validate once, without synchronizing
             # subsequent layers or decode steps using the same specialization.
             if inject is None:
                 mx.eval(mixed)
             else:
                 mx.eval(mixed, injection)
-            _VALIDATED.add(signature)
+            _VALIDATED.add(launch)
         mixed = mixed.reshape(batch, seq, hidden)
         if inject is None:
             return mixed if write is None else (mixed, hyper_input)

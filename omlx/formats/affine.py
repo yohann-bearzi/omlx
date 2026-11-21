@@ -408,6 +408,14 @@ def decoded(bits: int) -> str:
 # face's shared source (_SHARED), which only the kernels that apply a block
 # to several inputs include: MLX hashes a kernel's whole source at every
 # launch.
+_QMV_LAYOUT_CHECK = r"""    static_assert(
+        !FAST || K % BLOCK_SIZE == 0,
+        "affine qmv_fast face: K must be whole blocks; AffineFormat.dot gives a K its face");"""
+
+_PARTIAL_LAYOUT_CHECK = r"""    static_assert(
+        K % VPT == 0 && K % GS == 0,
+        "affine partial block: K must be whole lanes and groups");"""
+
 _DOT = r"""
 template <typename T>
 struct Dot {
@@ -422,9 +430,7 @@ struct Dot {
     static constant constexpr int BLOCK = BLOCK_SIZE;
     static constant constexpr int ROW_W = K * BYTES_PER_PACK / PACK_FACTOR;
     static constant constexpr int ROW_G = K / GS;
-    static_assert(
-        !FAST || K % BLOCK_SIZE == 0,
-        "affine qmv_fast face: K must be whole blocks; AffineFormat.dot gives a K its face");
+__LAYOUT_CHECK__
 
     const device uint8_t* w;
     const device T* s;
@@ -510,17 +516,25 @@ def values_per_thread(bits: int, fast: bool) -> int:
 
 
 @cache
-def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
+def face(
+    bits: int, group_size: int, fast: bool, dtype: mx.Dtype, *, partial_blocks=False
+) -> Dot:
     """The dot face of ``bits``-bit weights with ``group_size`` groups, as
-    MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal."""
+    MLX's ``qmv_fast`` (``fast``) or ``qmv`` traversal. A kernel that
+    handles its own tail lanes can request ``partial_blocks`` to walk two
+    packs per lane even when the last simdgroup's block is incomplete."""
     source = header(bits, group_size, fast)
     key = f"affine_b{bits}g{group_size}{'f' if fast else 's'}"
+    if partial_blocks:
+        key += "_partial"
+    check = _PARTIAL_LAYOUT_CHECK if partial_blocks else _QMV_LAYOUT_CHECK
+    dot = _DOT.replace("__LAYOUT_CHECK__", check)
     qdot = _QDOT_FUNCTION.replace("__QDOT__", _QDOT[bits])
     source += qdot
     return Dot(
         key=key,
         source=(
-            f"namespace omlx_{key} {{\n{source}\n{_DOT}\n}}"
+            f"namespace omlx_{key} {{\n{source}\n{dot}\n}}"
             f"  // namespace omlx_{key}\n"
         ),
         shared=(
@@ -531,6 +545,41 @@ def face(bits: int, group_size: int, fast: bool, dtype: mx.Dtype) -> Dot:
         type=f"omlx_{key}::Dot<T>",
         tensors=AffineFormat.tensors,
         dtypes=(dtype,),
+    )
+
+
+# The serial HC up walks adjacent lanes. Keep the group scalars in the row
+# while advancing its packed codes, with one native lane of decoded weights
+# live at a time. Each lane contributes its own rounded partial sum.
+_STREAM_UP = r"""
+template <int R, typename T, typename X>
+METAL_FUNC float hc_stream_up(Dot<T> m, int n, X a) {
+    using L = typename Dot<T>::template Lanes<R>;
+    static_assert(R % GS == 0 && GS % L::VPT == 0, "whole affine groups");
+    constexpr int chunks = GS / L::VPT;
+    float acc = 0.0f;
+    for (int g = 0; g < R / GS; ++g) {
+        auto group = L(m, n, g * chunks).row(0);
+        for (int chunk = 0; chunk < chunks; ++chunk) {
+            float xv[L::VPT];
+            const auto aux = L::load(a + g * GS + chunk * L::VPT, xv);
+            const auto weights = L::decode(group);
+            acc += L::apply(0.0f, weights, xv, aux);
+            group.w += PACKS_PER_THREAD * BYTES_PER_PACK;
+        }
+    }
+    return L(m, n, 0).finish(0, acc);
+}
+"""
+
+
+@cache
+def serial_up_header(face: Dot) -> str:
+    """The shared affine face and its serial HC dot in the face's namespace."""
+    namespace = f"omlx_{face.key}"
+    return (
+        f"{face.shared}\nnamespace {namespace} {{\n{_STREAM_UP}\n}}\n"
+        f"using {namespace}::hc_stream_up;\n"
     )
 
 

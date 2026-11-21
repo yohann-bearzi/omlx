@@ -762,30 +762,31 @@ def down_row_groups(lowrank: int, inject: bool, rps: int) -> int:
     return lowrank // (8 * rps) + int(inject)
 
 
-def two_launch_fits(rows, hc, hidden, lowrank, up_bits, inject, gpu_class) -> bool:
-    """hc_fused's ``_decode_v2`` without its row limit and its switch: whether
-    the two-launch kernels take ``rows`` rows. It counts 2-byte activations
-    in threadgroup memory, as hc_fused does (its decode takes BF16 and FP16
-    rows); FP32 rows stage 4 bytes an element, so a shape that fits here may
-    not fit them."""
+def two_launch_fits(
+    rows, hc, hidden, lowrank, up_bits, inject, gpu_class, itemsize: int = 2
+) -> bool:
+    """Whether the two-launch geometry fits, including the stream and up
+    activations at their stored precision and the FP32 partial sums."""
     rps = down_rps(rows, gpu_class)
     chunks = up_chunks(up_bits, lowrank)
     return (
         hc == 4
         and lowrank % (8 * rps) == 0
         and -(-hidden // 256) <= down_row_groups(lowrank, inject, rps)
-        and hidden * 2 + 32 <= TG_MEMORY_BYTES
-        and lowrank * 2 + up_outputs(rows, gpu_class) * (chunks + 1) * 4
+        and hidden * itemsize + 32 <= TG_MEMORY_BYTES
+        and lowrank * itemsize + up_outputs(rows, gpu_class) * (chunks + 1) * 4
         <= TG_MEMORY_BYTES
-        and chunks <= V2_UP_THREADS
+        and 0 < chunks <= V2_UP_THREADS
     )
 
 
-def takes_two_launches(rows, hc, hidden, lowrank, up_bits, inject, gpu_class) -> bool:
+def takes_two_launches(
+    rows, hc, hidden, lowrank, up_bits, inject, gpu_class, itemsize: int = 2
+) -> bool:
     """hc_fused's choice of form: the two-launch kernels to ``V2_MAX_ROWS``
     rows where they fit, the three-launch kernels otherwise."""
     return rows <= V2_MAX_ROWS and two_launch_fits(
-        rows, hc, hidden, lowrank, up_bits, inject, gpu_class
+        rows, hc, hidden, lowrank, up_bits, inject, gpu_class, itemsize
     )
 
 
@@ -916,6 +917,8 @@ def up_threads(bits: int, lowrank: int) -> int:
     """The up tile's threads: the most whole chunk rows within
     ``V2_UP_THREADS``."""
     chunks = up_chunks(bits, lowrank)
+    if chunks <= 0:
+        raise ValueError("hc oracle: no whole up chunks")
     return chunks * (V2_UP_THREADS // chunks)
 
 
@@ -1031,7 +1034,16 @@ def decode(module, hyper_input, write=None, *, gpu_class, two_launch=None):
     operands = (
         None if write is None else _write_operands(hyper_input, write, hidden, hc)
     )
-    shape = (rows, hc, hidden, lowrank, up.bits, inject is not None, gpu_class)
+    shape = (
+        rows,
+        hc,
+        hidden,
+        lowrank,
+        up.bits,
+        inject is not None,
+        gpu_class,
+        dtype.size,
+    )
     if two_launch is None:
         two_launch = takes_two_launches(*shape)
     elif two_launch and not two_launch_fits(*shape):

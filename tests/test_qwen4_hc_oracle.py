@@ -16,10 +16,15 @@ from __future__ import annotations
 
 import ast
 import inspect
+from concurrent.futures import ThreadPoolExecutor
+from copy import copy
+from dataclasses import replace
+from threading import Barrier
 
 import mlx.core as mx
 import pytest
 
+from omlx.formats import affine
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from tests.oracles import hc_fused as oracle
 from tests.test_qwen4_hc_fused import HC, LOWRANK, _module
@@ -52,13 +57,7 @@ _SOURCES = {
     "NP_SOURCE": ("fused", "_NP_SOURCE"),
     "WN_SOURCE": ("fused", "_WN_SOURCE"),
     "WND_SOURCE": ("fused", "_WND_SOURCE"),
-    "D_SOURCE": ("fused", "_D_SOURCE"),
-    "U_SOURCE": ("fused", "_U_SOURCE"),
-    "NDN_SOURCE": ("fused", "_NDN_SOURCE"),
-    "NDNW_SOURCE": ("fused", "_NDNW_SOURCE"),
-    "U2_SOURCE": ("fused", "_U2_SOURCE"),
     "TI_SOURCE": ("fused", "_TI_SOURCE"),
-    "V2_HEADER": ("fused", "_V2_HEADER"),
 }
 
 
@@ -82,7 +81,8 @@ def test_oracle_sources_are_literals():
     }
     derived = {"NP_SOURCE", "WND_SOURCE", "NDN_SOURCE", "NDNW_SOURCE", "V2_HEADER"}
     pieces = {"NDN_SOURCE_TEMPLATE", "NDN_LOAD", "NDN_WRITE_LOAD"}
-    assert set(_SOURCES) - derived | pieces <= literals
+    frozen_decode = {"D_SOURCE", "U_SOURCE", "U2_SOURCE"}
+    assert (set(_SOURCES) - derived) | pieces | frozen_decode <= literals
     imported = {
         name.split(".")[0]
         for node in ast.walk(tree)
@@ -126,14 +126,14 @@ def _inputs(rows, hidden, dtype, seed, zero=None, batch=1):
     return hyper, (branch, gate)
 
 
-def _modules(bits, group_size, dtype, hidden=2560, seed=0):
+def _modules(bits, group_size, dtype, hidden=2560, seed=0, lowrank=LOWRANK):
     """A module with the inject rows and one without, the same down and up."""
     mx.random.seed(seed)
-    with_inject = _module(bits, True, hidden=hidden, group_size=group_size, dtype=dtype)
-    without = _module(bits, False, hidden=hidden, group_size=group_size, dtype=dtype)
-    without.hc_norm = with_inject.hc_norm
-    without.input_mix_weight_down = with_inject.input_mix_weight_down
-    without.input_mix_weight_up = with_inject.input_mix_weight_up
+    with_inject = _module(
+        bits, True, hidden=hidden, group_size=group_size, dtype=dtype, lowrank=lowrank
+    )
+    without = copy(with_inject)
+    del without["block_inject_weight"]
     return with_inject, without
 
 
@@ -145,16 +145,6 @@ def _decode(monkeypatch, module, hyper, write, gpu_class):
     return live, oracle.decode(module, hyper, write, gpu_class=gpu_class)
 
 
-def _assert_fits_fp32(module, hidden, rows, gpu_class):
-    """two_launch_fits counts 2-byte rows, as hc_fused does: an FP32 shape of
-    these tests fits the two-launch kernels' threadgroup memory at 4 bytes."""
-    lowrank = module.hc_lowrank
-    chunks = oracle.up_chunks(module["input_mix_weight_up"].bits, lowrank)
-    outputs = oracle.up_outputs(rows, gpu_class)
-    assert hidden * 4 + 32 <= oracle.TG_MEMORY_BYTES
-    assert lowrank * 4 + outputs * (chunks + 1) * 4 <= oracle.TG_MEMORY_BYTES
-
-
 def _assert_decode(
     monkeypatch, modules, hidden, dtype, rows_list, gpu_class, seed, writes=True
 ):
@@ -162,8 +152,6 @@ def _assert_decode(
         for rows in rows_list:
             if rows > oracle.V2_MAX_ROWS and gpu_class != "d":
                 continue  # the three-launch kernels have one geometry
-            if dtype == mx.float32:
-                _assert_fits_fp32(module, hidden, rows, gpu_class)
             hyper, pending = _inputs(rows, hidden, dtype, seed + rows)
             for write in (None, pending) if writes else (None,):
                 what = ("decode", rows, "block_inject_weight" in module, write is None)
@@ -230,7 +218,7 @@ def test_zero_rows_match_the_oracle(zero, bits, dtype, monkeypatch):
         for rows in (1, 7):
             hyper, pending = _inputs(rows, 2560, dtype, 0, zero=zero)
             for write in (None, pending) if dtype != mx.float32 else (None,):
-                for gpu_class in ("d", "s"):
+                for gpu_class in ("d", "s") if rows <= oracle.V2_MAX_ROWS else ("d",):
                     _assert_bitwise(
                         *_decode(monkeypatch, module, hyper, write, gpu_class),
                         ("zero decode", rows),
@@ -272,28 +260,30 @@ def test_the_two_decode_forms_give_a_row_the_same_bits(bits, group_size, dtype):
     """What the ports keep: wherever the two-launch kernels take a call, at
     any row count, they give each output the three-launch kernels' bits."""
     seed = 2000 + 10 * bits + group_size
-    for module in _modules(bits, group_size, dtype, seed=seed):
-        inject = "block_inject_weight" in module
-        for gpu_class in ("d", "s"):
-            for rows in range(1, oracle.MAX_ROWS + 1):
-                assert oracle.two_launch_fits(
-                    rows, HC, 2560, LOWRANK, bits, inject, gpu_class
+    modules = _modules(bits, group_size, dtype, seed=seed)
+    for rows in range(1, oracle.MAX_ROWS + 1):
+        hyper, pending = _inputs(rows, 2560, dtype, seed + rows)
+        for module in modules:
+            inject = "block_inject_weight" in module
+            for write in (None, pending):
+                expected = oracle.decode(
+                    module, hyper, write, gpu_class="d", two_launch=False
                 )
-                hyper, pending = _inputs(rows, 2560, dtype, seed + rows)
-                for write in (None, pending):
+                for gpu_class in ("d", "s"):
+                    assert oracle.two_launch_fits(
+                        rows, HC, 2560, LOWRANK, bits, inject, gpu_class, dtype.size
+                    )
                     _assert_bitwise(
                         oracle.decode(
                             module, hyper, write, gpu_class=gpu_class, two_launch=True
                         ),
-                        oracle.decode(
-                            module, hyper, write, gpu_class=gpu_class, two_launch=False
-                        ),
+                        expected,
                         ("forms", gpu_class, rows, inject, write is None),
                     )
 
 
 # Shapes on each side of every clause of the two-launch fit: three streams;
-# a low rank of whole row groups or not (328); the norm's strips against the
+# a low rank of whole row groups or not (328, 336); the norm's strips against the
 # row groups (5376, 5440); the stream in threadgroup memory (16320, 16384, and
 # 16368 exactly at the limit); the up tile's threadgroup memory (512 at 8 bits
 # over it; 960, over it only with its activations and the staging's padding
@@ -302,7 +292,7 @@ _FORM_SHAPES = [
     (hc, hidden, lowrank)
     for hc in (3, 4)
     for hidden in (2560, 5376, 5440, 16320, 16368, 16384)
-    for lowrank in (320, 328, 384, 512, 960, 2560, 3264)
+    for lowrank in (320, 328, 336, 384, 512, 960, 2560, 3264)
 ]
 
 
@@ -317,8 +307,9 @@ def test_the_oracle_takes_hc_fused_s_form(monkeypatch):
             for rows in range(1, oracle.MAX_ROWS + 1):
                 for bits in (4, 5, 6, 8):
                     for inject in (True, False):
+                        chunks = oracle.up_chunks(bits, lowrank)
                         live = hc_fused._decode_v2(
-                            rows, hc, hidden, lowrank, bits, inject
+                            rows, hc, hidden, lowrank, chunks, inject
                         )
                         fits = oracle.two_launch_fits(
                             rows, hc, hidden, lowrank, bits, inject, gpu_class
@@ -328,6 +319,30 @@ def test_the_oracle_takes_hc_fused_s_form(monkeypatch):
                             rows, hc, hidden, lowrank, bits, inject, gpu_class
                         ), (gpu_class, hc, hidden, lowrank, rows, bits, inject)
     assert seen == {(True, True), (True, False), (False, True), (False, False)}
+
+
+def test_decode_affine_partial_block_requires_a_whole_group():
+    """96 values fill whole 8-bit lanes but truncate the second group of 64."""
+    from omlx.formats import testing
+
+    face = affine.face(8, 64, True, mx.bfloat16, partial_blocks=True)
+    x = mx.zeros((96,), mx.bfloat16)
+    codes = mx.zeros((8, 24), mx.uint32)
+    params = mx.ones((8, 2), mx.bfloat16)
+    with pytest.raises(RuntimeError, match="K must be whole lanes and groups"):
+        mx.eval(testing.dot_rows(face, [codes, params, params], x, 8))
+
+
+def test_decode_refuses_an_empty_up_tile(monkeypatch):
+    # Eight 4-bit weights do not fill a two-pack lane. No tile can launch.
+    chunks = oracle.up_chunks(4, 8)
+    assert chunks == 0
+    with pytest.raises(ValueError, match="no whole up chunks"):
+        oracle.up_threads(4, 8)
+    assert not oracle.two_launch_fits(1, HC, 256, 8, 4, False, "d")
+    live = _live()
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    assert not live._decode_v2(1, HC, 256, 8, chunks, False)
 
 
 def test_the_oracle_s_geometry_is_hc_fused_s(monkeypatch):
@@ -353,7 +368,8 @@ def test_the_oracle_s_geometry_is_hc_fused_s(monkeypatch):
     for bits in (4, 5, 6, 8):
         assert oracle.pack_factor(bits) == hc_fused._pack_factor(bits)
         for lowrank in (320, 384, 512):
-            chunks = hc_fused._up_chunks(bits, lowrank)
+            face = affine.face(bits, 64, True, mx.bfloat16, partial_blocks=True)
+            chunks = lowrank // face.vpt
             assert oracle.up_chunks(bits, lowrank) == chunks
             # hc_fused's _kernel_up_mix: whole chunk rows within its threads.
             threads = chunks * (hc_fused._V2_UP_THREADS // chunks)
@@ -389,7 +405,10 @@ def test_batched_and_strided_rows_match_the_oracle(bits, monkeypatch):
                 for write in (None, pending, strided_pending):
                     what = ("batched", batch, seq, write is None)
                     if batch * seq <= oracle.MAX_ROWS:
-                        for gpu_class in ("d", "s"):
+                        classes = (
+                            ("d", "s") if batch * seq <= oracle.V2_MAX_ROWS else ("d",)
+                        )
+                        for gpu_class in classes:
                             _assert_bitwise(
                                 *_decode(monkeypatch, m, rows_in, write, gpu_class),
                                 what,
@@ -433,41 +452,274 @@ def test_mixed_projections_match_the_oracle(down, up, inject, monkeypatch):
             )
 
 
-def _low_rank(module, lowrank, bits, group_size=64):
-    """``module`` with down and up projections of another low rank."""
-    import mlx.nn as nn
+@pytest.mark.parametrize(
+    "projection",
+    ["input_mix_weight_down", "block_inject_weight", "input_mix_weight_up"],
+)
+@pytest.mark.parametrize("rows,write", [(1, False), (3, True), (7, False)])
+def test_decode_uses_each_projections_dot_face(projection, rows, write, monkeypatch):
+    """Encode one nonzero per row twice. The toy reads centered bytes and
+    finishes with a row scale. The oracle reads unsigned affine bytes with
+    that scale in every group. A single product makes both traversals exact.
+    Each other projection retains its stock weights and traversal."""
+    from tests.test_formats_kernels import _toy
 
-    width = module.hc_count * module.hidden_size
-    dtype = module.hc_norm.weight.dtype
-    module.hc_lowrank = lowrank
-    for name, (k, n) in (
-        ("input_mix_weight_down", (width, lowrank)),
-        ("input_mix_weight_up", (lowrank, width)),
-    ):
-        layer = nn.QuantizedLinear(k, n, bias=False, group_size=group_size, bits=bits)
-        scales = mx.abs(mx.random.normal(layer.scales.shape)) * 0.01 + 0.002
-        layer.scales = scales.astype(dtype)
-        layer.biases = (mx.random.normal(layer.biases.shape) * 0.005).astype(dtype)
-        setattr(module, name, layer)
-    mx.eval(module.parameters())
-    return module
+    live = _live()
+    stock_face = live._decode_face
+    toy = replace(_toy("hc"), tensors=("hc_gains",))
+    mx.random.seed(2500 + rows)
+    hidden = 1152
+    module = _module(8, True, hidden=hidden)
+    layer = module[projection]
+    n, words = layer.weight.shape
+    k = words * 4
+    # Row zero hits the last chunk. Following rows span different slices,
+    # groups and lanes, including the down projection's partial last block.
+    selected = (k - 1 - mx.arange(n) * 67) % k
+    codes = (mx.arange(k)[None, :] == selected[:, None]).astype(mx.uint8)
+    # MLX binds fewer than eight scalars as constants. Inject has four rows.
+    gains = 2.0 ** ((mx.arange(max(n, 8)) % 4).astype(mx.float32) - 2)
+    layer.weight = codes.view(mx.uint32)
+    layer.scales = mx.broadcast_to(gains[:n, None], layer.scales.shape).astype(
+        mx.bfloat16
+    )
+    layer.biases = mx.zeros_like(layer.scales)
+    hyper, pending = _inputs(rows, hidden, mx.bfloat16, 2550 + rows)
+    operands = pending if write else None
+    expected = oracle.decode(module, hyper, operands, gpu_class="d")
+    mx.eval(expected)
+
+    layer.weight = (codes + 128).astype(mx.uint8).view(mx.uint32)
+    layer.hc_gains = gains
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    monkeypatch.setattr(
+        live,
+        "_decode_face",
+        lambda p, inject: toy if p is layer else stock_face(p, inject),
+    )
+    result = live.fused_forward(module, hyper, operands)
+    assert result is not None
+    _assert_bitwise(result, expected, (projection, rows, write))
+
+
+def test_decode_up_stages_each_chunk_before_adding_it(monkeypatch):
+    """A fused multiply-add rounds differently with a running accumulator.
+    The two-launch kernel stores each chunk in threadgroup memory. A serial
+    up row must give that staged sum's bits even for a face using fma."""
+    from omlx.formats import Dot
+
+    live = _live()
+    stock_face = live._decode_face
+    toy = Dot(
+        key="hc_fma",
+        type="HcFma",
+        tensors=(),
+        vpt=4,
+        source=r"""
+struct HcFma {
+    static constant constexpr int CONTRACT = 1;
+    const device uint8_t* codes;
+    template <int K> struct Lanes {
+        static constant constexpr int VPT = 4, BLOCK = 32 * VPT;
+        const device uint8_t* w;
+        Lanes(HcFma m, size_t row, uint lane)
+            : w(m.codes + row * K + lane * VPT) {}
+        using Row = const device uint8_t*;
+        Row row(int r) const { return w + r * K; }
+        void step() { w += BLOCK; }
+        template <typename XP>
+        static float load(XP x, thread float* xt) {
+            for (int i = 0; i < VPT; ++i) xt[i] = float(x[i]);
+            return 0.0f;
+        }
+        static float madd(float acc, Row w, thread const float* xt, float) {
+            float dot = 0.0f;
+            for (int i = 0; i < VPT; ++i) dot += (float(w[i]) - 128.0f) * xt[i];
+            return metal::fma(0.013f, dot, acc);
+        }
+        float finish(int, float sum) const { return sum; }
+    };
+};
+""",
+    )
+    mx.random.seed(2560)
+    module = _module(8, True, hidden=256, dtype=mx.float32)
+    up = module.input_mix_weight_up
+    n = up.weight.shape[0]
+    codes = mx.random.randint(126, 131, (n, LOWRANK)).astype(mx.uint8)
+    up.weight = codes.view(mx.uint32)
+    monkeypatch.setattr(
+        live,
+        "_decode_face",
+        lambda p, inject: toy if p is up else stock_face(p, inject),
+    )
+    hyper, _ = _inputs(3, 256, mx.float32, 2561)
+    monkeypatch.setattr(live, "_DECODE_V2", True)
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    staged = live.fused_forward(module, hyper)
+    assert staged is not None
+    mx.eval(staged)
+    monkeypatch.setattr(live, "_DECODE_V2", False)
+    serial = live.fused_forward(module, hyper)
+    assert serial is not None
+    _assert_bitwise(serial, staged, "up chunk accumulation")
+
+
+@pytest.mark.parametrize("rows", [7, 16])
+def test_affine_serial_up_streams_chunks_in_order(rows, monkeypatch):
+    """Across two groups, (2**25 - 2**25) + (+/-1) must retain the last code."""
+    hidden, dtype = 256, mx.bfloat16
+    width = HC * hidden
+    module = _module(8, False, hidden=hidden)
+    module.hc_norm.weight = mx.zeros((width,), dtype)
+    up = module.input_mix_weight_up
+    codes = mx.zeros((width, LOWRANK), mx.uint8)
+    for k in (0, 64, 73):
+        codes[:, k] = 1
+    up.weight = codes.view(mx.uint32)
+    up.scales = mx.ones_like(up.scales)
+    up.scales[:, 0] = 2
+    up.biases = mx.zeros_like(up.biases)
+
+    positive = mx.arange(rows) % 2 == 0
+    act = mx.zeros((rows, LOWRANK), dtype)
+    act[:, 0] = 2**24
+    act[:, 64] = -(2**25)
+    act[:, 73] = mx.where(positive, 1, -1).astype(dtype)
+
+    live = _live()
+    build = mx.fast.metal_kernel
+    up_sources = []
+
+    def with_known_activations(**spec):
+        if "hc_fused_down" in spec["name"]:
+            return lambda **kwargs: (act, mx.zeros((rows, HC), dtype))
+        if "hc_fused_up" in spec["name"]:
+            up_sources.append(spec["source"])
+        return build(**spec)
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", with_known_activations)
+    monkeypatch.setattr(live, "_KERNELS", {})
+    monkeypatch.setattr(live, "_VALIDATED", set())
+    if hasattr(live, "_decode_launch"):
+        monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
+        monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+
+    mixed = live.fused_forward(module, mx.ones((1, rows, width), dtype))
+    assert mixed is not None
+    expected = mx.where(positive, 0.73046875, 0.26953125).astype(dtype)
+    expected = mx.broadcast_to(expected.reshape(1, rows, 1), (1, rows, hidden))
+    _assert_bitwise(mixed, expected, "affine group and chunk carry")
+    assert len(up_sources) == 1
+    assert "hc_stream_up<R>(up, n, a)" in up_sources[0], "up did not stream the group"
+
+
+@pytest.mark.parametrize("gpu_class", ["d", "s"])
+@pytest.mark.parametrize("rows", [4, 5, 6, 7, 16])
+def test_affine_serial_up_route_by_row(rows, gpu_class, monkeypatch):
+    """Six rows keep the two-launch decode; from seven, the serial up streams.
+
+    The two-launch up re-reads its weight for every row and wins the small
+    row counts; from seven rows the three-launch up, which streams one affine
+    group's scales through all of a row's chunks, is as fast or faster (it
+    measured 0.9993 against the parent at seven rows on the M3 Ultra). The
+    kernels are recorded, not run: both routes' numbers are checked against
+    the canonical path and against each other by their own tests.
+    """
+    hidden, dtype = 256, mx.bfloat16
+    width = HC * hidden
+    module = _module(8, False, hidden=hidden)
+    module.hc_norm.weight = mx.zeros((width,), dtype)
+    live = _live()
+    builds = []
+
+    def record(**spec):
+        name = spec["name"]
+        builds.append((name, spec.get("source", "")))
+        if "fused_write_norm" in name:
+            return lambda **kwargs: [
+                mx.zeros((rows, hidden), dtype),
+                mx.zeros((rows, width), dtype),
+            ]
+        if "fused_norm" in name:
+            return lambda **kwargs: [mx.zeros((rows, width), dtype)]
+        if "hc_fused_down" in name:
+            return lambda **kwargs: [
+                mx.zeros((rows, LOWRANK), dtype),
+                mx.zeros((rows, HC), dtype),
+            ]
+        if "decode_write_norm_down" in name:
+            return lambda **kwargs: [
+                mx.zeros((rows, width), dtype),
+                mx.zeros((rows, width), dtype),
+                mx.zeros((rows, HC, LOWRANK + HC), mx.float32),
+            ]
+        if "decode_norm_down" in name:
+            return lambda **kwargs: [
+                mx.zeros((rows, width), dtype),
+                mx.zeros((rows, HC, LOWRANK + HC), mx.float32),
+            ]
+        return lambda **kwargs: [
+            mx.zeros((rows, hidden), dtype),
+            mx.zeros((rows, HC), dtype),
+        ]
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", record)
+    monkeypatch.setattr(live, "_KERNELS", {})
+    monkeypatch.setattr(live, "_VALIDATED", set())
+    monkeypatch.setattr(live, "_gpu_class", lambda: gpu_class)
+    if hasattr(live, "_decode_launch"):
+        monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
+        monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+
+    mixed = live.fused_forward(module, mx.ones((1, rows, width), dtype))
+    assert mixed is not None
+    names = [name for name, _ in builds]
+    ups = [(name, source) for name, source in builds if "up" in name]
+    assert len(ups) == 1, names
+    if rows <= 6:
+        assert "decode_up" in ups[0][0], names
+        assert any("decode_norm_down" in name for name in names), names
+    else:
+        assert "fused_up" in ups[0][0], names
+        assert any("hc_fused_down" in name for name in names), names
+        assert "hc_stream_up<R>(up, n, a)" in ups[0][1], "up did not stream the group"
+
+
+@pytest.mark.parametrize("rows", [1, 7])
+def test_concurrent_decode_reads_each_layers_current_weights(rows, monkeypatch):
+    live = _live()
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
+    monkeypatch.setattr(live, "_VALIDATED", set())
+    mx.random.seed(2670)
+    layers = [_module(bits, True, hidden=256) for bits in (8, 8, 4)]
+    hyper, pending = _inputs(rows, 256, mx.bfloat16, 2671)
+    expected = [oracle.decode(layer, hyper, pending, gpu_class="d") for layer in layers]
+    for layer in layers:
+        live._eps_array(layer)
+    mx.eval(expected)
+    together = Barrier(2, timeout=30)
+
+    def check(order):
+        for index in order:
+            together.wait()
+            result = live.fused_forward(layers[index], hyper, pending)
+            assert result is not None
+            _assert_bitwise(result, expected[index], (rows, index))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        list(pool.map(check, [(0, 2, 1), (1, 0, 2)]))
 
 
 @pytest.mark.parametrize("bits", [4, 8])
 def test_a_low_rank_of_other_chunks_matches_the_oracle(bits, monkeypatch):
     """A low rank of 384: 24 or 48 up chunks, which do not divide the up tile's
     320 threads, so it takes whole chunk rows of them."""
-    mx.random.seed(2300 + bits)
-    module = _low_rank(_module(bits, True), 384, bits)
-    without = _module(bits, False)
-    without.hc_norm = module.hc_norm
-    without.hc_lowrank = 384
-    without.input_mix_weight_down = module.input_mix_weight_down
-    without.input_mix_weight_up = module.input_mix_weight_up
+    modules = _modules(bits, 64, mx.bfloat16, seed=2300 + bits, lowrank=384)
     for gpu_class in ("d", "s"):
         _assert_decode(
             monkeypatch,
-            [module, without],
+            modules,
             2560,
             mx.bfloat16,
             (1, 2, 4, 7),
@@ -476,7 +728,7 @@ def test_a_low_rank_of_other_chunks_matches_the_oracle(bits, monkeypatch):
         )
 
 
-def test_the_oracle_refuses_what_hc_fused_does_not_take():
+def test_the_oracle_refuses_what_hc_fused_does_not_take(monkeypatch):
     mx.random.seed(2400)
     module = _module(4, True)
     hyper, (branch, gate) = _inputs(2, 2560, mx.bfloat16, 2400)
@@ -484,11 +736,49 @@ def test_the_oracle_refuses_what_hc_fused_does_not_take():
         rows_in, _ = _inputs(rows, 2560, mx.bfloat16, 2400)
         with pytest.raises(ValueError, match="1 to 16 rows"):
             oracle.decode(module, rows_in, gpu_class="d")
-    for write in ((branch[..., :-64], gate), (branch, gate.astype(mx.float16))):
+    for write in (
+        (branch[..., :-64], gate),
+        (branch.reshape(2, 1, 2560), gate),
+        (branch, gate[..., :-1]),
+        (branch, gate.reshape(2, 1, HC)),
+        (branch.astype(mx.float16), gate),
+        (branch, gate.astype(mx.float16)),
+    ):
         with pytest.raises(ValueError, match="no such pending write"):
             oracle.decode(module, hyper, write, gpu_class="d")
+    prefill, (branch, gate) = _inputs(17, 2560, mx.bfloat16, 2401)
+    with pytest.raises(ValueError, match="no such pending write"):
+        oracle.prefill(module, prefill, (branch, gate.reshape(17, 1, HC)))
     # 5440: 22 norm strips a stream, 21 row groups from 3 rows.
     wide = _module(4, True, hidden=5440)
     rows_in, _ = _inputs(3, 5440, mx.bfloat16, 2401)
     with pytest.raises(ValueError, match="do not take this call"):
         oracle.decode(wide, rows_in, gpu_class="d", two_launch=True)
+    expected = oracle.decode(wide, rows_in, gpu_class="d", two_launch=False)
+    live, automatic = _decode(monkeypatch, wide, rows_in, None, "d")
+    _assert_bitwise(automatic, expected, "oracle fallback")
+    _assert_bitwise(live, expected, "live fallback")
+
+
+@pytest.mark.parametrize("hidden,lowrank", [(8192, 320), (256, 1792)])
+def test_fp32_decode_respects_each_threadgroup_memory_limit(
+    hidden, lowrank, monkeypatch
+):
+    """The stream or the up tile fits in 32 KiB at two bytes per activation.
+    Neither fits at four. Refuse the forced launch before it reaches Metal."""
+    mx.random.seed(2402)
+    module = _module(8, True, hidden=hidden, dtype=mx.float32, lowrank=lowrank)
+    rows_in, _ = _inputs(1, hidden, mx.float32, 2402)
+    assert oracle.two_launch_fits(1, HC, hidden, lowrank, 8, True, "d")
+
+    def oversized(*args):
+        pytest.fail("dispatched a two-launch tile exceeding threadgroup memory")
+
+    monkeypatch.setattr(oracle, "_norm_down", oversized)
+    monkeypatch.setattr(_live(), "_kernel_norm_down", oversized)
+    with pytest.raises(ValueError, match="do not take this call"):
+        oracle.decode(module, rows_in, gpu_class="d", two_launch=True)
+    expected = oracle.decode(module, rows_in, gpu_class="d", two_launch=False)
+    live, automatic = _decode(monkeypatch, module, rows_in, None, "d")
+    _assert_bitwise(automatic, expected, "FP32 oracle fallback")
+    _assert_bitwise(live, expected, "FP32 live fallback")
