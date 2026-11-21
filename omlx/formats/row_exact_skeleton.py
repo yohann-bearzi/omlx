@@ -74,8 +74,7 @@ __LAST_BLOCK__
 )
 
 _BLOCK = Template(
-    r"""
-    float xs[ROWS][VALUES_PER_THREAD];
+    r"""    float xs[ROWS][VALUES_PER_THREAD];
 $aux
     ROW_EXACT_UNROLL
     for (int i = 0; i < ROWS; i++) {
@@ -176,7 +175,7 @@ def emit_row_exact_kernel(ops: RowOps, fast: bool, unrolled: bool, group_count: 
     block = _BLOCK.substitute(ops.slots)
     last = "" if fast else (
         "  if (int(simd_lid) * VALUES_PER_THREAD < K_SIZE - k) {\n"
-        + indent(block, "  " + "  ").lstrip()
+        + indent(block, "  ")
         + "  }\n"
     )
     tile = _ROW.substitute(ops.slots).replace("__BLOCK__", block).replace("__LAST_BLOCK__", last)

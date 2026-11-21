@@ -31,7 +31,7 @@ _REFERENCE = Path(__file__).parent / "data" / "parity_row_exact_a13.json"
 # The combined digest of the 240 pinned specs, captured from release-3
 # eae63b6c's own builders (specs/parity-skeletons-evidence/a13/test_emit.py
 # proved 240/240; the serialization here is the one below).
-A13_DIGEST = "<pending>"
+A13_DIGEST = "fd884b476cbabb5772730282d87b344412c95c853b007f7ba1ed51d665e02f9d"
 
 
 def _reference():
