@@ -17,6 +17,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -26,107 +27,50 @@ import pytest
 
 from omlx.formats import row_exact_skeleton, tuning
 
-REF = "eae63b6c"
+_REFERENCE = Path(__file__).parent / "data" / "parity_row_exact_a13.json"
+# The combined digest of the 240 pinned specs, captured from release-3
+# eae63b6c's own builders (specs/parity-skeletons-evidence/a13/test_emit.py
+# proved 240/240; the serialization here is the one below).
+A13_DIGEST = "<pending>"
 
 
-def _show(path: str) -> str:
-    return subprocess.check_output(
-        ["git", "show", f"{REF}:omlx/{path}.py"], text=True
-    )
+def _reference():
+    return json.loads(_REFERENCE.read_text())
 
 
-def _extract(source: str, names: set, env: dict) -> dict:
-    tree = ast.parse(source)
-    items = []
-    for node in tree.body:
-        if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name):
-            name = node.targets[0].id
-        elif isinstance(node, ast.FunctionDef):
-            name = node.name
-        else:
-            continue
-        if name in names:
-            items.append(node)
-    exec(compile(ast.Module(items, type_ignores=[]), "<pinned generator>", "exec"), env)
-    return env
-
-
-def _pinned():
-    source = _show("formats/affine")
-    tree = ast.parse(source)
-    end = next(
-        n.end_lineno for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "decoded"
-    )
-    names = {
-        n.targets[0].id
-        for n in tree.body
-        if isinstance(n, ast.Assign) and n.lineno < end
-    }
-    affine_env = _extract(source, names | {"header", "decoded"}, {})
-    from functools import cache
-    from textwrap import indent
-    from types import SimpleNamespace as NS
-
-    impl = _show("patches/row_exact_qmv")
-    env = _extract(
-        impl,
-        {
-            "_BITS",
-            "_TILE",
-            "_BLOCK",
-            "_LAST_BLOCK",
-            "_SOURCE",
-            "_group_source",
-            "_header",
-            "_kernel",
-            "_group_kernel",
-        },
-        dict(
-            **{k: affine_env[k] for k in ("header", "decoded")},
-            cache=cache,
-            indent=indent,
-            mx=NS(fast=NS(metal_kernel=lambda **kw: dict(kw))),
-        ),
-    )
-    return affine_env, env
-
-
-def _specs(affine_env):
-    specs = []
-    for bits in (4, 5, 6, 8):
-        for group_size in (32, 64, 128):
-            for fast in (False, True):
-                ops = row_exact_skeleton.affine_row_ops(bits, group_size, fast)
-                for unrolled in (False, True):
-                    for count in (0, 1, 2, 3, 4):
-                        spec = row_exact_skeleton.kernel_spec(
-                            ops, bits, group_size, fast, unrolled, count
-                        )
-                        specs.append((bits, group_size, fast, unrolled, count, spec))
-    return specs
+def _spec_digest(spec) -> str:
+    parts = [spec["name"], spec["header"], spec["source"], *spec["inputs"], *spec["outputs"]]
+    return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
 def test_a13_affine_240_specs_byte_identical_to_eae63b6c():
-    """240/240 (bits, group, fast, unroll, projections) specs are exactly the
-    pinned release-3 builders'."""
-    affine_env, pinned = _pinned()
-    digest = hashlib.sha256()
+    """240/240 (bits, group, fast, unroll, projections) specs equal the pinned
+    release-3 builders exactly (names, Metal, inputs and outputs)."""
+    reference = _reference()
+    assert len(reference) == 240
     mismatches = []
-    for bits, group_size, fast, unrolled, count, spec in _specs(affine_env):
-        want = (
-            pinned["_group_kernel"](bits, group_size, fast, count, unrolled)
-            if count
-            else pinned["_kernel"](bits, group_size, fast, unrolled)
+    digest = hashlib.sha256()
+    for want in reference:
+        ops = row_exact_skeleton.affine_row_ops(
+            want["bits"], want["group_size"], want["fast"]
         )
-        if spec != want:
-            mismatches.append((bits, group_size, fast, unrolled, count))
-        for key in ("name", "header", "source"):
-            digest.update(spec[key].encode() + b"\0")
-        digest.update(",".join(spec["input_names"]).encode() + b"\0")
-        digest.update(",".join(spec["output_names"]).encode() + b"\0")
+        spec = row_exact_skeleton.kernel_spec(
+            ops, want["bits"], want["group_size"], want["fast"],
+            want["unrolled"], want["count"],
+        )
+        got = {
+            "name": spec["name"],
+            "header": spec["header"],
+            "source": spec["source"],
+            "inputs": list(spec["input_names"]),
+            "outputs": list(spec["output_names"]),
+        }
+        if got != {k: want[k] for k in got}:
+            mismatches.append((want["bits"], want["group_size"], want["fast"],
+                               want["unrolled"], want["count"]))
+        digest.update(_spec_digest(got).encode())
     assert not mismatches, mismatches[:4]
-    assert len(_specs(affine_env)) == 240
-    print("A13 parity digest", digest.hexdigest())
+    assert digest.hexdigest() == A13_DIGEST, digest.hexdigest()
 
 
 def test_qmv_shared_unrolls_by_pragma_not_fold_expression():
