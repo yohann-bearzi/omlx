@@ -94,9 +94,9 @@ _SOURCE = r"""
     float result[RPS];
     qmv_rows<T, K_SIZE, RPS, 0>(
         rt, size_t(rhs[pair]) * N_SIZE + out_row, rt, 0,
-        x + size_t(pair / LHS_DIV) * K_SIZE, simd_lid, result);
+        x + OFFSET(pair / LHS_DIV) * K_SIZE, simd_lid, result);
     if (simd_lid == 0) {
-      store_rows(omlx_iota<RPS>(), result, y + size_t(pair) * N_SIZE + out_row);
+      store_rows(omlx_iota<RPS>(), result, y + OFFSET(pair) * N_SIZE + out_row);
     }
 """
 
@@ -179,15 +179,17 @@ def _ordered_kernel(face: Dot, small_offsets: bool = False):
 
 
 @cache
-def _kernel(face: Dot):
+def _kernel(face: Dot, small_offsets: bool = False):
     matrices = kernels.Matrices()
     inputs = ["x", *matrices.add("rt", face), "rhs"]
+    suffix = "_u32" if small_offsets else ""
+    body = _SOURCE.replace("OFFSET", "" if small_offsets else "size_t")
     return mx.fast.metal_kernel(
-        name=f"omlx_moe_verify_gather_{face.key}",
+        name=f"omlx_moe_verify_gather_{face.key}{suffix}",
         input_names=inputs,
         output_names=["y"],
         header=matrices.header + kernels.STORE_ROWS,
-        source=matrices.declarations + _SOURCE,
+        source=matrices.declarations + body,
     )
 
 
@@ -241,8 +243,9 @@ def _projection(
     if row_bounds is not None:
         input_rows, output_rows = row_bounds
         small_offsets = max(input_rows * k, output_rows * n) <= 2**32
+    kernel = _kernel(face, small_offsets)
     ordered = _ordered_kernel(face, small_offsets)
-    return Projection(face, _kernel(face), ordered, operands, n)
+    return Projection(face, kernel, ordered, operands, n)
 
 
 def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:

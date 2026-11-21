@@ -217,6 +217,7 @@ def _affine_sources(monkeypatch):
         format_linear._kernel.__wrapped__(face, True)
         format_linear._shared_kernel.__wrapped__(face)
         gather._kernel.__wrapped__(face)
+        gather._kernel.__wrapped__(face, True)
         gather._ordered_kernel.__wrapped__(face)
         gather._ordered_kernel.__wrapped__(face, True)
     for bits, group, dtype in product((4, 8), (32, 64, 128), (mx.bfloat16, mx.float16)):
@@ -257,8 +258,9 @@ def _metal_digest(recorded):
 # plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
 # preserve their Metal byte for byte when the face declares none.
 # The 144 verify-gather builders use wide offsets. Bounded ordered blocks
-# add 72 kernels using 32-bit input and output offsets.
-_METAL_DIGEST = "532 153e82bdea9a231d4c796534ba647e151283f9f9db81c75f3184637ddd89c198"
+# add 72 kernels using 32-bit input and output offsets, and bounded blocks'
+# unordered gathers add the other 72.
+_METAL_DIGEST = "604 295711a5e2a5d8a34aa2fcf111297ef1a6a14d8b21a2c769ef875f8c9a36997e"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):

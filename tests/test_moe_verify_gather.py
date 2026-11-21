@@ -1144,3 +1144,24 @@ def test_the_ordered_plan_uses_small_offsets_only_when_all_rows_fit(
         (True, True),
         (False, False),
     ]
+
+
+def test_a_bounded_block_s_unordered_gather_takes_32_bit_offsets(monkeypatch):
+    """A block's unordered launches are bounded by the plan's rows and pairs,
+    so the plan builds the 32-bit offset kernel once, at construction; a direct
+    gather, whose pair grid has no such bound, keeps the wide one."""
+    seen = []
+    real = gather._kernel
+
+    def spy(face, small_offsets=False):
+        seen.append(small_offsets)
+        return real(face, small_offsets)
+
+    monkeypatch.setattr(gather, "_kernel", spy)
+    plan = gather._build_plan(_switch(), HIDDEN, TOP_K)
+    assert plan is not None
+    assert seen and all(seen), seen
+    seen.clear()
+    wide = gather.projection(_switch().gate_up_proj, HIDDEN)
+    assert wide is not None
+    assert seen and not any(seen), seen
