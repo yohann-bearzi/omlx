@@ -171,6 +171,16 @@ def test_load_validates_speculation_against_actual_expert_offload(
     with pytest.raises(ValidationFinishedError):
         maybe_apply_pre_load_patches(str(tmp_path), settings)
 
+def test_oqh_experts_are_refused(tmp_path):
+    _checkpoint(tmp_path, "qwen4_exp")
+    raw = json.loads((tmp_path / "config.json").read_text())
+    raw["omlx_oqh"] = {"version": 1, "tensors": {}}
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    assert moe_offload_compatibility(tmp_path) == (
+        False,
+        "MoE expert offload does not read oQh experts.",
+    )
+
 
 @pytest.mark.parametrize("kind", ["mixtral", "llama"])
 def test_unverified_type_is_hidden_even_with_matching_experts(tmp_path, kind):

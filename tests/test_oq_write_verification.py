@@ -39,7 +39,10 @@ def test_writer_keeps_a_broken_reload_unverified(
     damaged = []
 
     def save_shard(file, tensors, **kwargs):
-        if Path(file).parent == staging:
+        # The writer's shard. The oQe refinement (#5292) rewrites it from the
+        # saved bytes (".refine-<shard>", then replaced): the damage carries.
+        name = Path(file).name
+        if Path(file).parent == staging and not name.startswith(".refine-"):
             tensors = dict(tensors)
             if damage == "missing-scale":
                 down = "model.layers.0.mlp.down_proj."

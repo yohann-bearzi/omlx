@@ -62,9 +62,11 @@ before the graph is first built its Metal is proven on a stand-in: the
 smallest launches that MLX generates the same Metal for, over zeros, and
 nothing of the call. If that fails, those blocks keep their composed body.
 
-Row-exact MTP verify windows (up to 16 rows whose logits must equal serial
-decode) run the same arithmetic for the whole window in the same launches:
-the router gemv over all rows (``qwen35_moe_router.router_gemv``), then
+MTP verify windows (1..16 rows; row-exact MTP requires each row to equal
+serial decode, and every armed verify runs them) run the same arithmetic for
+the whole window in the same launches: the router gemv over all rows
+(``qwen35_moe_router.router_gemv``), or the block's quantized gate one row at
+a time through ``row_exact_qmv``, then
 window variants of the launches above in which each threadgroup serves one
 row with the one-token source verbatim (threadgroups of one weight block for
 consecutive rows are adjacent, so shared experts are fetched once through
@@ -73,10 +75,11 @@ rows on the recomputed selections cost more than the routing launch
 (``softmax_topk_rows``) they save, so it runs on its own. Every row is
 bit-identical to the fused one-token call on that row. This replaces the
 verifier's composed MoE (about fifteen launches, two of them binding the
-whole stacked experts) only while row-exact verify is armed and the block
-folds its shared expert; one-row windows are one token's call. A window's
-launches are one graph too, kept per thread in the window's proof for the
-window's shape and dtype and the router's width; if its stand-in fails, the
+whole stacked experts) in every armed verify, row-exact or not, when the
+block folds its shared expert; one-row windows are one token's call. A
+window's launches are one graph too, kept per thread in the window's proof
+for the window's shape and dtype and the router's width; a quantized gate's
+logits stay outside it, one row at a time. If its stand-in fails, the
 verifier keeps its composed MoE for blocks of these faces and shapes.
 
 MLX commits a command buffer once the inputs bound to it exceed its size cap
@@ -113,7 +116,9 @@ from .qwen35_moe_router import (
     topk_header,
     topk_indices_header,
 )
+from .qwen35_verify_qmm import _is_armed as is_verify_armed
 from .qwen35_verify_qmm import is_row_exact_armed
+from .row_exact_qmv import quantized_linear as row_exact_linear
 
 logger = logging.getLogger(__name__)
 
@@ -782,6 +787,23 @@ def _plain(layer, *classes) -> bool:
     return type(layer) in classes and "bias" not in layer
 
 
+def _window_router_ok(gate) -> bool:
+    """Whether a verify window takes the block's quantized gate through
+    ``row_exact_linear``: exactly a plain quantized linear of an affine
+    layout that tiles (its other layouts fall back to one stock call a
+    row), without a bias, in the dtype the launches are compiled for. These
+    are the affine widths and group sizes ``row_exact_qmv`` tiles."""
+    return (
+        _plain(gate, nn.QuantizedLinear)
+        and "biases" in gate
+        and gate.mode == "affine"
+        and gate.bits in (4, 5, 6, 8)
+        and gate.group_size in (32, 64, 128)
+        and gate["scales"].dtype in (mx.bfloat16, mx.float16)
+        and gate["biases"].dtype == gate["scales"].dtype
+    )
+
+
 def _operands(layer, face: Dot) -> tuple:
     names = formats.tensor_names(layer)
     return tuple(layer[name] for name in (names[0], *face.tensors))
@@ -855,6 +877,7 @@ class _Plan(NamedTuple):
     outside: bool  # the block computes a router or shared expert outside them
     proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
     window: kernels.Proof | None = None  # theirs; failed: one token still runs
+    quantized_router: bool = False  # a verify window's routing is the gate's rows
 
 
 def _projection_dot(layer, k: int, n: int) -> Dot | None:
@@ -979,6 +1002,9 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         router = router_gemv(gate["weight"])
     if router is not None:
         weight = (gate["weight"],)
+    # A quantized gate's verify rows run its own one-row arithmetic
+    # (``row_exact_linear``) outside the window's launches.
+    quantized_router = router is None and _window_router_ok(gate)
     # What the launches are compiled from, beside a launch's rows and routing.
     operands = gate_up_operands + down_operands
     if shared is not None:
@@ -1092,6 +1118,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         outside=router is None,
         proof=proof,
         window=kernels.proof("routed_window", *key),
+        quantized_router=quantized_router,
     )
 
 
@@ -1470,18 +1497,32 @@ def _window(launches: _Launches, folded: bool):
     return graph
 
 
+def _window_logits(launches: _Launches, folded: bool):
+    """A window's launches as one function of its rows and the routing the
+    block's quantized gate computed outside it, for MLX's compile: the rows
+    of ``x`` ([B, L, hidden]), their logits ([rows, experts]) and the plan's
+    operands, the rows ([rows, hidden]) out. It closes over no array."""
+
+    def graph(x, logits, operands):
+        x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
+        return _experts(launches, x, logits, operands, folded)
+
+    return graph
+
+
 def _windows(plan: _Plan, x) -> bool:
     """Whether the rows of a window ``x`` ([B, L, hidden]) run through the
     plan's window launches: 2..``WINDOW_MAX_ROWS`` rows of the plan's
     width, in the dtype the launches are compiled for, for a router of
-    whole simdgroups that the launches run. (A window of one row is one
-    token's call.)"""
+    whole simdgroups (the fused gemv, or the block's quantized gate's
+    rows) that the launches run. (A window of one row is one token's
+    call.)"""
     launches = plan.launches
     return (
         x.dtype == launches.dtype
         and x.shape[-1] == launches.hidden
         and 2 <= x.size // launches.hidden <= WINDOW_MAX_ROWS
-        and launches.router is not None
+        and (launches.router is not None or plan.quantized_router)
         and router_eligible(x, plan.experts, WINDOW_MAX_ROWS)
     )
 
@@ -1502,14 +1543,15 @@ def _cached_plan(block, dtype: mx.Dtype) -> _Plan | None:
 
 
 def routed_verify_window(block, x):
-    """The block's output for a row-exact verify window ``x`` ([B, L, hidden],
+    """The block's output for a verify window ``x`` ([B, L, hidden],
     1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
     one-token call on that row, as [rows, hidden]; or None outside the
     fused layout.
 
-    Router gemv, gate+up (with the softmax + top-k folded in up to 3
-    rows, after the routing launch from 4) and down/combine each run once
-    for the whole window, in one graph of the rows and the block's arrays
+    Router gemv (or a quantized gate's rows, through ``row_exact_linear``),
+    gate+up (with the softmax + top-k folded in up to 3 rows, after the
+    routing launch from 4) and down/combine each run once for the whole
+    window, in one graph of the rows, their routing and the block's arrays
     that MLX's compile builds the first time a thread meets the window's
     shape and dtype and the router's width on blocks of these faces,
     tensor dtypes and shapes, and that the window's proof keeps for that
@@ -1524,39 +1566,54 @@ def routed_verify_window(block, x):
     plan = _cached_plan(block, x.dtype)
     if plan is None or plan.window is None or plan.proof.failed:
         return None
+    launches = plan.launches
     signature = (x.shape, x.dtype, plan.experts)
     if x.size == x.shape[-1]:
         # One row runs the one-token launches: their proof and graph.
         y = _decode(block, plan, x, plan.proof.graphs.get(signature))
         return None if y is None else mx.reshape(y, (1, -1), stream=mx.gpu)
+    rows = x.size // x.shape[-1]
+    if plan.window.failed or not _windows(plan, x):
+        return None
+    # A quantized gate's logits are its own one-row arithmetic per row
+    # (``row_exact_linear``), computed outside the window's graph.
+    logits = None
+    if plan.quantized_router:
+        logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+        if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+            return None
     # A verify step's block is the replay of the graph its thread kept.
     graph = plan.window.graphs.get(signature)
     if graph is not None:
-        return graph(x, plan.operands)
-    if plan.window.failed or not _windows(plan, x):
-        return None
-    launches, rows = plan.launches, x.size // x.shape[-1]
-    logits = _ranked(rows, plan.experts, launches.dtype)
-    folded = _topk_folds(launches, logits)
-    stand_in = partial(_stand_in, launches, logits, folded, (), plan.operands)
+        if logits is None:
+            return graph(x, plan.operands)
+        return graph(x, logits, plan.operands)
+    ranked = _ranked(rows, plan.experts, launches.dtype)
+    folded = _topk_folds(launches, ranked)
+    outside = () if logits is None else (ranked,)
+    stand_in = partial(_stand_in, launches, ranked, folded, outside, plan.operands)
     said = (
         f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
         "fused verify-window experts failed; verifier fallback",
     )
     if not plan.window.prove((rows, plan.experts, folded), stand_in, logger, *said):
         return None
-    graph = mx.compile(_window(launches, folded))
-    y = graph(x, plan.operands)
+    if logits is None:
+        graph = mx.compile(_window(launches, folded))
+        y = graph(x, plan.operands)
+    else:
+        graph = mx.compile(_window_logits(launches, folded))
+        y = graph(x, logits, plan.operands)
     plan.window.keep(signature, graph)
     return y
 
 
 def _ensure_verify_window_patch(cls) -> None:
-    """Serve row-exact verify MoE blocks through ``routed_verify_window``.
+    """Serve verify MoE blocks through ``routed_verify_window``.
 
     Wraps the mlx-vlm verifier's ``_feed_forward`` (the router patch's verify
-    entry) for ``cls`` blocks while row-exact verify is armed; other verify
-    modes, blocks and shapes keep the wrapped body."""
+    entry) for ``cls`` blocks while a verify is armed; other blocks and shapes
+    keep the wrapped body."""
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
     original = Qwen3_5BatchInvariantForward._feed_forward
@@ -1565,7 +1622,8 @@ def _ensure_verify_window_patch(cls) -> None:
 
     @wraps(original)
     def verify_window(self, feed_forward, x):
-        if is_row_exact_armed() and isinstance(feed_forward, cls):
+        armed = is_row_exact_armed() or is_verify_armed()
+        if armed and isinstance(feed_forward, cls):
             y = routed_verify_window(feed_forward, x)
             if y is not None:
                 return mx.reshape(y, x.shape, stream=mx.gpu)

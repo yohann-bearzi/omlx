@@ -7,6 +7,8 @@ import json
 from functools import lru_cache
 from pathlib import Path
 
+from ..oqh.format import is_oqh_config
+
 _SUPPORTED_TYPES = frozenset(
     {
         "deepseek_v41",
@@ -49,6 +51,8 @@ def moe_offload_compatibility(model_path):
             return False, IN_QUANT_FORMAT
         if raw.get("model_type") not in _SUPPORTED_TYPES:
             return False, "MoE expert offload is not supported for this model type."
+        if is_oqh_config(raw):
+            return False, "MoE expert offload does not read oQh experts."
         files = [config, *path.glob("*.safetensors")]
         index = path / "model.safetensors.index.json"
         if index.exists():

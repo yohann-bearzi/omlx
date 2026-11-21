@@ -1042,13 +1042,13 @@ _SETTINGS = {
 
 
 def _calibration(patch, sampled=None):
-    """oQe's calibration tokens for the tiny runs; ``sampled`` counts the
-    times they are read."""
+    """oQe's calibration tokens for the tiny runs; ``sampled`` records the
+    dataset of each read."""
     tokens = (mx.arange(128).reshape(8, 16) % 63 + 1).astype(mx.int32)
 
     def load(*args, **kwargs):
         if sampled is not None:
-            sampled.append(1)
+            sampled.append(kwargs.get("dataset"))
         return tokens
 
     patch.setattr(oq, "_load_calibration_data", load)
@@ -2241,8 +2241,8 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
     assert sorted(arrays) == sorted(their_arrays)
     assert all(np.array_equal(arrays[name], their_arrays[name]) for name in arrays)
     assert metadata == their_metadata
-    # A run with a format reads the calibration: no calibration samples, and
-    # it makes and pins its own verification reference.
+    # A run with a format reads the calibration: no imatrix samples, one draw
+    # for its own verification reference and one for the oQe affine refinement.
     sampled.clear()
     _, _, applied = _quantize(
         source,
@@ -2251,7 +2251,8 @@ def test_a_calibration_alone_is_the_one_a_run_makes_and_reuses(source, toy, tmp_
         quant_format="toy",
         imatrix_cache_path=str(alone),
     )
-    assert len(sampled) == 1 and len(toy.encoded) == len(applied) > 0
+    assert sampled == [oq._OQE_CALIB_DATASET, oq._OQE_REFINE_CALIB_DATASET]
+    assert len(toy.encoded) == len(applied) > 0
     assert (alone.parent / f"{source.name}.verify.reference.npz").is_file()
     assert (tmp_path / "oqe-toy" / "verify" / "reference.npz").is_file()
     report = json.loads((tmp_path / "oqe-toy" / "oq_imatrix_report.json").read_text())
@@ -3640,3 +3641,89 @@ def test_an_unpacked_minimax_at_8_bits_writes_a_checkpoint_that_loads(
     logits = model.language_model(mx.array([[1, 2, 3, 4]]))
     logits = getattr(logits, "logits", logits)
     assert mx.isfinite(logits).all()
+
+
+# The upstream merge (e1a402cf): oQh (#5317) and the oQe code refinement (#5292).
+
+
+@pytest.mark.parametrize("given", ["mode", "object"])
+def test_oqh_and_a_quant_format_refuse_each_other_before_a_read(
+    source, toy, tmp_path, given
+):
+    """oQh is a writer of its own (lead's ruling (a)): a run given both is
+    refused before anything is read or written, whatever its source."""
+    fmt = "toy" if given == "mode" else toy
+    for model_path in (source, tmp_path / "no-such-source"):
+        output = tmp_path / "oqh-toy"
+        with pytest.raises(
+            ValueError,
+            match="oQh's hadamard and a quant format are different writers: pass one",
+        ):
+            oq.quantize_oq_streaming(
+                str(model_path),
+                str(output),
+                3,
+                hadamard=True,
+                quant_format=fmt,
+                **_SETTINGS,
+            )
+        # Even when the caller does not ask for oQe, which oQh implies.
+        with pytest.raises(ValueError, match="different writers"):
+            oq.quantize_oq_streaming(
+                str(model_path), str(output), 3, hadamard=True, quant_format=fmt
+            )
+    assert list(tmp_path.iterdir()) == []
+    assert toy.offered == [] and toy.encoded == [] and toy.accepted == []
+
+
+def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
+    source, plain, toy, tmp_path, caplog
+):
+    """The oQe code refinement runs on a format build's affine layers as on a
+    stock build, and leaves the format's layers as the format encoded them;
+    the log and the report say how many it skipped (refining format layers is
+    release-3)."""
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    output = tmp_path / "oqe-toy"
+    tensors, config, _ = _quantize(source, output, quant_format="toy")
+    entries = _in_format(config)
+    assert entries
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["status"] == "done"
+    assert refine["format_layers"] == {
+        "mode": "toy",
+        "skipped": len(entries),
+        "reason": "the refinement re-picks affine codes; format layers keep the "
+        "format's encoding",
+    }
+    said = (
+        f"oQe refine: {len(entries)} layers in quant format toy skipped "
+        "(format layers keep their encoding)"
+    )
+    assert said in caplog.messages
+    # The format's tensors are its codec's encoding of the source, untouched.
+    weights = mx.load(str(source / "model.safetensors"))
+    for name, entry in entries.items():
+        w = weights[f"{name.removeprefix('language_model.')}.weight"]
+        kept = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
+        assert _same(kept, _Codec().encode(w, None, entry["bits"], entry["group_size"]))
+    # Its affine layers are the stock build's, refined alike.
+    _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
+
+
+def test_the_refinement_writer_leaves_the_layers_it_is_told_to_skip(tmp_path):
+    """A skipped layer is not refined even when its tensors read as affine."""
+    weight_map = {
+        f"model.layers.0.{name}.{part}": "model.safetensors"
+        for name in ("a", "b")
+        for part in ("weight", "scales", "biases")
+    }
+    quantization = {"bits": 4, "group_size": 64, "mode": "affine"}
+    writer = oq._OQRefineWriter(
+        tmp_path, weight_map, quantization, frozenset({"model.layers.0.a"})
+    )
+    assert writer.spec("model.layers.0.a") is None
+    assert writer.spec("model.layers.0.b") == (4, 64)
+    assert oq._OQRefineWriter(tmp_path, weight_map, quantization).spec(
+        "model.layers.0.a"
+    ) == (4, 64)

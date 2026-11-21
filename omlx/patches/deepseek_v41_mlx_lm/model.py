@@ -19,7 +19,7 @@ from typing import Any
 import mlx.core as mx
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
-from omlx.patches.deepseek_v41.config import ModelConfig
+from omlx.patches.deepseek_v41.config import ModelConfig, TensorSplit
 from omlx.patches.deepseek_v41.language import LanguageModel
 from omlx.patches.deepseek_v41.loading import load
 from omlx.patches.deepseek_v41.model import Model as _LoadedModel
@@ -205,8 +205,13 @@ def load_tensor_shard(
     ced_prefill: bool = False,
     a8_prefill: bool = False,
     a8_prefill_min_tokens: int = 128,
+    tensor_split: Any = None,
 ) -> Model:
-    """This rank's tensor-parallel slice of a converted checkpoint, text model only."""
+    """This rank's tensor-parallel slice of a converted checkpoint, text model only.
+
+    ``tensor_split`` (``{"attention": [...], "experts": [...]}``) gives each
+    rank its own share; without it the ranks split evenly.
+    """
 
     from omlx.patches.format_load import refuse_format_checkpoint
 
@@ -232,5 +237,6 @@ def load_tensor_shard(
         a8_prefill=a8_prefill,
         a8_prefill_min_tokens=a8_prefill_min_tokens,
         mtp_head=is_mtp_active() and group.rank() == 0,
+        tensor_split=TensorSplit.from_dict(tensor_split),
     )
     return _as_cluster_rank(model, group)
