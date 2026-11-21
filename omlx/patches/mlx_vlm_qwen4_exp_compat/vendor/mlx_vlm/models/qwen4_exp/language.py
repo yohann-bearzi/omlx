@@ -2933,8 +2933,10 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         )
         if projected is not None:
             return projected[0]
-        if rows == 1 or isinstance(self.o_proj, FormatLinear):
+        if rows == 1:
             return self.o_proj(output)
+        if isinstance(self.o_proj, FormatLinear):
+            return row_exact_qmv.quantized_linear(self.o_proj, output)
         return _VERIFIER._linear(self.o_proj, output)
 
     def _fused_forward(

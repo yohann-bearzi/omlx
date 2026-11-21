@@ -1557,6 +1557,10 @@ def _stack_format_inputs(module):
     stacked = first._stacked_outputs(*layers[1:], layout=layout)
     if not _exact_format_face(stacked, k, n, module.conv1d.weight.dtype):
         return None
+    # The cache publishes these arrays to concurrent eval calls (decode and a
+    # rolled verify tile share them); an unevaluated concatenate would then be
+    # scheduled by two threads at once. Materialize it here, once.
+    mx.eval([stacked[name] for name in stacked._tensors])
     return stacked
 
 

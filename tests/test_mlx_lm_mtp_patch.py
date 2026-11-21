@@ -6849,3 +6849,35 @@ def test_row_exact_verify_helpers_group_format_projections(monkeypatch, rows):
             assert got.shape == want.shape and got.dtype == want.dtype
             assert mx.array_equal(got.view(mx.uint32), want.view(mx.uint32)).item()
         assert launches == ([(rows, 320)] if rows > 1 else [])
+
+
+@testing.verified("qwen4_exp")
+def test_use_target_verify_dense_declines_format_linear_when_armed(monkeypatch):
+    from mlx_vlm.speculative.ops import linear as ops
+
+    from omlx import formats
+    from omlx.patches import qwen35_verify_qmm
+    from tests.test_formats_kernels import _toy
+    from tests.test_formats_linear import _toy_linear, _ToyFormat
+
+    calls = []
+
+    def original(linear, x):
+        calls.append(tuple(x.shape))
+        return True
+
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("dense_gate")))
+    layer, _, _ = _toy_linear(40, 320, seed=1)
+    x = mx.zeros((1, 3, 320), mx.float32)
+
+    monkeypatch.setattr(ops, "_use_target_verify_dense", original)
+    qwen35_verify_linear.apply()
+    monkeypatch.setattr(qwen35_verify_qmm, "is_row_exact_armed", lambda: True)
+    assert ops._use_target_verify_dense(layer, x) is False
+    assert calls == []
+
+    monkeypatch.setattr(qwen35_verify_qmm, "is_row_exact_armed", lambda: False)
+    monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: False)
+    assert ops._use_target_verify_dense(layer, x) is True
+    assert calls == [(1, 3, 320)]

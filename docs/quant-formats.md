@@ -1343,8 +1343,9 @@ a bias to any member of a warmed group sends it through its own projection.
 
 During armed row-exact verification, mlx-vlm groups eligible format projections
 that share an input. Qwen4 fused attention requests its explicit tile for the query,
-key, value and index projections together. If the output tile is unavailable,
-a format output projection runs through its own layer.
+key, value and index projections together. If the output tile is unavailable, a format
+output projection runs through row-exact one-row calls (its own layer at one row, or
+one one-row call per row for verify windows).
 
 On the M5 Max and later, MLX's affine switch layers use the affine tile face
 for sorted prompt rows. The gather can apply SwiGLU to fused gate/up outputs

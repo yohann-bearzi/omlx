@@ -516,3 +516,59 @@ def test_format_attention_projections_fuse_and_match_the_generic_path(
         ),
         (id(attn.o_proj),),
     ]
+
+
+@requires_kernels
+@testing.verified("qwen4_exp")
+def test_format_attention_fused_output_fallback_stays_row_exact(monkeypatch):
+    """When o_proj is a FormatLinear without an exact dot face for the output
+    tile, multi-row _fused_output falls back to row_exact_qmv.quantized_linear
+    (one-row calls per row), not a multi-row matmul."""
+    from omlx import formats
+    from omlx.formats.linear import FormatLinear
+    from tests.test_formats_linear import _ToyFormat
+
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(None))
+    attn = _attention(seed=151)
+    projection = attn.o_proj
+    n, groups = projection.scales.shape
+    k = groups * projection.group_size
+    mx.random.seed(201)
+    codes = mx.random.randint(126, 131, (n, k)).astype(mx.uint8)
+    scales = mx.full((n,), 2.0**-6)
+    attn.o_proj = FormatLinear(
+        "toy", 8, 1, k, {"codes": codes, "group_scales": scales}
+    )
+
+    output = (mx.random.normal((1, 3, k)) * 0.5).astype(mx.bfloat16)
+    serial = mx.concatenate([attn.o_proj(output[:, r : r + 1]) for r in range(3)], 1)
+    mx.eval(output, serial)
+
+    ql_calls = []
+    real_ql = language.row_exact_qmv.quantized_linear
+
+    def spy_ql(linear, x):
+        ql_calls.append((linear, tuple(x.shape)))
+        return real_ql(linear, x)
+
+    seen_rows = []
+    real_call = FormatLinear.__call__
+
+    def spy_call(self, x):
+        if self is attn.o_proj:
+            seen_rows.append(x.shape[1])
+        return real_call(self, x)
+
+    monkeypatch.setattr(language.row_exact_qmv, "quantized_linear", spy_ql)
+    monkeypatch.setattr(FormatLinear, "__call__", spy_call)
+
+    got = attn._fused_output(output, 3)
+    mx.eval(got)
+    assert ql_calls == [(attn.o_proj, (1, 3, k))]
+    assert seen_rows == [1, 1, 1]
+    assert _bit_equal(got, serial)
+
+    one = attn._fused_output(output[:, :1], 1)
+    mx.eval(one)
+    assert _bit_equal(one, serial[:, :1])

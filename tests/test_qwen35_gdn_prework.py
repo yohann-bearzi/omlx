@@ -1721,7 +1721,7 @@ def format_gdn(monkeypatch):
             codes = (126 + (col + row) % 5).astype(mx.uint8)
             scales = mx.random.randint(1, 5, (n,)).astype(mx.float32) / 256
             return FormatLinear(
-                "toy", width, group, k, {"weight": codes, "scales": scales}
+                "toy", width, group, k, {"codes": codes, "group_scales": scales}
             )
 
         monkeypatch.setattr(sys.modules[__name__], "_random_projection", projection)
@@ -1855,8 +1855,8 @@ def test_format_gdn_decode_keeps_composed_state_and_rebuilds_the_stack(
         ):
             assert got.shape == want.shape and got.dtype == want.dtype
             assert mx.array_equal(_bits(got), _bits(want)).item()
-        module.in_proj_a.scales = -module.in_proj_a.scales
-        module.out_proj.scales = 2 * module.out_proj.scales
+        module.in_proj_a["group_scales"] = -module.in_proj_a["group_scales"]
+        module.out_proj["group_scales"] = 2 * module.out_proj["group_scales"]
         new_plan = prework_mod._qwen4_decode_plan(module)
         assert new_plan is not None and new_plan is not plan
         plan = new_plan
@@ -1925,18 +1925,18 @@ def test_gdn_checks_each_format_projection_before_planning(format_gdn, part, att
         layer.bias = mx.zeros((layer.output_dims,), mx.bfloat16)
     elif attribute in ("dtype", "extent"):
         scales = (
-            layer.scales.astype(mx.bfloat16)
+            layer["group_scales"].astype(mx.bfloat16)
             if attribute == "dtype"
-            else layer.scales[:-1]
+            else layer["group_scales"][:-1]
         )
         module[part] = FormatLinear(
             layer.fmt,
             layer.bits,
             layer.group_size,
             layer.input_dims,
-            {"weight": layer.weight, "scales": scales},
+            {"codes": layer["codes"], "group_scales": scales},
         )
-        assert module[part].scales is scales
+        assert module[part]["group_scales"] is scales
     else:
         layer.input_dims = layer.input_dims // 2
     assert prework_mod._qwen4_decode_plan(module) is None
@@ -1953,7 +1953,7 @@ def test_gdn_checks_the_layout_of_the_unequal_input_stack(format_gdn, monkeypatc
     def padded(k, n, bits, group):
         shape = layout(k, n, bits, group)
         if n in (16480, 32960):
-            shape["weight"] = ((n, k + 8), mx.uint8)
+            shape["codes"] = ((n, k + 8), mx.uint8)
         return shape
 
     monkeypatch.setattr(fmt, "layout", padded)
@@ -2036,8 +2036,62 @@ def test_gdn_keeps_input_projections_of_two_checkpoint_readers_apart(format_gdn)
         source.bits,
         source.group_size,
         source.input_dims,
-        {name: source[name] for name in ("weight", *other.tensors)},
+        {name: source[name] for name in (other.codes_name, *other.tensors)},
     )
     decode = prework_mod._qwen4_decode_plan(module)
     assert decode is not None and decode[-2] is None and decode[-1] is not None
     assert prework_mod._qwen4_verify_plan(module) is None
+
+
+def test_gdn_stacked_format_inputs_are_evaluated_before_caching(
+    format_gdn, monkeypatch
+):
+    """The cached stacked inputs are materialized once, not left as lazy
+    concatenates two eval threads could schedule at the same time."""
+    module = format_gdn(8, mx.bfloat16)
+    evaluated = set()
+    real = prework_mod.mx.eval
+
+    def record(*arrays, **kwargs):
+        for item in arrays:
+            for array in item if isinstance(item, (list, tuple)) else (item,):
+                evaluated.add(id(array))
+        return real(*arrays, **kwargs)
+
+    monkeypatch.setattr(prework_mod.mx, "eval", record)
+    stacked = prework_mod._stacked_format_inputs(module)
+    assert stacked is not None
+    assert {id(stacked[name]) for name in stacked._tensors} <= evaluated
+    evaluated.clear()
+    assert prework_mod._stacked_format_inputs(module) is stacked
+    assert evaluated == set()
+
+
+def test_gdn_declines_stack_when_input_projections_have_mixed_tensor_dtypes(
+    format_gdn, monkeypatch
+):
+    from omlx import formats
+    from omlx.formats.linear import FormatLinear
+
+    module = format_gdn(8, mx.bfloat16)
+    fmt = formats.get("toy")
+    layout = fmt.layout
+
+    def untyped_scales(k, n, bits, group):
+        shape = layout(k, n, bits, group)
+        shape["group_scales"] = (shape["group_scales"][0], None)
+        return shape
+
+    monkeypatch.setattr(fmt, "layout", untyped_scales)
+    source = module.in_proj_a
+    module.in_proj_a = FormatLinear(
+        source.fmt,
+        source.bits,
+        source.group_size,
+        source.input_dims,
+        {
+            "codes": source["codes"],
+            "group_scales": source["group_scales"].astype(mx.float16),
+        },
+    )
+    assert prework_mod._stacked_format_inputs(module) is None

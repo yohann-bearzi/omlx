@@ -8,7 +8,9 @@ quantized projection has the serial step's bits; stock multi-row kernels
 
 from __future__ import annotations
 
+import gc
 import inspect
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Barrier
@@ -853,3 +855,258 @@ def test_format_verify_rechecks_the_face_when_a_loaded_tensor_changes(monkeypatc
     assert layer["codes"] is replacement
     assert row_exact_qmv._plan(layer, x, 3) is None
     assert mx.array_equal(row_exact_qmv.quantized_linear(layer, x), layer(x)).item()
+
+
+@pytest.mark.parametrize("bits", [6, 8])
+def test_one_row_and_rows_qmv_decline_constant_bound_scales(bits):
+    """MLX binds a tensor of fewer than 8 elements as a constant; the tile
+    reads scales and biases from device memory, so the layout is declined at
+    plan time and the layer keeps its composed path."""
+    weight, scales, biases = mx.quantize(
+        mx.zeros((2, 256), dtype=mx.bfloat16), group_size=128, bits=bits
+    )
+    assert scales.size == 4
+    assert (
+        row_exact_qmv.one_row_qmv(
+            weight, scales, biases, bits, 128, "affine", mx.bfloat16, 1
+        )
+        is None
+    )
+    assert (
+        row_exact_qmv.rows_qmv(
+            weight, scales, biases, bits, 128, "affine", mx.bfloat16, lambda _: (1, 1)
+        )
+        is None
+    )
+
+
+@testing.verified("qwen4_exp")
+def test_format_layer_with_k_below_eight_falls_back(monkeypatch):
+    """MLX binds an x of fewer than 8 elements as a constant, and the shared
+    tile reads x from device memory: a format layer of k below 8 falls back."""
+    for vpt, k, rows in ((4, 4, 1), (2, 2, 2)):
+        face = _toy(f"tiny_k{vpt}", vpt=vpt)
+        formats.load()
+        monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(face))
+        layer, _, _ = _toy_linear(16, k)
+        x = mx.ones((1, rows, k), mx.float32)
+        assert row_exact_qmv.quantized_linears_tiled((layer,), x, 1, 4) is None
+        got = row_exact_qmv.quantized_linear(layer, x)
+        assert mx.array_equal(got, layer(x)).item()
+
+
+def test_group_plan_does_not_collide_when_a_member_is_replaced_at_same_id(monkeypatch):
+    """A group's plan is keyed by its members' identity, not their id(): a
+    replacement member reported at the same id gets its own plan."""
+    first = _linear(320, 40, 8, 64, 1)
+    second = _linear(320, 72, 8, 64, 2)
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is not None
+    other = _linear(320, 16, 8, 64, 3)
+    real_id = id
+    monkeypatch.setattr(
+        row_exact_qmv,
+        "id",
+        lambda value: real_id(second) if value is other else real_id(value),
+        raising=False,
+    )
+    plan = row_exact_qmv._group_plan((first, other), x, 3)
+    assert plan is not None and plan.output_shapes[1][-1] == 16
+
+
+@testing.verified("qwen4_exp")
+def test_warm_group_launch_avoids_id_audit_events(monkeypatch):
+    """A warm grouped launch resolves its plan without id() calls: once an
+    audit hook is installed (mlx-vlm's), every id() raises an event."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("audit_id")))
+    cases = (
+        ([_linear(320, n, 8, 64, n) for n in (40, 72, 16)], mx.bfloat16),
+        ([_toy_linear(n, 320, seed=n)[0] for n in (40, 72, 16)], mx.float32),
+    )
+    events = []
+    active = []
+
+    def hook(event, args):
+        if event == "builtins.id" and active:
+            events.append(event)
+
+    sys.addaudithook(hook)
+    for layers, dtype in cases:
+        x = mx.ones((1, 3, 320), dtype)
+        assert row_exact_qmv._group_plan(layers, x, 3) is not None
+        row_exact_qmv.quantized_linears(layers, x)
+        events.clear()
+        active.append(True)
+        try:
+            row_exact_qmv.quantized_linears(layers, x)
+        finally:
+            active.clear()
+        assert events == []
+
+
+def test_tile_store_loop_keeps_compile_time_bounds():
+    """The store loop keeps a compile-time bound (RPS) and both partial
+    branches are if constexpr: no runtime index into result."""
+    assert "for (int r = 0; r < RPS; r++)" in row_exact_qmv._TILE
+    assert row_exact_qmv._TILE.count("if constexpr (PARTIAL)") == 2
+
+
+@testing.verified("qwen4_exp")
+def test_group_plan_rechecks_when_sibling_mutates_during_build(monkeypatch):
+    """The sibling tokens are snapshotted before the launch is built: a
+    mutation that lands during the build is not cached with the old plan."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("sibling_mut")))
+    first, _, _ = _toy_linear(40, 320, seed=1)
+    second, _, _ = _toy_linear(72, 320, seed=2)
+    x = mx.ones((1, 3, 320), mx.float32)
+    real = row_exact_qmv._module_launch
+
+    def mutate(*args, **kwargs):
+        second["bias"] = mx.ones((72,), mx.float32)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(row_exact_qmv, "_module_launch", mutate)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is not None
+    monkeypatch.setattr(row_exact_qmv, "_module_launch", real)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is None
+
+
+def test_quantized_linears_tiled_returns_none_for_zero_rows_or_invalid_tile():
+    """Zero rows, empty projection lists, and non-positive tile arguments
+    return None rather than failing inside concatenation or grid dispatch."""
+    linears = [_linear(2560, 256, 4, 64, 1)]
+    tiled = row_exact_qmv.quantized_linears_tiled
+    assert tiled(linears, mx.zeros((1, 0, 2560), mx.bfloat16), 2, 4, True) is None
+    assert tiled(linears, mx.zeros((1, 0, 2560), mx.bfloat16), 2, 4, False) is None
+    assert tiled((), mx.zeros((1, 2, 2560), mx.bfloat16), 1, 4) is None
+    assert tiled(linears, mx.zeros((1, 2, 2560), mx.bfloat16), 0, 4) is None
+    assert tiled(linears, mx.zeros((1, 2, 2560), mx.bfloat16), 1, 0) is None
+
+
+@testing.verified("qwen4_exp")
+def test_concurrent_group_plan_misses_and_invalidation(monkeypatch):
+    """Concurrent cold misses do not duplicate plan entries, and concurrent
+    invalidation of a mutated FormatLinear sibling never raises IndexError."""
+    first = _linear(320, 40, 8, 64, 1)
+    second = _linear(320, 72, 8, 64, 2)
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    cold = Barrier(2, timeout=10)
+    real_launch = row_exact_qmv._module_launch
+
+    def slow_launch(*args, **kwargs):
+        cold.wait()
+        return real_launch(*args, **kwargs)
+
+    monkeypatch.setattr(row_exact_qmv, "_module_launch", slow_launch)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        plans = list(
+            pool.map(
+                lambda _: row_exact_qmv._group_plan((first, second), x, 3), range(2)
+            )
+        )
+    monkeypatch.setattr(row_exact_qmv, "_module_launch", real_launch)
+    assert plans[0] is not None and plans[0] is plans[1]
+    assert len(row_exact_qmv._plans(first)[(2, 3, mx.bfloat16, 320, None)]) == 1
+
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("concurrent_inv")))
+    f0, _, _ = _toy_linear(40, 320, seed=1)
+    f1, _, _ = _toy_linear(72, 320, seed=2)
+    xf = mx.ones((1, 3, 320), mx.float32)
+    assert row_exact_qmv._group_plan((f0, f1), xf, 3) is not None
+    f1["bias"] = mx.ones((72,), mx.float32)
+    invalidate = Barrier(2, timeout=10)
+    real_face = row_exact_qmv._face
+
+    def slow_face(linear, value):
+        if linear is f0:
+            invalidate.wait()
+        return real_face(linear, value)
+
+    monkeypatch.setattr(row_exact_qmv, "_face", slow_face)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        rebuilt = list(
+            pool.map(lambda _: row_exact_qmv._group_plan((f0, f1), xf, 3), range(2))
+        )
+    assert rebuilt == [None, None]
+    assert len(row_exact_qmv._plans(f0)[(2, 3, mx.float32, 320, None)]) == 1
+
+
+def test_warm_group_plan_does_not_allocate_weakrefs(monkeypatch):
+    """A warm _group_plan lookup reads immutable entries without allocating
+    new weakref objects."""
+    layers = [_linear(320, n, 8, 64, n) for n in (40, 72)]
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    warm = row_exact_qmv._group_plan(layers, x, 3)
+    assert warm is not None
+
+    def fail_ref(*args, **kwargs):
+        pytest.fail("warm _group_plan allocated a weakref")
+
+    monkeypatch.setattr(row_exact_qmv.weakref, "ref", fail_ref)
+    assert row_exact_qmv._group_plan(layers, x, 3) is warm
+
+
+def test_warm_quantized_linear_reuses_cached_packed_name(monkeypatch):
+    """A warm quantized_linear call reads launch.names[0] instead of
+    re-resolving formats.tensor_names."""
+    linear = _linear(320, 40, 8, 64, 1)
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    want = _serial(linear, x)
+    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), want)
+
+    def fail_names(*args, **kwargs):
+        pytest.fail("warm quantized_linear called formats.tensor_names")
+
+    monkeypatch.setattr(row_exact_qmv.formats, "tensor_names", fail_names)
+    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), want)
+
+
+def test_group_plan_prunes_dead_member_entries():
+    """Collected group members are pruned from the first layer's plan table."""
+    first = _linear(320, 40, 8, 64, 1)
+    ephemeral = _linear(320, 72, 8, 64, 2)
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    key = (2, 3, mx.bfloat16, 320, None)
+    assert row_exact_qmv._group_plan((first, ephemeral), x, 3) is not None
+    del ephemeral
+    gc.collect()
+    other = _linear(320, 16, 8, 64, 3)
+    assert row_exact_qmv._group_plan((first, other), x, 3) is not None
+    assert len(row_exact_qmv._plans(first)[key]) == 1
+
+
+@testing.verified("qwen4_exp")
+def test_format_face_declines_zero_vpt_and_indivisible_k(monkeypatch):
+    """_face refuses faces with vpt < 1 or k not divisible by face.vpt."""
+    formats.load()
+    monkeypatch.setitem(
+        formats._FORMATS, "toy", _ToyFormat(replace(_toy("zero_vpt"), vpt=0))
+    )
+    layer0, _, _ = _toy_linear(16, 32, seed=1)
+    x0 = mx.ones((1, 2, 32), mx.float32)
+    assert row_exact_qmv._face(layer0, x0) is None
+    assert mx.array_equal(row_exact_qmv.quantized_linear(layer0, x0), layer0(x0)).item()
+
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("vpt8", vpt=8)))
+    layer12, _, _ = _toy_linear(16, 12, seed=2)
+    x12 = mx.ones((1, 2, 12), mx.float32)
+    assert row_exact_qmv._face(layer12, x12) is None
+    got12 = row_exact_qmv.quantized_linear(layer12, x12)
+    assert mx.array_equal(got12, layer12(x12)).item()
+
+
+def test_quantized_linears_falls_back_above_four_projections(monkeypatch):
+    """Groups of more than four projections run each projection separately."""
+    layers = [_linear(320, 16 + 8 * i, 8, 64, i + 1) for i in range(5)]
+    x = mx.random.normal((1, 3, 320)).astype(mx.bfloat16)
+
+    def fail_group(*args, **kwargs):
+        pytest.fail("grouped more than four projections")
+
+    monkeypatch.setattr(row_exact_qmv, "_group_plan", fail_group)
+    outputs = row_exact_qmv.quantized_linears(layers, x)
+    for linear, got in zip(layers, outputs):
+        assert _bit_equal(got, _serial(linear, x))

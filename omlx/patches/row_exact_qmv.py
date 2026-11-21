@@ -27,6 +27,8 @@ weights; it replaces ``quantized_matmul`` bit for bit.
 from __future__ import annotations
 
 import logging
+import threading
+import weakref
 from functools import cache
 
 import mlx.core as mx
@@ -54,15 +56,18 @@ _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 # Every K block of a column is decoded once and applied to the ROWS rows,
 # their inputs loaded ahead; each (row, column) accumulator is the one-row
 # call's. Simdgroups past N (a partial last tile) have nothing to compute.
-_TILE = r"""
+_TILE = kernels._compact(
+    r"""
 template <
     typename T, int K, int N, int ROWS, int RPS, int VPT,
     typename D, typename X, typename Y>
 METAL_FUNC void omlx_row_exact(D m, X x, Y y, int tile, int row0, uint sg, uint sl) {
   constexpr bool PARTIAL = N % (2 * RPS) != 0;
   const int out_row = tile * (2 * RPS) + int(sg) * RPS;
-  if (PARTIAL && out_row >= N) {
-    return;
+  if constexpr (PARTIAL) {
+    if (out_row >= N) {
+      return;
+    }
   }
   const int valid = PARTIAL ? min(RPS, N - out_row) : RPS;
   float result[ROWS * RPS];
@@ -70,13 +75,19 @@ METAL_FUNC void omlx_row_exact(D m, X x, Y y, int tile, int row0, uint sg, uint 
       m, size_t(out_row), valid, x + row0 * K, sl, result);
   if (sl == 0) {
     for (int i = 0; i < ROWS; i++) {
-      for (int r = 0; r < valid; r++) {
+      for (int r = 0; r < RPS; r++) {
+        if constexpr (PARTIAL) {
+          if (r >= valid) {
+            break;
+          }
+        }
         y[(row0 + i) * N + out_row + r] = static_cast<T>(result[i * RPS + r]);
       }
     }
   }
 }
 """
+)
 
 
 # Projection i's tile `tile` (of its own tiles).
@@ -155,10 +166,12 @@ class _Launch:
         "padding",
         "shape",
         "faces",
+        "names",
     )
 
-    def __init__(self, faces, dtype, k, sizes, rows, per_group, rps, unrolled):
+    def __init__(self, faces, dtype, k, sizes, rows, per_group, rps, unrolled, names):
         self.faces = tuple(faces)
+        self.names = tuple(names)
         self.padding = -rows % per_group
         padded = rows + self.padding
         constants = (
@@ -266,6 +279,10 @@ def _face(linear, x: mx.array) -> Dot | None:
     elif not isinstance(linear, FormatLinear) or x.shape[-1] != linear.input_dims:
         return None
     k = int(x.shape[-1])
+    # MLX binds x as a constant below 8 elements; the shared tile reads it
+    # from device memory (linear.py's _plan refuses the same).
+    if k < 8:
+        return None
     face = formats.dot(linear, k, int(linear[formats.tensor_names(linear)[0]].shape[0]))
     if face is None or not face.exact_for(x.dtype) or face.vpt < 1 or k % face.vpt:
         return None
@@ -299,9 +316,8 @@ def _module_launch(linears, faces, x: mx.array, rows: int, geometry=None):
     ``kernels.unrolled_tile_ok`` (by default, or as ``geometry`` asks), once
     this GPU's bits are checked against the layers' one-row calls."""
     k = int(x.shape[-1])
-    sizes = [
-        int(linear[formats.tensor_names(linear)[0]].shape[0]) for linear in linears
-    ]
+    names = tuple(formats.tensor_names(linear)[0] for linear in linears)
+    sizes = [int(linear[name].shape[0]) for linear, name in zip(linears, names)]
     vpt = faces[0].vpt
     if geometry is None:
         first = linears[0]
@@ -319,10 +335,12 @@ def _module_launch(linears, faces, x: mx.array, rows: int, geometry=None):
         unrolled = per_group > 1
     else:
         per_group, rps, unrolled = geometry
-        if rows % per_group:
+        if per_group < 1 or rps < 1 or rows % per_group:
             return None
     unrolled = unrolled and kernels.unrolled_tile_ok(vpt, rps, per_group)
-    launch = _Launch(faces, x.dtype, k, sizes, rows, per_group, rps, unrolled)
+    launch = _Launch(
+        faces, x.dtype, k, sizes, rows, per_group, rps, unrolled, names
+    )
     if launch.shape is not None:
 
         def run(probe):
@@ -333,7 +351,9 @@ def _module_launch(linears, faces, x: mx.array, rows: int, geometry=None):
             return [_one_row_calls(linear, probe) for linear in linears]
 
         if not unrolled_tile_verified(launch.shape, run, reference, rows, k, x.dtype):
-            launch = _Launch(faces, x.dtype, k, sizes, rows, per_group, rps, False)
+            launch = _Launch(
+                faces, x.dtype, k, sizes, rows, per_group, rps, False, names
+            )
     return launch
 
 
@@ -346,7 +366,6 @@ def _format_plans(linear):
         lambda _: ({}, object()),
         depth=0,
         flags=(
-            id(linear.fmt),
             linear.fmt,
             linear.input_dims,
             type(linear.bits),
@@ -358,6 +377,9 @@ def _format_plans(linear):
     )
 
 
+_GROUP_PLANS_LOCK = threading.Lock()
+
+
 def _plans(linear) -> dict:
     if isinstance(linear, FormatLinear):
         return _format_plans(linear)[0]
@@ -365,8 +387,7 @@ def _plans(linear) -> dict:
     # read per call.
     plans = linear.__dict__.get("_omlx_row_exact_plans")
     if plans is None:
-        plans = {}
-        object.__setattr__(linear, "_omlx_row_exact_plans", plans)
+        plans = linear.__dict__.setdefault("_omlx_row_exact_plans", {})
     return plans
 
 
@@ -374,7 +395,7 @@ def _plan(linear, x: mx.array, rows: int) -> _Launch | None:
     plans = _plans(linear)
     key = (rows, x.dtype, x.shape[-1])
     if key not in plans:
-        face = _face(linear, x) if rows <= MAX_ROWS else None
+        face = _face(linear, x) if 1 <= rows <= MAX_ROWS else None
         plans[key] = (
             None if face is None else _module_launch((linear,), (face,), x, rows)
         )
@@ -408,27 +429,37 @@ def quantized_linear(linear, x: mx.array) -> mx.array:
     launch = _plan(linear, x, rows)
     if launch is None:
         return _one_row_calls(linear, flat).reshape(*lead, -1)
-    (y,) = launch(flat, [_operands(linear, launch.faces[0])])
+    (y,) = launch(
+        flat,
+        [(linear[launch.names[0]], *(linear[t] for t in launch.faces[0].tensors))],
+    )
     return _biased(linear, y).reshape(*lead, -1)
 
 
 def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _Launch | None:
+    if not linears:
+        return None
     plans = _plans(linears[0])
-    key = (
-        tuple(id(linear) for linear in linears),
-        rows,
-        x.dtype,
-        x.shape[-1],
-        geometry,
+    # The members after the first are keyed by their identity, not their
+    # address: a weak reference to each, checked on every hit, so a freed
+    # member's address reused by another layer cannot return its plan.
+    # Entries are stored as immutable tuples so warm hits read lock-free
+    # without allocating weakrefs or lists; updates serialize under
+    # _GROUP_PLANS_LOCK outside _module_launch.
+    key = (len(linears), rows, x.dtype, x.shape[-1], geometry)
+    members = linears[1:]
+    tokens = tuple(
+        _format_plans(linear)[1]
+        for linear in members
+        if isinstance(linear, FormatLinear)
     )
-    entry = plans.get(key)
-    if entry is not None:
-        launch, others = entry
-        if not others or all(
-            _format_plans(linears[index])[1] is token for index, token in others
+    for entry_refs, entry_tokens, launch in plans.get(key, ()):
+        if (
+            all(ref() is linear for ref, linear in zip(entry_refs, members))
+            and entry_tokens == tokens
         ):
             return launch
-    faces = [_face(linear, x) for linear in linears] if rows <= MAX_ROWS else []
+    faces = [_face(linear, x) for linear in linears] if 1 <= rows <= MAX_ROWS else []
     grouped = (
         faces
         and all(face is not None for face in faces)
@@ -437,12 +468,20 @@ def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _Launch | Non
         and kernels.table_bytes(*faces) <= formats.TABLE_BYTES
     )
     launch = _module_launch(linears, faces, x, rows, geometry) if grouped else None
-    others = tuple(
-        (index, _format_plans(linear)[1])
-        for index, linear in enumerate(linears[1:], 1)
-        if isinstance(linear, FormatLinear)
-    )
-    plans[key] = launch, others
+    refs = tuple(weakref.ref(linear) for linear in members)
+    with _GROUP_PLANS_LOCK:
+        kept = []
+        for entry in plans.get(key, ()):
+            entry_refs, entry_tokens, entry_launch = entry
+            if not all(ref() is not None for ref in entry_refs):
+                continue
+            if all(ref() is linear for ref, linear in zip(entry_refs, members)):
+                if entry_tokens == tokens:
+                    return entry_launch
+                continue
+            kept.append(entry)
+        kept.append((refs, tokens, launch))
+        plans[key] = tuple(kept)
     return launch
 
 
@@ -457,7 +496,10 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     plan = _group_plan(linears, x, rows) if 1 < rows and 1 < len(linears) <= 4 else None
     if plan is None:
         return tuple(quantized_linear(linear, x) for linear in linears)
-    operands = [_operands(m, face) for m, face in zip(linears, plan.faces)]
+    operands = [
+        (m[name], *(m[tensor] for tensor in face.tensors))
+        for m, face, name in zip(linears, plan.faces, plan.names)
+    ]
     outputs = plan(x.reshape(rows, x.shape[-1]), operands)
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
@@ -475,10 +517,14 @@ def quantized_linears_tiled(
     rows = 1
     for size in lead:
         rows *= size
-    plan = _group_plan(tuple(linears), x, rows, (rows_per_group, rps, unrolled))
+    linears = tuple(linears)
+    plan = _group_plan(linears, x, rows, (rows_per_group, rps, unrolled))
     if plan is None:
         return None
-    operands = [_operands(m, face) for m, face in zip(linears, plan.faces)]
+    operands = [
+        (m[name], *(m[tensor] for tensor in face.tensors))
+        for m, face, name in zip(linears, plan.faces, plan.names)
+    ]
     outputs = plan(x.reshape(rows, x.shape[-1]), operands)
     return tuple(y.reshape(*lead, -1) for y in outputs)
 
@@ -542,7 +588,7 @@ class OneRowQmv:
         n = int(weight.shape[0])
         k = int(scales.shape[-1]) * group_size
         face = _affine_face(bits, group_size, dtype)
-        launch = _Launch((face,), dtype, k, [n], 1, 1, rps, False)
+        launch = _Launch((face,), dtype, k, [n], 1, 1, rps, False, ("weight",))
         self._kernel, self._template, self._grid = (
             launch.kernel,
             launch.template,
@@ -595,6 +641,9 @@ def _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, rps)
         or n % (2 * rps)
         or scales.shape != (n, k // group_size)
         or weight.shape[1] * 32 != k * bits
+        # MLX binds a tensor of fewer than 8 elements as a constant; the tile
+        # reads scales and biases from device memory.
+        or scales.size < 8
     )
 
 
@@ -664,6 +713,7 @@ class RowsQmv:
                 per_group,
                 rps,
                 self._unrolled,
+                ("weight",),
             )
             if launch.shape is not None and not unrolled_tile_verified(
                 launch.shape,
@@ -682,6 +732,7 @@ class RowsQmv:
                     per_group,
                     rps,
                     False,
+                    ("weight",),
                 )
             self._launch[rows] = launch
         (y,) = launch(x.reshape(rows, self._k), [self._weights])
