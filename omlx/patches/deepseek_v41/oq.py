@@ -24,7 +24,6 @@ import mlx.core as mx
 import numpy as np
 
 from ...model_discovery import SOURCE_RECORDS
-
 from ...oq import (
     _OQE_REFINE_SAMPLES,
     _OQE_REFINE_SEQ_LENGTH,

@@ -40,7 +40,7 @@ _DRIVER = r"""
 import sys
 from pathlib import Path
 
-tree, source, output, level = sys.argv[1:5]
+tree, source, output, level, hadamard = sys.argv[1:6]
 import mlx.core as mx
 import omlx.oq as oq
 
@@ -58,6 +58,7 @@ oq.quantize_oq_streaming(
     imatrix_seq_length=16,
     imatrix_cache_path=str(out.parent / f"{out.name}.npz"),
     sensitivity_map_override={0: 0.1, 1: 0.2},
+    hadamard=hadamard == "1",
 )
 """
 
@@ -151,14 +152,16 @@ def _qwen3_5_moe_source(path: Path, monkeypatch) -> None:
     test_oq._qwen3_5_stream_source(path, "qwen3_5_moe", vlm=False, mtp=False)
 
 
-def _build(tree: Path, source: Path, output: Path, level: int, workdir: Path) -> str:
+def _build(
+    tree: Path, source: Path, output: Path, level: int, workdir: Path, *, hadamard=False
+) -> str:
     env = {
         **os.environ,
         "PYTHONPATH": str(tree),
         "PYTHONDONTWRITEBYTECODE": "1",
         "HF_HUB_OFFLINE": "1",
     }
-    args = [str(tree), str(source), str(output), str(level)]
+    args = [str(tree), str(source), str(output), str(level), "1" if hadamard else "0"]
     done = subprocess.run(
         [sys.executable, "-c", _DRIVER, *args],
         cwd=workdir,
@@ -176,6 +179,7 @@ def _report(path: Path) -> dict:
         report.pop(key, None)
     for key in _VOLATILE_REFINE:
         (report.get("refine") or {}).pop(key, None)
+    (report.get("oqh") or {}).pop("seconds", None)
     plan = (report.get("collection") or {}).get("batch_plan") or {}
     for key in _VOLATILE_PLAN:
         plan.pop(key, None)
@@ -229,3 +233,29 @@ def test_a_stock_oqe_build_is_upstream_s_byte_for_byte(
     # Upstream refined this build: the parity covers the refinement's codes.
     refine = json.loads((theirs / report).read_text())["refine"]
     assert refine["status"] == "done" and refine["tensors"] > 0, refine
+
+
+@pytest.mark.parametrize("level", [4, 3], ids=["oQ4h", "oQ3h"])
+def test_a_stock_oqh_build_is_upstream_s_byte_for_byte(
+    upstream_tree, tmp_path, monkeypatch, level
+):
+    source = tmp_path / "source"
+    _qwen3_5_moe_source(source, monkeypatch)
+    work = tmp_path / "work"
+    work.mkdir()
+    theirs = tmp_path / "upstream" / "out"
+    ours = tmp_path / "merged" / "out"
+    _build(upstream_tree, source, theirs, level, work, hadamard=True)
+    _build(_REPO, source, ours, level, work, hadamard=True)
+
+    their_files = sorted(p.name for p in theirs.iterdir())
+    assert sorted(p.name for p in ours.iterdir()) == their_files
+    report = "oq_imatrix_report.json"
+    for name in their_files:
+        if name == report:
+            continue
+        assert (ours / name).read_bytes() == (theirs / name).read_bytes(), name
+    mine, upstream = _report(ours / report), _report(theirs / report)
+    assert mine == upstream
+    assert "refine" not in mine
+    assert mine["oqh"]["status"] == "done" and mine["oqh"]["tensors"] > 0

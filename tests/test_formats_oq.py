@@ -3684,19 +3684,29 @@ def test_oqh_and_a_quant_format_refuse_each_other_before_a_read(
 
 
 def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
-    source, plain, toy, tmp_path, caplog
+    source, plain, toy, tmp_path, caplog, monkeypatch
 ):
     """The oQe code refinement runs on a format build's affine layers as on a
     stock build, and leaves the format's layers as the format encoded them;
     the log and the report say how many it skipped (refining format layers is
     release-3)."""
     caplog.set_level(logging.INFO, logger="omlx.oq")
+    # Layers 128 wide stay affine: the build then holds both a format's layers
+    # and affine ones, so the refinement has work only on the affine side.
+    class NoWide(_Codec):
+        def layout(self, k, n, bits, group_size):
+            if n == 128:
+                return None
+            return super().layout(k, n, bits, group_size)
+
+    monkeypatch.setitem(formats._FORMATS, "toy", NoWide())
     output = tmp_path / "oqe-toy"
     tensors, config, _ = _quantize(source, output, quant_format="toy")
     entries = _in_format(config)
     assert entries
     refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
     assert refine["status"] == "done"
+    assert refine["tensors"] > 0
     assert refine["format_layers"] == {
         "mode": "toy",
         "skipped": len(entries),
@@ -3716,6 +3726,46 @@ def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
         assert _same(kept, _Codec().encode(w, None, entry["bits"], entry["group_size"]))
     # Its affine layers are the stock build's, refined alike.
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
+
+
+def test_skipped_refinement_omits_format_layers_report(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    """A refinement that did not run says nothing about format layers."""
+
+    def skipped(*args, **kwargs):
+        return {"status": "skipped", "reason": "calibrated through a proxy"}
+
+    monkeypatch.setattr(oq, "_refine_oqe_output", skipped)
+    output = tmp_path / "oqe-toy"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert "format_layers" not in refine
+    assert not any(
+        "layers in quant format" in message and "skipped" in message
+        for message in caplog.messages
+    )
+
+
+def test_refinement_error_status_omits_format_layers_report(
+    source, toy, tmp_path, monkeypatch, caplog
+):
+    """Only a completed refinement reports format layers; an error says nothing."""
+
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+
+    def failed(*args, **kwargs):
+        return {"status": "error", "reason": "refinement failed"}
+
+    monkeypatch.setattr(oq, "_refine_oqe_output", failed)
+    output = tmp_path / "oqe-toy"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert "format_layers" not in refine
+    assert not any(
+        "layers in quant format" in message and "skipped" in message
+        for message in caplog.messages
+    )
 
 
 def test_the_refinement_writer_leaves_the_layers_it_is_told_to_skip(tmp_path):

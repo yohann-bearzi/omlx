@@ -9405,7 +9405,7 @@ def quantize_oq_streaming(
             progress_callback=cb,
             skip=frozenset(format_bases),
         )
-        if format_bases:
+        if format_bases and refine_report.get("status") == "done":
             logger.info(
                 "oQe refine: %d layers in quant format %s skipped (format "
                 "layers keep their encoding)",

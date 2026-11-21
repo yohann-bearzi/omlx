@@ -20,9 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from ..model_discovery import _VISION_WEIGHT_PREFIXES
-from ..patches.moe_offload_compat import in_quant_format
-
 from ..oqh import format as oqh_format
+from ..patches.moe_offload_compat import in_quant_format
 from .node_role import ROLES
 from .performance import ExecutionProfileName, NodePerformanceProfile
 from .staging import DEFAULT_REMOTE_PYTHON, is_local_host, run_remote_python

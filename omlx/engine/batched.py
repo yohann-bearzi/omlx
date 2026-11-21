@@ -18,7 +18,6 @@ from ..adapter.output_parser import repair_tool_parser
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..formats import FormatRefusedError, LoadHookError
-
 from ..lora_adapters import apply_adapter
 from ..model_settings import (
     a8_prefill_on,

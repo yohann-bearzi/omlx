@@ -15,10 +15,9 @@ from transformers import PreTrainedTokenizerFast
 
 from omlx.custom_kernels.quant_matmul import fast as quant_fast
 
-from ..format_load import refuse_format_checkpoint
-
 from ...oqh import format as oqh_format
 from ...oqh.modules import from_tensors as oqh_module
+from ..format_load import refuse_format_checkpoint
 from ..mlx_lm_mtp import get_mtp_depth
 from .a8 import MIN_TOKENS_FLOOR, tag_dense_a8
 from .config import ModelConfig

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from . import gguf
+from .custom_kernels.quant_matmul import fast as quant_fast
 from .engine import BaseEngine, BatchedEngine
 from .engine.decision import DecisionEngine
 from .engine.embedding import EmbeddingEngine
@@ -70,7 +71,6 @@ from .exceptions import (
     is_metal_out_of_memory,
 )
 from .formats import FormatRefusedError, LoadHookError
-
 from .lora_adapters import adapter_info
 from .model_discovery import (
     VLM_NATIVE_TEXT_MODEL_TYPES,
@@ -78,13 +78,12 @@ from .model_discovery import (
     format_size,
     is_realtime_stt_model,
 )
-from .custom_kernels.quant_matmul import fast as quant_fast
 from .model_settings import (
     ModelSettings,
     a8_prefill_on,
-    ced_prefill_on,
     ane_prefill_backend,
     ane_prefill_fraction,
+    ced_prefill_on,
     validate_ane_prefill,
 )
 from .patches.format_load import check_engine_loader
