@@ -878,6 +878,7 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     assert launches.window_down_unrolled_kernel is not None
     # The unrolled callable is what runs; the rolled one is not built.
     assert launches.window_down_kernel is None
+    assert launches.window_down is launches.window_down_unrolled_kernel
     other = _block(2048, 512, top_k=8, bits=4)
     other_x = mx.random.normal((1, 1, 2048)).astype(mx.bfloat16)
     other_plan = _plan(other, other_x)
@@ -889,6 +890,7 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     assert other_plan.launches.window_topk_coalesced_kernel is None
     assert other_plan.launches.window_down_unrolled_kernel is None
     assert other_plan.launches.window_down_kernel is not None
+    assert other_plan.launches.window_down is other_plan.launches.window_down_kernel
 
 
 def test_the_window_proof_separates_window_fast(monkeypatch):
@@ -924,9 +926,12 @@ def test_the_window_fast_decision_reads_the_allowlist_bits(monkeypatch):
     assert routed._window_fast(SimpleNamespace(bits=5), tables, 2560, 640)
     assert not routed._window_fast(SimpleNamespace(bits=4), tables, 2560, 640)
     assert not routed._window_fast(SimpleNamespace(bits=True), tables, 2560, 640)
+    assert not routed._window_fast(SimpleNamespace(bits=5.0), tables, 2560, 640)
     assert not routed._window_fast(
         SimpleNamespace(bits=5), SimpleNamespace(tables=()), 2560, 640
     )
+    monkeypatch.setattr(routed, "_WINDOW_FAST_SHAPES", frozenset({(2560, 640, 1)}))
+    assert not routed._window_fast(SimpleNamespace(bits=True), tables, 2560, 640)
 
 
 def test_the_cached_window_call_path_reads_no_window_fast(monkeypatch):

@@ -129,7 +129,7 @@ METAL_FUNC void omlx_router_softmax_row(
 # largest; the selected lane moves on and rescans its keys once its three
 # are used. Key 0 stands for the per-row launch's -inf / NE when nothing is
 # left.
-_TOPK_GENERIC = """
+_TOPK_GENERIC_CORE = """
 template <typename T, int NE>
 struct omlx_router_topk {
   enum : uint { PER = uint(NE) / 32 };
@@ -155,7 +155,9 @@ struct omlx_router_topk {
     p = gbest;
     i = gbest_i;
   }
+"""
 
+_TOPK_GENERIC_RW = """
   static METAL_FUNC uint nth(const device T* logits, uint lane, int n) {
     float vals[PER];
     omlx_router_softmax_row<T, NE>(logits, lane, vals);
@@ -190,7 +192,9 @@ struct omlx_router_topk {
 };
 """
 
-_TOPK_BF16 = """
+_TOPK_GENERIC = _TOPK_GENERIC_CORE + _TOPK_GENERIC_RW
+
+_TOPK_BF16_CORE = """
 template <int NE>
 struct omlx_router_topk<bfloat16_t, NE> {
   enum : uint { PER = uint(NE) / 32 };
@@ -238,7 +242,9 @@ struct omlx_router_topk<bfloat16_t, NE> {
     }
     return sel;
   }
+"""
 
+_TOPK_BF16_RW = """
   static METAL_FUNC uint nth(const device bfloat16_t* logits, uint lane, int n) {
     uint key[PER];
     keys(logits, lane, key);
@@ -272,6 +278,8 @@ struct omlx_router_topk<bfloat16_t, NE> {
   }
 };
 """
+
+_TOPK_BF16 = _TOPK_BF16_CORE + _TOPK_BF16_RW
 
 # Lane 0 renormalizes the selection over its own sum and stores it.
 _TOPK_STORE_HEADER = """
@@ -738,17 +746,20 @@ def _topk_write_tg_header(dtype: mx.Dtype) -> str:
 
 
 def _coalesce_header(dtype: mx.Dtype) -> str:
-    """The coalesced routing launch's header: its dtype's selection structs
-    and the threadgroup write, without the store helper its source never
-    calls (member ``write``s are not instantiated here)."""
+    """The coalesced routing launch's header: its dtype's selection core and
+    the threadgroup write. The struct's ``nth``/``write`` (the store helper's
+    only callers) are left out: its source calls neither, and a C++17 caller
+    would have to resolve the store helper's name in an uninstantiated
+    member."""
     if dtype == mx.bfloat16:
         structs = (
             "\ntemplate <typename T, int NE>\nstruct omlx_router_topk;\n"
             + _SOFTMAX_ROW_HEADER
-            + _TOPK_BF16
+            + _TOPK_BF16_CORE
+            + "};\n"
         )
     else:
-        structs = _SOFTMAX_ROW_HEADER + _TOPK_GENERIC
+        structs = _SOFTMAX_ROW_HEADER + _TOPK_GENERIC_CORE + "};\n"
     return structs + _topk_write_tg_header(dtype)
 
 

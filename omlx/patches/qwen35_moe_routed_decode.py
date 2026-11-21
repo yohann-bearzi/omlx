@@ -792,8 +792,9 @@ def _window_router_ok(gate, dtype: mx.Dtype) -> bool:
     ``row_exact_linear``: exactly a plain quantized linear of an affine
     layout that tiles (its other layouts fall back to one stock call a
     row), without a bias, whose scales and biases are the dtype the
-    launches are compiled for (a mixed dtype would promote in the tile and
-    every window would decline after its gate work). These are the affine
+    launches are compiled for (a mixed dtype would promote in
+    ``quantized_matmul`` and every window would decline after its gate
+    work). These are the affine
     widths and group sizes ``row_exact_qmv`` tiles."""
     return (
         _plain(gate, nn.QuantizedLinear)
@@ -943,7 +944,7 @@ def _window_fast(gate_up, gu_fmt, hidden: int, inter: int) -> bool:
     table-backed routed gate+up face and a ``(hidden, inter, bits)`` the
     allowlist names. The bits are the layer's own (never the face's name),
     and the allowlist is the only width filter: adding a measured width is
-    editing the tuple, not a second condition."""
+    editing ``_WINDOW_FAST_SHAPES``, not a second condition."""
     bits = getattr(gate_up, "bits", None)
     return (
         bool(gu_fmt.tables)
@@ -1578,27 +1579,31 @@ def routed_verify_window(block, x):
     plan = _cached_plan(block, x.dtype)
     if plan is None or plan.window is None or plan.proof.failed:
         return None
-    launches = plan.launches
-    signature = (x.shape, x.dtype, plan.experts)
-    if x.size == x.shape[-1]:
+    shape, dtype = x.shape, x.dtype
+    if x.size == shape[-1]:
         # One row runs the one-token launches: their proof and graph.
+        signature = (shape, dtype, plan.experts)
         y = _decode(block, plan, x, plan.proof.graphs.get(signature))
         return None if y is None else mx.reshape(y, (1, -1), stream=mx.gpu)
-    rows = x.size // x.shape[-1]
     # The window's graph is the plan's variant: the fused router's two-argument
     # call or a quantized gate's external logits. Plans of both can share the
     # proof (the router's absence is in its key), so the signature names the
     # variant.
-    window_signature = (*signature, plan.quantized_router)
-    # A verify step's block is the replay of the graph its thread kept.
+    window_signature = (shape, dtype, plan.experts, plan.quantized_router)
+    # A verify step's block is the replay of the graph its thread kept: a hit
+    # reads nothing else.
     graph = plan.window.graphs.get(window_signature)
     if graph is not None:
         if plan.quantized_router:
+            rows = x.size // shape[-1]
+            launches = plan.launches
             logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
             if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
                 return None
             return graph(x, logits, plan.operands)
         return graph(x, plan.operands)
+    rows = x.size // shape[-1]
+    launches = plan.launches
     if plan.window.failed or not _windows(plan, x):
         return None
     # A quantized gate's logits are its own one-row arithmetic per row

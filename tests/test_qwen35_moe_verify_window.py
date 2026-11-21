@@ -840,12 +840,20 @@ def test_softmax_topk_coalesce_rejects_bad_bounds():
         router.softmax_topk_coalesce(mx.zeros((33, 128), mx.bfloat16), 1, max_rows=64)
         is None
     )
+    # The accepted boundaries stay accepted.
+    assert (
+        router.softmax_topk_coalesce(mx.zeros((32, 128), mx.bfloat16), 1, max_rows=32)
+        is not None
+    )
+    assert router.softmax_topk_coalesce(logits, 1) is not None
 
 
-def test_the_router_coalesce_kernel_carries_only_its_own_selection(monkeypatch):
-    """The coalesced routing launch compiles one dtype's selection: no
-    ``if constexpr`` arm of the other dtype, and nothing its source does not
-    call."""
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_the_router_coalesce_kernel_carries_only_its_own_selection(dtype, monkeypatch):
+    """The coalesced routing launch compiles one dtype's selection core: no
+    ``if constexpr`` arm of the other dtype, no ``nth``/``write`` and no store
+    helper (a C++17 caller would have to resolve its name), and nothing its
+    source does not call."""
     from tests.test_formats_affine import uncalled
 
     built = {}
@@ -857,9 +865,18 @@ def test_the_router_coalesce_kernel_carries_only_its_own_selection(monkeypatch):
 
     monkeypatch.setattr(mx.fast, "metal_kernel", spy_kernel)
     router._softmax_topk_coalesce_kernel.cache_clear()
-    logits = mx.zeros((2, 128), mx.bfloat16)
-    assert router.softmax_topk_coalesce(logits, 8, max_rows=8) is not None
+    assert (
+        router.softmax_topk_coalesce(mx.zeros((2, 128), dtype), 8, max_rows=8)
+        is not None
+    )
     name, (header, source) = next(iter(built.items()))
     assert "softmax_topk_coalesce" in name
     assert "if constexpr (metal::is_same_v<T, bfloat16_t>)" not in header
+    assert "omlx_router_topk_store" not in header
+    assert "void write(" not in header
+    assert "uint nth(" not in header
+    assert (
+        "if constexpr (metal::is_same_v<T, bfloat16_t>)"
+        not in router.topk_indices_header(dtype)
+    )
     assert uncalled(header + source) == [], name
