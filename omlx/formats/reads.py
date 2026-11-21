@@ -349,7 +349,8 @@ class LoadRead:
             forbidden.add(self.returns.name)
         else:
             raise ValueError(
-                f"load return type must be 'float' or AuxType(...), not {self.returns!r}"
+                "load return type must be 'float' or AuxType(...), "
+                f"not {self.returns!r}"
             )
         _check_params(self.params, 2, "load", forbidden=frozenset(forbidden))
         _check_qualifiers(
@@ -762,7 +763,7 @@ class PairRead:
     """Declared signature of a ``Codes`` face's ``pair`` member."""
 
     returns: str = "uint"
-    pack: str = "uint"
+    pack: str | AuxType = "uint"
     index: str = "int"
     params: tuple[str, str] = ("q", "j")
     qualifiers: tuple[str, ...] = ("static",)
@@ -856,6 +857,10 @@ def _expand_slot(
         raise ValueError(
             f"{owner}: read slot {marker} in {part} must end with '{{' or a "
             f"line break, not {suffix!r}"
+        )
+    elif not text[end:].lstrip().startswith("{"):
+        raise ValueError(
+            f"{owner}: read slot {marker} in {part} must be followed by '{{'"
         )
     emitted = render(prefix)
     return text[:at] + emitted + text[end:]

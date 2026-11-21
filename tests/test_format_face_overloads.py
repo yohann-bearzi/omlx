@@ -253,7 +253,7 @@ def test_skeleton_qualifies_a_callers_mutable_activation_pointer(shared, staged)
             lambda: Pointer("device", "float = 0", const=True),
             "element",
         ),
-        # TypeParam validation (blocks template defaults, SFINAE, multi-params, keywords)
+        # TypeParam validation (defaults, SFINAE, multi-params, keywords)
         ("tparam_empty", lambda: TypeParam(""), "identifier"),
         ("tparam_non_ascii", lambda: TypeParam("α"), "identifier"),
         ("tparam_default_short", lambda: TypeParam("typename = short"), "identifier"),
@@ -271,7 +271,7 @@ def test_skeleton_qualifies_a_callers_mutable_activation_pointer(shared, staged)
         ("tparam_keyword_const", lambda: TypeParam("const"), "reserved"),
         ("tparam_reserved_row", lambda: TypeParam("Row"), "reserved"),
         ("tparam_reserved_codes", lambda: TypeParam("Codes"), "reserved"),
-        # AuxType validation (value type by identifier only; blocks refs/ptrs/SFINAE/keywords)
+        # AuxType validation (by-value identifier; blocks refs/ptrs/SFINAE/keywords)
         ("aux_empty", lambda: AuxType(""), "identifier"),
         ("aux_const_ref", lambda: AuxType("thread const Aux&"), "identifier"),
         ("aux_const_ptr", lambda: AuxType("thread const Aux*"), "identifier"),
@@ -298,7 +298,7 @@ def test_primitives_refuse_unsafe_types(name, build, fragment):
 @pytest.mark.parametrize(
     ("name", "build", "fragment"),
     [
-        # Review corpus: mutable device / threadgroup / generic / pointer-const / non-pointer
+        # Review corpus: mutable device/threadgroup/generic, ptr-const, non-ptr
         (
             "load_mutable_device",
             lambda: LoadRead(input=Pointer("device", "float", const=False)),
@@ -454,7 +454,7 @@ def test_load_declaration_refuses_unsafe_forms(name, build, fragment):
 @pytest.mark.parametrize(
     ("name", "build", "fragment"),
     [
-        # Review corpus: mutable scratch, const-ptr, template scratch, row, return, default
+        # Review corpus: mutable scratch, ptr-const, template scratch, row, return
         (
             "madd_mutable_scratch",
             lambda: MaddRead(scratch=Pointer("thread", "float", const=False)),
@@ -656,7 +656,10 @@ def test_madd_declaration_refuses_unsafe_forms(name, build, fragment):
             "apply_shared_owner_injection",
             lambda: ApplyRead(
                 shared_slot="apply_shared",
-                shared_owner="Dot<T>::Lanes<K>; static float madd(float, Row, thread float*, float) {} //",
+                shared_owner=(
+                    "Dot<T>::Lanes<K>; "
+                    "static float madd(float, Row, thread float*, float) {} //"
+                ),
                 shared_templates=("typename T", "int K"),
             ),
             "shared_owner",
@@ -782,7 +785,7 @@ def test_dot_reads_refuses_inconsistent_declarations(name, build, fragment):
 @pytest.mark.parametrize(
     ("name", "build", "fragment"),
     [
-        # Review corpus: mutable P / ptr P / array P / mutable Codes / ptr Codes / short / int short / refs / defaults / template
+        # Review corpus: bad P/Codes/index, short, int short, refs, defaults, template
         (
             "weight_mutable_params",
             lambda: WeightRead(params_type="thread P&"),
@@ -995,7 +998,7 @@ def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
             (),
             reads=reads,
         )
-    # Bad trailing token on slot line
+    # Bad trailing token on slot line (same line or next line)
     with pytest.raises(ValueError, match="must end with"):
         Dot(
             "deleted_slot",
@@ -1004,6 +1007,35 @@ def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
             (),
             reads=reads,
         )
+    with pytest.raises(ValueError, match="followed by '\\{'"):
+        Dot(
+            "multiline_deleted_slot",
+            src.replace(
+                "    __OMLX_READ_MADD__ {", "    __OMLX_READ_MADD__\n    = delete;"
+            ),
+            "T",
+            (),
+            reads=reads,
+        )
+    with pytest.raises(ValueError, match="followed by '\\{'"):
+        Dot(
+            "multiline_trailing_ret",
+            src.replace(
+                "    __OMLX_READ_MADD__ {", "    __OMLX_READ_MADD__\n    -> short {"
+            ),
+            "T",
+            (),
+            reads=reads,
+        )
+    # A body brace on the next line stays valid.
+    multiline_ok = Dot(
+        "multiline_brace_ok",
+        src.replace("    __OMLX_READ_MADD__ {", "    __OMLX_READ_MADD__\n    {"),
+        "T",
+        (),
+        reads=reads,
+    )
+    assert "static float madd(" in multiline_ok.emitted_source
     # Unexpanded leftover slot (typo)
     with pytest.raises(ValueError, match="unexpanded read slot"):
         Dot(
