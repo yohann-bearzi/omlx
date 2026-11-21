@@ -149,7 +149,6 @@ def _decode(monkeypatch, module, hyper, write, gpu_class):
     return live, oracle.decode(module, hyper, write, gpu_class=gpu_class)
 
 
-@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 def test_decode_helper_switches_gpu_class_geometry(monkeypatch):
     """The helper's class switch rebuilds the launches: the 's' geometry runs."""
     hidden, dtype = 256, mx.bfloat16
@@ -685,6 +684,7 @@ def _kernel_recorder(live, monkeypatch, rows, width, hidden, lowrank, dtype):
     monkeypatch.setattr(live, "_VALIDATED", set())
     if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
         monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
+    if hasattr(live, "kernels"):
         monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
     return builds
 
@@ -817,18 +817,38 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
     width = HC * hidden
     module = _module(8, True, hidden=hidden, lowrank=512)
     module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+    down = module.input_mix_weight_down
+    inj = module.block_inject_weight
     live = _live()
     stock_face = live._decode_face
 
-    def with_table(values):
-        table = Table("t", mx.float32, (0.0,) * values)
-        return lambda projection, inject: replace(
-            stock_face(projection, inject), tables=(table,)
-        )
+    def with_tables(down_table, inj_table):
+        def attach(projection, inject):
+            face = stock_face(projection, inject)
+            if projection is down:
+                return replace(face, tables=(down_table,))
+            if projection is inj:
+                return replace(face, tables=(inj_table,))
+            return face
+
+        return attach
 
     monkeypatch.setattr(live, "_gpu_class", lambda: "d")
-    for values, expected in ((24, "decode_up"), (25, "fused_up")):
-        monkeypatch.setattr(live, "_decode_face", with_table(values))
+    shared = Table("t", mx.float32, (0.0,) * 24)
+    for down_table, inj_table, expected in (
+        (
+            Table("d", mx.float32, (0.0,) * 12),
+            Table("i", mx.float32, (0.0,) * 12),
+            "decode_up",
+        ),  # 48 + 48 bytes fit
+        (
+            Table("d", mx.float32, (0.0,) * 12),
+            Table("i", mx.float32, (0.0,) * 13),
+            "fused_up",
+        ),  # 48 + 52 overflow; any dropped face sees 52 at most
+        (shared, shared, "decode_up"),  # one deduplicated 96-byte table fits
+    ):
+        monkeypatch.setattr(live, "_decode_face", with_tables(down_table, inj_table))
         builds = _kernel_recorder(
             live, monkeypatch, rows, width, hidden, 512, module.hc_norm.weight.dtype
         )
@@ -836,7 +856,7 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
             module, mx.ones((1, rows, width), module.hc_norm.weight.dtype)
         )
         assert out is not None
-        assert expected in _up_builds(builds)[0], (values, [b[0] for b in builds])
+        assert expected in _up_builds(builds)[0], (expected, [b[0] for b in builds])
 
     hidden, lowrank, rows = 256, 3200, 1
     width = HC * hidden
