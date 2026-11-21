@@ -1839,3 +1839,77 @@ for face in pickle.load(sys.stdin.buffer):
         env={**os.environ, "PYTHONHASHSEED": seed},
         check=True,
     )
+
+
+def test_quant_format_refine_defaults_to_disabled():
+    class Plain(formats.QuantFormat):
+        pass
+
+    fmt = Plain()
+    w = mx.zeros((16, 64))
+    h = mx.zeros((64, 64))
+    assert fmt.can_refine(64, 16, 4, 64) is False
+    assert fmt.refine(w, {}, h, 4, 64) is None
+    affine = formats.get("affine")
+    assert affine is not None
+    assert affine.can_refine(64, 16, 4, 64) is False
+    assert affine.refine(w, {}, h, 4, 64) is None
+
+
+def test_quant_format_can_refine_detects_override_and_allows_narrowing():
+    class Refining(formats.QuantFormat):
+        def refine(self, w, tensors, hessian, bits, group_size):
+            return tensors
+
+    fmt = Refining()
+    assert fmt.can_refine(64, 16, 4, 64) is True
+    fmt.refine = lambda w, tensors, hessian, bits, group_size: tensors
+    assert fmt.can_refine(64, 16, 4, 64) is True
+    # The instance-bound branch alone: the class keeps the default.
+    bound = formats.QuantFormat()
+    bound.refine = lambda w, tensors, hessian, bits, group_size: tensors
+    assert bound.can_refine(64, 16, 4, 64) is True
+    bound.refine = None
+    assert bound.can_refine(64, 16, 4, 64) is False
+    # A subclass or instance that disables refinement is not refining.
+    fmt.refine = None
+    assert fmt.can_refine(64, 16, 4, 64) is False
+
+    class Disabled(formats.QuantFormat):
+        refine = None
+
+    assert Disabled().can_refine(64, 16, 4, 64) is False
+
+    class Slotted(formats.QuantFormat):
+        __slots__ = ("refine",)
+
+    slotted = Slotted()
+    slotted.refine = lambda w, tensors, hessian, bits, group_size: tensors
+    assert slotted.can_refine(64, 16, 4, 64) is True
+
+    # A truthy non-callable is not a refinement.
+    noncallable = formats.QuantFormat()
+    noncallable.refine = "x"
+    assert noncallable.can_refine(64, 16, 4, 64) is False
+
+    class PropertyNone(formats.QuantFormat):
+        @property
+        def refine(self):
+            return None
+
+    assert PropertyNone().can_refine(64, 16, 4, 64) is False
+
+    class Narrow(Refining):
+        def can_refine(self, k, n, bits, group_size):
+            return n < 128
+
+    assert Narrow().can_refine(64, 16, 4, 64) is True
+    assert Narrow().can_refine(128, 128, 4, 64) is False
+
+
+def test_quant_format_contract_docs_name_refine():
+    page = (Path(__file__).resolve().parents[1] / "docs/quant-formats.md").read_text()
+    assert "can_refine" in page and "refine" in page
+    assert "not wired yet" in page
+    doc = " ".join(formats.QuantFormat.refine.__doc__.split())
+    assert "not wired yet" in doc

@@ -534,6 +534,39 @@ class QuantFormat:
         matrices has its own."""
         return None
 
+    def can_refine(self, k: int, n: int, bits: int, group_size: int) -> bool:
+        """Whether this format refines an ``(n, k)`` matrix's codes at these
+        bits and group size against the shrunk Gram of its layer's inputs.
+
+        A format opts in by overriding :meth:`refine` (on the class or as a
+        bound attribute of the instance); the default keeps every format that
+        predates refinement, and affine, unrefined. A format may override
+        this to narrow the matrices it refines by geometry."""
+        refine = getattr(self, "refine", None)
+        return callable(refine) and (
+            getattr(refine, "__func__", None) is not QuantFormat.refine
+        )
+
+    def refine(
+        self,
+        w: mx.array,
+        tensors: dict[str, mx.array],
+        hessian: mx.array,
+        bits: int,
+        group_size: int,
+    ) -> dict[str, mx.array] | None:
+        """Tensors that keep ``w``'s codes, refined against the shrunk Gram
+        ``hessian`` (``(k, k)``, or ``(e, k, k)`` for a stack of ``w``'s):
+        the codes that minimise ``tr((W^- - W) H (W^- - W)^T)``, where ``H``
+        is ``G + 3 diag(G)`` over the layer inputs' Gram ``G``. ``tensors``
+        are ``w``'s as :meth:`encode` returned them. The returned dict holds
+        exactly :meth:`layout`'s names, shapes and dtypes; None leaves the
+        encoded tensors. oQ keeps the refined tensors only when their Hessian
+        error does not exceed the encoded ones', and skips a matrix whose
+        :meth:`can_refine` is false. oQ's format-refinement pass is not wired
+        yet; until then oQ skips format layers. The default declines."""
+        return None
+
     def record(self) -> dict:
         """What a checkpoint written in the format keeps of it beside its
         layers (the revision of its layout, what it needs to read its own

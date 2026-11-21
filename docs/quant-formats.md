@@ -51,6 +51,12 @@ class MyFormat(QuantFormat):
     def tile(self, layer, k, n) -> Tile | None:
         ...                # the face that oMLX's tile kernels decode them through
 
+    def can_refine(self, k, n, bits, group_size) -> bool:
+        ...                # whether oQ refines this matrix's codes (default: no)
+
+    def refine(self, w, tensors, hessian, bits, group_size):
+        ...                # new tensors on the shrunk Gram, or None
+
     def record(self):
         ...                # what a checkpoint keeps of the format ({})
 
@@ -70,6 +76,17 @@ myformat = "my_package:FORMAT"
 Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot`, `tile` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
 - A format names the tensor that holds its codes, `codes_name` (`weight` by default). **A plugin's format keeps no tensor called `weight`, `scales`, `biases` or `bias`**: those are MLX's own names on a quantized layer, and a format layer of a plugin has none of them, so a family's by-hand reader that indexes one fails loudly instead of reading codes as floats. Its codes and its tensors are identifiers, each named once and apart from `bias`. The built-in affine format keeps MLX's names (`weight`, `scales`, `biases`).
+- `can_refine` and `refine` are optional: a format that overrides `refine` (on
+  the class or as an attribute of the instance) opts in, and one that does not
+  keeps exactly the encoding `encode` gave it. oQ calls `refine` with the
+  source's floats `w`, the tensors `encode` returned, the shrunk Gram `H = G + 3
+  diag(G)` of the layer's inputs (`(k, k)`, or `(e, k, k)` for a stack), and
+  the bits and group size; the returned tensors hold exactly `layout`'s names,
+  shapes and dtypes. oQ keeps them only when their Hessian error
+  `tr((W^- - W) H (W^- - W)^T)` does not exceed the encoded ones', and still
+  verifies the written checkpoint. A format may narrow matrices by geometry
+  through `can_refine`. oQ's format-refinement pass is not wired yet; until
+  then oQ skips format layers.
 - A mode has one format. A second format for a registered mode is refused.
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.
