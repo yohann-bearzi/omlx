@@ -159,34 +159,15 @@ def is_row_exact_armed() -> bool:
 # NSG simdgroups a threadgroup, each four rows n0..n0 + 3 of the matrix with
 # the full K walked lane-strided, a run of 8 inputs a lane and step, every
 # input row against each row's weights in the run's order; then simd_sum and
-# one lane a result stores. The rows' cursors are made once; per run each
-# row's group parameters and codes are read once.
-_MSG_SOURCE = """
-    constexpr int NSG = __NSG__;
-    constexpr int MROWS = __M__;
-    using F = __FACE__;
-    uint sg = simdgroup_index_in_threadgroup;
-    uint lane = thread_index_in_simdgroup;
-    uint tg_n = threadgroup_position_in_grid.y;
-    int N = int(N_size);
-    int n0 = (int(tg_n) * NSG + int(sg)) * 4;
-    if (n0 + 3 >= N) { return; }
-    if constexpr (omlx_tile_face<F, K>::value) {
-      using R = typename F::template Runs<K>;
+# one lane per result stores. Each run reads one set of group parameters
+# and packed codes per output column.
+_MSG_CURSORS = """\
       const R r0(w, size_t(n0));
       const R r1(w, size_t(n0 + 1));
       const R r2(w, size_t(n0 + 2));
-      const R r3(w, size_t(n0 + 3));
-      float acc[4 * MROWS];
-      _Pragma("unroll")
-      for (int i = 0; i < 4 * MROWS; ++i) {
-        acc[i] = 0.0f;
-      }
-      using Vec8 = metal::vec<T, 8>;
-      const device Vec8* xv = (const device Vec8*)x;
-      for (int run = int(lane); run < K / 8; run += 32) {
-        const int gi = run * 8 / R::GROUP;
-__XLOADS__
+      const R r3(w, size_t(n0 + 3));"""
+
+_MSG_FOUR_ROWS = """\
         const auto p0 = r0.params(gi);
         const auto p1 = r1.params(gi);
         const auto p2 = r2.params(gi);
@@ -202,7 +183,45 @@ __XLOADS__
           float w2 = R::weight(p2, c2, ki);
           float w3 = R::weight(p3, c3, ki);
 __FMAS__
-        }
+        }"""
+
+_MSG_ONE_ROW = """\
+        _Pragma("unroll")
+        for (int j = 0; j < 4; ++j) {
+          const R rj(w, size_t(n0 + j));
+          const auto p = rj.params(gi);
+          const auto c = rj.fetch(run);
+          _Pragma("unroll")
+          for (int ki = 0; ki < 8; ++ki) {
+            const float wj = R::weight(p, c, ki);
+__FMAS__
+          }
+        }"""
+
+_MSG_SOURCE = """
+    constexpr int NSG = __NSG__;
+    constexpr int MROWS = __M__;
+    using F = __FACE__;
+    uint sg = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint tg_n = threadgroup_position_in_grid.y;
+    int N = int(N_size);
+    int n0 = (int(tg_n) * NSG + int(sg)) * 4;
+    if (n0 + 3 >= N) { return; }
+    if constexpr (omlx_tile_face<F, K>::value) {
+      using R = typename F::template Runs<K>;
+__CURSORS__
+      float acc[4 * MROWS];
+      _Pragma("unroll")
+      for (int i = 0; i < 4 * MROWS; ++i) {
+        acc[i] = 0.0f;
+      }
+      using Vec8 = metal::vec<T, 8>;
+      const device Vec8* xv = (const device Vec8*)x;
+      for (int run = int(lane); run < K / 8; run += 32) {
+        const int gi = run * 8 / R::GROUP;
+__XLOADS__
+__DECODE__
       }
       _Pragma("unroll")
       for (int i = 0; i < 4 * MROWS; ++i) {
@@ -225,31 +244,40 @@ def _msg_kernel(m: int, face, nsg: int):
     xloads = "".join(
         f"        Vec8 v{r} = xv[{r} * (K / 8) + run];\n" for r in range(m)
     )
-    fmas = "".join(
-        f"          acc[{j} * {m} + {r}] += float(v{r}[ki]) * w{j};\n"
-        for j in range(4)
-        for r in range(m)
-    )
+    key = getattr(face, "key", "")
+    if m == 6 and key.startswith("affine_tile_b8g"):
+        # Six activation rows need 24 accumulators. Consume both packed
+        # words of one output column before fetching the next column.
+        cursors = ""
+        decode = _MSG_ONE_ROW
+        fmas = "\n".join(
+            f"            acc[j * {m} + {r}] += float(v{r}[ki]) * wj;" for r in range(m)
+        )
+    else:
+        cursors = _MSG_CURSORS
+        if key.startswith("affine_tile_b4g"):
+            # Keep full-width row arithmetic, rebasing at n0 only once.
+            cursors = """\
+      const R r0(w, size_t(n0));
+      const F four{(const device uint8_t*)r0.c, r0.s, r0.b};
+      const R r1(four, size_t(1));
+      const R r2(four, size_t(2));
+      const R r3(four, size_t(3));"""
+        decode = _MSG_FOUR_ROWS
+        fmas = "\n".join(
+            f"          acc[{j} * {m} + {r}] += float(v{r}[ki]) * w{j};"
+            for j in range(4)
+            for r in range(m)
+        )
     source = (
         _MSG_SOURCE.replace("__NSG__", str(nsg))
         .replace("__M__", str(m))
         .replace("__FACE__", face.type)
+        .replace("__CURSORS__", cursors)
         .replace("__XLOADS__\n", xloads)
+        .replace("__DECODE__", decode)
+        .replace("__FMAS__", fmas)
     )
-    key = getattr(face, "key", "")
-    if key.startswith("affine_tile_b4g"):
-        # Rebase the four rows' pointers once at n0 and step the cursor by
-        # compile-time row offsets: two 64-bit row products, not eight.
-        source = source.replace(
-            "      const R r1(w, size_t(n0 + 1));\n"
-            "      const R r2(w, size_t(n0 + 2));\n"
-            "      const R r3(w, size_t(n0 + 3));\n",
-            "      const F four{(const device uint8_t*)r0.c, r0.s, r0.b};\n"
-            "      const R r1(four, size_t(1));\n"
-            "      const R r2(four, size_t(2));\n"
-            "      const R r3(four, size_t(3));\n",
-        )
-    source = source.replace("__FMAS__\n", fmas)
     return kernels.face_kernel(
         f"omlx_vk_m{m}_nsg{nsg}", ("x", "w", "N_size"), {"w": face}, ("y",), "", source
     )
