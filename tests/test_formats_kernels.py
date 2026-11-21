@@ -679,6 +679,22 @@ def test_qmv_rows_unrolls_pairs_only_when_asked():
     assert pragma not in plain.header
     assert f"{pragma} {loop}" in pairs.header
     assert "OMLX_QMV_UNROLL_PAIRS" not in plain.header + pairs.header
+    assert pairs.header == plain.header.replace(loop, f"{pragma} {loop}", 1)
+    unrolled_plain = kernels.Matrices(unrolled=True)
+    unrolled_plain.add("m", face)
+    assert pragma not in unrolled_plain.header
+    pairs_shared = kernels.Matrices(unroll_pairs=True)
+    pairs_shared.add("m", face, shared=True)
+    assert "void qmv_rows(" not in pairs_shared.header
+    assert "omlx_shared_folded" not in pairs_shared.header
+    assert pragma not in pairs_shared.header
+
+
+def test_the_guide_documents_unroll_pairs():
+    assert (
+        '`kernels.Matrices(unroll_pairs=True)` puts '
+        '`_Pragma("clang loop unroll_count(2)")` on the K loop of `qmv_rows`'
+    ) in _PAGE
 
 
 def test_a_source_need_not_end_with_a_newline():

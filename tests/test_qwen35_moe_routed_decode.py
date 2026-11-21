@@ -2840,6 +2840,43 @@ def test_the_routed_decode_page_names_the_odd_gate_up_width():
     assert "gate+up width is odd" in page.read_text()
 
 
+@pytest.mark.parametrize("restricted", ["gate_up_proj", "down_proj"])
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_face_that_declares_dtypes_admits_only_the_activation(
+    monkeypatch, restricted
+):
+    """A face that names its dtypes gates the token: another dtype composes."""
+    from tests.test_formats_kernels import _toy
+
+    face = _toy("declared_dtypes")
+    half = replace(face, dtypes=(mx.float16,))
+    reader = load_toy_format(monkeypatch, face)
+    block = format_block(1024, 320, "affine")
+    limited = block.switch_mlp.get(restricted)
+    monkeypatch.setattr(
+        type(reader),
+        "dot",
+        lambda self, layer, k, n: half if layer is limited else face,
+    )
+    assert _plan(block, mx.zeros((1, 1, 1024), mx.float16)) is not None
+    assert _plan(block, mx.zeros((1, 1, 1024), mx.bfloat16)) is None
+
+
+@pytest.mark.usefixtures("format_checkpoint")
+def test_a_face_of_every_float_admits_the_served_activations(monkeypatch):
+    """An empty dtypes tuple is exact for every float, so the face guard
+    admits them; the kernels' capability guard keeps an fp32 plan out."""
+    from tests.test_formats_kernels import _toy
+
+    face = _toy("every_float")
+    assert face.dtypes == ()
+    load_toy_format(monkeypatch, face)
+    block = format_block(1024, 320, "affine")
+    for dtype in (mx.bfloat16, mx.float16):
+        assert _plan(block, mx.zeros((1, 1, 1024), dtype)) is not None
+    assert routed._cached_plan(block, mx.float32) is None
+
+
 @pytest.mark.usefixtures("format_checkpoint")
 def test_a_format_shared_expert_gate_folds_into_routed_decode(monkeypatch):
     from tests.test_formats_kernels import _toy

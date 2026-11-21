@@ -34,6 +34,12 @@ from tests.test_formats_tables import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _activation_dtype(face: Dot, router_dtype=mx.bfloat16):
+    """What a builder is specialized for: the face's one declared dtype, or
+    the plain router's dtype when the face is exact for every float."""
+    return face.dtypes[0] if len(face.dtypes) == 1 else router_dtype
+
+
 def hand_tables(text):
     return kernels.hand_tables(text)
 
@@ -724,10 +730,9 @@ def test_no_kernel_built_over_faces_holds_a_table_written_by_hand(monkeypatch):
         kernels.face_kernel("scan", ("m",), {"m": face}, ("out",), "", "")
         routed._gate_up_kernel.__wrapped__(face, None, None)
         routed._gate_up_kernel.__wrapped__(face, tabled(plain), gate)
-        routed._gate_up_topk_kernel.__wrapped__(face, None, None, face.dtypes[0])
-        routed._gate_up_topk_kernel.__wrapped__(
-            face, tabled(plain), gate, face.dtypes[0]
-        )
+        dtype = _activation_dtype(face)
+        routed._gate_up_topk_kernel.__wrapped__(face, None, None, dtype)
+        routed._gate_up_topk_kernel.__wrapped__(face, tabled(plain), gate, dtype)
         routed._down_kernel.__wrapped__(face, None)
         routed._down_kernel.__wrapped__(face, shared)
         routed._gate_up_window_kernel.__wrapped__(face, shared, gate)
@@ -735,6 +740,13 @@ def test_no_kernel_built_over_faces_holds_a_table_written_by_hand(monkeypatch):
         table = bool(face.tables)
         assert captures == [table] * 12 + [table, True] * 2 + [table] * 4
         captures.clear()
+    poly = _toy("polymorphic", "")
+    assert poly.dtypes == ()
+    routed._gate_up_topk_kernel.__wrapped__(
+        poly, None, None, _activation_dtype(poly)
+    )
+    assert captures == [False]
+    captures.clear()
     toy = _toy(
         "every",
         "  omlx_table<half, 2> a;\n  omlx_table<int8_t, 3> b;",
