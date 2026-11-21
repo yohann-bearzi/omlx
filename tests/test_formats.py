@@ -1175,11 +1175,42 @@ def test_kernel_keys_distinguish_each_field_of_the_concrete_face(kind):
     }
     cache = {face: "first"}
     for item in fields(face):
-        if item.compare:
+        # `reads` is declared beside a source that has its slot markers, so
+        # the test below covers it with a face the markers fit.
+        if item.compare and item.name != "reads":
             other = replace(face, **{item.name: alternatives[item.name]})
             assert other not in cache, item.name
             cache[other] = item.name
             assert cache[replace(other)] == item.name
+
+
+def test_a_faces_declared_reads_are_part_of_its_kernel_key():
+    source = (
+        "struct Dot {\n"
+        "  __OMLX_READ_LOAD__ { return 0; }\n"
+        "  __OMLX_READ_MADD__ { return 0; }\n"
+        "};\n"
+    )
+    first = formats.Dot(
+        "first",
+        source,
+        "T",
+        (),
+        reads=formats.DotReads(
+            load=formats.LoadRead(params=("x", "xt")),
+            madd=formats.MaddRead(params=("acc", "r", "xt", "")),
+        ),
+    )
+    second = replace(
+        first,
+        reads=formats.DotReads(
+            load=formats.LoadRead(params=("x2", "xt2")),
+            madd=formats.MaddRead(params=("acc2", "r2", "xt2", "")),
+        ),
+    )
+    assert first != second
+    assert first not in {second: "second"} and second not in {first: "first"}
+    assert first.emitted_source != second.emitted_source
 
 
 def test_inherited_face_equality_and_hash_cover_the_same_fields():
