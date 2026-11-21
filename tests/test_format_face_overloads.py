@@ -1,10 +1,42 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Read the documented overload even when another one compiles and returns zero."""
+"""Declared read signatures for format faces, and const skeleton reads.
+
+A face declares its read members' signatures in Python (``DotReads``,
+``TileReads``, ``CodesReads``) and oMLX emits the exact C++ signatures into
+the face's source at explicit slots (``__OMLX_READ_<SLOT>__``). Nothing
+parses C++: every unsafe form is refused at declaration time with a clear
+``ValueError``. Faces that omit ``reads=`` keep running during the revision-1
+deprecation window with a ``DeprecationWarning`` and const skeleton calls.
+"""
+
+from __future__ import annotations
+
+import copy
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 import mlx.core as mx
 import pytest
 
-from omlx.formats import kernels, testing
+from omlx import formats
+from omlx.formats import (
+    ApplyRead,
+    AuxType,
+    Codes,
+    CodesReads,
+    Dot,
+    DotReads,
+    LoadRead,
+    MaddRead,
+    PairRead,
+    Pointer,
+    Tile,
+    TileReads,
+    TypeParam,
+    WeightRead,
+    kernels,
+    testing,
+)
 from tests import test_formats_kernels as dot
 from tests import test_formats_tile as tile
 
@@ -43,6 +75,9 @@ def _dot_outputs(face, path):
         face, (weights, scales), xs, n, rps=2, unrolled=path == "unrolled"
     )
     return actual, mx.sum(xs[:, None, :] * w, axis=2)
+
+
+# --- Legacy faces (Part 1 const skeleton calls + revision-1 deprecation) ---
 
 
 def _dot_reader(overloaded):
@@ -152,7 +187,6 @@ def test_skeleton_qualifies_a_callers_mutable_activation_pointer(shared, staged)
         + "if (lane == 0) out[0] = result[0];",
     )
     (got,) = kernel(
-        # Eight matrix rows keep scales in device memory in the generated kernel.
         inputs=[
             mx.ones((256,)),
             mx.full((8, 256), 130, mx.uint8),
@@ -164,3 +198,1182 @@ def test_skeleton_qualifies_a_callers_mutable_activation_pointer(shared, staged)
         output_dtypes=[mx.float32],
     )
     _assert_bits(got, mx.array([512.0]))
+
+
+# --- Declaration-refusal tests (review bypass corpus) ----------------------
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        # Pointer validation
+        ("ptr_constant_space", lambda: Pointer("constant", "float"), "address space"),
+        ("ptr_unknown_space", lambda: Pointer("generic", "float"), "address space"),
+        (
+            "ptr_const_in_space",
+            lambda: Pointer("device const", "float"),
+            "address space",
+        ),
+        ("ptr_non_bool_const", lambda: Pointer("device", "float", const=1), "const"),
+        (
+            "ptr_non_bool_const_first",
+            lambda: Pointer("device", "float", const=True, const_first=1),
+            "const_first",
+        ),
+        (
+            "ptr_const_first_without_const",
+            lambda: Pointer("thread", "float", const=False, const_first=True),
+            "const_first",
+        ),
+        (
+            "ptr_elem_ptr_const",
+            lambda: Pointer("device", "float* const", const=True),
+            "element",
+        ),
+        (
+            "ptr_elem_ptr_const_ref",
+            lambda: Pointer("device", "float* const&", const=True),
+            "element",
+        ),
+        ("ptr_elem_ref", lambda: Pointer("thread", "float&", const=True), "element"),
+        ("ptr_elem_short", lambda: Pointer("device", "short", const=True), "element"),
+        (
+            "ptr_elem_int_short",
+            lambda: Pointer("device", "int short", const=True),
+            "element",
+        ),
+        (
+            "ptr_elem_default",
+            lambda: Pointer("device", "float = 0", const=True),
+            "element",
+        ),
+        # TypeParam validation (blocks template defaults, SFINAE, multi-params, keywords)
+        ("tparam_empty", lambda: TypeParam(""), "identifier"),
+        ("tparam_non_ascii", lambda: TypeParam("α"), "identifier"),
+        ("tparam_default_short", lambda: TypeParam("typename = short"), "identifier"),
+        ("tparam_default_val", lambda: TypeParam("X = float"), "identifier"),
+        ("tparam_nontype_default", lambda: TypeParam("int N = 0"), "identifier"),
+        ("tparam_bool_expr", lambda: TypeParam("bool B = (1 > 0)"), "identifier"),
+        ("tparam_two", lambda: TypeParam("X, Y"), "identifier"),
+        ("tparam_pack", lambda: TypeParam("X..."), "identifier"),
+        (
+            "tparam_sfinae",
+            lambda: TypeParam("typename = metal::enable_if_t<!metal::is_const_v<X>>"),
+            "identifier",
+        ),
+        ("tparam_keyword_short", lambda: TypeParam("short"), "reserved"),
+        ("tparam_keyword_const", lambda: TypeParam("const"), "reserved"),
+        ("tparam_reserved_row", lambda: TypeParam("Row"), "reserved"),
+        ("tparam_reserved_codes", lambda: TypeParam("Codes"), "reserved"),
+        # AuxType validation (value type by identifier only; blocks refs/ptrs/SFINAE/keywords)
+        ("aux_empty", lambda: AuxType(""), "identifier"),
+        ("aux_const_ref", lambda: AuxType("thread const Aux&"), "identifier"),
+        ("aux_const_ptr", lambda: AuxType("thread const Aux*"), "identifier"),
+        ("aux_float_ref", lambda: AuxType("thread float&"), "identifier"),
+        ("aux_float_ptr", lambda: AuxType("thread float*"), "identifier"),
+        ("aux_star", lambda: AuxType("Aux*"), "identifier"),
+        ("aux_amp", lambda: AuxType("Aux&"), "identifier"),
+        (
+            "aux_sfinae",
+            lambda: AuxType("metal::enable_if_t<!metal::is_const_v<F>, float>"),
+            "identifier",
+        ),
+        ("aux_float_builtin", lambda: AuxType("float"), "reserved"),
+        ("aux_short_builtin", lambda: AuxType("short"), "reserved"),
+        ("aux_half_builtin", lambda: AuxType("half"), "reserved"),
+        ("aux_reserved_row", lambda: AuxType("Row"), "reserved"),
+    ],
+)
+def test_primitives_refuse_unsafe_types(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        # Review corpus: mutable device / threadgroup / generic / pointer-const / non-pointer
+        (
+            "load_mutable_device",
+            lambda: LoadRead(input=Pointer("device", "float", const=False)),
+            "const",
+        ),
+        (
+            "load_mutable_threadgroup",
+            lambda: LoadRead(input=Pointer("threadgroup", "float", const=False)),
+            "const",
+        ),
+        (
+            "load_generic_mutable_device",
+            lambda: LoadRead(input=Pointer("device", TypeParam("X"), const=False)),
+            "const",
+        ),
+        (
+            "load_generic_mutable_staged",
+            lambda: LoadRead(input=Pointer("threadgroup", TypeParam("X"), const=False)),
+            "const",
+        ),
+        (
+            "load_thread_space_input",
+            lambda: LoadRead(input=Pointer("thread", "float", const=True)),
+            "device",
+        ),
+        (
+            "load_const_qualified_pointer_str",
+            lambda: LoadRead(input="device float* const"),
+            "load input",
+        ),
+        (
+            "load_const_qualified_ref_str",
+            lambda: LoadRead(input="device float* const&"),
+            "load input",
+        ),
+        (
+            "load_staged_const_qualified_str",
+            lambda: LoadRead(input="threadgroup float* const"),
+            "load input",
+        ),
+        (
+            "load_non_pointer_value",
+            lambda: LoadRead(input="device const float"),
+            "load input",
+        ),
+        (
+            "load_two_template_params",
+            lambda: LoadRead(input=(TypeParam("X"), TypeParam("Y"))),
+            "load input",
+        ),
+        (
+            "load_const_scratch",
+            lambda: LoadRead(scratch=Pointer("thread", "float", const=True)),
+            "load scratch",
+        ),
+        (
+            "load_device_scratch",
+            lambda: LoadRead(scratch=Pointer("device", "float", const=False)),
+            "load scratch",
+        ),
+        (
+            "load_half_scratch",
+            lambda: LoadRead(scratch=Pointer("thread", "half", const=False)),
+            "load scratch",
+        ),
+        (
+            "load_default_scratch_str",
+            lambda: LoadRead(scratch="thread float* = (thread float*)0"),
+            "load scratch",
+        ),
+        (
+            "load_raw_aux_return",
+            lambda: LoadRead(returns="Aux"),
+            "load return",
+        ),
+        (
+            "load_ref_return",
+            lambda: LoadRead(returns="thread float&"),
+            "load return",
+        ),
+        (
+            "load_sfinae_return",
+            lambda: LoadRead(returns="metal::enable_if_t<true, float>"),
+            "load return",
+        ),
+        (
+            "load_short_return",
+            lambda: LoadRead(returns="short"),
+            "load return",
+        ),
+        (
+            "load_tparam_return",
+            lambda: LoadRead(returns=TypeParam("R")),
+            "load return",
+        ),
+        (
+            "load_param_keyword",
+            lambda: LoadRead(params=("short", "xt")),
+            "parameter",
+        ),
+        (
+            "load_param_default",
+            lambda: LoadRead(params=("x", "xt = 0")),
+            "parameter",
+        ),
+        (
+            "load_param_duplicate",
+            lambda: LoadRead(params=("x", "x")),
+            "distinct",
+        ),
+        (
+            "load_param_collides_tparam",
+            lambda: LoadRead(input=TypeParam("x"), params=("x", "xt")),
+            "collide",
+        ),
+        (
+            "load_param_collides_aux",
+            lambda: LoadRead(returns=AuxType("Aux"), params=("Aux", "xt")),
+            "collide",
+        ),
+        (
+            "load_param_arity",
+            lambda: LoadRead(params=("x",)),
+            "2 parameter",
+        ),
+        (
+            "load_attr_qualifier",
+            lambda: LoadRead(qualifiers=("__attribute__((always_inline))", "static")),
+            "qualifier",
+        ),
+        (
+            "load_missing_static",
+            lambda: LoadRead(qualifiers=("inline",)),
+            "static",
+        ),
+        (
+            "load_dup_qualifier",
+            lambda: LoadRead(qualifiers=("static", "static")),
+            "duplicate",
+        ),
+        (
+            "load_bad_slot",
+            lambda: LoadRead(slot="LOAD"),
+            "slot",
+        ),
+    ],
+)
+def test_load_declaration_refuses_unsafe_forms(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        # Review corpus: mutable scratch, const-ptr, template scratch, row, return, default
+        (
+            "madd_mutable_scratch",
+            lambda: MaddRead(scratch=Pointer("thread", "float", const=False)),
+            "madd scratch",
+        ),
+        (
+            "madd_device_scratch",
+            lambda: MaddRead(scratch=Pointer("device", "float", const=True)),
+            "madd scratch",
+        ),
+        (
+            "madd_half_scratch",
+            lambda: MaddRead(scratch=Pointer("thread", "half", const=True)),
+            "madd scratch",
+        ),
+        (
+            "madd_template_elem_scratch",
+            lambda: MaddRead(scratch=Pointer("thread", TypeParam("F"), const=True)),
+            "madd scratch",
+        ),
+        (
+            "madd_generic_scratch",
+            lambda: MaddRead(scratch=TypeParam("XT")),
+            "madd scratch",
+        ),
+        (
+            "madd_ptr_const_scratch",
+            lambda: MaddRead(scratch="thread float* const"),
+            "madd scratch",
+        ),
+        (
+            "madd_ptr_const_ref_scratch",
+            lambda: MaddRead(scratch="thread float* const&"),
+            "madd scratch",
+        ),
+        ("madd_const_row", lambda: MaddRead(row="thread const Row&"), "madd row"),
+        (
+            "madd_array_row",
+            lambda: MaddRead(row="metal::array<uint, float>"),
+            "madd row",
+        ),
+        ("madd_template_row", lambda: MaddRead(row=TypeParam("RR")), "madd row"),
+        ("madd_short_return", lambda: MaddRead(returns="short"), "madd must return"),
+        (
+            "madd_sfinae_return",
+            lambda: MaddRead(
+                returns="metal::enable_if_t<!metal::is_const_v<F>, float>"
+            ),
+            "madd must return",
+        ),
+        ("madd_half_acc", lambda: MaddRead(acc="half"), "madd accumulator"),
+        ("madd_aux_by_ref_str", lambda: MaddRead(aux="thread const Aux&"), "madd aux"),
+        ("madd_aux_by_ptr_str", lambda: MaddRead(aux="thread const Aux*"), "madd aux"),
+        ("madd_aux_default_str", lambda: MaddRead(aux="float = 0.0f"), "madd aux"),
+        ("madd_aux_short", lambda: MaddRead(aux="short"), "madd aux"),
+        ("madd_aux_raw_ident", lambda: MaddRead(aux="Aux"), "madd aux"),
+        (
+            "madd_param_default",
+            lambda: MaddRead(params=("acc", "r", "xt", "sum = zero")),
+            "parameter",
+        ),
+        (
+            "madd_param_keyword",
+            lambda: MaddRead(params=("acc", "r", "xt", "short")),
+            "parameter",
+        ),
+        (
+            "madd_param_collides_aux",
+            lambda: MaddRead(aux=TypeParam("A"), params=("acc", "r", "xt", "A")),
+            "collide",
+        ),
+        (
+            "madd_attr_qualifier",
+            lambda: MaddRead(qualifiers=("__attribute__((always_inline))", "static")),
+            "qualifier",
+        ),
+    ],
+)
+def test_madd_declaration_refuses_unsafe_forms(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        ("apply_row_instead_of_decoded", lambda: ApplyRead(decoded="Row"), "decoded"),
+        (
+            "apply_mutable_decoded",
+            lambda: ApplyRead(decoded="thread Decoded&"),
+            "decoded",
+        ),
+        (
+            "apply_array_decoded",
+            lambda: ApplyRead(decoded="thread const metal::array<float, 2>&"),
+            "decoded",
+        ),
+        (
+            "apply_template_decoded",
+            lambda: ApplyRead(decoded=TypeParam("D")),
+            "decoded",
+        ),
+        (
+            "apply_mutable_scratch",
+            lambda: ApplyRead(scratch=Pointer("thread", "float", const=False)),
+            "apply scratch",
+        ),
+        (
+            "apply_generic_scratch",
+            lambda: ApplyRead(scratch=TypeParam("XT")),
+            "apply scratch",
+        ),
+        (
+            "apply_ptr_const_ref_scratch",
+            lambda: ApplyRead(scratch="thread float* const&"),
+            "apply scratch",
+        ),
+        ("apply_short_return", lambda: ApplyRead(returns="short"), "apply must return"),
+        ("apply_half_acc", lambda: ApplyRead(acc="half"), "apply accumulator"),
+        ("apply_bad_aux", lambda: ApplyRead(aux="thread const Aux&"), "apply aux"),
+        ("apply_non_bool_wrap", lambda: ApplyRead(wrap=1), "wrap"),
+        (
+            "apply_bad_wrap_indent_newline",
+            lambda: ApplyRead(wrap=True, wrap_indent="\n"),
+            "wrap_indent",
+        ),
+        (
+            "apply_bad_wrap_indent_code",
+            lambda: ApplyRead(wrap=True, wrap_indent="short "),
+            "wrap_indent",
+        ),
+        (
+            "apply_owner_without_shared_slot",
+            lambda: ApplyRead(shared_owner="Dot::Lanes<K>"),
+            "shared_slot",
+        ),
+        (
+            "apply_templates_without_shared_slot",
+            lambda: ApplyRead(shared_templates=("int K",)),
+            "shared_slot",
+        ),
+        (
+            "apply_shared_slot_without_owner",
+            lambda: ApplyRead(shared_slot="apply_shared"),
+            "shared_owner",
+        ),
+        (
+            "apply_shared_slot_equals_slot",
+            lambda: ApplyRead(shared_slot="apply", shared_owner="Dot::Lanes"),
+            "shared_slot",
+        ),
+        (
+            "apply_shared_template_default",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T = float", "int K"),
+            ),
+            "shared_templates",
+        ),
+        (
+            "apply_shared_template_comma",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T, int K",),
+            ),
+            "shared_templates",
+        ),
+        (
+            "apply_shared_template_duplicate",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<T>",
+                shared_templates=("typename T", "int T"),
+            ),
+            "duplicate",
+        ),
+        (
+            "apply_shared_template_collides_aux",
+            lambda: ApplyRead(
+                aux=TypeParam("T"),
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T", "int K"),
+            ),
+            "collide",
+        ),
+        (
+            "apply_shared_owner_undeclared_arg",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<U>::Lanes<K>",
+                shared_templates=("typename T", "int K"),
+            ),
+            "shared_owner",
+        ),
+        (
+            "apply_shared_owner_injection",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>; static float madd(float, Row, thread float*, float) {} //",
+                shared_templates=("typename T", "int K"),
+            ),
+            "shared_owner",
+        ),
+        (
+            "apply_shared_qualifiers_static",
+            lambda: ApplyRead(
+                shared_slot="apply_shared",
+                shared_owner="Dot<T>::Lanes<K>",
+                shared_templates=("typename T", "int K"),
+                shared_qualifiers=("static",),
+            ),
+            "shared_qualifiers",
+        ),
+    ],
+)
+def test_apply_declaration_refuses_unsafe_forms(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        ("dotreads_empty_loads", lambda: DotReads(load=()), "at least one LoadRead"),
+        ("dotreads_bad_load", lambda: DotReads(load="load"), "LoadRead"),
+        ("dotreads_bad_madd", lambda: DotReads(madd="madd"), "MaddRead"),
+        ("dotreads_bad_apply", lambda: DotReads(apply="apply"), "ApplyRead"),
+        (
+            "dotreads_dup_load_slot",
+            lambda: DotReads(
+                load=(
+                    LoadRead(Pointer("device", "float", const=True), slot="load"),
+                    LoadRead(Pointer("threadgroup", "float", const=True), slot="load"),
+                )
+            ),
+            "duplicate slot",
+        ),
+        (
+            "dotreads_dup_generic_load",
+            lambda: DotReads(
+                load=(
+                    LoadRead(TypeParam("XP"), slot="load_a"),
+                    LoadRead(TypeParam("T"), slot="load_b"),
+                )
+            ),
+            "duplicate load",
+        ),
+        (
+            "dotreads_dup_device_load_const_order",
+            lambda: DotReads(
+                load=(
+                    LoadRead(
+                        Pointer("device", "float", const=True, const_first=True),
+                        slot="load_a",
+                    ),
+                    LoadRead(
+                        Pointer("device", "float", const=True, const_first=False),
+                        slot="load_b",
+                    ),
+                )
+            ),
+            "duplicate load",
+        ),
+        (
+            "dotreads_load_return_mismatch",
+            lambda: DotReads(
+                load=(
+                    LoadRead(
+                        Pointer("device", "float", const=True),
+                        returns="float",
+                        slot="load_a",
+                    ),
+                    LoadRead(
+                        Pointer("threadgroup", "float", const=True),
+                        returns=AuxType("Aux"),
+                        slot="load_b",
+                    ),
+                )
+            ),
+            "same return type",
+        ),
+        (
+            "dotreads_madd_aux_not_returned",
+            lambda: DotReads(
+                load=LoadRead(returns="float"),
+                madd=MaddRead(aux=AuxType("Aux")),
+            ),
+            "load does not return",
+        ),
+        (
+            "dotreads_madd_float_when_load_aux",
+            lambda: DotReads(
+                load=LoadRead(returns=AuxType("Aux")),
+                madd=MaddRead(aux="float"),
+            ),
+            "load does not return",
+        ),
+        (
+            "dotreads_apply_aux_not_returned",
+            lambda: DotReads(
+                load=LoadRead(returns=AuxType("Aux")),
+                madd=MaddRead(aux=AuxType("Aux")),
+                apply=ApplyRead(aux=AuxType("Other")),
+            ),
+            "load does not return",
+        ),
+        (
+            "dotreads_slot_collision_load_madd",
+            lambda: DotReads(
+                load=LoadRead(slot="read"),
+                madd=MaddRead(slot="read"),
+            ),
+            "duplicate slot",
+        ),
+    ],
+)
+def test_dot_reads_refuses_inconsistent_declarations(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        # Review corpus: mutable P / ptr P / array P / mutable Codes / ptr Codes / short / int short / refs / defaults / template
+        (
+            "weight_mutable_params",
+            lambda: WeightRead(params_type="thread P&"),
+            "params",
+        ),
+        ("weight_value_params", lambda: WeightRead(params_type="P"), "params"),
+        ("weight_ptr_params", lambda: WeightRead(params_type="thread P*"), "params"),
+        (
+            "weight_ptr_const_params",
+            lambda: WeightRead(params_type="thread P* const"),
+            "params",
+        ),
+        (
+            "weight_array_params",
+            lambda: WeightRead(params_type="thread const metal::array<float, 4>&"),
+            "params",
+        ),
+        (
+            "weight_template_params",
+            lambda: WeightRead(params_type=TypeParam("A")),
+            "params",
+        ),
+        ("weight_mutable_codes", lambda: WeightRead(codes="thread Codes&"), "codes"),
+        ("weight_moved_codes", lambda: WeightRead(codes="thread Codes&&"), "codes"),
+        ("weight_ptr_codes", lambda: WeightRead(codes="Codes*"), "codes"),
+        ("weight_template_codes", lambda: WeightRead(codes=TypeParam("Q")), "codes"),
+        ("weight_short_index", lambda: WeightRead(index="short"), "index"),
+        ("weight_int_short_index", lambda: WeightRead(index="int short"), "index"),
+        (
+            "weight_int_unsigned_index",
+            lambda: WeightRead(index="int unsigned"),
+            "index",
+        ),
+        (
+            "weight_short_ref_index",
+            lambda: WeightRead(index="thread const short&"),
+            "index",
+        ),
+        ("weight_mutable_int_index", lambda: WeightRead(index="thread int&"), "index"),
+        (
+            "weight_const_int_ref_index",
+            lambda: WeightRead(index="thread const int&"),
+            "index",
+        ),
+        ("weight_moved_int_index", lambda: WeightRead(index="thread int&&"), "index"),
+        ("weight_default_index", lambda: WeightRead(index="int = 0"), "index"),
+        ("weight_template_index", lambda: WeightRead(index=TypeParam("I")), "index"),
+        (
+            "weight_short_return",
+            lambda: WeightRead(returns="short"),
+            "weight must return",
+        ),
+        (
+            "weight_half_return",
+            lambda: WeightRead(returns="half"),
+            "weight must return",
+        ),
+        (
+            "weight_param_keyword_short",
+            lambda: WeightRead(params=("p", "q", "short")),
+            "parameter",
+        ),
+        (
+            "weight_param_keyword_unsigned",
+            lambda: WeightRead(params=("p", "q", "unsigned")),
+            "parameter",
+        ),
+        (
+            "weight_param_default",
+            lambda: WeightRead(params=("p", "q", "i = 0")),
+            "parameter",
+        ),
+        (
+            "weight_extra_param",
+            lambda: WeightRead(params=("p", "q", "i", "extra")),
+            "3 parameter",
+        ),
+        (
+            "weight_bad_qualifier",
+            lambda: WeightRead(qualifiers=("inline",)),
+            "static",
+        ),
+        (
+            "tilereads_bad_weight",
+            lambda: TileReads(weight="weight"),
+            "WeightRead",
+        ),
+    ],
+)
+def test_weight_declaration_refuses_unsafe_forms(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "fragment"),
+    [
+        ("pair_short_return", lambda: PairRead(returns="ushort"), "pair must return"),
+        ("pair_int_return", lambda: PairRead(returns="int"), "pair must return"),
+        ("pair_float_return", lambda: PairRead(returns="float"), "pair must return"),
+        ("pair_short_index", lambda: PairRead(index="short"), "index"),
+        ("pair_int_short_index", lambda: PairRead(index="int short"), "index"),
+        ("pair_mutable_int_index", lambda: PairRead(index="thread int&"), "index"),
+        ("pair_template_index", lambda: PairRead(index=TypeParam("I")), "index"),
+        ("pair_pack_ptr", lambda: PairRead(pack="uint*"), "pack"),
+        ("pair_pack_ref", lambda: PairRead(pack="thread uint&"), "pack"),
+        ("pair_pack_const_ref", lambda: PairRead(pack="thread const Pack&"), "pack"),
+        ("pair_pack_short", lambda: PairRead(pack="short"), "pack"),
+        ("pair_pack_float", lambda: PairRead(pack="float"), "pack"),
+        ("pair_pack_template", lambda: PairRead(pack=TypeParam("Q")), "pack"),
+        ("pair_param_keyword", lambda: PairRead(params=("q", "short")), "parameter"),
+        ("codesreads_bad_pair", lambda: CodesReads(pair="pair"), "PairRead"),
+    ],
+)
+def test_pair_declaration_refuses_unsafe_forms(name, build, fragment):
+    with pytest.raises(ValueError, match=fragment):
+        build()
+
+
+# --- Face construction, slot validation, and deprecation warning -----------
+
+
+def _declared_dot_source() -> str:
+    source = dot._TOY
+    source = source.replace(
+        "    template <typename XP>\n"
+        "    static float load(XP x, thread float* xt) {",
+        "    __OMLX_READ_LOAD__ {",
+    )
+    source = source.replace(
+        "    static float madd(float acc, Row r, thread const float* xt, float) {",
+        "    __OMLX_READ_MADD__ {",
+    )
+    source = source.replace(
+        "    template <typename A>\n"
+        "    static float apply("
+        "float acc, thread const Decoded& d, thread const float* xt, A aux) {",
+        "    __OMLX_READ_APPLY__ {",
+    )
+    return source
+
+
+def _declared_dot_reads() -> DotReads:
+    return DotReads(
+        load=LoadRead(input=TypeParam("XP"), params=("x", "xt")),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+        apply=ApplyRead(aux=TypeParam("A"), params=("acc", "d", "xt", "aux")),
+    )
+
+
+def _declared_tile_source() -> str:
+    return tile._TOY.replace(
+        "    static float weight(thread const P& p, Codes q, int i) {",
+        "    __OMLX_READ_WEIGHT__ {",
+    )
+
+
+def test_face_refuses_wrong_reads_kind():
+    with pytest.raises(ValueError, match="DotReads"):
+        Dot("k", _declared_dot_source(), "T", (), reads=TileReads())
+    with pytest.raises(ValueError, match="DotReads"):
+        Dot("k", _declared_dot_source(), "T", (), reads="bad")
+    with pytest.raises(ValueError, match="TileReads"):
+        Tile("k", _declared_tile_source(), "T", (), reads=DotReads())
+    with pytest.raises(ValueError, match="CodesReads"):
+        Codes("k", "__OMLX_READ_PAIR__ {}", "T", (), reads=TileReads())
+
+
+def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
+    reads = _declared_dot_reads()
+    src = _declared_dot_source()
+    # Missing slot
+    with pytest.raises(ValueError, match="missing read slot __OMLX_READ_MADD__"):
+        Dot(
+            "missing",
+            src.replace("__OMLX_READ_MADD__", "int unused"),
+            "T",
+            (),
+            reads=reads,
+        )
+    # Duplicate slot
+    with pytest.raises(ValueError, match="repeats read slot __OMLX_READ_MADD__"):
+        Dot(
+            "dup",
+            src.replace(
+                "    __OMLX_READ_MADD__ {",
+                "    __OMLX_READ_MADD__ {\n    __OMLX_READ_MADD__ {",
+            ),
+            "T",
+            (),
+            reads=reads,
+        )
+    # Commented / mid-line slot
+    with pytest.raises(ValueError, match="must start its line"):
+        Dot(
+            "commented",
+            src.replace("    __OMLX_READ_MADD__ {", "    // __OMLX_READ_MADD__ {"),
+            "T",
+            (),
+            reads=reads,
+        )
+    with pytest.raises(ValueError, match="must start its line"):
+        Dot(
+            "quoted",
+            src.replace(
+                "    __OMLX_READ_MADD__ {",
+                '    static_assert(true, "__OMLX_READ_MADD__");',
+            ),
+            "T",
+            (),
+            reads=reads,
+        )
+    # Bad trailing token on slot line
+    with pytest.raises(ValueError, match="must end with"):
+        Dot(
+            "deleted_slot",
+            src.replace("    __OMLX_READ_MADD__ {", "    __OMLX_READ_MADD__ = delete;"),
+            "T",
+            (),
+            reads=reads,
+        )
+    # Unexpanded leftover slot (typo)
+    with pytest.raises(ValueError, match="unexpanded read slot"):
+        Dot(
+            "leftover",
+            src + "\n// __OMLX_READ_TYPO__\n",
+            "T",
+            (),
+            reads=reads,
+        )
+    # Unexpanded slot when reads=None
+    with pytest.raises(ValueError, match="unexpanded read slot"):
+        Dot("legacy_slot", src, "T", ())
+    # shared_slot with empty face.shared
+    shared_reads = DotReads(
+        load=LoadRead(params=("x", "xt")),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+        apply=ApplyRead(
+            params=("acc", "d", "xt", "aux"),
+            shared_slot="apply_shared",
+            shared_owner="Dot::Lanes<K>",
+            shared_templates=("int K",),
+        ),
+    )
+    with pytest.raises(ValueError, match="shared is empty"):
+        Dot(
+            "no_shared",
+            src.replace("    __OMLX_READ_APPLY__ {", "    __OMLX_READ_APPLY__;"),
+            "T",
+            (),
+            reads=shared_reads,
+        )
+    # shared_slot expects ';' in source, not '{'
+    with pytest.raises(ValueError, match="must end with ';'"):
+        Dot(
+            "decl_with_brace",
+            src,
+            "T",
+            (),
+            shared="__OMLX_READ_APPLY_SHARED__ { return 0; }",
+            reads=shared_reads,
+        )
+    # Missing shared_slot in shared
+    with pytest.raises(
+        ValueError, match="missing read slot __OMLX_READ_APPLY_SHARED__"
+    ):
+        Dot(
+            "missing_shared",
+            src.replace("    __OMLX_READ_APPLY__ {", "    __OMLX_READ_APPLY__;"),
+            "T",
+            (),
+            shared="// no slot here\n",
+            reads=shared_reads,
+        )
+
+
+def test_omitting_reads_emits_deprecation_warning_for_every_face_kind():
+    with pytest.warns(DeprecationWarning, match="DotReads"):
+        Dot("warn_dot", "struct D {};", "D", ())
+    with pytest.warns(DeprecationWarning, match="TileReads"):
+        Tile("warn_tile", "struct T {};", "T", ())
+    with pytest.warns(DeprecationWarning, match="CodesReads"):
+        Codes("warn_codes", "struct C {};", "C", ())
+
+
+# --- Acceptance & GPU execution with declared read signatures --------------
+
+
+@pytest.mark.parametrize("path", ["dot", "staged", "shared", "unrolled", "parts"])
+def test_declared_dot_face_emits_exact_metal_and_runs(path):
+    src = _declared_dot_source().replace("KEY", f"decl_{path}")
+    face = Dot(
+        key=f"toy_decl_{path}",
+        source=src,
+        type=f"omlx_toy_decl_{path}::Dot",
+        tensors=("group_scales",),
+        vpt=8,
+        reads=_declared_dot_reads(),
+    )
+    assert face.emitted_source == dot._TOY.replace("KEY", f"decl_{path}")
+    actual, expected = _dot_outputs(face, path)
+    _assert_bits(actual, expected)
+
+
+def test_declared_dot_accepts_concrete_and_templated_const_loads():
+    # Two concrete const loads (threadgroup + device)
+    base = _declared_dot_source()
+    concrete_src = base.replace(
+        "    __OMLX_READ_LOAD__ {\n"
+        "      copy(omlx_iota<VPT>(), x, xt);\n"
+        "      return 0;\n"
+        "    }",
+        "    __OMLX_READ_LOAD_TG__ {\n"
+        "      copy(omlx_iota<VPT>(), x, xt);\n"
+        "      return 0;\n"
+        "    }\n"
+        "    __OMLX_READ_LOAD_DEV__ {\n"
+        "      copy(omlx_iota<VPT>(), x, xt);\n"
+        "      return 0;\n"
+        "    }",
+    ).replace("KEY", "concrete_decl")
+    concrete_reads = DotReads(
+        load=(
+            LoadRead(
+                Pointer("threadgroup", "float", const=True, const_first=True),
+                params=("x", "xt"),
+                slot="load_tg",
+            ),
+            LoadRead(
+                Pointer("device", "float", const=True, const_first=True),
+                params=("x", "xt"),
+                slot="load_dev",
+            ),
+        ),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+        apply=ApplyRead(aux=TypeParam("A"), params=("acc", "d", "xt", "aux")),
+    )
+    face = Dot(
+        key="toy_concrete_decl",
+        source=concrete_src,
+        type="omlx_toy_concrete_decl::Dot",
+        tensors=("group_scales",),
+        vpt=8,
+        reads=concrete_reads,
+    )
+    for path in ("dot", "staged"):
+        actual, expected = _dot_outputs(face, path)
+        _assert_bits(actual, expected)
+
+    # Two templated const pointer loads (const threadgroup X* and const device X*)
+    tmpl_reads = DotReads(
+        load=(
+            LoadRead(
+                Pointer("threadgroup", TypeParam("X"), const=True, const_first=True),
+                params=("x", "xt"),
+                slot="load_tg",
+            ),
+            LoadRead(
+                Pointer("device", TypeParam("X"), const=True, const_first=True),
+                params=("x", "xt"),
+                slot="load_dev",
+            ),
+        ),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+        apply=ApplyRead(aux=TypeParam("A"), params=("acc", "d", "xt", "aux")),
+    )
+    tmpl_face = replace(
+        face,
+        key="toy_tmpl_const_decl",
+        source=concrete_src.replace("concrete_decl", "tmpl_const_decl"),
+        type="omlx_toy_tmpl_const_decl::Dot",
+        reads=tmpl_reads,
+    )
+    for path in ("dot", "staged"):
+        actual, expected = _dot_outputs(tmpl_face, path)
+        _assert_bits(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    ["struct Aux { float bias; };", "using Aux = float;", "typedef float Aux;"],
+    ids=["struct", "using", "typedef"],
+)
+def test_declared_dot_accepts_aux_by_value_and_any_member_order(declaration):
+    # Also places madd BEFORE load and includes C++17 digit separators and strings
+    # with '//' to confirm zero C++ parsing happens.
+    src = (
+        _declared_dot_source()
+        .replace(
+            "    __OMLX_READ_LOAD__ {\n"
+            "      copy(omlx_iota<VPT>(), x, xt);\n"
+            "      return 0;\n"
+            "    }\n"
+            "    __OMLX_READ_MADD__ {\n"
+            "      return acc + dot(omlx_iota<VPT>(), r.w, xt);\n"
+            "    }",
+            f"    static constant constexpr int MARK_A = 1'000;\n"
+            f'    static_assert(MARK_A == 1000, "http://example/madd");\n'
+            f"    {declaration}\n"
+            "    __OMLX_READ_MADD__ {\n"
+            "      return acc + dot(omlx_iota<VPT>(), r.w, xt);\n"
+            "    }\n"
+            "    __OMLX_READ_LOAD__ {\n"
+            "      copy(omlx_iota<VPT>(), x, xt);\n"
+            + (
+                "      return {0.0f};\n"
+                if declaration.startswith("struct")
+                else "      return 0;\n"
+            )
+            + "    }\n"
+            "    static constant constexpr int MARK_B = 2'000;",
+        )
+        .replace("KEY", "aux_decl")
+    )
+    aux = AuxType("Aux")
+    reads = DotReads(
+        load=LoadRead(
+            input=TypeParam("XP"),
+            returns=aux,
+            params=("x", "xt"),
+            qualifiers=("METAL_FUNC", "static"),
+        ),
+        madd=MaddRead(aux=aux, params=("acc", "r", "xt", "")),
+        apply=ApplyRead(aux=aux, params=("acc", "d", "xt", "aux")),
+    )
+    face = Dot(
+        key="toy_aux_decl",
+        source=src,
+        type="omlx_toy_aux_decl::Dot",
+        tensors=("group_scales",),
+        vpt=8,
+        reads=reads,
+    )
+    for path in ("dot", "shared"):
+        actual, expected = _dot_outputs(face, path)
+        _assert_bits(actual, expected)
+
+
+def test_declared_dot_supports_out_of_line_shared_apply():
+    src = (
+        _declared_dot_source()
+        .replace(
+            "    __OMLX_READ_APPLY__ {\n"
+            "      return madd(acc, d, xt, aux);\n"
+            "    }",
+            "    __OMLX_READ_APPLY__;",
+        )
+        .replace("KEY", "ool_decl")
+    )
+    shared = (
+        "namespace omlx_toy_ool_decl {\n"
+        "__OMLX_READ_APPLY_SHARED__ {\n"
+        "  return madd(acc, d, xt, aux);\n"
+        "}\n"
+        "}\n"
+    )
+    reads = DotReads(
+        load=LoadRead(input=TypeParam("XP"), params=("x", "xt")),
+        madd=MaddRead(
+            scratch=Pointer("thread", "float", const=True, const_first=True),
+            params=("acc", "r", "xt", "aux"),
+        ),
+        apply=ApplyRead(
+            scratch=Pointer("thread", "float", const=True, const_first=True),
+            params=("acc", "d", "xt", "aux"),
+            shared_slot="apply_shared",
+            shared_owner="Dot::Lanes<K>",
+            shared_templates=("int K",),
+            wrap=True,
+        ),
+    )
+    face = Dot(
+        key="toy_ool_decl",
+        source=src,
+        shared=shared,
+        type="omlx_toy_ool_decl::Dot",
+        tensors=("group_scales",),
+        vpt=8,
+        reads=reads,
+    )
+    assert "METAL_FUNC float Dot::Lanes<K>::apply(\n" in face.emitted_shared
+    for path in ("dot", "shared", "unrolled"):
+        actual, expected = _dot_outputs(face, path)
+        _assert_bits(actual, expected)
+
+
+@pytest.mark.parametrize("codes", ["Codes", "thread const Codes&"])
+def test_declared_tile_face_emits_exact_metal_and_runs(codes):
+    tag = "val" if codes == "Codes" else "ref"
+    face = Tile(
+        key=f"toy_decl_tile_{tag}",
+        source=_declared_tile_source().replace("KEY", f"decl_tile_{tag}"),
+        type=f"omlx_toy_decl_tile_{tag}::Tile",
+        tensors=("group_scales", "row_scales"),
+        reads=TileReads(WeightRead(codes=codes, params=("p", "q", "i"))),
+    )
+    expected_src = tile._TOY.replace("KEY", f"decl_tile_{tag}").replace(
+        "Codes q, int i", f"{codes} q, int i"
+    )
+    assert face.emitted_source == expected_src
+    n, k = 8, 72
+    weights = (129 + mx.arange(n * k).reshape(n, k) % 17).astype(mx.uint8)
+    group = mx.arange(1, n * 3 + 1).reshape(n, 3).astype(mx.float32)
+    scale = mx.arange(1, n + 1).astype(mx.float32)
+    rows = [7, 0, 3]
+    want = tile._toy_decode(weights, group, scale)[mx.array(rows)]
+    exact, rounded = testing.tile_rows(
+        face, (weights, group, scale), k, rows, mx.bfloat16
+    )
+    _assert_bits(exact, want)
+    _assert_bits(rounded, want.astype(mx.bfloat16))
+
+
+@pytest.mark.parametrize("pack_decl", ["Pack", AuxType("Pack")], ids=["str", "aux"])
+def test_declared_codes_face_emits_exact_metal_and_runs(pack_decl):
+    src = """
+struct DeclCodes {
+  static constant constexpr int CONTRACT = 1;
+  const device uchar* values;
+  const device float* maps;
+  template <int K>
+  struct Runs {
+    static constant constexpr int GROUP = 64;
+    const device uchar* values;
+    const device float* maps;
+    Runs(DeclCodes m, size_t row)
+      : values(m.values + row * K), maps(m.maps + row * (K / GROUP) * 2) {}
+    float2 params(int g) const { return float2(maps[2*g], maps[2*g+1]); }
+    struct Pack { uchar4 lo, hi; };
+    Pack fetch(int run) const { return ((const device Pack*)values)[run]; }
+    __OMLX_READ_PAIR__ {
+      return uint(q.lo[j]) | (uint(q.hi[j]) << 16);
+    }
+  };
+};
+"""
+    tag = "aux" if isinstance(pack_decl, AuxType) else "str"
+    face = Codes(
+        key=f"decl_codes_{tag}",
+        source=src,
+        type="DeclCodes",
+        tensors=("maps",),
+        reads=CodesReads(PairRead(pack=pack_decl, params=("q", "j"))),
+    )
+    assert "static uint pair(Pack q, int j)" in face.emitted_source
+    k, n = 64, 8
+    codes_arr = (1 + mx.arange(n * k).reshape(n, k) % 15).astype(mx.uint8)
+    maps = mx.stack([mx.ones((n, 1)), mx.zeros((n, 1))], axis=-1).astype(mx.float32)
+    levels, weights = testing.codes_rows(
+        face, (codes_arr, maps), k, range(n), mx.float16
+    )
+    _assert_bits(levels, codes_arr.astype(mx.uint16))
+    _assert_bits(weights, codes_arr.astype(mx.float32))
+
+
+def test_declared_face_supports_replace_deepcopy_and_concurrent_construction():
+    src = _declared_dot_source().replace("KEY", "copy_decl")
+    face = Dot(
+        key="toy_copy_decl",
+        source=src,
+        type="omlx_toy_copy_decl::Dot",
+        tensors=("group_scales",),
+        dtypes=(mx.float32,),
+        vpt=8,
+        reads=_declared_dot_reads(),
+    )
+    cloned = copy.deepcopy(face)
+    assert cloned == face and cloned.emitted_source == face.emitted_source
+    replaced = replace(face, dtypes=(mx.bfloat16,))
+    assert replaced.dtypes == (mx.bfloat16,)
+    assert replaced.emitted_source == face.emitted_source
+    # Replacing reads re-emits from the template cleanly
+    new_reads = replace(
+        _declared_dot_reads(),
+        madd=MaddRead(
+            scratch=Pointer("thread", "float", const=True, const_first=True),
+            params=("acc", "r", "xt", ""),
+        ),
+    )
+    re_emitted = replace(face, reads=new_reads)
+    assert "const thread float* xt" in re_emitted.emitted_source
+    assert "thread const float* xt" in face.emitted_source
+
+    def make(i):
+        return Dot(
+            key=f"toy_thread_{i}",
+            source=_declared_dot_source().replace("KEY", f"thread_{i}"),
+            type=f"omlx_toy_thread_{i}::Dot",
+            tensors=("group_scales",),
+            vpt=8,
+            reads=_declared_dot_reads(),
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        built = list(pool.map(make, range(8)))
+    assert all(
+        f.emitted_source == dot._TOY.replace("KEY", f"thread_{i}")
+        for i, f in enumerate(built)
+    )
+    assert formats.DotReads is DotReads

@@ -44,6 +44,48 @@ import mlx.nn as nn
 
 from ..patches.module_cache import epoch as cache_epoch
 from ..patches.module_cache import publish as cache_publish
+from .reads import (
+    ApplyRead as ApplyRead,
+)
+from .reads import (
+    AuxType as AuxType,
+)
+from .reads import (
+    CodesReads as CodesReads,
+)
+from .reads import (
+    DotReads as DotReads,
+)
+from .reads import (
+    LoadRead as LoadRead,
+)
+from .reads import (
+    MaddRead as MaddRead,
+)
+from .reads import (
+    PairRead as PairRead,
+)
+from .reads import (
+    Pointer as Pointer,
+)
+from .reads import (
+    Reads as Reads,
+)
+from .reads import (
+    TileReads as TileReads,
+)
+from .reads import (
+    TypeParam as TypeParam,
+)
+from .reads import (
+    WeightRead as WeightRead,
+)
+from .reads import (
+    emit_parts,
+)
+from .reads import (
+    slot_marker as slot_marker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +298,13 @@ class _Face:
     dtypes: tuple[mx.Dtype, ...] = ()
     # Tables the face reads, staged by the kernel (docs/quant-formats.md, Tables).
     tables: tuple[Table, ...] = field(default=(), kw_only=True)
+    # Declared signatures of the face's read members, emitted into source/shared
+    # at construction (docs/quant-formats.md). Optional with a deprecation
+    # warning in contract revision 1; required in revision 2.
+    reads: Reads | None = field(default=None, kw_only=True)
+    _emitted: tuple[tuple[str, str, str], ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
 
     def __deepcopy__(self, memo):
         return _copy_descriptor(self, self.dtypes, memo)
@@ -302,10 +351,15 @@ class _Face:
             )
         from .kernels import hand_tables  # the kernels' module reads this one
 
-        parts = tuple(self._metal_parts())
-        for part, _, source in parts:
+        raw_parts = tuple(
+            (name, phase, getattr(self, name))
+            for name, phase in _metal_fields(type(self))
+        )
+        for part, _, source in raw_parts:
             if not isinstance(source, str):
                 raise ValueError(f"{owner}: {part} is Metal, not {source!r}")
+        parts = emit_parts(self, raw_parts)
+        object.__setattr__(self, "_emitted", parts)
         found = hand_tables("\n".join(source for _, _, source in parts), face=True)
         if found:
             (line, name, text), *_ = found
@@ -329,8 +383,12 @@ class _Face:
             )
 
     def _metal_parts(self):
-        for name, phase in _metal_fields(type(self)):
-            yield name, phase, getattr(self, name)
+        return self._emitted
+
+    @property
+    def emitted_source(self) -> str:
+        """The face's main Metal source with declared read signatures emitted."""
+        return self._emitted[0][2]
 
     @cached_property
     def _hash_key(self):
@@ -385,6 +443,13 @@ class Dot(_Face):
         if type(self.vpt) is not int or self.vpt < 0:
             raise ValueError(f"{owner}: vpt is a count of inputs, not {self.vpt!r}")
 
+    @property
+    def emitted_shared(self) -> str:
+        """The face's shared Metal source with declared read signatures emitted."""
+        for name, _, text in self._emitted:
+            if name == "shared":
+                return text
+        return ""
     __hash__ = _Face.__hash__
 
 
