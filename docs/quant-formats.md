@@ -1366,9 +1366,9 @@ dot face too: one row per threadgroup, the normed row staged per stream, the
 inject dot read in whole face lanes over each virtual thread's contiguous run,
 `simd_sum` per 32 threads, the eight partials added in order, and the row's
 `finish` applied once to the total before the sigmoid. A face whose lanes do not
-tile the 256 threads (its `vpt` does not divide the row's width) or whose staged
-stream and tables do not fit the threadgroup keeps the canonical path for the
-injection.
+tile the 256 threads (`256 * vpt` does not divide the row's width) or whose
+staged stream, partials and tables do not fit the threadgroup keeps the
+canonical path for the injection.
 
 The routed decode plans its launches for a bf16 or fp16 activation when both the gate+up and down faces are exact for it. A face with an empty `dtypes` accepts all three types in `formats.FLOATS`. The activation dtype selects the top-k kernel and is part of the proof shared between blocks. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches. A block whose fused gate+up width is odd keeps its composed path: halving it would shift every expert past the first.
 

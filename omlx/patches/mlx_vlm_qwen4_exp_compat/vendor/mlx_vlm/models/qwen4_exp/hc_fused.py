@@ -491,14 +491,6 @@ _DECODE_UP = r"""
 """
 
 
-# Prefill epilogue for one row per threadgroup:
-# - mixed = mean over streams of sigmoid(up) * normed, with BF16 rounding after
-#   each gate, product and partial sum.
-# - inj = 2 * sigmoid(normed . inject / HC) from the quantized four-row bank.
-# The normed row is read once: each stream is staged in threadgroup memory and
-# its inject dot runs from there. The inject sum keeps one fixed order: virtual
-# thread v = s * VT + t (t < VT) sums elements [v * PER, (v + 1) * PER) of the
-# row, then simd_sum per 32 virtual threads, then the 8 partials in order.
 # The tail inject over the inject projection's dot face, one row per
 # threadgroup: mixed = mean over streams of sigmoid(up) * normed, with BF16
 # rounding after each gate, product and partial sum; inj = 2 * sigmoid of the
@@ -963,6 +955,9 @@ def _tail_inject_ok(width, hidden, hc, dtype, face) -> bool:
     return (
         face is not None
         and face.vpt >= 1
+        and hidden > 0
+        and width > 0
+        and width == hc * hidden
         and width % (256 * face.vpt) == 0
         and hidden * dtype.size + hc * 32 + kernels.table_bytes(face)
         <= _TG_MEMORY_BYTES
@@ -992,7 +987,7 @@ def _tail_inject_launch(hc, hidden, dtype, inject_face):
     )
     template = [("T", dtype), ("K", width), ("H", hidden), ("HC", hc)]
     dtypes = [dtype, dtype]
-    warm = []  # the native kernel, once the first call recorded the instance
+    recorded = [False]  # the first call records the face kernel's instance
 
     def run(rows, up, normed, inject_layer):
         launch = dict(
@@ -1003,10 +998,10 @@ def _tail_inject_launch(hc, hidden, dtype, inject_face):
             output_shapes=[(rows, hidden), (rows, hc)],
             output_dtypes=dtypes,
         )
-        if warm:
-            return warm[0](**launch)
+        if recorded[0]:
+            return kernel.native(**launch)
         out = kernel(**launch)
-        warm.append(kernel.native)
+        recorded[0] = True
         return out
 
     return run

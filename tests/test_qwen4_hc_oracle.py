@@ -76,12 +76,27 @@ def test_oracle_sources_are_literals():
         "WND_SOURCE",
         "NDN_SOURCE",
         "NDNW_SOURCE",
-        "TI_SOURCE",
         "V2_HEADER",
     }
     pieces = {"NDN_SOURCE_TEMPLATE", "NDN_LOAD", "NDN_WRITE_LOAD"}
-    frozen_decode = {"D_SOURCE", "U_SOURCE", "U2_SOURCE"}
-    assert (set(_SOURCES) - derived) | pieces | frozen_decode <= literals
+    frozen = {
+        "D_SOURCE",
+        "U_SOURCE",
+        "U2_SOURCE",
+        "TI_SOURCE",
+        "TG_HEADER",
+    }
+    assert (set(_SOURCES) - derived) | pieces | frozen <= literals
+    live_tree = ast.parse(inspect.getsource(_live()))
+    live_literals = {
+        node.targets[0].id
+        for node in live_tree.body
+        if isinstance(node, ast.Assign)
+        and isinstance(node.value, ast.Constant)
+        and isinstance(node.value.value, str)
+    }
+    assert "_TAIL_INJECT" in live_literals
+    assert "TI_SOURCE" not in live_literals and "TG_HEADER" not in live_literals
     imported = {
         name.split(".")[0]
         for node in ast.walk(tree)
@@ -268,6 +283,9 @@ def test_tail_inject_ok_checks_vpt_and_table_bytes():
     empty = replace(qmv8, vpt=0)
     assert not live._tail_inject_ok(10240, 2560, 4, dtype, empty)
     assert not live._tail_inject_ok(4608, 1152, 4, dtype, qmv8)
+    assert not live._tail_inject_ok(0, 0, 4, dtype, qmv8)
+    assert not live._tail_inject_ok(10240, 2560, 4, dtype, None)
+    assert not live._tail_inject_ok(2560, 2560, 4, dtype, qmv8)
     # H = 16128 keeps the width whole 256-thread groups and leaves 384 bytes
     # of the 32 KiB threadgroup for the stride, the partials and the tables.
     tabled = replace(qmv8, tables=(Table("t", mx.float32, (0.0,) * 96),))
@@ -284,6 +302,11 @@ def test_prefill_tail_inject_uses_dot_face_and_finish(monkeypatch):
     width = HC * hidden
     mx.random.seed(2678)
     module = _module(8, True, hidden=hidden)
+    # The staged stream is the normed row, not sigmoid(up) * normed: drive the
+    # up projection's gate to zero so the assertion would fail if it were.
+    module.input_mix_weight_up.biases = mx.full(
+        module.input_mix_weight_up.biases.shape, -10.0, dtype
+    )
     inject = module.block_inject_weight
     codes = mx.full((HC, width), 128, mx.uint8)
     codes[:, 0] = 129
@@ -302,34 +325,142 @@ def test_prefill_tail_inject_uses_dot_face_and_finish(monkeypatch):
             toy if projection is inject else stock_face(projection, is_inject)
         ),
     )
+    base_gains = mx.array([1.0, 1.5, 2.0, 2.5, 0.0, 0.0, 0.0, 0.0], mx.float32)
 
-    def injection_of(gain):
-        inject.hc_gains = mx.full((8,), gain, mx.float32)
+    def injection_of(gains):
+        inject.hc_gains = gains
         out = live.prefill_forward(module, hyper, None, nax=False)
         assert out is not None
         mx.eval(out)
         return out[2]
 
-    base = injection_of(1.0)
-    doubled = injection_of(2.0)
-    # The dot's value: each code adds its own stream's activated element. The
-    # staged stream is the kernel's own rounding of sigmoid(up) * normed.
+    base = injection_of(base_gains)
+    doubled = injection_of(2.0 * base_gains)
+    # The dot's value: each code adds its own stream's normed element.
     flat = hyper.reshape(rows, width)
     normed = live._kernel_norm(module, flat, rows, HC, hidden, dtype, precise=True)
-    normed = normed.reshape(hyper.shape)
-    up = module.input_mix_weight_up(live._act(HC)(module.input_mix_weight_down(normed)))
-    gate = (1.0 / (1.0 + mx.exp(-up.astype(mx.float32)))).astype(dtype)
-    staged = (gate.astype(mx.float32) * normed.astype(mx.float32)).astype(dtype)
-    staged = staged.reshape(rows, width)
-    total = staged[:, 0].astype(mx.float32) + staged[:, hidden].astype(mx.float32)
-    expected = 2.0 * mx.sigmoid(total / float(HC))
+    normed = normed.reshape(rows, width)
+    total = normed[:, 0].astype(mx.float32) + normed[:, hidden].astype(mx.float32)
     for t in range(HC):
+        expected = 2.0 * mx.sigmoid(float(base_gains[t]) * total / float(HC))
         gap = mx.abs(base[0, :, t].astype(mx.float32) - expected)
         assert float(gap.max()) < 0.02, "the face's dot is not the staged stream's"
     # finish scales the dot's FP32 sum before the sigmoid: logit(inj/2) doubles.
     q_base = mx.log(base / (2.0 - base))
     q_doubled = mx.log(doubled / (2.0 - doubled))
-    assert float(mx.abs(q_doubled - 2.0 * q_base).max()) < 0.05
+    for t in range(4):
+        assert float(mx.abs(q_doubled[0, :, t] - 2.0 * q_base[0, :, t]).max()) < 0.12
+
+
+@pytest.mark.parametrize("group_size", [32, 64])
+@pytest.mark.parametrize("bits", [4, 5, 6, 8])
+def test_float32_tail_inject_matches_oracle_bits(bits, group_size):
+    """The FP32 sums, where a 16-bit output would mask a reordering."""
+    rows = 17
+    mx.random.seed(2800 + bits + group_size)
+    module = _module(bits, True, group_size=group_size, dtype=mx.float32)
+    inject = module.block_inject_weight
+    hidden = 2560
+    width = HC * hidden
+    up = (mx.random.normal((rows, width)) * 3).astype(mx.float32)
+    normed = (mx.random.normal((rows, width)) * 0.05).astype(mx.float32)
+    live = _live()
+    face = affine.face(bits, group_size, False, mx.float32)
+    launch = live._tail_inject_launch(HC, hidden, mx.float32, face)
+    assert launch is not None
+    actual = launch(rows, up, normed, inject)
+    expected = oracle._kernel(
+        "ti_f32",
+        ["up", "xn", "inject_w", "inject_s", "inject_b"],
+        ["mixed", "inj"],
+        oracle.TI_SOURCE,
+        header=oracle.V2_HEADER,
+    )(
+        inputs=[up, normed, inject.weight, inject.scales, inject.biases],
+        template=[
+            ("T", mx.float32),
+            ("BITS_I", bits),
+            ("GS_I", group_size),
+            ("K", width),
+            ("H", hidden),
+            ("HC", HC),
+        ],
+        grid=(256, 1, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, hidden), (rows, HC)],
+        output_dtypes=[mx.float32, mx.float32],
+    )
+    _assert_bitwise(
+        tuple(actual), tuple(expected), ("tail inject fp32", bits, group_size)
+    )
+
+
+def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
+    """A swapped layer or a new input dtype rebuilds the plan and its launch."""
+    hidden, dtype, rows = 2560, mx.bfloat16, 17
+    mx.random.seed(2810)
+    module = _module(8, True, hidden=hidden)
+    hyper, pending = _inputs(rows, hidden, dtype, 2811)
+    live = _live()
+    seen = []
+    real_face_kernel = live.kernels.face_kernel
+
+    def record(*args, **kwargs):
+        kernel = real_face_kernel(*args, **kwargs)
+        seen.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(live.kernels, "face_kernel", record)
+    monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+    live._tail_inject_launch.cache_clear()
+    out = live.prefill_forward(module, hyper, pending, nax=False)
+    assert out is not None
+    assert seen and len(seen[-1].instances()) == 1
+    _assert_bitwise(out, oracle.prefill(module, hyper, pending), "first plan")
+    first = module.__dict__["_hc_tail_inject"]
+    other = _module(8, True, hidden=hidden, group_size=32)
+    module.block_inject_weight = other.block_inject_weight
+    out = live.prefill_forward(module, hyper, pending, nax=False)
+    assert out is not None
+    plan = module.__dict__["_hc_tail_inject"]
+    assert plan[0] is module.block_inject_weight and plan[0] is not first[0]
+    _assert_bitwise(out, oracle.prefill(module, hyper, pending), "swapped layer")
+    module.set_dtype(mx.float16)
+    half = hyper.astype(mx.float16)
+    half_pending = (
+        pending[0].astype(mx.float16),
+        pending[1].astype(mx.float16),
+    )
+    out = live.prefill_forward(module, half, half_pending, nax=False)
+    assert out is not None
+    plan = module.__dict__["_hc_tail_inject"]
+    assert plan[1] == mx.float16
+    _assert_bitwise(out, oracle.prefill(module, half, half_pending), "new input dtype")
+
+
+def test_concurrent_prefill_tail_inject_matches_oracle():
+    """Two threads on different formats each get their own layer's bits."""
+    hidden, rows = 2560, 17
+    modules = {bits: _module(bits, True, hidden=hidden) for bits in (4, 8)}
+    inputs = {bits: _inputs(rows, hidden, mx.bfloat16, 2820 + bits) for bits in modules}
+    live = _live()
+    barrier = Barrier(2)
+
+    def run(bits):
+        module = modules[bits]
+        hyper, pending = inputs[bits]
+        barrier.wait()
+        for _ in range(3):
+            out = live.prefill_forward(module, hyper, pending, nax=False)
+            assert out is not None
+            _assert_bitwise(
+                out, oracle.prefill(module, hyper, pending), ("thread", bits)
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run, bits) for bits in modules]
+        for future in futures:
+            future.result()
 
 
 def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
@@ -338,13 +469,14 @@ def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
     mx.random.seed(2671)
     module = _module(8, True, hidden=hidden)
     module.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
-    up_layer = module.block_inject_weight
+    inject_layer = module.block_inject_weight
     live = _live()
     monkeypatch.setattr(live, "_VALIDATED", set())
     if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
         monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
     monkeypatch.setattr(live, "_KERNELS", {})
     monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+    live._tail_inject_launch.cache_clear()
 
     def prefill_signatures():
         return {
@@ -365,7 +497,7 @@ def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
     hyper65, pending65 = _inputs(65, hidden, dtype, 2674)
     live.prefill_forward(other, hyper65, pending65, nax=False)
     assert len(prefill_signatures()) == 2, "a distinct face validates its own"
-    assert module.__dict__["_hc_tail_inject"][0] is up_layer
+    assert module.__dict__["_hc_tail_inject"][0] is inject_layer
 
 
 def test_hc_fused_drops_legacy_tail_headers():
