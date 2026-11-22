@@ -463,128 +463,12 @@ _MMA_NSG = 8
 # weights of its column into its simdgroup's tile, rounded to T; the
 # simdgroup multiplies the tile against every row tile; the parts are summed
 # once at the end, in simdgroup order.
-_MMA_SOURCE = """
-    constexpr int BM = __BM__;
-    constexpr int BN = __BN__;
-    constexpr int BK = __BK__;
-    constexpr int BK_SUB = 8;
-    constexpr int NSG = __NSG__;
-    constexpr int K_chunk = K / NSG;
-    using F = __FACE__;
-
-    uint tid = thread_position_in_threadgroup.x;
-    uint sg_id = tid / 32;
-    uint lane = tid % 32;
-    uint tg_n = threadgroup_position_in_grid.y;
-
-    int N = int(N_size);
-    int n0 = int(tg_n) * BN;
-    int k_begin = int(sg_id) * K_chunk;
-    int k_end = k_begin + K_chunk;
-
-    threadgroup T B_tile[NSG][BK * BN];
-    threadgroup float tg_partials[NSG][BM * BN];
-
-    if constexpr (omlx_tile_face<F, K>::value) {
-      using R = typename F::template Runs<K>;
-      metal::simdgroup_matrix<T, 8, 8> b_L, b_R;
-__DECL__
-      int dq_n = int(lane) % BN;
-      int dq_k_lane = int(lane) / BN;
-      const R runs(w, size_t(n0 + dq_n));
-
-      for (int k0 = k_begin; k0 < k_end; k0 += BK) {
-        _Pragma("unroll")
-        for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {
-          int dq_k = pack_idx * 2 + dq_k_lane;
-          int k_base = k0 + dq_k * 8;
-          const auto p = runs.params(k_base / R::GROUP);
-          const auto c = runs.fetch(k_base / 8);
-          _Pragma("unroll")
-          for (int ki = 0; ki < 8; ++ki) {
-            B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] = T(R::weight(p, c, ki));
-          }
-        }
-        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
-        for (int ks = 0; ks < BK / BK_SUB; ++ks) {
-__LOADS__
-          metal::simdgroup_load(b_L, B_tile[sg_id] + ks * BK_SUB * BN, BN);
-          metal::simdgroup_load(b_R, B_tile[sg_id] + ks * BK_SUB * BN + 8, BN);
-__MACS__
-        }
-        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
-      }
-
-__STORES__
-      metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-
-      for (int off = int(tid); off < BM * BN; off += NSG * 32) {
-        float acc = 0.0f;
-        _Pragma("unroll")
-        for (int g = 0; g < NSG; ++g) {
-          acc += tg_partials[g][off];
-        }
-        int row = off / BN;
-        int col = off - row * BN;
-        y[row * N + n0 + col] = T(acc);
-      }
-    }
-"""
-
-
 @cache
 def _mma_face(bits: int, group_size: int, dtype):
     """The affine tile face of one signature, built once per signature."""
     from omlx.formats import affine
 
     return affine.tile_face(bits, group_size, dtype)
-
-
-@cache
-def _mma_face_kernel(row_tiles: int, face):
-    """The generic mma kernel of ``row_tiles`` tiles over ``face`` (plugin and
-    tabled faces; the builtin affine faces take the skeleton below)."""
-    from omlx.formats import kernels
-
-    rows = range(row_tiles)
-    decl = "".join(
-        f"      metal::simdgroup_matrix<T, 8, 8> a{r};\n"
-        f"      metal::simdgroup_matrix<float, 8, 8> c{r}L(0.0f), c{r}R(0.0f);\n"
-        for r in rows
-    )
-    loads = "".join(
-        f"          metal::simdgroup_load(a{r}, x + {r} * 8 * K + k0 + ks * BK_SUB, K);\n"
-        for r in rows
-    )
-    macs = "".join(
-        f"          metal::simdgroup_multiply_accumulate(c{r}L, a{r}, b_L, c{r}L);\n"
-        f"          metal::simdgroup_multiply_accumulate(c{r}R, a{r}, b_R, c{r}R);\n"
-        for r in rows
-    )
-    stores = "".join(
-        f"      metal::simdgroup_store(c{r}L, tg_partials[sg_id] + {r} * 8 * BN, BN);\n"
-        f"      metal::simdgroup_store(c{r}R, tg_partials[sg_id] + {r} * 8 * BN + 8, BN);\n"
-        for r in rows
-    )
-    source = (
-        _MMA_SOURCE.replace("__BM__", str(8 * row_tiles))
-        .replace("__BN__", str(_MMA_BN))
-        .replace("__BK__", str(_MMA_BK))
-        .replace("__NSG__", str(_MMA_NSG))
-        .replace("__FACE__", face.type)
-        .replace("__DECL__\n", decl)
-        .replace("__LOADS__\n", loads)
-        .replace("__MACS__\n", macs)
-        .replace("__STORES__\n", stores)
-    )
-    return kernels.face_kernel(
-        f"omlx_vk_mma_rt{row_tiles}",
-        ("x", "w", "N_size"),
-        {"w": face},
-        ("y",),
-        "",
-        source,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1049,7 +933,7 @@ _AFFINE_MMA = re.compile(r"affine_tile_b([234568])g(32|64|128)_(bf16|fp16)")
 def _mma_plan(row_tiles: int, face, k: int, dtype):
     """``(kernel, template)`` for one mma signature, built at construction.
     The builtin affine faces take the byte-identical skeleton with K baked;
-    every other face keeps the generic tile-face kernel and K's template."""
+    every other face binds tile_mma_ops into the same skeleton with K baked."""
     import mlx.core as mx
 
     from omlx.formats import verify_skeleton
@@ -1061,7 +945,19 @@ def _mma_plan(row_tiles: int, face, k: int, dtype):
         name = f"omlx_vk_mma_rt{row_tiles}_k{k}_q{bits}_gs{group}_{tag}"
         spec = verify_skeleton.emit_mma_kernel(ops, row_tiles, k, name)
         return mx.fast.metal_kernel(**spec), [("T", dtype)]
-    return _mma_face_kernel(row_tiles, face), [("T", dtype), ("K", k)]
+    from omlx.formats import kernels
+
+    ops = verify_skeleton.tile_mma_ops(face)
+    source = verify_skeleton.emit_mma_source(ops, row_tiles, k)
+    kernel = kernels.face_kernel(
+        f"omlx_vk_mma_rt{row_tiles}_k{k}",
+        ("x", "w", "N_size"),
+        {"w": face},
+        ("y",),
+        ops.header,
+        source,
+    )
+    return kernel, [("T", dtype)]
 
 
 @cache

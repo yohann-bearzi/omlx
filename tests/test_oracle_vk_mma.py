@@ -102,16 +102,18 @@ def test_mma_plan_routing_and_forged_keys():
     four = affine.tile_face(4, 64, mx.bfloat16)
     live._mma_plan.cache_clear()
     try:
-        assert live._mma_plan(1, four, 2560, mx.bfloat16)[1] == [("T", mx.bfloat16)]
+        from omlx.formats import kernels as face_kernels
+
+        plain = live._mma_plan(1, four, 2560, mx.bfloat16)
+        assert plain[1] == [("T", mx.bfloat16)]
+        assert not isinstance(plain[0], face_kernels._FaceKernel)
         forged = replace(four, key="affine_tile_b7g64_bf16")
-        assert live._mma_plan(1, forged, 2560, mx.bfloat16)[1] == [
-            ("T", mx.bfloat16),
-            ("K", 2560),
-        ]
-        assert live._mma_plan(1, tabled_tile(four), 2560, mx.bfloat16)[1] == [
-            ("T", mx.bfloat16),
-            ("K", 2560),
-        ]
+        tabled = tabled_tile(four)
+        altered = replace(four, tables=tabled.tables)
+        for face in (forged, altered, tabled):
+            plan = live._mma_plan(1, face, 2560, mx.bfloat16)
+            assert plan[1] == [("T", mx.bfloat16)]
+            assert isinstance(plan[0], face_kernels._FaceKernel)
     finally:
         live._mma_plan.cache_clear()
 
@@ -137,3 +139,73 @@ def test_zero_k_or_n_is_refused_when_the_plan_is_built():
             live._mma_launch(1, 8, 64, mx.bfloat16, mx.bfloat16, 0, 4096)
     finally:
         live._mma_launch.cache_clear()
+
+
+def test_mma_plan_routes_tabled_faces_through_the_skeleton(monkeypatch):
+    from omlx.formats import kernels, verify_skeleton
+
+    face = tabled_tile(affine.tile_face(4, 64, mx.bfloat16))
+    seen = []
+
+    def record(name, inputs, faces, outputs, header, source):
+        seen.append((name, inputs, faces, outputs, header, source))
+        return None
+
+    monkeypatch.setattr(kernels, "face_kernel", record)
+    live._mma_plan.cache_clear()
+    try:
+        kernel, template = live._mma_plan(1, face, 2560, mx.bfloat16)
+        assert kernel is None and template == [("T", mx.bfloat16)]
+        ops = verify_skeleton.tile_mma_ops(face)
+        want = verify_skeleton.emit_mma_source(ops, 1, 2560)
+        assert seen[0] == (
+            "omlx_vk_mma_rt1_k2560",
+            ("x", "w", "N_size"),
+            {"w": face},
+            ("y",),
+            ops.header,
+            want,
+        )
+    finally:
+        live._mma_plan.cache_clear()
+
+
+def test_mma_plan_runs_tabled_face_and_enforces_tile_contract():
+    from tests.test_formats_tile import _TOY, _toy, _toy_matrix
+
+    w = _linear(64, 256, 4, 64, mx.bfloat16, seed=1)
+    x = _x(8, 256, mx.bfloat16, seed=1)
+    n_scalar = mx.array(64, dtype=mx.int32)
+    live._mma_plan.cache_clear()
+    try:
+        face = tabled_tile(affine.tile_face(4, 64, mx.bfloat16))
+        kernel, template = live._mma_plan(1, face, 256, mx.bfloat16)
+        (y,) = kernel(
+            inputs=[x, *w, n_scalar],
+            template=template,
+            grid=(256, 4, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(8, 64)],
+            output_dtypes=[mx.bfloat16],
+        )
+        mx.eval(y)
+        assert _same(y, oracle.vk_qmm_mma(x, *w, group_size=64, bits=4))
+        for tag, source, message in (
+            ("mma_run4", _TOY.replace("RUN = 8;", "RUN = 4;"), "RUN must be 8"),
+            ("mma_rev99", _TOY.replace("CONTRACT = 1;", "CONTRACT = 99;"), "contract"),
+        ):
+            bad = _toy(tag, source)
+            kernel, template = live._mma_plan(1, bad, 256, mx.bfloat16)
+            with pytest.raises(RuntimeError, match=message) as failed:
+                (out,) = kernel(
+                    inputs=[x, *_toy_matrix(64, 256), n_scalar],
+                    template=template,
+                    grid=(256, 4, 1),
+                    threadgroup=(256, 1, 1),
+                    output_shapes=[(8, 64)],
+                    output_dtypes=[mx.bfloat16],
+                )
+                mx.eval(out)
+            assert str(failed.value).count("error:") == 1
+    finally:
+        live._mma_plan.cache_clear()

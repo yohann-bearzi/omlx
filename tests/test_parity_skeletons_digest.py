@@ -102,6 +102,41 @@ def test_the_mma_skeleton_has_no_reserved_keyword(bits):
 def test_mma_tile_ops_fields_are_all_used():
     import inspect
 
-    source = inspect.getsource(verify_skeleton.emit_mma_kernel)
+    source = inspect.getsource(verify_skeleton.emit_mma_source) + inspect.getsource(
+        verify_skeleton.emit_mma_kernel
+    )
     for field in verify_skeleton.MmaTileOps.__dataclass_fields__:
         assert field in source, field
+
+
+def test_tile_mma_ops_keeps_the_contract_check():
+    class Face:
+        type = "F"
+
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.tile_mma_ops(Face()), 1, 2560
+    )
+    assert "if constexpr (omlx_tile_face<F, K>::value)" in source
+    assert "omlx_mma_dep<T, F>" in source
+
+
+def test_tile_mma_ops_uses_emit_k_and_no_dead_n_global():
+    class Face:
+        type = "F"
+
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.tile_mma_ops(Face()), 1, 5120
+    )
+    assert "constexpr int K = 5120;" in source
+    assert "n_global" not in source
+
+
+def test_emit_mma_source_does_not_rewrite_face_type():
+    class Face:
+        type = "omlx_foo__K__::Tile"
+
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.tile_mma_ops(Face()), 1, 5120
+    )
+    assert "omlx_foo__K__::Tile" in source
+    assert "constexpr int K = 5120;" in source

@@ -21,6 +21,8 @@ class MmaTileOps:
     header: str = ""
     operands: tuple[str, ...] = ("w_q", "scales", "biases")
     k_consts: str = ""
+    cursor: str = ""
+    close: str = ""
     load_params: str = ""
     unpack: str = ""
 
@@ -76,8 +78,33 @@ def affine_mma_ops(bits: int, group_size: int) -> MmaTileOps:
     )
 
 
-def emit_mma_kernel(ops: MmaTileOps, row_tiles: int, k_val: int, name: str) -> dict:
-    """The MMA kernel spec for ``row_tiles`` 8-row tiles over ``ops``."""
+def tile_mma_ops(face) -> MmaTileOps:
+    """The generic Tile binding: the face's own ``Runs<K>`` cursor, its
+    ``params``/``fetch``/``weight`` calls, in the same skeleton as affine.
+    The face type is dependent on the kernel's T so a face outside the tile
+    contract fails at Metal compilation with the contract sentence instead of phase-1 compilation."""
+    return MmaTileOps(
+        header="template <typename, typename U> struct omlx_mma_dep { using type = U; };\n",
+        operands=("w",),
+        k_consts="        constexpr int K = __K__;",
+        cursor=f"""        using F = typename omlx_mma_dep<T, {face.type}>::type;
+        if constexpr (omlx_tile_face<F, K>::value) {{
+        using R = typename F::template Runs<K>;
+        const R runs(w, size_t(n0 + dq_n));""",
+        close="\n        }",
+        load_params="""                int k_base = k0 + dq_k * 8;""",
+        unpack="""                const auto p = runs.params(k_base / R::GROUP);
+                const auto c = runs.fetch(k_base / 8);
+                _Pragma("unroll")
+                for (int ki = 0; ki < 8; ++ki) {
+                    B_tile[sg_id][(dq_k * 8 + ki) * BN + dq_n] =
+                        T(R::weight(p, c, ki));
+                }""",
+    )
+
+
+def emit_mma_source(ops: MmaTileOps, row_tiles: int, k_val: int) -> str:
+    """The MMA Metal source for ``row_tiles`` 8-row tiles over ``ops``."""
     bn, bk, nsg = 16, 32, 8
     decl = "\n        ".join(
         f"simdgroup_matrix<T, 8, 8> a{r};"
@@ -128,7 +155,7 @@ def emit_mma_kernel(ops: MmaTileOps, row_tiles: int, k_val: int, name: str) -> d
 
         int dq_n = int(lane) % BN;
         int dq_k_lane = int(lane) / BN;
-
+{ops.cursor}
         for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
             _Pragma("unroll")
             for (int pack_idx = 0; pack_idx < 2; ++pack_idx) {{
@@ -158,13 +185,18 @@ def emit_mma_kernel(ops: MmaTileOps, row_tiles: int, k_val: int, name: str) -> d
             int row = off / BN;
             int col = off - row * BN;
             y[row * N + n0 + col] = T(acc);
-        }}
+        }}{ops.close}
     """
+    return source
+
+
+def emit_mma_kernel(ops: MmaTileOps, row_tiles: int, k_val: int, name: str) -> dict:
+    """The MMA kernel spec for ``row_tiles`` 8-row tiles over ``ops``."""
     spec = dict(
         name=name,
         input_names=["x", *ops.operands, "N_size"],
         output_names=["y"],
-        source=source,
+        source=emit_mma_source(ops, row_tiles, k_val),
     )
     if ops.header:
         spec["header"] = ops.header
