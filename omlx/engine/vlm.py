@@ -1808,6 +1808,44 @@ class VLMBatchedEngine(BaseEngine):
             ),
         )
 
+    def _apply_pre_load_patches(self) -> None:
+        """The pre-load patches, before the model is instantiated.
+
+        A request for MTP that cannot attach fails the load: a served model
+        with ``mtp_enabled`` and no head is an error, never a silent
+        MTP-less model. Other incompatible models keep the lenient path
+        (their patches are a no-op).
+        """
+        from ..utils.model_loading import (
+            _offload_config,
+            maybe_apply_pre_load_patches,
+        )
+
+        try:
+            maybe_apply_pre_load_patches(
+                self._model_name,
+                model_settings=self._model_settings,
+                for_vlm=True,
+            )
+        except (ValueError, LoadHookError):
+            # A refusal, or oMLX's load hook unable to wrap the library's
+            # loader: every load fails with it.
+            raise
+        except Exception as error:
+            # qwen4_exp is this release's ported family, and its branch also
+            # chooses the PLE storage: a silent failure would load the table
+            # into RAM. Other families keep upstream's lenient skip.
+            try:
+                family = _offload_config(self._model_name).get("model_type")
+            except Exception:
+                family = None
+            if family == "qwen4_exp":
+                raise RuntimeError(
+                    f"qwen4_exp's pre-load patches failed for {self._model_name}: "
+                    f"{error}"
+                ) from error
+            logger.debug(f"pre-load patches skipped: {error}")
+
     @property
     def model_name(self) -> str:
         return self._model_name
@@ -2032,20 +2070,7 @@ class VLMBatchedEngine(BaseEngine):
             # is a no-op when the model is incompatible. On the thread that
             # loads, as every load's: the process-wide state they set is not
             # another load's meanwhile.
-            try:
-                from ..utils.model_loading import maybe_apply_pre_load_patches
-
-                maybe_apply_pre_load_patches(
-                    self._model_name,
-                    model_settings=self._model_settings,
-                    for_vlm=True,
-                )
-            except (ValueError, LoadHookError):
-                # A refusal, or oMLX's load hook unable to wrap the library's
-                # loader: every load fails with it.
-                raise
-            except Exception as e:
-                logger.debug(f"pre-load patches skipped: {e}")
+            self._apply_pre_load_patches()
 
             _patch_video_processor_bug()
             apply_pixtral_torch_free_patch()

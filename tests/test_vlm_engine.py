@@ -3888,3 +3888,66 @@ class TestNativeVideo:
         assert estimate.call_count == 2
         kwargs = engine._preflight_or_raise_with_eviction.call_args.kwargs
         assert kwargs["num_prompt_tokens"] == 1002
+
+
+def test_qwen4_pre_load_failure_raises_even_with_mtp_off(monkeypatch):
+    """qwen4_exp is the ported family: any pre-load failure is loud (its
+    branch also picks the PLE storage; a silent failure would put the table
+    in RAM)."""
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    def raise_(*arguments, **keywords):
+        raise RuntimeError("the runtime refused the PLE storage")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+    monkeypatch.setattr(
+        model_loading,
+        "_offload_config",
+        lambda name: {"model_type": "qwen4_exp"},
+    )
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = SimpleNamespace(mtp_enabled=False)
+    with pytest.raises(RuntimeError, match="qwen4_exp's pre-load patches failed"):
+        engine._apply_pre_load_patches()
+
+
+def test_qwen4_pre_load_failure_raises_with_mtp_on(monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    def raise_(*arguments, **keywords):
+        raise RuntimeError("the runtime refused the head")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+    monkeypatch.setattr(
+        model_loading,
+        "_offload_config",
+        lambda name: {"model_type": "qwen4_exp"},
+    )
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = SimpleNamespace(mtp_enabled=True)
+    with pytest.raises(RuntimeError, match="qwen4_exp's pre-load patches failed"):
+        engine._apply_pre_load_patches()
+
+
+def test_another_family_pre_load_failure_keeps_the_lenient_path(monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    def raise_(*arguments, **keywords):
+        raise RuntimeError("not our family")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+    monkeypatch.setattr(
+        model_loading, "_offload_config", lambda name: {"model_type": "llama"}
+    )
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = SimpleNamespace(mtp_enabled=False)
+    engine._apply_pre_load_patches()
