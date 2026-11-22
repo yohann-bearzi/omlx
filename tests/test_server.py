@@ -929,9 +929,10 @@ class TestModelFallback:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("route", ["inference", "explicit"])
-    @pytest.mark.parametrize("failure", ["cached", "format", "hook"])
+    @pytest.mark.parametrize("failure", ["cached", "format", "hook", "preload"])
     async def test_model_unavailable_returns_409(self, route, failure):
         """Cached model load failures return 409 instead of an unhandled 500."""
+        from omlx.engine.vlm import PreLoadPatchError
         from omlx.formats import FormatRefusedError, LoadHookError
 
         self._state.global_settings = GlobalSettings()
@@ -944,6 +945,9 @@ class TestModelFallback:
             "cached": ModelUnavailableError("broken-model", "cached failure"),
             "format": FormatRefusedError("checkpoint refused", mode="toy"),
             "hook": LoadHookError("loader is incompatible"),
+            "preload": PreLoadPatchError(
+                "qwen4_exp's pre-load patches failed for broken-model: boom"
+            ),
         }[failure]
         pool.get_entry.return_value.engine = None
         pool.get_engine = AsyncMock(side_effect=error)
@@ -954,6 +958,35 @@ class TestModelFallback:
                 await get_engine("broken-model", EngineType.LLM)
             else:
                 await srv.load_model_public("broken-model")
+
+        assert exc_info.value.status_code == 409
+        assert str(error) in exc_info.value.detail
+
+    @pytest.mark.asyncio
+    async def test_default_model_fallback_preload_error_returns_409(self):
+        """Default-model fallback surfaces PreLoadPatchError as 409, not 404."""
+        from omlx.engine.vlm import PreLoadPatchError
+
+        self._state.global_settings = GlobalSettings()
+        self._state.global_settings.model.model_fallback = True
+        self._state.default_model = "default-model"
+
+        error = PreLoadPatchError(
+            "qwen4_exp's pre-load patches failed for default-model: boom"
+        )
+        pool = MagicMock()
+        pool.resolve_model_id.side_effect = lambda mid, _sm: mid
+
+        async def mock_get_engine(model_id, **_kwargs):
+            if model_id == "default-model":
+                raise error
+            raise ModelNotFoundError(model_id, ["default-model"])
+
+        pool.get_engine = AsyncMock(side_effect=mock_get_engine)
+        self._state.engine_pool = pool
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("unknown-model", EngineType.LLM)
 
         assert exc_info.value.status_code == 409
         assert str(error) in exc_info.value.detail

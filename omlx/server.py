@@ -220,7 +220,7 @@ from .api.utils import (
 )
 from .engine import BaseEngine, BatchedEngine, GenerationOutput, VLMBatchedEngine
 from .engine.distributed import DistributedInferenceError
-from .engine.vlm import MINIMAX_M3_MODEL_TYPES
+from .engine.vlm import MINIMAX_M3_MODEL_TYPES, PreLoadPatchError
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.decision import DecisionEngine
@@ -1551,7 +1551,7 @@ async def get_engine(
                 if _lease and _leased_out is not None:
                     _leased_out.append(_server_state.default_model)
                 return fb_engine
-            except (FormatRefusedError, LoadHookError) as exc:
+            except (FormatRefusedError, LoadHookError, PreLoadPatchError) as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except Exception:
                 pass  # Fall through to original 404
@@ -1574,7 +1574,12 @@ async def get_engine(
         raise HTTPException(status_code=507, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
-    except (ModelUnavailableError, FormatRefusedError, LoadHookError) as e:
+    except (
+        ModelUnavailableError,
+        FormatRefusedError,
+        LoadHookError,
+        PreLoadPatchError,
+    ) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e))
@@ -4063,7 +4068,12 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
         raise HTTPException(status_code=507, detail=str(e)) from e
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e)) from e
-    except (ModelUnavailableError, FormatRefusedError, LoadHookError) as e:
+    except (
+        ModelUnavailableError,
+        FormatRefusedError,
+        LoadHookError,
+        PreLoadPatchError,
+    ) as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
     except ModelLoadingError as e:
         raise HTTPException(status_code=409, detail=str(e)) from e

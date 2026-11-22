@@ -576,14 +576,12 @@ def maybe_apply_pre_load_patches(
 
     # The vendored qwen4_exp must be in place before anything imports the
     # installed mlx_vlm module: the cluster's capability detection and the
-    # served load both pre-load without ``for_vlm``, and a later compat
+    # worker's pre-load both pre-load without ``for_vlm``, and a later compat
     # patch cannot replace a module sys.modules already holds. Installed
     # here for every path, before a caller can import the family module.
     config = _offload_config(model_name)
-    if (
-        isinstance(config, dict)
-        and str(config.get("model_type", "")).lower() == "qwen4_exp"
-    ):
+    model_type = config.get("model_type")
+    if model_type == "qwen4_exp":
         from ..patches.mlx_vlm_qwen4_exp_compat import (
             apply_mlx_vlm_qwen4_exp_compat_patch,
         )
@@ -596,7 +594,6 @@ def maybe_apply_pre_load_patches(
             from ..patches.moe_offload_compat import in_quant_format
 
             offload = not in_quant_format(config)
-        model_type = config.get("model_type")
         validate_moe_expert_offload(
             {
                 "moe_expert_offload_enabled": offload,

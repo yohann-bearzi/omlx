@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +14,8 @@ import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
-_VENDOR_MLX_VLM = Path(__file__).resolve().parent / "vendor" / "mlx_vlm"
+_VENDOR_MLX_VLM = (Path(__file__).resolve().parent / "vendor" / "mlx_vlm").resolve()
+_LOCK = threading.Lock()
 _APPLIED = False
 
 
@@ -29,63 +31,67 @@ def _append_package_path(package: Any, path: Path) -> None:
 def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
     """Expose ``mlx_vlm.models.qwen4_exp`` from oMLX's vendor tree."""
     global _APPLIED
-    if _APPLIED:
-        return False
+    with _LOCK:
+        if _APPLIED:
+            return False
 
-    # The vendor must be installed before anything imports the installed
-    # qwen4_exp: a module sys.modules already holds cannot be replaced
-    # without leaving two copies in the process, so refuse loudly and name
-    # the fix. ``maybe_apply_pre_load_patches`` installs this patch before
-    # the family module can be imported (capability detection, the served
-    # load, the worker's pre-load all go through it).
-    shadowed = sorted(
-        name
-        for name in sys.modules
-        if name == "mlx_vlm.models.qwen4_exp"
-        or name.startswith("mlx_vlm.models.qwen4_exp.")
-    )
-    foreign = [
-        name
-        for name in shadowed
-        if getattr(sys.modules[name], "__file__", None) is None
-        or _VENDOR_MLX_VLM not in Path(sys.modules[name].__file__).resolve().parents
-    ]
-    if foreign:
-        module = sys.modules[foreign[0]]
-        raise RuntimeError(
-            f"{foreign[0]} was imported from {getattr(module, '__file__', '?')!r} "
-            "before oMLX's qwen4_exp compat patch: install the patch before "
-            "anything imports the model module (maybe_apply_pre_load_patches "
-            "does)"
+        # The vendor must be installed before anything imports the installed
+        # qwen4_exp: a module sys.modules already holds cannot be replaced
+        # without leaving two copies in the process, so refuse loudly and name
+        # the fix. ``maybe_apply_pre_load_patches`` installs this patch before
+        # the family module can be imported (capability detection, the served
+        # load, the worker's pre-load all go through it).
+        shadowed = sorted(
+            (
+                (name, module)
+                for name, module in list(sys.modules.items())
+                if name == "mlx_vlm.models.qwen4_exp"
+                or name.startswith("mlx_vlm.models.qwen4_exp.")
+            ),
+            key=lambda item: item[0],
         )
+        foreign = [
+            (name, module)
+            for name, module in shadowed
+            if not getattr(module, "__file__", None)
+            or _VENDOR_MLX_VLM not in Path(module.__file__).resolve().parents
+        ]
+        if foreign:
+            name, module = foreign[0]
+            raise RuntimeError(
+                f"{name} was imported from {getattr(module, '__file__', '?')!r} "
+                "before oMLX's qwen4_exp compat patch: install the patch before "
+                "anything imports the model module (maybe_apply_pre_load_patches "
+                "does)"
+            )
 
-    try:
-        import mlx_vlm
-        import mlx_vlm.models
+        try:
+            import mlx_vlm
+            import mlx_vlm.models
 
-        _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-        _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-        importlib.import_module("mlx_vlm.models.qwen4_exp")
-        from mlx_vlm.models.qwen3_5 import language as qwen35_language
+            _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+            _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+            importlib.import_module("mlx_vlm.models.qwen4_exp")
+            from mlx_vlm.models.qwen3_5 import language as qwen35_language
 
-        from ..mlx_vlm_mtp import (
-            qwen35_verify_attention,
-            qwen35_verify_linear,
-        )
+            from ..mlx_vlm_mtp import (
+                qwen35_verify_attention,
+                qwen35_verify_linear,
+            )
 
-        # Reuse the shared primitives without replacing Qwen4's HC trunk.
-        qwen35_verify_linear.apply()
-        qwen35_verify_attention.apply(qwen35_language)
-        _patch_prompt_utils()
-        _patch_prompt_loop()
-        _patch_model_file_bypass()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
-        return False
+            # Reuse the shared primitives without replacing Qwen4's HC trunk.
+            qwen35_verify_linear.apply()
+            qwen35_verify_attention.apply(qwen35_language)
+            _patch_prompt_utils()
+            _patch_prompt_loop()
+            _patch_model_file_bypass()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
+            return False
 
-    _APPLIED = True
-    logger.info("Qwen4-Exp mlx-vlm compatibility patch applied")
-    return True
+        _APPLIED = True
+        logger.info("Qwen4-Exp mlx-vlm compatibility patch applied")
+        return True
 
 
 def _patch_model_file_bypass() -> None:

@@ -3116,24 +3116,35 @@ def test_the_engines_apply_pre_load_patches_on_the_thread_that_loads():
             if isinstance(node, ast.FunctionDef) and node.name == loader
         )
 
-        def dispatches(node):
-            return sum(
-                isinstance(call, ast.Call)
-                and getattr(call.func, "id", None) == "maybe_apply_pre_load_patches"
+        def calls(node, name):
+            return [
+                call
                 for call in ast.walk(node)
-            )
+                if isinstance(call, ast.Call)
+                and name
+                in (
+                    getattr(call.func, "id", None),
+                    getattr(call.func, "attr", None),
+                )
+            ]
 
-        # Once, inside the function the global MLX executor runs: the walk of
-        # a format run, on that thread too, never sets or restores that state
-        # while an engine loads.
-        assert dispatches(nested) == dispatches(start) == 1, engine
+        # Once, inside the function the global MLX executor runs, inline or
+        # through the engine's own pre-load method: the walk of a format run,
+        # on that thread too, never sets or restores that state while an
+        # engine loads.
+        inline = calls(nested, "maybe_apply_pre_load_patches")
+        direct = calls(nested, "_apply_pre_load_patches")
+        assert len(inline) + len(direct) == 1, engine
+        if inline:
+            (call,) = inline
+        else:
+            (dispatch,) = direct
+            assert ast.unparse(dispatch) == "self._apply_pre_load_patches()"
+            method = ast.parse(
+                textwrap.dedent(inspect.getsource(engine._apply_pre_load_patches))
+            )
+            (call,) = calls(method, "maybe_apply_pre_load_patches")
         # With the arguments the engine gave them before.
-        (call,) = (
-            node
-            for node in ast.walk(nested)
-            if isinstance(node, ast.Call)
-            and getattr(node.func, "id", None) == "maybe_apply_pre_load_patches"
-        )
         assert ast.unparse(call) == (
             "maybe_apply_pre_load_patches(self._model_name, "
             f"model_settings=self._model_settings{extra})"

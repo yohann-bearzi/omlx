@@ -3935,7 +3935,8 @@ def test_qwen4_pre_load_failure_raises_with_mtp_on(monkeypatch):
         engine._apply_pre_load_patches()
 
 
-def test_another_family_pre_load_failure_keeps_the_lenient_path(monkeypatch):
+@pytest.mark.parametrize("family", ["llama", "qwen3_5_moe"])
+def test_another_family_pre_load_failure_keeps_the_lenient_path(monkeypatch, family):
     from types import SimpleNamespace
 
     from omlx.utils import model_loading
@@ -3945,9 +3946,135 @@ def test_another_family_pre_load_failure_keeps_the_lenient_path(monkeypatch):
 
     monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
     monkeypatch.setattr(
-        model_loading, "_offload_config", lambda name: {"model_type": "llama"}
+        model_loading, "_offload_config", lambda name: {"model_type": family}
     )
     engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
     engine._model_name = "toy"
     engine._model_settings = SimpleNamespace(mtp_enabled=False)
     engine._apply_pre_load_patches()
+
+
+def test_pre_load_reraises_value_and_load_hook_errors_unchanged(
+    monkeypatch,
+):
+    """A refusal or an unwrappable loader keeps its own exception on every
+    family: the loud qwen4 check never wraps the classes callers match on."""
+    from types import SimpleNamespace
+
+    from omlx.formats import FormatRefusedError, LoadHookError
+    from omlx.utils import model_loading
+
+    for family in ("qwen4_exp", "llama"):
+        for error in (
+            ValueError("bad"),
+            FormatRefusedError("no", mode="toy"),
+            LoadHookError("hook"),
+        ):
+
+            def raise_(*arguments, _error=error, **keywords):
+                raise _error
+
+            monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+            monkeypatch.setattr(
+                model_loading,
+                "_offload_config",
+                lambda name, _family=family: {"model_type": _family},
+            )
+            engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+            engine._model_name = "toy"
+            engine._model_settings = SimpleNamespace(mtp_enabled=False)
+            with pytest.raises(type(error)) as excinfo:
+                engine._apply_pre_load_patches()
+            assert excinfo.value is error
+
+
+def test_pre_load_forwards_model_name_settings_and_for_vlm_and_chains_cause(
+    monkeypatch,
+):
+    """The pre-load gets the model, its settings and the VLM flag; the loud
+    error names the model and keeps the original failure as its cause."""
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    seen = {}
+    orig = RuntimeError("boom")
+
+    def fail(arguments, model_settings=None, for_vlm=None):
+        seen["args"] = (arguments,)
+        seen["kwargs"] = {"model_settings": model_settings, "for_vlm": for_vlm}
+        raise orig
+
+    def read_config(name):
+        seen["config_name"] = name
+        return {"model_type": "qwen4_exp"}
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", fail)
+    monkeypatch.setattr(model_loading, "_offload_config", read_config)
+    settings = SimpleNamespace(mtp_enabled=False)
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = settings
+    with pytest.raises(vlm_module.PreLoadPatchError, match="toy.*boom") as excinfo:
+        engine._apply_pre_load_patches()
+
+    assert seen["args"] == ("toy",)
+    assert seen["kwargs"] == {"model_settings": settings, "for_vlm": True}
+    assert seen["config_name"] == "toy"
+    assert excinfo.value.__cause__ is orig
+
+
+def test_pre_load_missing_or_raising_config_stays_lenient(monkeypatch):
+    """A config that is missing or cannot be read keeps the lenient path:
+    the family cannot be named, and a broken config is not a patch failure."""
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    def raise_(*arguments, **keywords):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+
+    def raise_config(name):
+        raise OSError("gone")
+
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = SimpleNamespace(mtp_enabled=True)
+
+    monkeypatch.setattr(model_loading, "_offload_config", raise_config)
+    engine._apply_pre_load_patches()
+
+    monkeypatch.setattr(model_loading, "_offload_config", lambda name: {})
+    engine._apply_pre_load_patches()
+
+
+@pytest.mark.parametrize(
+    "model_type", ["Qwen4-Exp", "qwen4-exp", "QWEN4_EXP", " qwen4_exp "]
+)
+def test_qwen4_pre_load_failure_raises_for_hyphenated_or_mixed_case_model_type(
+    monkeypatch, model_type
+):
+    """The family check normalizes the config spelling: prefixed and
+    hyphenated checkpoints must not fall back to the lenient path."""
+    from types import SimpleNamespace
+
+    from omlx.utils import model_loading
+
+    def raise_(*arguments, **keywords):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(model_loading, "maybe_apply_pre_load_patches", raise_)
+    monkeypatch.setattr(
+        model_loading,
+        "_offload_config",
+        lambda name: {"model_type": model_type},
+    )
+    engine = vlm_module.VLMBatchedEngine.__new__(vlm_module.VLMBatchedEngine)
+    engine._model_name = "toy"
+    engine._model_settings = SimpleNamespace(mtp_enabled=False)
+    with pytest.raises(
+        vlm_module.PreLoadPatchError, match="qwen4_exp's pre-load patches failed"
+    ):
+        engine._apply_pre_load_patches()

@@ -3130,10 +3130,12 @@ def test_a_drafter_or_draft_refused_is_never_skipped():
     )
 
     def rethrows_refusal(handler):
+        # A broader tuple (a family's pre-load refusal included) still
+        # re-raises every format or load-hook refusal: both must be there.
         return (
             isinstance(handler.type, ast.Tuple)
-            and {getattr(name, "id", None) for name in handler.type.elts}
-            == {"FormatRefusedError", "LoadHookError"}
+            and {"FormatRefusedError", "LoadHookError"}
+            <= {getattr(name, "id", None) for name in handler.type.elts}
             and isinstance(handler.body[-1], ast.Raise)
             and handler.body[-1].exc is None
         )

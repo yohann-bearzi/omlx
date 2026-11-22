@@ -1577,6 +1577,117 @@ class TestVLMFallback:
         assert str(refusal) in str(excinfo.value)
         assert "fallback" not in str(excinfo.value)
 
+    @pytest.mark.asyncio
+    async def test_qwen4_exp_vlm_preload_failure_does_not_fall_back_to_llm(
+        self, small_mock_model_dir
+    ):
+        """A qwen4_exp pre-load failure is a load error: the LLM engine would
+        skip the patches and serve the family without its PLE/MTP setup."""
+        from omlx.engine.vlm import PreLoadPatchError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.config_model_type = "qwen4_exp"
+        failure = PreLoadPatchError(
+            "qwen4_exp's pre-load patches failed for model-a: boom"
+        )
+        vlm_engine = MagicMock()
+        vlm_engine.start = AsyncMock(side_effect=failure)
+        vlm_engine.stop = AsyncMock()
+        llm_engine = MagicMock()
+        with (
+            patch("omlx.engine_pool.BatchedEngine", llm_engine),
+            patch(
+                "omlx.engine_pool.VLMBatchedEngine",
+                MagicMock(return_value=vlm_engine),
+            ),
+            pytest.raises(PreLoadPatchError) as excinfo,
+        ):
+            await pool._load_engine("model-a")
+
+        llm_engine.assert_not_called()
+        assert excinfo.value is failure
+        assert "fallback" not in str(excinfo.value)
+
+    @pytest.mark.asyncio
+    async def test_qwen4_exp_preload_failure_caches_and_retries_on_variant_change(
+        self, small_mock_model_dir
+    ):
+        """PreLoadPatchError is cached as a refusal on the same variant and
+        clears for retry when runtime_settings change."""
+        from omlx.engine.vlm import PreLoadPatchError
+        from omlx.model_settings import ModelSettings
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.config_model_type = "qwen4_exp"
+        failure = PreLoadPatchError(
+            "qwen4_exp's pre-load patches failed for model-a: boom"
+        )
+        vlm_engine = MagicMock()
+        vlm_engine.start = AsyncMock(side_effect=[failure, None])
+        vlm_engine.stop = AsyncMock()
+        s1 = ModelSettings(mtp_enabled=True)
+        s2 = ModelSettings(mtp_enabled=False)
+
+        with patch(
+            "omlx.engine_pool.VLMBatchedEngine",
+            MagicMock(return_value=vlm_engine),
+        ):
+            with pytest.raises(PreLoadPatchError) as first:
+                await pool.get_engine("model-a", runtime_settings=s1)
+            assert first.value is failure
+            assert entry.load_failed and entry.load_refusal is not None
+
+            with pytest.raises(PreLoadPatchError) as cached:
+                await pool.get_engine("model-a", runtime_settings=s1)
+            assert str(cached.value) == str(failure)
+            assert vlm_engine.start.await_count == 1
+
+            loaded = await pool.get_engine("model-a", runtime_settings=s2)
+            assert loaded is vlm_engine
+            assert vlm_engine.start.await_count == 2
+            assert not entry.load_failed
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("force_lm", [True, False], ids=["force_lm", "vlm"])
+    async def test_qwen4_exp_force_lm_vlm_fallback_preload_failure_surfaces_as_is(
+        self, small_mock_model_dir, force_lm
+    ):
+        """A PreLoadPatchError from the fallback engine surfaces unchanged,
+        never wrapped into RuntimeError / ModelUnavailableError."""
+        from omlx.engine.vlm import PreLoadPatchError
+
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.model_type = "vlm"
+        entry.engine_type = "vlm"
+        entry.config_model_type = "qwen4_exp"
+        failure = PreLoadPatchError(
+            "qwen4_exp's pre-load patches failed for model-a: boom"
+        )
+        first, second = MagicMock(), MagicMock()
+        first.start = AsyncMock(side_effect=TypeError("unsupported"))
+        first.stop = AsyncMock()
+        second.start = AsyncMock(side_effect=failure)
+        second.stop = AsyncMock()
+        first_cls = "BatchedEngine" if force_lm else "VLMBatchedEngine"
+        second_cls = "VLMBatchedEngine" if force_lm else "BatchedEngine"
+        with (
+            patch(f"omlx.engine_pool.{first_cls}", return_value=first),
+            patch(f"omlx.engine_pool.{second_cls}", return_value=second),
+            pytest.raises(PreLoadPatchError) as excinfo,
+        ):
+            await pool._load_engine("model-a", force_lm=force_lm)
+
+        assert excinfo.value is failure
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("force_lm", [False, True], ids=["vlm", "force_lm"])

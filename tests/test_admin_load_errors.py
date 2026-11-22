@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 import omlx.admin.routes as admin_routes
 import omlx.server  # noqa: F401 — ensure server module is imported first
+from omlx.engine.vlm import PreLoadPatchError
 from omlx.exceptions import (
     EnginePoolError,
     InsufficientMemoryError,
@@ -59,6 +60,7 @@ def _load(pool):
         (ModelUnavailableError("m"), 409),
         (FormatRefusedError("checkpoint refused", mode="toy"), 409),
         (LoadHookError("loader is incompatible"), 409),
+        (PreLoadPatchError("qwen4_exp's pre-load patches failed"), 409),
         (ModelLoadingError("m"), 409),
         (ModelBusyError("m", "unload"), 409),
         # Anything else from the pool is still a server-side fault.

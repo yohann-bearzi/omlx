@@ -55,6 +55,7 @@ from ..engine.splash import (
 from ..engine.splash import (
     scan_ssd_cache as scan_splash_ssd_cache,
 )
+from ..engine.vlm import PreLoadPatchError
 from ..exceptions import (
     InsufficientMemoryError,
     ModelBusyError,
@@ -2965,6 +2966,7 @@ async def load_model(
         ModelBusyError,
         FormatRefusedError,
         LoadHookError,
+        PreLoadPatchError,
     ) as e:
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:

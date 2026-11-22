@@ -101,6 +101,11 @@ from .realtime_voice import RealtimeVoiceError, RealtimeVoiceSession
 
 logger = logging.getLogger(__name__)
 
+
+class PreLoadPatchError(RuntimeError):
+    """The pre-load patches failed for a family that cannot load without them."""
+
+
 _VOICE_BACKENDS = {
     "lfm3_audio": LFM3VoiceBackend,
     "lfm3_omni": LFM3VoiceBackend,
@@ -1809,12 +1814,12 @@ class VLMBatchedEngine(BaseEngine):
         )
 
     def _apply_pre_load_patches(self) -> None:
-        """The pre-load patches, before the model is instantiated.
+        """Apply pre-load patches before instantiating the model.
 
-        A request for MTP that cannot attach fails the load: a served model
-        with ``mtp_enabled`` and no head is an error, never a silent
-        MTP-less model. Other incompatible models keep the lenient path
-        (their patches are a no-op).
+        ValueError (including FormatRefusedError) and LoadHookError fail every
+        load unchanged. Any other failure raises PreLoadPatchError for
+        qwen4_exp (whose pre-load branch also selects the PLE storage and MTP
+        setup), while other families keep the lenient debug skip.
         """
         from ..utils.model_loading import (
             _offload_config,
@@ -1836,11 +1841,16 @@ class VLMBatchedEngine(BaseEngine):
             # chooses the PLE storage: a silent failure would load the table
             # into RAM. Other families keep upstream's lenient skip.
             try:
-                family = _offload_config(self._model_name).get("model_type")
+                raw = _offload_config(self._model_name).get("model_type")
+                family = (
+                    raw.strip().lower().replace("-", "_")
+                    if isinstance(raw, str)
+                    else None
+                )
             except Exception:
                 family = None
             if family == "qwen4_exp":
-                raise RuntimeError(
+                raise PreLoadPatchError(
                     f"qwen4_exp's pre-load patches failed for {self._model_name}: "
                     f"{error}"
                 ) from error

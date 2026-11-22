@@ -1698,6 +1698,17 @@ def test_a_vlm_load_and_a_rank_of_the_same_model_need_different_things(tmp_path)
     assert "mlx_vlm" in vlm
 
 
+def test_qwen4_exp_rank_requires_mlx_vlm(tmp_path):
+    """qwen4_exp installs its compat vendor on every pre-load path, including ranks."""
+
+    from omlx.cluster.autoconfigure import required_imports
+
+    model = _model_dir(tmp_path, model_type="qwen4_exp")
+    modules = {requirement.module for requirement in required_imports(model)}
+
+    assert "mlx_vlm" in modules
+
+
 def test_a_model_directory_that_cannot_be_read_still_reports_the_common_imports():
     """An unreadable config is not a reason to claim a rank needs nothing."""
 

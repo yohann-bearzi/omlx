@@ -57,7 +57,11 @@ from .engine.splash import (
 from .engine.sts import STSEngine
 from .engine.stt import STTEngine
 from .engine.tts import TTSEngine
-from .engine.vlm import OCR_MODEL_GENERATION_DEFAULTS, VLMBatchedEngine
+from .engine.vlm import (
+    OCR_MODEL_GENERATION_DEFAULTS,
+    PreLoadPatchError,
+    VLMBatchedEngine,
+)
 from .engine_core import get_mlx_executor, shutdown_mlx_executor
 from .exceptions import (
     DEFAULT_CEILING_ADVICE,
@@ -1969,6 +1973,10 @@ class EnginePool:
             )
         elif isinstance(exc, LoadHookError):
             entry.load_refusal = partial(LoadHookError, entry.load_failure_message)
+        elif isinstance(exc, PreLoadPatchError):
+            entry.load_refusal = partial(
+                PreLoadPatchError, entry.load_failure_message
+            )
         else:
             entry.load_refusal = None
 
@@ -3119,7 +3127,7 @@ class EnginePool:
                     force_lm=force_lm,
                     runtime_settings=runtime_load_settings,
                 )
-            except (FormatRefusedError, LoadHookError):
+            except (FormatRefusedError, LoadHookError, PreLoadPatchError):
                 if entry.load_refusal is not None:
                     entry.load_refusal_variant = requested_variant
                 raise
@@ -4430,10 +4438,15 @@ class EnginePool:
                     # start() already stopped Splash; its error carries the
                     # tail of the Splash log. There is no MLX fallback.
                     raise
-                if isinstance(start_error, (FormatRefusedError, LoadHookError)):
-                    # A checkpoint's quant format refused, or oMLX's load hook
-                    # unable to wrap a library's loader: the other library
-                    # would meet the same.
+                if isinstance(
+                    start_error,
+                    (FormatRefusedError, LoadHookError, PreLoadPatchError),
+                ):
+                    # A checkpoint's quant format refused, oMLX's load hook
+                    # unable to wrap a library's loader, or a family's
+                    # pre-load patches failed: the other library would meet
+                    # the same (or skip the patches and load the family
+                    # without them).
                     raise
                 if force_lm and entry.engine_type == "vlm":
                     # force_lm created a BatchedEngine but mlx-lm can't
@@ -4465,10 +4478,12 @@ class EnginePool:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
                         if isinstance(
-                            fallback_error, (FormatRefusedError, LoadHookError)
+                            fallback_error,
+                            (FormatRefusedError, LoadHookError, PreLoadPatchError),
                         ):
-                            # The other library's load of it was refused, or
-                            # could not be wrapped.
+                            # The other library's load of it was refused, could
+                            # not be wrapped, or failed a required pre-load
+                            # patch.
                             raise
                         raise RuntimeError(
                             f"LM load failed (force_lm=True): {start_error}; "
@@ -4507,10 +4522,12 @@ class EnginePool:
                         await self._start_engine(engine)
                     except Exception as fallback_error:
                         if isinstance(
-                            fallback_error, (FormatRefusedError, LoadHookError)
+                            fallback_error,
+                            (FormatRefusedError, LoadHookError, PreLoadPatchError),
                         ):
-                            # The other library's load of it was refused, or
-                            # could not be wrapped.
+                            # The other library's load of it was refused, could
+                            # not be wrapped, or failed a required pre-load
+                            # patch.
                             raise
                         raise RuntimeError(
                             f"VLM load failed: {start_error}; "
@@ -4791,7 +4808,11 @@ class EnginePool:
             if not load_completed:
                 self._schedule_failed_load_reclaim(model_id, pre_load_memory)
             raise
-        except (FormatRefusedError, LoadHookError) as exc:
+        except (
+            FormatRefusedError,
+            LoadHookError,
+            PreLoadPatchError,
+        ) as exc:
             if load_completed:
                 load_completed = False
                 await self._release_loaded_engine(entry, engine, resident_size)
