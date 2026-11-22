@@ -166,6 +166,11 @@ def test_mma_plan_routes_tabled_faces_through_the_skeleton(monkeypatch):
             ops.header,
             want,
         )
+        from omlx.formats.tuning.schema import MmaTilePolicy
+
+        tuned = MmaTilePolicy(32, 32, 4)
+        live._mma_plan(1, face, 2560, mx.bfloat16, tuned)
+        assert seen[1][0] == "omlx_vk_mma_rt1_k2560_bn32_bk32_nsg4"
     finally:
         live._mma_plan.cache_clear()
 
@@ -248,3 +253,175 @@ def test_mma_plan_runs_an_fp16_toy_face_with_two_row_tiles():
         assert mx.allclose(y.astype(mx.float32), reference, rtol=2e-2, atol=5e-2)
     finally:
         live._mma_plan.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "bn,bk,nsg,rows",
+    [
+        (32, 32, 4, 8),
+        (8, 64, 4, 16),
+        (16, 64, 4, 16),
+        (16, 32, 4, 8),
+        (8, 128, 4, 16),
+    ],
+)
+def test_mma_launch_uses_policy_grid_and_threadgroup(
+    monkeypatch, tmp_path, bn, bk, nsg, rows
+):
+    import json
+
+    from omlx.formats import tuning, verify_skeleton
+
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    chip = tuning.current_chip()
+    verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=64, k=2560, rows=rows, dtype=mx.bfloat16
+    )
+    entry = {
+        "key": {
+            "route": "mma_tile",
+            "face_id": face.key,
+            "dtype": "bf16",
+            "bits": 4,
+            "group": 64,
+            "rows_bucket": str(rows),
+            "n": 64,
+            "k": 2560,
+        },
+        "face_sha256": tuning.face_digest(face),
+        "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+        "measured_at": "2026-11-22T00:00:00Z",
+        "params": {"bn": bn, "bk": bk, "nsg": nsg},
+    }
+    (tmp_path / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": [entry]})
+    )
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [tmp_path])
+    monkeypatch.setattr(tuning, "_CHIPS", {})
+    live._mma_plan.cache_clear()
+    live._mma_launch.cache_clear()
+    try:
+        row_tiles = (rows + 7) // 8
+        launch, _ = live._mma_launch(
+            row_tiles, 4, 64, mx.bfloat16, mx.bfloat16, 2560, 64
+        )
+        assert launch.keywords["grid"] == (32 * nsg, 64 // bn, 1)
+        assert launch.keywords["threadgroup"] == (32 * nsg, 1, 1)
+        weight, scales, biases = _linear(64, 2560, 4, 64, mx.bfloat16, seed=3)
+        x = _x(rows, 2560, mx.bfloat16, seed=3)
+        y = live.vk_qmm_mma(x, weight, scales, biases, group_size=64, bits=4)
+        want = oracle.vk_qmm_mma(x, weight, scales, biases, group_size=64, bits=4)
+        assert mx.allclose(
+            y.astype(mx.float32), want.astype(mx.float32), rtol=2e-2, atol=5e-2
+        )
+    finally:
+        live._mma_plan.cache_clear()
+        live._mma_launch.cache_clear()
+
+
+def test_vk_qmm_mma_accepts_tuned_alignment_and_launch_refuses_unaligned(
+    monkeypatch, tmp_path
+):
+    import json
+
+    from omlx.formats import tuning, verify_skeleton
+
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    chip = tuning.current_chip()
+    verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=72, k=128, rows=8, dtype=mx.bfloat16
+    )
+    live._mma_plan.cache_clear()
+    live._mma_launch.cache_clear()
+    try:
+        # Without a tuned entry, parity (16, 32, 8) refuses K=128 and N=72.
+        with pytest.raises(ValueError, match="vk_qmm_mma takes 1 to 24 rows"):
+            live._mma_launch(1, 4, 64, mx.bfloat16, mx.bfloat16, 128, 64)
+        with pytest.raises(ValueError, match="vk_qmm_mma takes 1 to 24 rows"):
+            live._mma_launch(1, 4, 64, mx.bfloat16, mx.bfloat16, 256, 72)
+
+        entry = {
+            "key": {
+                "route": "mma_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "rows_bucket": "8",
+                "n": 72,
+                "k": 128,
+            },
+            "face_sha256": tuning.face_digest(face),
+            "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+            "measured_at": "2026-11-22T00:00:00Z",
+            "params": {"bn": 8, "bk": 32, "nsg": 4},
+        }
+        (tmp_path / f"{chip}.json").write_text(
+            json.dumps({"schema_version": 1, "chip": chip, "entries": [entry]})
+        )
+        monkeypatch.setattr(tuning, "_EXTRA_DIRS", [tmp_path])
+        monkeypatch.setattr(tuning, "_CHIPS", {})
+        live._mma_plan.cache_clear()
+        live._mma_launch.cache_clear()
+        weight, scales, biases = _linear(72, 128, 4, 64, mx.bfloat16, seed=9)
+        x = _x(8, 128, mx.bfloat16, seed=9)
+        y = live.vk_qmm_mma(x, weight, scales, biases, group_size=64, bits=4)
+        ref = mx.quantized_matmul(
+            x, weight, scales, biases, transpose=True, group_size=64, bits=4
+        )
+        mx.eval(y, ref)
+        assert mx.allclose(
+            y.astype(mx.float32), ref.astype(mx.float32), rtol=2e-2, atol=5e-2
+        )
+    finally:
+        live._mma_plan.cache_clear()
+        live._mma_launch.cache_clear()
+
+
+def test_mma_plan_runs_tabled_face_under_tuned_policy():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    w = _linear(64, 256, 4, 64, mx.bfloat16, seed=11)
+    x = _x(8, 256, mx.bfloat16, seed=11)
+    n_scalar = mx.array(64, dtype=mx.int32)
+    face = tabled_tile(affine.tile_face(4, 64, mx.bfloat16))
+    policy = MmaTilePolicy(32, 32, 4)
+    live._mma_plan.cache_clear()
+    try:
+        kernel, template = live._mma_plan(1, face, 256, mx.bfloat16, policy)
+        (y,) = kernel(
+            inputs=[x, *w, n_scalar],
+            template=template,
+            grid=(128, 2, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(8, 64)],
+            output_dtypes=[mx.bfloat16],
+        )
+        want = oracle.vk_qmm_mma(x, *w, group_size=64, bits=4)
+        mx.eval(y, want)
+        assert mx.allclose(
+            y.astype(mx.float32), want.astype(mx.float32), rtol=2e-2, atol=5e-2
+        )
+    finally:
+        live._mma_plan.cache_clear()
+
+
+def test_mma_plan_names_a_tuned_policy(monkeypatch):
+    from omlx.formats import verify_skeleton
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    four = affine.tile_face(4, 64, mx.bfloat16)
+    names = []
+    original = verify_skeleton.emit_mma_kernel
+
+    def capture(ops, row_tiles, k, name):
+        names.append(name)
+        return original(ops, row_tiles, k, name)
+
+    monkeypatch.setattr(verify_skeleton, "emit_mma_kernel", capture)
+    live._mma_plan.cache_clear()
+    try:
+        live._mma_plan(1, four, 2560, mx.bfloat16, MmaTilePolicy(16, 32, 4))
+    finally:
+        live._mma_plan.cache_clear()
+    assert names and names[-1].endswith("_bn16_bk32_nsg4")

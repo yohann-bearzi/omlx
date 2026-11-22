@@ -559,6 +559,12 @@ def test_rows_bucket_bounds():
     assert tuning.rows_bucket("dense_qmv", 1) == "1"
     assert tuning.rows_bucket("dense_qmv", 24) == "17-24"
     assert tuning.rows_bucket("dense_qmv", 25) == "25+"
+    assert tuning.rows_bucket("mma_tile", 0) == "<1"
+    assert tuning.rows_bucket("mma_tile", 7) == "8"
+    assert tuning.rows_bucket("mma_tile", 8) == "8"
+    assert tuning.rows_bucket("mma_tile", 9) == "16"
+    assert tuning.rows_bucket("mma_tile", 17) == "24"
+    assert tuning.rows_bucket("mma_tile", 25) == "25+"
 
 
 def test_current_chip_fails_closed(monkeypatch):
@@ -1060,6 +1066,16 @@ def test_params_from_json_checks_unknown_keys_bools_and_param_staging():
             "dense_tile",
             {"backend": "nax", "bm": True, "bn": 64, "bk": 64},
         )
+    with pytest.raises(ValueError, match="bool"):
+        schema.params_from_json(
+            "dense_tile",
+            {"backend": "nax", "bm": 64, "bn": 64, "bk": 64, "align_n": "yes"},
+        )
+    with pytest.raises(ValueError, match="int"):
+        schema.params_from_json(
+            "dense_tile",
+            {"backend": "nax", "bm": "64", "bn": 64, "bk": 64},
+        )
     decoded = schema.params_from_json(
         "dense_tile",
         {
@@ -1306,3 +1322,138 @@ def test_direct_is_legal_refuses_a_bad_param_staging():
     assert not schema.DenseTilePolicy(
         "nax", 64, 64, 64, param_staging="bogus"
     ).is_legal(face, 5120, 2560, 2048, CHIP)
+def _stub_face():
+    from types import SimpleNamespace
+
+    return SimpleNamespace(tables=())
+
+
+def test_mma_tile_is_legal_rejects_unsupported_bn_and_bk():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    face = _stub_face()
+    assert not MmaTilePolicy(64, 32, 4).is_legal(face, 2560, 128, 8, "applegpu_g15d")
+    assert not MmaTilePolicy(16, 48, 4).is_legal(face, 2880, 64, 8, "applegpu_g15d")
+    for bn in (8, 16, 32):
+        assert MmaTilePolicy(bn, 32, 4).is_legal(face, 2560, 64, 8, "applegpu_g15d")
+    for bk in (32, 64, 128):
+        assert MmaTilePolicy(16, bk, 4).is_legal(face, 2560, 64, 8, "applegpu_g15d")
+
+
+def test_mma_tile_is_legal_checks_tg_limits_and_dtype():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    face = _stub_face()
+    assert not MmaTilePolicy(16, 32, 64).is_legal(
+        face, 2048, 64, 8, "applegpu_g15d"
+    )
+    assert not MmaTilePolicy(16, 32, 16).is_legal(
+        face, 2560, 4096, 24, "applegpu_g15d"
+    )
+    assert not MmaTilePolicy(16, 32, 16).is_legal(
+        face, 2560, 64, 8, "applegpu_g15d", dtype="fp32"
+    )
+    assert not MmaTilePolicy(16, 32, 4).is_legal(
+        face, 2560, 64, 8, "applegpu_g15d", dtype="unknown"
+    )
+    assert MmaTilePolicy(16, 32, 16).is_legal(face, 2560, 64, 8, "applegpu_g15d")
+    assert not MmaTilePolicy(8, 32, 36).is_legal(face, 1152, 64, 8, "applegpu_g15d")
+    for m, legal in ((1, True), (7, True), (8, True), (9, False), (16, False), (17, False)):
+        assert (
+            MmaTilePolicy(16, 64, 12).is_legal(face, 768, 64, m, "applegpu_g15d")
+            is legal
+        ), m
+    assert "MmaTilePolicy" in tuning.__all__
+
+
+def test_params_from_json_rejects_bad_types_for_mma_tile():
+    import pytest
+
+    from omlx.formats.tuning.schema import params_from_json
+
+    for bad in ({"bn": "16"}, {"bn": True}, {"nsg": False}):
+        with pytest.raises(ValueError):
+            params_from_json("mma_tile", bad)
+
+
+def test_mma_asserts_mirror_is_legal():
+    import re
+
+    from omlx.formats import verify_skeleton
+    from omlx.formats.tuning.schema import MmaTilePolicy, mma_asserts
+
+    class Face:
+        type = "F"
+        key = "f"
+        source = ""
+        tensors = ()
+        tables = ()
+
+    face = Face()
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.tile_mma_ops(face, policy=MmaTilePolicy(32, 32, 4)),
+        1,
+        2560,
+    )
+    expressions = re.findall(r'static_assert\((.*?), "', source)
+    assert expressions == [expression for expression, _ in mma_asserts()]
+    for dtype, elem in (("bf16", 2), ("fp32", 4)):
+        for bn in (0, 8, 16, 32, 64):
+            for bk in (16, 32, 64, 128):
+                for nsg in (0, 1, 4, 8, 32, 64):
+                    for k, n, m in (
+                        (2560, 64, 8),
+                        (2048, 4096, 24),
+                        (1024, 8, 8),
+                        (256, 24, 16),
+                    ):
+                        bm = ((m + 7) // 8) * 8
+                        symbols = {
+                            "BN": bn,
+                            "BK": bk,
+                            "NSG": nsg,
+                            "K": k,
+                            "N": n,
+                            "BM": bm,
+                        }
+                        truth = all(
+                            [
+                                eval(
+                                    expression.replace("sizeof(T)", str(elem))
+                                    .replace("||", " or ")
+                                    .replace("&&", " and "),
+                                    {"__builtins__": {}},
+                                    symbols,
+                                )
+                                for expression in expressions
+                            ]
+                        )
+                        expected = truth and bn > 0 and n % bn == 0
+                        got = MmaTilePolicy(bn, bk, nsg).is_legal(
+                            face, k, n, m, "applegpu_g15d", dtype=dtype
+                        )
+                        assert got == expected, (bn, bk, nsg, k, n, m, dtype)
+    # Non-positive shape dimensions are refused.
+    for k, n, m in ((0, 64, 8), (2560, 0, 8), (2560, 64, 0)):
+        assert not MmaTilePolicy(16, 32, 8).is_legal(
+            face, k, n, m, "applegpu_g15d", dtype="bf16"
+        )
+    # Exact 32,768-byte threadgroup boundary including face table_bytes.
+    # 16 * (32 * 16 * 2 + 16 * 16 * 4) == 32768; a 4-byte Table pushes it over.
+    assert MmaTilePolicy(16, 32, 16).is_legal(
+        face, 2560, 64, 16, "applegpu_g15d", dtype="bf16"
+    )
+    tabled = SimpleNamespace(tables=(Table("levels", mx.uint32, (1,)),))
+    assert not MmaTilePolicy(16, 32, 16).is_legal(
+        tabled, 2560, 64, 16, "applegpu_g15d", dtype="bf16"
+    )
+
+
+def test_register_skeleton_refuses_a_route_without_row_buckets():
+    import pytest
+
+    from omlx.formats import tuning
+
+    with pytest.raises(ValueError, match="no row buckets"):
+        tuning.register_skeleton("unbucketed", "skeleton")
+    tuning.register_skeleton("mma_tile", "skeleton")

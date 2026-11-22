@@ -11,7 +11,12 @@ template, so a face swap changes the bound expressions only.
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from . import tuning
 
 
 @dataclass(frozen=True)
@@ -25,9 +30,73 @@ class MmaTileOps:
     close: str = ""
     load_params: str = ""
     unpack: str = ""
+    policy: tuning.MmaTilePolicy | None = None
 
 
-def affine_mma_ops(bits: int, group_size: int) -> MmaTileOps:
+_REGISTER_LOCK = threading.Lock()
+_SKELETON_REGISTERED = False
+
+
+class _StubFace:
+    key = "stub"
+    type = "F"
+    source = ""
+    tensors = ()
+    tables = ()
+
+
+def _skeleton_material() -> str:
+    """Everything the route's emitted code is built from, for the digest."""
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    parts = [
+        emit_mma_source(MmaTileOps(), 1, 2560),
+        emit_mma_source(MmaTileOps(policy=MmaTilePolicy(32, 64, 4)), 2, 2560),
+        emit_mma_source(MmaTileOps(policy=MmaTilePolicy(8, 64, 4)), 2, 2560),
+    ]
+    for bits in (2, 3, 4, 5, 6, 8):
+        parts.append(repr(affine_mma_ops(bits, 64)))
+    parts.append(repr(tile_mma_ops(_StubFace())))
+    return "\n".join(parts)
+
+
+def _register_tuning() -> None:
+    """Register this route's skeleton text with the tuner (once, thread-safe)."""
+    global _SKELETON_REGISTERED
+    if _SKELETON_REGISTERED:
+        return
+    with _REGISTER_LOCK:
+        if _SKELETON_REGISTERED:
+            return
+        from omlx.formats import tuning
+
+        tuning.register_skeleton("mma_tile", _skeleton_material())
+        _SKELETON_REGISTERED = True
+
+
+def mma_tile_policy(face, *, bits, group, n, k, rows, dtype):
+    """The tuned tile for this face and shape, else the parity floor."""
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    _register_tuning()
+    from omlx.formats import tuning
+
+    return (
+        tuning.lookup(
+            "mma_tile",
+            face,
+            dtype=dtype,
+            bits=bits,
+            group=group,
+            n=n,
+            k=k,
+            rows=rows,
+        )
+        or MmaTilePolicy()
+    )
+
+
+def affine_mma_ops(bits: int, group_size: int, policy=None) -> MmaTileOps:
     """The affine tile binding: one packed run per lane read, a scale and a
     bias per group. 8-bit runs are two words; at 8-bit the MLX layout aligns
     every run to 8 bytes, so one uint2 load replaces two uint loads."""
@@ -70,6 +139,7 @@ def affine_mma_ops(bits: int, group_size: int) -> MmaTileOps:
         constexpr int K = __K__;
         constexpr int K_by_8 = K / 8;
         constexpr int K_by_gs = K / GS;""",
+        policy=policy,
         load_params="""                int n_global = n0 + dq_n;
                 int k_base = k0 + dq_k * 8;
                 float s = float(scales[n_global * K_by_gs + (k_base / GS)]);
@@ -78,7 +148,7 @@ def affine_mma_ops(bits: int, group_size: int) -> MmaTileOps:
     )
 
 
-def tile_mma_ops(face) -> MmaTileOps:
+def tile_mma_ops(face, policy=None) -> MmaTileOps:
     """The generic Tile binding: the face's own ``Runs<K>`` cursor, its
     ``params``/``fetch``/``weight`` calls, in the same skeleton as affine.
     The face type is dependent on the kernel's T so a face outside the tile
@@ -86,6 +156,7 @@ def tile_mma_ops(face) -> MmaTileOps:
     return MmaTileOps(
         header="template <typename, typename U> struct omlx_mma_dep { using type = U; };\n",
         operands=("w",),
+        policy=policy,
         k_consts="        constexpr int K = __K__;",
         cursor=f"""        using F = typename omlx_mma_dep<T, {face.type}>::type;
         if constexpr (omlx_tile_face<F, K>::value) {{
@@ -103,8 +174,8 @@ def tile_mma_ops(face) -> MmaTileOps:
     )
 
 
-def emit_mma_source(ops: MmaTileOps, row_tiles: int, k_val: int) -> str:
-    """The MMA Metal source for ``row_tiles`` 8-row tiles over ``ops``."""
+def _emit_parity(ops: MmaTileOps, row_tiles: int, k_val: int) -> str:
+    """The digest-pinned (BN 16, BK 32, NSG 8) body, verbatim."""
     bn, bk, nsg = 16, 32, 8
     decl = "\n        ".join(
         f"simdgroup_matrix<T, 8, 8> a{r};"
@@ -188,6 +259,131 @@ def emit_mma_source(ops: MmaTileOps, row_tiles: int, k_val: int) -> str:
         }}{ops.close}
     """
     return source
+
+
+def _emit_general(
+    ops: MmaTileOps, row_tiles: int, k_val: int, bn: int, bk: int, nsg: int
+) -> str:
+    """The tuned tile: BN/8 column tiles per row, BK/8 fragments per pass."""
+    from omlx.formats.tuning.schema import mma_asserts
+
+    tiles = max(1, bn // 8)
+    k_lanes = 32 // bn if 0 < bn <= 32 else 1
+    packs = max(1, (bk // 8) // k_lanes)
+    declares = []
+    for r in range(row_tiles):
+        declares.append(f"simdgroup_matrix<T, 8, 8> a{r};")
+        for t in range(tiles):
+            declares.append(
+                f"simdgroup_matrix<float, 8, 8> c{r}_{t} ="
+                " simdgroup_matrix<float, 8, 8>(0.0f);"
+            )
+    decl = "\n        ".join(declares)
+    b_decl = ", ".join(f"b_{t}" for t in range(tiles))
+    loads = "\n                ".join(
+        f"simdgroup_load(a{r}, x + {r} * 8 * K + k0 + ks * BK_SUB, K);"
+        for r in range(row_tiles)
+    )
+    b_loads = "\n                ".join(
+        f"simdgroup_load(b_{t}, B_tile[sg_id] + ks * BK_SUB * BN + {8 * t}, BN);"
+        for t in range(tiles)
+    )
+    macs = "\n                ".join(
+        " ".join(
+            f"simdgroup_multiply_accumulate(c{r}_{t}, a{r}, b_{t}, c{r}_{t});"
+            for t in range(tiles)
+        )
+        for r in range(row_tiles)
+    )
+    stores = "\n        ".join(
+        " ".join(
+            f"simdgroup_store(c{r}_{t}, tg_partials[sg_id] + {r} * 8 * BN"
+            f" + {8 * t}, BN);"
+            for t in range(tiles)
+        )
+        for r in range(row_tiles)
+    )
+    k_consts = ops.k_consts.replace("__K__", str(int(k_val)))
+    asserts = "\n".join(
+        f'        static_assert({expression}, "{message}");'
+        for expression, message in mma_asserts()
+    )
+    source = f"""
+        using namespace metal;
+        constexpr int BM = {8 * row_tiles};
+        constexpr int BN = {bn};
+        constexpr int BK = {bk};
+        constexpr int BK_SUB = 8;
+        constexpr int NSG = {nsg};
+{k_consts}
+{asserts}
+        constexpr int K_chunk = NSG > 0 ? K / NSG : 0;
+
+        uint tid = thread_position_in_threadgroup.x;
+        uint sg_id = tid / 32;
+        uint lane = tid % 32;
+        uint tg_n = threadgroup_position_in_grid.y;
+
+        int N = int(N_size);
+        int n0 = int(tg_n) * BN;
+        int k_begin = int(sg_id) * K_chunk;
+        int k_end = k_begin + K_chunk;
+
+        threadgroup T B_tile[NSG][BK * BN];
+        threadgroup float tg_partials[NSG][BM * BN];
+
+        simdgroup_matrix<T, 8, 8> {b_decl};
+        {decl}
+
+        int dq_n = int(lane) % BN;
+        int dq_k_lane = int(lane) / BN;
+{ops.cursor}
+        for (int k0 = k_begin; k0 < k_end; k0 += BK) {{
+            _Pragma("unroll")
+            for (int pack_idx = 0; pack_idx < {packs}; ++pack_idx) {{
+                int dq_k = pack_idx * {k_lanes} + dq_k_lane;
+{ops.load_params}
+                {ops.unpack}
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (int ks = 0; ks < BK / BK_SUB; ++ks) {{
+                {loads}
+                {b_loads}
+                {macs}
+            }}
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }}
+
+        {stores}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int off = int(tid); off < BM * BN; off += NSG * 32) {{
+            float acc = 0.0f;
+            _Pragma("unroll")
+            for (int g = 0; g < NSG; ++g) {{
+                acc += tg_partials[g][off];
+            }}
+            int row = off / BN;
+            int col = off - row * BN;
+            y[row * N + n0 + col] = T(acc);
+        }}{ops.close}
+    """
+    return source
+
+
+def emit_mma_source(ops: MmaTileOps, row_tiles: int, k_val: int) -> str:
+    """The MMA Metal source for ``row_tiles`` 8-row tiles over ``ops``.
+
+    The parity tile (BN 16, BK 32, NSG 8) is the digest-pinned body
+    verbatim; any other policy emits the same skeleton with BN/8 column
+    tiles, BK/8 fragments and its compile-time asserts."""
+    policy = ops.policy
+    bn, bk, nsg = (
+        (policy.bn, policy.bk, policy.nsg) if policy is not None else (16, 32, 8)
+    )
+    if (bn, bk, nsg) == (16, 32, 8):
+        return _emit_parity(ops, row_tiles, k_val)
+    return _emit_general(ops, row_tiles, k_val, bn, bk, nsg)
 
 
 def emit_mma_kernel(ops: MmaTileOps, row_tiles: int, k_val: int, name: str) -> dict:

@@ -930,7 +930,7 @@ _AFFINE_MMA = re.compile(r"affine_tile_b([234568])g(32|64|128)_(bf16|fp16)")
 
 
 @cache
-def _mma_plan(row_tiles: int, face, k: int, dtype):
+def _mma_plan(row_tiles: int, face, k: int, dtype, policy=None):
     """``(kernel, template)`` for one mma signature, built at construction.
     The builtin affine faces take the byte-identical skeleton with K baked;
     every other face binds tile_mma_ops into the same skeleton with K baked."""
@@ -938,19 +938,24 @@ def _mma_plan(row_tiles: int, face, k: int, dtype):
 
     from omlx.formats import verify_skeleton
 
+    suffix = (
+        ""
+        if policy is None or (policy.bn, policy.bk, policy.nsg) == (16, 32, 8)
+        else f"_bn{policy.bn}_bk{policy.bk}_nsg{policy.nsg}"
+    )
     match = _AFFINE_MMA.fullmatch(face.key)
     if match and face in _affine_tile_faces(int(match[1])):
         bits, group, tag = int(match[1]), int(match[2]), match[3]
-        ops = verify_skeleton.affine_mma_ops(bits, group)
-        name = f"omlx_vk_mma_rt{row_tiles}_k{k}_q{bits}_gs{group}_{tag}"
+        ops = verify_skeleton.affine_mma_ops(bits, group, policy=policy)
+        name = f"omlx_vk_mma_rt{row_tiles}_k{k}_q{bits}_gs{group}_{tag}{suffix}"
         spec = verify_skeleton.emit_mma_kernel(ops, row_tiles, k, name)
         return mx.fast.metal_kernel(**spec), [("T", dtype)]
     from omlx.formats import kernels
 
-    ops = verify_skeleton.tile_mma_ops(face)
+    ops = verify_skeleton.tile_mma_ops(face, policy=policy)
     source = verify_skeleton.emit_mma_source(ops, row_tiles, k)
     kernel = kernels.face_kernel(
-        f"omlx_vk_mma_rt{row_tiles}_k{k}",
+        f"omlx_vk_mma_rt{row_tiles}_k{k}{suffix}",
         ("x", "w", "N_size"),
         {"w": face},
         ("y",),
@@ -970,13 +975,23 @@ def _mma_launch(
 
     if k <= 0 or n <= 0:
         raise ValueError(f"vk_qmm_mma takes K > 0 and N > 0, not {k} x {n}")
+    from omlx.formats import verify_skeleton
+
     face = _mma_face(bits, group_size, scale_dtype)
-    kernel, template = _mma_plan(row_tiles, face, k, dtype)
+    policy = verify_skeleton.mma_tile_policy(
+        face, bits=bits, group=group_size, n=n, k=k, rows=8 * row_tiles, dtype=dtype
+    )
+    if k % (policy.bk * policy.nsg) or n % policy.bn:
+        raise ValueError(
+            f"vk_qmm_mma takes 1 to 24 rows, K in {policy.bk * policy.nsg}s and N in "
+            f"{policy.bn}s, not {8 * row_tiles} x {k} x {n}"
+        )
+    kernel, template = _mma_plan(row_tiles, face, k, dtype, policy)
     launch = partial(
         kernel,
         template=template,
-        grid=(32 * _MMA_NSG, n // _MMA_BN, 1),
-        threadgroup=(32 * _MMA_NSG, 1, 1),
+        grid=(32 * policy.nsg, n // policy.bn, 1),
+        threadgroup=(32 * policy.nsg, 1, 1),
         output_shapes=[(8 * row_tiles, n)],
         output_dtypes=[dtype],
     )
@@ -991,7 +1006,7 @@ def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
     M = int(x2.shape[0])
     K = int(x2.shape[1])
     N = int(w_q.shape[0])
-    if not 1 <= M <= 24 or K % (_MMA_BK * _MMA_NSG) or N % _MMA_BN:
+    if not 1 <= M <= 24:
         raise ValueError(
             f"vk_qmm_mma takes 1 to 24 rows, K in {_MMA_BK * _MMA_NSG}s and N in "
             f"{_MMA_BN}s, not {M} x {K} x {N}"
@@ -1000,10 +1015,10 @@ def vk_qmm_mma(x2, w_q, scales, biases, *, group_size: int, bits: int = 4):
         return None  # no tile face reads such scales
     row_tiles = (M + 7) // 8
     bm = 8 * row_tiles
-    xm, M0 = _pad_rows(mx, x2, bm)
     launch, n_scalar = _mma_launch(
         row_tiles, bits, group_size, scales.dtype, x2.dtype, K, N
     )
+    xm, M0 = _pad_rows(mx, x2, bm)
     (y,) = launch(inputs=[xm, w_q, scales, biases, n_scalar])
     return y[:M0, :] if M0 < bm else y
 

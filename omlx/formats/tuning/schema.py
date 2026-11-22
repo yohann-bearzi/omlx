@@ -12,7 +12,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import Any, Literal
+from typing import Any, Literal, get_origin, get_type_hints
 
 from .. import kernels
 
@@ -68,6 +68,15 @@ class RowExactPolicy:
     rows_per_group: int
     rps: int
     unrolled: bool
+
+
+def _elem_bytes(dtype: Any) -> int | None:
+    """A dtype's element size, or None when it is not a known element."""
+    size = getattr(dtype, "size", None)
+    if isinstance(size, int) and not isinstance(size, bool) and size > 0:
+        return size
+    text = str(getattr(dtype, "name", dtype)).removeprefix("mlx.core.")
+    return _DTYPE_BYTES.get(text)
 
 
 @dataclass(frozen=True)
@@ -144,19 +153,72 @@ class DenseTilePolicy:
         # operands (`xs[BM*stride]`, `ws[BN*stride]`), the NAX face kernel its
         # weight buffer alone, with `stride = BK + 16 / sizeof(T)` and
         # `Ws[...] + PAD / sizeof(T)`.  Keep this beside those sources.
-        size = getattr(dtype, "size", None)
-        if isinstance(size, int) and not isinstance(size, bool) and size > 0:
-            elem_bytes = size
-        else:
-            text = str(getattr(dtype, "name", dtype)).removeprefix("mlx.core.")
-            elem_bytes = _DTYPE_BYTES.get(text)
-            if elem_bytes is None:
-                return False
+        elem_bytes = _elem_bytes(dtype)
+        if elem_bytes is None:
+            return False
         stride = self.bk + 16 // elem_bytes
         weight_bytes = elem_bytes * self.bn * stride
         activations = 0 if self.backend == "nax" else elem_bytes * self.bm * stride
         tg = weight_bytes + activations + self.pad_bytes + kernels.table_bytes(face)
         return tg <= _THREADGROUP_BYTES
+
+
+@dataclass(frozen=True)
+class MmaTilePolicy:
+    """One MMA skeleton launch's compile-time tile: BN output columns per
+    8-row tile, BK K steps per simdgroup pass, NSG simdgroups."""
+
+    bn: int = 16
+    bk: int = 32
+    nsg: int = 8
+
+    def is_legal(
+        self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
+    ) -> bool:
+        """Whether the template runs these constants for this face's shape.
+
+        Mirrors ``mma_asserts`` (BN/BK choices, NSG threads, K divisibility,
+        threadgroup bytes with the actual dtype) plus the runtime N, row and
+        face-table checks; the parity tile (16, 32, 8) is the digest-pinned
+        default."""
+        if self.bn not in MMA_BN_CHOICES or self.bk not in MMA_BK_CHOICES:
+            return False
+        if self.nsg < 1 or 32 * self.nsg > 1024:
+            return False
+        if m < 1 or n < 1 or k < 1:
+            return False
+        if k % (self.bk * self.nsg) or n % self.bn:
+            return False
+        elem_bytes = _elem_bytes(dtype)
+        if elem_bytes is None:
+            return False
+        bm = ((m + 7) // 8) * 8
+        staging = self.nsg * (self.bk * self.bn * elem_bytes + bm * self.bn * 4)
+        return staging + kernels.table_bytes(face) <= _THREADGROUP_BYTES
+
+
+MMA_BN_CHOICES = (8, 16, 32)
+MMA_BK_CHOICES = (32, 64, 128)
+
+
+def mma_asserts() -> tuple[tuple[str, str], ...]:
+    """The MMA template's compile-time constraints, as (expression, message).
+
+    ``emit_mma_source`` emits these as ``static_assert`` lines for a tuned
+    tile; ``MmaTilePolicy.is_legal`` enforces the same list in Python."""
+    return (
+        ("BN == 8 || BN == 16 || BN == 32", "BN is 8, 16 or 32"),
+        ("BK == 32 || BK == 64 || BK == 128", "BK is 32, 64 or 128"),
+        ("NSG >= 1 && NSG * 32 <= 1024", "NSG * 32 threads at most 1024"),
+        (
+            "K > 0 && BK > 0 && NSG > 0 && K % (BK * NSG) == 0",
+            "K is a multiple of BK * NSG",
+        ),
+        (
+            "BM > 0 && NSG >= 1 && NSG * (BK * BN * sizeof(T) + BM * BN * 4) <= 32768",
+            "threadgroup staging is at most 32768 bytes",
+        ),
+    )
 
 
 _BACKENDS = ("steel", "nax")
@@ -174,7 +236,10 @@ _DTYPE_BYTES = {
     "float64": 8,
 }
 _THREADGROUP_BYTES = 32768
-_ROUTES: dict[str, type] = {"dense_tile": DenseTilePolicy}
+_ROUTES: dict[str, type] = {
+    "dense_tile": DenseTilePolicy,
+    "mma_tile": MmaTilePolicy,
+}
 
 
 def route_names() -> tuple[str, ...]:
@@ -197,34 +262,34 @@ def params_from_json(route: str, data: Any):
     unknown = set(data) - known
     if unknown:
         raise ValueError(f"tuning: {route} params have unknown keys {sorted(unknown)}")
-    if data.get("backend") not in _BACKENDS:
+    if cls is DenseTilePolicy and data.get("backend") not in _BACKENDS:
         raise ValueError(
             f"tuning: {route} backend is one of {_BACKENDS}, not "
             f"{data.get('backend')!r}"
         )
-    if "bk" in data and data["bk"] not in _BKS:
+    if "bk" in data and (isinstance(data["bk"], bool) or data["bk"] not in _BKS):
         raise ValueError(f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}")
-    for key, kind in (
-        ("backend", str),
-        ("bm", int),
-        ("bn", int),
-        ("bk", int),
-        ("wm", int),
-        ("wn", int),
-        ("align_n", bool),
-        ("split_k", int),
-        ("x_nreads", int),
-        ("param_staging", str),
-        ("vec_store", bool),
-        ("pad_bytes", int),
-        ("gx", int),
-    ):
-        if key not in data:
+    hints = get_type_hints(cls)
+    for name, hint in hints.items():
+        if name not in data:
             continue
-        value = data[key]
-        if not isinstance(value, kind) or (kind is int and isinstance(value, bool)):
+        value = data[name]
+        if hint is int:
+            ok = isinstance(value, int) and not isinstance(value, bool)
+        elif hint is bool:
+            ok = isinstance(value, bool)
+        elif (
+            hint is str
+            or get_origin(hint) is Literal
+            or (isinstance(hint, type) and issubclass(hint, Enum))
+        ):
+            ok = isinstance(value, str)
+        else:
+            ok = True
+        if not ok:
             raise ValueError(
-                f"tuning: {route} param {key!r} is {kind.__name__}, not {value!r}"
+                f"tuning: {route} param {name!r} is not a valid "
+                f"{getattr(hint, '__name__', hint)}: {value!r}"
             )
     if "param_staging" in data:
         try:

@@ -1247,8 +1247,14 @@ def test_the_mma_skeleton_has_no_reserved_keyword(bits):
 def test_mma_tile_ops_fields_are_all_used():
     import inspect
 
-    source = inspect.getsource(verify_skeleton.emit_mma_source) + inspect.getsource(
-        verify_skeleton.emit_mma_kernel
+    source = "".join(
+        inspect.getsource(function)
+        for function in (
+            verify_skeleton.emit_mma_source,
+            verify_skeleton._emit_parity,
+            verify_skeleton._emit_general,
+            verify_skeleton.emit_mma_kernel,
+        )
     )
     for field in verify_skeleton.MmaTileOps.__dataclass_fields__:
         assert field in source, field
@@ -1286,3 +1292,265 @@ def test_emit_mma_source_does_not_rewrite_face_type():
     )
     assert "omlx_foo__K__::Tile" in source
     assert "constexpr int K = 5120;" in source
+
+
+def _mma_face():
+    import mlx.core as mx
+
+    from omlx.formats import affine
+
+    return affine.tile_face(4, 64, mx.bfloat16)
+
+
+def _tuned_table(tmp_path, face, policy):
+    import json
+
+    from omlx.formats import tuning
+
+    chip = tuning.current_chip()
+    entry = {
+        "key": {
+            "route": "mma_tile",
+            "face_id": face.key,
+            "dtype": "bf16",
+            "bits": 4,
+            "group": 64,
+            "rows_bucket": "8",
+            "n": 64,
+            "k": 2560,
+        },
+        "face_sha256": tuning.face_digest(face),
+        "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+        "measured_at": "2026-11-22T00:00:00Z",
+        "params": policy,
+    }
+    (tmp_path / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": [entry]})
+    )
+    return tmp_path
+
+
+def test_mma_tile_policy_defaults_to_the_parity_floor():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    face = _mma_face()
+    policy = verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=64, k=2560, rows=8, dtype="bf16"
+    )
+    assert policy == MmaTilePolicy()
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.affine_mma_ops(4, 64, policy=policy), 1, 2560
+    )
+    assert "constexpr int BN = 16;" in source
+    assert "constexpr int NSG = 8;" in source
+
+
+def test_mma_tile_table_entry_drives_the_emitted_geometry(monkeypatch, tmp_path):
+    from omlx.formats import tuning
+
+    face = _mma_face()
+    verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=64, k=2560, rows=8, dtype="bf16"
+    )
+    monkeypatch.setattr(
+        tuning,
+        "_EXTRA_DIRS",
+        [_tuned_table(tmp_path, face, {"bn": 32, "bk": 32, "nsg": 4})],
+    )
+    monkeypatch.setattr(tuning, "_CHIPS", {})
+    policy = verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=64, k=2560, rows=8, dtype="bf16"
+    )
+    assert (policy.bn, policy.bk, policy.nsg) == (32, 32, 4)
+    assert (
+        verify_skeleton.mma_tile_policy(
+            face, bits=4, group=64, n=64, k=2560, rows=7, dtype="bf16"
+        ).nsg
+        == 4
+    )
+    source = verify_skeleton.emit_mma_source(
+        verify_skeleton.affine_mma_ops(4, 64, policy=policy), 1, 2560
+    )
+    assert "constexpr int BN = 32;" in source
+    assert "constexpr int NSG = 4;" in source
+
+
+def test_mma_tile_policy_is_resolved_when_the_ops_are_built(monkeypatch, tmp_path):
+    from omlx.formats import tuning
+
+    face = _mma_face()
+    ops = verify_skeleton.affine_mma_ops(4, 64)
+    verify_skeleton.mma_tile_policy(
+        face, bits=4, group=64, n=64, k=2560, rows=8, dtype="bf16"
+    )
+    monkeypatch.setattr(
+        tuning,
+        "_EXTRA_DIRS",
+        [_tuned_table(tmp_path, face, {"bn": 32, "bk": 32, "nsg": 4})],
+    )
+    monkeypatch.setattr(tuning, "_CHIPS", {})
+    source = verify_skeleton.emit_mma_source(ops, 1, 2560)
+    assert "constexpr int BN = 16;" in source
+    assert "constexpr int NSG = 8;" in source
+
+
+def test_register_tuning_blocks_until_registered(monkeypatch):
+    import threading
+
+    from omlx.formats import tuning
+
+    verify_skeleton._register_tuning()
+    before = tuning.skeleton_digest("mma_tile")
+    verify_skeleton._SKELETON_REGISTERED = False
+    tuning._SKELETON_DIGEST.pop("mma_tile", None)
+    started = threading.Event()
+    release = threading.Event()
+    original = tuning.register_skeleton
+
+    def paused(route, text):
+        started.set()
+        release.wait(5)
+        original(route, text)
+
+    monkeypatch.setattr(tuning, "register_skeleton", paused)
+    worker = threading.Thread(target=verify_skeleton._register_tuning)
+    second = threading.Thread(target=verify_skeleton._register_tuning)
+    try:
+        worker.start()
+        assert started.wait(5)
+        second.start()
+        second.join(0.2)
+        assert second.is_alive()
+        release.set()
+        worker.join(5)
+        second.join(5)
+        assert tuning.skeleton_digest("mma_tile") == before
+    finally:
+        release.set()
+        if worker.is_alive():
+            worker.join(5)
+        if second.is_alive():
+            second.join(5)
+        with tuning._LOCK:
+            if before is not None:
+                tuning._SKELETON_DIGEST["mma_tile"] = before
+        verify_skeleton._SKELETON_REGISTERED = True
+
+
+def test_mma_skeleton_digest_tracks_ops_bindings(monkeypatch):
+    from dataclasses import replace
+
+    from omlx.formats import tuning
+
+    verify_skeleton._SKELETON_REGISTERED = False
+    verify_skeleton._register_tuning()
+    before = tuning.skeleton_digest("mma_tile")
+    try:
+        orig_affine = verify_skeleton.affine_mma_ops
+
+        def changed_affine(bits, group_size, policy=None):
+            ops = orig_affine(bits, group_size, policy)
+            return replace(ops, unpack=ops.unpack + " ")
+
+        monkeypatch.setattr(verify_skeleton, "affine_mma_ops", changed_affine)
+        verify_skeleton._SKELETON_REGISTERED = False
+        verify_skeleton._register_tuning()
+        assert tuning.skeleton_digest("mma_tile") != before
+        monkeypatch.undo()
+
+        orig_tile = verify_skeleton.tile_mma_ops
+
+        def changed_tile(face, policy=None):
+            ops = orig_tile(face, policy)
+            return replace(ops, unpack=ops.unpack + " ")
+
+        monkeypatch.setattr(verify_skeleton, "tile_mma_ops", changed_tile)
+        verify_skeleton._SKELETON_REGISTERED = False
+        verify_skeleton._register_tuning()
+        assert tuning.skeleton_digest("mma_tile") != before
+    finally:
+        with tuning._LOCK:
+            tuning._SKELETON_DIGEST["mma_tile"] = before
+        verify_skeleton._SKELETON_REGISTERED = True
+
+
+def test_mma_skeleton_digest_restored_after_ops_test():
+    from omlx.formats import tuning
+
+    current = tuning.skeleton_digest("mma_tile")
+    verify_skeleton._SKELETON_REGISTERED = False
+    verify_skeleton._register_tuning()
+    assert current == tuning.skeleton_digest("mma_tile")
+
+
+def test_mma_skeleton_digest_tracks_general_template_and_asserts(monkeypatch):
+    from omlx.formats import tuning
+    from omlx.formats.tuning import schema
+
+    verify_skeleton._SKELETON_REGISTERED = False
+    verify_skeleton._register_tuning()
+    before = tuning.skeleton_digest("mma_tile")
+    try:
+        orig_general = verify_skeleton._emit_general
+
+        def changed_general(*args, **kwargs):
+            return orig_general(*args, **kwargs) + " "
+
+        monkeypatch.setattr(verify_skeleton, "_emit_general", changed_general)
+        verify_skeleton._SKELETON_REGISTERED = False
+        verify_skeleton._register_tuning()
+        assert tuning.skeleton_digest("mma_tile") != before
+        monkeypatch.undo()
+
+        orig_asserts = schema.mma_asserts
+
+        def changed_asserts():
+            items = list(orig_asserts())
+            expr, msg = items[0]
+            items[0] = (expr, msg + "!")
+            return tuple(items)
+
+        monkeypatch.setattr(schema, "mma_asserts", changed_asserts)
+        verify_skeleton._SKELETON_REGISTERED = False
+        verify_skeleton._register_tuning()
+        assert tuning.skeleton_digest("mma_tile") != before
+    finally:
+        with tuning._LOCK:
+            tuning._SKELETON_DIGEST["mma_tile"] = before
+        verify_skeleton._SKELETON_REGISTERED = True
+
+
+def test_emit_mma_source_emits_asserts_for_non_parity_nsg():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    tuned = verify_skeleton.emit_mma_source(
+        verify_skeleton.affine_mma_ops(4, 64, policy=MmaTilePolicy(16, 32, 4)),
+        1,
+        2560,
+    )
+    parity_default = verify_skeleton.emit_mma_source(
+        verify_skeleton.affine_mma_ops(4, 64), 1, 2560
+    )
+    parity_explicit = verify_skeleton.emit_mma_source(
+        verify_skeleton.affine_mma_ops(4, 64, policy=MmaTilePolicy(16, 32, 8)),
+        1,
+        2560,
+    )
+    assert "static_assert(" in tuned
+    assert "static_assert(" not in parity_default
+    assert parity_explicit == parity_default
+
+
+def test_emit_mma_source_illegal_bn_emits_assert():
+    from omlx.formats.tuning.schema import MmaTilePolicy
+
+    for bad in (
+        MmaTilePolicy(64, 32, 4),
+        MmaTilePolicy(0, 32, 4),
+        MmaTilePolicy(16, 0, 0),
+    ):
+        source = verify_skeleton.emit_mma_source(
+            verify_skeleton.affine_mma_ops(4, 64, policy=bad), 1, 2560
+        )
+        assert "static_assert(BN == 8 || BN == 16 || BN == 32" in source
+        assert "NSG > 0 ? K / NSG : 0" in source

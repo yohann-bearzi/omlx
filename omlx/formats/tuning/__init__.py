@@ -26,6 +26,7 @@ from .schema import (
     DenseTilePolicy,
     FetchGranularity,
     LoadLifetime,
+    MmaTilePolicy,
     ParamStaging,
     RowExactPolicy,
     RowIndexWidth,
@@ -39,6 +40,7 @@ __all__ = [
     "DenseTilePolicy",
     "FetchGranularity",
     "LoadLifetime",
+    "MmaTilePolicy",
     "ParamStaging",
     "RowExactPolicy",
     "RowIndexWidth",
@@ -84,7 +86,6 @@ ROW_EXACT_TABLE: dict = {}
 # (chip_gen, bits, group_size, m bucket, n bucket, k bucket) -> DenseTilePolicy.
 DENSE_TILE_TABLE: dict = {}
 
-
 # --- The per-chip DATA tables -------------------------------------------------
 
 _V1 = Path(__file__).with_name("v1")
@@ -121,6 +122,11 @@ _ROWS_BUCKETS = {
         (257, 512, "257-512"),
         (513, 1024, "513-1024"),
         (1025, 2048, "1025-2048"),
+    ),
+    "mma_tile": (
+        (1, 8, "8"),
+        (9, 16, "16"),
+        (17, 24, "24"),
     ),
     "dense_qmv": (
         (1, 1, "1"),
@@ -160,7 +166,15 @@ def current_chip() -> str:
 
 
 def register_skeleton(route: str, text: str) -> None:
-    """The route's current skeleton template source, for staleness checks."""
+    """The route's current skeleton template source, for staleness checks.
+
+    A route the tuner cannot bucket must not register: a lookup for it would
+    silently compare unruly row strings and miss every entry."""
+    if route not in _ROWS_BUCKETS:
+        raise ValueError(
+            f"tuning: route {route!r} has no row buckets; a lookup would miss "
+            "every entry (add it to _ROWS_BUCKETS)"
+        )
     digest = hashlib.sha256(text.encode()).hexdigest()[:12]
     with _LOCK:
         _SKELETON_DIGEST[route] = digest
