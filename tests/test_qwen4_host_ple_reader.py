@@ -205,3 +205,23 @@ def test_disk_ple_reader_casts_rows_to_the_weight_scale_dtype():
     got = host(mx.array(ids))
     mx.eval(got)
     assert got.dtype == mx.float16
+
+
+def test_read_format_evals_once_per_shard(monkeypatch):
+    dims = 64
+    layers = [_layer(8, dims, 71)]
+    table = _table(layers, [8])
+    language = SimpleNamespace(
+        DiskBackedShardedEmbedding=type("DiskBackedShardedEmbedding", (), {})
+    )
+    read = adapter._ple_reader(table, language)
+    calls = []
+    real = adapter.mx.eval
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(adapter.mx, "eval", counting)
+    read(np.array([0, 3, 7], dtype=np.int64))
+    assert len(calls) == 1

@@ -187,7 +187,6 @@ def _ple_reader(table: Any, language: Any) -> Callable[[np.ndarray], list]:
                 for index in np.unique(shard):
                     positions = np.flatnonzero(shard == index)
                     value = decode(shards[index], mx.array(local[positions]))
-                    mx.eval(value)
                     pieces.append((positions, _host_view(value)))
             _, (first_values, name) = pieces[0]
             out = np.empty((rows.size, first_values.shape[1]), first_values.dtype)
