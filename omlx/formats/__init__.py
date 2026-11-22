@@ -299,8 +299,7 @@ class _Face:
     # Tables the face reads, staged by the kernel (docs/quant-formats.md, Tables).
     tables: tuple[Table, ...] = field(default=(), kw_only=True)
     # Declared signatures of the face's read members, emitted into source/shared
-    # at construction (docs/quant-formats.md). Optional with a deprecation
-    # warning in contract revision 1; required in revision 2.
+    # at construction (docs/quant-formats.md). A face without it is refused.
     reads: Reads | None = field(default=None, kw_only=True)
     _emitted: tuple[tuple[str, str, str], ...] = field(
         default=(), init=False, repr=False, compare=False

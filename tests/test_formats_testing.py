@@ -1132,7 +1132,13 @@ def test_face_helpers_report_custom_codes_name_on_operand_mismatch():
             codes_name="packed_bytes",
         ),
         lambda: testing.tile_rows(
-            formats.Tile("t", "", "T", ("group_scales",)),
+            formats.Tile(
+                "t",
+                "struct Tile {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+                "T",
+                ("group_scales",),
+                reads=formats.TileReads(),
+            ),
             one,
             8,
             range(8),

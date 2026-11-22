@@ -527,7 +527,7 @@ The block collects each defect as `(mode, repr(error))`. A test that expects one
 | `shared` | `Dot` only. Metal that a kernel which applies one block's weights to several inputs includes after `source`, and no other kernel does: where a face defines `decode` and `apply` out of its struct (its struct declares them), so that the kernels that never call them do not carry them. MLX hashes a kernel's whole source at every launch, about 0.05 µs a KB. Empty (the default) for a face whose struct defines them. |
 | `dtypes` | The activation dtypes the face is exact for, as a tuple of distinct `mx.Dtype` among `float16`, `bfloat16` and `float32`; empty (the default) for those three (`formats.FLOATS`). Their order is part of the face: a format lists them in one order. Ask with `face.exact_for(dtype)`. |
 | `tables` | The lookup tables the face reads, as a tuple of `Table`, given by keyword; empty (the default) for none. See [Tables](#tables). |
-| `reads` | Declared signatures of the face's read members (`DotReads`, `TileReads`, or `CodesReads`), given by keyword. oMLX validates the declaration in Python and emits the C++ signatures into `__OMLX_READ_<SLOT>__` slots once at face construction (`face.emitted_source` / `face.emitted_shared`). Optional with a `DeprecationWarning` in contract revision 1; required in contract revision 2. |
+| `reads` | Declared signatures of the face's read members (`DotReads`, `TileReads`, or `CodesReads`), given by keyword. oMLX validates the declaration in Python and emits the C++ signatures into `__OMLX_READ_<SLOT>__` slots once at face construction (`face.emitted_source` / `face.emitted_shared`). Required: a face without `reads` is refused at construction. |
 
 ## The dot face
 
@@ -559,7 +559,7 @@ struct Dot {
 | `struct Decoded` and `static Decoded decode(Row r)` | One row's weights of the current block as `apply` takes them, read once for several inputs. A face with nothing to share writes `using Decoded = Row;` and returns `r`. A face whose `decode` and `apply` are long declares them in its struct and defines them in `shared` (affine does). |
 | `static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux)` | What `madd` gives, from `decode`'s weights: `apply(acc, decode(r), xt, aux)` equals `madd(acc, r, xt, aux)` bit for bit. A kernel that applies one block's weights to several inputs decodes them once and calls `apply` for each. |
 
-The skeleton gives `load` a const activation pointer and writable scratch. It passes that scratch to `madd` and `apply` as `thread const float*`. Declare the read signatures in Python with `reads=DotReads(load=LoadRead(...), madd=MaddRead(...), apply=ApplyRead(...))` and place `__OMLX_READ_LOAD__`, `__OMLX_READ_MADD__`, and `__OMLX_READ_APPLY__` (plus `shared_slot` in `shared`, e.g. `__OMLX_READ_APPLY_SHARED__`, when `apply` is defined out of line) at the start of their lines in the face source. oMLX validates each signature structurally at declaration time — refusing mutable activation or scratch pointers, wrong address spaces, pointer-const without pointee-const, template defaults or SFINAE, wrong return/row/decoded types, and reference, pointer, or mismatched `AuxType` — and emits the C++ signatures once at construction, without parsing C++ or adding per-call work. Omitting `reads=` emits a `DeprecationWarning` in contract revision 1 and will be refused in contract revision 2; the built-in affine faces declare `reads`. Declaring `reads` ensures the emitted signatures are safe by construction; as with `Table`, a face must not smuggle undeclared extra read overloads, macros, or pointer/reference aliases for `AuxType` (refused by review, while Part 1's const skeleton calls keep legacy revision-1 faces safe). The kit checks which overload runs by comparing non-zero reference products bit for bit.
+The skeleton gives `load` a const activation pointer and writable scratch. It passes that scratch to `madd` and `apply` as `thread const float*`. Declare the read signatures in Python with `reads=DotReads(load=LoadRead(...), madd=MaddRead(...), apply=ApplyRead(...))` and place `__OMLX_READ_LOAD__`, `__OMLX_READ_MADD__`, and `__OMLX_READ_APPLY__` (plus `shared_slot` in `shared`, e.g. `__OMLX_READ_APPLY_SHARED__`, when `apply` is defined out of line) at the start of their lines in the face source. oMLX validates each signature structurally at declaration time — refusing mutable activation or scratch pointers, wrong address spaces, pointer-const without pointee-const, template defaults or SFINAE, wrong return/row/decoded types, and reference, pointer, or mismatched `AuxType` — and emits the C++ signatures once at construction, without parsing C++ or adding per-call work. A face without `reads` is refused at construction; the built-in affine faces declare it. Declaring `reads` ensures the emitted signatures are safe by construction; as with `Table`, a face must not smuggle undeclared extra read overloads, macros, or pointer/reference aliases for `AuxType` (refused by review; the skeletons call reads with const pointers and int indices, so a smuggled mutable or narrow overload is never selected). The kit checks which overload runs by comparing non-zero reference products bit for bit.
 
 A kernel runs a face in this order, in every lane, on the rows `r` it computes together:
 
@@ -632,12 +632,11 @@ struct Dot {
       return (... + ((float(w[I]) - 128.0f) * xt[I]));
     }
 
-    template <typename XP>
-    static float load(XP x, thread float* xt) {
+    __OMLX_READ_LOAD__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
-    static float madd(float acc, Row r, thread const float* xt, float) {
+    __OMLX_READ_MADD__ {
       return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
 
@@ -645,8 +644,7 @@ struct Dot {
 
     using Decoded = Row;
     static Decoded decode(Row r) { return r; }
-    template <typename A>
-    static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux) {
+    __OMLX_READ_APPLY__ {
       return madd(acc, d, xt, aux);
     }
   };
@@ -660,6 +658,11 @@ Dot(
     source=SOURCE,
     type="omlx_myformat_b8::Dot",
     tensors=("group_scales",),
+    reads=DotReads(
+        load=LoadRead(input=TypeParam("XP")),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+        apply=ApplyRead(aux=TypeParam("A")),
+    ),
 )
 ```
 
@@ -694,7 +697,7 @@ A kernel builds a cursor for each row a thread decodes, and reads the row throug
 | `Codes fetch(int run) const` | The codes `8 * run` to `8 * run + 7` of the row, `run` in `[0, K / 8)`. |
 | `static float weight(thread const P& p, Codes c, int i)` | Weight `i` (0 to 7) of a run of codes `c` in a group of parameters `p`, as a float32. |
 
-Tile readers pass `p` and `c` as const and `i` as an `int`. A by-value `Codes` parameter copies the codes. Declare `weight` in Python with `reads=TileReads(WeightRead(...))` and place `__OMLX_READ_WEIGHT__` at the start of its line in the face source: `WeightRead` accepts only `float` return, `thread const P&` (or `const thread P&`), `Codes` or `thread const Codes&`, and `int` index by value, never a template or `short`/reference index. Omitting `reads=` emits a `DeprecationWarning` in contract revision 1 and will be refused in contract revision 2. The kit compares the decoded weights before and after the activation cast with an independent non-zero reference, including faces that offer mutable or short overloads.
+Tile readers pass `p` and `c` as const and `i` as an `int`. A by-value `Codes` parameter copies the codes. Declare `weight` in Python with `reads=TileReads(WeightRead(...))` and place `__OMLX_READ_WEIGHT__` at the start of its line in the face source: `WeightRead` accepts only `float` return, `thread const P&` (or `const thread P&`), `Codes` or `thread const Codes&`, and `int` index by value, never a template or `short`/reference index. A face without `reads` is refused at construction. The kit compares the decoded weights before and after the activation cast with an independent non-zero reference, including faces that offer mutable or short overloads.
 
 `P` and `Codes` are types that are default-constructible and copy-assignable: a kernel holds arrays of them and assigns their elements. K is a whole number of runs. A kernel runs a face in this order, in each thread that decodes values of a row, for each block of K that it decodes, with `T` the activations' type:
 
@@ -793,7 +796,7 @@ struct Tile {
     Codes fetch(int run) const {
       return Codes(c[run]);
     }
-    static float weight(thread const P& p, Codes q, int i) {
+    __OMLX_READ_WEIGHT__ {
       const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
       return (float(code) - 128.0f) * p.s;
     }
@@ -808,6 +811,7 @@ Tile(
     source=METAL,
     type="omlx_myformat_b8g32::Tile",
     tensors=("group_scales", "row_scales"),
+    reads=TileReads(WeightRead(params=("p", "q", "i"))),
 )
 ```
 
@@ -849,8 +853,7 @@ Each read is relative to its row and independent of previous reads. Declare
 place `__OMLX_READ_PAIR__` at the start of its line in the face source:
 `PairRead` emits `uint pair(Pack q, int j)` with a by-value pack type and `int`
 index, refusing non-`uint` returns, pointer/reference packs, and narrow or
-reference indices (omitting `reads=` emits a `DeprecationWarning` in contract
-revision 1 and will be refused in contract revision 2). A format
+reference indices (a face without `reads` is refused at construction). A format
 may map stored symbols to integer levels before returning a pair. sg8 encodes
 each level as the exact bf16 or fp16 operand `128 + level`. At each group
 boundary it applies the scale and bias and removes the added 128 using the
@@ -879,7 +882,7 @@ an out-of-line brace-initialized constructor is not detected and only costs spee
 review refuses it.
 
 ```python
-from omlx.formats import Dot, Table
+from omlx.formats import Dot, DotReads, LoadRead, MaddRead, Table, TypeParam
 
 Dot(
     key="mytable_b2",
@@ -887,6 +890,10 @@ Dot(
     type="omlx_mytable_b2::Dot",
     tensors=("group_scales",),
     tables=(Table("levels", mx.float32, (-1.5, -0.5, 0.5, 1.5)),),
+    reads=DotReads(
+        load=LoadRead(input=TypeParam("XP")),
+        madd=MaddRead(params=("acc", "r", "xt", "")),
+    ),
 )
 ```
 
@@ -1047,13 +1054,14 @@ A missing or mismatched member is cited where the skeleton uses it, with a note 
 'omlx_myformat_b8::Dot::Lanes<512>'
 ```
 
+A member or declared read names a type the face does not define:
+
 ```
-<omlx skeletons, docs/quant-formats.md>:44:51: error: too many arguments to function call,
-expected 3, have 4
-<quant format myformat_b8>:38:18: note: 'madd' declared here
+<quant format myformat_b8>:44:12: error: unknown type name 'Decoded'
 ```
 
-The last one is a `madd` declared without its `aux` parameter.
+The last one is `decode` (and the emitted `apply` signature after it), after
+the face's `using Decoded = Row;` is deleted.
 
 ## Test a format
 

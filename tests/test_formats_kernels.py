@@ -63,12 +63,11 @@ struct Dot {
       return (... + ((float(w[I]) - 128.0f) * xt[I]));
     }
 
-    template <typename XP>
-    static float load(XP x, thread float* xt) {
+    __OMLX_READ_LOAD__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
-    static float madd(float acc, Row r, thread const float* xt, float) {
+    __OMLX_READ_MADD__ {
       return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
 
@@ -76,8 +75,7 @@ struct Dot {
 
     using Decoded = Row;
     static Decoded decode(Row r) { return r; }
-    template <typename A>
-    static float apply(float acc, thread const Decoded& d, thread const float* xt, A aux) {
+    __OMLX_READ_APPLY__ {
       return madd(acc, d, xt, aux);
     }
   };
@@ -86,13 +84,41 @@ struct Dot {
 """
 
 
-def _toy(key, source=_TOY, vpt=8) -> Dot:
+# The toy's read members as the Metal its declaration emits, once.
+_TOY_LITERAL = (
+    _TOY.replace(
+        "    __OMLX_READ_LOAD__ {",
+        "    template <typename XP>\n    static float load(XP x, thread float* xt) {",
+    )
+    .replace(
+        "    __OMLX_READ_MADD__ {",
+        "    static float madd(float acc, Row r, thread const float* xt, float) {",
+    )
+    .replace(
+        "    __OMLX_READ_APPLY__ {",
+        "    template <typename A>\n"
+        "    static float apply(float acc, thread const Decoded& d, "
+        "thread const float* xt, A aux) {",
+    )
+)
+
+_TOY_READS = formats.DotReads(
+    load=formats.LoadRead(input=formats.TypeParam("XP"), params=("x", "xt")),
+    madd=formats.MaddRead(params=("acc", "r", "xt", "")),
+    apply=formats.ApplyRead(
+        aux=formats.TypeParam("A"), params=("acc", "d", "xt", "aux")
+    ),
+)
+
+
+def _toy(key, source=_TOY, vpt=8, reads=_TOY_READS) -> Dot:
     return Dot(
         key=f"toy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_toy_{key}::Dot",
         tensors=("group_scales",),
         vpt=vpt,
+        reads=reads,
     )
 
 
@@ -606,12 +632,12 @@ def test_a_kernel_includes_each_format_source_once():
         matrices.add(name, face)
     header = matrices.header
     assert header.startswith('\n#line 1 "<omlx skeletons, docs/quant-formats.md>"\n')
-    assert header.count(a.source) == header.count(b.source) == 1
+    assert header.count(a.emitted_source) == header.count(b.emitted_source) == 1
     # Formats may use the index packs; the skeletons use the formats.
     assert (
         header.index("struct omlx_ints")
-        < header.index(a.source)
-        < header.index(b.source)
+        < header.index(a.emitted_source)
+        < header.index(b.emitted_source)
         < header.index("void qmv_rows(")
     )
 
@@ -633,7 +659,7 @@ def test_a_kernel_has_the_revisions_omlx_runs_when_it_is_built(monkeypatch):
     # They follow the formats' sources, none of which reads them, and end
     # with the skeletons: nor does a face's type, or the kernel.
     assert (
-        max(header.index(a.source), header.index(b.source))
+        max(header.index(a.emitted_source), header.index(b.emitted_source))
         < header.index(revisions)
         < header.index("void qmv_rows(")
     )
@@ -662,7 +688,7 @@ def test_a_source_two_faces_share_is_cited_under_the_first():
     matrices.add("sg", first)
     matrices.add("rt", replace(first, key="toy_other"))
     header = matrices.header
-    assert header.count(first.source) == 1
+    assert header.count(first.emitted_source) == 1
     assert '#line 1 "<quant format toy_a>"' in header and "toy_other" not in header
 
 
@@ -735,12 +761,18 @@ def test_a_face_loads_inputs_staged_in_threadgroup_memory(k, packs):
 @metal
 def test_a_load_of_device_inputs_alone_fails_on_staged_ones_naming_load():
     device_only = _TOY.replace(
-        "    template <typename XP>\n    static float load(XP x, thread float* xt) {",
-        "    template <typename X>\n"
-        "    static float load(const device X* x, thread float* xt) {",
+        "    __OMLX_READ_LOAD__ {\n", "    __OMLX_READ_LOAD_DEV__ {\n"
     )
     assert device_only != _TOY
-    face = _toy("device_only", source=device_only)
+    reads = replace(
+        _TOY_READS,
+        load=formats.LoadRead(
+            input=formats.Pointer("device", formats.TypeParam("X"), const=True),
+            params=("x", "xt"),
+            slot="load_dev",
+        ),
+    )
+    face = _toy("device_only", source=device_only, reads=reads)
     operands, x, want = _matrix(8, 512)
     assert mx.array_equal(testing.dot_rows(face, operands, x, 8), want[:8]).item()
     with pytest.raises(RuntimeError) as failure:
@@ -1053,17 +1085,33 @@ def test_the_shared_rows_skeleton_refuses_what_the_row_skeleton_does(
     assert message.count("error:") == 1
 
 
-_CONST_LOAD = """    static float load(const device float* x, thread float* xt) {
+_CONST_LOAD = """    __OMLX_READ_LOAD_DEV__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
-    static float load(const threadgroup float* x, thread float* xt) {
+    __OMLX_READ_LOAD_TG__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
     template <typename XP>
     static float load(XP x, thread float* xt) = delete;
 """
+
+_CONST_READS = replace(
+    _TOY_READS,
+    load=(
+        formats.LoadRead(
+            input=formats.Pointer("device", "float", const=True),
+            params=("x", "xt"),
+            slot="load_dev",
+        ),
+        formats.LoadRead(
+            input=formats.Pointer("threadgroup", "float", const=True),
+            params=("x", "xt"),
+            slot="load_tg",
+        ),
+    ),
+)
 
 
 @metal
@@ -1072,12 +1120,14 @@ def test_a_face_s_load_is_given_const_inputs_whatever_the_kernel_s(skeleton):
     """A kernel may hand a skeleton its staged inputs as they are
     (threadgroup T xs[K], not const); the face's load is given them const,
     as the guide says: a load of const pointers alone compiles."""
-    template = (
-        "    template <typename XP>\n    static float load(XP x, thread float* xt) {\n"
-    )
+    template = "    __OMLX_READ_LOAD__ {\n"
     start = _TOY.index(template)
     end = _TOY.index("    }\n", start) + len("    }\n")
-    face = _toy(f"const_{skeleton}", source=_TOY[:start] + _CONST_LOAD + _TOY[end:])
+    face = _toy(
+        f"const_{skeleton}",
+        source=_TOY[:start] + _CONST_LOAD + _TOY[end:],
+        reads=_CONST_READS,
+    )
     matrices = kernels.Matrices()
     shared = skeleton == "shared"
     call = (
@@ -1114,6 +1164,57 @@ def test_a_face_s_load_is_given_const_inputs_whatever_the_kernel_s(skeleton):
         output_dtypes=[mx.float32],
     )[0]
     assert mx.array_equal(got, want[:1]).item()
+
+
+@metal
+@pytest.mark.parametrize("storage", ["threadgroup", "device"])
+def test_a_non_const_input_pointer_selects_the_deleted_load(storage):
+    """The const overloads alone let a non-const pointer convert silently:
+    the toy keeps a deleted generic load, so the compiler says so."""
+    template = "    __OMLX_READ_LOAD__ {\n"
+    start = _TOY.index(template)
+    end = _TOY.index("    }\n", start) + len("    }\n")
+    face = _toy(
+        f"const_{storage}_deleted",
+        source=_TOY[:start] + _CONST_LOAD + _TOY[end:],
+        reads=_CONST_READS,
+    )
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("m", face)]
+    storage_decl = (
+        "threadgroup float xs[K];\n"
+        "    for (uint i = thread_index_in_simdgroup; i < K; i += 32) {\n"
+        "      xs[i] = x[i];\n"
+        "    }\n"
+        "    threadgroup_barrier(mem_flags::mem_threadgroup);"
+        if storage == "threadgroup"
+        else "device float* xs = (device float*)x;"
+    )
+    kernel = mx.fast.metal_kernel(
+        name=f"omlx_test_deleted_load_{storage}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header,
+        source=matrices.declarations + f"""
+    {storage_decl}
+    using Lanes = {face.type}::Lanes<K>;
+    thread float xt[8];
+    Lanes::load(xs, xt);
+    y[0] = xt[0];
+""",
+    )
+    (codes, scales), x, _ = _matrix(8, 512)
+    with pytest.raises(RuntimeError, match="deleted function"):
+        mx.eval(
+            kernel(
+                inputs=[x, codes, scales],
+                template=[("K", 512)],
+                grid=(32, 1, 1),
+                threadgroup=(32, 1, 1),
+                output_shapes=[(1,)],
+                output_dtypes=[mx.float32],
+            )[0]
+        )
 
 
 @metal
@@ -1197,7 +1298,13 @@ def test_a_face_s_shared_source_is_in_the_kernels_that_share_alone():
     # After the source whose struct it defines members of.
     assert header.index("// the shared source") > header.index("struct Dot {")
     assert '#line 1 "<quant format toy_shared shared>"' in header
-    tile = formats.Tile(key="t", source="", type="T", tensors=())
+    tile = formats.Tile(
+        key="t",
+        source="struct Tile {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+        type="T",
+        tensors=(),
+        reads=formats.TileReads(),
+    )
     with pytest.raises(TypeError, match="a tile face has no shared source"):
         kernels.Matrices().add("t", tile, shared=True)
     with pytest.raises(ValueError, match="shared is Metal"):
@@ -1221,12 +1328,11 @@ def test_staged_inputs_fit_in_a_threadgroup_s_memory():
 # The toy's rows with the codes as stored, re-centred in madd with the sum of
 # the lane's inputs: what load returns is a struct of the face's own.
 _LOAD = r"""
-    template <typename XP>
-    static float load(XP x, thread float* xt) {
+    __OMLX_READ_LOAD__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0;
     }
-    static float madd(float acc, Row r, thread const float* xt, float) {
+    __OMLX_READ_MADD__ {
       return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
 """
@@ -1238,15 +1344,25 @@ _LOAD_STRUCT = r"""
     static float sum(omlx_ints<I...>, thread const float* xt) {
       return (... + xt[I]);
     }
-    template <typename XP>
-    static Inputs load(XP x, thread float* xt) {
+    __OMLX_READ_LOAD__ {
       copy(omlx_iota<VPT>(), x, xt);
       return {sum(omlx_iota<VPT>(), xt)};
     }
-    static float madd(float acc, Row r, thread const float* xt, Inputs inputs) {
+    __OMLX_READ_MADD__ {
       return acc + (dot(omlx_iota<VPT>(), r.w, xt) - 128.0f * inputs.sum);
     }
 """
+_LOAD_STRUCT_READS = replace(
+    _TOY_READS,
+    load=formats.LoadRead(
+        input=formats.TypeParam("XP"),
+        returns=formats.AuxType("Inputs"),
+        params=("x", "xt"),
+    ),
+    madd=formats.MaddRead(
+        aux=formats.AuxType("Inputs"), params=("acc", "r", "xt", "inputs")
+    ),
+)
 
 
 @metal
@@ -1257,7 +1373,9 @@ def test_what_load_returns_is_the_faces_own_type(k):
         "(float(w[I]) - 128.0f) * xt[I]", "float(w[I]) * xt[I]"
     )
     operands, x, want = _matrix(16, k, seed=k)
-    got = testing.dot_rows(_toy("aux", source=source), operands, x, 16, (2, 2))
+    got = testing.dot_rows(
+        _toy("aux", source=source, reads=_LOAD_STRUCT_READS), operands, x, 16, (2, 2)
+    )
     assert mx.array_equal(got, want).item()
 
 
@@ -1452,8 +1570,12 @@ def test_an_error_in_a_format_cites_the_formats_own_line():
 def test_an_error_the_skeleton_brings_out_cites_the_formats_own_line():
     # Row is a member of Lanes<K>: its members are looked up for a given K.
     source = _TOY.replace("r.w, xt);", "r.weights, xt);")
-    message = _error(_toy("member", source=source))
-    assert f"<quant format toy_member>:{_line(source, 'r.weights')}:" in message
+    face = _toy("member", source=source)
+    message = _error(face)
+    assert (
+        f"<quant format toy_member>:{_line(face.emitted_source, 'r.weights')}:"
+        in message
+    )
     assert "no member named 'weights'" in message
     # ... and the skeleton's line that asked for it.
     assert "<omlx skeletons, docs/quant-formats.md>:" in message
@@ -1585,9 +1707,8 @@ _BREAKS = {
     "no member named 'finish'": {
         "old": "    float finish(int r, float sum) const { return sum * s[r]; }\n",
     },
-    "too many arguments": {
-        "old": "thread const float* xt, float) {",
-        "new": "thread const float* xt) {",
+    "unknown type name 'Decoded'": {
+        "old": "    using Decoded = Row;\n",
     },
     "a later revision": {
         "old": "CONTRACT = 1;",
@@ -1607,7 +1728,18 @@ def _example() -> Dot:
     (face,) = (
         text for language, text in _BLOCKS if language == "python" and "SOURCE" in text
     )
-    return eval(face, {"Dot": Dot, "SOURCE": source})
+    return eval(
+        face,
+        {
+            "Dot": Dot,
+            "SOURCE": source,
+            "DotReads": formats.DotReads,
+            "LoadRead": formats.LoadRead,
+            "MaddRead": formats.MaddRead,
+            "ApplyRead": formats.ApplyRead,
+            "TypeParam": formats.TypeParam,
+        },
+    )
 
 
 def _page_error(k=512, old="", new="") -> str:
@@ -1625,6 +1757,7 @@ def test_the_pages_example_is_the_toy_format():
         source=_TOY.strip().replace("omlx_toy_KEY", "omlx_myformat_b8"),
         type="omlx_myformat_b8::Dot",
         tensors=("group_scales",),
+        reads=_TOY_READS,
     )
 
 

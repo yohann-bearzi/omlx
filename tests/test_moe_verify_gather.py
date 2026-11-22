@@ -20,7 +20,7 @@ import omlx.patches.qwen35_moe_gate_up as gate_up_fusion
 from omlx import formats
 from omlx.formats import Dot, affine, kernels
 from omlx.patches import moe_verify_gather as gather
-from tests.test_formats_kernels import _PAGE, _TOY, _matrix, _toy
+from tests.test_formats_kernels import _PAGE, _TOY, _TOY_READS, _matrix, _toy
 from tests.test_qwen35_moe_routed_decode import _does_not_compile, _logged, _same_bits
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -658,6 +658,7 @@ def test_projections_of_different_tensor_counts_take_their_own(monkeypatch):
         source=source,
         type="omlx_toy_two_tensors::Dot",
         tensors=("group_scales", "unit"),
+        reads=_TOY_READS,
     )
     monkeypatch.setitem(formats._FORMATS, "toy", _ByTensors(_toy("gather"), two))
     switch = _ToySwitch(k=320, inter=72, n=40)

@@ -114,14 +114,37 @@ def test_a_malformed_table_is_refused(name, dtype, values, said):
 # --- faces with tables ---------------------------------------------------------
 
 
+_SHELL = (
+    "struct Dot {\n"
+    "  __OMLX_READ_LOAD__ { return 0; }\n"
+    "  __OMLX_READ_MADD__ { return 0; }\n"
+    "};\n"
+)
+_SHELL_READS = formats.DotReads()
+
+
 def _face(*tables, tensors=("scales",)):
-    return Dot(key="t", source="", type="T", tensors=tensors, tables=tables)
+    return Dot(
+        key="t",
+        source=_SHELL,
+        type="T",
+        tensors=tensors,
+        tables=tables,
+        reads=_SHELL_READS,
+    )
 
 
 def test_tables_are_a_keyword_of_a_face_and_none_by_default():
-    assert Dot("k", "", "T", ()).tables == ()
+    assert Dot("k", _SHELL, "T", (), reads=_SHELL_READS).tables == ()
     with pytest.raises(TypeError):
-        Dot("k", "", "T", (), (), (Table("t", mx.float32, (1.0,)),))
+        Dot(
+            "k",
+            _SHELL,
+            "T",
+            (),
+            (),
+            (Table("t", mx.float32, (1.0,)),),
+        )
 
 
 @pytest.mark.parametrize(
@@ -145,7 +168,14 @@ def test_tables_are_a_keyword_of_a_face_and_none_by_default():
 )
 def test_a_face_s_tables_are_checked(tables, tensors, said):
     with pytest.raises(ValueError, match=said):
-        Dot(key="t", source="", type="T", tensors=tensors, tables=tables)
+        Dot(
+            key="t",
+            source=_SHELL,
+            type="T",
+            tensors=tensors,
+            tables=tables,
+            reads=_SHELL_READS,
+        )
 
 
 def test_a_face_may_hold_4096_bytes_of_tables():
@@ -297,6 +327,10 @@ struct Dot {
   const device uint8_t* codes;
   const device float* scales;
 MEMBERS
+  struct Row {};
+  using Decoded = Row;
+  __OMLX_READ_LOAD__ { return 0; }
+  __OMLX_READ_MADD__ { return 0; }
 };
 }
 """
@@ -309,6 +343,7 @@ def _toy(key, members, *tables):
         type=f"omlx_tables_{key}::Dot",
         tensors=("scales",),
         tables=tables,
+        reads=_SHELL_READS,
     )
 
 
@@ -914,6 +949,7 @@ _TOY4 = (
 @pytest.mark.parametrize("k", [512, 320])
 def test_a_four_value_table_gives_the_face_s_rows_in_either_form(form, k):
     from tests.test_formats_kernels import _TOY as ROWS_TOY
+    from tests.test_formats_kernels import _TOY_READS as ROWS_READS
     from tests.test_formats_kernels import _matrix
 
     source = ROWS_TOY.replace("KEY", f"four_{form}")
@@ -926,6 +962,7 @@ def test_a_four_value_table_gives_the_face_s_rows_in_either_form(form, k):
         type=f"omlx_toy_four_{form}::Dot",
         tensors=("scales",),
         tables=(LEVELS4,),
+        reads=ROWS_READS,
     )
     (codes, scales), x, _ = _matrix(16, k)
     levels = np.array(LEVELS4.values, dtype=np.float32)[np.array(codes) & 3]

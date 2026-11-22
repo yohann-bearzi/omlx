@@ -124,12 +124,15 @@ struct ByteCodes {
     Pack fetch(int run) const {
       return ((const device Pack*)values)[run];
     }
-    static uint pair(Pack q, int j) {
+    __OMLX_READ_PAIR__ {
       return uint(q.lo[j] ^ 15) | (uint(q.hi[j] ^ 15) << 16);
     }
   };
 };
 """
+
+
+_BYTE_READS = formats.CodesReads(pair=formats.PairRead(pack="Pack", params=("q", "j")))
 
 
 class ByteFormat(formats.QuantFormat):
@@ -139,7 +142,9 @@ class ByteFormat(formats.QuantFormat):
     contract = 1
 
     def codes(self, layer, k, n):
-        return formats.Codes("byte_codes", _BYTE_CODES, "ByteCodes", self.tensors)
+        return formats.Codes(
+            "byte_codes", _BYTE_CODES, "ByteCodes", self.tensors, reads=_BYTE_READS
+        )
 
 
 def _byte_layer(k, n, monkeypatch):
@@ -251,9 +256,17 @@ def test_codes_are_optional_and_use_the_registrys_operand_checks(monkeypatch, de
     assert formats.QuantFormat().codes(layer, k, n) is None
     fmt = formats.get(layer.mode)
     if detail == "no tensor":
-        result = formats.Codes("missing", "", "Codes", ("other",))
+        result = formats.Codes(
+            "missing", _BYTE_CODES, "ByteCodes", ("other",), reads=_BYTE_READS
+        )
     else:
-        result = formats.Tile("wrong_face", "", "Tile", ())
+        result = formats.Tile(
+            "wrong_face",
+            "struct Tile {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+            "Tile",
+            (),
+            reads=formats.TileReads(),
+        )
     monkeypatch.setattr(fmt, "codes", lambda *_: result)
     with testing.no_dot_defects() as defects:
         assert formats.codes(layer, k, n) is None
@@ -315,14 +328,15 @@ def test_sg8_codes_rejects_incomplete_launch_geometry(monkeypatch, k, rows, n, g
         ("GROUP = 64", "GROUP = 48", "whole groups"),
         ("GROUP = 64", "GROUP = 4", "whole groups"),
         ("float2 params", "half2 params", "params.*float2"),
-        ("static uint pair", "static int pair", "pair.*uint"),
     ],
-    ids=["old", "new", "partial-group", "partial-run", "params", "pair"],
+    ids=["old", "new", "partial-group", "partial-run", "params"],
 )
 def test_codes_struct_contract_is_checked(old, new, error):
     from dataclasses import replace
 
-    face = formats.Codes("invalid_codes", _BYTE_CODES, "ByteCodes", ("maps",))
+    face = formats.Codes(
+        "invalid_codes", _BYTE_CODES, "ByteCodes", ("maps",), reads=_BYTE_READS
+    )
     source = face.source.replace(old, new)
     if old == "float2 params":
         source = source.replace("return float2(maps", "return half2(maps")
@@ -387,7 +401,7 @@ def test_affine_declines_incompatible_codes_without_reporting_a_defect(field):
 
 
 def test_codes_rows_requires_a_codes_face():
-    face = formats.Tile("tile", "", "Tile", ())
+    face = affine.tile_face(4, 64, mx.float16)
     with pytest.raises(ValueError, match="not a Codes face"):
         testing.codes_rows(face, (), 512, [0], mx.float16)
 
@@ -430,7 +444,7 @@ struct TableCodes {
       }
       return p;
     }
-    static uint pair(Pack p, int j) {
+    __OMLX_READ_PAIR__ {
       return uint(p.lo[j]) | (uint(p.hi[j]) << 16);
     }
   };
@@ -438,11 +452,19 @@ struct TableCodes {
 """
 
 
+_TABLE_READS = formats.CodesReads(pair=formats.PairRead(pack="Pack", params=("p", "j")))
+
+
 def test_staged_tables_reads_a_codes_faces_packed_table():
     bits = tuple(i ^ 11 for i in range(16))
     table = formats.Table("lut", mx.uint8, bits)
     face = formats.Codes(
-        "table_codes", _TABLE_CODES, "TableCodes", ("maps",), tables=(table,)
+        "table_codes",
+        _TABLE_CODES,
+        "TableCodes",
+        ("maps",),
+        tables=(table,),
+        reads=_TABLE_READS,
     )
     operands = (mx.zeros((1, 512), mx.uint8), mx.ones((1, 8, 2), mx.float32))
     got = testing.staged_tables(face, operands, mx.float16)
@@ -460,7 +482,12 @@ def test_codes_read_their_own_staged_table(monkeypatch, consumer):
     for mask in (15, 0):
         table = formats.Table("lut", mx.uint8, tuple(i ^ mask for i in range(16)))
         face = formats.Codes(
-            "table_codes", _TABLE_CODES, "TableCodes", ("maps",), tables=(table,)
+            "table_codes",
+            _TABLE_CODES,
+            "TableCodes",
+            ("maps",),
+            tables=(table,),
+            reads=_TABLE_READS,
         )
         monkeypatch.setattr(ByteFormat, "codes", lambda *_, result=face: result)
         layer, (packed, scales, biases) = _byte_layer(k, n, monkeypatch)
@@ -491,7 +518,9 @@ def test_codes_keeps_the_matrices_other_skeletons(shared):
     matrices = kernels.Matrices()
     matrices.add("dot", _toy("beside_codes"), shared=shared)
     assert "struct omlx_code_runs" not in matrices.header
-    face = formats.Codes("byte_codes", _BYTE_CODES, "ByteCodes", ("maps",))
+    face = formats.Codes(
+        "byte_codes", _BYTE_CODES, "ByteCodes", ("maps",), reads=_BYTE_READS
+    )
     with pytest.raises(TypeError, match="a codes face has no shared source"):
         matrices.add("codes", face, shared=True)
     matrices.add("codes", face)
@@ -575,7 +604,9 @@ def test_affine_codes_face_refuses_unsupported_widths():
 def test_codes_rows_names_the_codes_tensor_in_an_error():
     """``codes_name`` is the packed tensor's name in the check's message: a
     caller that names it differently sees its own name, not ``weight``."""
-    face = formats.Codes("byte_codes", _BYTE_CODES, "ByteCodes", ("maps",))
+    face = formats.Codes(
+        "byte_codes", _BYTE_CODES, "ByteCodes", ("maps",), reads=_BYTE_READS
+    )
     with pytest.raises(ValueError, match="codes is not an mx.array"):
         testing.codes_rows(
             face,
@@ -594,7 +625,7 @@ def test_a_codes_face_refuses_a_hand_written_table():
         "struct ByteCodes {", "constant float LUT[4] = {1};\nstruct ByteCodes {"
     )
     with pytest.raises(ValueError, match="its source declares LUT"):
-        formats.Codes("hand_table", source, "ByteCodes", ("maps",))
+        formats.Codes("hand_table", source, "ByteCodes", ("maps",), reads=_BYTE_READS)
 
 
 def test_sg8_codes_refuses_non_multiple_of_32_group():
@@ -602,7 +633,11 @@ def test_sg8_codes_refuses_non_multiple_of_32_group():
     the kernel reads 8 of every 40 weights and would drop the rest."""
     k, n = 320, 16
     face = formats.Codes(
-        "forty", _BYTE_CODES.replace("GROUP = 64", "GROUP = 40"), "ByteCodes", ("maps",)
+        "forty",
+        _BYTE_CODES.replace("GROUP = 64", "GROUP = 40"),
+        "ByteCodes",
+        ("maps",),
+        reads=_BYTE_READS,
     )
     operands = (mx.zeros((n, k), mx.uint8), mx.ones((n, k // 40, 2), mx.float32))
     with pytest.raises((ValueError, RuntimeError), match="sg8.*geometry"):

@@ -60,7 +60,7 @@ struct Tile {
     Codes fetch(int run) const {
       return Codes(c[run]);
     }
-    static float weight(thread const P& p, Codes q, int i) {
+    __OMLX_READ_WEIGHT__ {
       const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
       return (float(code) - 128.0f) * p.s;
     }
@@ -69,13 +69,16 @@ struct Tile {
 }  // namespace omlx_toy_KEY
 """
 
+_TILE_READS = formats.TileReads(weight=formats.WeightRead(params=("p", "q", "i")))
 
-def _toy(key, source=_TOY) -> formats.Tile:
+
+def _toy(key, source=_TOY, reads=_TILE_READS) -> formats.Tile:
     return formats.Tile(
         key=f"toy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_toy_{key}::Tile",
         tensors=("group_scales", "row_scales"),
+        reads=reads,
     )
 
 
@@ -121,7 +124,18 @@ def _error(face, operands, k=64) -> str:
 
 def test_a_tile_is_a_face_of_its_own_kind():
     tile = _toy("kind")
-    dot = Dot(**{f: getattr(tile, f) for f in ("key", "source", "type", "tensors")})
+    dot = Dot(
+        key=tile.key,
+        source=(
+            "struct Dot {\n"
+            "  __OMLX_READ_LOAD__ { return 0; }\n"
+            "  __OMLX_READ_MADD__ { return 0; }\n"
+            "};\n"
+        ),
+        type=tile.type,
+        tensors=tile.tensors,
+        reads=formats.DotReads(),
+    )
     assert (
         tile != dot and not isinstance(tile, Dot) and not isinstance(dot, formats.Tile)
     )
@@ -202,7 +216,7 @@ def test_a_kernel_of_tile_faces_has_the_tile_skeleton_alone():
     matrices = kernels.Matrices()
     face = _toy("header")
     assert matrices.add("m", face) == ["m_weight", "m_group_scales", "m_row_scales"]
-    assert matrices.header == _header((face.key, face.source))
+    assert matrices.header == _header((face.key, face.emitted_source))
     assert matrices.declarations.startswith(
         "    const auto m = omlx_toy_header::Tile{(const device uint8_t*)m_weight, "
         "m_group_scales, m_row_scales};\n"
@@ -371,22 +385,6 @@ _BREAKS = {
         ),
         "Runs<K>::P and Runs<K>::Codes must be types",
     ),
-    "p_misnamed": (
-        [
-            ("    struct P {", "    struct Q {"),
-            ("    P params(", "    Q params("),
-            ("thread const P& p", "thread const Q& p"),
-        ],
-        "Runs<K>::P and Runs<K>::Codes must be types",
-    ),
-    "codes_misnamed": (
-        [
-            ("using Codes = uint2;", "using Code = uint2;"),
-            ("    Codes fetch(", "    Code fetch("),
-            ("Codes q, int i", "Code q, int i"),
-        ],
-        "Runs<K>::P and Runs<K>::Codes must be types",
-    ),
     "cursor": (
         ("Runs(Tile m, size_t row)\n", "Runs(Tile m, size_t row, int k)\n"),
         "tile face: Runs<K> must be constructible from the face and a size_t row",
@@ -432,18 +430,6 @@ _BREAKS = {
         ),
         "Runs<K> needs a const member fetch(int run)",
     ),
-    "weight_not_static": (
-        ("static float weight(", "float weight("),
-        "tile face: Runs<K> needs a static member weight(P, Codes, int i) that "
-        "returns a float",
-    ),
-    "weight_a_const_member": (
-        (
-            "static float weight(thread const P& p, Codes q, int i) {",
-            "float weight(thread const P& p, Codes q, int i) const {",
-        ),
-        "Runs<K> needs a static member weight(P, Codes, int i)",
-    ),
     "fetch_of_a_moved_index": (
         ("Codes fetch(int run) const {", "Codes fetch(thread int&& run) const {"),
         "Runs<K> needs a const member fetch(int run)",
@@ -460,14 +446,6 @@ _BREAKS = {
         ),
         "Runs<K>::P and Runs<K>::Codes must be types",
     ),
-    "weight_of_a_mutable_run": (
-        ("Codes q, int i) {", "thread Codes& q, int i) {"),
-        "Runs<K> needs a static member weight(P, Codes, int i)",
-    ),
-    "weight_of_a_moved_index": (
-        ("Codes q, int i) {", "Codes q, thread int&& i) {"),
-        "Runs<K> needs a static member weight(P, Codes, int i)",
-    ),
     "cursor_of_a_moved_row": (
         ("Runs(Tile m, size_t row)\n", "Runs(Tile m, thread size_t&& row)\n"),
         "Runs<K> must be constructible from the face and a size_t row",
@@ -476,15 +454,11 @@ _BREAKS = {
         ("P params(int group) const {", "P params(thread int&& group) const {"),
         "Runs<K> needs a const member params(int g)",
     ),
-    "weight_of_a_moved_run": (
-        ("Codes q, int i) {", "thread Codes&& q, int i) {"),
-        "Runs<K> needs a static member weight(P, Codes, int i)",
-    ),
-    "weight_of_another_type": (
-        ("static float weight(", "static half weight("),
-        "Runs<K> needs a static member weight(P, Codes, int i)",
-    ),
 }
+# The weight signature is a declared read (`WeightRead`): a mutable codes
+# reference, a moved or narrow index, another return type, a non-static or
+# const member, or other P/Codes names are refused when the declaration is
+# made (tests/test_format_face_overloads.py), not by the compiler.
 
 
 def _broken(rule) -> str:
@@ -658,14 +632,18 @@ def test_tile_rows_uses_the_const_overloads_it_checked():
         "    Runs(thread Tile&, size_t) = delete;\n"
         "    Runs(thread const Tile& m, size_t row)",
     ).replace(
-        "    static float weight(thread const P& p, Codes q, int i) {",
+        "    __OMLX_READ_WEIGHT__ {",
         "    static float weight(thread P&, thread const Codes&, int) = delete;\n"
         "    static float weight(thread const P&, thread Codes&, int) = delete;\n"
-        "    static float weight(thread const P& p, thread const Codes& q, int i) {",
+        "    __OMLX_READ_WEIGHT__ {",
+    )
+    reads = replace(
+        _TILE_READS,
+        weight=formats.WeightRead(codes="thread const Codes&", params=("p", "q", "i")),
     )
     operands = _toy_operands()
     exact, _ = testing.tile_rows(
-        _toy("const_inputs", source), operands, 64, range(8), mx.float32
+        _toy("const_inputs", source, reads), operands, 64, range(8), mx.float32
     )
     assert _same(exact, _toy_decode(*operands))
 
@@ -827,11 +805,20 @@ def test_the_pages_tile_example_is_the_toy():
         for language, text in _BLOCKS
         if language == "python" and text.startswith("Tile(")
     )
-    assert eval(face, {"Tile": formats.Tile, "METAL": _TOY}) == formats.Tile(
+    assert eval(
+        face,
+        {
+            "Tile": formats.Tile,
+            "METAL": _TOY,
+            "TileReads": formats.TileReads,
+            "WeightRead": formats.WeightRead,
+        },
+    ) == formats.Tile(
         key="myformat_b8g32",
         source=_TOY,
         type="omlx_myformat_b8g32::Tile",
         tensors=("group_scales", "row_scales"),
+        reads=_TILE_READS,
     )
 
 

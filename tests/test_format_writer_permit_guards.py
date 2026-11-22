@@ -187,24 +187,41 @@ def test_writer_rejects_a_bad_face_from_the_persisted_reader(
         oq, "_TEST_VERIFIED", frozenset({"qwen3_5_moe_text", "qwen3_5_moe"})
     )
 
+    slots = {
+        "dot": (
+            "__OMLX_READ_LOAD__ { return 0; }\n"
+            "__OMLX_READ_MADD__ { return 0; }\n"
+            "__OMLX_READ_APPLY__ { return 0; }\n"
+        ),
+        "tile": "__OMLX_READ_WEIGHT__ { return 0; }\n",
+        "codes": "__OMLX_READ_PAIR__ { return 0; }\n",
+    }[kind]
+    reads = {
+        "dot": formats.DotReads(apply=formats.ApplyRead()),
+        "tile": formats.TileReads(),
+        "codes": formats.CodesReads(),
+    }[kind]
+
     def bad_face(*args):
         if defect == "wrong type":
             return True
         if defect == "shared table":
             return formats.Dot(
                 key="hand",
-                source="struct Face {};",
+                source="struct Face {}\n" + slots,
                 shared="constant float LEVELS[2] = {1, 2};",
                 type="Face",
                 tensors=(),
                 vpt=8,
+                reads=reads,
             )
         face_type = {"dot": formats.Dot, "tile": formats.Tile, "codes": formats.Codes}[kind]
         return face_type(
             key="hand",
-            source="constant float LEVELS[] = {-1.0f, 1.0f};",
+            source="constant float LEVELS[] = {-1.0f, 1.0f};\n" + slots,
             type="Face",
             tensors=(),
+            reads=reads,
         )
 
     class Codec(_Codec):

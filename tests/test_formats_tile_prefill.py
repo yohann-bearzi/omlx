@@ -71,7 +71,7 @@ struct Tile {
     Codes fetch(int run) const {
       return Codes(c[run]);
     }
-    static float weight(thread const P& p, Codes q, int i) {
+    __OMLX_READ_WEIGHT__ {
       const uint code = ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;
       return (float(code) - 128.0f) * p.s;
     }
@@ -81,12 +81,16 @@ struct Tile {
 """
 
 
-def _tile_toy(key, source=_TILE) -> Tile:
+_TILE_READS = formats.TileReads(weight=formats.WeightRead(params=("p", "q", "i")))
+
+
+def _tile_toy(key, source=_TILE, reads=_TILE_READS) -> Tile:
     return Tile(
         key=f"tiletoy_{key}",
         source=source.replace("KEY", key),
         type=f"omlx_tiletoy_{key}::Tile",
         tensors=("group_scales",),
+        reads=reads,
     )
 
 
@@ -236,9 +240,9 @@ def test_sorted_tile_calls_the_checked_face_overloads(toy, case):
         )
     if case == "int_weight_index":
         source = source.replace(
-            "static float weight(thread const P& p, Codes q, int i)",
-            "static float weight(thread const P&, Codes, short) { return 0; }\n"
-            "    static float weight(thread const P& p, Codes q, int i)",
+            "    __OMLX_READ_WEIGHT__ {",
+            "    static float weight(thread const P&, Codes, short) { return 0; }\n"
+            "    __OMLX_READ_WEIGHT__ {",
         )
     toy(_tile_toy("checked_" + case, source))
     tensors = _stack(128, 256, seed=122)
@@ -594,11 +598,17 @@ def test_a_sparse_expert_uses_the_full_weight_row_offset():
           return float((row >> 32) == 1) + 8.0f * float((row & 31) == 0);
         }
         Codes fetch(int) const { return 0; }
-        static float weight(P p, Codes, int) { return p; }
+        __OMLX_READ_WEIGHT__ { return p; }
       };
     };
     """
-    face = Tile(key="steel_wide_row", type="WideRow", source=source, tensors=())
+    face = Tile(
+        key="steel_wide_row",
+        type="WideRow",
+        source=source,
+        tensors=(),
+        reads=formats.TileReads(),
+    )
     kernel = tile_gather.kernel(face)
     x = mx.ones((1, 1, 32), mx.float16)
     dummy = mx.zeros((8,), mx.uint8)

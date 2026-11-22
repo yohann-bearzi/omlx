@@ -24,11 +24,21 @@ from omlx.formats import testing
 
 _PAGE = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
 
+_DOT_SHELL = (
+    "struct Dot {\n"
+    "  __OMLX_READ_LOAD__ { return 0; }\n"
+    "  __OMLX_READ_MADD__ { return 0; }\n"
+    "  __OMLX_READ_APPLY__ { return 0; }\n"
+    "};\n"
+)
+_TILE_SHELL = "struct Tile {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n"
+
 _FACE = formats.Dot(
     key="toy_b4",
-    source="namespace omlx_toy_b4 { struct Dot {}; }\n",
+    source=_DOT_SHELL,
     type="omlx_toy_b4::Dot",
     tensors=("group_scales",),
+    reads=formats.DotReads(apply=formats.ApplyRead()),
 )
 
 
@@ -958,9 +968,10 @@ def test_a_format_has_no_face_until_it_gives_one():
 def _tile():
     return formats.Tile(
         key="toy_tile_b4",
-        source="namespace omlx_toy_tile_b4 { struct Tile {}; }\n",
+        source=_TILE_SHELL,
         type="omlx_toy_tile_b4::Tile",
         tensors=("group_scales",),
+        reads=formats.TileReads(),
     )
 
 
@@ -1162,10 +1173,16 @@ def test_equal_faces_are_one_cache_key():
 
 @pytest.mark.parametrize("kind", [formats.Dot, formats.Tile])
 def test_kernel_keys_distinguish_each_field_of_the_concrete_face(kind):
-    face = kind("first", "struct F {};", "F", ())
+    if kind is formats.Dot:
+        shell, reads = _DOT_SHELL, formats.DotReads(apply=formats.ApplyRead())
+        another = _DOT_SHELL + "struct Extra { int i; };\n"
+    else:
+        shell, reads = _TILE_SHELL, formats.TileReads()
+        another = _TILE_SHELL + "struct Extra { int i; };\n"
+    face = kind("first", shell, "F", (), reads=reads)
     alternatives = {
         "key": "second",
-        "source": "struct F { int i; };",
+        "source": another,
         "type": "G",
         "tensors": ("group_scales",),
         "dtypes": (mx.float16,),
@@ -1184,31 +1201,52 @@ def test_kernel_keys_distinguish_each_field_of_the_concrete_face(kind):
             assert cache[replace(other)] == item.name
 
 
-def test_a_faces_declared_reads_are_part_of_its_kernel_key():
-    source = (
-        "struct Dot {\n"
-        "  __OMLX_READ_LOAD__ { return 0; }\n"
-        "  __OMLX_READ_MADD__ { return 0; }\n"
-        "};\n"
-    )
-    first = formats.Dot(
-        "first",
-        source,
-        "T",
-        (),
-        reads=formats.DotReads(
-            load=formats.LoadRead(params=("x", "xt")),
-            madd=formats.MaddRead(params=("acc", "r", "xt", "")),
+@pytest.mark.parametrize(
+    "kind, source, reads, other_reads",
+    [
+        (
+            formats.Dot,
+            (
+                "struct Dot {\n"
+                "  __OMLX_READ_LOAD__ { return 0; }\n"
+                "  __OMLX_READ_MADD__ { return 0; }\n"
+                "};\n"
+            ),
+            formats.DotReads(
+                load=formats.LoadRead(params=("x", "xt")),
+                madd=formats.MaddRead(params=("acc", "r", "xt", "")),
+            ),
+            formats.DotReads(
+                load=formats.LoadRead(params=("x2", "xt2")),
+                madd=formats.MaddRead(params=("acc2", "r2", "xt2", "")),
+            ),
         ),
-    )
-    second = replace(
-        first,
-        reads=formats.DotReads(
-            load=formats.LoadRead(params=("x2", "xt2")),
-            madd=formats.MaddRead(params=("acc2", "r2", "xt2", "")),
+        (
+            formats.Tile,
+            "struct Tile {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+            formats.TileReads(),
+            formats.TileReads(
+                formats.WeightRead(codes="thread const Codes&", params=("p", "q", "i"))
+            ),
         ),
-    )
-    assert first != second
+        (
+            formats.Codes,
+            "struct Codes {\n  __OMLX_READ_PAIR__ { return 0; }\n};\n",
+            formats.CodesReads(),
+            formats.CodesReads(pair=formats.PairRead(pack="uint2")),
+        ),
+    ],
+    ids=["dot", "tile", "codes"],
+)
+def test_a_faces_declared_reads_are_part_of_its_kernel_key(
+    kind, source, reads, other_reads
+):
+    first = kind("first", source, "T", (), reads=reads)
+    same = kind("first", source, "T", (), reads=reads)
+    second = replace(first, reads=other_reads)
+    assert first == same and first._hash_key == same._hash_key
+    assert {first: "found"}[same] == "found"
+    assert first != second and first._hash_key != second._hash_key
     assert first not in {second: "second"} and second not in {first: "first"}
     assert first.emitted_source != second.emitted_source
 
@@ -1218,7 +1256,13 @@ def test_inherited_face_equality_and_hash_cover_the_same_fields():
     class LabeledDot(formats.Dot):
         label: str = ""
 
-    face = LabeledDot("first", "struct F {};", "F", ())
+    face = LabeledDot(
+        "first",
+        _DOT_SHELL,
+        "F",
+        (),
+        reads=formats.DotReads(apply=formats.ApplyRead()),
+    )
     renamed = replace(face, label="second")
     assert face == renamed
     assert {face: "compiled"}[renamed] == "compiled"
@@ -1759,7 +1803,23 @@ def test_faces_sent_to_another_interpreter_share_its_hash_seed():
     import subprocess
     import sys
 
-    faces = [cls("face", "metal", "F", ()) for cls in (formats.Dot, formats.Tile)]
+    faces = [
+        formats.Dot(
+            "face",
+            "struct F {\n  __OMLX_READ_LOAD__ { return 0; }\n"
+            "  __OMLX_READ_MADD__ { return 0; }\n};\n",
+            "F",
+            (),
+            reads=formats.DotReads(),
+        ),
+        formats.Tile(
+            "face",
+            "struct F {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+            "F",
+            (),
+            reads=formats.TileReads(),
+        ),
+    ]
     for face in faces:
         hash(face)
     # A worker can receive an already hashed face and build an equal one locally.

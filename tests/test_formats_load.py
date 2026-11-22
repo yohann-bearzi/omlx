@@ -2000,9 +2000,24 @@ def test_a_load_can_copy_a_format_holding_its_contract_descriptors(
     if descriptor == "table":
         face = table
     elif descriptor == "dot":
-        face = formats.Dot("fixed", "struct Fixed {};", "Fixed", (), (mx.bfloat16,))
+        face = formats.Dot(
+            "fixed",
+            "struct Fixed {\n  __OMLX_READ_LOAD__ { return 0; }\n"
+            "  __OMLX_READ_MADD__ { return 0; }\n};\n",
+            "Fixed",
+            (),
+            (mx.bfloat16,),
+            reads=formats.DotReads(),
+        )
     else:
-        face = formats.Tile("fixed", "struct Fixed {};", "Fixed", (), tables=(table,))
+        face = formats.Tile(
+            "fixed",
+            "struct Fixed {\n  __OMLX_READ_WEIGHT__ { return 0; }\n};\n",
+            "Fixed",
+            (),
+            tables=(table,),
+            reads=formats.TileReads(),
+        )
     fmt = _ToyFormat(face)
     monkeypatch.setitem(formats._FORMATS, "toy", fmt)
     (tmp_path / "config.json").write_text(json.dumps(_typed(_written({}))))

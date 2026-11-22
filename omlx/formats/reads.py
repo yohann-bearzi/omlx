@@ -16,7 +16,6 @@ declaration time with a clear ``ValueError``.
 from __future__ import annotations
 
 import re
-import warnings
 from dataclasses import dataclass
 
 _KEYWORDS = frozenset(
@@ -505,7 +504,7 @@ class ApplyRead:
                 f"'const thread Decoded&', not {self.decoded!r}"
             )
         _check_const_scratch(self.scratch, "apply")
-        _, aux_tparam, aux_name = _check_aux(self.aux, "apply")
+        _, _, aux_name = _check_aux(self.aux, "apply")
         forbidden = frozenset({aux_name}) if aux_name else frozenset()
         _check_params(self.params, 4, "apply", forbidden=forbidden)
         _check_qualifiers(
@@ -577,11 +576,6 @@ class ApplyRead:
                 raise ValueError(
                     f"apply shared_templates parameter {tname!r} cannot "
                     "collide with parameter name"
-                )
-            if aux_tparam is not None and tname == aux_tparam:
-                raise ValueError(
-                    f"apply shared_templates parameter {tname!r} cannot collide "
-                    "with aux TypeParam"
                 )
             template_names.add(tname)
         if not isinstance(self.shared_owner, str) or not self.shared_owner:
@@ -891,9 +885,8 @@ def emit_parts(
     """Validate ``face.reads`` and emit its declared C++ signatures into
     ``raw_parts`` once at face construction.
 
-    If ``face.reads`` is ``None``, emit a ``DeprecationWarning`` (revision-1
-    migration window) and return ``raw_parts`` unchanged unless an unexpanded
-    ``__OMLX_READ_`` marker is present.
+    A face must declare its read members: a face without ``reads`` is refused
+    at construction, never compiled.
     """
     from . import Codes, Dot, Tile
 
@@ -909,24 +902,15 @@ def emit_parts(
 
     reads = face.reads
     if reads is None:
-        for part, _, text in raw_parts:
-            if _SLOT_PREFIX in text:
-                raise ValueError(
-                    f"{owner}: {part} contains an unexpanded read slot "
-                    f"({_SLOT_PREFIX}...); pass reads={expected.__name__}(...)"
-                )
-        warnings.warn(
-            f"{owner}: omitting reads= is deprecated and will be refused in "
-            f"contract revision 2; declare reads={expected.__name__}(...) so "
-            "oMLX emits its read signatures (docs/quant-formats.md)",
-            DeprecationWarning,
-            stacklevel=5 if isinstance(face, Dot) else 4,
+        raise ValueError(
+            f"{owner}: a face declares its read members: pass "
+            f"reads={expected.__name__}(...) so oMLX emits its read signatures "
+            "(docs/quant-formats.md)"
         )
-        return raw_parts
 
     if not isinstance(reads, expected):
         raise ValueError(
-            f"{owner}: reads must be {expected.__name__} or None, "
+            f"{owner}: reads must be {expected.__name__}, "
             f"not {type(reads).__name__}"
         )
 

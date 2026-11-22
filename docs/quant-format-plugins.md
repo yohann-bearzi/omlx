@@ -65,7 +65,15 @@ The reference's own example, 8-bit codes with one float scale per row:
 
 ```python
 import mlx.core as mx
-from omlx.formats import Dot, QuantFormat
+from omlx.formats import (
+    ApplyRead,
+    Dot,
+    DotReads,
+    LoadRead,
+    MaddRead,
+    QuantFormat,
+    TypeParam,
+)
 
 class MyFormat(QuantFormat):
     mode = "myformat"
@@ -84,8 +92,17 @@ class MyFormat(QuantFormat):
     def dot(self, layer, k, n):
         if k % 8:  # K must be whole runs of the face's VPT (8)
             return None
-        return Dot(key="myformat_b8", source=SOURCE,
-                   type="omlx_myformat_b8::Dot", tensors=("group_scales",))
+        return Dot(
+            key="myformat_b8",
+            source=SOURCE,
+            type="omlx_myformat_b8::Dot",
+            tensors=("group_scales",),
+            reads=DotReads(
+                load=LoadRead(input=TypeParam("XP")),
+                madd=MaddRead(params=("acc", "r", "xt", "")),
+                apply=ApplyRead(aux=TypeParam("A")),
+            ),
+        )
 
 FORMAT = MyFormat()
 ```

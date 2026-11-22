@@ -5,8 +5,8 @@ A face declares its read members' signatures in Python (``DotReads``,
 ``TileReads``, ``CodesReads``) and oMLX emits the exact C++ signatures into
 the face's source at explicit slots (``__OMLX_READ_<SLOT>__``). Nothing
 parses C++: every unsafe form is refused at declaration time with a clear
-``ValueError``. Faces that omit ``reads=`` keep running during the revision-1
-deprecation window with a ``DeprecationWarning`` and const skeleton calls.
+``ValueError``. A face without ``reads`` is refused at construction: every
+face declares its read members.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ def _dot_outputs(face, path):
     return actual, mx.sum(xs[:, None, :] * w, axis=2)
 
 
-# --- Legacy faces (Part 1 const skeleton calls + revision-1 deprecation) ---
+# --- Const skeleton calls ------------------------------------------------
 
 
 def _dot_reader(overloaded):
@@ -123,8 +123,8 @@ def test_tile_reads_const_weight_with_int_index(quad, overload):
     group = mx.arange(1, n * 3 + 1).reshape(n, 3).astype(mx.float32)
     scale = mx.arange(1, n + 1).astype(mx.float32)
     source = tile._TOY
-    signature = "    static float weight(thread const P& p, Codes q, int i) {"
-    assert source.count(signature) == 1
+    slot = "    __OMLX_READ_WEIGHT__ {"
+    assert source.count(slot) == 1
     extra = {
         "const": "",
         "params": (
@@ -145,11 +145,14 @@ def test_tile_reads_const_weight_with_int_index(quad, overload):
       for (int i = 0; i < 4; ++i) out[i] = fetch(4 * quad + i);
     }
 """
+    reads = replace(
+        tile._TILE_READS,
+        weight=WeightRead(codes="thread const Codes&", params=("p", "q", "i")),
+    )
     face = tile._toy(
         f"read_{overload}_{int(quad)}",
-        source.replace(
-            signature, extra + signature.replace("Codes q", "thread const Codes& q")
-        ),
+        source.replace(slot, extra + slot),
+        reads,
     )
     rows = [7, 0, 3]
     want = tile._toy_decode(weights, group, scale)[rows]
@@ -936,52 +939,31 @@ def test_pair_declaration_refuses_unsafe_forms(name, build, fragment):
         build()
 
 
-# --- Face construction, slot validation, and deprecation warning -----------
+# --- Face construction and slot validation -------------------------------
 
 
 def _declared_dot_source() -> str:
-    source = dot._TOY
-    source = source.replace(
-        "    template <typename XP>\n"
-        "    static float load(XP x, thread float* xt) {",
-        "    __OMLX_READ_LOAD__ {",
-    )
-    source = source.replace(
-        "    static float madd(float acc, Row r, thread const float* xt, float) {",
-        "    __OMLX_READ_MADD__ {",
-    )
-    source = source.replace(
-        "    template <typename A>\n"
-        "    static float apply("
-        "float acc, thread const Decoded& d, thread const float* xt, A aux) {",
-        "    __OMLX_READ_APPLY__ {",
-    )
-    return source
+    return dot._TOY
 
 
 def _declared_dot_reads() -> DotReads:
-    return DotReads(
-        load=LoadRead(input=TypeParam("XP"), params=("x", "xt")),
-        madd=MaddRead(params=("acc", "r", "xt", "")),
-        apply=ApplyRead(aux=TypeParam("A"), params=("acc", "d", "xt", "aux")),
-    )
+    return dot._TOY_READS
 
 
 def _declared_tile_source() -> str:
-    return tile._TOY.replace(
-        "    static float weight(thread const P& p, Codes q, int i) {",
-        "    __OMLX_READ_WEIGHT__ {",
-    )
+    return tile._TOY
 
 
 def test_face_refuses_wrong_reads_kind():
-    with pytest.raises(ValueError, match="DotReads"):
+    with pytest.raises(ValueError, match="reads must be DotReads, not TileReads"):
         Dot("k", _declared_dot_source(), "T", (), reads=TileReads())
-    with pytest.raises(ValueError, match="DotReads"):
+    with pytest.raises(ValueError, match="reads must be DotReads, not str"):
         Dot("k", _declared_dot_source(), "T", (), reads="bad")
-    with pytest.raises(ValueError, match="TileReads"):
+    with pytest.raises(ValueError, match="reads must be DotReads, not int"):
+        Dot("k", _declared_dot_source(), "T", (), reads=0)
+    with pytest.raises(ValueError, match="reads must be TileReads, not DotReads"):
         Tile("k", _declared_tile_source(), "T", (), reads=DotReads())
-    with pytest.raises(ValueError, match="CodesReads"):
+    with pytest.raises(ValueError, match="reads must be CodesReads, not TileReads"):
         Codes("k", "__OMLX_READ_PAIR__ {}", "T", (), reads=TileReads())
 
 
@@ -1076,9 +1058,9 @@ def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
             (),
             reads=reads,
         )
-    # Unexpanded slot when reads=None
-    with pytest.raises(ValueError, match="unexpanded read slot"):
-        Dot("legacy_slot", src, "T", ())
+    # A face without a declaration is refused before any slot is read.
+    with pytest.raises(ValueError, match="declares its read members"):
+        Dot("no_reads", src, "T", ())
     # shared_slot with empty face.shared
     shared_reads = DotReads(
         load=LoadRead(params=("x", "xt")),
@@ -1123,16 +1105,11 @@ def test_face_refuses_missing_duplicate_midline_bad_suffix_and_leftover_slots():
 
 
 def _dot_source_without_a_declared_apply() -> str:
-    source = dot._TOY
-    source = source.replace(
-        "    template <typename XP>\n"
-        "    static float load(XP x, thread float* xt) {",
-        "    __OMLX_READ_LOAD__ {",
+    block = (
+        "    __OMLX_READ_APPLY__ {\n" "      return madd(acc, d, xt, aux);\n" "    }\n"
     )
-    return source.replace(
-        "    static float madd(float acc, Row r, thread const float* xt, float) {",
-        "    __OMLX_READ_MADD__ {",
-    )
+    assert dot._TOY.count(block) == 1
+    return dot._TOY.replace(block, "")
 
 
 def test_dot_with_vpt_or_shared_requires_declared_apply():
@@ -1183,13 +1160,12 @@ def test_expand_slot_handles_prefix_overlapping_slot_names():
         assert "static float madd(" in face.emitted_source
 
 
-def test_omitting_reads_emits_deprecation_warning_for_every_face_kind():
-    with pytest.warns(DeprecationWarning, match="DotReads"):
-        Dot("warn_dot", "struct D {};", "D", ())
-    with pytest.warns(DeprecationWarning, match="TileReads"):
-        Tile("warn_tile", "struct T {};", "T", ())
-    with pytest.warns(DeprecationWarning, match="CodesReads"):
-        Codes("warn_codes", "struct C {};", "C", ())
+def test_a_face_without_declared_reads_is_refused():
+    for kind, reads in ((Dot, "DotReads"), (Tile, "TileReads"), (Codes, "CodesReads")):
+        with pytest.raises(
+            ValueError, match=f"declares its read members.*{reads}"
+        ):
+            kind("no_reads", "struct F {};", "F", ())
 
 
 # --- Acceptance & GPU execution with declared read signatures --------------
@@ -1206,7 +1182,7 @@ def test_declared_dot_face_emits_exact_metal_and_runs(path):
         vpt=8,
         reads=_declared_dot_reads(),
     )
-    assert face.emitted_source == dot._TOY.replace("KEY", f"decl_{path}")
+    assert face.emitted_source == dot._TOY_LITERAL.replace("KEY", f"decl_{path}")
     actual, expected = _dot_outputs(face, path)
     _assert_bits(actual, expected)
 
@@ -1404,7 +1380,8 @@ def test_declared_tile_face_emits_exact_metal_and_runs(codes):
         reads=TileReads(WeightRead(codes=codes, params=("p", "q", "i"))),
     )
     expected_src = tile._TOY.replace("KEY", f"decl_tile_{tag}").replace(
-        "Codes q, int i", f"{codes} q, int i"
+        "    __OMLX_READ_WEIGHT__ {",
+        f"    static float weight(thread const P& p, {codes} q, int i) {{",
     )
     assert face.emitted_source == expected_src
     n, k = 8, 72
@@ -1503,7 +1480,7 @@ def test_declared_face_supports_replace_deepcopy_and_concurrent_construction():
     with ThreadPoolExecutor(max_workers=4) as pool:
         built = list(pool.map(make, range(8)))
     assert all(
-        f.emitted_source == dot._TOY.replace("KEY", f"thread_{i}")
+        f.emitted_source == dot._TOY_LITERAL.replace("KEY", f"thread_{i}")
         for i, f in enumerate(built)
     )
     assert formats.DotReads is DotReads
@@ -1536,7 +1513,7 @@ _OQEL_15_DIGESTS = {
 # the gather and routed patch sources, which the release-2 fixes changed
 # (moe_verify_gather, qwen35_moe_routed_decode, qwen35_moe_router). A base
 # change re-pins this snapshot; the emission itself is pinned by the face
-# digests and by legacy == migrated inside the test.
+# digests inside this test, which also cover the emitted read signatures.
 _OQEL_BUILDER_DIGESTS = {
     False: "123 ffcf3fdbb73c7a13576ea09d3299490350022a334016cebc6cba7018b7a6a202",
     True: "123 374125617b12a61d3e6cc9ab4436ab7200f8dbb11f4df3977bd4aef8ecda7b5d",
@@ -1672,76 +1649,15 @@ def _oqel():
         from omlx_oqel import codebook
 
         return face, codebook
-    except ImportError:
+    except ModuleNotFoundError as error:
+        if error.name != "omlx_oqel":
+            raise
         pytest.skip(
             "omlx-oqel is not installed (stage it with tools/integ/stage-plugin.sh)"
         )
 
 
-_OQEL_AUX = AuxType("Aux")
-_OQEL_DOT_READS = DotReads(
-    load=LoadRead(input=TypeParam("XP"), returns=_OQEL_AUX, params=("x", "xt")),
-    madd=MaddRead(aux=_OQEL_AUX, params=("acc", "r", "xt", "")),
-    apply=ApplyRead(
-        aux=_OQEL_AUX,
-        params=("acc", "d", "xt", ""),
-        wrap=True,
-        wrap_indent="",
-    ),
-)
-_OQEL_TILE_READS = TileReads(WeightRead(params=("p", "codes", "i")))
-
-
-def _migrate_oqel_dot(legacy: Dot) -> Dot:
-    """Port an oQeL a6480a5 Dot face to declared read signatures."""
-    src = legacy.source
-    replacements = (
-        (
-            "template <typename XP>\nstatic Aux load(XP x, thread float* xt) {",
-            "__OMLX_READ_LOAD__ {",
-        ),
-        (
-            "static float apply(\n"
-            "float acc, thread const Decoded& d, thread const float* xt, Aux) {",
-            "__OMLX_READ_APPLY__ {",
-        ),
-        (
-            "static float madd(float acc, Row r, thread const float* xt, Aux) {",
-            "__OMLX_READ_MADD__ {",
-        ),
-    )
-    for old, new in replacements:
-        assert src.count(old) == 1, old
-        src = src.replace(old, new)
-    return Dot(
-        key=legacy.key,
-        source=src,
-        type=legacy.type,
-        tensors=legacy.tensors,
-        dtypes=legacy.dtypes,
-        tables=legacy.tables,
-        shared=legacy.shared,
-        vpt=legacy.vpt,
-        reads=_OQEL_DOT_READS,
-    )
-
-
-def _migrate_oqel_tile(legacy: Tile) -> Tile:
-    """Port an oQeL a6480a5 Tile face to declared read signatures."""
-    old = "    static float weight(thread const P& p, Codes codes, int i) {"
-    assert legacy.source.count(old) == 1
-    return Tile(
-        key=legacy.key,
-        source=legacy.source.replace(old, "    __OMLX_READ_WEIGHT__ {"),
-        type=legacy.type,
-        tensors=legacy.tensors,
-        dtypes=legacy.dtypes,
-        tables=legacy.tables,
-        reads=_OQEL_TILE_READS,
-    )
-
-
-def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool, *, migrate: bool):
+def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool):
     from omlx.formats import linear as format_linear
     from omlx.formats import tile_gather, tile_wide
     from omlx.patches import m5_gather_qmm_nax as nax
@@ -1771,10 +1687,8 @@ def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool, *, migrate: bo
     for bits in (2, 3, 4):
         for vpt in (8, 16):
             for layout in (codebook.DEFAULT, other):
-                legacy = face_mod.dot(bits, layout, vpt)
-                f = _migrate_oqel_dot(legacy) if migrate else legacy
-                if migrate:
-                    assert f.emitted_source == legacy.source
+                f = face_mod.dot(bits, layout, vpt)
+                assert isinstance(f.reads, DotReads)
                 m_plain = kernels.Matrices()
                 m_plain.add("m", f)
                 m_sh = kernels.Matrices()
@@ -1807,10 +1721,8 @@ def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool, *, migrate: bo
                 routed._down_kernel.__wrapped__(f, None)
                 routed._gate_up_window_kernel.__wrapped__(f, shared, gate)
                 routed._down_window_kernel.__wrapped__(f, shared)
-        legacy_t = face_mod.tile(bits, codebook.DEFAULT)
-        tf = _migrate_oqel_tile(legacy_t) if migrate else legacy_t
-        if migrate:
-            assert tf.emitted_source == legacy_t.source
+        tf = face_mod.tile(bits, codebook.DEFAULT)
+        assert isinstance(tf.reads, TileReads)
         m = kernels.Matrices()
         m.add("m", tf)
         face_records.append((tf.key, tf.emitted_source, m.header, m.declarations))
@@ -1822,82 +1734,46 @@ def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool, *, migrate: bo
 
 
 @pytest.mark.parametrize("selects", [False, True], ids=["staged", "selects"])
-def test_every_oqel_plugin_face_is_byte_identical_legacy_and_migrated(
-    monkeypatch, selects
-):
+def test_every_oqel_plugin_face_emits_the_a6480a5_metal(monkeypatch, selects):
+    """The plugin's 15 faces and the 123 served builders on them are
+    byte-identical to a6480a5's literal read members: the declared
+    signatures emit the same Metal at construction."""
     face_mod, codebook = _oqel()
     face_mod.dot.cache_clear()
     face_mod.tile.cache_clear()
-    with warnings.catch_warnings(record=True) as legacy_warns:
-        warnings.simplefilter("always", DeprecationWarning)
-        legacy_faces, legacy_builders = _oqel_digests(
-            monkeypatch, face_mod, codebook, selects, migrate=False
-        )
-    assert (
-        len([w for w in legacy_warns if issubclass(w.category, DeprecationWarning)])
-        == 15
+    faces, builders = _oqel_digests(monkeypatch, face_mod, codebook, selects)
+    assert faces == _OQEL_15_DIGESTS[selects]
+    assert builders == _OQEL_BUILDER_DIGESTS[selects]
+
+
+def test_plugin_overview_doc_builds_its_dot_face_with_reads():
+    page = (
+        Path(__file__).parents[1] / "docs" / "quant-format-plugins.md"
+    ).read_text()
+    (block,) = (
+        text
+        for language, text in dot._fenced(page)
+        if language == "python" and "class MyFormat" in text
     )
-    assert legacy_faces == _OQEL_15_DIGESTS[selects]
-    assert legacy_builders == _OQEL_BUILDER_DIGESTS[selects]
-
-    # Migrated oQeL faces (using DotReads / TileReads) warn zero times and
-    # emit byte-identical Metal across all 15 faces and all 123 served builders.
-    with warnings.catch_warnings(record=True) as migrated_warns:
-        warnings.simplefilter("always", DeprecationWarning)
-        migrated_faces, migrated_builders = _oqel_digests(
-            monkeypatch, face_mod, codebook, selects, migrate=True
-        )
-    assert [
-        w for w in migrated_warns if issubclass(w.category, DeprecationWarning)
-    ] == []
-    assert migrated_faces == _OQEL_15_DIGESTS[selects]
-    assert migrated_builders == _OQEL_BUILDER_DIGESTS[selects]
-
-
-@pytest.mark.parametrize("bits, k", [(2, 256), (3, 256), (4, 256), (2, 512), (4, 512)])
-def test_migrated_oqel_dot_face_runs_bit_identically(bits, k):
-    face_mod, codebook = _oqel()
-    plugin = pytest.importorskip("omlx_oqel")
-    vpt = 16 if k == 512 else 8
-    legacy = face_mod.dot(bits, codebook.DEFAULT, vpt)
-    migrated = _migrate_oqel_dot(legacy)
-    layout = plugin.FORMAT.layout(k, 8, bits, 64)
-    operands = (
-        mx.full(layout["codes"][0], 0x5A, layout["codes"][1]),
-        mx.full(layout["group_scales"][0], 0x20, mx.uint8),
-        mx.ones(layout["row_scales"][0], mx.bfloat16),
+    (source,) = (
+        text
+        for language, text in dot._BLOCKS
+        if language == "cpp" and text.startswith("namespace omlx_myformat_b8 {")
     )
-    x = mx.ones((k,), mx.bfloat16)
-    want = testing.dot_rows(legacy, operands, x, 8)
-    got = testing.dot_rows(migrated, operands, x, 8)
-    _assert_bits(got, want)
-    xs = mx.stack([x, x * 2])
-    want_sh = testing.shared_rows(legacy, operands, xs, 8, rps=2)
-    got_sh = testing.shared_rows(migrated, operands, xs, 8, rps=2)
-    _assert_bits(got_sh, want_sh)
+    scope = {"SOURCE": source}
+    exec(block, scope)
+    face = scope["FORMAT"].dot(None, 512, 8)
+    assert isinstance(face.reads, DotReads)
+    assert "static float load(" in face.emitted_source
+    assert "__OMLX_READ_" not in face.emitted_source
 
 
-@pytest.mark.parametrize("bits, k", [(2, 256), (3, 256), (4, 256)])
-def test_migrated_oqel_tile_face_runs_bit_identically(bits, k):
-    face_mod, codebook = _oqel()
-    plugin = pytest.importorskip("omlx_oqel")
-    legacy = face_mod.tile(bits, codebook.DEFAULT)
-    migrated = _migrate_oqel_tile(legacy)
-    layout = plugin.FORMAT.layout(k, 8, bits, 64)
-    operands = (
-        mx.full(layout["codes"][0], 0x5A, layout["codes"][1]),
-        mx.full(layout["group_scales"][0], 0x20, mx.uint8),
-        mx.ones(layout["row_scales"][0], mx.bfloat16),
-    )
-    want, _ = testing.tile_rows(legacy, operands, k, range(8), mx.bfloat16)
-    got, _ = testing.tile_rows(migrated, operands, k, range(8), mx.bfloat16)
-    _assert_bits(got, want)
-
-
-def test_docs_specify_declared_read_signatures_and_migration():
+def test_docs_specify_declared_read_signatures():
     page = (Path(__file__).parents[1] / "docs" / "quant-formats.md").read_text()
     assert "A face may also define a mutable overload." not in page
     assert "omlx/formats/reads.py" in page
+    assert "A face without `reads` is refused at construction" in page
+    assert "emitted `decode`" not in page
     for slot in (
         "__OMLX_READ_LOAD__",
         "__OMLX_READ_MADD__",
@@ -1906,8 +1782,7 @@ def test_docs_specify_declared_read_signatures_and_migration():
         "__OMLX_READ_PAIR__",
     ):
         assert slot in page
-    assert "DeprecationWarning" in page
-    assert "revision 2" in page
+    assert "DeprecationWarning" not in page
     versions = page.split("\n## Versions\n")[1].split("\n## ")[0]
     for symbol in (
         "DotReads",

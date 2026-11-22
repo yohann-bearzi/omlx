@@ -18,7 +18,17 @@ import mlx.core as mx
 import pytest
 
 from omlx import formats
-from omlx.formats import Dot, Table, Tile, affine, kernels, testing
+from omlx.formats import (
+    ApplyRead,
+    Dot,
+    DotReads,
+    Table,
+    Tile,
+    TileReads,
+    affine,
+    kernels,
+    testing,
+)
 from omlx.formats import linear as format_linear
 from omlx.patches import m5_gather_qmm_nax as nax
 from omlx.patches import moe_verify_gather as gather
@@ -30,6 +40,28 @@ from tests.test_formats_tables import (
     tabled,
     tabled_tile,
 )
+
+_SLOTS = (
+    "__OMLX_READ_LOAD__ { return 0; }\n"
+    "__OMLX_READ_MADD__ { return 0; }\n"
+    "__OMLX_READ_APPLY__ { return 0; }\n"
+)
+_TILE_SLOTS = "__OMLX_READ_WEIGHT__ { return 0; }\n"
+_DOT_READS = DotReads(apply=ApplyRead())
+_TILE_READS = TileReads()
+
+
+def _face(kind=Dot, source="", key="legal", type="F", tensors=(), **kw):
+    """A face of ``source`` plus the read slots its declaration fills."""
+    tile = kind is Tile
+    return kind(
+        key=key,
+        source=source + "\n" + (_TILE_SLOTS if tile else _SLOTS),
+        type=type,
+        tensors=tensors,
+        reads=_TILE_READS if tile else _DOT_READS,
+        **kw,
+    )
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -273,7 +305,7 @@ def test_the_repository_scan_reads_static_and_constant_arrays():
     ],
 )
 def test_a_valid_face_accepts_scalar_vector_and_function_declarations(source):
-    Dot(key="legal", source=source, type="F", tensors=())
+    _face(source=source)
 
 
 @pytest.mark.parametrize(
@@ -295,18 +327,17 @@ def test_a_valid_face_accepts_scalar_vector_and_function_declarations(source):
 def test_a_table_is_reported_by_its_declarator_name(source):
     assert [name for _, name, _ in hand_tables(source)] == ["LUT"]
     with pytest.raises(ValueError, match=r"declares LUT.*Tile\("):
-        Tile(key="bad", source=source, type="F", tensors=())
+        _face(Tile, source=source, key="bad")
 
 
 def test_a_dot_reports_tables_in_its_shared_source():
     message = r"line 2 of its shared source declares LEVELS"
     with pytest.raises(ValueError, match=message):
-        Dot(
-            key="shared",
+        _face(
             source="struct Face {};",
+            key="shared",
             shared="// shared rows\nconstant float LEVELS[2] = {1, 2};",
             type="Face",
-            tensors=(),
             vpt=8,
         )
 
@@ -318,17 +349,31 @@ def test_validation_follows_the_source_parts_a_face_contributes():
     class Extended(Dot):
         extra: str = field(default="", metadata=source_field.metadata)
 
-    face = Extended("extra", "struct F {};", "F", (), extra="using Aux = int;")
+    face = Extended(
+        "extra",
+        "struct F {};\n" + _SLOTS,
+        "F",
+        (),
+        extra="using Aux = int;",
+        reads=_DOT_READS,
+    )
     builder = kernels.Matrices()
     builder.add("m", face)
     assert face.extra in builder.header
     with pytest.raises(ValueError, match=r"line 2 of its extra source declares LUT"):
-        Extended("extra", face.source, "F", (), extra="// extra\ndevice int LUT[8];")
+        Extended(
+            "extra",
+            face.source,
+            "F",
+            (),
+            extra="// extra\ndevice int LUT[8];",
+            reads=_DOT_READS,
+        )
 
 
-def test_a_face_s_empty_main_source_is_still_cited_in_the_header():
+def test_a_face_s_main_source_is_cited_in_the_header_from_its_first_line():
     builder = kernels.Matrices()
-    builder.add("m", Dot("empty", "", "F", ()))
+    builder.add("m", _face(source="", key="empty"))
     assert '\n#line 1 "<quant format empty>"\n' in builder.header
 
 
@@ -355,7 +400,7 @@ def test_a_face_s_empty_main_source_is_still_cited_in_the_header():
 )
 def test_a_face_refuses_arrays_with_static_storage(source):
     with pytest.raises(ValueError, match=r"its source declares LUT "):
-        Dot("storage", source, "F", ())
+        _face(source=source, key="storage")
 
 
 @pytest.mark.parametrize(
@@ -379,7 +424,7 @@ def test_a_face_refuses_arrays_with_static_storage(source):
 )
 def test_a_face_refuses_tables_after_specifiers_labels_and_operators(source):
     with pytest.raises(ValueError, match=r"its source declares LUT "):
-        Dot("access", source, "F", ())
+        _face(source=source, key="access")
 
 
 @pytest.mark.parametrize(
@@ -395,7 +440,7 @@ def test_a_face_refuses_tables_after_specifiers_labels_and_operators(source):
     ],
 )
 def test_a_face_accepts_namespace_enums(source):
-    Dot("enum_ok", source, "F", ())
+    _face(source=source, key="enum_ok")
 
 
 @pytest.mark.parametrize(
@@ -407,7 +452,7 @@ def test_a_face_accepts_namespace_enums(source):
 )
 def test_a_face_refuses_enum_arrays_with_static_storage(source):
     with pytest.raises(ValueError, match=r"its source declares LUT "):
-        Dot("enum_table", source, "F", ())
+        _face(source=source, key="enum_table")
 
 
 @pytest.mark.parametrize(
@@ -420,7 +465,7 @@ def test_a_face_refuses_enum_arrays_with_static_storage(source):
     ],
 )
 def test_a_face_accepts_aliased_enum_and_pointer_scalars(source):
-    Dot("alias", source, "F", ())
+    _face(source=source, key="alias")
 
 
 @pytest.mark.parametrize(
@@ -491,7 +536,7 @@ def test_scope_and_declarator_guards(source, names):
 )
 def test_a_face_refuses_the_tables_authors_write(source):
     with pytest.raises(ValueError, match=r"its source declares LUT "):
-        Dot("written", source, "F", ())
+        _face(source=source, key="written")
 
 
 @pytest.mark.parametrize(
@@ -543,7 +588,7 @@ def test_a_face_refuses_the_tables_authors_write(source):
     ],
 )
 def test_a_face_never_refuses_code_that_is_not_a_table(source):
-    Dot("valid", source, "F", ())
+    _face(source=source, key="valid")
 
 
 @pytest.mark.parametrize("keyword", ["else", "do", "try"])
@@ -571,14 +616,14 @@ def test_exotic_spellings_are_documented_as_not_detected(source):
     # Such a table stays in constant memory: it costs speed, results are the
     # same. The guide and the refusal say so, and review refuses it.
     assert kernels.hand_tables(source, face=True) == ()
-    Dot("unread", source, "F", ())
+    _face(source=source, key="unread")
 
 
 def test_the_guide_and_the_refusal_name_what_the_scan_does_not_read():
     page = (ROOT / "docs" / "quant-formats.md").read_text()
     section = page.split("\n## Tables\n", 1)[1].split("\n## ", 1)[0]
     with pytest.raises(ValueError) as refused:
-        Dot("said", "constant float LUT[4] = {1};", "F", ())
+        _face(source="constant float LUT[4] = {1};", key="said")
     guide = " ".join(section.split())
     assert "#if 0" in guide
     assert "brace-initialized constructor" in guide
@@ -591,22 +636,27 @@ def test_the_guide_and_the_refusal_name_what_the_scan_does_not_read():
 
 @pytest.mark.parametrize("part", ["source", "shared"])
 def test_a_face_requires_metal_text_in_each_fragment(part):
-    args = {"key": "bad", "source": "struct F {};", "type": "F", "tensors": ()}
+    args = {
+        "key": "bad",
+        "source": "struct F {};\n" + _SLOTS,
+        "type": "F",
+        "tensors": (),
+        "reads": _DOT_READS,
+    }
     with pytest.raises(ValueError, match=rf"face 'bad': {part} is Metal"):
         Dot(**{**args, part: 7})
 
 
 def test_a_face_can_initialize_an_automatic_aggregate():
-    Dot("automatic", "struct S { int a; }; void f() { S s{0}; }", "F", ())
+    _face(source="struct S { int a; }; void f() { S s{0}; }", key="automatic")
 
 
 def test_a_shared_source_sees_types_declared_by_the_main_source():
     with pytest.raises(ValueError, match=r"line 1 of its shared source declares LUT"):
-        Dot(
-            "split",
-            "struct S { float v[4]; };",
-            "Face",
-            (),
+        _face(
+            source="struct S { float v[4]; };",
+            key="split",
+            type="Face",
             shared="constant S LUT[2];",
             vpt=8,
         )
@@ -650,12 +700,16 @@ struct Dot {
 
 def test_an_implicit_static_table_names_its_storage_rule():
     with pytest.raises(ValueError, match=r"LUT with static storage"):
-        Dot("implicit", "namespace N { constexpr float LUT[4] = {1}; }", "N::Dot", ())
+        _face(
+            source="namespace N { constexpr float LUT[4] = {1}; }",
+            key="implicit",
+            type="N::Dot",
+        )
 
 
 def test_a_face_that_declares_a_table_by_hand_is_refused_when_it_is_made():
     with pytest.raises(ValueError) as refused:
-        Dot(key="hand", source=_HAND, type="omlx_hand::Dot", tensors=())
+        _face(source=_HAND, key="hand", type="omlx_hand::Dot")
     said = str(refused.value)
     assert said.startswith(
         "quant format face 'hand': line 3 of its source declares LEVELS"
@@ -666,14 +720,16 @@ def test_a_face_that_declares_a_table_by_hand_is_refused_when_it_is_made():
     assert "docs/quant-formats.md, Tables" in said
     # Declared as data, the same face is made.
     source = _HAND.replace("constant constexpr float LEVELS[] = {-1.0f, 1.0f};\n", "")
-    Dot(key="hand", source=source, type="omlx_hand::Dot", tensors=(), tables=(LUT,))
+    _face(source=source, key="hand", type="omlx_hand::Dot", tables=(LUT,))
 
 
 class _Hand(formats.QuantFormat):
     mode, tensors, contract = "hand", ("scales",), formats.CONTRACT
 
     def dot(self, layer, k, n):
-        return Dot(key="hand", source=_HAND, type="omlx_hand::Dot", tensors=("scales",))
+        return _face(
+            source=_HAND, key="hand", type="omlx_hand::Dot", tensors=("scales",)
+        )
 
     def layout(self, k, n, bits, group_size):
         return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
