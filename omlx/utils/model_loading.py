@@ -574,9 +574,24 @@ def maybe_apply_pre_load_patches(
     # note below). The hook only acts on weights that hold oQh tensors.
     install_load_hook()
 
+    # The vendored qwen4_exp must be in place before anything imports the
+    # installed mlx_vlm module: the cluster's capability detection and the
+    # served load both pre-load without ``for_vlm``, and a later compat
+    # patch cannot replace a module sys.modules already holds. Installed
+    # here for every path, before a caller can import the family module.
+    config = _offload_config(model_name)
+    if (
+        isinstance(config, dict)
+        and str(config.get("model_type", "")).lower() == "qwen4_exp"
+    ):
+        from ..patches.mlx_vlm_qwen4_exp_compat import (
+            apply_mlx_vlm_qwen4_exp_compat_patch,
+        )
+
+        apply_mlx_vlm_qwen4_exp_compat_patch()
+
     offload = getattr(model_settings, "moe_expert_offload_enabled", False)
     if model_settings is not None:
-        config = _offload_config(model_name)
         if offload:
             from ..patches.moe_offload_compat import in_quant_format
 
