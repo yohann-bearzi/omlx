@@ -15,6 +15,7 @@ released builder the same way.
 from __future__ import annotations
 
 import ast
+import gc
 import hashlib
 import importlib.util
 import json
@@ -22,21 +23,43 @@ import logging
 import re
 import subprocess
 import sys
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 from types import SimpleNamespace
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from omlx import formats
-from omlx.formats import Dot, Table, affine, kernels, row_exact_skeleton, tuning
+from omlx.formats import (
+    Dot,
+    Table,
+    affine,
+    kernels,
+    row_exact_skeleton,
+    testing,
+    tuning,
+)
+from omlx.formats.linear import FormatLinear
+from omlx.patches import module_cache, qwen35_gdn_prework, row_exact_qmv
 
 _REFERENCE = Path(__file__).parent / "data" / "parity_row_exact_a13.json"
+_LAUNCH_19_REFERENCE = (
+    Path(__file__).parent / "data" / "parity_row_exact_19_launches.json"
+)
 # The combined digest of the 240 pinned specs, captured from release-3
 # eae63b6c's own builders (specs/parity-skeletons-evidence/a13/test_emit.py
 # proved 240/240; the serialization here is the one below).
 A13_DIGEST = "fd884b476cbabb5772730282d87b344412c95c853b007f7ba1ed51d665e02f9d"
+# The combined digest of all 19 served launch captures from release-3 eae63b6c
+# (spec, grid, threadgroup, template, input_shapes, output_shapes, output_dtypes).
+A13_LAUNCH_19_DIGEST = (
+    "6d39e45f0c311672076ceb86711ea67c964431e85c2dafba084d5b104b2d6359"
+)
 
 
 def _reference():
@@ -78,15 +101,27 @@ def test_a13_affine_240_specs_byte_identical_to_eae63b6c():
     assert digest.hexdigest() == A13_DIGEST, digest.hexdigest()
 
 
-def test_qmv_shared_unrolls_by_pragma_not_fold_expression():
-    """The shared skeleton's unrolled block is the looped one under a full
-    pragma (SROA/LICM run first); the fold-expression form is gone."""
+def test_qmv_shared_unrolls_inner_block_and_folds_rows3():
+    """The shared skeleton pragma-unrolls all three loops inside
+    omlx_shared_block (rolled carries no pragma or fold helper), and keeps
+    the pack-fold only for ROWS == 3 where pragma loses on M5 Max."""
     from omlx.formats import kernels
 
-    assert not hasattr(kernels, "_SHARED_FOLDED")
+    pragma = '_Pragma("clang loop unroll(full)")'
+    rolled = kernels._qmv_shared(False)
     unrolled = kernels._qmv_shared(True)
-    assert '_Pragma("clang loop unroll(full)")' in unrolled
-    assert "omlx_shared_folded" not in unrolled
+    assert pragma not in rolled
+    assert "omlx_shared_folded" not in rolled
+
+    block_start = unrolled.index("METAL_FUNC void omlx_shared_block(")
+    block_end = unrolled.index("METAL_FUNC void omlx_qmv_shared(")
+    block = unrolled[block_start:block_end]
+    # All three loops in omlx_shared_block carry the full-unroll pragma.
+    assert block.count(pragma) == 3, block
+    assert f"{pragma}\nfor (int i = 0; i < ROWS; i++) {{" in block
+    assert f"{pragma}\nfor (int r = 0; r < RPS; r++) {{" in block
+    assert "if constexpr (ROWS == 3) {" in block
+    assert "omlx_shared_folded<K, RPS, PARTIAL>(" in block
 
 
 def test_row_index_width_is_chosen_at_construction():
@@ -130,27 +165,33 @@ struct Dot {
       return (... + ((float(w[I]) - 128.0f) * xt[I]));
     }
 
-    template <typename XP>
-    static float load(XP x, thread float* xt) {
+    __OMLX_READ_LOAD__ {
       copy(omlx_iota<VPT>(), x, xt);
       return 0.0f;
     }
-    static float madd(float acc, Row r, thread const float* xt, float) {
+    __OMLX_READ_MADD__ {
       return acc + dot(omlx_iota<VPT>(), r.w, xt);
     }
     float finish(int r, float sum) const { return sum * s[r]; }
 
     using Decoded = Row;
     static Decoded decode(Row r) { return r; }
-    template <typename A>
-    static float apply(
-        float acc, thread const Decoded& d, thread const float* xt, A aux) {
+    __OMLX_READ_APPLY__ {
       return madd(acc, d, xt, aux);
     }
   };
 };
 }  // namespace omlx_sk_KEY
 """
+
+
+_PLUGIN_READS = formats.DotReads(
+    load=formats.LoadRead(input=formats.TypeParam("XP"), params=("x", "xt")),
+    madd=formats.MaddRead(params=("acc", "r", "xt", "")),
+    apply=formats.ApplyRead(
+        aux=formats.TypeParam("A"), params=("acc", "d", "xt", "aux")
+    ),
+)
 
 
 def _plugin_dot(key: str, *, dtypes=(mx.float32,), vpt: int = 8) -> Dot:
@@ -161,6 +202,7 @@ def _plugin_dot(key: str, *, dtypes=(mx.float32,), vpt: int = 8) -> Dot:
         tensors=("group_scales",),
         dtypes=dtypes,
         vpt=vpt,
+        reads=_PLUGIN_READS,
     )
 
 
@@ -195,15 +237,14 @@ struct Dot {{
     Row row(int r) const {{ return {{w + r * K, lut}}; }}
     void step() {{ w += BLOCK; }}
 
-    template <typename XP>
-    static float load(XP x, thread float* xt) {{
+    __OMLX_READ_LOAD__ {{
       for (int i = 0; i < VPT; i++) xt[i] = float(x[i]);
       return 0.0f;
     }}
+    __OMLX_READ_MADD__ {{ return 0.0f; }}
     using Decoded = Row;
     static Decoded decode(Row r) {{ return r; }}
-    static float apply(
-        float acc, thread const Decoded& d, thread const float* xt, float) {{
+    __OMLX_READ_APPLY__ {{
       for (int i = 0; i < VPT; i++) {{
         acc += d.lut[uint(d.w[i]) & {mask}u] * xt[i];
       }}
@@ -222,6 +263,7 @@ struct Dot {{
         dtypes=(mx.float32,),
         vpt=8,
         tables=(table,),
+        reads=formats.DotReads(apply=formats.ApplyRead()),
     )
     return face, values
 
@@ -527,7 +569,594 @@ def test_dot_row_ops_cold_proof_checks_contract_and_refuses_broken_faces(
     assert caplog.records == []
 
 
-# The verify (MMA) skeleton, its released builder recorded.
+def test_compile_kernel_takes_only_spec():
+    """The unroll choice is part of the emitted spec (its name and header):
+    compile_kernel cannot silently compile another variant."""
+    import inspect
+
+    assert list(inspect.signature(row_exact_skeleton.compile_kernel).parameters) == [
+        "spec"
+    ]
+
+
+def test_row_exact_legacy_builders_deleted():
+    """Rule 29: per-shape builders and legacy _Launch are deleted in the switch."""
+    deleted = (
+        "_TILE",
+        "_BLOCK",
+        "_LAST_BLOCK",
+        "_SOURCE",
+        "_group_source",
+        "_header",
+        "_kernel",
+        "_group_kernel",
+        "_source",
+        "_launch_geometry",
+        "_Launch",
+        "_CALL",
+        "_launch_source",
+    )
+    remaining = [name for name in deleted if hasattr(row_exact_qmv, name)]
+    assert remaining == [], remaining
+
+
+def test_row_exact_plan_pre_flattens_operands_and_chooses_index_width_at_build():
+    """Rule 28: RowExactPlan resolves index width and pre-flattens operands once."""
+    face = affine.face(8, 64, True, mx.bfloat16)
+    w = mx.broadcast_to(mx.array(0, dtype=mx.uint32), (32, 64))
+    s = mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (32, 4))
+    b = mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (32, 4))
+    plan32 = row_exact_skeleton.build_plan(
+        (face,),
+        (32,),
+        256,
+        4,
+        mx.bfloat16,
+        (2, 4, False),
+        operands=(w, s, b),
+        names=("weight",),
+        operand_keys=(("weight", "scales", "biases"),),
+    )
+    assert isinstance(plan32, row_exact_skeleton.RowExactPlan)
+    assert plan32.index_width is tuning.RowIndexWidth.INT32_CHECKED
+    assert plan32.operands == (w, s, b)
+    assert plan32.grid == (32, 4, 4)
+    assert plan32.threadgroup == (32, 2, 1)
+    assert "size_t(out_row)" not in plan32.spec["header"]
+
+    plan64 = row_exact_skeleton.build_plan(
+        (face,),
+        (2**20,),
+        4096,
+        4,
+        mx.bfloat16,
+        (2, 4, False),
+        row_bytes=4096,
+    )
+    assert isinstance(plan64, row_exact_skeleton.RowExactPlan)
+    assert plan64.index_width is tuning.RowIndexWidth.SIZE_T64
+    assert "size_t(out_row)" in plan64.spec["header"]
+
+
+def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
+    """All 19 served shapes match eae63b6c byte-for-byte on spec, grid,
+    threadgroup, template, input shapes and output shapes."""
+    reference = json.loads(_LAUNCH_19_REFERENCE.read_text())
+    assert len(reference) == 19
+
+    captured = {}
+    cur = [None]
+
+    def fake_metal_kernel(**spec):
+        def runner(**kw):
+            captured[cur[0]] = {
+                "spec": {
+                    "name": spec["name"],
+                    "input_names": list(spec["input_names"]),
+                    "output_names": list(spec["output_names"]),
+                    "header": spec.get("header", ""),
+                    "source": spec["source"],
+                },
+                "grid": list(kw["grid"]),
+                "threadgroup": list(kw["threadgroup"]),
+                "template": [
+                    [k, str(v) if isinstance(v, mx.Dtype) else v]
+                    for k, v in kw.get("template", [])
+                ],
+                "input_shapes": [list(a.shape) for a in kw["inputs"]],
+                "output_shapes": [list(s) for s in kw["output_shapes"]],
+                "output_dtypes": [str(d) for d in kw["output_dtypes"]],
+            }
+            return [
+                mx.broadcast_to(mx.array(0, dtype=d), s)
+                for s, d in zip(kw["output_shapes"], kw["output_dtypes"])
+            ]
+
+        return runner
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", fake_metal_kernel)
+    monkeypatch.setattr(row_exact_qmv, "unrolled_tile_verified", lambda *a, **kw: True)
+    if hasattr(row_exact_skeleton, "_kernel_from_spec"):
+        row_exact_skeleton._kernel_from_spec.cache_clear()
+    if hasattr(row_exact_qmv, "_kernel"):
+        row_exact_qmv._kernel.cache_clear()
+
+    def mk_w(k, n, bits=8, gs=64, dtype=mx.bfloat16):
+        w = mx.broadcast_to(mx.array(0, dtype=mx.uint32), (n, k * bits // 32))
+        s = mx.broadcast_to(mx.array(0, dtype=dtype), (n, k // gs))
+        b = mx.broadcast_to(mx.array(0, dtype=dtype), (n, k // gs))
+        return w, s, b
+
+    def mk_layer(k, n, bits=8, gs=64, dtype=mx.bfloat16):
+        m = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+        nn.Module.__init__(m)
+        m.bits, m.group_size, m.mode = bits, gs, "affine"
+        m.weight, m.scales, m.biases = mk_w(k, n, bits, gs, dtype)
+        return m
+
+    try:
+        w, s, b = mk_w(6144, 2560, 8, 64)
+        p1 = row_exact_qmv.one_row_qmv(w, s, b, 8, 64, "affine", mx.bfloat16, 1)
+        cur[0] = "gdn_out_m1"
+        p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 6144)))
+        pm = row_exact_qmv.rows_qmv(
+            w,
+            s,
+            b,
+            8,
+            64,
+            "affine",
+            mx.bfloat16,
+            qwen35_gdn_prework._qwen4_verify_out_tile,
+            unrolled=True,
+        )
+        for m in (2, 3, 4, 8):
+            cur[0] = f"gdn_out_m{m}"
+            pm(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 6144)))
+
+        w, s, b = mk_w(2560, 16480, 8, 64)
+        p1 = row_exact_qmv.one_row_qmv(w, s, b, 8, 64, "affine", mx.bfloat16, 2)
+        cur[0] = "gdn_in_m1"
+        p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 2560)))
+        pm = row_exact_qmv.rows_qmv(
+            w,
+            s,
+            b,
+            8,
+            64,
+            "affine",
+            mx.bfloat16,
+            qwen35_gdn_prework._qwen4_verify_in_tile,
+            unrolled=True,
+        )
+        for m in (2, 3, 4):
+            cur[0] = f"gdn_in_m{m}"
+            pm(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 2560)))
+
+        att_ls = [mk_layer(2560, n, 8, 64) for n in (12288, 512, 512, 640)]
+        for m, geom in [(1, (1, 2, False)), (2, (2, 4, True)), (3, (1, 4, True))]:
+            cur[0] = f"attn4_m{m}"
+            row_exact_qmv.quantized_linears_tiled(
+                att_ls,
+                mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 2560)),
+                *geom,
+            )
+
+        o_l = [mk_layer(6144, 2560, 8, 64)]
+        for m, geom in [(1, (1, 2, False)), (2, (2, 4, True))]:
+            cur[0] = f"oproj_m{m}"
+            row_exact_qmv.quantized_linears_tiled(
+                o_l,
+                mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 6144)),
+                *geom,
+            )
+
+        l4 = mk_layer(5120, 10240, 4, 64)
+        for m in (2, 8):
+            cur[0] = f"gdn27b_4b_m{m}"
+            row_exact_qmv.quantized_linear(
+                l4, mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 5120))
+            )
+
+        qkv_ls = [mk_layer(2560, n, 8, 64) for n in (12288, 512, 512)]
+        for m in (2, 8):
+            cur[0] = f"qkv_ql_m{m}"
+            row_exact_qmv.quantized_linears(
+                qkv_ls, mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 2560))
+            )
+
+        lh = mk_layer(2560, 151936, 8, 64)
+        cur[0] = "head_8b_m5"
+        row_exact_qmv.quantized_linear(
+            lh, mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 5, 2560))
+        )
+    finally:
+        if hasattr(row_exact_skeleton, "_kernel_from_spec"):
+            row_exact_skeleton._kernel_from_spec.cache_clear()
+        if hasattr(row_exact_qmv, "_kernel"):
+            row_exact_qmv._kernel.cache_clear()
+
+    assert set(captured) == set(reference)
+    mismatches = [k for k in reference if captured[k] != reference[k]]
+    assert not mismatches, [
+        (
+            k,
+            {
+                f: (captured[k][f], reference[k][f])
+                for f in reference[k]
+                if captured[k][f] != reference[k][f]
+            },
+        )
+        for k in mismatches[:3]
+    ]
+    digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()
+    assert digest == A13_LAUNCH_19_DIGEST, digest
+
+
+class _Bf16PluginFormat(formats.QuantFormat):
+    mode = "sk_bf16_plugin"
+    codes_name = "codes"
+    tensors = ("group_scales",)
+    contract = 1
+
+    def __init__(self, face: Dot):
+        self._face = face
+
+    def dot(self, layer, k: int, n: int) -> Dot | None:
+        return self._face
+
+    def decode(self, tensors, bits: int, group_size: int) -> mx.array:
+        return (tensors["codes"].astype(mx.float32) - 128.0) * tensors[
+            "group_scales"
+        ][:, None]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@testing.verified("qwen4_exp")
+def test_row_exact_supports_format_linear_plugin_face_and_mixed_group(monkeypatch):
+    """Non-affine FormatLinear and a mixed affine+plugin group run through the
+    same RowExactSkeleton / RowExactPlan with zero stock-only bypass."""
+    plugin_face = _plugin_dot("mixed_group_layer", dtypes=(mx.bfloat16,))
+    fmt = _Bf16PluginFormat(plugin_face)
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, fmt.mode, fmt)
+
+    mx.random.seed(31)
+    k, n_aff, n_plug, rows = 256, 32, 24, 4
+    aff = nn.QuantizedLinear(k, n_aff, bias=False, group_size=64, bits=8)
+    aff.weight, aff.scales, aff.biases = mx.quantize(
+        (mx.random.normal((n_aff, k)) * 0.05).astype(mx.bfloat16),
+        group_size=64,
+        bits=8,
+    )
+    codes = mx.random.randint(0, 256, (n_plug, k)).astype(mx.uint8)
+    scales = mx.array([2.0 ** (r % 4 - 2) for r in range(n_plug)], dtype=mx.float32)
+    plug = FormatLinear(fmt, 8, 64, k, {"codes": codes, "group_scales": scales})
+    x = mx.random.randint(-4, 5, (1, rows, k)).astype(mx.bfloat16)
+
+    # Single plugin FormatLinear through quantized_linear -> RowExactPlan.
+    plan_plug = row_exact_qmv._plan(plug, x, rows)
+    assert isinstance(plan_plug, row_exact_skeleton.RowExactPlan)
+    got_plug = row_exact_qmv.quantized_linear(plug, x)
+    want_plug = mx.concatenate([plug(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(got_plug.view(mx.uint16), want_plug.view(mx.uint16)).item()
+
+    # Mixed [affine, plugin] group in one RowExactPlan launch.
+    gplan = row_exact_qmv._group_plan((aff, plug), x, rows, (2, 4, True))
+    assert isinstance(gplan, row_exact_skeleton.RowExactPlan)
+    assert len(gplan.faces) == 2
+    y_aff, y_plug = row_exact_qmv.quantized_linears_tiled((aff, plug), x, 2, 4, True)
+    want_aff = mx.concatenate([aff(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(y_aff.view(mx.uint16), want_aff.view(mx.uint16)).item()
+    assert mx.array_equal(y_plug.view(mx.uint16), want_plug.view(mx.uint16)).item()
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@testing.verified("qwen4_exp")
+def test_row_exact_plan_cache_thread_safe_and_invalidates_on_weight_write(monkeypatch):
+    """Rule 14 concurrency (4 threads + Barrier) and weight mutation
+    invalidation on both nn.QuantizedLinear and FormatLinear."""
+    plugin_face = _plugin_dot("concurrent_plan", dtypes=(mx.bfloat16,))
+    fmt = _Bf16PluginFormat(plugin_face)
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, fmt.mode, fmt)
+
+    mx.random.seed(41)
+    k, n, rows = 256, 32, 4
+    aff0 = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    aff0.weight, aff0.scales, aff0.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    aff1 = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    aff1.weight, aff1.scales, aff1.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    codes = mx.random.randint(0, 256, (n, k)).astype(mx.uint8)
+    scales = mx.array([2.0 ** (r % 4 - 2) for r in range(n)], dtype=mx.float32)
+    plug = FormatLinear(fmt, 8, 64, k, {"codes": codes, "group_scales": scales})
+    x = mx.random.randint(-4, 5, (1, rows, k)).astype(mx.bfloat16)
+    want0 = mx.concatenate([aff0(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    want1 = mx.concatenate([aff1(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    want_p = mx.concatenate([plug(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    mx.eval(
+        x, want0, want1, want_p, aff0.parameters(), aff1.parameters(), plug.parameters()
+    )
+
+    gate = Barrier(4, timeout=20)
+
+    def worker(_):
+        gate.wait()
+        y0, y1 = row_exact_qmv.quantized_linears((aff0, aff1), x)
+        yp = row_exact_qmv.quantized_linear(plug, x)
+        mx.eval(y0, y1, yp)
+        return y0, y1, yp
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(worker, range(4)))
+    for y0, y1, yp in results:
+        assert mx.array_equal(y0.view(mx.uint16), want0.view(mx.uint16)).item()
+        assert mx.array_equal(y1.view(mx.uint16), want1.view(mx.uint16)).item()
+        assert mx.array_equal(yp.view(mx.uint16), want_p.view(mx.uint16)).item()
+
+    # Mutate sibling nn.QuantizedLinear weight and FormatLinear codes: plans refresh.
+    old_group = row_exact_qmv._group_plan((aff0, aff1), x, rows)
+    aff1.weight, aff1.scales, aff1.biases = mx.quantize(
+        (mx.random.normal((n, k), key=mx.random.key(99)) * 0.05).astype(mx.bfloat16),
+        group_size=64,
+        bits=8,
+    )
+    new_y0, new_y1 = row_exact_qmv.quantized_linears((aff0, aff1), x)
+    new_group = row_exact_qmv._group_plan((aff0, aff1), x, rows)
+    assert new_group is not old_group
+    want1_new = mx.concatenate([aff1(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(new_y0.view(mx.uint16), want0.view(mx.uint16)).item()
+    assert mx.array_equal(new_y1.view(mx.uint16), want1_new.view(mx.uint16)).item()
+    assert not mx.array_equal(new_y1.view(mx.uint16), want1.view(mx.uint16)).item()
+
+    old_plug_plan = row_exact_qmv._plan(plug, x, rows)
+    plug["codes"] = mx.full(codes.shape, 132, codes.dtype)
+    new_yp = row_exact_qmv.quantized_linear(plug, x)
+    new_plug_plan = row_exact_qmv._plan(plug, x, rows)
+    assert new_plug_plan is not old_plug_plan
+    want_p_new = mx.concatenate([plug(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(new_yp.view(mx.uint16), want_p_new.view(mx.uint16)).item()
+    assert not mx.array_equal(new_yp.view(mx.uint16), want_p.view(mx.uint16)).item()
+
+
+def test_row_exact_plan_uses_slots_and_preflattened_checks():
+    """RowExactPlan uses __slots__ and pre-flattens operand identity checks
+    at construction so warm hits avoid zip/nested loops and __dict__ reads."""
+    assert hasattr(row_exact_skeleton.RowExactPlan, "__slots__")
+    face = affine.face(8, 64, True, mx.bfloat16)
+    w, s, b = mx.quantize(
+        mx.zeros((32, 256), dtype=mx.bfloat16), group_size=64, bits=8
+    )
+    single = row_exact_skeleton.build_plan(
+        (face,),
+        (32,),
+        256,
+        2,
+        mx.bfloat16,
+        (2, 4, False),
+        operands=(w, s, b),
+        names=("weight",),
+        operand_keys=(("weight", "scales", "biases"),),
+        grouped=False,
+    )
+    assert not hasattr(single, "__dict__")
+    assert single.single_checks == (("weight", w), ("scales", s), ("biases", b))
+    assert single.group_checks == (
+        (0, "weight", w),
+        (0, "scales", s),
+        (0, "biases", b),
+    )
+
+
+def test_format_rows_qmv_bad_geometry_raises_value_error():
+    """An unaligned geometry raises ValueError, never AttributeError on None."""
+    mx.random.seed(51)
+    k, n = 256, 32
+    w, s, b = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    with testing.verified("qwen4_exp"):
+        layer = FormatLinear(
+            "affine", 8, 64, k, {"weight": w, "scales": s, "biases": b}
+        )
+    project = row_exact_qmv.format_rows_qmv(layer, mx.bfloat16, lambda rows: (4, 3))
+    assert project is not None
+    x = mx.zeros((1, 2, k), dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="tile"):
+        project(x)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_format_rows_qmv_isolates_graphs_across_output_widths_and_geometries(
+    monkeypatch,
+):
+    """A plan's proof is keyed by its template (output width, geometry), grid and
+    padding: two widths, or two geometries at one input shape, never replay a
+    graph built for the other's launch."""
+    mx.random.seed(57)
+    k, rows = 256, 2
+    x = mx.random.randint(-4, 5, (1, rows, k)).astype(mx.bfloat16)
+    layers, projects = [], []
+    with testing.verified("qwen4_exp"):
+        for n in (32, 64):
+            w, s, b = mx.quantize(
+                (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16),
+                group_size=64,
+                bits=8,
+            )
+            layer = FormatLinear(
+                "affine", 8, 64, k, {"weight": w, "scales": s, "biases": b}
+            )
+            layers.append(layer)
+            projects.append(
+                row_exact_qmv.format_rows_qmv(layer, mx.bfloat16, lambda _: (4, 1))
+            )
+    assert all(project is not None for project in projects)
+
+    narrow, wide = projects
+    got_narrow, got_wide = narrow(x), wide(x)
+    assert got_narrow.shape == (1, rows, 32), got_narrow.shape
+    assert got_wide.shape == (1, rows, 64), got_wide.shape
+    for layer, got in zip(layers, (got_narrow, got_wide)):
+        want = mx.concatenate(
+            [layer(x[:, r : r + 1]) for r in range(rows)], axis=1
+        )
+        assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+
+    # Same width and input shape, a second geometry: its own graph, so the
+    # second geometry's plan is the one traced and launched.
+    monkeypatch.setattr(row_exact_qmv, "unrolled_tile_verified", lambda *a, **kw: True)
+    calls = []
+    traced = row_exact_skeleton.RowExactPlan.__call__
+
+    def spy(self, value, operands=None):
+        calls.append(dict(self.template)["RPS"])
+        return traced(self, value, operands)
+
+    monkeypatch.setattr(row_exact_skeleton.RowExactPlan, "__call__", spy)
+    first = row_exact_qmv.format_rows_qmv(layers[0], mx.bfloat16, lambda _: (4, 2))
+    second = row_exact_qmv.format_rows_qmv(layers[0], mx.bfloat16, lambda _: (2, 2))
+    first(x)
+    assert calls == [4], calls
+    second(x)
+    assert calls == [4, 2], calls
+
+
+def test_clear_cached_drops_quantized_linear_row_exact_plans():
+    """A stock layer's row-exact plans are a registered slot: clearing the
+    module's cache drops the plans and their references to replaced weights."""
+    mx.random.seed(59)
+    k, n, rows = 256, 32, 2
+    layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    row_exact_qmv.quantized_linear(layer, x)
+    assert "_omlx_row_exact_plans" in layer.__dict__
+    module_cache.clear_cached(layer)
+    assert "_omlx_row_exact_plans" not in layer.__dict__
+
+
+def test_build_plan_rejects_direct_input_with_padding_or_group():
+    """A direct-input plan launches ``x`` as it is: only an unpadded
+    single-projection geometry can use it."""
+    face = affine.face(8, 64, True, mx.bfloat16)
+    common = dict(shapes=(32,), k=256, dtype=mx.bfloat16)
+    assert (
+        row_exact_skeleton.build_plan(
+            (face,), rows=3, geometry=(2, 4, False), direct_input=True, **common
+        )
+        is None
+    )
+    assert (
+        row_exact_skeleton.build_plan(
+            (face,), rows=4, geometry=(2, 4, False), direct_input=True, grouped=True,
+            **common,
+        )
+        is None
+    )
+    assert (
+        row_exact_skeleton.build_plan(
+            (face,), rows=4, geometry=(2, 4, False), direct_input=True, **common
+        )
+        is not None
+    )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_format_rows_qmv_proof_graph_retains_no_weight_arrays(monkeypatch):
+    """The graph a proof keeps is built from an operand-free plan: dropping the
+    project releases the layer's tensors even though the proof outlives it."""
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+
+    def helper():
+        mx.random.seed(63)
+        k, n = 256, 32
+        w, s, b = mx.quantize(
+            (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16),
+            group_size=64,
+            bits=8,
+        )
+        with testing.verified("qwen4_exp"):
+            layer = FormatLinear(
+                "affine", 8, 64, k, {"weight": w, "scales": s, "biases": b}
+            )
+        project = row_exact_qmv.format_rows_qmv(layer, mx.bfloat16, lambda _: (4, 1))
+        return project, weakref.ref(layer["weight"])
+
+    project, weight_ref = helper()
+    out = project(mx.random.normal((1, 2, 256)).astype(mx.bfloat16))
+    mx.eval(out)
+    del out, project
+    gc.collect()
+    assert weight_ref() is None
+
+
+def test_quantized_linears_tiled_recovers_after_bias_removed():
+    """A bias-key refusal is cached with the state it was made under: removing
+    the bias (even one stored as None) rebuilds the launch."""
+    mx.random.seed(61)
+    k, n, rows = 256, 32, 2
+    layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    want = mx.concatenate([layer(x[:, r : r + 1]) for r in range(rows)], axis=1)
+
+    layer["bias"] = None
+    assert row_exact_qmv.quantized_linears_tiled((layer,), x, 2, 4, True) is None
+    del layer["bias"]
+    (got,) = row_exact_qmv.quantized_linears_tiled((layer,), x, 2, 4, True)
+    assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+
+    # A two-member group rebuilds its grouped launch after a bias is removed.
+    second = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    second.weight, second.scales, second.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    second["bias"] = None
+    assert row_exact_qmv._group_plan((layer, second), x, rows) is None
+    del second["bias"]
+    assert row_exact_qmv._group_plan((layer, second), x, rows) is not None
+
+
+
+def test_quantized_linears_tiled_single_layer_invalidates_on_weight_and_bias():
+    """Single-member quantized_linears_tiled fast path invalidates cleanly on
+    weight overwrite and bias addition."""
+    mx.random.seed(53)
+    k, n, rows = 256, 32, 2
+    layer = nn.QuantizedLinear(k, n, bias=False, group_size=64, bits=8)
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        (mx.random.normal((n, k)) * 0.05).astype(mx.bfloat16), group_size=64, bits=8
+    )
+    x = mx.random.normal((1, rows, k)).astype(mx.bfloat16)
+    (y0,) = row_exact_qmv.quantized_linears_tiled((layer,), x, 2, 4, True)
+    want0 = mx.concatenate([layer(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(y0.view(mx.uint16), want0.view(mx.uint16)).item()
+
+    old_plan = row_exact_qmv._group_plan((layer,), x, rows, (2, 4, True))
+    layer.weight, layer.scales, layer.biases = mx.quantize(
+        (mx.random.normal((n, k), key=mx.random.key(77)) * 0.05).astype(mx.bfloat16),
+        group_size=64,
+        bits=8,
+    )
+    (y1,) = row_exact_qmv.quantized_linears_tiled((layer,), x, 2, 4, True)
+    new_plan = row_exact_qmv._group_plan((layer,), x, rows, (2, 4, True))
+    assert new_plan is not old_plan
+    want1 = mx.concatenate([layer(x[:, r : r + 1]) for r in range(rows)], axis=1)
+    assert mx.array_equal(y1.view(mx.uint16), want1.view(mx.uint16)).item()
+    assert not mx.array_equal(y1.view(mx.uint16), y0.view(mx.uint16)).item()
+
+    layer["bias"] = mx.ones((n,), dtype=mx.bfloat16)
+    assert row_exact_qmv.quantized_linears_tiled((layer,), x, 2, 4, True) is None
+
 
 # The verify (MMA) skeleton, its released builder recorded.
 

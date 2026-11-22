@@ -1829,7 +1829,9 @@ def test_warm_gdn_format_projection_replays_without_a_python_launch(
     def unexpected_launch(*args, **kwargs):
         pytest.fail("warm format projection re-entered its Python Metal launch")
 
-    monkeypatch.setattr(row_exact_qmv._Launch, "__call__", unexpected_launch)
+    monkeypatch.setattr(
+        row_exact_qmv.row_exact_skeleton.RowExactPlan, "__call__", unexpected_launch
+    )
     got = run(x)
     assert got.shape == want.shape and got.dtype == want.dtype
     assert mx.array_equal(_bits(got), _bits(want)).item()
@@ -1862,18 +1864,23 @@ def test_format_gdn_decode_keeps_composed_state_and_rebuilds_the_stack(
         plan = new_plan
 
 
+# The header directive that marks an unrolled row-exact kernel.
+_UNROLLED = '#define ROW_EXACT_UNROLL _Pragma("clang loop unroll(full)")'
+
+
 def test_gdn_format_tiles_bind_the_served_projection_geometry(format_gdn, monkeypatch):
+    from omlx.formats import row_exact_skeleton
     from omlx.patches import row_exact_qmv
 
     module = format_gdn(8, mx.bfloat16)
     seen = []
 
-    def kernel(faces, unrolled, constants):
-        assert len(faces) == 1
+    def compile_kernel(spec):
+        unrolled = _UNROLLED in spec["header"]
 
         def call(*, inputs, template, grid, threadgroup, output_shapes, output_dtypes):
-            assert template == [("T", mx.bfloat16)]
-            dims = dict(constants)
+            dims = dict(template)
+            assert dims.pop("T") == mx.bfloat16
             seen.append((dims, unrolled, grid, threadgroup))
             return [
                 mx.zeros(shape, dtype=d)
@@ -1882,7 +1889,10 @@ def test_gdn_format_tiles_bind_the_served_projection_geometry(format_gdn, monkey
 
         return call
 
-    monkeypatch.setattr(row_exact_qmv, "_kernel", kernel)
+    monkeypatch.setattr(row_exact_skeleton, "compile_kernel", compile_kernel)
+    monkeypatch.setattr(
+        row_exact_skeleton, "prove_dot_face", lambda *args, **kwargs: True
+    )
     monkeypatch.setattr(row_exact_qmv, "unrolled_tile_verified", lambda *args: True)
     decode = prework_mod._qwen4_decode_plan(module)
     verify = prework_mod._qwen4_verify_plan(module)
@@ -1900,11 +1910,10 @@ def test_gdn_format_tiles_bind_the_served_projection_geometry(format_gdn, monkey
             assert y.shape == (1, rows, size) and y.dtype == mx.bfloat16
             dims, unrolled, grid, threads = seen.pop()
             assert dims == {
-                "K": width,
+                "K_SIZE": width,
+                "N_SIZE": size,
                 "ROWS": group,
                 "RPS": rps,
-                "VPT": 8,
-                "N_0": size,
             }
             assert grid == (32, 2 * (rows // group), (size + 2 * rps - 1) // (2 * rps))
             assert threads == (32, 2, 1)

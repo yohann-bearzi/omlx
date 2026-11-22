@@ -30,6 +30,7 @@ __all__ = [
     "RowExactPolicy",
     "RowIndexWidth",
     "UnrollPolicy",
+    "row_exact_policy",
     "row_index_width",
 ]
 
@@ -43,6 +44,15 @@ def row_index_width(n: int, row_bytes: int) -> RowIndexWidth:
         if n * row_bytes < 2**31
         else RowIndexWidth.SIZE_T64
     )
+
+
+def row_exact_policy(
+    op_tag: str, rows: int, bits: int, k: int, n: int, chip_gen: int
+) -> RowExactPolicy | None:
+    """Look up a chip-tuned ``RowExactPolicy``, or None for the parity floor."""
+    if not ROW_EXACT_TABLE:
+        return None
+    return ROW_EXACT_TABLE.get((op_tag, rows, bits, k, n, chip_gen))
 
 
 # (op_tag, rows, bits, k, n, chip_gen) -> RowExactPolicy. The parity floor:

@@ -18,10 +18,12 @@ from dataclasses import dataclass
 from functools import cache
 from string import Template
 from textwrap import indent
+from typing import Any
 
 import mlx.core as mx
 
-from . import Dot, affine, kernels
+from .. import formats
+from . import Dot, affine, kernels, tuning
 from .tuning import RowIndexWidth
 
 logger = logging.getLogger(__name__)
@@ -266,7 +268,10 @@ def dot_row_ops(face: Dot) -> RowOps:
             "row-exact launch"
         )
     return RowOps(
-        face.source + face.shared, ("weight", *face.tensors), _DOT_SLOTS, face
+        face.emitted_source + face.emitted_shared,
+        ("weight", *face.tensors),
+        _DOT_SLOTS,
+        face,
     )
 
 
@@ -571,4 +576,309 @@ def prove_dot_face(
         logger,
         f"quant format face {face.key}: row-exact skeleton engaged",
         f"quant format face {face.key}: row-exact skeleton contract failed; fallback",
+    )
+
+
+@cache
+def _affine_spec(
+    bits: int,
+    group_size: int,
+    fast: bool,
+    unrolled: bool,
+    group_count: int,
+    index_width: RowIndexWidth,
+) -> dict:
+    ops = affine_row_ops(bits, group_size, fast, index_width)
+    return kernel_spec(ops, bits, group_size, fast, unrolled, group_count, index_width)
+
+
+@cache
+def _dot_spec(
+    faces: tuple[Dot, ...], fast: bool, unrolled: bool, group_count: int
+) -> dict:
+    ops = tuple(dot_row_ops(face) for face in faces)
+    group = f"_group{group_count}" if group_count else ""
+    suffix = "_u" if unrolled else ""
+    keys = "_".join(face.key for face in faces)
+    symbol = f"omlx_row_exact_dot{group}_{keys}_{int(fast)}{suffix}"
+    return emit_row_exact_kernel(ops, fast, unrolled, group_count, symbol)
+
+
+@cache
+def _kernel_from_spec(
+    name: str,
+    input_names: tuple[str, ...],
+    output_names: tuple[str, ...],
+    header: str,
+    source: str,
+):
+    return mx.fast.metal_kernel(
+        name=name,
+        input_names=list(input_names),
+        output_names=list(output_names),
+        header=header,
+        source=source,
+    )
+
+
+def compile_kernel(spec: dict):
+    """Compile one emitted row-exact kernel spec into an MLX Metal kernel.
+
+    The unroll choice is part of the spec (its name and header), so a caller
+    cannot compile another variant through this entry point."""
+    return _kernel_from_spec(
+        spec["name"],
+        tuple(spec["input_names"]),
+        tuple(spec["output_names"]),
+        spec["header"],
+        spec["source"],
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RowExactPlan:
+    """Immutable launch plan built once at construction / first signature.
+
+    Holds every construction-time decision (rule 28): compiled kernel, spec,
+    grid, threadgroup, template, output shapes/dtypes, index width,
+    pre-flattened operands and identity checks, and optional
+    unrolled-verification key. Hot ``__call__`` performs zero geometry,
+    source, or operand assembly.
+    """
+
+    kernel: Any
+    spec: dict
+    grid: tuple[int, int, int]
+    threadgroup: tuple[int, int, int]
+    template: list[tuple[str, Any]]
+    output_shapes: list[tuple[int, ...]]
+    output_dtypes: list[mx.Dtype]
+    padding: int
+    faces: tuple[Dot, ...]
+    names: tuple[str, ...]
+    index_width: RowIndexWidth
+    operands: tuple[mx.array, ...]
+    operand_keys: tuple[tuple[str, ...], ...]
+    shape: tuple | None
+    direct_input: bool = False
+    single_checks: tuple[tuple[str, mx.array], ...] = ()
+    group_checks: tuple[tuple[int, str, mx.array], ...] = ()
+
+    def operands_match(self, linears) -> bool:
+        """True when every layer's tensors are still the exact arrays cached
+        in ``self.operands`` (lock-free, zero ``id()`` audit events)."""
+        dget = dict.get
+        for idx, key, arr in self.group_checks:
+            if dget(linears[idx], key) is not arr:
+                return False
+        return True
+
+    def __call__(
+        self, x: mx.array, operands: tuple[mx.array, ...] | None = None
+    ) -> list:
+        """Launch the planned kernel for ``x`` using pre-flattened operands
+        (or explicit ``operands`` when a compiled graph passes traced arrays)."""
+        ops = self.operands if operands is None else operands
+        if not self.direct_input:
+            if not self.padding:
+                return self.kernel(
+                    inputs=[x, *ops],
+                    template=self.template,
+                    grid=self.grid,
+                    threadgroup=self.threadgroup,
+                    output_shapes=self.output_shapes,
+                    output_dtypes=self.output_dtypes,
+                )
+            rows = x.shape[0]
+            outputs = self.kernel(
+                inputs=[mx.pad(x, [(0, self.padding), (0, 0)]), *ops],
+                template=self.template,
+                grid=self.grid,
+                threadgroup=self.threadgroup,
+                output_shapes=self.output_shapes,
+                output_dtypes=self.output_dtypes,
+            )
+            return [y[:rows] for y in outputs]
+        return self.kernel(
+            inputs=[x, *ops],
+            template=self.template,
+            grid=self.grid,
+            threadgroup=self.threadgroup,
+            output_shapes=[(*x.shape[:-1], self.output_shapes[0][-1])],
+            output_dtypes=self.output_dtypes,
+        )
+
+
+def build_plan(
+    faces: tuple[Dot, ...],
+    shapes: tuple[int, ...],
+    k: int,
+    rows: int,
+    dtype: mx.Dtype,
+    geometry: tuple[int, int, bool],
+    *,
+    operands: tuple[mx.array, ...] = (),
+    names: tuple[str, ...] = (),
+    operand_keys: tuple[tuple[str, ...], ...] = (),
+    grouped: bool = False,
+    index_width: RowIndexWidth | None = None,
+    direct_input: bool = False,
+    row_bytes: int | None = None,
+) -> RowExactPlan | None:
+    """Build an immutable ``RowExactPlan`` for one or more ``Dot`` faces.
+
+    Resolves affine-slot vs generic ``dot_row_ops`` binding, ``RowIndexWidth``,
+    cold-proof contract verification for plugin/tabled/mixed faces, kernel
+    compilation, template arguments, grid, and pre-flattened operands once at
+    construction time (rules 25, 28).
+    """
+    faces = tuple(faces)
+    shapes = tuple(int(n) for n in shapes)
+    per_group, rps, unrolled = geometry
+    if (
+        not faces
+        or len(faces) != len(shapes)
+        or k < 8
+        or rows < 1
+        or per_group < 1
+        or rps < 1
+        or any(n < 1 for n in shapes)
+    ):
+        return None
+    if len({face.vpt for face in faces}) != 1 or faces[0].vpt < 1:
+        return None
+    if not grouped and len(faces) != 1:
+        return None
+
+    padding = -rows % per_group
+    padded = rows + padding
+    # A direct-input plan launches ``x`` as it is and shapes one output: only
+    # an unpadded single-projection launch can take it.
+    if direct_input and (grouped or padding):
+        return None
+    affine_specs = [affine.row_ops_spec(face) for face in faces]
+    homogeneous_affine = (
+        affine_specs[0] is not None
+        and all(spec == affine_specs[0] for spec in affine_specs)
+    )
+
+    max_n = max(shapes)
+    if index_width is None:
+        if row_bytes is not None:
+            rb = row_bytes
+        elif homogeneous_affine:
+            rb = k * affine_specs[0][0] // 8
+        elif operands:
+            rb = max(
+                (a.nbytes // max(a.shape[0], 1) for a in operands if a.ndim >= 1),
+                default=k,
+            )
+        else:
+            rb = k
+        index_width = tuning.row_index_width(max_n, max(rb, padded))
+
+    group_count = len(faces) if grouped else 0
+    if homogeneous_affine:
+        bits, group_size, fast = affine_specs[0]
+        spec = _affine_spec(bits, group_size, fast, unrolled, group_count, index_width)
+        kernel = compile_kernel(spec)
+        shape_key = (
+            (
+                "affine",
+                bits,
+                group_size,
+                fast,
+                index_width,
+                group_count,
+                dtype,
+                k,
+                shapes,
+                per_group,
+                rps,
+            )
+            if unrolled
+            else None
+        )
+    else:
+        if kernels.table_bytes(*faces) > formats.TABLE_BYTES:
+            return None
+        if operands:
+            pos = 0
+            proven: set[tuple] = set()
+            for face, n in zip(faces, shapes):
+                arity = 1 + len(face.tensors)
+                if pos + arity > len(operands):
+                    return None
+                op_specs = tuple(
+                    (a.shape, a.dtype) for a in operands[pos : pos + arity]
+                )
+                pos += arity
+                key = (face, n, op_specs)
+                if key not in proven:
+                    if not prove_dot_face(face, k, n, dtype, op_specs):
+                        return None
+                    proven.add(key)
+        vpt = faces[0].vpt
+        fast = (k % (32 * vpt)) == 0
+        spec = _dot_spec(faces, fast, unrolled, group_count)
+        kernel = compile_kernel(spec)
+        shape_key = (
+            ("dot", faces, fast, group_count, dtype, k, shapes, per_group, rps)
+            if unrolled
+            else None
+        )
+
+    if group_count:
+        template = [
+            ("T", dtype),
+            ("K_SIZE", k),
+            *((f"N_{i}", n) for i, n in enumerate(shapes)),
+            ("ROWS", per_group),
+            ("RPS", rps),
+        ]
+    else:
+        template = [
+            ("T", dtype),
+            ("K_SIZE", k),
+            ("N_SIZE", shapes[0]),
+            ("ROWS", per_group),
+            ("RPS", rps),
+        ]
+    tiles = sum((n + 2 * rps - 1) // (2 * rps) for n in shapes)
+    grid = (32, 2 * (padded // per_group), tiles)
+    threadgroup = (32, 2, 1)
+    output_shapes = [(padded, n) for n in shapes]
+    output_dtypes = [dtype] * len(shapes)
+    operands_t = tuple(operands)
+    keys_t = tuple(operand_keys)
+    group_checks: list[tuple[int, str, mx.array]] = []
+    if operands_t and keys_t:
+        pos = 0
+        for idx, keys in enumerate(keys_t):
+            for key in keys:
+                group_checks.append((idx, key, operands_t[pos]))
+                pos += 1
+    single_checks = (
+        tuple((key, arr) for _, key, arr in group_checks)
+        if len(keys_t) == 1
+        else ()
+    )
+    return RowExactPlan(
+        kernel=kernel,
+        spec=spec,
+        grid=grid,
+        threadgroup=threadgroup,
+        template=template,
+        output_shapes=output_shapes,
+        output_dtypes=output_dtypes,
+        padding=padding,
+        faces=faces,
+        names=tuple(names),
+        index_width=index_width,
+        operands=operands_t,
+        operand_keys=keys_t,
+        shape=shape_key,
+        direct_input=direct_input,
+        single_checks=single_checks,
+        group_checks=tuple(group_checks),
     )

@@ -6828,14 +6828,14 @@ def test_row_exact_verify_helpers_group_format_projections(monkeypatch, rows):
     )
     mx.eval(*serial)
     launches = []
-    run = row_exact_qmv._Launch.__call__
+    run = row_exact_qmv.RowExactPlan.__call__
 
-    def record(launch, values, operands):
+    def record(launch, values, operands=None):
         if len(launch.faces) == len(layers):
             launches.append(values.shape)
         return run(launch, values, operands)
 
-    monkeypatch.setattr(row_exact_qmv._Launch, "__call__", record)
+    monkeypatch.setattr(row_exact_qmv.RowExactPlan, "__call__", record)
     qwen35_verify_linear.apply()
     monkeypatch.setattr(qwen35_verify_qmm, "is_row_exact_armed", lambda: True)
     verifier = Qwen3_5BatchInvariantForward()

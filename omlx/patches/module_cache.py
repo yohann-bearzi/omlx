@@ -95,6 +95,16 @@ def epoch(module: nn.Module) -> int:
     return module.__dict__.get(_EPOCH_SLOT, 0)
 
 
+def register_slot(slot: str) -> None:
+    """Register a module ``__dict__`` slot that ``clear_cached`` drops.
+
+    A patch that keeps entries on a module outside ``cached_per_module``
+    registers its slot when it creates it, so clearing the module drops them
+    (and their references to replaced tensors) too."""
+    with _SLOTS_LOCK:
+        _SLOTS.add(slot)
+
+
 def publish(module: nn.Module, slot: str, since: int, entry) -> None:
     """Publish ``entry`` as ``module.__dict__[slot]``, a slot ``clear_cached``
     drops, unless the module was cleared since ``since`` (its epoch read
@@ -118,4 +128,4 @@ def clear_cached(module: nn.Module) -> None:
         d[_EPOCH_SLOT] = d.get(_EPOCH_SLOT, 0) + 1
 
 
-__all__ = ["cached_per_module", "clear_cached"]
+__all__ = ["cached_per_module", "clear_cached", "register_slot"]

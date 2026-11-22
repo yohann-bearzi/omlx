@@ -16,12 +16,12 @@ each weight block is decoded once and applied to all of them, and every
 with the same ``simd_sum`` (qmv's lane layout per column does not depend on
 how many columns a simdgroup owns or how many rows share the threadgroup).
 
-The tile runs over each matrix's dot face (``formats.dot``), through the
-shared-rows skeleton ``kernels.qmv_shared``, so any format layer with a dot
-face takes it too; one launch may run several projections of one input.
-``one_row_qmv`` runs it for the one-row decode call itself, with a narrower
-column tile than stock ``qmv_fast`` so more threadgroups stream the
-weights; it replaces ``quantized_matmul`` bit for bit.
+Both stock MLX affine layers and ``FormatLinear`` layers route through the
+unified ``omlx.formats.row_exact_skeleton`` (``RowExactPlan`` built once at
+construction / first signature); one launch may run several projections of
+one input. ``one_row_qmv`` runs it for the one-row decode call itself, with
+a narrower column tile than stock ``qmv_fast`` so more threadgroups stream
+the weights; it replaces ``quantized_matmul`` bit for bit.
 """
 
 from __future__ import annotations
@@ -29,15 +29,18 @@ from __future__ import annotations
 import logging
 import threading
 import weakref
+from dataclasses import replace
 from functools import cache
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
-from ..formats import Dot, affine, kernels
+from ..formats import Dot, affine, kernels, row_exact_skeleton, tuning
 from ..formats.affine import _GROUP_SIZES, qmv_fast_layout, values_per_thread
 from ..formats.linear import FormatLinear
+from ..formats.row_exact_skeleton import RowExactPlan
+from . import module_cache
 from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
@@ -50,162 +53,6 @@ MAX_ROWS = 16
 _BITS = (4, 5, 6, 8)
 # Large 6- and 8-bit heads can amortize padding over a shared weight pass.
 _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
-
-# One projection's tile: a threadgroup's two simdgroups own RPS output
-# columns each of tile `tile` (2 * RPS columns), for ROWS rows from row0.
-# Every K block of a column is decoded once and applied to the ROWS rows,
-# their inputs loaded ahead; each (row, column) accumulator is the one-row
-# call's. Simdgroups past N (a partial last tile) have nothing to compute.
-_TILE = kernels._compact(
-    r"""
-template <
-    typename T, int K, int N, int ROWS, int RPS, int VPT,
-    typename D, typename X, typename Y>
-METAL_FUNC void omlx_row_exact(D m, X x, Y y, int tile, int row0, uint sg, uint sl) {
-  constexpr bool PARTIAL = N % (2 * RPS) != 0;
-  const int out_row = tile * (2 * RPS) + int(sg) * RPS;
-  if constexpr (PARTIAL) {
-    if (out_row >= N) {
-      return;
-    }
-  }
-  const int valid = PARTIAL ? min(RPS, N - out_row) : RPS;
-  float result[ROWS * RPS];
-  qmv_shared<T, K, ROWS, RPS, VPT, PARTIAL>(
-      m, size_t(out_row), valid, x + row0 * K, sl, result);
-  if (sl == 0) {
-    for (int i = 0; i < ROWS; i++) {
-      for (int r = 0; r < RPS; r++) {
-        if constexpr (PARTIAL) {
-          if (r >= valid) {
-            break;
-          }
-        }
-        y[(row0 + i) * N + out_row + r] = static_cast<T>(result[i * RPS + r]);
-      }
-    }
-  }
-}
-"""
-)
-
-
-# Projection i's tile `tile` (of its own tiles).
-_CALL = (
-    "omlx_row_exact<T, K, N_{i}, ROWS, RPS, VPT>("
-    "m{i}, x, y{i}, {tile}, row0, sg, sl);"
-)
-
-
-def _launch_source(count: int) -> str:
-    """The body of a launch of ``count`` projections of one input: the tile
-    axis walks each projection's tiles in turn, and each writes its own
-    output."""
-    lines = [
-        "    const int tile = int(threadgroup_position_in_grid.z);",
-        "    const int row0 = int(threadgroup_position_in_grid.y) * ROWS;",
-        "    const uint sg = simdgroup_index_in_threadgroup;",
-        "    const uint sl = thread_index_in_simdgroup;",
-    ]
-    if count == 1:
-        return "\n".join([*lines, "    " + _CALL.format(i=0, tile="tile")]) + "\n"
-    lines.append("    int start = 0;")
-    for i in range(count):
-        lines += [
-            f"    constexpr int TILES_{i} = (N_{i} + 2 * RPS - 1) / (2 * RPS);",
-            f"    if (tile < start + TILES_{i}) {{",
-            "      " + _CALL.format(i=i, tile="tile - start"),
-            "      return;",
-            "    }",
-            f"    start += TILES_{i};",
-        ]
-    return "\n".join(lines) + "\n"
-
-
-def _source(faces: tuple, unrolled: bool) -> tuple[list[str], str, str]:
-    """The inputs, header and source of a launch over ``faces`` (one a
-    projection), the skeleton's loops unrolled in full if ``unrolled``."""
-    matrices = kernels.Matrices(unrolled=unrolled)
-    inputs = ["x"]
-    for i, face in enumerate(faces):
-        inputs += matrices.add(f"m{i}", face, shared=True)
-    source = matrices.declarations + _launch_source(len(faces))
-    return inputs, matrices.header + _TILE, source
-
-
-@cache
-def _kernel(faces: tuple, unrolled: bool, constants: tuple):
-    inputs, header, source = _source(faces, unrolled)
-    # MLX writes the template signature on each launch. Bind the integer
-    # dimensions once for all layers and verify lengths with this tile.
-    prefix = "".join(f"constexpr int {name} = {value};\n" for name, value in constants)
-    return mx.fast.metal_kernel(
-        name="omlx_row_exact_"
-        + "_".join(face.key for face in faces)
-        + ("_u_" if unrolled else "_")
-        + "_".join(str(value) for _, value in constants),
-        input_names=inputs,
-        output_names=[f"y{i}" for i in range(len(faces))],
-        header=header,
-        source=prefix + source,
-    )
-
-
-class _Launch:
-    """Static parameters of one launch of projections of one input (their
-    faces share a vpt): ``rows`` rows, ``per_group`` of them a threadgroup
-    (rows padded with zeros to whole groups), ``rps`` output columns a
-    simdgroup, the skeleton unrolled if ``unrolled``."""
-
-    __slots__ = (
-        "kernel",
-        "template",
-        "grid",
-        "output_shapes",
-        "output_dtypes",
-        "padding",
-        "shape",
-        "faces",
-        "names",
-    )
-
-    def __init__(self, faces, dtype, k, sizes, rows, per_group, rps, unrolled, names):
-        self.faces = tuple(faces)
-        self.names = tuple(names)
-        self.padding = -rows % per_group
-        padded = rows + self.padding
-        constants = (
-            ("K", k),
-            ("ROWS", per_group),
-            ("RPS", rps),
-            ("VPT", self.faces[0].vpt),
-            *((f"N_{i}", n) for i, n in enumerate(sizes)),
-        )
-        self.kernel = _kernel(self.faces, unrolled, constants)
-        self.template = [("T", dtype)]
-        tiles = sum((n + 2 * rps - 1) // (2 * rps) for n in sizes)
-        self.grid = (32, 2 * (padded // per_group), tiles)
-        self.output_shapes = [(padded, n) for n in sizes]
-        self.output_dtypes = [dtype] * len(sizes)
-        # What an unrolled launch's check is kept by (None: rolled).
-        self.shape = (self.faces, *self.template, *constants) if unrolled else None
-
-    def __call__(self, x: mx.array, operands) -> list:
-        """The outputs for ``x`` of shape [rows, K] and each projection's
-        operands (its weight, then its face's tensors)."""
-        rows = x.shape[0]
-        if self.padding:
-            x = mx.pad(x, [(0, self.padding), (0, 0)])
-        outputs = self.kernel(
-            inputs=[x, *(a for matrix in operands for a in matrix)],
-            template=self.template,
-            grid=self.grid,
-            threadgroup=(32, 2, 1),
-            output_shapes=self.output_shapes,
-            output_dtypes=self.output_dtypes,
-        )
-        return [y[:rows] for y in outputs] if self.padding else outputs
-
 
 # The envelope of kernels.unrolled_tile_ok was measured on one GPU
 # generation; another compiler or GPU can still get a tile inside it wrong (an
@@ -230,9 +77,10 @@ def unrolled_tile_verified(
         x = (mx.random.normal((rows, k), key=mx.random.key(rows)) * 0.5).astype(dtype)
         got, want = run(x), reference(x)
         mx.eval(got, want)
-        verdict = _UNROLLED_VERDICTS[shape] = all(
+        verdict = all(
             mx.array_equal(a.reshape(b.shape), b).item() for a, b in zip(got, want)
         )
+        verdict = _UNROLLED_VERDICTS.setdefault(shape, verdict)
         if not verdict:
             logger.warning(
                 "row-exact unrolled tile %s differs from the one-row call on this "
@@ -279,8 +127,8 @@ def _face(linear, x: mx.array) -> Dot | None:
     elif not isinstance(linear, FormatLinear) or x.shape[-1] != linear.input_dims:
         return None
     k = int(x.shape[-1])
-    # MLX binds x as a constant below 8 elements; the shared tile reads it
-    # from device memory (linear.py's _plan refuses the same).
+    # MLX binds x as a constant below 8 elements; the tile reads it from
+    # device memory (linear.py's _plan refuses the same).
     if k < 8:
         return None
     face = formats.dot(linear, k, int(linear[formats.tensor_names(linear)[0]].shape[0]))
@@ -308,53 +156,94 @@ def _unrolled_ok(bits: int, rps: int, rows_per_group: int) -> bool:
     return kernels.unrolled_tile_ok(values_per_thread(bits, True), rps, rows_per_group)
 
 
-def _module_launch(linears, faces, x: mx.array, rows: int, geometry=None):
-    """The launch of ``linears`` (layers over ``faces``) for ``rows`` rows of
-    ``x``, on ``geometry`` (rows per threadgroup, columns per simdgroup,
-    unrolled) or the default one; None where ``geometry`` does not fit. A
-    threadgroup of several rows runs the unrolled skeleton inside
-    ``kernels.unrolled_tile_ok`` (by default, or as ``geometry`` asks), once
-    this GPU's bits are checked against the layers' one-row calls."""
+def _module_launch(
+    linears, faces, x: mx.array, rows: int, geometry=None, *, grouped: bool = True
+) -> RowExactPlan | None:
+    """Build a ``RowExactPlan`` for ``linears`` (layers over ``faces``) at
+    ``rows`` rows of ``x``, on ``geometry`` ``(rows_per_group, rps, unrolled)``
+    or the default policy; None where ``geometry`` does not fit or a plugin
+    face fails cold proof."""
     k = int(x.shape[-1])
     names = tuple(formats.tensor_names(linear)[0] for linear in linears)
-    sizes = [int(linear[name].shape[0]) for linear, name in zip(linears, names)]
+    operand_keys = tuple((name, *face.tensors) for name, face in zip(names, faces))
+    operands = tuple(
+        linear[key]
+        for linear, keys in zip(linears, operand_keys)
+        for key in keys
+    )
+    sizes = tuple(int(linear[name].shape[0]) for linear, name in zip(linears, names))
     vpt = faces[0].vpt
     if geometry is None:
         first = linears[0]
         bits = int(first.bits)
-        # The padding rule is affine's: a format layer of the built-in mode
-        # keeps it.
-        pad = getattr(first, "mode", "affine") == "affine" and _padded(
-            bits, qmv_fast_layout(k, max(sizes), bits), max(sizes), k
+        policy = tuning.row_exact_policy(
+            "group" if grouped else "linear",
+            rows,
+            bits,
+            k,
+            max(sizes),
+            kernels.gpu_generation(),
         )
-        per_group, rps = kernels.shared_geometry(vpt, max(sizes), rows, pad)
-        if bits == 6 and rows % per_group:
-            # Three inputs share a 6-bit decode. Four pads a five-row window
-            # to eight and regresses the 27B head on the M5 Max.
-            per_group = 3
-        unrolled = per_group > 1
+        if policy is not None:
+            per_group, rps, unrolled = (
+                policy.rows_per_group,
+                policy.rps,
+                policy.unrolled,
+            )
+        else:
+            # The padding rule is affine's: a format layer of the built-in
+            # mode keeps it.
+            pad = getattr(first, "mode", "affine") == "affine" and _padded(
+                bits, qmv_fast_layout(k, max(sizes), bits), max(sizes), k
+            )
+            per_group, rps = kernels.shared_geometry(vpt, max(sizes), rows, pad)
+            if bits == 6 and rows % per_group:
+                # Three inputs share a 6-bit decode. Four pads a five-row
+                # window to eight and regresses the 27B head on the M5 Max.
+                per_group = 3
+            unrolled = False
     else:
         per_group, rps, unrolled = geometry
         if per_group < 1 or rps < 1 or rows % per_group:
             return None
     unrolled = unrolled and kernels.unrolled_tile_ok(vpt, rps, per_group)
-    launch = _Launch(
-        faces, x.dtype, k, sizes, rows, per_group, rps, unrolled, names
+    plan = row_exact_skeleton.build_plan(
+        faces,
+        sizes,
+        k,
+        rows,
+        x.dtype,
+        (per_group, rps, unrolled),
+        operands=operands,
+        names=names,
+        operand_keys=operand_keys,
+        grouped=grouped,
     )
-    if launch.shape is not None:
+    if plan is None:
+        return None
+    if plan.shape is not None:
 
         def run(probe):
-            outputs = launch(probe, [_operands(m, f) for m, f in zip(linears, faces)])
+            outputs = plan(probe)
             return [_biased(m, y) for m, y in zip(linears, outputs)]
 
         def reference(probe):
             return [_one_row_calls(linear, probe) for linear in linears]
 
-        if not unrolled_tile_verified(launch.shape, run, reference, rows, k, x.dtype):
-            launch = _Launch(
-                faces, x.dtype, k, sizes, rows, per_group, rps, False, names
+        if not unrolled_tile_verified(plan.shape, run, reference, rows, k, x.dtype):
+            plan = row_exact_skeleton.build_plan(
+                faces,
+                sizes,
+                k,
+                rows,
+                x.dtype,
+                (per_group, rps, False),
+                operands=operands,
+                names=names,
+                operand_keys=operand_keys,
+                grouped=grouped,
             )
-    return launch
+    return plan
 
 
 def _format_plans(linear):
@@ -378,28 +267,89 @@ def _format_plans(linear):
 
 
 _GROUP_PLANS_LOCK = threading.Lock()
+_MISS = object()
+_DICT_GET = dict.get
+_PLANS_SLOT = "_omlx_row_exact_plans"
+_DECLINE_KEYS = ("weight", "scales", "biases", "bias")
+
+
+class _Declined:
+    """A cached refusal of one or more projections, with the tensors and bias
+    keys it was made under: the cache answers None only while they are still
+    the module's, and a build follows any of them changing."""
+
+    __slots__ = ("checks",)
+
+    def __init__(self, checks: tuple) -> None:
+        self.checks = checks
+
+    def matches(self, linears) -> bool:
+        dget = _DICT_GET
+        for idx, key, arr, present in self.checks:
+            if (key in linears[idx]) != present or dget(linears[idx], key) is not arr:
+                return False
+        return True
+
+
+def _declined(linears) -> _Declined:
+    """The refusal cache of ``linears``' current tensors and bias keys."""
+    dget = _DICT_GET
+    return _Declined(
+        tuple(
+            (idx, key, dget(linear, key), key in linear)
+            for idx, linear in enumerate(linears)
+            for key in _DECLINE_KEYS
+        )
+    )
 
 
 def _plans(linear) -> dict:
+    plans = linear.__dict__.get(_PLANS_SLOT)
+    if plans is not None:
+        return plans
     if isinstance(linear, FormatLinear):
         return _format_plans(linear)[0]
-    # Plans live on the (first) module, so they die with it; weights are
-    # read per call.
-    plans = linear.__dict__.get("_omlx_row_exact_plans")
-    if plans is None:
-        plans = linear.__dict__.setdefault("_omlx_row_exact_plans", {})
-    return plans
+    # Plans live on the (first) module, so they die with it; operand identities
+    # are checked lock-free on warm hits so weight writes refresh the plan.
+    # Registered, so ``clear_cached`` drops them with the tensors they hold.
+    module_cache.register_slot(_PLANS_SLOT)
+    return linear.__dict__.setdefault(_PLANS_SLOT, {})
 
 
-def _plan(linear, x: mx.array, rows: int) -> _Launch | None:
+def _plan(linear, x: mx.array, rows: int) -> RowExactPlan | None:
+    if not (1 <= rows <= MAX_ROWS):
+        return None
     plans = _plans(linear)
     key = (rows, x.dtype, x.shape[-1])
-    if key not in plans:
-        face = _face(linear, x) if 1 <= rows <= MAX_ROWS else None
-        plans[key] = (
-            None if face is None else _module_launch((linear,), (face,), x, rows)
-        )
-    return plans[key]
+    cached = plans.get(key, _MISS)
+    if cached is not _MISS:
+        if isinstance(cached, _Declined):
+            if cached.matches((linear,)):
+                return None
+        else:
+            dget = _DICT_GET
+            for name, arr in cached.single_checks:
+                if dget(linear, name) is not arr:
+                    break
+            else:
+                return cached
+    declined = _declined((linear,))
+    face = _face(linear, x)
+    built = (
+        None
+        if face is None
+        else _module_launch((linear,), (face,), x, rows, grouped=False)
+    )
+    existing = plans.get(key, _MISS)
+    if isinstance(existing, RowExactPlan):
+        dget = _DICT_GET
+        for name, arr in existing.single_checks:
+            if dget(linear, name) is not arr:
+                break
+        else:
+            return existing
+    plans[key] = built if built is not None else declined
+    return built
 
 
 def _one_row_calls(linear, x: mx.array) -> mx.array:
@@ -408,7 +358,8 @@ def _one_row_calls(linear, x: mx.array) -> mx.array:
 
 
 def _biased(linear, y: mx.array) -> mx.array:
-    return y + linear["bias"] if "bias" in linear else y
+    bias = _DICT_GET(linear, "bias")
+    return y + bias if bias is not None else y
 
 
 def quantized_linear(linear, x: mx.array) -> mx.array:
@@ -419,47 +370,133 @@ def quantized_linear(linear, x: mx.array) -> mx.array:
     than MAX_ROWS rows) run one one-row call per row, which is the serial
     decode call itself.
     """
-    lead = x.shape[:-1]
-    rows = 1
-    for size in lead:
-        rows *= size
+    shape = x.shape
+    k = shape[-1]
+    rows = x.size // k if k else 0
     if rows <= 1:
         return linear(x)
-    flat = x.reshape(rows, x.shape[-1])
-    launch = _plan(linear, x, rows)
-    if launch is None:
-        return _one_row_calls(linear, flat).reshape(*lead, -1)
-    (y,) = launch(
-        flat,
-        [(linear[launch.names[0]], *(linear[t] for t in launch.faces[0].tensors))],
-    )
-    return _biased(linear, y).reshape(*lead, -1)
+    dget = _DICT_GET
+    plans = linear.__dict__.get(_PLANS_SLOT)
+    if plans is not None:
+        plan = plans.get((rows, x.dtype, k), _MISS)
+        if plan is _MISS or isinstance(plan, _Declined):
+            plan = _plan(linear, x, rows)
+        else:
+            for name, arr in plan.single_checks:
+                if dget(linear, name) is not arr:
+                    plan = _plan(linear, x, rows)
+                    break
+    else:
+        plan = _plan(linear, x, rows)
+    flat = x if len(shape) == 2 else x.reshape(rows, k)
+    if plan is None:
+        y = _one_row_calls(linear, flat)
+        return y if len(shape) == 2 else y.reshape(*shape[:-1], -1)
+    y = plan(flat)[0]
+    bias = dget(linear, "bias")
+    if bias is not None:
+        y = y + bias
+    return y if len(shape) == 2 else y.reshape(*shape[:-1], -1)
 
 
-def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _Launch | None:
-    if not linears:
+def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> RowExactPlan | None:
+    count = len(linears)
+    if not count or not (1 <= rows <= MAX_ROWS):
         return None
-    plans = _plans(linears[0])
+    first = linears[0]
+    plans = _plans(first)
+    dget = _DICT_GET
+    key = (count, rows, x.dtype, x.shape[-1], geometry)
+    if count == 1:
+        cached = plans.get(key, _MISS)
+        if cached is not _MISS:
+            if isinstance(cached, _Declined):
+                if cached.matches(linears):
+                    return None
+            elif "bias" not in first:
+                for name, arr in cached.single_checks:
+                    if dget(first, name) is not arr:
+                        break
+                else:
+                    return cached
+        declined = _declined(linears)
+        face = _face(first, x)
+        launch = (
+            _module_launch(linears, (face,), x, rows, geometry, grouped=True)
+            if (
+                face is not None
+                and "bias" not in first
+                and kernels.table_bytes(face) <= formats.TABLE_BYTES
+            )
+            else None
+        )
+        with _GROUP_PLANS_LOCK:
+            existing = plans.get(key, _MISS)
+            if isinstance(existing, RowExactPlan) and launch is not None:
+                if "bias" not in first:
+                    for name, arr in existing.single_checks:
+                        if dget(first, name) is not arr:
+                            break
+                    else:
+                        return existing
+            elif (
+                isinstance(existing, _Declined)
+                and launch is None
+                and existing.matches(linears)
+            ):
+                return None
+            plans[key] = launch if launch is not None else declined
+        return launch
     # The members after the first are keyed by their identity, not their
     # address: a weak reference to each, checked on every hit, so a freed
     # member's address reused by another layer cannot return its plan.
     # Entries are stored as immutable tuples so warm hits read lock-free
-    # without allocating weakrefs or lists; updates serialize under
-    # _GROUP_PLANS_LOCK outside _module_launch.
-    key = (len(linears), rows, x.dtype, x.shape[-1], geometry)
+    # without allocating weakrefs, lists or generators; updates serialize
+    # under _GROUP_PLANS_LOCK outside _module_launch. Format siblings are
+    # keyed by the tokens they had when the entry was built, so a warm hit
+    # compares stored tokens instead of re-slicing the members.
+    entries = plans.get(key)
+    if entries is not None:
+        for entry_refs, entry_fmt_checks, entry_launch in entries:
+            matched = True
+            for i, ref in enumerate(entry_refs, 1):
+                if ref() is not linears[i]:
+                    matched = False
+                    break
+            if not matched:
+                continue
+            for i, entry_token in entry_fmt_checks:
+                if _format_plans(linears[i])[1] is not entry_token:
+                    matched = False
+                    break
+            if not matched:
+                break
+            if isinstance(entry_launch, _Declined):
+                if entry_launch.matches(linears):
+                    return None
+                break
+            launch = entry_launch
+            ok = True
+            for m in linears:
+                if "bias" in m:
+                    ok = False
+                    break
+            if ok:
+                for idx, name, arr in launch.group_checks:
+                    if dget(linears[idx], name) is not arr:
+                        ok = False
+                        break
+            if ok:
+                return launch
+            break
     members = linears[1:]
-    tokens = tuple(
-        _format_plans(linear)[1]
-        for linear in members
+    fmt_checks = tuple(
+        (i, _format_plans(linear)[1])
+        for i, linear in enumerate(members, 1)
         if isinstance(linear, FormatLinear)
     )
-    for entry_refs, entry_tokens, launch in plans.get(key, ()):
-        if (
-            all(ref() is linear for ref, linear in zip(entry_refs, members))
-            and entry_tokens == tokens
-        ):
-            return launch
-    faces = [_face(linear, x) for linear in linears] if 1 <= rows <= MAX_ROWS else []
+    declined = _declined(linears)
+    faces = [_face(linear, x) for linear in linears]
     grouped = (
         faces
         and all(face is not None for face in faces)
@@ -467,41 +504,67 @@ def _group_plan(linears, x: mx.array, rows: int, geometry=None) -> _Launch | Non
         and not any("bias" in linear for linear in linears)
         and kernels.table_bytes(*faces) <= formats.TABLE_BYTES
     )
-    launch = _module_launch(linears, faces, x, rows, geometry) if grouped else None
+    launch = (
+        _module_launch(linears, faces, x, rows, geometry, grouped=True)
+        if grouped
+        else None
+    )
     refs = tuple(weakref.ref(linear) for linear in members)
+    stored = launch if launch is not None else declined
     with _GROUP_PLANS_LOCK:
         kept = []
         for entry in plans.get(key, ()):
-            entry_refs, entry_tokens, entry_launch = entry
+            entry_refs, entry_fmt_checks, entry_launch = entry
             if not all(ref() is not None for ref in entry_refs):
                 continue
             if all(ref() is linear for ref, linear in zip(entry_refs, members)):
-                if entry_tokens == tokens:
-                    return entry_launch
+                if entry_fmt_checks == fmt_checks:
+                    if (
+                        launch is None
+                        and isinstance(entry_launch, _Declined)
+                        and entry_launch.matches(linears)
+                    ):
+                        return None
+                    elif (
+                        launch is not None
+                        and isinstance(entry_launch, RowExactPlan)
+                        and entry_launch.operands_match(linears)
+                        and not any("bias" in linear for linear in linears)
+                    ):
+                        return entry_launch
                 continue
             kept.append(entry)
-        kept.append((refs, tokens, launch))
+        kept.append((refs, fmt_checks, stored))
         plans[key] = tuple(kept)
     return launch
+
+
+def _launch_group(plan: RowExactPlan, x: mx.array, rows: int, shape: tuple) -> tuple:
+    flat = x if len(shape) == 2 else x.reshape(rows, shape[-1])
+    outputs = plan(flat)
+    if len(shape) == 2:
+        return tuple(outputs)
+    lead = shape[:-1]
+    if len(outputs) == 1:
+        return (outputs[0].reshape(*lead, -1),)
+    return tuple([y.reshape(*lead, -1) for y in outputs])
 
 
 def quantized_linears(linears, x: mx.array) -> tuple:
     """``tuple(linear(x) for linear in linears)`` with one-row arithmetic per
     row, in a single launch when the projections have faces of one vpt and
     no bias, and their distinct tables fit in one launch."""
-    lead = x.shape[:-1]
-    rows = 1
-    for size in lead:
-        rows *= size
-    plan = _group_plan(linears, x, rows) if 1 < rows and 1 < len(linears) <= 4 else None
+    shape = x.shape
+    k = shape[-1]
+    rows = x.size // k if k else 0
+    plan = (
+        _group_plan(linears, x, rows)
+        if rows > 1 and 1 < len(linears) <= 4
+        else None
+    )
     if plan is None:
         return tuple(quantized_linear(linear, x) for linear in linears)
-    operands = [
-        (m[name], *(m[tensor] for tensor in face.tensors))
-        for m, face, name in zip(linears, plan.faces, plan.names)
-    ]
-    outputs = plan(x.reshape(rows, x.shape[-1]), operands)
-    return tuple(y.reshape(*lead, -1) for y in outputs)
+    return _launch_group(plan, x, rows, shape)
 
 
 def quantized_linears_tiled(
@@ -513,20 +576,35 @@ def quantized_linears_tiled(
     ``kernels.unrolled_tile_ok``). Every tile gives each row its one-row bits
     (at one row, the layer's own call's); None where the launch does not
     take these projections."""
-    lead = x.shape[:-1]
-    rows = 1
-    for size in lead:
-        rows *= size
-    linears = tuple(linears)
-    plan = _group_plan(linears, x, rows, (rows_per_group, rps, unrolled))
+    shape = x.shape
+    k = shape[-1]
+    rows = x.size // k if k else 0
+    geometry = (rows_per_group, rps, unrolled)
+    if not isinstance(linears, tuple):
+        linears = tuple(linears)
+    if len(linears) == 1:
+        first = linears[0]
+        plans = first.__dict__.get(_PLANS_SLOT)
+        if plans is not None:
+            plan = plans.get((1, rows, x.dtype, k, geometry), _MISS)
+            if plan is _MISS or isinstance(plan, _Declined):
+                plan = _group_plan(linears, x, rows, geometry)
+            elif plan is not None:
+                dget = _DICT_GET
+                if "bias" in first:
+                    plan = _group_plan(linears, x, rows, geometry)
+                else:
+                    for name, arr in plan.single_checks:
+                        if dget(first, name) is not arr:
+                            plan = _group_plan(linears, x, rows, geometry)
+                            break
+        else:
+            plan = _group_plan(linears, x, rows, geometry)
+    else:
+        plan = _group_plan(linears, x, rows, geometry)
     if plan is None:
         return None
-    operands = [
-        (m[name], *(m[tensor] for tensor in face.tensors))
-        for m, face, name in zip(linears, plan.faces, plan.names)
-    ]
-    outputs = plan(x.reshape(rows, x.shape[-1]), operands)
-    return tuple(y.reshape(*lead, -1) for y in outputs)
+    return _launch_group(plan, x, rows, shape)
 
 
 def format_rows_qmv(linear, dtype, geometry):
@@ -539,27 +617,49 @@ def format_rows_qmv(linear, dtype, geometry):
     operands = _operands(linear, face)
     operand_dtypes = tuple(a.dtype for a in operands)
     n = linear.output_dims
+    if affine.row_ops_spec(face) is None:
+        operand_specs = tuple((a.shape, a.dtype) for a in operands)
+        if not row_exact_skeleton.prove_dot_face(face, k, n, dtype, operand_specs):
+            return None
 
     @cache
     def tile(rows):
         rps, group = geometry(rows)
-        launch = _module_launch((linear,), (face,), probe, rows, (group, rps, rows > 1))
-        # The kernel already binds the face, geometry and verified unroll choice.
-        proof = kernels.proof("format_gdn_rows", launch.kernel, dtype, operand_dtypes)
-        return launch, proof
+        plan = _module_launch(
+            (linear,), (face,), probe, rows, (group, rps, rows > 1), grouped=False
+        )
+        if plan is None:
+            raise ValueError(f"no {rps}x{group} tile for {rows} rows of {n}")
+        # The plan binds the face, geometry and verified unroll choice; the
+        # proof key carries them too, so graphs of one width or tile are never
+        # replayed for another's launch.
+        proof = kernels.proof(
+            "format_gdn_rows",
+            plan.kernel,
+            tuple(plan.template),
+            plan.grid,
+            plan.padding,
+            dtype,
+            operand_dtypes,
+        )
+        return plan, proof
 
     def project(x):
         rows = x.size // k
-        launch, proof = tile(rows)
+        plan, proof = tile(rows)
         signature = (x.shape, x.dtype)
         graph = proof.graphs.get(signature)
         if graph is not None:
             return graph(x, *operands)
 
-        # Equal tiles share the graph on this thread, each with its own weights.
+        # Equal tiles share the graph on this thread, each with its own weights;
+        # the kept graph closes over an operand-free plan, so a proof outliving
+        # the project holds none of the layer's arrays.
+        graph_plan = replace(plan, operands=(), single_checks=(), group_checks=())
+
         @mx.compile
         def graph(value, *tensors):
-            (y,) = launch(value.reshape(rows, k), (tensors,))
+            (y,) = graph_plan(value.reshape(rows, k), tensors)
             return y.reshape(*value.shape[:-1], n)
 
         y = graph(x, *operands)
@@ -582,32 +682,31 @@ class OneRowQmv:
     kernel, whose launch geometry is fixed.
     """
 
-    __slots__ = ("_kernel", "_weights", "_template", "_grid", "_n", "_dtype")
+    __slots__ = ("_plan",)
 
     def __init__(self, weight, scales, biases, bits, group_size, dtype, rps):
         n = int(weight.shape[0])
         k = int(scales.shape[-1]) * group_size
         face = _affine_face(bits, group_size, dtype)
-        launch = _Launch((face,), dtype, k, [n], 1, 1, rps, False, ("weight",))
-        self._kernel, self._template, self._grid = (
-            launch.kernel,
-            launch.template,
-            launch.grid,
+        self._plan = row_exact_skeleton.build_plan(
+            (face,),
+            (n,),
+            k,
+            1,
+            dtype,
+            (1, rps, False),
+            operands=(weight, scales, biases),
+            names=("weight",),
+            operand_keys=(("weight", "scales", "biases"),),
+            grouped=False,
+            direct_input=True,
         )
-        self._weights = (weight, scales, biases)
-        self._n = n
-        self._dtype = dtype
+        if self._plan is None:
+            raise ValueError(f"row-exact tile: no plan for {n} outputs of {k} inputs")
 
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is one row ``[..., K]`` of the planned dtype."""
-        return self._kernel(
-            inputs=[x, *self._weights],
-            template=self._template,
-            grid=self._grid,
-            threadgroup=(32, 2, 1),
-            output_shapes=[(*x.shape[:-1], self._n)],
-            output_dtypes=[self._dtype],
-        )[0]
+        return self._plan(x)[0]
 
 
 def _affine_face(bits: int, group_size: int, dtype) -> Dot:
@@ -618,7 +717,9 @@ def _affine_face(bits: int, group_size: int, dtype) -> Dot:
     return affine.face(bits, group_size, True, dtype)  # refuses a group size MLX lacks
 
 
-def _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, rps) -> bool:
+def _qmv_fast_layout(
+    weight, scales, biases, bits, group_size, mode, dtype, rps
+) -> bool:
     """Stock one-row ``quantized_matmul`` runs ``qmv_fast`` on this layout
     (``qmv_fast_layout``) and ``2 * rps`` divides N."""
     if (
@@ -693,50 +794,64 @@ class RowsQmv:
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``[..., K]`` of the planned dtype, row-contiguous."""
         rows = x.size // self._k
-        launch = self._launch.get(rows)
-        if launch is None:
+        plan = self._launch.get(rows)
+        if plan is None:
             rps, per_group = self._geometry(rows)
             if (
-                rows % per_group
+                rows < 1
+                or per_group < 1
+                or rps < 1
+                or rows % per_group
                 or self._n % (2 * rps)
                 or (self._unrolled and not _unrolled_ok(self._bits, rps, per_group))
             ):
                 raise ValueError(
                     f"no {rps}x{per_group} tile for {rows} rows of {self._n}"
                 )
-            launch = _Launch(
+            plan = row_exact_skeleton.build_plan(
                 (self._face,),
-                self._dtype,
+                (self._n,),
                 self._k,
-                [self._n],
                 rows,
-                per_group,
-                rps,
-                self._unrolled,
-                ("weight",),
+                self._dtype,
+                (per_group, rps, self._unrolled),
+                operands=self._weights,
+                names=("weight",),
+                operand_keys=(("weight", "scales", "biases"),),
+                grouped=False,
+                direct_input=True,
             )
-            if launch.shape is not None and not unrolled_tile_verified(
-                launch.shape,
-                lambda probe: launch(probe, [self._weights]),
+            if plan is None:
+                raise ValueError(
+                    f"no {rps}x{per_group} tile for {rows} rows of {self._n}"
+                )
+            if plan.shape is not None and not unrolled_tile_verified(
+                plan.shape,
+                lambda probe: plan(probe),
                 _stock_rows([self._weights], self._bits, self._group_size),
                 rows,
                 self._k,
                 self._dtype,
             ):
-                launch = _Launch(
+                plan = row_exact_skeleton.build_plan(
                     (self._face,),
-                    self._dtype,
+                    (self._n,),
                     self._k,
-                    [self._n],
                     rows,
-                    per_group,
-                    rps,
-                    False,
-                    ("weight",),
+                    self._dtype,
+                    (per_group, rps, False),
+                    operands=self._weights,
+                    names=("weight",),
+                    operand_keys=(("weight", "scales", "biases"),),
+                    grouped=False,
+                    direct_input=True,
                 )
-            self._launch[rows] = launch
-        (y,) = launch(x.reshape(rows, self._k), [self._weights])
-        return y.reshape(*x.shape[:-1], self._n)
+                if plan is None:
+                    raise ValueError(
+                        f"no {rps}x{per_group} tile for {rows} rows of {self._n}"
+                    )
+            plan = self._launch.setdefault(rows, plan)
+        return plan(x)[0]
 
 
 def rows_qmv(

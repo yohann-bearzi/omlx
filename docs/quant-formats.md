@@ -1331,10 +1331,11 @@ face is exact for the rows' dtype and reads K in whole lanes; projections launch
 together have faces of one `vpt` and no bias. Other layers, and more than 16 rows, run
 one one-row call per row. A 2-D matrix of K 64 or 128 at 4 or 8 bits has no dot face
 (MLX's one-row call there is `qmv_quad`), so it runs its one-row calls: the bits of the
-serial decode step. Where a threadgroup applies its tile to several rows (outputs of
-2048 tiles or more, the vocabulary head) the skeleton runs unrolled inside
-`kernels.unrolled_tile_ok`, once the GPU's bits for that shape are checked against the
-layers' one-row calls; a shape that differs runs rolled.
+serial decode step. With the default tile the skeleton runs rolled; an explicit
+tile (`quantized_linears_tiled`, the GDN verify tiles) or a tuning-policy entry
+asks for the unrolled tile, inside `kernels.unrolled_tile_ok`, once the GPU's
+bits for that shape are checked against the layers' one-row calls; a shape that
+differs runs the rolled tile.
 A group whose distinct tables total more than 4096 bytes runs each projection
 separately. Equal tables count once toward the limit.
 A format projection's input width must match the layer's declared K. Verify

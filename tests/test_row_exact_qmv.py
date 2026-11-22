@@ -9,7 +9,6 @@ quantized projection has the serial step's bits; stock multi-row kernels
 from __future__ import annotations
 
 import gc
-import inspect
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -20,7 +19,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx import formats
-from omlx.formats import affine, testing
+from omlx.formats import row_exact_skeleton, testing
 from omlx.patches import qwen35_verify_qmm, row_exact_qmv
 from tests.test_formats_affine import MLX_MASKS, MLX_SCALES, mlx_branches
 from tests.test_formats_kernels import _toy
@@ -83,10 +82,9 @@ def test_a_tile_s_source_holds_its_own_bit_width_alone(bits, fast):
     branch of MLX's code for its width. A lane has all of its inputs in
     qmv_impl's last block or none: the skeleton reads it with load and
     apply, as a whole block, and the safe loads are not there."""
-    _, header, source = row_exact_qmv._source(
-        (affine.face(bits, 64, fast, mx.bfloat16),), False
-    )
-    metal = header + source
+    ops = row_exact_skeleton.affine_row_ops(bits, 64, fast)
+    spec = row_exact_skeleton.kernel_spec(ops, bits, 64, fast, False, 0)
+    metal = spec["header"] + spec["source"]
     assert mlx_branches(metal) == (MLX_MASKS[bits], MLX_SCALES[bits])
     assert "_safe" not in metal
 
@@ -100,7 +98,13 @@ def test_shared_down_reuses_its_shape_bound_kernel_across_verify_lengths():
         got = row_exact_qmv.quantized_linear(linear, x)
         assert _bit_equal(got, _serial(linear, x))
         plan = row_exact_qmv._plan(linear, x, rows)
-        assert plan.template == [("T", x.dtype)]
+        assert plan.template == [
+            ("T", x.dtype),
+            ("K_SIZE", k),
+            ("N_SIZE", n),
+            ("ROWS", 1),
+            ("RPS", 4),
+        ]
         plans.append(plan)
     assert plans[0].kernel is plans[1].kernel
     assert plans[0].grid != plans[1].grid
@@ -396,18 +400,32 @@ def test_unrolled_rows_qmv_refuses_tiles_past_the_register_envelope(
         launch(mx.zeros((1, 8, k), dtype=mx.bfloat16))
 
 
+# The header directive that marks an unrolled row-exact kernel (the name's
+# _u suffix is not enough: SIZE_T64 appends _i64 after it).
+_UNROLLED_HEADER = '#define ROW_EXACT_UNROLL _Pragma("clang loop unroll(full)")'
+
+
 def _miscompiled(factory):
     """``factory`` whose unrolled kernels return every output off by one, as a
     GPU whose compiler gets the unrolled tile wrong would."""
-    signature = inspect.signature(factory)
-
-    def make(*args, **kwargs):
-        kernel = factory(*args, **kwargs)
-        if not signature.bind(*args, **kwargs).arguments.get("unrolled", False):
+    def make(spec):
+        kernel = factory(spec)
+        if _UNROLLED_HEADER not in spec["header"]:
             return kernel
         return lambda **kw: [y + 1 for y in kernel(**kw)]
 
     return make
+
+
+def test_miscompiled_wraps_unrolled_size_t64_and_keyword_spec():
+    """The test helper sees an unrolled SIZE_T64 kernel (name _u_i64) and
+    accepts the spec by keyword, as compile_kernel does."""
+    spec = row_exact_skeleton._affine_spec(
+        8, 64, True, True, 0, row_exact_skeleton.RowIndexWidth.SIZE_T64
+    )
+    wrapped = _miscompiled(lambda s: (lambda **kw: [0]))
+    assert wrapped(spec)() == [1]
+    assert wrapped(spec=spec)() == [1]
 
 
 # A GPU that computes an unrolled tile wrong (an M3 Ultra did at 4-bit gs64)
@@ -427,7 +445,11 @@ def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypa
         ],
         axis=1,
     )
-    monkeypatch.setattr(row_exact_qmv, "_kernel", _miscompiled(row_exact_qmv._kernel))
+    monkeypatch.setattr(
+        row_exact_skeleton,
+        "compile_kernel",
+        _miscompiled(row_exact_skeleton.compile_kernel),
+    )
     launch = row_exact_qmv.rows_qmv(
         weight, scales, biases, bits, group_size, "affine", mx.bfloat16,
         lambda _: (2, 2), unrolled=True,
@@ -439,7 +461,11 @@ def test_rows_qmv_falls_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypa
 def test_grouped_tiles_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
     linears = [_linear(2560, n, 4, 64, seed) for seed, n in enumerate((1024, 512))]
     x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
-    monkeypatch.setattr(row_exact_qmv, "_kernel", _miscompiled(row_exact_qmv._kernel))
+    monkeypatch.setattr(
+        row_exact_skeleton,
+        "compile_kernel",
+        _miscompiled(row_exact_skeleton.compile_kernel),
+    )
     outputs = row_exact_qmv.quantized_linears_tiled(linears, x, 2, 4, True)
     for linear, observed in zip(linears, outputs):
         assert _bit_equal(observed, _serial(linear, x))
@@ -451,12 +477,11 @@ def test_engine_threads_keep_the_verdict_of_each_output_width(monkeypatch):
     widths = (16384, 16392)
     launches = {n: [] for n in widths}
     together = Barrier(2, timeout=30)
-    factory = row_exact_qmv._kernel
-    signature = inspect.signature(factory)
+    factory = row_exact_skeleton.compile_kernel
 
-    def observe(*args, **kwargs):
-        kernel = factory(*args, **kwargs)
-        unrolled = signature.bind(*args, **kwargs).arguments.get("unrolled", False)
+    def observe(spec):
+        kernel = factory(spec)
+        unrolled = _UNROLLED_HEADER in spec["header"]
 
         def launch(**params):
             n = params["output_shapes"][0][-1]
@@ -468,7 +493,7 @@ def test_engine_threads_keep_the_verdict_of_each_output_width(monkeypatch):
 
         return launch
 
-    monkeypatch.setattr(row_exact_qmv, "_kernel", observe)
+    monkeypatch.setattr(row_exact_skeleton, "compile_kernel", observe)
     monkeypatch.setattr(row_exact_qmv, "_UNROLLED_VERDICTS", {})
     layers = [_linear(512, n, 8, 64, seed=n) for n in widths]
     x = mx.random.normal((1, 4, 512), key=mx.random.key(8)).astype(mx.bfloat16)
@@ -477,7 +502,8 @@ def test_engine_threads_keep_the_verdict_of_each_output_width(monkeypatch):
 
     def call(layer, reference):
         for _ in range(2):
-            assert _bit_equal(row_exact_qmv.quantized_linear(layer, x), reference)
+            (got,) = row_exact_qmv.quantized_linears_tiled((layer,), x, 4, 4, True)
+            assert _bit_equal(got, reference)
 
     with ThreadPoolExecutor(max_workers=2) as engines:
         list(engines.map(call, layers, expected))
@@ -633,32 +659,38 @@ def test_a_matrix_of_mlx_s_quad_kernel_keeps_its_one_row_calls(k, bits):
 def test_shared_rows_run_the_unrolled_tile_this_gpu_computes_right():
     linear = _linear(2560, 16384, 8, 64, seed=10)
     x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
-    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
-    assert row_exact_qmv._plan(linear, x, 4).shape is not None
+    (got,) = row_exact_qmv.quantized_linears_tiled((linear,), x, 4, 4, True)
+    assert _bit_equal(got, _serial(linear, x))
+    assert row_exact_qmv._group_plan((linear,), x, 4, (4, 4, True)).shape is not None
     assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [True]
-    # One row a threadgroup: the rolled tile, unchecked.
-    narrow = _linear(2560, 1024, 8, 64, seed=10)
-    assert row_exact_qmv._plan(narrow, x, 4).shape is None
+    # Default quantized_linear keeps eae63b6c's rolled policy.
+    assert row_exact_qmv._plan(linear, x, 4).shape is None
     # Past the envelope (8 rows of 4 values on qmv's traversal: 32
-    # accumulators): rolled.
+    # accumulators): rolled even when unrolled=True is asked.
     wide = _linear(2624, 16384, 8, 64, seed=10)
     x = mx.random.normal((1, 8, 2624)).astype(mx.bfloat16)
-    plan = row_exact_qmv._plan(wide, x, 8)
+    plan = row_exact_qmv._group_plan((wide,), x, 8, (8, 4, True))
     assert plan.grid[1] == 2 and plan.shape is None
-    assert _bit_equal(row_exact_qmv.quantized_linear(wide, x), _serial(wide, x))
+    (got_wide,) = row_exact_qmv.quantized_linears_tiled((wide,), x, 8, 4, True)
+    assert _bit_equal(got_wide, _serial(wide, x))
 
 
 def test_shared_rows_fall_back_when_this_gpu_gets_the_unrolled_tile_wrong(monkeypatch):
     linear = _linear(2560, 16384, 8, 64, seed=11)
     x = mx.random.normal((1, 4, 2560)).astype(mx.bfloat16)
-    monkeypatch.setattr(row_exact_qmv, "_kernel", _miscompiled(row_exact_qmv._kernel))
-    assert _bit_equal(row_exact_qmv.quantized_linear(linear, x), _serial(linear, x))
-    assert row_exact_qmv._plan(linear, x, 4).shape is None
+    monkeypatch.setattr(
+        row_exact_skeleton,
+        "compile_kernel",
+        _miscompiled(row_exact_skeleton.compile_kernel),
+    )
+    (got,) = row_exact_qmv.quantized_linears_tiled((linear,), x, 4, 4, True)
+    assert _bit_equal(got, _serial(linear, x))
+    assert row_exact_qmv._group_plan((linear,), x, 4, (4, 4, True)).shape is None
     assert list(row_exact_qmv._UNROLLED_VERDICTS.values()) == [False]
 
 
 @pytest.mark.parametrize("k,bits", [(2560, 8), (5120, 6)], ids=["flash-next", "27b"])
-def test_vocabulary_head_verify_windows_launch_unrolled_tiles(monkeypatch, k, bits):
+def test_vocabulary_head_verify_windows_equal_serial(k, bits):
     # Repeat packed rows to build the full head without a dense vocabulary matrix.
     n = 248320
     head = _linear(k, 32, bits, 64, seed=bits)
@@ -666,33 +698,12 @@ def test_vocabulary_head_verify_windows_launch_unrolled_tiles(monkeypatch, k, bi
         head[name] = mx.tile(head[name], (n // 32, 1))
     mx.eval(head.parameters())
 
-    # Observe the launch after the first-use bit check, including a rolled fallback.
-    launches = []
-    factory = row_exact_qmv._kernel
-    signature = inspect.signature(factory)
-
-    def observe(*args, **kwargs):
-        kernel = factory(*args, **kwargs)
-        unrolled = signature.bind(*args, **kwargs).arguments.get("unrolled", False)
-
-        def launch(**params):
-            launches.append(unrolled)
-            return kernel(**params)
-
-        return launch
-
-    monkeypatch.setattr(row_exact_qmv, "_kernel", observe)
     x = mx.random.normal((1, 16, k), key=mx.random.key(k)).astype(mx.bfloat16)
     serial = _serial(head, x)
     mx.eval(serial)
-    missed = []
     for rows in range(2, 17):
-        launches.clear()
         got = row_exact_qmv.quantized_linear(head, x[:, :rows])
         assert _bit_equal(got, serial[:, :rows]), rows
-        if not launches or not launches[-1]:
-            missed.append(rows)
-    assert missed == [], f"verify widths without an unrolled head launch: {missed}"
 
 
 @testing.verified("qwen4_exp")
@@ -946,10 +957,12 @@ def test_warm_group_launch_avoids_id_audit_events(monkeypatch):
 
 
 def test_tile_store_loop_keeps_compile_time_bounds():
-    """The store loop keeps a compile-time bound (RPS) and both partial
-    branches are if constexpr: no runtime index into result."""
-    assert "for (int r = 0; r < RPS; r++)" in row_exact_qmv._TILE
-    assert row_exact_qmv._TILE.count("if constexpr (PARTIAL)") == 2
+    """The skeleton's fused simd_sum+store loop keeps compile-time RPS bounds
+    and guards partial tiles with constexpr PARTIAL."""
+    row_tpl = row_exact_skeleton._ROW.template
+    assert "for (int r = 0; r < RPS; r++)" in row_tpl
+    assert "constexpr bool PARTIAL = (N_OUT % (2 * RPS)) != 0;" in row_tpl
+    assert "if (PARTIAL && r >= valid)" in row_tpl
 
 
 @testing.verified("qwen4_exp")
@@ -973,6 +986,45 @@ def test_group_plan_rechecks_when_sibling_mutates_during_build(monkeypatch):
     assert row_exact_qmv._group_plan((first, second), x, 3) is None
 
 
+@testing.verified("qwen4_exp")
+def test_group_plan_does_not_cache_refusal_after_bias_removed_during_build(
+    monkeypatch,
+):
+    """A refusal is snapshotted before the build: a bias removed while the
+    launch is being declined is not recorded as still present."""
+    first = _linear(320, 40, 8, 64, 1)
+    second = _linear(320, 72, 8, 64, 2)
+    second["bias"] = None
+    x = mx.ones((1, 3, 320), mx.bfloat16)
+    real = row_exact_qmv.weakref.ref
+    removed = []
+
+    def remove_bias_once(obj, *args, **kwargs):
+        if obj is second and not removed:
+            removed.append(True)
+            del second["bias"]
+        return real(obj, *args, **kwargs)
+
+    monkeypatch.setattr(row_exact_qmv.weakref, "ref", remove_bias_once)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is None
+    monkeypatch.setattr(row_exact_qmv.weakref, "ref", real)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is not None
+
+
+def test_out_of_range_rows_do_not_populate_plan_cache():
+    """Rows outside 1..MAX_ROWS are every call's one-row fallback; they cache
+    no refusal (and no tensor references) on the module."""
+    layer = _linear(256, 32, 8, 64, 1)
+    row_exact_qmv.quantized_linear(
+        layer, mx.zeros((1, row_exact_qmv.MAX_ROWS + 5, 256), mx.bfloat16)
+    )
+    assert "_omlx_row_exact_plans" not in layer.__dict__
+    row_exact_qmv.quantized_linears_tiled(
+        (layer,), mx.zeros((1, 0, 256), mx.bfloat16), 2, 4
+    )
+    assert "_omlx_row_exact_plans" not in layer.__dict__
+
+
 def test_quantized_linears_tiled_returns_none_for_zero_rows_or_invalid_tile():
     """Zero rows, empty projection lists, and non-positive tile arguments
     return None rather than failing inside concatenation or grid dispatch."""
@@ -983,6 +1035,28 @@ def test_quantized_linears_tiled_returns_none_for_zero_rows_or_invalid_tile():
     assert tiled((), mx.zeros((1, 2, 2560), mx.bfloat16), 1, 4) is None
     assert tiled(linears, mx.zeros((1, 2, 2560), mx.bfloat16), 0, 4) is None
     assert tiled(linears, mx.zeros((1, 2, 2560), mx.bfloat16), 1, 0) is None
+
+
+def test_rows_qmv_rejects_empty_rows_or_non_positive_geometry():
+    """RowsQmv refuses an empty input and a non-positive tile with ValueError
+    from the plan build, never AttributeError on a missing plan."""
+    weight, scales, biases = _quantized(256, 32, 8, 64, mx.bfloat16, seed=13)
+    empty = mx.zeros((1, 0, 256), dtype=mx.bfloat16)
+    rows = mx.zeros((1, 2, 256), dtype=mx.bfloat16)
+    qmv = row_exact_qmv.rows_qmv(
+        weight, scales, biases, 8, 64, "affine", mx.bfloat16, lambda _: (4, 1)
+    )
+    with pytest.raises(ValueError, match="tile"):
+        qmv(empty)
+    for geometry in (lambda _: (4, -1), lambda _: (-1, 1)):
+        qmv = row_exact_qmv.rows_qmv(
+            weight, scales, biases, 8, 64, "affine", mx.bfloat16, geometry
+        )
+        with pytest.raises(ValueError, match="tile"):
+            qmv(rows)
+    with pytest.raises(ValueError, match="plan"):
+        row_exact_qmv.OneRowQmv(weight, scales, biases, 8, 64, mx.bfloat16, 0)
+
 
 
 @testing.verified("qwen4_exp")
@@ -1047,6 +1121,35 @@ def test_warm_group_plan_does_not_allocate_weakrefs(monkeypatch):
 
     monkeypatch.setattr(row_exact_qmv.weakref, "ref", fail_ref)
     assert row_exact_qmv._group_plan(layers, x, 3) is warm
+
+
+@testing.verified("qwen4_exp")
+def test_warm_format_group_hit_checks_stored_tokens_without_isinstance(monkeypatch):
+    """Sibling format tokens are captured with their indices at construction:
+    a warm hit compares the stored tokens, never re-slicing the members or
+    asking isinstance(sibling, FormatLinear)."""
+    formats.load()
+    monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("warm_fmt_tokens")))
+    first, _, _ = _toy_linear(40, 320, seed=1)
+    second, _, _ = _toy_linear(72, 320, seed=2)
+    x = mx.ones((1, 3, 320), mx.float32)
+    warm = row_exact_qmv._group_plan((first, second), x, 3)
+    assert warm is not None
+
+    real_format_linear = row_exact_qmv.FormatLinear
+
+    class _TrapMeta(type):
+        def __instancecheck__(cls, obj):
+            if obj is second:
+                pytest.fail("warm group hit ran isinstance(sibling, FormatLinear)")
+            return isinstance(obj, real_format_linear)
+
+    class _Trap(metaclass=_TrapMeta):
+        pass
+
+    monkeypatch.setattr(row_exact_qmv, "FormatLinear", _Trap)
+    assert row_exact_qmv._group_plan((first, second), x, 3) is warm
+
 
 
 def test_warm_quantized_linear_reuses_cached_packed_name(monkeypatch):
