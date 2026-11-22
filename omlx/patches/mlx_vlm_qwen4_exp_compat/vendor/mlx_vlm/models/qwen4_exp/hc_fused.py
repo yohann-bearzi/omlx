@@ -499,20 +499,29 @@ _DECODE_UP = r"""
 # its inject dot runs from there. The inject sum keeps one fixed order: virtual
 # thread v = s * VT + t (t < VT) sums elements [v * PER, (v + 1) * PER) of the
 # row, then simd_sum per 32 virtual threads, then the 8 partials in order.
-_TI_SOURCE = r"""
+# The tail inject over the inject projection's dot face, one row per
+# threadgroup: mixed = mean over streams of sigmoid(up) * normed, with BF16
+# rounding after each gate, product and partial sum; inj = 2 * sigmoid of the
+# inject dot, from the quantized four-row bank. The normed row is read once:
+# each stream is staged in threadgroup memory and its inject dot runs over the
+# face from there. The inject sum keeps the stock order: virtual thread
+# v = s * VT + t (t < VT) sums its contiguous PER values in whole face lanes,
+# then simd_sum per 32 virtual threads, then the 8 partials in order, and the
+# row's face finishes the total once.
+_TAIL_INJECT = r"""
+    using L = typename decltype(inject)::template Lanes<K>;
     const uint row = threadgroup_position_in_grid.z;
     const uint t = thread_index_in_threadgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint lane = thread_index_in_simdgroup;
     constexpr int PER_H = (H + 255) / 256;
-    constexpr int PF = hc_pack_factor<BITS_I>();
-    constexpr int BP = hc_bytes_per_pack<BITS_I>();
-    constexpr int ROW_BYTES = K * BP / PF;
-    constexpr int GROUPS = K / GS_I;
     constexpr int PER = K / 256;
     constexpr int VT = H / PER;
+    constexpr int CHUNKS = PER / L::VPT;
+    constexpr int PARTS = VT / 32;
     static_assert(K == HC * H && H % PER == 0 && VT % 32 == 0 && HC * VT == 256,
                   "inject chunks must tile each stream");
+    static_assert(PER % L::VPT == 0, "an inject chunk must hold whole lanes");
     threadgroup T xs[H];
     threadgroup float part[HC][8];
     const device T* up_r = up + (size_t)row * K;
@@ -533,22 +542,19 @@ _TI_SOURCE = r"""
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (int(t) < VT) {
             float res[HC] = {0.0f};
-            float xv[PF];
+            float xv[L::VPT];
             const int e0 = int(t) * PER;
-            for (int e = e0; e < e0 + PER; e += PF) {
-                const float sum = hc_load_vector_tg<T, PF, BITS_I>(xs + e, xv);
-                const int ge = s * H + e;
-                const int g = ge / GS_I;
+            const uint c0 = uint((s * H + e0) / L::VPT);
+            for (int i = 0; i < CHUNKS; ++i) {
+                const auto aux = L::load((const threadgroup T*)(xs + e0 + i * L::VPT), xv);
+                const L cursor(inject, 0, c0 + uint(i));
                 for (int r = 0; r < HC; ++r) {
-                    res[r] += hc_qdot<PF, BITS_I>(
-                        (const device uint8_t*)inject_w + r * ROW_BYTES + ge * BP / PF,
-                        xv, float(inject_s[r * GROUPS + g]), float(inject_b[r * GROUPS + g]),
-                        sum);
+                    res[r] = L::madd(res[r], cursor.row(r), xv, aux);
                 }
             }
             for (int r = 0; r < HC; ++r) {
-                const float v = simd_sum(res[r]);
-                if (lane == 0) part[r][s * (VT / 32) + int(sg)] = v;
+                const float v = metal::simd_sum(res[r]);
+                if (lane == 0) part[r][s * PARTS + int(sg)] = v;
             }
         }
         // Stream s + 1 overwrites xs only after every inject read of stream s.
@@ -561,55 +567,13 @@ _TI_SOURCE = r"""
     if (t < HC) {
         float v = 0.0f;
         for (int i = 0; i < 8; ++i) v += part[t][i];
+        v = L(inject, int(t), 0).finish(0, v);
         const float q = float(T(float(T(v)) / float(HC)));
         const float gate = float(T(1.0f / (1.0f + metal::exp(-q))));
         inj[(size_t)row * HC + t] = T(2.0f * gate);
     }
 """
 
-# hc_load_vector for a threadgroup-staged vector; same arithmetic as the device form.
-_TG_HEADER = r"""
-template <typename T, int N, int bits>
-inline float hc_load_vector_tg(const threadgroup T* x, thread float* xt) {
-    float sum = 0.0f;
-    if (bits == 4) {
-        for (int i = 0; i < N; i += 4) {
-            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-            xt[i] = x[i];
-            xt[i + 1] = x[i + 1] / 16.0f;
-            xt[i + 2] = x[i + 2] / 256.0f;
-            xt[i + 3] = x[i + 3] / 4096.0f;
-        }
-    } else if (bits == 5) {
-        for (int i = 0; i < N; i += 8) {
-            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3])
-                + float(x[i + 4]) + float(x[i + 5]) + float(x[i + 6]) + float(x[i + 7]);
-            xt[i] = x[i];
-            xt[i + 1] = x[i + 1] / 32.0f;
-            xt[i + 2] = x[i + 2] / 4.0f;
-            xt[i + 3] = x[i + 3] / 128.0f;
-            xt[i + 4] = x[i + 4] / 16.0f;
-            xt[i + 5] = x[i + 5] / 2.0f;
-            xt[i + 6] = x[i + 6] / 64.0f;
-            xt[i + 7] = x[i + 7] / 8.0f;
-        }
-    } else if (bits == 6) {
-        for (int i = 0; i < N; i += 4) {
-            sum += float(x[i]) + float(x[i + 1]) + float(x[i + 2]) + float(x[i + 3]);
-            xt[i] = x[i];
-            xt[i + 1] = x[i + 1] / 64.0f;
-            xt[i + 2] = x[i + 2] / 16.0f;
-            xt[i + 3] = x[i + 3] / 4.0f;
-        }
-    } else if (bits == 8) {
-        for (int i = 0; i < N; ++i) {
-            sum += x[i];
-            xt[i] = x[i];
-        }
-    }
-    return sum;
-}
-"""
 
 def _kernel(
     name: str,
@@ -993,6 +957,61 @@ def _kernel_norm_down(launch, module, flat, operands, weights):
     return launch(inputs=[flat, *operands, *norm, *weights])
 
 
+def _tail_inject_ok(width, hidden, hc, dtype, face) -> bool:
+    """Whether the prefill tail inject's face tiles 256 threads and fits the
+    threadgroup: its staged stream, the partials and its tables."""
+    return (
+        face is not None
+        and face.vpt >= 1
+        and width % (256 * face.vpt) == 0
+        and hidden * dtype.size + hc * 32 + kernels.table_bytes(face)
+        <= _TG_MEMORY_BYTES
+    )
+
+
+@functools.cache
+def _tail_inject_launch(hc, hidden, dtype, inject_face):
+    """The prefill tail inject's launch for one geometry and face, or None
+    when the face does not fit. Everything per call is resolved here: the
+    call builds only the two output shapes and the grid. This callable holds
+    kernel arguments shared by layers and threads; each call reads its own
+    layer's arrays, including replacements after a load."""
+    if inject_face is None or not _tail_inject_ok(
+        hc * hidden, hidden, hc, dtype, inject_face
+    ):
+        return None
+    width = hc * hidden
+    read = _matrix_reader(inject_face)
+    kernel = kernels.face_kernel(
+        "omlx_qwen4_hc_prefill_tail_inject",
+        ("up", "xn", "inject"),
+        {"inject": inject_face},
+        ("mixed", "inj"),
+        "",
+        _TAIL_INJECT,
+    )
+    template = [("T", dtype), ("K", width), ("H", hidden), ("HC", hc)]
+    dtypes = [dtype, dtype]
+    warm = []  # the native kernel, once the first call recorded the instance
+
+    def run(rows, up, normed, inject_layer):
+        launch = dict(
+            inputs=[up, normed, *read(inject_layer)],
+            template=template,
+            grid=(256, 1, rows),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(rows, hidden), (rows, hc)],
+            output_dtypes=dtypes,
+        )
+        if warm:
+            return warm[0](**launch)
+        out = kernel(**launch)
+        warm.append(kernel.native)
+        return out
+
+    return run
+
+
 @functools.cache
 def _decode_launch(
     rows, hc, hidden, lowrank, dtype, down_face, up_face, inj_face, write
@@ -1310,51 +1329,31 @@ def prefill_forward(module, hyper_input, write=None, nax=True):
         normed = normed.reshape(hyper_input.shape)
         mix = _act(hc)(module.input_mix_weight_down(normed))
         up = module.input_mix_weight_up(mix)
-        if inject is None or width % (256 * _pack_factor(inject.bits)):
-            # Each of the 256 threads dots whole packs of the inject row.
+        tail_launch = None
+        if inject is not None:
+            # The face and the launch depend on the layer's layout and the
+            # input's dtype alone: resolve them once per module and dtype.
+            plan = module.__dict__.get("_hc_tail_inject")
+            if plan is None or plan[0] is not inject or plan[1] != dtype:
+                tail_launch = _tail_inject_launch(
+                    hc, hidden, dtype, _decode_face(inject, True)
+                )
+                module.__dict__["_hc_tail_inject"] = (inject, dtype, tail_launch)
+            else:
+                tail_launch = plan[2]
+        if tail_launch is None:
             mixed = _tail(hc, hidden)(up, normed)
             injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
         else:
-            mixed, injection = _kernel(
-                "omlx_qwen4_hc_prefill_tail_inject",
-                ["up", "xn", "inject_w", "inject_s", "inject_b"],
-                ["mixed", "inj"],
-                _TI_SOURCE,
-                header=_HEADER + _TG_HEADER,
-            )(
-                inputs=[
-                    up.reshape(rows, width),
-                    normed.reshape(rows, width),
-                    inject.weight,
-                    inject.scales,
-                    inject.biases,
-                ],
-                template=[
-                    ("T", dtype),
-                    ("BITS_I", inject.bits),
-                    ("GS_I", inject.group_size),
-                    ("K", width),
-                    ("H", hidden),
-                    ("HC", hc),
-                ],
-                grid=(256, 1, rows),
-                threadgroup=(256, 1, 1),
-                output_shapes=[(rows, hidden), (rows, hc)],
-                output_dtypes=[dtype, dtype],
+            mixed, injection = tail_launch(
+                rows,
+                up.reshape(rows, width),
+                normed.reshape(rows, width),
+                inject,
             )
             mixed = mixed.reshape(*hyper_input.shape[:-1], hidden)
             injection = injection.reshape(*hyper_input.shape[:-1], hc)
-        signature = (
-            "prefill",
-            dtype,
-            hc,
-            hidden,
-            module.hc_lowrank,
-            module.input_mix_weight_down.bits,
-            inject.bits if inject is not None else None,
-            inject.group_size if inject is not None else None,
-            write is not None,
-        )
+        signature = ("prefill", dtype, hc, hidden, write is not None, tail_launch)
         if signature not in _VALIDATED:
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)

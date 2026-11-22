@@ -495,36 +495,30 @@ def test_prefill_tail_inject_keeps_reference_bits(bits, rows, seed, group_size):
     up = (mx.random.normal((rows, WIDTH)) * 3).astype(mx.bfloat16)
     normed = (mx.random.normal((rows, WIDTH)) * 2).astype(mx.bfloat16)
 
-    def run(name, source, header):
-        return hc_fused._kernel(
-            name,
-            ["up", "xn", "inject_w", "inject_s", "inject_b"],
-            ["mixed", "inj"],
-            source,
-            header=header,
-        )(
-            inputs=[up, normed, inject.weight, inject.scales, inject.biases],
-            template=[
-                ("T", mx.bfloat16),
-                ("BITS_I", bits),
-                ("GS_I", group_size),
-                ("K", WIDTH),
-                ("H", HIDDEN),
-                ("HC", HC),
-            ],
-            grid=(256, 1, rows),
-            threadgroup=(256, 1, 1),
-            output_shapes=[(rows, HIDDEN), (rows, HC)],
-            output_dtypes=[mx.bfloat16, mx.bfloat16],
-        )
-
-    expected = run(
-        "test_reference_tail_inject", _REFERENCE_TAIL_INJECT, hc_fused._HEADER
+    expected = hc_fused._kernel(
+        "test_reference_tail_inject",
+        ["up", "xn", "inject_w", "inject_s", "inject_b"],
+        ["mixed", "inj"],
+        _REFERENCE_TAIL_INJECT,
+        header=hc_fused._HEADER,
+    )(
+        inputs=[up, normed, inject.weight, inject.scales, inject.biases],
+        template=[
+            ("T", mx.bfloat16),
+            ("BITS_I", bits),
+            ("GS_I", group_size),
+            ("K", WIDTH),
+            ("H", HIDDEN),
+            ("HC", HC),
+        ],
+        grid=(256, 1, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[(rows, HIDDEN), (rows, HC)],
+        output_dtypes=[mx.bfloat16, mx.bfloat16],
     )
-    actual = run(
-        "omlx_qwen4_hc_prefill_tail_inject",
-        hc_fused._TI_SOURCE,
-        hc_fused._HEADER + hc_fused._TG_HEADER,
+    face = hc_fused._decode_face(inject, True)
+    actual = hc_fused._tail_inject_launch(HC, HIDDEN, mx.bfloat16, face)(
+        rows, up, normed, inject
     )
     mx.eval(expected, actual)
     for observed, reference in zip(actual, expected):

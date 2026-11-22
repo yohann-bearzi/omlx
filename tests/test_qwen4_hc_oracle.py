@@ -24,7 +24,7 @@ from threading import Barrier
 import mlx.core as mx
 import pytest
 
-from omlx.formats import affine
+from omlx.formats import Table, affine, kernels
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from tests.oracles import hc_fused as oracle
 from tests.test_qwen4_hc_fused import HC, LOWRANK, _module
@@ -46,12 +46,10 @@ def _live():
 # Each source the oracle runs, by the live module and name it is kept under.
 _SOURCES = {
     "HEADER": ("fused", "_HEADER"),
-    "TG_HEADER": ("fused", "_TG_HEADER"),
     "N_SOURCE": ("fused", "_N_SOURCE"),
     "NP_SOURCE": ("fused", "_NP_SOURCE"),
     "WN_SOURCE": ("fused", "_WN_SOURCE"),
     "WND_SOURCE": ("fused", "_WND_SOURCE"),
-    "TI_SOURCE": ("fused", "_TI_SOURCE"),
 }
 
 
@@ -73,7 +71,14 @@ def test_oracle_sources_are_literals():
         and isinstance(node.value, ast.Constant)
         and isinstance(node.value.value, str)
     }
-    derived = {"NP_SOURCE", "WND_SOURCE", "NDN_SOURCE", "NDNW_SOURCE", "V2_HEADER"}
+    derived = {
+        "NP_SOURCE",
+        "WND_SOURCE",
+        "NDN_SOURCE",
+        "NDNW_SOURCE",
+        "TI_SOURCE",
+        "V2_HEADER",
+    }
     pieces = {"NDN_SOURCE_TEMPLATE", "NDN_LOAD", "NDN_WRITE_LOAD"}
     frozen_decode = {"D_SOURCE", "U_SOURCE", "U2_SOURCE"}
     assert (set(_SOURCES) - derived) | pieces | frozen_decode <= literals
@@ -248,6 +253,127 @@ def test_zero_rows_match_the_oracle(zero, bits, dtype, monkeypatch):
             live = _live().prefill_forward(module, hyper, write, nax=False)
             assert live is not None
             _assert_bitwise(live, oracle.prefill(module, hyper, write), "zero prefill")
+
+
+def test_tail_inject_ok_checks_vpt_and_table_bytes():
+    """The tail inject's face must tile 256 threads and fit the threadgroup."""
+    live = _live()
+    dtype = mx.bfloat16
+    qmv8 = affine.face(8, 64, False, dtype)
+    assert qmv8.vpt == 4
+    assert live._tail_inject_ok(10240, 2560, 4, dtype, qmv8)
+    fast4 = affine.face(4, 64, True, dtype)
+    assert fast4.vpt == 16
+    assert not live._tail_inject_ok(10240, 2560, 4, dtype, fast4)
+    empty = replace(qmv8, vpt=0)
+    assert not live._tail_inject_ok(10240, 2560, 4, dtype, empty)
+    assert not live._tail_inject_ok(4608, 1152, 4, dtype, qmv8)
+    # H = 16128 keeps the width whole 256-thread groups and leaves 384 bytes
+    # of the 32 KiB threadgroup for the stride, the partials and the tables.
+    tabled = replace(qmv8, tables=(Table("t", mx.float32, (0.0,) * 96),))
+    assert live._tail_inject_ok(64512, 16128, 4, dtype, tabled)
+    over = replace(qmv8, tables=(Table("t", mx.float32, (0.0,) * 97),))
+    assert not live._tail_inject_ok(64512, 16128, 4, dtype, over)
+
+
+def test_prefill_tail_inject_uses_dot_face_and_finish(monkeypatch):
+    """The tail inject reads the inject face: its finish scales the row's sum."""
+    from tests.test_formats_kernels import _toy
+
+    hidden, dtype, rows = 2560, mx.bfloat16, 17
+    width = HC * hidden
+    mx.random.seed(2678)
+    module = _module(8, True, hidden=hidden)
+    inject = module.block_inject_weight
+    codes = mx.full((HC, width), 128, mx.uint8)
+    codes[:, 0] = 129
+    codes[:, hidden] = 129
+    inject.weight = codes.view(mx.uint32)
+    inject.scales = mx.zeros_like(inject.scales)
+    inject.biases = mx.zeros_like(inject.biases)
+    hyper, _ = _inputs(rows, hidden, dtype, 2679)
+    live = _live()
+    stock_face = live._decode_face
+    toy = replace(_toy("hc20"), tensors=("hc_gains",))
+    monkeypatch.setattr(
+        live,
+        "_decode_face",
+        lambda projection, is_inject: (
+            toy if projection is inject else stock_face(projection, is_inject)
+        ),
+    )
+
+    def injection_of(gain):
+        inject.hc_gains = mx.full((8,), gain, mx.float32)
+        out = live.prefill_forward(module, hyper, None, nax=False)
+        assert out is not None
+        mx.eval(out)
+        return out[2]
+
+    base = injection_of(1.0)
+    doubled = injection_of(2.0)
+    # The dot's value: each code adds its own stream's activated element. The
+    # staged stream is the kernel's own rounding of sigmoid(up) * normed.
+    flat = hyper.reshape(rows, width)
+    normed = live._kernel_norm(module, flat, rows, HC, hidden, dtype, precise=True)
+    normed = normed.reshape(hyper.shape)
+    up = module.input_mix_weight_up(live._act(HC)(module.input_mix_weight_down(normed)))
+    gate = (1.0 / (1.0 + mx.exp(-up.astype(mx.float32)))).astype(dtype)
+    staged = (gate.astype(mx.float32) * normed.astype(mx.float32)).astype(dtype)
+    staged = staged.reshape(rows, width)
+    total = staged[:, 0].astype(mx.float32) + staged[:, hidden].astype(mx.float32)
+    expected = 2.0 * mx.sigmoid(total / float(HC))
+    for t in range(HC):
+        gap = mx.abs(base[0, :, t].astype(mx.float32) - expected)
+        assert float(gap.max()) < 0.02, "the face's dot is not the staged stream's"
+    # finish scales the dot's FP32 sum before the sigmoid: logit(inj/2) doubles.
+    q_base = mx.log(base / (2.0 - base))
+    q_doubled = mx.log(doubled / (2.0 - doubled))
+    assert float(mx.abs(q_doubled - 2.0 * q_base).max()) < 0.05
+
+
+def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
+    """One validation per tail-inject specialization, never per row count."""
+    hidden, dtype = 2560, mx.bfloat16
+    mx.random.seed(2671)
+    module = _module(8, True, hidden=hidden)
+    module.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
+    up_layer = module.block_inject_weight
+    live = _live()
+    monkeypatch.setattr(live, "_VALIDATED", set())
+    if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
+        monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
+    monkeypatch.setattr(live, "_KERNELS", {})
+    monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+
+    def prefill_signatures():
+        return {
+            signature
+            for signature in live._VALIDATED
+            if isinstance(signature, tuple) and signature and signature[0] == "prefill"
+        }
+
+    hyper17, pending17 = _inputs(17, hidden, dtype, 2672)
+    live.prefill_forward(module, hyper17, pending17, nax=False)
+    first = prefill_signatures()
+    assert len(first) == 1
+    hyper33, pending33 = _inputs(33, hidden, dtype, 2673)
+    live.prefill_forward(module, hyper33, pending33, nax=False)
+    assert prefill_signatures() == first, "the row count must not re-validate"
+    other = _module(8, True, hidden=hidden, group_size=32)
+    other.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
+    hyper65, pending65 = _inputs(65, hidden, dtype, 2674)
+    live.prefill_forward(other, hyper65, pending65, nax=False)
+    assert len(prefill_signatures()) == 2, "a distinct face validates its own"
+    assert module.__dict__["_hc_tail_inject"][0] is up_layer
+
+
+def test_hc_fused_drops_legacy_tail_headers():
+    """The tail inject runs over the face: the hand-written sources are gone."""
+    live = _live()
+    assert not hasattr(live, "_TI_SOURCE")
+    assert not hasattr(live, "_TG_HEADER")
+    assert kernels.hand_tables(live._TAIL_INJECT) == ()
 
 
 # 2560: the tail kernel takes the inject rows; 1152: its width is not whole
@@ -813,7 +939,6 @@ def test_decode_v2_accounts_for_face_table_bytes(monkeypatch):
 
 def test_decode_launch_accounts_for_face_tables(monkeypatch):
     """A face's staged tables reach the form's bounds through the launch."""
-    from omlx.formats import Table
 
     hidden, rows = 16320, 1
     width = HC * hidden
@@ -824,6 +949,8 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
     live = _live()
     stock_face = live._decode_face
 
+    up_table = Table("u", mx.float32, (0.0,) * 5)  # 20 B, outside both bounds
+
     def with_tables(down_table, inj_table):
         def attach(projection, inject):
             face = stock_face(projection, inject)
@@ -831,7 +958,7 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
                 return replace(face, tables=(down_table,))
             if projection is inj:
                 return replace(face, tables=(inj_table,))
-            return face
+            return replace(face, tables=(up_table,))
 
         return attach
 
@@ -859,6 +986,30 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
         )
         assert out is not None
         assert expected in _up_builds(builds)[0], (expected, [b[0] for b in builds])
+
+    # Without inject rows the down face's own table still counts.
+    plain = copy(module)
+    del plain["block_inject_weight"]
+    plain_table = Table("d", mx.float32, (0.0,) * 25)  # 100 B, over the bound
+    monkeypatch.setattr(
+        live,
+        "_decode_face",
+        lambda projection, inject: (
+            replace(stock_face(projection, inject), tables=(plain_table,))
+            if projection is down
+            else stock_face(projection, inject)
+        ),
+    )
+    builds = _kernel_recorder(
+        live, monkeypatch, rows, width, hidden, 512, module.hc_norm.weight.dtype
+    )
+    out = live.fused_forward(
+        plain, mx.ones((1, rows, width), module.hc_norm.weight.dtype)
+    )
+    assert out is not None
+    assert (
+        "fused_up" in _up_builds(builds)[0]
+    ), "the down table must count without inject"
 
     hidden, lowrank, rows = 256, 3200, 1
     width = HC * hidden
