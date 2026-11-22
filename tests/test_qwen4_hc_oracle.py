@@ -530,7 +530,7 @@ def test_decode_up_stages_each_chunk_before_adding_it(monkeypatch):
     """A fused multiply-add rounds differently with a running accumulator.
     The two-launch kernel stores each chunk in threadgroup memory. A serial
     up row must give that staged sum's bits even for a face using fma."""
-    from omlx.formats import Dot
+    from omlx.formats import ApplyRead, Dot, DotReads, LoadRead, MaddRead, TypeParam
 
     live = _live()
     stock_face = live._decode_face
@@ -551,20 +551,28 @@ struct HcFma {
         using Row = const device uint8_t*;
         Row row(int r) const { return w + r * K; }
         void step() { w += BLOCK; }
-        template <typename XP>
-        static float load(XP x, thread float* xt) {
+        __OMLX_READ_LOAD__ {
             for (int i = 0; i < VPT; ++i) xt[i] = float(x[i]);
             return 0.0f;
         }
-        static float madd(float acc, Row w, thread const float* xt, float) {
+        __OMLX_READ_MADD__ {
             float dot = 0.0f;
-            for (int i = 0; i < VPT; ++i) dot += (float(w[i]) - 128.0f) * xt[i];
+            for (int i = 0; i < VPT; ++i) dot += (float(r[i]) - 128.0f) * xt[i];
             return metal::fma(0.013f, dot, acc);
+        }
+        using Decoded = Row;
+        __OMLX_READ_APPLY__ {
+            return madd(acc, d, xt, aux);
         }
         float finish(int, float sum) const { return sum; }
     };
 };
 """,
+        reads=DotReads(
+            load=LoadRead(input=TypeParam("XP")),
+            madd=MaddRead(params=("acc", "r", "xt", "")),
+            apply=ApplyRead(),
+        ),
     )
     mx.random.seed(2560)
     module = _module(8, True, hidden=256, dtype=mx.float32)

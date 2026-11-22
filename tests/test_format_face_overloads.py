@@ -1520,6 +1520,14 @@ _OQEL_BUILDER_DIGESTS = {
 }
 
 
+def test_the_serial_hc_up_header_carries_the_emitted_shared_metal():
+    face = affine.face(4, 64, True, mx.bfloat16)
+    header = affine.serial_up_header(face)
+    assert header.startswith(f"{face.emitted_shared}\n")
+    assert "__OMLX_READ_" not in header
+    assert "hc_stream_up" in header
+
+
 def test_every_shipped_affine_face_declares_reads_without_deprecation():
     affine.face.cache_clear()
     affine.tile_face.cache_clear()

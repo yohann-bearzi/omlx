@@ -611,7 +611,7 @@ def serial_up_header(face: Dot) -> str:
     """The shared affine face and its serial HC dot in the face's namespace."""
     namespace = f"omlx_{face.key}"
     return (
-        f"{face.shared}\nnamespace {namespace} {{\n{_STREAM_UP}\n}}\n"
+        f"{face.emitted_shared}\nnamespace {namespace} {{\n{_STREAM_UP}\n}}\n"
         f"using {namespace}::hc_stream_up;\n"
     )
 
