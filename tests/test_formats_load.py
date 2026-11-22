@@ -4950,3 +4950,65 @@ def test_a_reader_refuses_a_bfloat16_export_that_needed_a_copy(toy, monkeypatch)
     monkeypatch.setattr(mx, "get_array_buffer_size", measured)
     with pytest.raises(formats.FormatRefusedError, match="cannot be verified"):
         formats._check_reader_isolation(toy, reader, stage="deepcopy")
+
+
+def test_recorded_format_oqh_override_clears_stock_switch(tmp_path, toy):
+    from omlx import formats
+
+    config = _typed({"toy": {}}) | {
+        "model_type": "qwen4_exp",
+        "quantization": {"bits": 4, "group_size": 64},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with testing.verified("qwen4_exp"), mx.stream(mx.cpu), format_load.loading(
+        tmp_path
+    ) as ckpt:
+        assert ckpt.verified_modes == frozenset({"toy", "affine"})
+        ckpt.apply_model_config({"omlx_oqh": {"version": 1}})
+        assert not ckpt._allow_stock_switch
+        assert ckpt.verified
+        assert ckpt.verified_modes == frozenset({"toy"})
+        packed = nn.Linear(128, 32, bias=False).to_quantized(group_size=64, bits=4)
+        assert type(packed) is nn.QuantizedLinear
+        with pytest.raises(formats.FormatRefusedError):
+            formats._may_build("affine")
+
+
+def test_non_ported_recorded_format_keeps_plugin_mode_across_benign_override(
+    tmp_path, toy
+):
+    from omlx import formats
+
+    (tmp_path / "config.json").write_text(json.dumps(_typed({"toy": {}})))
+    with testing.verified("llama"), mx.stream(mx.cpu), format_load.loading(
+        tmp_path
+    ) as ckpt:
+        ckpt.apply_model_config({"tie_word_embeddings": False})
+        assert ckpt.verified
+        assert ckpt.verified_modes == frozenset({"toy"})
+        formats._may_build("toy")
+
+
+def test_recorded_format_non_ported_model_type_override_clears_stock_switch(
+    tmp_path, toy
+):
+    from omlx import formats
+
+    config = _typed({"toy": {}}) | {
+        "model_type": "qwen4_exp",
+        "quantization": {"bits": 4, "group_size": 64},
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    with (
+        testing.verified("qwen4_exp"),
+        testing.verified("llama"),
+        mx.stream(mx.cpu),
+        format_load.loading(tmp_path) as ckpt,
+    ):
+        assert ckpt.verified_modes == frozenset({"toy", "affine"})
+        ckpt.apply_model_config({"model_type": "llama"})
+        assert not ckpt._allow_stock_switch
+        assert ckpt.verified
+        assert ckpt.verified_modes == frozenset({"toy"})
+        with pytest.raises(formats.FormatRefusedError):
+            formats._may_build("affine")

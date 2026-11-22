@@ -319,6 +319,7 @@ def test_docs_describe_stock_qmv_quad_parity():
     assert "exhibits the difference" not in page
     assert "can differ from MLX's quantized embedding projection" not in page
     assert "stock affine layers keep MLX's own `quantized_matmul`" in page
+    assert "while its format has no declared layout" not in page
 
 
 def test_non_stackable_embedding_load_raises_format_refused_error(

@@ -395,6 +395,10 @@ class _Checkpoint:
                         mode,
                         self,
                     )
+        if not ported_family(effective) or oqh_format.is_oqh_config(effective):
+            self._allow_stock_switch = False
+            self.verified = supplied.verified
+            self.verified_modes = supplied.verified_modes
 
     def _written(self, mode: str):
         """What the checkpoint's config keeps of ``mode``'s format, as it is

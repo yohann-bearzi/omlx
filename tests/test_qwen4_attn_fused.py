@@ -510,12 +510,9 @@ def test_format_attention_projections_fuse_and_match_the_generic_path(
     monkeypatch.setattr(language.row_exact_qmv, "quantized_linears_tiled", record)
     cache = _prefill(attn, 0, seed=2)
     assert _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (19,)) == [rows]
-    assert observed == [
-        tuple(
-            map(id, (attn.q_proj, attn.k_proj, attn.v_proj, attn.indexer.index_qk_proj))
-        ),
-        (id(attn.o_proj),),
-    ]
+    # The four projections take the grouped plan's launch (no tiled call);
+    # o_proj keeps its single-plan tiled call.
+    assert observed == [(id(attn.o_proj),)]
 
 
 @requires_kernels
@@ -572,3 +569,36 @@ def test_format_attention_fused_output_fallback_stays_row_exact(monkeypatch):
     one = attn._fused_output(output[:, :1], 1)
     mx.eval(one)
     assert _bit_equal(one, serial[:, :1])
+
+
+@requires_kernels
+def test_a_fused_decode_looks_up_the_group_plan_once(monkeypatch):
+    from omlx.patches import row_exact_qmv
+
+    attn = _attention(3)
+    cache = _prefill(attn, 700, 4)
+    assert attn_fused.row_plan(701, 701) is not None
+    groups = []
+    launches = []
+    real_plan = row_exact_qmv._group_plan
+    real_launch = row_exact_qmv._launch_group
+
+    def planning(linears, *args, **kwargs):
+        plan = real_plan(linears, *args, **kwargs)
+        if linears and linears[0] is attn.q_proj:
+            groups.append(plan)
+        return plan
+
+    def launching(plan, *args, **kwargs):
+        launches.append(plan)
+        return real_launch(plan, *args, **kwargs)
+
+    monkeypatch.setattr(row_exact_qmv, "_group_plan", planning)
+    monkeypatch.setattr(row_exact_qmv, "_launch_group", launching)
+    mx.random.seed(15)
+    x = (mx.random.normal((1, 1, _CONFIG.hidden_size)) * 0.5).astype(
+        mx.bfloat16
+    )
+    _step(attn, cache, x)
+    assert len(groups) == 1
+    assert groups[0] in launches

@@ -2356,12 +2356,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         past_len = cache.offset
         # One launch for the four projections and one for the q/k norms and
         # MRoPE when attn_fused serves the layout (same bits).
-        fused = length <= attn_fused.MAX_ROWS and self._fused_projections_ready(
-            x, position_ids
+        plan = (
+            self._fused_plan(x, position_ids)
+            if length <= attn_fused.MAX_ROWS
+            else None
         )
-        if fused:
+        if plan is not None:
             q_out, projected, v_out, queries, new_keys, index_positions = (
-                self._fused_prologue(x, past_len, position_ids)
+                self._fused_prologue(x, past_len, position_ids, plan)
             )
         else:
             projected = _target_verify_linear(indexer.index_qk_proj, x)
@@ -2389,7 +2391,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             axis=1,
         ).astype(mx.float32)
 
-        if fused:
+        if plan is not None:
             values = v_out.reshape(batch, length, self.num_key_value_heads, -1).transpose(
                 0, 2, 1, 3
             )
@@ -2434,7 +2436,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             outputs.append(output)
         output = mx.concatenate(outputs, axis=2).transpose(0, 2, 1, 3)
         output = output.reshape(batch, length, -1) * gate
-        if fused:
+        if plan is not None:
             return self._fused_output(output, length)
         return _VERIFIER._linear(self.o_proj, output)
 
@@ -2687,12 +2689,14 @@ class Qwen4ExpAttention(Qwen3_5Attention):
                 cache._omlx_last_prefill_gathered = True
             return self._gathered_batch(x, cache, position_ids, target_verify, paddings)
 
-        if rows := self._fused_rows(
+        fused = self._fused_rows(
             x, mask, cache, position_ids, position_embeddings, target_verify
-        ):
+        )
+        if fused is not None:
+            rows, plan = fused
             if rows > 1:
                 cache._omlx_last_prefill_gathered = False
-            return self._fused_forward(x, cache, position_ids)
+            return self._fused_forward(x, cache, position_ids, plan)
 
         if cache is not None and x.ndim == 3 and x.shape[1] > 1:
             cache._omlx_last_prefill_gathered = False
@@ -2742,10 +2746,11 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         position_ids: Optional[mx.array],
         position_embeddings: Optional[tuple[mx.array, mx.array]],
         target_verify: bool,
-    ) -> int:
-        """Rows of a call the generic path below runs as ``_fused_forward``
-        reproduces it -- one decode row (dense or ``_masked_decode``), or a
-        row-exact verify window whose indexer selects every block; 0 otherwise."""
+    ) -> Optional[tuple[int, Any]]:
+        """Rows and the grouped projection plan of a call the generic path
+        below runs as ``_fused_forward`` reproduces -- one decode row (dense
+        or ``_masked_decode``), or a row-exact verify window whose indexer
+        selects every block; None otherwise."""
 
         causal_mask = mask is None or (isinstance(mask, str) and mask == "causal")
         if not (
@@ -2757,32 +2762,31 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             and isinstance(cache.offset, int)
             and position_embeddings is None
         ):
-            return 0
+            return None
         rows = x.shape[1]
         if target_verify:
             if not (2 <= rows <= attn_fused.MAX_ROWS and _row_exact_verify_armed()):
-                return 0
+                return None
         elif rows != 1:
-            return 0
+            return None
         if position_ids is not None and tuple(position_ids.shape) not in (
             (1, rows),
             (3, 1, rows),
         ):
-            return 0
+            return None
         indexer = self.indexer
         past = cache.offset
         # The indexer returns no mask while its blocks fit the budget; past it
         # only a decode row gets here (_masked_decode).
         dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
         if not (dense or rows == 1):
-            return 0
-        if (
-            dense
-            and attn_fused.row_plan(past + 1, past + rows) is None
-            or not self._fused_projections_ready(x, position_ids)
-        ):
-            return 0
-        return rows
+            return None
+        if dense and attn_fused.row_plan(past + 1, past + rows) is None:
+            return None
+        plan = self._fused_plan(x, position_ids)
+        if plan is None:
+            return None
+        return rows, plan
 
     def _prep_ready(self, x: mx.array, pos_ndim: int) -> bool:
         """Whether ``attn_fused.prep_qk`` computes these q/k norms and MRoPE."""
@@ -2880,39 +2884,40 @@ class Qwen4ExpAttention(Qwen3_5Attention):
             rope_scale=rotary.attention_scaling,
         )
 
-    def _fused_projections_ready(self, x: mx.array, position_ids: Optional[mx.array]) -> bool:
-        """Whether ``_fused_prologue`` runs these rows: the grouped projection
-        launch takes the four projections and the kernels this layout."""
+    def _fused_plan(self, x: mx.array, position_ids: Optional[mx.array]):
+        """The grouped projection plan when ``_fused_prologue`` runs these
+        rows, else None: one lookup, shared by the gate and the launch."""
         rotary = self.rotary_emb
-        return (
-            self._prep_ready(x, 3 if position_ids is None else position_ids.ndim)
-            and attn_fused.ready(
-                x.dtype,
-                self.num_attention_heads,
-                self.num_key_value_heads,
-                self.head_dim,
-                rotary.dim,
-                3 if position_ids is None else position_ids.ndim,
-            )
-            and row_exact_qmv._group_plan(
-                (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
-                x,
-                x.shape[0] * x.shape[1],
-                _fused_tile(x.shape[0] * x.shape[1]),
-            )
-            is not None
+        if not self._prep_ready(
+            x, 3 if position_ids is None else position_ids.ndim
+        ):
+            return None
+        if not attn_fused.ready(
+            x.dtype,
+            self.num_attention_heads,
+            self.num_key_value_heads,
+            self.head_dim,
+            rotary.dim,
+            3 if position_ids is None else position_ids.ndim,
+        ):
+            return None
+        return row_exact_qmv._group_plan(
+            (self.q_proj, self.k_proj, self.v_proj, self.indexer.index_qk_proj),
+            x,
+            x.shape[0] * x.shape[1],
+            _fused_tile(x.shape[0] * x.shape[1]),
         )
 
-    def _fused_prologue(self, x: mx.array, past: int, position_ids: Optional[mx.array]):
+    def _fused_prologue(
+        self, x: mx.array, past: int, position_ids: Optional[mx.array], plan
+    ):
         """The four projections in one launch, then the q/k norms and MRoPE in
         one: ``(q_out [R, heads * 2 * D], index_out, v_out, queries, keys,
         index_positions)``, each value as the MLX ops compute it."""
         rows = x.shape[1]
         indexer = self.indexer
-        q_out, k_out, v_out, index_out = row_exact_qmv.quantized_linears_tiled(
-            (self.q_proj, self.k_proj, self.v_proj, indexer.index_qk_proj),
-            x,
-            *_fused_tile(rows),
+        q_out, k_out, v_out, index_out = row_exact_qmv._launch_group(
+            plan, x, rows, x.shape
         )
         if position_ids is None:
             # What the indexer and _prepare_projected_qkv build.
@@ -2944,6 +2949,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         x: mx.array,
         cache: QSAKVCache,
         position_ids: Optional[mx.array],
+        plan,
     ) -> mx.array:
         """The generic path's result for ``_fused_rows``' calls in five
         launches (the four projections; q/k norms and MRoPE; SDPA with the
@@ -2957,7 +2963,7 @@ class Qwen4ExpAttention(Qwen3_5Attention):
         past = cache.offset
         dense = (cache._index_offset + rows) // indexer.compress_ratio <= indexer.block_topk
         q_out, index_out, v_out, queries, keys, index_positions = self._fused_prologue(
-            x, past, position_ids
+            x, past, position_ids, plan
         )
         if dense:
             # indexer.from_projected's append; it then selects every block.

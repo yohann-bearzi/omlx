@@ -27,8 +27,7 @@ def _function_nodes(path, function):
 @pytest.mark.parametrize(
     "path,function,symbol",
     [
-        (LANGUAGE, "_fused_projections_ready", "QuantizedLinear"),
-        (LANGUAGE, "_can_fuse_hyper_connection", "QuantizedLinear"),
+        (LANGUAGE, "_fused_plan", "QuantizedLinear"),
         (Q4 / "hc_fused.py", "_quantized_ok", "QuantizedLinear"),
         (LANGUAGE, "_uniform_affine_layout", "QuantizedEmbedding"),
         (ADAPTER, "_ple_reader", "QuantizedEmbedding"),
@@ -36,6 +35,7 @@ def _function_nodes(path, function):
 )
 def test_qwen_private_route_releases_its_mlx_class_branch(path, function, symbol):
     nodes = _function_nodes(path, function)
+    assert nodes, f"{function} not found"
     assert not any(
         isinstance(node, ast.Attribute) and node.attr == symbol for node in nodes
     )
@@ -44,6 +44,7 @@ def test_qwen_private_route_releases_its_mlx_class_branch(path, function, symbol
 @pytest.mark.parametrize("operation", ["construct", "exact_type"])
 def test_ple_join_releases_the_mlx_constructor_and_source_test(operation):
     nodes = _function_nodes(LANGUAGE, "fuse_quantized_shards")
+    assert nodes, "fuse_quantized_shards not found"
     for node in nodes:
         if operation == "construct" and isinstance(node, ast.Call):
             assert not (
@@ -61,13 +62,14 @@ def test_ple_join_releases_the_mlx_constructor_and_source_test(operation):
     "function,legacy",
     [
         ("_forward", "hybrid_projection"),
-        ("fuse_hyper_connection_projections", "_can_prepare_exact_hybrid"),
+        ("compile_hyper_connections", "_can_prepare_exact_hybrid"),
     ],
 )
 def test_hyper_connection_releases_the_hybrid_call_and_its_preparation(
     function, legacy
 ):
     nodes = _function_nodes(LANGUAGE, function)
+    assert nodes, f"{function} not found"
     assert not any(
         isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == legacy
         for n in nodes
