@@ -547,6 +547,15 @@ def values_per_thread(bits: int, fast: bool) -> int:
     return pack_factor * (2 if fast and bits != 2 else 1)
 
 
+_AFFINE_DOT_SPECS: dict[Dot, tuple[int, int, bool]] = {}
+
+
+def row_ops_spec(face: Dot) -> tuple[int, int, bool] | None:
+    """``(bits, group_size, fast)`` when ``face`` is a built-in affine dot
+    face (not ``partial_blocks``, no extra tables), else None."""
+    return _AFFINE_DOT_SPECS.get(face)
+
+
 @cache
 def face(
     bits: int, group_size: int, fast: bool, dtype: mx.Dtype, *, partial_blocks=False
@@ -563,7 +572,7 @@ def face(
     dot = _DOT.replace("__LAYOUT_CHECK__", check)
     qdot = _QDOT_FUNCTION.replace("__QDOT__", _QDOT[bits])
     source += qdot
-    return Dot(
+    dot_face = Dot(
         key=key,
         source=(
             f"namespace omlx_{key} {{\n{source}\n{dot}\n}}"
@@ -579,6 +588,9 @@ def face(
         dtypes=(dtype,),
         reads=_DOT_READS,
     )
+    if not partial_blocks:
+        _AFFINE_DOT_SPECS[dot_face] = (bits, group_size, fast)
+    return dot_face
 
 
 # The serial HC up walks adjacent lanes. Keep the group scalars in the row
