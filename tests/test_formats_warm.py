@@ -866,6 +866,10 @@ def test_warm_dot_skips_k_under_eight(monkeypatch):
 
     with testing.verified("llama"):
         assert warm_dot(FailInit, fmt, 8, 1, 4, tensors, layout) is None
+        (codes7, scales7), _, _ = _matrix(16, 7)
+        tensors7 = {"codes": codes7, "group_scales": scales7}
+        layout7 = {"codes": ((16, 7), mx.uint8), "group_scales": ((16,), mx.float32)}
+        assert warm_dot(FailInit, fmt, 8, 1, 7, tensors7, layout7) is None
         (codes8, scales8), _, _ = _matrix(16, 8)
         tensors8 = {"codes": codes8, "group_scales": scales8}
         layout8 = {"codes": ((16, 8), mx.uint8), "group_scales": ((16,), mx.float32)}
@@ -1152,3 +1156,107 @@ def test_warm_dot_recipe_holds_no_checkpoint_tensors(monkeypatch):
     assert codes_ref() is None and scales_ref() is None
     stand_in = captured[0]()
     assert stand_in.input_shapes == ((320,), (16, 320), (16,))
+
+
+def test_concurrent_warm_of_same_instance_builds_once(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def native(**keywords):
+        calls.append(keywords)
+        entered.set()
+        assert release.wait(10)
+        return [mx.zeros((1,))]
+
+    call = kernel(monkeypatch, native)
+    instance = call.instance([((8,), mx.float32)], [mx.float32])
+    monkeypatch.setattr(kernels, "_warm_stream", lambda: mx.cpu)
+    monkeypatch.setattr(mx, "eval", lambda *outputs: None)
+    monkeypatch.setattr(
+        kernels,
+        "zeros",
+        lambda *specs, stream: [mx.zeros(*specs[0], stream=stream)],
+    )
+
+    def recipe():
+        return kernels.StandIn(((8,),), ((1,),), (1, 1, 1), (1, 1, 1))
+
+    (first,) = kernels.warm({instance: recipe})
+    assert entered.wait(5)
+    (second,) = kernels.warm({instance: recipe})
+    release.set()
+    first.result(timeout=10)
+    second.result(timeout=10)
+    assert len(calls) == 1
+
+
+def test_a_build_launches_with_the_stand_in_s_grid_and_threadgroup(monkeypatch):
+    seen = []
+
+    def native(**keywords):
+        seen.append((keywords["grid"], keywords["threadgroup"]))
+        return []
+
+    call = kernel(monkeypatch, native)
+    instance = call.instance([((8,), mx.float32)], [mx.float32])
+    monkeypatch.setattr(kernels, "_warm_stream", lambda: mx.cpu)
+    monkeypatch.setattr(mx, "eval", lambda *outputs: None)
+    monkeypatch.setattr(
+        kernels,
+        "zeros",
+        lambda *specs, stream: [mx.zeros(*specs[0], stream=stream)],
+    )
+    (future,) = kernels.warm(
+        {
+            instance: lambda: kernels.StandIn(
+                ((8,),), ((1,),), (32, 2, 1), (32, 1, 1)
+            )
+        }
+    )
+    future.result(timeout=5)
+    assert seen == [((32, 2, 1), (32, 1, 1))]
+
+
+def test_msg_launch_records_only_its_first_call(monkeypatch):
+    from omlx.formats import affine
+    from omlx.patches import qwen35_verify_qmm
+
+    records = []
+    wrapped = kernels._FaceKernel(lambda **call: [call])
+    real_record = wrapped._record
+
+    def counted_record(*arguments, **keywords):
+        records.append(arguments)
+        return real_record(*arguments, **keywords)
+
+    monkeypatch.setattr(wrapped, "_record", counted_record)
+    monkeypatch.setattr(kernels, "face_kernel", lambda *arguments, **keywords: wrapped)
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    qwen35_verify_qmm._msg_launch.cache_clear()
+    launch = qwen35_verify_qmm._msg_launch(4, face, 4, mx.bfloat16, 64, 100000)
+    x = mx.zeros((4, 64), mx.bfloat16, stream=mx.cpu)
+    w = mx.zeros((100000, 64), mx.uint8, stream=mx.cpu)
+    scales = mx.zeros((100000,), mx.bfloat16, stream=mx.cpu)
+    biases = mx.zeros((100000,), mx.bfloat16, stream=mx.cpu)
+    for _ in range(2):
+        launch(inputs=[x, w, scales, biases, 100000])
+    assert len(records) == 1
+
+
+def test_warm_dot_skips_zero_n_without_querying_dot(monkeypatch):
+    (codes, scales), _, _ = _matrix(16, 320)
+    tensors = {"codes": codes[:0], "group_scales": scales[:0]}
+    layout = {"codes": ((0, 320), mx.uint8), "group_scales": ((0,), mx.float32)}
+
+    class NoQuery(QuantFormat):
+        mode, codes_name, tensors, contract = "toy", "codes", ("group_scales",), 1
+
+        def dot(self, layer, k, n):
+            pytest.fail("queried the face of an n == 0 matrix")
+
+    monkeypatch.setattr(
+        "omlx.formats.linear.kernels.warm",
+        lambda instances: pytest.fail("warmed an n == 0 matrix"),
+    )
+    with testing.verified("llama"):
+        assert warm_dot(FormatLinear, NoQuery(), 8, 1, 320, tensors, layout) is None

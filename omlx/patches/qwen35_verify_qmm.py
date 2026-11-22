@@ -1127,6 +1127,32 @@ def _pad_rows(mx, x2, m: int):
     return x2, M
 
 
+@cache
+def _msg_launch(m: int, face, nsg: int, dtype, k: int, n: int):
+    """The msg launch of ``(m, face, nsg, dtype, k, n)``, its Metal recorded
+    on the first call: a stock affine head's verify steps then call the
+    kernel directly."""
+    kernel = _msg_kernel(m, face, nsg)
+    cols = 4 * nsg
+    recorded = [False]
+
+    def launch(**call):
+        if recorded[0]:
+            return kernel.native(**call)
+        result = kernel(**call)
+        recorded[0] = True
+        return result
+
+    return partial(
+        launch,
+        template=[("T", dtype), ("K", k)],
+        grid=(32 * nsg, (n + cols - 1) // cols, 1),
+        threadgroup=(32 * nsg, 1, 1),
+        output_shapes=[(m, n)],
+        output_dtypes=[dtype],
+    )
+
+
 def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
     """Verify-shape qmm: (M, K) x (N, K)^T -> (M, N), M in 2..6.
 
@@ -1154,16 +1180,8 @@ def vk_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
             return None  # no tile face reads such scales
         xm, M0 = _pad_rows(mx, x2, m)
         face = affine.tile_face(bits, group_size, scales.dtype)
-        kernel = _msg_kernel(m, face, _MSG_NSG)
-        cols = 4 * _MSG_NSG
-        (y,) = kernel(
-            inputs=[xm, w_q, scales, biases, N],
-            template=[("T", x2.dtype), ("K", K)],
-            grid=(32 * _MSG_NSG, (N + cols - 1) // cols, 1),
-            threadgroup=(32 * _MSG_NSG, 1, 1),
-            output_shapes=[(m, N)],
-            output_dtypes=[x2.dtype],
-        )
+        launch = _msg_launch(m, face, _MSG_NSG, x2.dtype, K, N)
+        (y,) = launch(inputs=[xm, w_q, scales, biases, N])
         return y[:M0, :] if M0 < m else y
 
     # Small M gets a dedicated template (fewer wasted accumulators).

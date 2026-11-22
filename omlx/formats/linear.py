@@ -646,7 +646,9 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
     if getattr(layer_cls, "_STACK", 0) or k < 8:
         return None
     codes = tensors.get(fmt.codes_name)
-    if codes is not None and codes.ndim >= 2 and codes.shape[-2] % 8:
+    if codes is not None and codes.ndim >= 2 and (
+        codes.shape[-2] < 8 or codes.shape[-2] % 8
+    ):
         return None
     stand_in = layer_cls(
         fmt,

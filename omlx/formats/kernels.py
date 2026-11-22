@@ -1025,6 +1025,15 @@ class _Instance:
     def build(self, describe):
         if self in self.kernel._built:
             return
+        # One build per instance: two loads of one format ask for the same
+        # Metal, and the second waits here instead of allocating the zeros
+        # and running the stand-in again.
+        with self.kernel._locks.setdefault(self, threading.Lock()):
+            if self in self.kernel._built:
+                return
+            self._build_locked(describe)
+
+    def _build_locked(self, describe):
         stand_in = describe()
         shapes = stand_in.input_shapes
         if len(shapes) != len(self.inputs) or any(
@@ -1066,6 +1075,7 @@ class _FaceKernel:
         self.native = native
         self._instances = {}
         self._built = set()
+        self._locks: dict = {}
 
     def __call__(self, **launch):
         # MLX reads each argument whole. Materialize one a caller may pass
