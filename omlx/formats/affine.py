@@ -628,18 +628,20 @@ def serial_up_header(face: Dot) -> str:
     )
 
 
-# The 4- and 8-bit spellings the frozen face digest pins, and every width a
-# tile face reads (tile_face, and AffineFormat.tile over format layers):
-# every width MLX quantizes to.
-_TILE_BITS = (4, 8)
+# The 2-, 3-, 4- and 8-bit spellings the frozen face digest pins, and every
+# width a tile face reads (tile_face, and AffineFormat.tile over format
+# layers): every width MLX quantizes to.
+_TILE_BITS = (2, 3, 4, 8)
 _TILE_FACE_BITS = (2, 3, 4, 5, 6, 8)
 
-# A run of 8 codes is BITS bytes: one 32-bit word at 4 bits, two at 8, read
-# where they lie (an 8-bit run is two words, which a weight's slice aligns to
-# 4 bytes, not 8: a packed_uint2). Each width's source has its run's type and
-# the code at position i alone. K is asserted whole groups in the
-# constructor, not in the class: a failed assert there would leave Runs<K>
-# without members for the skeleton's checks, each then an error of its own.
+# A run of 8 codes is BITS bytes: two bytes at 2 bits, three at 3, one 32-bit
+# word at 4, two at 8, read where they lie (an 8-bit run is two words, which a
+# weight's slice aligns to 4 bytes, not 8: a packed_uint2; a 3-bit run takes
+# three byte loads; 5 and 6 bits pack into a 64-bit word). Each width's source
+# has its run's type, its fetch and the code at position i alone. K is asserted
+# whole groups in the constructor, not in the class: a failed assert there
+# would leave Runs<K> without members for the skeleton's checks, each then an
+# error of its own.
 _TILE = r"""
 using namespace metal;
 
@@ -681,7 +683,7 @@ __RUNS__
       return {float(s[g]), float(b[g])};
     }
     Codes fetch(int run) const {
-      return Codes(c[run]);
+      __FETCH__
     }
     __OMLX_READ_WEIGHT__ {
       return p.s * float(code_at(q, i)) + p.b;
@@ -690,10 +692,20 @@ __RUNS__
 };
 """
 
+# How a width reads a run, from its cursor: a byte or word load (or struct
+# conversion for 5/6-bit _RUN64), or three byte loads at 3 bits. Each width's
+# text is its own alone: MLX hashes the whole source at every launch.
+_FETCH = {
+    3: (
+        "const device Stored* p = c + 3 * run;\n"
+        "      return Codes(p[0]) | (Codes(p[1]) << 8) | (Codes(p[2]) << 16);"
+    ),
+}
+
 # A run's type as a kernel holds it, as it is stored, and its code i, by width.
-# Below 8 bits but 4, a run's BITS bytes become one 64-bit word as MLX's
-# affine loaders and the vk_mma kernel read them (two bytes at 2 bits, three
-# 16-bit halves at 6, byte by byte at 3 and 5).
+# 2- and 3-bit runs stay in ushort/uint (16/32 bits) to avoid 64-bit register
+# pressure in double-buffered NAX loaders; 5- and 6-bit runs (40/48 bits) pack
+# into one 64-bit word as MLX's affine loaders and vk_mma read them.
 _RUN64 = r"""    struct Codes {
       uint64_t q;
       Codes() = default;
@@ -704,12 +716,18 @@ _RUN64 = r"""    struct Codes {
       return uint((run.q >> (BITS * i)) & ((1ul << BITS) - 1ul));
     }"""
 _RUNS = {
-    2: "    using Stored = ushort;\n" + _RUN64.replace("__LOAD__", "uint64_t(run)"),
-    3: "    struct Stored {\n      uint8_t b[3];\n    };\n"
-    + _RUN64.replace(
-        "__LOAD__",
-        "uint64_t(run.b[0]) | (uint64_t(run.b[1]) << 8) | (uint64_t(run.b[2]) << 16)",
-    ),
+    2: r"""    using Codes = ushort;
+    using Stored = ushort;
+    const device Stored* c;
+    static uint code_at(ushort q, int i) {
+      return (q >> (2 * i)) & 0x3u;
+    }""",
+    3: r"""    using Codes = uint;
+    using Stored = uint8_t;
+    const device Stored* c;
+    static uint code_at(uint q, int i) {
+      return (q >> (3 * i)) & 0x7u;
+    }""",
     5: "    struct Stored {\n      uint8_t b[5];\n    };\n"
     + _RUN64.replace(
         "__LOAD__",
@@ -748,6 +766,7 @@ def _tile_source(bits: int, group_size: int) -> str:
         _TILE.replace("__BITS__", str(bits))
         .replace("__GS__", str(group_size))
         .replace("__RUNS__", _RUNS[bits])
+        .replace("__FETCH__", _FETCH.get(bits, "return Codes(c[run]);"))
     )
     return f"namespace {namespace} {{\n{tile}\n}}  // namespace {namespace}\n"
 

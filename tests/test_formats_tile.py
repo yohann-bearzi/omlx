@@ -870,7 +870,7 @@ def _float32_decode(layer):
     )
 
 
-_LAYOUTS = [(bits, gs) for bits in (4, 8) for gs in (32, 64, 128)]
+_LAYOUTS = [(bits, gs) for bits in (2, 3, 4, 8) for gs in (32, 64, 128)]
 _DTYPES = [mx.bfloat16, mx.float16]
 
 
@@ -1034,7 +1034,30 @@ def test_no_affine_tile_face_for_float32_scales():
 # used is not hashed at every launch).
 @pytest.mark.parametrize(
     "bits, kept, left",
-    [(4, "uint code_at(uint q", ("uint2", "0xFFu")), (8, "packed_uint2", ("0xFu;",))],
+    [
+        (
+            2,
+            "uint code_at(ushort q",
+            ("uint2", "uint64_t", "0xFFu", "0x7u", "0xFu", "3 * run"),
+        ),
+        (
+            3,
+            "uint code_at(uint q",
+            ("packed_uint2", "uint64_t", "0xFFu", "0xFu", "0x3u"),
+        ),
+        (
+            4,
+            "uint code_at(uint q",
+            ("uint2", "uint64_t", "0xFFu", "0x7u", "0x3u", "3 * run"),
+        ),
+        (5, "run.b[4]", ("uint2", "0xFFu", "0xFu;", "0x3u", "3 * run", "ushort")),
+        (6, "run.h[2]", ("uint2", "0xFFu", "0xFu;", "0x3u", "3 * run", "uint8_t b")),
+        (
+            8,
+            "packed_uint2",
+            ("0xFu;", "uint64_t", "0x7u", "0x3u", "3 * run", "ushort"),
+        ),
+    ],
 )
 def test_each_affine_tile_width_has_its_runs_alone(bits, kept, left):
     source = affine.tile_face(bits, 64, mx.bfloat16).source
@@ -1079,7 +1102,7 @@ def test_affine_tile_weights_are_mlx_dequantize_in_float32(bits, group_size, dty
 # own alignment.
 @metal
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("bits", [2, 3, 5, 6])
+@pytest.mark.parametrize("bits", [5, 6])
 @pytest.mark.parametrize("group_size", [32, 64, 128])
 def test_every_width_s_tile_weights_are_mlx_dequantize_in_float32(
     bits, group_size, dtype
@@ -1124,7 +1147,13 @@ def _canary(name, bits, dtype, n=16, k=256):
         weight = mx.zeros(words, mx.uint32)
         scales, biases = mx.zeros(groups, dtype), mx.zeros(groups, dtype)
     else:  # 32768 * 3 - 65504 = 32800: in fp16, finite computed in float32 only
-        weight = mx.full(words, 0x33333333 if bits == 4 else 0x03030303, mx.uint32)
+        if bits == 3:
+            # 32 codes of 3 bits are 3 words; every code is 3.
+            period = mx.array([0xDB6DB6DB, 0xB6DB6DB6, 0x6DB6DB6D], mx.uint32)
+            weight = mx.tile(period[None, :], (n, k // 32))
+        else:
+            pattern = {2: 0xFFFFFFFF, 4: 0x33333333, 8: 0x03030303}[bits]
+            weight = mx.full(words, pattern, mx.uint32)
         scales = mx.full(groups, 32768.0, dtype)
         biases = mx.full(groups, -65504.0, dtype)
     return _with(layer, weight=weight, scales=scales, biases=biases)
@@ -1132,7 +1161,7 @@ def _canary(name, bits, dtype, n=16, k=256):
 
 @metal
 @pytest.mark.parametrize("dtype", _DTYPES)
-@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 8])
 @pytest.mark.parametrize("name", ["largest", "random", "zeros", "past_fp16"])
 def test_affine_tile_weights_hold_on_canaries(name, bits, dtype):
     layer = _canary(name, bits, dtype)

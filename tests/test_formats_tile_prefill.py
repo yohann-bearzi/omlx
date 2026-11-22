@@ -254,7 +254,7 @@ def test_sorted_tile_calls_the_checked_face_overloads(toy, case):
     assert tile.ran and not tile.failed
 
 
-@pytest.mark.parametrize("bits, group_size", [(4, 64), (8, 32)])
+@pytest.mark.parametrize("bits, group_size", [(2, 64), (3, 64), (4, 64), (8, 32)])
 def test_affine_through_a_format_stack_is_mlx_s_sorted_gather_qmm(bits, group_size):
     k, n = 512, 128
     mx.random.seed(3)

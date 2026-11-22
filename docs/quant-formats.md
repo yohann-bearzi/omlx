@@ -1332,7 +1332,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 
 | | Covered |
 |---|---|
-| Bits | 2, 3, 4, 5, 6 and 8 (both `AffineFormat.tile` and `affine.tile_face`): a run of 8 codes is 2, 3, 4, 5, 6 or 8 bytes at its own alignment (`ushort` at 2 bits, `uint8_t[3]`/`uint8_t[5]` at 3 and 5, `uint` at 4, `ushort[3]` at 6, `packed_uint2` at 8; `affine._RUNS`). |
+| Bits | 2, 3, 4, 5, 6 and 8 (both `AffineFormat.tile` and `affine.tile_face`): a run of 8 codes is 2, 3, 4, 5, 6 or 8 bytes at its own alignment (`ushort` at 2 bits, three byte loads at 3, `uint` at 4, `uint8_t[5]` at 5, `ushort[3]` at 6, `packed_uint2` at 8; `affine._RUNS`). |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
 | Weights | 32-bit words, a matrix or a stack of them, K whole groups (its `Runs<K>` asserts it), scales of 8 elements or more |

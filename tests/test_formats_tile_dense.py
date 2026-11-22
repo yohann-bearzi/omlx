@@ -91,7 +91,10 @@ def qwen_layer(tmp_path):
     return build
 
 
-@pytest.mark.parametrize("bits,dtype", [(4, mx.bfloat16), (8, mx.float16)])
+@pytest.mark.parametrize(
+    "bits,dtype",
+    [(2, mx.bfloat16), (3, mx.bfloat16), (4, mx.bfloat16), (8, mx.float16)],
+)
 @pytest.mark.parametrize("leading", [(17,), (2, 20)])
 def test_dense_format_prefill_matches_one_mlx_expert(monkeypatch, bits, dtype, leading):
     k, n = 512, 128

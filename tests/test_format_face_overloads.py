@@ -1498,18 +1498,15 @@ def _digest_records(records) -> str:
 
 
 # Baseline digests captured from untouched wip/3 head ba421f5c, re-pinned on
-# wip/a1-a13: the A13 unrolled shared skeleton carries three
-# _Pragma("clang loop unroll(full)") lines and keeps the pack-fold for
-# ROWS == 3 (specs/parity-skeletons.md §3.1), so its Matrices header differs
-# from the baseline. The rolled shared header, the pair header and the codes
-# citations it sizes are the baseline's. The face sources, tiles and the
-# wide/sg8 builders are unchanged; the emitted shared block's code generation
-# is what the chained A/B and 240-spec digest cover.
-_AFFINE_ALL_219_DIGEST = (
-    "219 c9a1dbbe22d203ea9e94d0a0e935c3cb3277d6eb27c15130e8cc6830e52ff9e8"
+# wip/a1-a13 (A13 shared-rows skeleton) and extended in T23 when
+# affine._TILE_BITS gained 2 and 3 bits (+12 tile face records: 219 -> 231;
+# +24 tile_wide/pair_kernel builders: 294 -> 318; all 219 existing face
+# records and 294 existing builders verified byte-identical).
+_AFFINE_ALL_DIGEST = (
+    "231 39ddda59ca82a5835c9e339557fafe6b6cb936887c9465fb904e2d22d7f9826b"
 )
 _AFFINE_WIDE_AND_SG8_DIGEST = (
-    "294 f7278ceacc58a45f410c3012954ff81e2046f04dbf4d0458c1e0c2e355a21e18"
+    "318 5905b3dfbb0349daa688a5c2f7384858cb4e5dd1d7aecfa97ff2a49e0eea39e5"
 )
 # Re-pinned on wip/a1-a13 together with the 219 affine records: the A13
 # unrolled shared block adds three _Pragma("clang loop unroll(full)") lines
@@ -1583,7 +1580,7 @@ def test_every_shipped_affine_face_declares_reads_without_deprecation():
                         assert "__OMLX_READ_PAIR__" in f.source
                         assert "static uint pair(" in f.emitted_source
                         faces += 1
-    assert faces == 219
+    assert faces == 231
     assert [w for w in caught if issubclass(w.category, DeprecationWarning)] == []
 
 
@@ -1639,7 +1636,7 @@ def test_all_shipped_affine_faces_and_builders_are_byte_identical_to_ba421f5c(
                     face_records.append(
                         (f.key, f.emitted_source, m.header, m.declarations)
                     )
-    assert _digest_records(face_records) == _AFFINE_ALL_219_DIGEST
+    assert _digest_records(face_records) == _AFFINE_ALL_DIGEST
 
     builder_records = []
 

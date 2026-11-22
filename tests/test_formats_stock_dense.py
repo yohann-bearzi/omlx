@@ -86,7 +86,7 @@ def _compare(layer, packed, x, monkeypatch, *, expected=None):
 
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("bits", [2, 3, 4, 8])
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 17])
 def test_wide_rows_match_stock(rows, bits, dtype, build_layer, monkeypatch):
     k, n = 2560, 512
