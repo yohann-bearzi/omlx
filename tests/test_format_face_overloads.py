@@ -1497,16 +1497,30 @@ def _digest_records(records) -> str:
     return f"{len(records)} {h.hexdigest()}"
 
 
-# Baseline digests captured from untouched wip/3 head ba421f5c.
+# Baseline digests captured from untouched wip/3 head ba421f5c, re-pinned on
+# wip/a1-a13: the A13 unrolled shared skeleton carries three
+# _Pragma("clang loop unroll(full)") lines and keeps the pack-fold for
+# ROWS == 3 (specs/parity-skeletons.md §3.1), so its Matrices header differs
+# from the baseline. The rolled shared header, the pair header and the codes
+# citations it sizes are the baseline's. The face sources, tiles and the
+# wide/sg8 builders are unchanged; the emitted shared block's code generation
+# is what the chained A/B and 240-spec digest cover.
 _AFFINE_ALL_219_DIGEST = (
-    "219 36620c98ea01019f350d2f87aa9931cf8fc8ad26499a8c1d2e6a6448403dccb5"
+    "219 c9a1dbbe22d203ea9e94d0a0e935c3cb3277d6eb27c15130e8cc6830e52ff9e8"
 )
 _AFFINE_WIDE_AND_SG8_DIGEST = (
     "294 f7278ceacc58a45f410c3012954ff81e2046f04dbf4d0458c1e0c2e355a21e18"
 )
+# Re-pinned on wip/a1-a13 together with the 219 affine records: the A13
+# unrolled shared block adds three _Pragma("clang loop unroll(full)") lines
+# (with the pack-fold for ROWS == 3), so its Matrices header differs from the
+# baseline; the rolled block carries no placeholder line, so the rolled
+# headers and the pair/codes citations are the baseline's. The plugin's own
+# face Metal (emitted_source/emitted_shared) is unchanged; measured with the
+# plugin staged at 238b9a9 on M5 Max.
 _OQEL_15_DIGESTS = {
-    False: "15 4f9de11638dc50371f7955ab38c36245cecf107296f180283f2d02898372d44b",
-    True: "15 a9abe62585311fd08e87cea5b043d416ebd0689e66663aa547b72719308b8c80",
+    False: "15 3a43bdfb1505022e273b2e2d4f5f3fc15799fb27838ea465b413bfa2f02696c3",
+    True: "15 381372b7ba0d84f6589d06c1e881c5dde0e8fc96f20488b7a0e0b373474b3d43",
 }
 # Captured on release/3 (7e230438). The oQeL face sources are unchanged from
 # ba421f5c (the 15-face digests above), but these 123 builder records include
@@ -1514,9 +1528,13 @@ _OQEL_15_DIGESTS = {
 # (moe_verify_gather, qwen35_moe_routed_decode, qwen35_moe_router). A base
 # change re-pins this snapshot; the emission itself is pinned by the face
 # digests inside this test, which also cover the emitted read signatures.
+# Re-measured on wip/a1-a13 with the 15-face digests: 12 of these 123 builder
+# records are the format_linear._shared_kernel builders that emit the unrolled
+# shared skeleton (their header moves with it); the other 111, the rolled
+# skeleton and the citations it sizes match the release-3 baseline.
 _OQEL_BUILDER_DIGESTS = {
-    False: "123 ffcf3fdbb73c7a13576ea09d3299490350022a334016cebc6cba7018b7a6a202",
-    True: "123 374125617b12a61d3e6cc9ab4436ab7200f8dbb11f4df3977bd4aef8ecda7b5d",
+    False: "123 4f3543376bc4513c757ca46a6048f75378877611cc84154cc0622800aecad7fa",
+    True: "123 0f3d0f0fcb8491b9f001d0bfd74c62a8f9f749d1ed99e4a7c2cbe5cc9b061908",
 }
 
 
