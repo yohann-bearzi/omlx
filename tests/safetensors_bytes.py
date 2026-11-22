@@ -28,6 +28,9 @@ _DTYPE_BYTES = {
     "U16": 2,
     "U8": 1,
     "BOOL": 1,
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "C64": 8,
 }
 
 
@@ -43,15 +46,33 @@ def tensor_bytes(path: Path) -> dict[str, dict]:
         if start > file_size:
             raise ValueError(f"{path}: safetensors header extends past EOF")
         header = json.loads(stream.read(length))
+        if not isinstance(header, dict):
+            raise ValueError(f"{path}: safetensors header is not an object")
         out = {}
         for name, entry in header.items():
             if name == "__metadata__":
                 continue
+            if not isinstance(entry, dict):
+                raise ValueError(f"{path}:{name}: tensor entry is not an object")
             dtype = entry["dtype"]
             if dtype not in _DTYPE_BYTES:
                 raise ValueError(f"{path}:{name}: unknown safetensors dtype {dtype!r}")
-            shape = list(entry["shape"])
-            lo, hi = entry["data_offsets"]
+            shape = entry["shape"]
+            if not isinstance(shape, list):
+                raise ValueError(f"{path}:{name}: shape is not a list")
+            if any(
+                isinstance(dim, bool) or not isinstance(dim, int) or dim < 0
+                for dim in shape
+            ):
+                raise ValueError(f"{path}:{name}: negative or non-integer shape")
+            offsets = entry["data_offsets"]
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != 2
+                or any(isinstance(v, bool) or not isinstance(v, int) for v in offsets)
+            ):
+                raise ValueError(f"{path}:{name}: data_offsets are two integers")
+            lo, hi = offsets
             expected = math.prod(shape) * _DTYPE_BYTES[dtype]
             if not (0 <= lo <= hi and start + hi <= file_size):
                 raise ValueError(

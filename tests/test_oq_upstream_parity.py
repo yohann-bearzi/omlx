@@ -78,7 +78,7 @@ oq.quantize_oq_streaming(
 
 # Volatile fields of oq_imatrix_report.json: where the cache is, how long the
 # refinement took, the free memory the calibration's batch plan read (its
-# decisions, the micro-batch size and budgets, are compared).
+# decisions and the micro-batch size are compared).
 _VOLATILE = ("cache_path",)
 _VOLATILE_REFINE = ("seconds",)
 _VOLATILE_PLAN = (
@@ -135,7 +135,7 @@ def _assert_parity(output: Path, case: dict) -> None:
     assert sorted(path.name for path in output.iterdir()) == case["files"]
     assert _tensor_hashes(output) == case["tensors"]
     assert json.loads((output / "config.json").read_text()) == case["config"]
-    assert _report(output / "oq_imatrix_report.json") == case["report"]
+    assert _report(output / "oq_imatrix_report.json") == _stripped(case["report"])
     index = output / "model.safetensors.index.json"
     got = json.loads(index.read_text()) if index.exists() else None
     assert got == case["index"]
@@ -386,6 +386,72 @@ def test_safetensors_bytes_detects_flipped_byte_dtype_and_shape(tmp_path):
         tensor_bytes(bad_len)
 
 
+def _write_raw(path: Path, header: dict, payload: bytes) -> None:
+    raw = json.dumps(header).encode()
+    path.write_bytes(struct.pack("<Q", len(raw)) + raw + payload)
+
+
+def test_safetensors_bytes_refuses_out_of_bounds_truncated_and_unknown(tmp_path):
+    # data_offsets past the payload
+    bad = tmp_path / "oob.safetensors"
+    _write_raw(bad, {"a": {"dtype": "U8", "shape": [2], "data_offsets": [0, 2]}}, b"\x01")
+    with pytest.raises(ValueError, match="out of bounds"):
+        tensor_bytes(bad)
+    # truncated header length
+    trunc = tmp_path / "trunc.safetensors"
+    trunc.write_bytes(b"\x00\x01")
+    with pytest.raises(ValueError, match="truncated"):
+        tensor_bytes(trunc)
+    # header length past the file's end
+    short = tmp_path / "eof.safetensors"
+    short.write_bytes(struct.pack("<Q", 100) + b"{}")
+    with pytest.raises(ValueError, match="extends past EOF"):
+        tensor_bytes(short)
+    # an unknown dtype is refused, not guessed
+    unknown = tmp_path / "dtype.safetensors"
+    _write_raw(unknown, {"a": {"dtype": "Q99", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
+    with pytest.raises(ValueError, match="unknown safetensors dtype"):
+        tensor_bytes(unknown)
+    # FP8 and C64 are known names with their stored widths
+    fp8 = tmp_path / "fp8.safetensors"
+    _write_raw(fp8, {"a": {"dtype": "F8_E4M3", "shape": [2], "data_offsets": [0, 2]}}, b"\x00\x00")
+    assert tensor_bytes(fp8)["a"]["dtype"] == "F8_E4M3"
+    c64 = tmp_path / "c64.safetensors"
+    _write_raw(c64, {"a": {"dtype": "C64", "shape": [1], "data_offsets": [0, 8]}}, b"\x00" * 8)
+    assert tensor_bytes(c64)["a"]["dtype"] == "C64"
+    # offsets are two non-bool integers and shapes are lists
+    for name, entry, said in (
+        ("bool_offsets", {"dtype": "U8", "shape": [1], "data_offsets": [False, True]}, "data_offsets"),
+        ("float_offsets", {"dtype": "U8", "shape": [1], "data_offsets": [0.0, 1.0]}, "data_offsets"),
+        ("str_shape", {"dtype": "U8", "shape": "", "data_offsets": [0, 1]}, "shape"),
+        ("dict_shape", {"dtype": "U8", "shape": {}, "data_offsets": [0, 1]}, "shape"),
+    ):
+        bad = tmp_path / f"{name}.safetensors"
+        _write_raw(bad, {"a": entry}, b"\x00")
+        with pytest.raises(ValueError, match=said):
+            tensor_bytes(bad)
+    # negative shapes, a non-dict header, a non-dict entry
+    # a boolean is not a shape integer
+    boolean = tmp_path / "boolean.safetensors"
+    _write_raw(
+        boolean, {"a": {"dtype": "U8", "shape": [True], "data_offsets": [0, 1]}}, b"\x00"
+    )
+    with pytest.raises(ValueError, match="negative or non-integer shape"):
+        tensor_bytes(boolean)
+    neg = tmp_path / "neg.safetensors"
+    _write_raw(neg, {"a": {"dtype": "U8", "shape": [-1], "data_offsets": [0, 0]}}, b"")
+    with pytest.raises(ValueError, match="negative"):
+        tensor_bytes(neg)
+    nondict = tmp_path / "nondict.safetensors"
+    _write_raw(nondict, [1, 2], b"")
+    with pytest.raises(ValueError, match="not an object"):
+        tensor_bytes(nondict)
+    entry = tmp_path / "entry.safetensors"
+    _write_raw(entry, {"a": 7}, b"")
+    with pytest.raises(ValueError, match="not an object"):
+        tensor_bytes(entry)
+
+
 def test_parity_child_env_pins_tf32_off_and_uses_no_custom_env_vars():
     """Both test and generator pin MLX_ENABLE_TF32=0 (matching conftest.py)
     and never read environment variables."""
@@ -585,3 +651,15 @@ def test_assert_parity_detects_corrupt_index(tmp_path):
     ] = "other.safetensors"
     with pytest.raises(AssertionError):
         _assert_parity(good, expected)
+
+
+def test_assert_parity_strips_volatile_plan_keys_from_golden(tmp_path):
+    """The golden side is stripped of host facts too (M5 goldens lack them)."""
+    good = _parity_directory(tmp_path / "good")
+    expected = _snapshot(good)
+    plan = expected["report"].setdefault("collection", {}).setdefault(
+        "batch_plan", {}
+    )
+    plan["metal_available_bytes"] = 524287998672
+    plan["capture_budget_bytes"] = 805306368
+    _assert_parity(good, expected)

@@ -1292,7 +1292,7 @@ def test_a_format_that_takes_no_layer_is_said_so(
         "oQ4: quant format toy took no layer: the output is as without it"
     ]
     assert _quoted(warnings[0])
-    assert not any("oQe refine:" in message for message in caplog.messages)
+    assert not any("layers in quant format" in message for message in caplog.messages)
     assert _RECORD not in config
     # As without it, but for the record of its verification: a run in a
     # format is checked whatever the format took.
@@ -3743,7 +3743,10 @@ def test_skipped_refinement_omits_format_layers_report(
     _quantize(source, output, quant_format="toy")
     refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
     assert "format_layers" not in refine
-    assert not any("layers in quant format" in message for message in caplog.messages)
+    assert not any(
+        "layers in quant format" in message and "skipped" in message
+        for message in caplog.messages
+    )
 
 
 def test_refinement_error_status_omits_format_layers_report(

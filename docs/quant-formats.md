@@ -76,9 +76,10 @@ myformat = "my_package:FORMAT"
 Installing the package is enough. oMLX reads the `omlx.quant_formats` entry points the first time the registry is used (`omlx.formats.load`, `get`, `dot`, `tile` or `register`). A kernel patch calls `load` when it is applied, so that a model's first token does not wait for the plugins' imports.
 
 - A format names the tensor that holds its codes, `codes_name` (`weight` by default). **A plugin's format keeps no tensor called `weight`, `scales`, `biases` or `bias`**: those are MLX's own names on a quantized layer, and a format layer of a plugin has none of them, so a family's by-hand reader that indexes one fails loudly instead of reading codes as floats. Its codes and its tensors are identifiers, each named once and apart from `bias`. The built-in affine format keeps MLX's names (`weight`, `scales`, `biases`).
-- `can_refine` and `refine` are optional: a format that overrides `refine` (on
-  the class or as an attribute of the instance) opts in, and one that does not
-  keeps exactly the encoding `encode` gave it. oQ calls `refine` with the
+- `can_refine` and `refine` are the contract's refinement methods: a format that
+  overrides `refine` (on the class or as a bound attribute of the instance)
+  refines its codes, and one that keeps the default leaves exactly the encoding
+  `encode` gave it. oQ calls `refine` with the
   source's floats `w`, the tensors `encode` returned, the shrunk Gram `H = G + 3
   diag(G)` of the layer's inputs (`(k, k)`, or `(e, k, k)` for a stack), and
   the bits and group size; the returned tensors hold exactly `layout`'s names,
