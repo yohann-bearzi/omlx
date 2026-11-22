@@ -16,7 +16,17 @@ from typing import Any
 import mlx.core as mx
 import mlx.nn as nn
 
-from .m5_gather_qmm_a8 import _mtp_module_ids, tag_routed_a8_modules
+from ..formats.affine import AffineFormat
+from ..formats.linear import FormatLinear
+from .m5_gather_qmm_a8 import (
+    _eligible as _routed_a8_eligible,
+)
+from .m5_gather_qmm_a8 import (
+    _is_fused_routed_glu,
+    _is_measured_family,
+    _mtp_module_ids,
+    tag_routed_a8_modules,
+)
 from .qwen35_packed_linear import PackedLinear
 
 logger = logging.getLogger(__name__)
@@ -76,7 +86,109 @@ def _tag_modules(model: Any, config: OqA8Config) -> int:
 
 
 def _is_q8_linear(module: Any) -> bool:
-    return isinstance(module, nn.QuantizedLinear) and module.bits == 8
+    return (
+        isinstance(module, nn.QuantizedLinear) or _is_stock_affine_layer(module)
+    ) and getattr(module, "bits", None) == 8
+
+
+def _is_stock_affine_layer(linear: Any) -> bool:
+    """A stock checkpoint's dense projection: the built-in affine format's
+    layer holds the same packed weight, scales and biases as MLX's layer."""
+    return isinstance(linear, FormatLinear) and isinstance(linear.fmt, AffineFormat)
+
+
+_MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_GDN_PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b")
+_ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
+_STANDALONE_PROJECTIONS = ("out_proj",)
+_QWEN_PREFIXES = (
+    "mlx_vlm.models.qwen3_5.language",
+    "mlx_vlm.models.qwen3_5_moe.language",
+    "mlx_vlm.models.qwen4_exp.language",
+    "mlx_lm.models.qwen3_5",
+)
+
+
+def _output_dims(linear: Any):
+    weight = getattr(linear, "weight", None)
+    if weight is not None and getattr(weight, "ndim", 0) >= 1:
+        return weight.shape[0]
+    return getattr(linear, "output_dims", None)
+
+
+def _has_routed_a8(model: Any, mtp_ids: set[int]) -> bool:
+    if not _is_measured_family(model):
+        return False
+    for _, module in model.named_modules():
+        if id(module) in mtp_ids:
+            continue
+        if _is_fused_routed_glu(module) and _routed_a8_eligible(
+            module, getattr(module, "activation", None)
+        ):
+            return True
+    return False
+
+
+def _refuse_unclassified(model: Any) -> None:
+    """Refuse the opt-in only where a format layer would be silently skipped.
+
+    The A8 backends are best-effort on MLX's own quantized layers: a Q6
+    sensitive projection or an N=48 GDN gate has always stayed on the old
+    path, and real checkpoints must keep loading. What the stock switch adds
+    is a format layer the backends cannot see at all -- a closed design must
+    refuse that, and only that, inside the Qwen language modules this patch
+    serves. A model whose Qwen projections are all unclassified (and with no
+    eligible routed A8 SwitchGLU) refuses too, so an entirely dead opt-in
+    cannot pass as a tagged model.
+    """
+    mtp_ids = _mtp_module_ids(model)
+    seen = 0
+    classified = 0
+    for _, module in model.named_modules():
+        if id(module) in mtp_ids:
+            continue
+        if not type(module).__module__.startswith(_QWEN_PREFIXES):
+            continue
+        names: list[str] = []
+        for projections in (_MLP_PROJECTIONS, _GDN_PROJECTIONS):
+            if all(hasattr(module, name) for name in projections):
+                names.extend(projections)
+        for name in (*_ATTN_PROJECTIONS, *_STANDALONE_PROJECTIONS):
+            if hasattr(module, name):
+                names.append(name)
+        for name in names:
+            linear = getattr(module, name)
+            if not isinstance(linear, (nn.QuantizedLinear, FormatLinear, PackedLinear)):
+                continue
+            seen += 1
+            if classify_linear(linear) is not None:
+                classified += 1
+                continue
+            if isinstance(linear, FormatLinear) and not _is_stock_affine_layer(linear):
+                raise ValueError(
+                    "oq_a8: "
+                    f"{type(module).__name__}.{name} is a non-affine "
+                    f"{type(linear).__name__} (mode="
+                    f"{getattr(linear, 'mode', None)}, bits="
+                    f"{getattr(linear, 'bits', None)}, output_dims="
+                    f"{_output_dims(linear)}); the A8 prefill kernels "
+                    "cannot take it. Disable a8_prefill or use an affine "
+                    "projection they tile."
+                )
+            out_dims = _output_dims(linear)
+            if isinstance(linear, PackedLinear) and out_dims and out_dims % 64 != 0:
+                raise ValueError(
+                    "oq_a8: "
+                    f"{type(module).__name__}.{name} is a PackedLinear "
+                    f"of output_dims={out_dims}; the A8 "
+                    "prefill kernels need a multiple of 64. Disable "
+                    "a8_prefill."
+                )
+    if seen and not classified and not _has_routed_a8(model, mtp_ids):
+        raise ValueError(
+            "oq_a8: no Qwen projection in this model classifies for the A8 "
+            "prefill kernels; the opt-in would be dead. Disable a8_prefill."
+        )
 
 
 def _kernels_available() -> bool:
@@ -167,7 +279,9 @@ def _classify_uncached(linear: Any) -> OqA8Plan | None:
     if isinstance(linear, PackedLinear):
         # Always Q4 GS64 with bfloat16 metadata; the kernel reads its tiles.
         return _plan_for(4, linear.output_dims, packed=True)
-    if not isinstance(linear, nn.QuantizedLinear):
+    if not isinstance(linear, nn.QuantizedLinear) and not _is_stock_affine_layer(
+        linear
+    ):
         return None
     if getattr(linear, "mode", None) != "affine":
         return None
@@ -581,6 +695,8 @@ def apply_qwen35_oq_a8_patch(
         floor = int(min_tokens)
     config = OqA8Config(min_tokens=floor)
 
+    if model is not None:
+        _refuse_unclassified(model)
     tagged = _tag_modules(model, config) if model is not None else 0
     if model is not None:
         # The routed-expert Gate+Up follows the same per-model opt-in.

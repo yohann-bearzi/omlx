@@ -880,3 +880,78 @@ def test_the_router_coalesce_kernel_carries_only_its_own_selection(dtype, monkey
         not in router.topk_indices_header(dtype)
     )
     assert uncalled(header + source) == [], name
+
+
+def _stock_affine_format_layer(linear):
+    import json
+    import pathlib
+    import tempfile
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatLinear
+    from omlx.patches.format_load import loading
+
+    directory = pathlib.Path(tempfile.mkdtemp())
+    (directory / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    arrays = {
+        "weight": linear["weight"],
+        "scales": linear["scales"],
+        "biases": linear["biases"],
+    }
+    with fmt_testing.verified("qwen4_exp"), loading(directory):
+        return FormatLinear(
+            "affine",
+            linear.bits,
+            linear.group_size,
+            arrays["scales"].shape[1] * linear.group_size,
+            arrays,
+        )
+
+
+@pytest.mark.parametrize("row_exact", [True, False], ids=["row_exact", "verify"])
+def test_stock_affine_format_router_takes_the_fused_window(row_exact, engaged):
+    """A stock checkpoint's router gate is a built-in affine FormatLinear;
+    the verify window must take it through the fused gate instead of one
+    stock call a row."""
+    hidden = 2048
+    block = _block(
+        6,
+        bits=4,
+        hidden=hidden,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    block.gate = _stock_affine_format_layer(block.gate)
+    block.eval()
+    mx.eval(block.parameters())
+    x = _inputs(5, 0, hidden=hidden).reshape(5, 1, hidden)
+    _check(block, x, engaged, row_exact=row_exact)
+
+
+def test_biased_or_non_affine_format_router_declines_fused_window():
+    from omlx.patches.qwen35_moe_routed_decode import _window_router_ok
+
+    block = _block(
+        6,
+        bits=4,
+        hidden=2048,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    gate = _stock_affine_format_layer(block.gate)
+    assert _window_router_ok(gate, mx.bfloat16)
+
+    gate["bias"] = mx.zeros((6,), dtype=mx.bfloat16)
+    assert not _window_router_ok(gate, mx.bfloat16)
+
+    non_affine = _stock_affine_format_layer(block.gate)
+    object.__setattr__(non_affine, "fmt", object())
+    assert not _window_router_ok(non_affine, mx.bfloat16)

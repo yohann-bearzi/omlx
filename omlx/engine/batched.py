@@ -300,6 +300,24 @@ class BatchedEngine(BaseEngine):
             return extract_k2_horizon_messages(messages)
         return messages
 
+    def _apply_oq_a8_prefill(self) -> None:
+        try:
+            from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+            # The model itself is what gets opted in: the patch tags its
+            # modules, so a model loaded with the setting off is never
+            # routed even though the class wrapper is process-wide.
+            apply_qwen35_oq_a8_patch(
+                self._model,
+                min_tokens=int(
+                    getattr(self._model_settings, "a8_prefill_min_tokens", 128)
+                ),
+            )
+        except ValueError:
+            raise
+        except Exception:
+            logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
@@ -568,20 +586,7 @@ class BatchedEngine(BaseEngine):
         if oqh and a8_prefill_on(self._model_settings):
             logger.warning("A8 prefill does not read oQh weights; it stays off")
         elif a8_prefill_on(self._model_settings):
-            try:
-                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
-
-                # The model itself is what gets opted in: the patch tags its
-                # modules, so a model loaded with the setting off is never
-                # routed even though the class wrapper is process-wide.
-                apply_qwen35_oq_a8_patch(
-                    self._model,
-                    min_tokens=int(
-                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
-                    ),
-                )
-            except Exception:
-                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+            self._apply_oq_a8_prefill()
 
         ane_backend = ane_prefill_backend(self.model_type)
         ane_enabled = getattr(self._model_settings, "qwen35_ane_prefill_enabled", False)

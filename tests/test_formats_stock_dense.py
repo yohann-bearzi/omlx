@@ -1090,3 +1090,136 @@ def test_planless_plugin_row_exact_above_max_rows_skips_prefill_and_matches_seri
         batched.view(mx.uint16), serial.view(mx.uint16)
     ).item(), "fixture must distinguish batched matmul from 1-row serial matmul"
     assert mx.array_equal(y.view(mx.uint16), serial.view(mx.uint16)).item()
+
+
+def test_decision_backbone_takes_format_embedding_and_linear_heads(tmp_path):
+    import json
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatEmbedding
+    from omlx.models.decision import DecisionBackbone
+    from omlx.patches.format_load import loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    mx.random.seed(83)
+    embedding = (mx.random.normal((16, 256)) * 0.1).astype(mx.float16)
+    arrays = dict(zip(("weight", "scales", "biases"), mx.quantize(embedding, bits=4)))
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        head = FormatEmbedding("affine", 4, 64, 256, arrays)
+    backbone = DecisionBackbone.__new__(DecisionBackbone)
+    backbone._lm_head = head
+    ids = mx.array([0, 3, 15])
+    rows = backbone.output_rows(ids)
+    mx.eval(rows)
+    want = head(ids)
+    mx.eval(want)
+    assert mx.array_equal(rows.view(mx.uint16), want.view(mx.uint16))
+    ids_2d = mx.array([[0, 3], [5, 15]])
+    rows_2d = backbone.output_rows(ids_2d)
+    mx.eval(rows_2d)
+    assert rows_2d.shape == (2, 2, 256)
+    assert mx.array_equal(rows_2d.view(mx.uint16), head(ids_2d).view(mx.uint16))
+    hidden = (mx.random.normal((1, 4, 256)) * 0.5).astype(mx.float16)
+    logits = backbone.logits(hidden)
+    mx.eval(logits)
+    expected = head.as_linear(hidden)
+    mx.eval(expected)
+    assert mx.array_equal(logits.view(mx.uint16), expected.view(mx.uint16))
+
+
+def test_decision_backbone_format_linear_head(tmp_path, build_layer):
+    """DecisionBackbone must decode FormatLinear heads through the format
+    interface (affine parity, custom plugin codes_name, and placeholder
+    refusal), never hand-reading .weight/.scales."""
+    import json
+
+    from omlx.formats import QuantFormat
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatLinear
+    from omlx.models.decision import DecisionBackbone
+    from omlx.patches.format_load import loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    mx.random.seed(89)
+    weight = (mx.random.normal((16, 256)) * 0.1).astype(mx.float16)
+    packed = mx.quantize(weight, bits=4, group_size=64)
+    arrays = dict(zip(("weight", "scales", "biases"), packed))
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        affine_head = FormatLinear("affine", 4, 64, 256, arrays)
+
+    backbone = DecisionBackbone.__new__(DecisionBackbone)
+    backbone._lm_head = affine_head
+    ids = mx.array([0, 3, 15])
+    rows = backbone.output_rows(ids)
+    mx.eval(rows)
+    want = mx.dequantize(
+        packed[0][ids],
+        packed[1][ids],
+        packed[2][ids],
+        group_size=64,
+        bits=4,
+        mode="affine",
+    )
+    mx.eval(want)
+    assert mx.array_equal(rows.view(mx.uint16), want.view(mx.uint16))
+    hidden = (mx.random.normal((1, 4, 256)) * 0.5).astype(mx.float16)
+    logits = backbone.logits(hidden)
+    mx.eval(logits)
+    expected = affine_head(hidden)
+    mx.eval(expected)
+    assert mx.array_equal(logits.view(mx.uint16), expected.view(mx.uint16))
+
+    # Custom plugin with non-standard codes_name (no .weight or .scales).
+    class _CustomCodesPlugin(QuantFormat):
+        mode = "custom_codes_decision_test"
+        codes_name = "payload"
+        tensors = ("meta_s", "meta_b")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "payload": ((n, k * bits // 32), mx.uint32),
+                "meta_s": ((n, k // group_size), None),
+                "meta_b": ((n, k // group_size), None),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return mx.dequantize(
+                tensors["payload"],
+                tensors["meta_s"],
+                tensors["meta_b"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+
+    plugin_head = build_layer(
+        _CustomCodesPlugin(),
+        4,
+        64,
+        256,
+        {"payload": packed[0], "meta_s": packed[1], "meta_b": packed[2]},
+    )
+    backbone._lm_head = plugin_head
+    plugin_rows = backbone.output_rows(ids)
+    mx.eval(plugin_rows)
+    assert mx.array_equal(plugin_rows.view(mx.uint16), want.view(mx.uint16))
+
+    # Placeholders must be refused instead of decoding zeros.
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        placeholder_head = FormatLinear(
+            "affine",
+            4,
+            64,
+            256,
+            {k: mx.zeros_like(v) for k, v in arrays.items()},
+            placeholders=True,
+        )
+    backbone._lm_head = placeholder_head
+    with pytest.raises(ValueError, match="placeholder"):
+        backbone.output_rows(ids)

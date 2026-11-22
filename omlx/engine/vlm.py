@@ -2058,6 +2058,24 @@ class VLMBatchedEngine(BaseEngine):
             logger.debug(f"OCR stop token IDs resolved: {ids}")
         return ids
 
+    def _apply_oq_a8_prefill(self) -> None:
+        try:
+            from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
+
+            # The model itself is what gets opted in: the patch tags its
+            # modules, so a model loaded with the setting off is never
+            # routed even though the class wrapper is process-wide.
+            apply_qwen35_oq_a8_patch(
+                self._vlm_model,
+                min_tokens=int(
+                    getattr(self._model_settings, "a8_prefill_min_tokens", 128)
+                ),
+            )
+        except ValueError:
+            raise
+        except Exception:
+            logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+
     async def start(self) -> None:
         """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter."""
         if self._loaded:
@@ -2814,20 +2832,7 @@ class VLMBatchedEngine(BaseEngine):
             if tagged:
                 logger.info("MiniMax A8 prefill on %d modules", tagged)
         elif a8_on and self.model_type != "deepseek_v41":
-            try:
-                from ..patches.qwen35_oq_a8 import apply_qwen35_oq_a8_patch
-
-                # The model itself is what gets opted in: the patch tags its
-                # modules, so a model loaded with the setting off is never
-                # routed even though the class wrapper is process-wide.
-                apply_qwen35_oq_a8_patch(
-                    self._vlm_model,
-                    min_tokens=int(
-                        getattr(self._model_settings, "a8_prefill_min_tokens", 128)
-                    ),
-                )
-            except Exception:
-                logger.debug("oQ A8 prefill patch not applied", exc_info=True)
+            self._apply_oq_a8_prefill()
 
         if ane_count or getattr(self._vlm_model, "_omlx_ane_gdn_prefill_count", 0):
             try:

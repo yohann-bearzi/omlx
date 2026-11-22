@@ -104,6 +104,7 @@ import numpy as np
 
 from .. import formats
 from ..formats import Dot, kernels
+from ..formats.affine import AffineFormat
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
@@ -796,8 +797,14 @@ def _window_router_ok(gate, dtype: mx.Dtype) -> bool:
     ``quantized_matmul`` and every window would decline after its gate
     work). These are the affine
     widths and group sizes ``row_exact_qmv`` tiles."""
-    return (
+    stock = (
         _plain(gate, nn.QuantizedLinear)
+        or type(gate) is FormatLinear
+        and isinstance(gate.fmt, AffineFormat)
+        and "bias" not in gate
+    )
+    return (
+        stock
         and "biases" in gate
         and gate.mode == "affine"
         and gate.bits in (4, 5, 6, 8)

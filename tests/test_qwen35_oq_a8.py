@@ -1311,3 +1311,382 @@ def test_q8_mtp_head_not_tagged(head_bits, tagged):
 
     assert dispatch._config_for(model.proj) is not None
     assert (dispatch._config_for(model.head.proj) is not None) is tagged
+
+
+def _stock_affine_format_linear(bits=4, out_dim=128, in_dim=256):
+    import json
+    import pathlib
+    import tempfile
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatLinear
+    from omlx.patches.format_load import loading
+
+    directory = pathlib.Path(tempfile.mkdtemp())
+    (directory / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    mx.random.seed(17)
+    weight = (mx.random.normal((out_dim, in_dim)) * 0.1).astype(mx.float16)
+    arrays = dict(zip(("weight", "scales", "biases"), mx.quantize(weight, bits=bits)))
+    with fmt_testing.verified("qwen4_exp"), loading(directory):
+        return FormatLinear("affine", bits, GROUP_SIZE, in_dim, arrays)
+
+
+@requires_kernels
+def test_stock_affine_format_layer_classifies_like_mlxs_layer():
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    layer = _stock_affine_format_linear(4)
+    plan = dispatch.classify_linear(layer)
+    assert plan is not None, "a stock affine FormatLinear must take the A8 plan"
+    assert (plan.bits, plan.group_size, plan.kernel) == (4, 64, "q4a8_g64")
+
+
+@requires_kernels
+def test_a8_plan_on_the_format_layer_is_bitwise_the_mlx_layer_plan():
+    """83ee1d7b ran these projections as QuantizedLinear; the format layer
+    carries the same tensors, so the same A8 kernel must produce the same
+    bits."""
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    fmt = _stock_affine_format_linear(4)
+    quantized = nn.QuantizedLinear(256, 128, bias=False, group_size=64, bits=4)
+    quantized.set_dtype(mx.float16)
+    for name in ("weight", "scales", "biases"):
+        setattr(quantized, name, fmt[name])
+    plans = (dispatch.classify_linear(fmt), dispatch.classify_linear(quantized))
+    assert plans[0] is not None and plans[1] is not None
+    mx.random.seed(23)
+    x = (mx.random.normal((32, 256)) * 0.5).astype(mx.float16)
+    outs = [
+        dispatch.apply_plan(
+            layer, dispatch.stage_a(x, plan.act_mode, plan.layout), plan
+        )
+        for layer, plan in zip((fmt, quantized), plans)
+    ]
+    assert mx.array_equal(outs[0].view(mx.uint16), outs[1].view(mx.uint16))
+
+
+@requires_kernels
+def test_apply_allows_qwen4_n48_gdn(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Gdn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.in_proj_qkv = _quantized_linear(256, 256, 4)
+            self.in_proj_z = _quantized_linear(256, 128, 4)
+            self.in_proj_b = _quantized_linear(256, 48, 5)
+            self.in_proj_a = _quantized_linear(256, 48, 5)
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = _quantized_linear(256, 128, 4)
+            self.up_proj = _quantized_linear(256, 128, 4)
+            self.down_proj = _quantized_linear(128, 256, 4)
+            self.linear_attn = Gdn()
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = Block()
+
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    Gdn.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    Block.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.setattr(dispatch, "_kernels_available", lambda: True)
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    dispatch.apply_qwen35_oq_a8_patch(Model())
+
+
+def test_refuses_a_dense_projection_the_a8_kernels_cannot_take(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = _quantized_linear(256, 128, 4)
+            self.up_proj = _quantized_linear(256, 128, 4)
+            down = _stock_affine_format_linear(4, out_dim=256, in_dim=128)
+            object.__setattr__(down, "fmt", object())
+            self.down_proj = down
+
+    Block.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    with pytest.raises(ValueError, match="down_proj"):
+        dispatch._refuse_unclassified(Block())
+
+
+def test_classified_dense_projections_load(monkeypatch):
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Block:
+        gate_proj = _quantized_linear(256, 128, 4)
+        up_proj = _quantized_linear(256, 128, 4)
+        down_proj = _quantized_linear(128, 256, 8)
+
+        def named_modules(self):
+            return [("", self)]
+
+    Block.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    plan = dispatch.OqA8Plan(bits=4, group_size=64, act_mode=0, variant=800)
+    calls = []
+
+    def stub_classify(linear):
+        calls.append(linear)
+        return plan
+
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    monkeypatch.setattr(dispatch, "classify_linear", stub_classify)
+    dispatch._refuse_unclassified(Block())
+    assert len(calls) == 3
+
+
+def test_apply_refusal_leaves_model_untagged(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = _quantized_linear(256, 128, 4)
+            self.up_proj = _quantized_linear(256, 128, 4)
+            down = _stock_affine_format_linear(4, out_dim=256, in_dim=128)
+            object.__setattr__(down, "fmt", object())
+            self.down_proj = down
+
+    Block.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = Block()
+
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    model = Model()
+    monkeypatch.setattr(dispatch, "_kernels_available", lambda: True)
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    with pytest.raises(ValueError, match="down_proj"):
+        dispatch.apply_qwen35_oq_a8_patch(model)
+    assert getattr(model.mlp, dispatch._CONFIG_ATTR, None) is None
+    assert getattr(model.mlp.gate_proj, dispatch._CONFIG_ATTR, None) is None
+
+
+def test_refuses_non_affine_format_and_unaligned_packed_linear(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.qwen35_packed_linear import PackedLinear
+
+    layer = _stock_affine_format_linear(4)
+    object.__setattr__(layer, "fmt", object())  # any non-AffineFormat value
+
+    class Packed(PackedLinear):
+        output_dims = 96
+
+        def __init__(self):
+            nn.Module.__init__(self)
+            object.__setattr__(self, "packed_weight", layer["weight"])
+            object.__setattr__(self, "packed_scales", layer["scales"])
+            object.__setattr__(self, "packed_biases", layer["biases"])
+
+    class Block:
+        gate_proj = _quantized_linear(256, 128, 4)
+        up_proj = _quantized_linear(256, 128, 4)
+
+        def __init__(self, down):
+            self.down_proj = down
+
+        def named_modules(self):
+            return [("", self)]
+
+    Block.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    for down in (layer, Packed()):
+        with pytest.raises(ValueError, match="down_proj"):
+            dispatch._refuse_unclassified(Block(down))
+
+    # A 64-aligned PackedLinear (not 128-aligned) is not refused as unaligned.
+    class Packed64(Packed):
+        output_dims = 64
+
+    plan = dispatch.OqA8Plan(bits=4, group_size=64, act_mode=0, variant=800)
+    monkeypatch.setattr(
+        dispatch,
+        "classify_linear",
+        lambda lin: None if isinstance(lin, PackedLinear) else plan,
+    )
+    dispatch._refuse_unclassified(Block(Packed64()))
+
+
+def test_q8_stock_affine_format_mtp_head_not_tagged(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Head(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = _stock_affine_format_linear(8)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = _quantized_linear(256, 128, 4)
+            self.head = Head()
+
+        def get_mtp_module(self):
+            return self.head
+
+    model = Model()
+    tagged = dispatch._tag_modules(model, dispatch.OqA8Config(min_tokens=128))
+    assert tagged >= 1
+    assert getattr(model.head.proj, dispatch._CONFIG_ATTR, None) is None
+
+
+def test_refuses_non_affine_attention_projection(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Attn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = _quantized_linear(256, 128, 4)
+            self.k_proj = _quantized_linear(256, 128, 4)
+            self.v_proj = _quantized_linear(256, 128, 4)
+            o_proj = _stock_affine_format_linear(4, out_dim=256, in_dim=128)
+            object.__setattr__(o_proj, "fmt", object())
+            self.o_proj = o_proj
+
+    Attn.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    with pytest.raises(ValueError, match="o_proj.*output_dims=256"):
+        dispatch._refuse_unclassified(Attn())
+
+
+def test_zero_classify_allows_routed_a8_with_q6_dense(monkeypatch):
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwiGLU
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class DenseBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = _quantized_linear(256, 128, 6)
+            self.up_proj = _quantized_linear(256, 128, 6)
+            self.down_proj = _quantized_linear(128, 256, 6)
+
+    class RoutedSwitchGLU(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = QuantizedSwitchLinear(
+                256, 256, 4, bias=False, group_size=64, bits=4
+            )
+            self.down_proj = QuantizedSwitchLinear(
+                128, 256, 4, bias=False, group_size=64, bits=4
+            )
+            self.activation = SwiGLU()
+
+    class Model(nn.Module):
+        def __init__(self, with_routed):
+            super().__init__()
+            self.mlp = DenseBlock()
+            if with_routed:
+                self.switch_mlp = RoutedSwitchGLU()
+
+    DenseBlock.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    RoutedSwitchGLU.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    monkeypatch.setattr(dispatch, "classify_linear", lambda linear: None)
+
+    # With eligible Q4 GS64 routed SwitchGLU, A8 opt-in is live -> passes.
+    dispatch._refuse_unclassified(Model(with_routed=True))
+
+    # Without routed A8, zero classified dense projections -> refuses.
+    with pytest.raises(ValueError, match="no Qwen projection"):
+        dispatch._refuse_unclassified(Model(with_routed=False))
+
+
+def test_refuse_unclassified_skips_qwen4_vision_namespace(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            out = _stock_affine_format_linear(4, out_dim=256, in_dim=128)
+            object.__setattr__(out, "fmt", object())
+            self.out_proj = out
+
+    VisionBlock.__module__ = "mlx_vlm.models.qwen4_exp.vision"
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    dispatch._refuse_unclassified(VisionBlock())
+
+
+def test_refuse_unclassified_covers_qwen35_and_skips_mtp(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Qwen35Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            out = _stock_affine_format_linear(4, out_dim=256, in_dim=128)
+            object.__setattr__(out, "fmt", object())
+            self.out_proj = out
+
+    Qwen35Block.__module__ = "mlx_vlm.models.qwen3_5.language"
+    block = Qwen35Block()
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: set())
+    with pytest.raises(ValueError, match="out_proj"):
+        dispatch._refuse_unclassified(block)
+
+    # Same module inside MTP draft head is excluded.
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda model: {id(block)})
+    dispatch._refuse_unclassified(block)
+
+
+def test_engine_loaders_propagate_oq_a8_value_error(monkeypatch):
+    from types import SimpleNamespace
+
+    from omlx.engine.batched import BatchedEngine
+    from omlx.engine.vlm import VLMBatchedEngine
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    def raise_value_error(model, min_tokens=None):
+        raise ValueError("oq_a8: refused")
+
+    def raise_runtime_error(model, min_tokens=None):
+        raise RuntimeError("transient")
+
+    vlm_engine = VLMBatchedEngine.__new__(VLMBatchedEngine)
+    vlm_engine._vlm_model = object()
+    vlm_engine._model_settings = SimpleNamespace(a8_prefill_min_tokens=128)
+
+    batched_engine = BatchedEngine.__new__(BatchedEngine)
+    batched_engine._model = object()
+    batched_engine._model_settings = SimpleNamespace(a8_prefill_min_tokens=128)
+
+    monkeypatch.setattr(dispatch, "apply_qwen35_oq_a8_patch", raise_value_error)
+    with pytest.raises(ValueError, match="oq_a8: refused"):
+        vlm_engine._apply_oq_a8_prefill()
+    with pytest.raises(ValueError, match="oq_a8: refused"):
+        batched_engine._apply_oq_a8_prefill()
+
+    monkeypatch.setattr(dispatch, "apply_qwen35_oq_a8_patch", raise_runtime_error)
+    vlm_engine._apply_oq_a8_prefill()
+    batched_engine._apply_oq_a8_prefill()

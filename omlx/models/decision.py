@@ -23,6 +23,8 @@ import mlx.nn as nn
 import numpy as np
 from mlx_vlm.utils import load as vlm_load
 
+from .. import formats
+from ..formats.linear import FormatEmbedding, FormatLinear
 from ..model_discovery import DECISION_SIDECAR_WEIGHTS, _vision_weight_bytes
 from ..patches.format_load import check_loaded, refuse_family
 from ..utils.image import load_image
@@ -298,14 +300,24 @@ class DecisionBackbone:
         return self._text_model.norm(hidden[0, -1])
 
     def logits(self, hidden: mx.array) -> mx.array:
-        if isinstance(self._lm_head, nn.Embedding | nn.QuantizedEmbedding):
-            return self._lm_head.as_linear(hidden)
-        return self._lm_head(hidden)
+        head = self._lm_head
+        if isinstance(head, (nn.Embedding, nn.QuantizedEmbedding, FormatEmbedding)):
+            return head.as_linear(hidden)
+        return head(hidden)
 
     def output_rows(self, ids: mx.array) -> mx.array:
         """Rows of the output projection for ``ids``, dequantized if needed."""
         head = self._lm_head
-        if isinstance(head, nn.QuantizedLinear | nn.QuantizedEmbedding):
+        if isinstance(head, FormatEmbedding):
+            return head(ids)
+        if isinstance(head, FormatLinear):
+            if formats.stackable(
+                head.fmt, head.input_dims, head.output_dims, head.bits, head.group_size
+            ):
+                rows = head._decoded(ids.reshape(-1))
+                return rows.reshape(*ids.shape, head.input_dims)
+            return head._decoded()[ids]
+        if isinstance(head, (nn.QuantizedLinear, nn.QuantizedEmbedding)):
             biases = head.get("biases")
             return mx.dequantize(
                 head.weight[ids],
@@ -313,6 +325,6 @@ class DecisionBackbone:
                 None if biases is None else biases[ids],
                 group_size=head.group_size,
                 bits=head.bits,
-                mode=getattr(head, "mode", "affine"),
+                mode=head.mode,
             )
         return head.weight[ids]

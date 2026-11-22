@@ -21,6 +21,8 @@ from mlx_lm.models.activations import swiglu
 
 from omlx.custom_kernels.nax import is_nax_available
 
+from ..formats.affine import AffineFormat
+from ..formats.linear import FormatLinear
 from .mlx_vlm_muse_glimmer_compat import is_applied as muse_glimmer_compat_applied
 from .qwen35_packed_linear import PackedLinear
 
@@ -497,6 +499,26 @@ class _VLMPackedPrefillLinear(PackedLinear):
         return super().__call__(x)
 
 
+class _VLMFormatPrefillLinear(FormatLinear):
+    """A stock affine format layer taking the prefill backend above the floor."""
+
+    def __call__(self, x):
+        if x.ndim != 3 or x.shape[-2] <= 1:
+            return super().__call__(x)
+        row_exact = self._qwen_row_exact
+        if row_exact is not None and row_exact():
+            return super().__call__(x)
+        if x.shape[
+            -2
+        ] >= _VLMQuantizedPrefillLinear._route_min_tokens or _q8_backend_candidate(
+            self, x
+        ):
+            routed = _try_backend(self, x)
+            if routed is not None:
+                return routed
+        return super().__call__(x)
+
+
 def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
     """Route the loaded Qwen projections without replacing their forward graph."""
     if not _has_native_qmm():
@@ -519,9 +541,9 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
     for _, module in model.named_modules():
         if not type(module).__module__.startswith(
             (
-                "mlx_vlm.models.qwen3_5.",
-                "mlx_vlm.models.qwen3_5_moe.",
-                "mlx_vlm.models.qwen4_exp.",
+                "mlx_vlm.models.qwen3_5.language",
+                "mlx_vlm.models.qwen3_5_moe.language",
+                "mlx_vlm.models.qwen4_exp.language",
             )
         ):
             continue
@@ -532,6 +554,9 @@ def apply_qwen35_q4_prefill_linear_patch(model) -> bool:
                 installed = True
             elif type(linear) is PackedLinear:
                 linear.__class__ = _VLMPackedPrefillLinear
+                installed = True
+            elif type(linear) is FormatLinear and isinstance(linear.fmt, AffineFormat):
+                linear.__class__ = _VLMFormatPrefillLinear
                 installed = True
     return installed
 
