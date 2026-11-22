@@ -90,6 +90,22 @@ DENSE_TILE_TABLE: dict = {}
 _V1 = Path(__file__).with_name("v1")
 _TABLE_DIRS = [_V1]
 _EXTRA_DIRS: list[Path] = []
+_KEY_FIELDS = frozenset(
+    {
+        "route",
+        "face_id",
+        "dtype",
+        "bits",
+        "group",
+        "rows_bucket",
+        "n",
+        "k",
+        "n_bucket",
+        "k_bucket",
+    }
+)
+_PROFILE_WILDCARDS = frozenset({"*:plain", "*:lut_small", "*:lut_tg"})
+_DTYPES = frozenset({"bf16", "fp16", "fp32"})
 _CHIPS: dict[str, ChipTable] = {}
 _SKELETON_DIGEST: dict[str, str] = {}
 _LOCK = threading.Lock()
@@ -118,6 +134,15 @@ _ROWS_BUCKETS = {
         (13, 16, "13-16"),
         (17, 24, "17-24"),
     ),
+}
+
+
+_N_BUCKETS = frozenset({"N<=1024", "N1025-4096", "N4097-32768", "N>32768"})
+_K_BUCKETS = frozenset({"K<=1024", "K1025-4096", "K>4096"})
+_ROWS_BUCKET_NAMES = {
+    route: frozenset({name for _, _, name in buckets})
+    | {f"<{buckets[0][0]}", f"{buckets[-1][1] + 1}+"}
+    for route, buckets in _ROWS_BUCKETS.items()
 }
 
 
@@ -238,13 +263,72 @@ class ChipTable:
     entries: tuple[_Entry, ...]
 
 
+def _check_key(path: Path, key: dict) -> None:
+    """The entry's key, fail closed: a typo must not silently never match."""
+    unknown = set(key) - _KEY_FIELDS
+    if unknown:
+        raise ValueError(f"tuning: {path} key has unknown fields {sorted(unknown)}")
+    route = key.get("route")
+    if not isinstance(route, str) or not route:
+        raise ValueError(f"tuning: {path} key names no route")
+    dtype = key.get("dtype")
+    if not isinstance(dtype, str) or dtype not in _DTYPES:
+        raise ValueError(
+            f"tuning: {path} key dtype is one of {sorted(_DTYPES)}, not {dtype!r}"
+        )
+    rows_bucket = key.get("rows_bucket")
+    allowed = _ROWS_BUCKET_NAMES.get(route)
+    if (
+        not isinstance(rows_bucket, str)
+        or not rows_bucket
+        or (allowed is not None and rows_bucket not in allowed)
+    ):
+        raise ValueError(
+            f"tuning: {path} key rows_bucket {rows_bucket!r} is not one this "
+            "route has"
+        )
+    for name in ("bits", "group"):
+        value = key.get(name)
+        if type(value) is not int or value < 1:
+            raise ValueError(
+                f"tuning: {path} key {name} is a positive int, not {value!r}"
+            )
+    face_id = key.get("face_id")
+    if not isinstance(face_id, str) or not face_id:
+        raise ValueError(f"tuning: {path} has an entry without face_id")
+    if face_id.startswith("*:") and face_id not in _PROFILE_WILDCARDS:
+        raise ValueError(
+            f"tuning: {path} wildcard {face_id!r} is one of "
+            f"{sorted(_PROFILE_WILDCARDS)}"
+        )
+    exact = "n" in key or "k" in key
+    bucketed = "n_bucket" in key or "k_bucket" in key
+    if exact == bucketed:
+        raise ValueError(f"tuning: {path} key needs n and k, or n_bucket and k_bucket")
+    if exact:
+        for name in ("n", "k"):
+            value = key.get(name)
+            if type(value) is not int or value < 1:
+                raise ValueError(
+                    f"tuning: {path} key {name} is a positive int, not {value!r}"
+                )
+    else:
+        for name, buckets in (("n_bucket", _N_BUCKETS), ("k_bucket", _K_BUCKETS)):
+            value = key.get(name)
+            if value not in buckets:
+                raise ValueError(
+                    f"tuning: {path} key {name} {value!r} is not one of "
+                    f"{sorted(buckets)}"
+                )
+
+
 def _read_table(path: Path, chips: dict[str, list[_Entry]]) -> None:
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         raise ValueError(f"tuning: cannot read {path}: {error}") from None
     version = data.get("schema_version") if isinstance(data, dict) else data
-    if not isinstance(data, dict) or isinstance(version, bool) or version != 1:
+    if not isinstance(data, dict) or type(version) is not int or version != 1:
         raise ValueError(f"tuning: {path} is a schema_version 1 table, not {version!r}")
     chip = data.get("chip")
     if not isinstance(chip, str) or not chip:
@@ -262,9 +346,8 @@ def _read_table(path: Path, chips: dict[str, list[_Entry]]) -> None:
         exactness = raw.get("exactness", "bitwise")
         if not isinstance(key, dict) or exactness not in ("bitwise", "rule17_fp32"):
             raise ValueError(f"tuning: {path} has an entry without a key/exactness")
-        face_id = key.get("face_id")
-        if not isinstance(face_id, str) or not face_id:
-            raise ValueError(f"tuning: {path} has an entry without face_id")
+        _check_key(path, key)
+        face_id = key["face_id"]
         face_sha = raw.get("face_sha256", "")
         exact_face = not face_id.startswith("*:")
         if not isinstance(face_sha, str) or (exact_face and not face_sha):
@@ -352,10 +435,10 @@ def _matches(entry: _Entry, query: _Query) -> int:
     if "n" in key and "k" in key:
         if key["n"] != query.n or key["k"] != query.k:
             return 0
-        return 3 if exact_face else 1
+        return 4 if exact_face else 2
     if key.get("n_bucket") != query.n_bucket or key.get("k_bucket") != query.k_bucket:
         return 0
-    return 2 if exact_face else 1
+    return 3 if exact_face else 1
 
 
 def lookup(
@@ -372,7 +455,7 @@ def lookup(
 ) -> object | None:
     """The tuned parameters for a face and shape, or None for the parity
     default.  Resolve once per launch plan, never per call."""
-    chip_id = chip or current_chip()
+    chip_id = current_chip() if chip is None else chip
     table = _index_for_chip(chip_id)
     if not table.entries:
         return None
@@ -393,10 +476,11 @@ def lookup(
         k_bucket=_k_bucket(k),
     )
     digest: str | None = None
-    candidates: list[tuple[int, _Entry]] = []
+    best_score = 0
+    best_params = None
     for entry in table.entries:
         score = _matches(entry, query)
-        if not score:
+        if score <= best_score:
             continue
         if entry.skeleton_sha256 != skeleton:
             continue
@@ -407,11 +491,11 @@ def lookup(
                 continue
         if not entry.params.is_legal(face, k, n, rows, chip_id, dtype=dtype):
             continue
-        candidates.append((score, entry))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1].params
+        if score == 4:
+            return entry.params
+        best_score = score
+        best_params = entry.params
+    return best_params
 
 
 def stale_entries(dirs=None, faces=None) -> list[str]:
@@ -427,6 +511,8 @@ def stale_entries(dirs=None, faces=None) -> list[str]:
     skeleton_digests: dict[str, str | None] = {}
     for entry_path in _TABLE_DIRS if dirs is None else dirs:
         base = Path(entry_path)
+        if not base.exists():
+            raise ValueError(f"tuning: {entry_path} does not exist")
         for path in [base] if base.is_file() else sorted(base.glob("*.json")):
             chips: dict[str, list[_Entry]] = {}
             _read_table(path, chips)
@@ -451,7 +537,8 @@ def stale_entries(dirs=None, faces=None) -> list[str]:
 
 
 def check_repin(measured_at: str, skeleton_commit_time: str) -> None:
-    """Refuse a _TUNED_METAL_DIGEST re-pin measured before the skeleton change."""
+    """Refuse a _TUNED_METAL_DIGEST re-pin measured at or before the
+    skeleton change."""
     from datetime import UTC, datetime
 
     def when(value: str) -> datetime:

@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import mlx.core as mx
 import pytest
 
-from omlx.formats import Dot, DotReads, Table, tuning
+from omlx.formats import ApplyRead, Dot, DotReads, Table, tuning
 from omlx.formats.tuning import schema
 
 CHIP = "applegpu_g17s_c1"
@@ -210,6 +210,40 @@ def test_a_stale_face_digest_is_skipped(tmp_path):
     tuning.reset_cache()
     assert _lookup(face) is None
     assert _lookup(_face(key="changed")) is None
+
+
+def test_lookup_keeps_the_in_tree_entry_on_an_equal_score(tmp_path, monkeypatch):
+    face = _face()
+    in_tree = _entry(face, n_bucket="N1025-4096", k_bucket="K>4096")
+    _write(tmp_path / "v1", CHIP, [in_tree])
+    plugin = tmp_path / "plugin"
+    plugin_entry = _entry(
+        face,
+        n_bucket="N1025-4096",
+        k_bucket="K>4096",
+        params={
+            "backend": "nax",
+            "bm": 128,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": True,
+        },
+    )
+    _write(plugin, CHIP, [plugin_entry])
+    calls = []
+    real = schema.DenseTilePolicy.is_legal
+    monkeypatch.setattr(
+        schema.DenseTilePolicy,
+        "is_legal",
+        lambda self, *args, **kwargs: calls.append(self) or real(self, *args, **kwargs),
+    )
+    tuning.register_tuning_path(plugin / f"{CHIP}.json")
+    tuning.reset_cache()
+    got = _lookup(face)
+    assert got is not None and got.bm == 64
+    assert len(calls) == 1
 
 
 def test_a_plugin_path_sits_below_the_in_tree_tables(tmp_path):
@@ -674,7 +708,19 @@ def test_x_nreads_and_align_n_are_legal_checks():
 
 def test_lookup_hashes_the_face_once(tmp_path, monkeypatch):
     face = _face()
-    first = _entry(face)
+    first = _entry(
+        face,
+        params={
+            "backend": "nax",
+            "bm": 64,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": True,
+            "pad_bytes": 65536,
+        },
+    )
     second = _entry(
         face,
         params={
@@ -791,31 +837,15 @@ def test_nax_gate_fails_closed_on_unknown_and_uppercase_chips():
 
 def test_lookup_uses_dtype_size_for_tg_budget(tmp_path):
     face = _face()
-    big_fp64 = _entry(
-        face,
-        dtype="float64",
-        params={
-            "backend": "steel",
-            "bm": 64,
-            "bn": 64,
-            "bk": 64,
-            "wm": 2,
-            "wn": 2,
-            "align_n": True,
-        },
-    )
-    _write(tmp_path / "v1", CHIP, [big_fp64])
-    tuning.reset_cache()
-    assert _lookup(face, dtype=mx.float64) is None
     assert not schema.DenseTilePolicy("steel", 64, 64, 64).is_legal(
         face, 5120, 2560, 2048, CHIP, dtype=mx.float64
     )
-    # Custom dtype with .size = 4 not in string fallback proves lookup passes
-    # the raw dtype object through to is_legal (and is_legal reads .size).
-    custom4 = SimpleNamespace(name="custom4", size=4)
+    # A raw dtype object whose .size is 4 under a bf16 key proves lookup
+    # passes the object through to is_legal (the 2-byte fallback would fit).
+    custom4 = SimpleNamespace(name="bf16", size=4)
     big_custom = _entry(
         face,
-        dtype="custom4",
+        dtype="bf16",
         params={
             "backend": "steel",
             "bm": 64,
@@ -828,7 +858,7 @@ def test_lookup_uses_dtype_size_for_tg_budget(tmp_path):
     )
     fit_custom = _entry(
         face,
-        dtype="custom4",
+        dtype="bf16",
         n_bucket="N1025-4096",
         k_bucket="K>4096",
         params={
@@ -955,12 +985,12 @@ def test_lookup_ranks_higher_score_regardless_of_entry_order(tmp_path):
         },
     )
     exact = _entry(face)
-    # Exact (score 3) wins even when listed after lower-score matches.
+    # Exact (score 4) wins even when listed after lower-score matches.
     _write(tmp_path / "v1", CHIP, [wildcard_exact, bucketed, exact])
     tuning.reset_cache()
     got = _lookup(face)
     assert got is not None and got.bm == 64
-    # Exact-face bucketed (score 2) beats wildcard exact-(n, k) (score 1).
+    # Exact-face bucketed (score 3) beats wildcard exact-(n, k) (score 2).
     _write(tmp_path / "v1", CHIP, [wildcard_exact, bucketed])
     tuning.reset_cache()
     got = _lookup(face)
@@ -1065,3 +1095,214 @@ def test_shape_bucket_boundaries():
     assert tuning._k_bucket(1025) == "K1025-4096"
     assert tuning._k_bucket(4096) == "K1025-4096"
     assert tuning._k_bucket(4097) == "K>4096"
+
+
+def test_wildcard_exact_shape_beats_wildcard_bucketed(tmp_path):
+    face = _face()
+    bucketed = _entry(
+        face,
+        face_id="*:plain",
+        n_bucket="N1025-4096",
+        k_bucket="K>4096",
+        params={
+            "backend": "nax",
+            "bm": 32,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": False,
+        },
+    )
+    exact = _entry(
+        face,
+        face_id="*:plain",
+        params={
+            "backend": "nax",
+            "bm": 128,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": False,
+        },
+    )
+    _write(tmp_path / "v1", CHIP, [bucketed, exact])
+    tuning.reset_cache()
+    got = _lookup(face)
+    assert got is not None and got.bm == 128
+
+
+def test_lookup_skips_is_legal_for_lower_score_after_a_best(tmp_path, monkeypatch):
+    face = _face()
+    bucketed = _entry(face, n_bucket="N1025-4096", k_bucket="K>4096")
+    wildcard = _entry(
+        face,
+        face_id="*:plain",
+        params={
+            "backend": "nax",
+            "bm": 128,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": False,
+        },
+    )
+    _write(tmp_path / "v1", CHIP, [bucketed, wildcard])
+    calls = []
+    real = schema.DenseTilePolicy.is_legal
+    monkeypatch.setattr(
+        schema.DenseTilePolicy,
+        "is_legal",
+        lambda self, *args, **kwargs: calls.append(self) or real(self, *args, **kwargs),
+    )
+    tuning.reset_cache()
+    got = _lookup(face)
+    assert got is not None and got.bm == 64
+    assert len(calls) == 1
+
+
+def test_read_table_rejects_malformed_keys_and_float_version(tmp_path):
+    face = _face()
+    good = _entry(face)
+    path = tmp_path / "v1"
+    cases = []
+    for version in (1.0, True, "1"):
+        cases.append({"schema_version": version, "chip": CHIP, "entries": [good]})
+    missing_rows = json.loads(json.dumps(good))
+    missing_rows["key"].pop("rows_bucket")
+    cases.append({"schema_version": 1, "chip": CHIP, "entries": [missing_rows]})
+    for change in (
+        {"row_bucket": "1025-2048"},
+        {"extra": 1},
+        {"dtype": "bfloat16"},
+        {"dtype": "bf61"},
+        {"dtype": "BF16"},
+        {"face_id": "*:typo"},
+        {"n": 2560},
+        {"n_bucket": "N1025-4096"},
+    ):
+        entry = json.loads(json.dumps(good))
+        entry["key"].update(change)
+        if "row_bucket" in change:
+            entry["key"].pop("rows_bucket")
+        if "n" in change:
+            entry["key"].pop("k")
+        cases.append({"schema_version": 1, "chip": CHIP, "entries": [entry]})
+    for case in cases:
+        path.mkdir(exist_ok=True)
+        (path / f"{CHIP}.json").write_text(json.dumps(case))
+        with pytest.raises(ValueError):
+            tuning.register_tuning_path(path)
+
+
+@pytest.mark.parametrize(
+    "change, match",
+    [
+        ({"bits": 0}, "bits"),
+        ({"bits": True}, "bits"),
+        ({"group": True}, "group"),
+        ({"n": 0}, "n"),
+        ({"n": True}, "n"),
+        ({"route": []}, "route"),
+        ({"n_bucket": "N1025-4096"}, "k_bucket"),
+    ],
+)
+def test_read_table_refuses_each_malformed_key_field(tmp_path, change, match):
+    face = _face()
+    entry = _entry(face)
+    if "n_bucket" in change:
+        entry["key"].pop("n")
+        entry["key"].pop("k")
+        entry["key"]["n_bucket"] = change["n_bucket"]
+        if "k_bucket" in change:
+            entry["key"]["k_bucket"] = change["k_bucket"]
+    else:
+        entry["key"].update(change)
+    _write(tmp_path / "v1", CHIP, [entry])
+    with pytest.raises(ValueError, match=match):
+        tuning.register_tuning_path(tmp_path / "v1")
+
+
+def test_read_table_rejects_unknown_bucket_labels(tmp_path):
+    face = _face()
+    for key_change in (
+        {"rows_bucket": "1024-2048"},
+        {"n_bucket": "N1024-4096", "k_bucket": "K>4096"},
+        {"n_bucket": "N1025-4096", "k_bucket": "K>=4096"},
+    ):
+        entry = _entry(face)
+        if "n_bucket" in key_change:
+            entry["key"].pop("n")
+            entry["key"].pop("k")
+        entry["key"].update(key_change)
+        _write(tmp_path / "v1", CHIP, [entry])
+        with pytest.raises(ValueError, match="bucket"):
+            tuning.register_tuning_path(tmp_path / "v1")
+
+
+def test_lookup_empty_chip_fails_closed(tmp_path, monkeypatch):
+    face = _face()
+    _write(tmp_path / "v1", CHIP, [_entry(face)])
+    monkeypatch.setattr(tuning, "current_chip", lambda: CHIP)
+    tuning.reset_cache()
+    assert _lookup(face, chip="") is None
+
+
+def test_stale_entries_rejects_a_missing_path(tmp_path):
+    with pytest.raises(ValueError, match="does not exist"):
+        tuning.stale_entries([tmp_path / "missing"])
+
+
+def test_exactness_values_are_validated(tmp_path):
+    face = _face()
+    entry = _entry(face)
+    entry["exactness"] = "rule17_fp32"
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.reset_cache()
+    assert _lookup(face) is not None
+    entry["exactness"] = "bogus"
+    (tmp_path / "v1" / f"{CHIP}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": CHIP, "entries": [entry]})
+    )
+    with pytest.raises(ValueError):
+        tuning.register_tuning_path(tmp_path / "v1")
+
+
+def test_face_digest_covers_shared_tensors_and_tables():
+    shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    face = Dot("toy_shared", shell, "F", (), reads=DotReads(apply=ApplyRead()))
+    shared = replace(face, shared="// shared\n")
+    assert tuning.face_digest(face) != tuning.face_digest(shared)
+    other = replace(face, tensors=("group_scales",))
+    assert tuning.face_digest(face) != tuning.face_digest(other)
+    other = replace(face, tables=(Table("levels", mx.uint32, (1, 2)),))
+    assert tuning.face_digest(face) != tuning.face_digest(other)
+
+
+def test_unknown_route_names_and_rows_bucket_are_honest():
+    assert "dense_tile" in schema.route_names()
+    assert tuning.rows_bucket("no_such_route", 7) == "7"
+
+
+def test_current_chip_without_an_architecture_is_unknown(monkeypatch):
+    from omlx.utils import hardware
+
+    monkeypatch.setattr(mx, "is_available", lambda device: True)
+    monkeypatch.setattr(mx, "device_info", lambda device: {})
+    monkeypatch.setattr(hardware, "get_gpu_core_count", lambda: 80)
+    tuning.reset_cache()
+    assert tuning.current_chip() == "unknown_c80"
+
+
+def test_check_repin_reads_naive_timestamps_as_utc():
+    with pytest.raises(ValueError, match="re-pin"):
+        tuning.check_repin("2026-11-21T17:00:00", "2026-11-21T17:00:00Z")
+
+
+def test_direct_is_legal_refuses_a_bad_param_staging():
+    face = _face()
+    assert not schema.DenseTilePolicy(
+        "nax", 64, 64, 64, param_staging="bogus"
+    ).is_legal(face, 5120, 2560, 2048, CHIP)
