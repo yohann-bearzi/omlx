@@ -10379,3 +10379,153 @@ def test_root_symlink_optiq_sidecar_is_merged_not_copied(tmp_path):
     assert "optiq_vision" not in config
     oq._copy_model_sidecars(source, output)
     assert not (output / "optiq").exists()
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestQwen4PleVirtualSeam:
+    """The oQ writer seam exposes raw FP8 PLE shards as streaming BF16."""
+
+    @staticmethod
+    def _config():
+        return {
+            "model_type": "qwen4_exp",
+            "text_config": {
+                "model_type": "qwen4_exp_text",
+                "ple_layer_ids": [2],
+                "split_ngram_parts": 2,
+            },
+        }
+
+    class _FakeIndex:
+        def __init__(self, sources):
+            self.sources = sources
+            self.virtual = {}
+
+        def source_shape(self, key):
+            entry = self.sources.get(key)
+            return None if entry is None else entry[0]
+
+        def source_dtype(self, key):
+            entry = self.sources.get(key)
+            return None if entry is None else entry[1]
+
+        def load_source(self, key):
+            return self.sources[key][2]
+
+        def register_virtual(self, key, shape, dtype, materializer, hides=()):
+            self.virtual[key] = (shape, dtype, materializer, hides)
+
+    def test_fp8_shards_register_as_bf16_and_decode(self):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import virtual_ple
+
+        dense_0 = mx.array([[1.0, -0.5], [0.25, 2.0]], dtype=mx.bfloat16)
+        dense_1 = mx.array([[-1.0, 0.5], [0.125, -2.0]], dtype=mx.bfloat16)
+        fp8_0 = mx.to_fp8(dense_0)
+        fp8_1 = mx.to_fp8(dense_1)
+        prefix = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding"
+        )
+        runtime_prefix = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding"
+        )
+        out_of_range = (
+            "model.language_model.layers.0.ple.ple_embedding."
+            "ngram_embedding"
+        )
+        idx = self._FakeIndex({
+            f"{prefix}.shard_0.weight": (fp8_0.shape, "F8_E4M3", fp8_0),
+            f"{runtime_prefix}.shards.1.weight": (fp8_1.shape, "F8_E4M3", fp8_1),
+            f"{out_of_range}.shard_0.weight": (fp8_0.shape, "F8_E4M3", fp8_0),
+            f"{prefix}.shard_0.bias": ((2,), "BF16", dense_0[0]),
+        })
+
+        registered = virtual_ple.register(idx, self._config())
+
+        assert registered == 2
+        for key, codes in (
+            (f"{prefix}.shard_0.weight", fp8_0),
+            (f"{runtime_prefix}.shards.1.weight", fp8_1),
+        ):
+            shape, dtype, materializer, hides = idx.virtual[key]
+            assert tuple(shape) == tuple(codes.shape)
+            assert dtype == "BF16"
+            assert hides == (key,)
+            decoded = materializer()
+            expected = mx.from_fp8(codes, dtype=mx.bfloat16)
+            mx.eval(decoded, expected)
+            assert decoded.dtype == mx.bfloat16
+            assert mx.array_equal(decoded, expected).item()
+        assert f"{out_of_range}.shard_0.weight" not in idx.virtual
+        assert f"{prefix}.shard_0.bias" not in idx.virtual
+
+    def test_rank_mismatch_raises(self):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import virtual_ple
+
+        prefix = (
+            "language_model.model.layers.1.ple.ple_embedding."
+            "ngram_embedding"
+        )
+        idx = self._FakeIndex(
+            {
+                f"{prefix}.shards.0.weight": (
+                    (2,),
+                    "F8_E4M3",
+                    mx.array([1, 2], dtype=mx.uint8),
+                ),
+            }
+        )
+        with pytest.raises(ValueError):
+            virtual_ple.register(idx, self._config())
+
+    def test_layer_id_zero_names_no_layer(self):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import virtual_ple
+
+        fp8 = mx.to_fp8(mx.ones((2, 2), dtype=mx.bfloat16))
+        config = self._config()
+        config["text_config"]["ple_layer_ids"] = [0]
+        idx = self._FakeIndex({
+            "model.language_model.layers.-1.ple.ple_embedding.ngram_embedding"
+            ".shard_0.weight": (fp8.shape, "F8_E4M3", fp8),
+        })
+        assert virtual_ple.register(idx, config) == 0
+        assert not idx.virtual
+
+    def test_materializer_refuses_after_its_index_is_gone(self):
+        import gc
+
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import virtual_ple
+
+        fp8 = mx.to_fp8(mx.ones((2, 2), dtype=mx.bfloat16))
+        key = (
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+            ".shard_0.weight"
+        )
+        idx = self._FakeIndex({key: (fp8.shape, "F8_E4M3", fp8)})
+        assert virtual_ple.register(idx, self._config()) == 1
+        materializer = idx.virtual[key][2]
+        del idx
+        gc.collect()
+        with pytest.raises(RuntimeError, match="outlived"):
+            materializer()
+
+    def test_non_qwen4_and_bf16_shards_register_nothing(self):
+        from omlx.patches.mlx_vlm_qwen4_exp_compat import virtual_ple
+
+        dense = mx.ones((2, 2), dtype=mx.bfloat16)
+        prefix = (
+            "model.language_model.layers.1.ple.ple_embedding."
+            "ngram_embedding"
+        )
+        bf16 = self._FakeIndex({
+            f"{prefix}.shard_0.weight": (dense.shape, "BF16", dense),
+        })
+        assert virtual_ple.register(bf16, self._config()) == 0
+        assert not bf16.virtual
+
+        fp8 = mx.to_fp8(dense)
+        other = self._FakeIndex({
+            f"{prefix}.shard_0.weight": (fp8.shape, "F8_E4M3", fp8),
+        })
+        assert virtual_ple.register(other, {"model_type": "other"}) == 0
+        assert not other.virtual

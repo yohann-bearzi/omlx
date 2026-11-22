@@ -3128,3 +3128,93 @@ def test_qwen4_resident_ple_fusion_preserves_eval_and_no_grad(monkeypatch):
     assert table.fuse_quantized_shards() is True
     assert table.fused.training is False
     assert table.fused._no_grad == {"weight", "biases"}
+
+_FP8_ROWS = [[1.0, -0.5, 0.25, -2.0], [0.125, 3.0, -1.5, 0.0]]
+
+
+def test_disk_ple_fp8_rows_decode_to_bf16():
+    """SSD reader: raw F8_E4M3 rows decode via from_fp8 (caller scales)."""
+    import numpy as np
+
+    cls = qwen4_language._SafeTensorMMap
+    codes = np.asarray(mx.to_fp8(mx.array(_FP8_ROWS, dtype=mx.bfloat16)))
+    assert codes.dtype == np.uint8
+    out = cls.to_mx(codes, "F8_E4M3")
+    expected = mx.from_fp8(mx.array(codes), dtype=mx.bfloat16)
+    mx.eval(out, expected)
+    assert out.dtype == mx.bfloat16
+    assert mx.array_equal(out, expected).item()
+    assert out.tolist() == _FP8_ROWS
+    bf16_codes = np.array([[0x3F80, 0xBF80]], dtype=np.uint16)
+    bf = cls.to_mx(bf16_codes, "BF16")
+    assert bf.dtype == mx.bfloat16
+    assert float(bf[0, 0].item()) == 1.0
+    assert float(bf[0, 1].item()) == -1.0
+
+
+def test_disk_backed_fp8_ple_reads_and_scales_rows(tmp_path):
+    """SSD PLE on an FP8 graft: F8_E4M3 shards are read from the mmap, decoded
+    with from_fp8, and scaled once by the shared weight_scale."""
+    import numpy as np
+
+    prefix = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding"
+    runtime = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding"
+    rows = {
+        f"{runtime}.shards.0.weight": _FP8_ROWS,
+        f"{runtime}.shards.1.weight": [[-1.0, 0.5, 2.0, -0.25], [4.0, -3.0, 0.0, 1.5]],
+    }
+    header, payload = {}, b""
+    for key, values in rows.items():
+        data = np.asarray(mx.to_fp8(mx.array(values, dtype=mx.bfloat16))).tobytes()
+        header[key] = {
+            "dtype": "F8_E4M3",
+            "shape": [2, 4],
+            "data_offsets": [len(payload), len(payload) + len(data)],
+        }
+        payload += data
+    blob = json.dumps(header).encode()
+    blob += b" " * ((-len(blob)) % 8)
+    filename = "model-ple-fp8-00000-of-00001.safetensors"
+    (tmp_path / filename).write_bytes(len(blob).to_bytes(8, "little") + blob + payload)
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": dict.fromkeys(rows, filename)}), encoding="utf-8"
+    )
+
+    embedding = qwen4_language.DiskBackedShardedEmbedding(
+        tmp_path, prefix, num_embeddings=4, dims=4, num_shards=2
+    )
+    try:
+        embedding.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+        values = embedding(mx.array([[3, 0]], dtype=mx.int32))
+        mx.eval(values)
+        assert values.dtype == mx.bfloat16
+        assert values.tolist() == [[[2.0, -1.5, 0.0, 0.75], [0.5, -0.25, 0.125, -1.0]]]
+        assert embedding.last_touched_shards == (0, 1)
+        assert embedding.rows_read == 2
+    finally:
+        embedding.close()
+
+
+def test_sharded_embedding_applies_shared_fp8_scale_after_decode():
+    """Resident PLE: uint8 shard values decode via from_fp8, then weight_scale."""
+    cls = qwen4_language.ShardedEmbedding
+    codes = mx.to_fp8(mx.array(_FP8_ROWS, dtype=mx.bfloat16))
+
+    class _Shard:
+        def __call__(self, indices):
+            return mx.take(codes, indices, axis=0)
+
+    embed = cls.__new__(cls)
+    embed.shards = [_Shard()]
+    embed.shard_offsets = [0, 2]
+    embed.dims = 4
+    embed.weight_scale = mx.array([0.5], dtype=mx.bfloat16)
+    indices = mx.array([1, 0])
+    out = embed(indices)
+    expected = (
+        mx.from_fp8(mx.take(codes, indices, axis=0), dtype=mx.bfloat16)
+        * embed.weight_scale
+    )
+    mx.eval(out, expected)
+    assert out.dtype == mx.bfloat16
+    assert mx.array_equal(out, expected).item()
