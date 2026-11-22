@@ -192,6 +192,39 @@ def toy(unpatched, monkeypatch):
 
 
 @pytest.fixture
+def no_installed_plugins(monkeypatch):
+    """Discover with no plugin's entry point installed, as a clean machine:
+    a staged omlx-oqel must not turn "no format of this mode is installed"
+    into a served format. The entry-point discovery is hidden here and the
+    registry reloaded built-ins only; the original registries are restored."""
+    saved = [
+        (registry, registry.copy())
+        for registry in (
+            formats._FORMATS,
+            formats._ORIGINS,
+            formats._SKIPPED,
+            formats._BUILTIN_MODES,
+        )
+    ]
+    was_loaded = formats._loaded
+    monkeypatch.setattr(formats, "entry_points", lambda **_kwargs: [])
+    monkeypatch.setattr(formats, "_loaded", False)
+    try:
+        formats.load()
+        for mode in list(formats._FORMATS):
+            if mode not in formats._BUILTIN_MODES:
+                del formats._FORMATS[mode]
+        formats._ORIGINS.clear()
+        formats._SKIPPED.clear()
+        yield
+    finally:
+        for registry, snapshot in saved:
+            registry.clear()
+            registry.update(snapshot)
+        formats._loaded = was_loaded
+
+
+@pytest.fixture
 def by_hand(toy, tmp_path_factory):
     """The test builds layers by hand as the load of a checkpoint with no
     record would."""
@@ -546,7 +579,9 @@ def test_mlx_s_modes_load_as_mlx_s_layers(toy):
     assert "global_scale" in inspect.signature(stack.to_quantized).parameters
 
 
-def test_a_mode_of_no_installed_format_names_the_missing_plugin(toy, tmp_path):
+def test_a_mode_of_no_installed_format_names_the_missing_plugin(
+    toy, tmp_path, no_installed_plugins
+):
     refusal = re.escape(
         "quant format 'oqel': no format of this mode is installed: install the "
         "plugin the checkpoint was written with"
@@ -1338,7 +1373,9 @@ def test_a_format_s_refusals_outside_a_load_name_the_checkpoint(toy, tmp_path):
         assert refusal.value.path == tmp_path
 
 
-def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(toy, tmp_path):
+def test_a_plugin_that_did_not_load_is_named_by_its_checkpoint(
+    toy, tmp_path, no_installed_plugins
+):
     # Installed, and skipped when the registry loaded (here for the revision
     # of the contract it is written for).
     skipped = (
