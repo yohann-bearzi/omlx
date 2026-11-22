@@ -55,7 +55,7 @@ def tensor_bytes(path: Path) -> dict[str, dict]:
             if not isinstance(entry, dict):
                 raise ValueError(f"{path}:{name}: tensor entry is not an object")
             dtype = entry["dtype"]
-            if dtype not in _DTYPE_BYTES:
+            if not isinstance(dtype, str) or dtype not in _DTYPE_BYTES:
                 raise ValueError(f"{path}:{name}: unknown safetensors dtype {dtype!r}")
             shape = entry["shape"]
             if not isinstance(shape, list):

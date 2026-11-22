@@ -3776,7 +3776,7 @@ def test_stock_and_declined_layers_never_probe_faces_while_format_layers_do(
     """Stock builds and declined affine layers never enter _probe_faces or
     _checked_face; format-encoded layers probe Dot, Tile and Codes."""
     probed: list[str] = []
-    checked_kinds: list[type] = []
+    checked_kinds: list[tuple[str, type]] = []
     real_probe = oq._probe_faces
     real_checked = formats._checked_face
 

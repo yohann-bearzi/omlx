@@ -412,6 +412,13 @@ def test_safetensors_bytes_refuses_out_of_bounds_truncated_and_unknown(tmp_path)
     _write_raw(unknown, {"a": {"dtype": "Q99", "shape": [1], "data_offsets": [0, 1]}}, b"\x00")
     with pytest.raises(ValueError, match="unknown safetensors dtype"):
         tensor_bytes(unknown)
+    # an unhashable dtype is refused, not a TypeError
+    unhashable = tmp_path / "unhashable.safetensors"
+    _write_raw(
+        unhashable, {"a": {"dtype": [], "shape": [1], "data_offsets": [0, 1]}}, b"\x00"
+    )
+    with pytest.raises(ValueError, match="unknown safetensors dtype"):
+        tensor_bytes(unhashable)
     # FP8 and C64 are known names with their stored widths
     fp8 = tmp_path / "fp8.safetensors"
     _write_raw(fp8, {"a": {"dtype": "F8_E4M3", "shape": [2], "data_offsets": [0, 2]}}, b"\x00\x00")
@@ -536,7 +543,6 @@ def test_a_stock_oqh_build_is_upstream_s_byte_for_byte(tmp_path, monkeypatch, le
 @pytest.mark.skipif(mx is None, reason="requires mlx")
 def test_expected_case_fails_loudly_on_unlisted_arch_without_git(tmp_path, monkeypatch):
     """An architecture with no golden must fail, never skip, git or not."""
-    import sys
     from types import SimpleNamespace
 
     monkeypatch.setattr(
@@ -548,7 +554,7 @@ def test_expected_case_fails_loudly_on_unlisted_arch_without_git(tmp_path, monke
         ),
     )
     monkeypatch.setattr(
-        "tests.test_oq_upstream_parity._archive_upstream", lambda destination: False
+        sys.modules[__name__], "_archive_upstream", lambda destination: False
     )
     with pytest.raises(pytest.fail.Exception, match=r"applegpu_g99z.*llama-oQ4e"):
         _expected_case("llama-oQ4e", tmp_path, 4, tmp_path)

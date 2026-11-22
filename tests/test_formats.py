@@ -1884,8 +1884,11 @@ def test_quant_format_can_refine_detects_override_and_allows_narrowing():
         __slots__ = ("refine",)
 
     slotted = Slotted()
+    assert slotted.can_refine(64, 16, 4, 64) is False
     slotted.refine = lambda w, tensors, hessian, bits, group_size: tensors
     assert slotted.can_refine(64, 16, 4, 64) is True
+    slotted.refine = None
+    assert slotted.can_refine(64, 16, 4, 64) is False
 
     # A truthy non-callable is not a refinement.
     noncallable = formats.QuantFormat()
@@ -1898,6 +1901,11 @@ def test_quant_format_can_refine_detects_override_and_allows_narrowing():
             return None
 
     assert PropertyNone().can_refine(64, 16, 4, 64) is False
+
+    # The unbound base function is not a refinement either.
+    unbound = formats.QuantFormat()
+    unbound.refine = formats.QuantFormat.refine
+    assert unbound.can_refine(64, 16, 4, 64) is False
 
     class Narrow(Refining):
         def can_refine(self, k, n, bits, group_size):

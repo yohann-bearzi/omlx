@@ -543,8 +543,10 @@ class QuantFormat:
         predates refinement, and affine, unrefined. A format may override
         this to narrow the matrices it refines by geometry."""
         refine = getattr(self, "refine", None)
-        return callable(refine) and (
-            getattr(refine, "__func__", None) is not QuantFormat.refine
+        return (
+            callable(refine)
+            and refine is not QuantFormat.refine
+            and getattr(refine, "__func__", None) is not QuantFormat.refine
         )
 
     def refine(
