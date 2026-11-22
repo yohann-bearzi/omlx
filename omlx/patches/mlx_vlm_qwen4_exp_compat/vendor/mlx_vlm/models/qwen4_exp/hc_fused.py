@@ -958,19 +958,18 @@ def _tail_inject_ok(width, hidden, hc, dtype, face) -> bool:
         and hidden > 0
         and width > 0
         and width == hc * hidden
+        and 8 % hc == 0
         and width % (256 * face.vpt) == 0
         and hidden * dtype.size + hc * 32 + kernels.table_bytes(face)
         <= _TG_MEMORY_BYTES
     )
 
 
-@functools.cache
 def _tail_inject_launch(hc, hidden, dtype, inject_face):
     """The prefill tail inject's launch for one geometry and face, or None
-    when the face does not fit. Everything per call is resolved here: the
-    call builds only the two output shapes and the grid. This callable holds
-    kernel arguments shared by layers and threads; each call reads its own
-    layer's arrays, including replacements after a load."""
+    when the face does not fit. One call builds it; the module's plan holds
+    it for that layer and dtype, so no global cache outlives its faces. Each
+    call reads its own layer's arrays, including replacements after a load."""
     if inject_face is None or not _tail_inject_ok(
         hc * hidden, hidden, hc, dtype, inject_face
     ):
@@ -1325,17 +1324,23 @@ def prefill_forward(module, hyper_input, write=None, nax=True):
         mix = _act(hc)(module.input_mix_weight_down(normed))
         up = module.input_mix_weight_up(mix)
         tail_launch = None
+        tail_face = None
         if inject is not None:
             # The face and the launch depend on the layer's layout and the
             # input's dtype alone: resolve them once per module and dtype.
             plan = module.__dict__.get("_hc_tail_inject")
             if plan is None or plan[0] is not inject or plan[1] != dtype:
-                tail_launch = _tail_inject_launch(
-                    hc, hidden, dtype, _decode_face(inject, True)
+                face = _decode_face(inject, True)
+                tail_launch = _tail_inject_launch(hc, hidden, dtype, face)
+                tail_face = face if tail_launch is not None else None
+                module.__dict__["_hc_tail_inject"] = (
+                    inject,
+                    dtype,
+                    tail_launch,
+                    tail_face,
                 )
-                module.__dict__["_hc_tail_inject"] = (inject, dtype, tail_launch)
             else:
-                tail_launch = plan[2]
+                tail_launch, tail_face = plan[2], plan[3]
         if tail_launch is None:
             mixed = _tail(hc, hidden)(up, normed)
             injection = None if inject is None else 2 * mx.sigmoid(inject(normed) / hc)
@@ -1348,7 +1353,7 @@ def prefill_forward(module, hyper_input, write=None, nax=True):
             )
             mixed = mixed.reshape(*hyper_input.shape[:-1], hidden)
             injection = injection.reshape(*hyper_input.shape[:-1], hc)
-        signature = ("prefill", dtype, hc, hidden, write is not None, tail_launch)
+        signature = ("prefill", dtype, hc, hidden, write is not None, tail_face)
         if signature not in _VALIDATED:
             mx.eval(mixed) if injection is None else mx.eval(mixed, injection)
             _VALIDATED.add(signature)

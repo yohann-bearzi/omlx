@@ -96,7 +96,7 @@ def test_oracle_sources_are_literals():
         and isinstance(node.value.value, str)
     }
     assert "_TAIL_INJECT" in live_literals
-    assert "TI_SOURCE" not in live_literals and "TG_HEADER" not in live_literals
+    assert "_TI_SOURCE" not in live_literals and "_TG_HEADER" not in live_literals
     imported = {
         name.split(".")[0]
         for node in ast.walk(tree)
@@ -282,12 +282,19 @@ def test_tail_inject_ok_checks_vpt_and_table_bytes():
     assert not live._tail_inject_ok(10240, 2560, 4, dtype, fast4)
     empty = replace(qmv8, vpt=0)
     assert not live._tail_inject_ok(10240, 2560, 4, dtype, empty)
+    unit = replace(qmv8, vpt=1)
+    assert live._tail_inject_ok(10240, 2560, 4, dtype, unit)
     assert not live._tail_inject_ok(4608, 1152, 4, dtype, qmv8)
     assert not live._tail_inject_ok(0, 0, 4, dtype, qmv8)
+    assert not live._tail_inject_ok(10240, -2560, -4, dtype, qmv8)
+    assert not live._tail_inject_ok(10240, 2560, 0, dtype, qmv8)
     assert not live._tail_inject_ok(10240, 2560, 4, dtype, None)
     assert not live._tail_inject_ok(2560, 2560, 4, dtype, qmv8)
-    # H = 16128 keeps the width whole 256-thread groups and leaves 384 bytes
-    # of the 32 KiB threadgroup for the stride, the partials and the tables.
+    assert not live._tail_inject_ok(3072, 1024, 3, dtype, qmv8)
+    assert not live._tail_inject_ok(4096, 256, 16, dtype, qmv8)
+    # H = 16128 keeps the width whole 256-thread groups and leaves 384
+    # bytes of the 32 KiB threadgroup for tables after the stream and
+    # partials.
     tabled = replace(qmv8, tables=(Table("t", mx.float32, (0.0,) * 96),))
     assert live._tail_inject_ok(64512, 16128, 4, dtype, tabled)
     over = replace(qmv8, tables=(Table("t", mx.float32, (0.0,) * 97),))
@@ -412,12 +419,30 @@ def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
 
     monkeypatch.setattr(live.kernels, "face_kernel", record)
     monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
-    live._tail_inject_launch.cache_clear()
     out = live.prefill_forward(module, hyper, pending, nax=False)
     assert out is not None
     assert seen and len(seen[-1].instances()) == 1
     _assert_bitwise(out, oracle.prefill(module, hyper, pending), "first plan")
     first = module.__dict__["_hc_tail_inject"]
+    face_calls = []
+    records = []
+    real_face = live._decode_face
+    real_record = seen[-1]._record
+
+    def counted_face(*args):
+        face_calls.append(1)
+        return real_face(*args)
+
+    def counted_record(*args, **kwargs):
+        records.append(1)
+        return real_record(*args, **kwargs)
+
+    monkeypatch.setattr(live, "_decode_face", counted_face)
+    monkeypatch.setattr(seen[-1], "_record", counted_record)
+    again = live.prefill_forward(module, hyper, pending, nax=False)
+    assert again is not None
+    assert module.__dict__["_hc_tail_inject"] is first
+    assert not face_calls and not records, (len(face_calls), len(records))
     other = _module(8, True, hidden=hidden, group_size=32)
     module.block_inject_weight = other.block_inject_weight
     out = live.prefill_forward(module, hyper, pending, nax=False)
@@ -438,7 +463,7 @@ def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
     _assert_bitwise(out, oracle.prefill(module, half, half_pending), "new input dtype")
 
 
-def test_concurrent_prefill_tail_inject_matches_oracle():
+def test_concurrent_prefill_tail_inject_matches_oracle(monkeypatch):
     """Two threads on different formats each get their own layer's bits."""
     hidden, rows = 2560, 17
     modules = {bits: _module(bits, True, hidden=hidden) for bits in (4, 8)}
@@ -462,6 +487,59 @@ def test_concurrent_prefill_tail_inject_matches_oracle():
         for future in futures:
             future.result()
 
+    # A cold shared face: two threads race the first record of one face kernel.
+    with monkeypatch.context() as inner:
+        inner.setattr(live.kernels, "_FACE_KERNELS", {})
+        inner.setattr(live, "_VALIDATED", set())
+        cold = [_module(8, True, hidden=hidden) for _ in range(2)]
+        cold_inputs = [_inputs(rows, hidden, mx.bfloat16, 2830 + i) for i in range(2)]
+        cold_barrier = Barrier(2)
+
+        def cold_run(index):
+            module, (hyper, pending) = cold[index], cold_inputs[index]
+            cold_barrier.wait()
+            out = live.prefill_forward(module, hyper, pending, nax=False)
+            assert out is not None
+            _assert_bitwise(
+                out, oracle.prefill(module, hyper, pending), ("cold", index)
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(cold_run, i) for i in range(2)]
+            for future in futures:
+                future.result()
+        assert len(live.kernels.instances()) == 1, live.kernels.instances()
+        cold_sigs = {
+            sig
+            for sig in live._VALIDATED
+            if isinstance(sig, tuple) and sig and sig[0] == "prefill"
+        }
+        assert len(cold_sigs) == 1, cold_sigs
+
+
+def test_plan_refresh_does_not_orphan_tail_inject_face_kernels(monkeypatch):
+    """Restoring _FACE_KERNELS leaves no orphaned tail-inject launch behind."""
+    live = _live()
+    monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+    with monkeypatch.context() as inner:
+        test_prefill_tail_inject_plan_refreshes_and_records_instance(inner)
+    assert live.kernels.instances() == ()
+    hidden, rows = 2560, 17
+    module = _module(8, True, hidden=hidden, group_size=32)
+    hyper, pending = _inputs(rows, hidden, mx.bfloat16, 2840)
+    module.set_dtype(mx.float16)
+    half, half_pending = hyper.astype(mx.float16), (
+        pending[0].astype(mx.float16),
+        pending[1].astype(mx.float16),
+    )
+    out = live.prefill_forward(module, half, half_pending, nax=False)
+    assert out is not None
+    recorded = live.kernels.instances()
+    assert len(recorded) == 1 and recorded[0].outputs == (
+        mx.float16,
+        mx.float16,
+    ), recorded
+
 
 def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
     """One validation per tail-inject specialization, never per row count."""
@@ -476,7 +554,6 @@ def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
         monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
     monkeypatch.setattr(live, "_KERNELS", {})
     monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
-    live._tail_inject_launch.cache_clear()
 
     def prefill_signatures():
         return {
@@ -489,15 +566,43 @@ def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
     live.prefill_forward(module, hyper17, pending17, nax=False)
     first = prefill_signatures()
     assert len(first) == 1
+    assert not any(callable(x) for sig in first for x in sig), first
     hyper33, pending33 = _inputs(33, hidden, dtype, 2673)
     live.prefill_forward(module, hyper33, pending33, nax=False)
     assert prefill_signatures() == first, "the row count must not re-validate"
+    same = _module(8, True, hidden=hidden)
+    same.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
+    live.prefill_forward(same, hyper33, pending33, nax=False)
+    assert (
+        prefill_signatures() == first
+    ), "a second module with one face must not re-validate"
     other = _module(8, True, hidden=hidden, group_size=32)
     other.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
     hyper65, pending65 = _inputs(65, hidden, dtype, 2674)
     live.prefill_forward(other, hyper65, pending65, nax=False)
     assert len(prefill_signatures()) == 2, "a distinct face validates its own"
     assert module.__dict__["_hc_tail_inject"][0] is inject_layer
+    fallback = _module(8, True, hidden=1152)
+    fallback.hc_norm.weight = mx.zeros((HC * 1152,), dtype)
+    fb_hyper, fb_pending = _inputs(17, 1152, dtype, 2675)
+    live.prefill_forward(fallback, fb_hyper, fb_pending, nax=False)
+    assert fallback.__dict__["_hc_tail_inject"][2:] == (None, None)
+    assert ("prefill", dtype, HC, 1152, True, None) in prefill_signatures()
+
+
+def test_tail_inject_ok_mirrors_the_kernel_s_hc_assert():
+    """The eligibility's hc law matches _TAIL_INJECT's static_asserts.
+
+    They require HC * VT == 256 with VT = H / PER = 256 / HC and VT % 32
+    == 0, so HC must divide 8; every other hc fails to compile.
+    """
+    live = _live()
+    dtype = mx.bfloat16
+    face = affine.face(8, 64, False, dtype)
+    hidden = 1024
+    for hc in range(1, 33):
+        width = hc * hidden
+        assert live._tail_inject_ok(width, hidden, hc, dtype, face) == (8 % hc == 0), hc
 
 
 def test_hc_fused_drops_legacy_tail_headers():
