@@ -93,7 +93,7 @@ def tile_mma_ops(face) -> MmaTileOps:
         const R runs(w, size_t(n0 + dq_n));""",
         close="\n        }",
         load_params="""                int k_base = k0 + dq_k * 8;""",
-        unpack="""                const auto p = runs.params(k_base / R::GROUP);
+        unpack="""const auto p = runs.params(k_base / R::GROUP);
                 const auto c = runs.fetch(k_base / 8);
                 _Pragma("unroll")
                 for (int ki = 0; ki < 8; ++ki) {

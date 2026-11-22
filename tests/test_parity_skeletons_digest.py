@@ -1274,6 +1274,7 @@ def test_tile_mma_ops_uses_emit_k_and_no_dead_n_global():
     )
     assert "constexpr int K = 5120;" in source
     assert "n_global" not in source
+    assert "\n                const auto p = runs.params(" in source
 
 
 def test_emit_mma_source_does_not_rewrite_face_type():

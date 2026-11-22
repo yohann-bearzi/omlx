@@ -192,7 +192,13 @@ def test_mma_plan_runs_tabled_face_and_enforces_tile_contract():
         assert _same(y, oracle.vk_qmm_mma(x, *w, group_size=64, bits=4))
         for tag, source, message in (
             ("mma_run4", _TOY.replace("RUN = 8;", "RUN = 4;"), "RUN must be 8"),
-            ("mma_rev99", _TOY.replace("CONTRACT = 1;", "CONTRACT = 99;"), "contract"),
+            (
+                "mma_rev99",
+                _TOY.replace("CONTRACT = 1;", "CONTRACT = 99;").replace(
+                    "Codes fetch(int run) const {", "Codes fetches(int run) const {"
+                ),
+                "contract",
+            ),
         ):
             bad = _toy(tag, source)
             kernel, template = live._mma_plan(1, bad, 256, mx.bfloat16)
@@ -207,5 +213,38 @@ def test_mma_plan_runs_tabled_face_and_enforces_tile_contract():
                 )
                 mx.eval(out)
             assert str(failed.value).count("error:") == 1
+    finally:
+        live._mma_plan.cache_clear()
+
+
+def test_mma_plan_runs_an_fp16_toy_face_with_two_row_tiles():
+    from tests.test_formats_tile import _toy, _toy_decode, _toy_matrix
+
+    toy = _toy("mma_fp16")
+    codes, group_scales, row_scales = _toy_matrix(64, 512, seed=5, group=32)
+    x = _x(16, 512, mx.float16, seed=7)
+    live._mma_plan.cache_clear()
+    try:
+        kernel, template = live._mma_plan(2, toy, 512, mx.float16)
+        (y,) = kernel(
+            inputs=[
+                x,
+                codes,
+                group_scales,
+                row_scales,
+                mx.array(64, dtype=mx.int32),
+            ],
+            template=template,
+            grid=(256, 4, 1),
+            threadgroup=(256, 1, 1),
+            output_shapes=[(16, 64)],
+            output_dtypes=[mx.float16],
+        )
+        mx.eval(y)
+        weights = _toy_decode(codes, group_scales, row_scales, group=32)
+        reference = x.astype(mx.float32) @ weights.astype(mx.float16).astype(
+            mx.float32
+        ).T
+        assert mx.allclose(y.astype(mx.float32), reference, rtol=2e-2, atol=5e-2)
     finally:
         live._mma_plan.cache_clear()
