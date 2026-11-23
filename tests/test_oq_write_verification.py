@@ -1036,3 +1036,626 @@ def test_writer_verification_inside_verified_carries_its_context_to_the_executor
             **_SETTINGS,
         )
     assert not (refused / "config.json").exists()
+
+
+class _MTPHead:
+    """A tiny attached MTP head: one 64-wide projection, format or plain."""
+
+    @staticmethod
+    def build(
+        *,
+        poisoned=False,
+        format_layer=True,
+        kind="linear",
+        hc_count=2,
+        hidden_size=32,
+        dtype=mx.bfloat16,
+    ):
+        import mlx.nn as nn
+
+        from tests.test_formats_linear import _pair, _switch_pair, _tensors
+
+        width = (hc_count or 1) * hidden_size
+
+        class Head(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.hidden_size = hidden_size
+                if hc_count is not None:
+                    self.hc_count = hc_count
+                if kind == "embedding":
+                    from omlx.formats.linear import FormatEmbedding
+
+                    quantized = nn.Embedding(32, hidden_size).to_quantized(
+                        group_size=32, bits=4
+                    )
+                    with format_testing.verified("qwen4_exp"):
+                        self.embedding = FormatEmbedding(
+                            "affine", 4, 32, hidden_size, _tensors(quantized)
+                        )
+                elif kind == "switch":
+                    with format_testing.verified("qwen4_exp"):
+                        _, layer = _switch_pair(
+                            width, 64, bits=4, dtype=mx.bfloat16, experts=2
+                        )
+                    self.switch = layer
+                elif format_layer:
+                    with format_testing.verified("qwen4_exp"):
+                        _, layer = _pair(width, 64, bits=4, dtype=dtype)
+                    if poisoned:
+                        scales = layer["scales"]
+                        layer["scales"] = mx.full(
+                            scales.shape, float("nan"), dtype=scales.dtype
+                        )
+                else:
+                    layer = nn.Linear(width, 64)
+                    if poisoned:
+                        layer.weight = mx.full(
+                            layer.weight.shape, float("nan"), dtype=layer.weight.dtype
+                        )
+                if kind == "linear":
+                    self.fc_embedding = layer
+
+        return Head()
+
+
+def _mtp_model(
+    *,
+    attached=True,
+    format_layer=True,
+    poisoned=False,
+    empty=False,
+    nonarray=False,
+    kind="linear",
+    hc_count=2,
+    hidden_size=32,
+    dtype=mx.bfloat16,
+    calls=None,
+):
+    import mlx.nn as nn
+
+    calls = calls if calls is not None else []
+    head = _MTPHead.build(
+        poisoned=poisoned,
+        format_layer=format_layer,
+        kind=kind,
+        hc_count=hc_count,
+        hidden_size=hidden_size,
+        dtype=dtype,
+    )
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            if attached:
+                self.mtp = head
+            owner = self.language_model
+
+            def mtp_forward(hidden, tokens, cache):
+                calls.append((tuple(hidden.shape), hidden.dtype, tuple(tokens.shape)))
+                if empty:
+                    return mx.zeros((1, 0, 4))
+                if nonarray:
+                    return 42
+                if kind == "embedding":
+                    return head.embedding(mx.array([0], dtype=mx.uint32))
+                if kind == "switch":
+                    return head.switch(
+                        hidden.reshape(1, 1, -1),
+                        mx.zeros((1, 1), dtype=mx.int32),
+                    )
+                return head.fc_embedding(hidden)
+
+            def make_mtp_cache():
+                return ["draft cache"]
+
+            owner.mtp_forward = mtp_forward
+            owner.make_mtp_cache = make_mtp_cache
+
+        def __call__(self, inputs):
+            return mx.zeros((1, 2, 4))
+
+        def close(self):
+            pass
+
+    return Model(), calls
+
+
+def _staged_vlm(tmp_path, hidden_size=32):
+    output = tmp_path / "vlm"
+    output.mkdir(parents=True)
+    (output / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "text_config": {"hidden_size": hidden_size, "hc_count": 2},
+            }
+        )
+    )
+    return output
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_written_format_checkpoint_executes_attached_mtp_head(
+    tmp_path, monkeypatch
+):
+    """The trunk forward alone passes a head whose format layers are poisoned:
+    verification runs the attached MTP head once and requires finite logits."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+    poisoned = _staged_vlm(tmp_path / "poisoned")
+    model, calls = _mtp_model(poisoned=True)
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="attached MTP head.*non-finite"):
+        oq_verify.verify_written_format_checkpoint(poisoned)
+    assert len(calls) == 1
+    assert "MTP head" in (poisoned / "VERIFY-FAILED.txt").read_text()
+    record = json.loads((poisoned / "config.json").read_text())["omlx_verification"]
+    assert record["verified"] is False
+    assert "MTP head" in record["reason"]
+
+    empty = _staged_vlm(tmp_path / "empty")
+    model, calls = _mtp_model(empty=True)
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="attached MTP head.*empty logits"):
+        oq_verify.verify_written_format_checkpoint(empty)
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize(
+    "case", ["no-mtp", "plain-head", "no-format-layers", "no-cache-fn"]
+)
+def test_verification_leaves_other_attached_heads_alone(tmp_path, monkeypatch, case):
+    """A checkpoint without an attached format MTP head verifies as before:
+    a head of plain layers, missing cache hook, or no head at all, is not
+    executed."""
+    import mlx.nn as nn
+
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(
+        attached=case != "no-mtp",
+        format_layer=case == "no-cache-fn",
+        poisoned=True,
+    )
+    if case == "no-format-layers":
+        model.mtp = nn.Module()
+    elif case == "no-cache-fn":
+        del model.language_model.make_mtp_cache
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == []
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_skips_a_list_backed_head_without_format_layers(
+    tmp_path, monkeypatch
+):
+    """Several families attach their head as a list of blocks; a list head
+    of plain layers is left alone, not failed on named_modules."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(format_layer=False, poisoned=True)
+    model.language_model.mtp = [model.mtp]
+    del model.mtp
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == []
+
+
+@pytest.mark.parametrize("container", ["list", "tuple", "dict"])
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_executes_a_format_layer_in_a_container_head(
+    tmp_path, monkeypatch, container
+):
+    """A container-backed head reads hidden_size from the config (the blocks
+    themselves carry no width), as the four list-backed families do."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path, hidden_size=64)
+    model, calls = _mtp_model(hc_count=None, hidden_size=64)
+    model.language_model.mtp = {
+        "list": lambda: [model.mtp],
+        "tuple": lambda: (model.mtp,),
+        "dict": lambda: {"blocks": [model.mtp]},
+    }[container]()
+    del model.mtp
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_empty_root_module_does_not_fall_back_to_owner(
+    tmp_path, monkeypatch
+):
+    """An empty root module is still an attached head: it must not fall
+    through to a different module on the owner."""
+    import mlx.nn as nn
+
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(poisoned=True)
+    model.language_model.mtp = model.mtp
+    model.mtp = nn.Module()
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == []
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_uses_config_hidden_size_and_owner_mtp(
+    tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    del model.mtp.hidden_size
+    model.language_model.mtp = model.mtp
+    del model.mtp
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_rejects_non_array_mtp_logits(tmp_path, monkeypatch):
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(nonarray=True)
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="attached MTP head produced int"):
+        oq_verify.verify_written_format_checkpoint(output)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_defaults_a_head_without_hc_count_to_hidden_size(
+    tmp_path, monkeypatch
+):
+    """A head without hc_count (other families' draft heads) reads a
+    hidden state of hidden_size, not a multiple."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(hc_count=None, hidden_size=64)
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_executes_an_embedding_only_format_head(
+    tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(kind="embedding")
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_executes_a_switch_only_format_head(tmp_path, monkeypatch):
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(kind="switch")
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_probes_an_fp16_head_at_fp16(tmp_path, monkeypatch):
+    """The probe runs at the head's float dtype so an fp16 head takes its
+    fp16 kernels instead of a bf16 decline and an fp32 promotion."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(dtype=mx.float16)
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.float16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_uses_a_top_level_hidden_size(tmp_path, monkeypatch):
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir(parents=True)
+    (output / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "hidden_size": 64})
+    )
+    model, calls = _mtp_model(hc_count=None, hidden_size=64)
+    del model.mtp.hidden_size
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_refuses_a_head_without_a_hidden_size(
+    tmp_path, monkeypatch
+):
+    from omlx import oq_verify
+
+    output = tmp_path / "vlm"
+    output.mkdir(parents=True)
+    (output / "config.json").write_text(json.dumps({"model_type": "qwen4_exp"}))
+    model, calls = _mtp_model()
+    del model.mtp.hidden_size
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="names no hidden size"):
+        oq_verify.verify_written_format_checkpoint(output)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_skips_a_cyclic_container_head(tmp_path, monkeypatch):
+    """A self-referencing container must not recurse forever."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(format_layer=False)
+    cycle: list = []
+    cycle.append(cycle)
+    model.mtp = cycle
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == []
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize(
+    "extra",
+    ["affine", "weight", "explicit-tensor", "stored-float-priority"],
+)
+def test_verification_probes_fp16_plugin_head_at_fp16(
+    toy, tmp_path, monkeypatch, extra
+):
+    """A plugin format whose layout declares fixed-dtype scales (e.g. fp32
+    ``group_scales``) has ``_stored_floats == ()`` and no ``scales`` key:
+    probing must inspect all format layers (prioritizing ``_stored_floats``
+    over fixed-dtype ``_tensors``) and then the head's own float weights so
+    an fp16 head probes at fp16 rather than falling back to bf16."""
+    from omlx import formats, oq_verify
+    from omlx.formats.linear import FormatLinear
+    from tests.test_formats_linear import _pair
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(format_layer=False)
+    if extra in ("affine", "weight"):
+        with format_testing.verified("qwen4_exp"):
+            toy_layer = FormatLinear(
+                toy.mode,
+                4,
+                32,
+                64,
+                {
+                    "codes": mx.full((64, 64), 128, dtype=mx.uint8),
+                    "group_scales": mx.ones((64,), dtype=mx.float32),
+                },
+            )
+            if extra == "affine":
+                # Delete and re-insert so named_modules() visits toy_layer
+                # before the fp16 affine layer (LIFO stack order in MLX).
+                del model.mtp.fc_embedding
+                model.mtp.fc_hidden = _pair(
+                    64, 64, bits=4, dtype=mx.float16
+                )[1]
+                model.mtp.fc_embedding = toy_layer
+                model.mtp.aux_bf16 = mx.zeros((4,), dtype=mx.bfloat16)
+                first_fmt = next(
+                    m
+                    for _, m in model.mtp.named_modules()
+                    if isinstance(m, FormatLinear)
+                )
+                assert first_fmt is toy_layer
+            else:
+                model.mtp.fc_embedding = toy_layer
+                model.mtp.norm_w = mx.zeros((64,), dtype=mx.float16)
+    elif extra == "explicit-tensor":
+
+        class _ExplicitFp16(formats.QuantFormat):
+            mode, codes_name = "explicit_fp16_mtp", "codes"
+            tensors, contract = ("row_scales",), formats.CONTRACT
+
+            def layout(self, k, n, bits, group_size):
+                return {
+                    "codes": ((n, k), mx.uint8),
+                    "row_scales": ((n,), mx.float16),
+                }
+
+            def decode(self, tensors, bits, group_size):
+                codes = tensors["codes"].astype(mx.float32) - 128.0
+                return codes * mx.expand_dims(
+                    tensors["row_scales"].astype(mx.float32), -1
+                )
+
+        formats.load()
+        monkeypatch.setitem(
+            formats._FORMATS, _ExplicitFp16.mode, _ExplicitFp16()
+        )
+        with format_testing.verified("qwen4_exp"):
+            model.mtp.fc_embedding = FormatLinear(
+                _ExplicitFp16.mode,
+                4,
+                32,
+                64,
+                {
+                    "codes": mx.full((64, 64), 128, dtype=mx.uint8),
+                    "row_scales": mx.ones((64,), dtype=mx.float16),
+                },
+            )
+            model.mtp.aux_bf16 = mx.zeros((4,), dtype=mx.bfloat16)
+    else:
+
+        class _StoredFloatPriority(formats.QuantFormat):
+            mode, codes_name = "stored_float_priority_mtp", "codes"
+            tensors, contract = ("aux", "row_scales"), formats.CONTRACT
+
+            def layout(self, k, n, bits, group_size):
+                return {
+                    "codes": ((n, k), mx.uint8),
+                    "aux": ((n,), mx.bfloat16),
+                    "row_scales": ((n,), None),
+                }
+
+            def decode(self, tensors, bits, group_size):
+                codes = tensors["codes"].astype(mx.float32) - 128.0
+                return codes * mx.expand_dims(
+                    tensors["row_scales"].astype(mx.float32), -1
+                )
+
+        formats.load()
+        monkeypatch.setitem(
+            formats._FORMATS,
+            _StoredFloatPriority.mode,
+            _StoredFloatPriority(),
+        )
+        with format_testing.verified("qwen4_exp"):
+            model.mtp.fc_embedding = FormatLinear(
+                _StoredFloatPriority.mode,
+                4,
+                32,
+                64,
+                {
+                    "codes": mx.full((64, 64), 128, dtype=mx.uint8),
+                    "aux": mx.ones((64,), dtype=mx.bfloat16),
+                    "row_scales": mx.ones((64,), dtype=mx.float16),
+                },
+            )
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.float16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_defaults_explicit_none_hc_count_to_hidden_size(
+    tmp_path, monkeypatch
+):
+    """An MTP head with explicit ``hc_count = None`` defaults to 1 *
+    hidden_size instead of raising TypeError on int(None)."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model(hc_count=None, hidden_size=64)
+    model.mtp.hc_count = None
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_drops_logits_ref_on_failure(
+    tmp_path, monkeypatch
+):
+    """On failure, ``_verify_attached_mtp`` clears ``logits`` (and the
+    other probe buffers) in ``finally`` so the traceback frame does not
+    pin arrays across ``mx.clear_cache()``."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, _ = _mtp_model(poisoned=True)
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="non-finite") as exc_info:
+        oq_verify.verify_written_format_checkpoint(output)
+    tb = exc_info.value.__traceback__
+    frame = None
+    while tb is not None:
+        if tb.tb_frame.f_code.co_name == "_verify_attached_mtp":
+            frame = tb.tb_frame
+            break
+        tb = tb.tb_next
+    assert frame is not None
+    for name in ("hidden", "mtp_cache", "mtp_out", "logits"):
+        assert frame.f_locals[name] is None
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_runs_when_methods_live_on_model(
+    tmp_path, monkeypatch
+):
+    """An LLM-shaped model with no ``language_model`` attribute still
+    verifies its attached head via ``model.mtp_forward`` and
+    ``model.make_mtp_cache``."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    model.mtp_forward = model.language_model.mtp_forward
+    model.make_mtp_cache = model.language_model.make_mtp_cache
+    del model.language_model
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_slices_first_prompt_row(tmp_path, monkeypatch):
+    """A multi-row verification prompt feeds only the first row's first
+    token ``(1, 1)`` into the attached MTP head."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(
+        output, prompt=np.array([[1, 2], [3, 4]], dtype=np.int32)
+    )
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verify_attached_mtp_unwraps_logits_attribute(tmp_path, monkeypatch):
+    """An MTP forward returning an output object with ``.logits`` (such as
+    ``LanguageModelOutput``) is unwrapped before validation."""
+    from types import SimpleNamespace
+
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    raw_forward = model.language_model.mtp_forward
+    model.language_model.mtp_forward = lambda h, t, c: SimpleNamespace(
+        logits=raw_forward(h, t, c)
+    )
+    _stub_vlm_verification(monkeypatch, model)
+    oq_verify.verify_written_format_checkpoint(output)
+    assert calls == [((1, 1, 64), mx.bfloat16, (1, 1))]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_verification_rejects_infinite_mtp_logits(tmp_path, monkeypatch):
+    """Infinite (not only NaN) logits from an attached MTP head fail
+    verification."""
+    from omlx import oq_verify
+
+    output = _staged_vlm(tmp_path)
+    model, calls = _mtp_model()
+    raw_forward = model.language_model.mtp_forward
+
+    def inf_forward(h, t, c):
+        raw_forward(h, t, c)
+        return mx.full((1, 1, 4), float("inf"), dtype=mx.float32)
+
+    model.language_model.mtp_forward = inf_forward
+    _stub_vlm_verification(monkeypatch, model)
+    with pytest.raises(RuntimeError, match="attached MTP head.*non-finite"):
+        oq_verify.verify_written_format_checkpoint(output)
+    assert len(calls) == 1

@@ -283,6 +283,123 @@ def _writer_failure(
         logger.exception("oQ verify: could not record the failure in config.json")
 
 
+def _verify_attached_mtp(model, prompt_mx, config) -> None:
+    """Run an attached MTP head of format layers once, before publishing.
+
+    The trunk forward is not the whole model: a checkpoint of a family with
+    an embedded Lightning MTP head (``qwen4_exp`` with ``mtp_enabled``) also
+    serves that head, and a head whose forward fails or produces empty or
+    non-finite logits still passes a trunk-only forward. The head is run on
+    the checkpoint's first token and a zero hidden state of the width it
+    reads (``hc_count * hidden_size`` for Qwen4-Exp), at the head's float
+    dtype (bfloat16 when it declares none); its logits must be a non-empty
+    array of finite values. A model with no attached head, or a head holding
+    no format layer, is left as it was.
+    """
+    from .formats.linear import FormatEmbedding, FormatLinear, FormatSwitchLinear
+
+    owner = getattr(model, "language_model", model)
+    mtp_forward = getattr(owner, "mtp_forward", None)
+    cache_fn = getattr(owner, "make_mtp_cache", None)
+    mtp = getattr(model, "mtp", None)
+    if mtp is None:
+        mtp = getattr(owner, "mtp", None)
+    if mtp_forward is None or cache_fn is None or mtp is None:
+        return
+    # Several families attach their head as a list of blocks (or a dict);
+    # a Qwen4-Exp head is one module. Walk both, modules before dict (an
+    # nn.Module is itself a dict), and once per object: a self-referencing
+    # container must not recurse forever.
+    seen: set[int] = set()
+
+    def head_modules(node):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        if callable(getattr(node, "named_modules", None)):
+            for _, module in node.named_modules():
+                yield module
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                yield from head_modules(item)
+        elif isinstance(node, dict):
+            for item in node.values():
+                yield from head_modules(item)
+
+    modules = list(head_modules(mtp))
+    kinds = (FormatLinear, FormatSwitchLinear, FormatEmbedding)
+    format_layers = [m for m in modules if isinstance(m, kinds)]
+    if not format_layers:
+        return
+    hidden_size = getattr(mtp, "hidden_size", None)
+    if hidden_size is None and isinstance(config, dict):
+        for source in (config.get("text_config"), config):
+            if isinstance(source, dict) and source.get("hidden_size") is not None:
+                hidden_size = source["hidden_size"]
+                break
+    if hidden_size is None:
+        raise RuntimeError(
+            "the written checkpoint's attached MTP head names no hidden size "
+            "to verify it with"
+        )
+    hc_count = getattr(mtp, "hc_count", None)
+    width = (1 if hc_count is None else int(hc_count)) * int(hidden_size)
+    # Probe at the head's own float dtype: an fp16 head's affine faces are
+    # built for fp16 and decline bf16, which would fall back to an fp32
+    # promotion instead of the served kernels. A plugin format may declare
+    # fixed-dtype scales (no _stored_floats, no "scales" key), so scan every
+    # format layer's tensors first and then the head's own float weights.
+    half_dtypes = (mx.bfloat16, mx.float16)
+    probe_dtype = None
+    for layer in format_layers:
+        for name in (
+            *getattr(layer, "_stored_floats", ()),
+            *getattr(layer, "_tensors", ()),
+            "scales",
+        ):
+            value = layer.get(name)
+            if isinstance(value, mx.array) and value.dtype in half_dtypes:
+                probe_dtype = value.dtype
+                break
+        if probe_dtype is not None:
+            break
+    if probe_dtype is None:
+        for module in modules:
+            if isinstance(module, dict):
+                for value in module.values():
+                    if isinstance(value, mx.array) and value.dtype in half_dtypes:
+                        probe_dtype = value.dtype
+                        break
+            if probe_dtype is not None:
+                break
+    if probe_dtype is None:
+        probe_dtype = mx.bfloat16
+    tokens = prompt_mx[:1, :1]
+    hidden = mtp_cache = mtp_out = logits = None
+    try:
+        hidden = mx.zeros((1, 1, width), dtype=probe_dtype)
+        mtp_cache = cache_fn()
+        mtp_out = mtp_forward(hidden, tokens, mtp_cache)
+        logits = getattr(mtp_out, "logits", mtp_out)
+        if not isinstance(logits, mx.array):
+            raise RuntimeError(
+                "the written checkpoint's attached MTP head produced "
+                f"{type(logits).__name__}, not logits"
+            )
+        mx.eval(logits)
+        if logits.size == 0:
+            raise RuntimeError(
+                "the written checkpoint's attached MTP head produced empty logits"
+            )
+        if not bool(mx.all(mx.isfinite(logits))):
+            raise RuntimeError(
+                "the written checkpoint's attached MTP head produced non-finite "
+                "logits"
+            )
+    finally:
+        hidden = mtp_cache = mtp_out = logits = None
+
+
 def verify_written_format_checkpoint(
     output,
     *,
@@ -420,6 +537,7 @@ def verify_written_format_checkpoint(
                     raise RuntimeError(
                         "the written checkpoint's forward produced non-finite logits"
                     )
+                _verify_attached_mtp(model, prompt_mx, config)
             finally:
                 if model is not None:
                     close = getattr(model, "close", None)
