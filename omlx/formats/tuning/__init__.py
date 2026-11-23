@@ -321,10 +321,12 @@ def _check_key(path: Path, key: dict) -> None:
     allowed = _ROWS_BUCKET_NAMES.get(route)
     span = _parse_rows_span(rows_bucket)
     custom = (
-        span is not None
+        isinstance(rows_bucket, str)
+        and "-" in rows_bucket
+        and span is not None
         and span[0] is not None
         and span[1] is not None
-        and 1 <= span[0] < span[1]
+        and 1 <= span[0] <= span[1]
     )
     if (
         not isinstance(rows_bucket, str)

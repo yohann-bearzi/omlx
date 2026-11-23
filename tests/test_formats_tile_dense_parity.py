@@ -7,6 +7,7 @@ import io
 import json
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from pathlib import Path
 from threading import Barrier
 
 import mlx.core as mx
@@ -15,6 +16,7 @@ import pytest
 
 from omlx.formats import affine, kernels, linear, testing, tile_dense, tuning
 from omlx.formats.linear import FormatLinear
+from omlx.formats.mlx import traversal as mlx_traversal
 from omlx.patches import m5_gather_qmm_nax as nax
 from tests.test_formats_tables import tabled_tile
 from tests.test_formats_tile_dense import _no_decode, _one_expert
@@ -1215,8 +1217,7 @@ def _assert_c2(got, want, x, quantized):
 
     def rel(a):
         return (
-            mx.sqrt(mx.sum((a.astype(mx.float32) - ref) ** 2))
-            / mx.sqrt(mx.sum(ref**2))
+            mx.sqrt(mx.sum((a.astype(mx.float32) - ref) ** 2)) / mx.sqrt(mx.sum(ref**2))
         ).item()
 
     got_err, want_err = rel(got), rel(want)
@@ -1287,23 +1288,24 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
 
     for n, k in ((48, 2560), (1, 2560), (4, 10240)):
-        quantized, layer = _layer(n, k, 8, 64)
-        for rows in (17, 24, 33, 48, 64, 128, 256, 512, 1024):
-            x = _x((rows, k), seed=rows + n)
-            with testing.fresh_proofs():
-                got = layer(x)
-            want = quantized(x)
-            mx.eval(got, want)
-            kept = layer.__dict__.get(linear._KEPT)
-            assert kept is not None and kept.dense not in (None, linear._UNBUILT)
-            policy = tile_dense.policy_for(kept.dense, rows, x.dtype)
-            assert policy is not None
-            if policy.backend == "mlx":
-                assert mx.array_equal(
-                    got.view(mx.uint16), want.view(mx.uint16)
-                ).item(), (n, rows)
-            else:
-                _assert_c2(got, want, x, quantized)
+        for dtype in (mx.bfloat16, mx.float16):
+            quantized, layer = _layer(n, k, 8, 64, dtype)
+            for rows in (17, 18, 24, 32, 33, 48, 64, 128, 256, 512, 1024):
+                x = _x((rows, k), dtype=dtype, seed=rows + n)
+                with testing.fresh_proofs():
+                    got = layer(x)
+                want = quantized(x)
+                mx.eval(got, want)
+                kept = layer.__dict__.get(linear._KEPT)
+                assert kept is not None and kept.dense not in (None, linear._UNBUILT)
+                policy = tile_dense.policy_for(kept.dense, rows, x.dtype)
+                assert policy is not None
+                if policy.backend == "mlx":
+                    assert mx.array_equal(
+                        got.view(mx.uint16), want.view(mx.uint16)
+                    ).item(), (n, dtype, rows)
+                else:
+                    _assert_c2(got, want, x, quantized)
 
 
 def test_unarmed_qmm_threshold_12_to_16_uses_prefill_matching_mlx_bitwise(monkeypatch):
@@ -1530,3 +1532,172 @@ def test_build_plan_rows_bucket_uses_target_chip_not_host_arch(monkeypatch):
     )
     assert declined is not None
     assert tile_dense.policy_for(declined, 48, mx.bfloat16).backend == "steel"
+
+
+def _rows_17_24_shapes():
+    base = Path(__file__).parents[1] / "omlx" / "formats" / "tuning" / "v1"
+    paths = sorted(base.glob("applegpu_*.json"))
+    assert paths
+    shapes = set()
+    for path in paths:
+        with open(path) as table:
+            entries = json.load(table)["entries"]
+        for entry in entries:
+            key = entry["key"]
+            if "n" in key and "k" in key:
+                shapes.add((key["n"], key["k"], key["bits"], key["group"]))
+    for n, k in (
+        (12288, 2560),
+        (512, 2560),
+        (2560, 6144),
+        (10240, 2560),
+        (6144, 2560),
+        (640, 2560),
+        (2560, 640),
+        (2560, 2560),
+        (4, 10240),
+    ):
+        shapes.add((n, k, 8, 64))
+    return sorted(shapes)
+
+
+def _wide_window_top(n, k, bits, group):
+    """The last row MLX runs qmv_wide for this shape on the host chip."""
+    arch = linear._metal_architecture() or ""
+    top = 16
+    for rows in range(17, 65):
+        folded = mlx_traversal(rows, n, k, group, arch, bits=bits)
+        if folded[0] == "wide":
+            top = rows
+    return top
+
+
+@pytest.mark.parametrize("n,k,bits,group", _rows_17_24_shapes())
+def test_rows_17_24_passes_c2_on_the_host_table(n, k, bits, group):
+    # The MLX reference is the host's own route, so each Mac judges its table:
+    # M5 Max -> applegpu_g17s_c40, M3 Ultra -> applegpu_g15d_c80.
+    if linear._nax_host():
+        chip, tensor_units = "applegpu_g17s_c40", True
+    else:
+        chip, tensor_units = "applegpu_g15d_c80", False
+    top = _wide_window_top(n, k, bits, group)
+    probe = range(17, top + 1) if top >= 17 else (17, 18, 24)
+    for dtype in (mx.bfloat16, mx.float16):
+        quantized, layer = _layer(n, k, bits, group, dtype)
+        plan = tile_dense.build_plan(layer, tensor_units=tensor_units, chip=chip)
+        assert plan is not None, (chip, n, k, bits, group, dtype)
+        for rows in probe:
+            x = _x((rows, k), dtype=dtype, seed=rows + n)
+            got = tile_dense.project(plan, x)
+            assert got is not None, (chip, n, k, bits, group, dtype, rows)
+            want = quantized(x)
+            mx.eval(got, want)
+            _assert_c2(got, want, x, quantized)
+
+
+def test_m3_wide_rows17_takes_mlx_and_passes_c2():
+    # applegpu_g15d's QMV limit is 18 for width 2560, so MLX runs qmv_wide at
+    # rows=17; the 17-17 span takes mlx and must be bitwise to stock while
+    # row 18 keeps the measured non-mlx route.
+    for n, k, bits in (
+        (640, 2560, 8),
+        (2560, 2560, 8),
+        (2560, 2560, 4),
+        (2560, 640, 8),
+    ):
+        for dtype in (mx.bfloat16, mx.float16):
+            quantized, layer = _layer(n, k, bits, 64, dtype)
+            plan = tile_dense.build_plan(
+                layer, tensor_units=False, chip="applegpu_g15d_c80"
+            )
+            assert plan is not None
+            assert tile_dense.policy_for(plan, 17, dtype).backend == "mlx"
+            assert tile_dense.policy_for(plan, 18, dtype).backend != "mlx"
+            x = _x((17, k), dtype=dtype, seed=n + k + bits)
+            got = tile_dense.project(plan, x)
+            want = quantized(x)
+            mx.eval(got, want)
+            assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
+            _assert_c2(got, want, x, quantized)
+
+
+def test_narrow_n_c2_evaluates_all_rows(monkeypatch):
+    seen: list[tuple[int, int, mx.Dtype]] = []
+    real_eval = mx.eval
+
+    def spy_eval(*args, **kwargs):
+        if len(args) == 2 and all(isinstance(a, mx.array) for a in args):
+            got, want = args
+            if got.ndim == 2 and got.shape == want.shape:
+                seen.append((got.shape[0], got.shape[1], got.dtype))
+        return real_eval(*args, **kwargs)
+
+    monkeypatch.setattr(mx, "eval", spy_eval)
+    test_flash_next_all_affine_prefill_shapes_route_at_construction_without_decode(
+        monkeypatch
+    )
+    expected = {
+        (rows, n, dtype)
+        for n in (48, 1, 4)
+        for dtype in (mx.bfloat16, mx.float16)
+        for rows in (17, 18, 24, 32, 33, 48, 64, 128, 256, 512, 1024)
+    }
+    assert len(seen) == 66, f"expected 66 row evaluations, got {len(seen)}"
+    assert set(seen) == expected
+
+    # Prove an early-row mismatch (rows=17, previously skipped) actually fails.
+    real_call = FormatLinear.__call__
+
+    def corrupt_row_17(self, x):
+        out = real_call(self, x)
+        if x.shape[0] == 17:
+            return out + mx.array(1.0, dtype=out.dtype)
+        return out
+
+    monkeypatch.setattr(mx, "eval", real_eval)
+    monkeypatch.setattr(FormatLinear, "__call__", corrupt_row_17)
+    with pytest.raises(AssertionError):
+        test_flash_next_all_affine_prefill_shapes_route_at_construction_without_decode(
+            monkeypatch
+        )
+
+
+def test_host_sweep_covers_wide_window_and_fp16(monkeypatch):
+    seen: set[tuple[int, mx.Dtype]] = set()
+    real_project = tile_dense.project
+
+    def spy_project(plan, x, *args, **kwargs):
+        seen.add((x.shape[0], x.dtype))
+        return real_project(plan, x, *args, **kwargs)
+
+    monkeypatch.setattr(tile_dense, "project", spy_project)
+    test_rows_17_24_passes_c2_on_the_host_table(2048, 2048, 4, 64)
+    top = _wide_window_top(2048, 2048, 4, 64)
+    assert top >= 31, f"expected 2048x2048 wide window top >= 31, got {top}"
+    expected = {
+        (rows, dtype)
+        for rows in range(17, top + 1)
+        for dtype in (mx.bfloat16, mx.float16)
+    }
+    assert seen == expected
+
+    # Verify _nax_host() (not gpu_generation() >= 17) selects the chip/tensor_units.
+    class _StopError(Exception):
+        pass
+
+    recorded: list[tuple[str | None, bool | None]] = []
+
+    def spy_build_plan(layer, *, tensor_units=None, chip=None, **kwargs):
+        recorded.append((chip, tensor_units))
+        raise _StopError()
+
+    monkeypatch.setattr(tile_dense, "build_plan", spy_build_plan)
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: 17)
+    monkeypatch.setattr(linear, "_nax_host", lambda: False)
+    with pytest.raises(_StopError):
+        test_rows_17_24_passes_c2_on_the_host_table(2048, 2048, 4, 64)
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: 15)
+    monkeypatch.setattr(linear, "_nax_host", lambda: True)
+    with pytest.raises(_StopError):
+        test_rows_17_24_passes_c2_on_the_host_table(2048, 2048, 4, 64)
+    assert recorded == [("applegpu_g15d_c80", False), ("applegpu_g17s_c40", True)]

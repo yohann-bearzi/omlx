@@ -1610,7 +1610,7 @@ def test_narrow_rows_span_beats_enclosing_bucket_and_exposes_row_bounds(tmp_path
     assert p53 is not None and (p53.backend, p53.bm, p53.bk) == ("steel", 32, 128)
 
 
-def test_lookup_empty_chip_fails_closed(tmp_path, monkeypatch):
+def test_lookup_empty_chip_fails_closed_twice_contract(tmp_path, monkeypatch):
     face = _face()
     _write(tmp_path / "v1", CHIP, [_entry(face)])
     monkeypatch.setattr(tuning, "current_chip", lambda: CHIP)
@@ -1666,6 +1666,94 @@ def test_nax_is_legal_rejects_klt_exceeding_tgp():
         )
         is True
     )
+
+
+def test_single_row_span_is_accepted_and_reversed_is_refused(tmp_path):
+    face = _face()
+    entry = _entry(face, n=2560, k=2560, rows_bucket="17-17", params={"backend": "mlx"})
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.reset_cache()
+    try:
+        table = tuning.lookup(
+            "dense_tile",
+            face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=2560,
+            k=2560,
+            rows=17,
+            chip=CHIP,
+        )
+        assert table is not None and table.backend == "mlx"
+        for out_of_span in (16, 18):
+            assert (
+                tuning.lookup(
+                    "dense_tile",
+                    face,
+                    dtype=mx.bfloat16,
+                    bits=4,
+                    group=64,
+                    n=2560,
+                    k=2560,
+                    rows=out_of_span,
+                    chip=CHIP,
+                )
+                is None
+            )
+        bad = _entry(
+            face, n=2560, k=2560, rows_bucket="18-17", params={"backend": "mlx"}
+        )
+        with pytest.raises(ValueError):
+            _write(tmp_path / "v1", CHIP, [bad])
+            tuning.reset_cache()
+            tuning.lookup(
+                "dense_tile",
+                face,
+                dtype=mx.bfloat16,
+                bits=4,
+                group=64,
+                n=2560,
+                k=2560,
+                rows=17,
+                chip=CHIP,
+            )
+    finally:
+        tuning.reset_cache()
+
+
+def test_bare_integer_rows_bucket_outside_route_is_refused(tmp_path):
+    face = _face()
+    bad_cases = (
+        _entry(face, n=2560, k=2560, rows_bucket="17", params={"backend": "mlx"}),
+        _entry(
+            face,
+            route="mma_tile",
+            n=2560,
+            k=2560,
+            rows_bucket="32",
+            params={"bn": 16, "bk": 32, "nsg": 8},
+        ),
+        _entry(face, n=2560, k=2560, rows_bucket="0-0", params={"backend": "mlx"}),
+    )
+    try:
+        for bad in bad_cases:
+            _write(tmp_path / "v1", CHIP, [bad])
+            tuning.reset_cache()
+            with pytest.raises(ValueError, match="rows_bucket"):
+                tuning.lookup(
+                    bad["key"]["route"],
+                    face,
+                    dtype=mx.bfloat16,
+                    bits=4,
+                    group=64,
+                    n=2560,
+                    k=2560,
+                    rows=17,
+                    chip=CHIP,
+                )
+    finally:
+        tuning.reset_cache()
 
 
 def test_row_bounds_preserves_custom_spans_below_17(tmp_path):
