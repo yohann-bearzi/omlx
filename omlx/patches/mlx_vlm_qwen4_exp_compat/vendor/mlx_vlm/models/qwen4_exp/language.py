@@ -68,7 +68,6 @@ install_capacity_methods(BatchKVCache)
 
 _PLE_RUNTIME_MODEL_PATH: Path | None = None
 _PLE_RUNTIME_MODE = "resident"
-_HYPER_SPLIT_INDICES: dict[tuple[int, int], tuple[mx.array, mx.array]] = {}
 
 
 def _rank_two_text_position_ids(
@@ -3089,41 +3088,20 @@ class Qwen4ExpGatedResidual(nn.Module):
 
     def _forward(self, hyper_input: mx.array, target_verify: bool = False):
         normed = self.hc_norm(hyper_input)
-        input_inject_weight = getattr(self, "input_inject_weight", None)
-        if input_inject_weight is None:
-            mix = (
-                _target_verify_linear(self.input_mix_weight_down, normed)
+        mix = (
+            _target_verify_linear(self.input_mix_weight_down, normed)
+            if target_verify
+            else self.input_mix_weight_down(normed)
+        )
+        block_injection = (
+            (
+                _target_verify_linear(self.block_inject_weight, normed)
                 if target_verify
-                else self.input_mix_weight_down(normed)
+                else self.block_inject_weight(normed)
             )
-            block_injection = (
-                (
-                    _target_verify_linear(self.block_inject_weight, normed)
-                    if target_verify
-                    else self.block_inject_weight(normed)
-                )
-                if "block_inject_weight" in self
-                else None
-            )
-        else:
-            combined = (
-                _target_verify_linear(input_inject_weight, normed)
-                if target_verify
-                else input_inject_weight(normed)
-            )
-            indices = _HYPER_SPLIT_INDICES.get((self.hc_lowrank, self.hc_count))
-            if indices is None:
-                indices = (
-                    mx.arange(self.hc_lowrank, dtype=mx.int32),
-                    mx.arange(
-                        self.hc_lowrank,
-                        self.hc_lowrank + self.hc_count,
-                        dtype=mx.int32,
-                    ),
-                )
-                _HYPER_SPLIT_INDICES[(self.hc_lowrank, self.hc_count)] = indices
-            mix = mx.take(combined, indices[0], axis=-1)
-            block_injection = mx.take(combined, indices[1], axis=-1)
+            if "block_inject_weight" in self
+            else None
+        )
 
         mix = nn.silu(mix / self.hc_count)
         mix = mx.sigmoid(

@@ -91,3 +91,33 @@ def test_host_ple_uses_its_reader_for_quantized_rows():
         and n.func.attr == "dequantize"
         for n in ast.walk(host)
     )
+
+
+def test_hyper_connection_releases_the_split_indices_and_inject_lookup():
+    text = LANGUAGE.read_text()
+    assert "_HYPER_SPLIT_INDICES" not in text
+    assert "input_inject_weight" not in text
+    tree = ast.parse(text)
+    assert not any(
+        isinstance(node, ast.Name) and node.id == "_HYPER_SPLIT_INDICES"
+        for node in ast.walk(tree)
+    )
+    nodes = _function_nodes(LANGUAGE, "_forward")
+    assert nodes
+    assert not any(
+        (isinstance(node, ast.Constant) and node.value == "input_inject_weight")
+        or (isinstance(node, ast.Attribute) and node.attr == "input_inject_weight")
+        or (isinstance(node, ast.Name) and node.id == "input_inject_weight")
+        for node in nodes
+    )
+
+
+def test_the_qwen4_adapter_wires_the_qwen35_q4_patches_in_load_first():
+    calls = {
+        node.func.id
+        for node in _function_nodes(ADAPTER, "load_first")
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    assert calls
+    assert "apply_qwen35_q4_mlp_patch" in calls
+    assert "apply_qwen35_q4_prefill_linear_patch" in calls

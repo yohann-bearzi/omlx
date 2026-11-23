@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -283,9 +284,11 @@ def test_qwen35_q8_gdn_backend_has_first_refusal_before_gpu_threshold(
         "_omlx_q4_lm_gdn_wrapper",
     ):
         saved_attrs[attr] = (
-            getattr(qwen35.GatedDeltaNet, attr)
-            if hasattr(qwen35.GatedDeltaNet, attr)
-            else None,
+            (
+                getattr(qwen35.GatedDeltaNet, attr)
+                if hasattr(qwen35.GatedDeltaNet, attr)
+                else None
+            ),
             hasattr(qwen35.GatedDeltaNet, attr),
         )
         if hasattr(qwen35.GatedDeltaNet, attr):
@@ -1173,3 +1176,21 @@ def test_vlm_format_prefill_linear_honours_row_exact_callable(monkeypatch, tmp_p
     fallback_out = model.lang.o_proj(x_2048)
     assert fallback_out is not sentinel
     assert len(calls) == 3
+
+
+def test_qwen35_q4_prefill_linear_patch_keeps_the_qwen4_exp_trunk(monkeypatch):
+    """An oQh qwen4_exp trunk keeps affine nn.QuantizedLinear projections
+    (format_load leaves _ported off); the q4 prefill tile still admits them."""
+    from omlx.patches import qwen35_q4_mlp as patch
+
+    monkeypatch.setattr(patch, "_has_native_qmm", lambda: True)
+
+    class Qwen4ExpAttention:
+        pass
+
+    Qwen4ExpAttention.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    attention = Qwen4ExpAttention()
+    attention.q_proj = nn.QuantizedLinear(64, 64, bias=False, group_size=64, bits=4)
+    model = SimpleNamespace(named_modules=lambda: [("attention", attention)])
+    assert patch.apply_qwen35_q4_prefill_linear_patch(model) is True
+    assert type(attention.q_proj) is patch._VLMQuantizedPrefillLinear
