@@ -33,6 +33,10 @@ _MTP_PREFIXES = (
     "model.mtp.",
     "mtp.",
 )
+_MTP_QUANT_PREFIXES = (
+    *_MTP_PREFIXES,
+    "language_model.model.mtp.",
+)
 _RMSNORM_CENTER_ANCHOR_RE = re.compile(
     r"^language_model\.model\.layers\.\d+"
     r"\.attn_hyper_connection\.hc_norm\.weight$"
@@ -145,6 +149,16 @@ class Model(Qwen3_5Model):
         if get_mtp_runtime().enabled:
             self.mtp = Qwen4ExpMTPModule(config.text_config)
             self.language_model.bind_mtp_owner(self)
+
+    def quantization_path_aliases(self, path: str) -> tuple[str, ...]:
+        """Every prefix a checkpoint's quantization map may name ``path``
+        under: mlx-vlm quantizes the head at ``mtp.``, while a checkpoint
+        keeps HF's ``model.language_model.mtp.`` and the sanitizer's
+        ``language_model.model.mtp.``."""
+        if path.startswith("mtp."):
+            rest = path[len("mtp.") :]
+            return tuple(prefix + rest for prefix in _MTP_QUANT_PREFIXES)
+        return ()
 
     def sanitize(self, weights):
         if get_ple_runtime_mode() == "mmap" and not getattr(
