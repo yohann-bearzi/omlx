@@ -1,10 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """MLX's wide mat-vec reduction over a format's runs of eight weights."""
 
-from functools import cache
-
-import mlx.core as mx
-
 from . import kernels
 
 _HEADER = r"""
@@ -112,64 +108,6 @@ def kernel(face):
     return kernels.face_kernel(
         "omlx_format_linear_wide", ("x", "w"), {"w": face}, ("y",), _HEADER, _SOURCE
     )
-
-
-# Two concurrent decode requests pass two singleton matrices. MLX folds them
-# into one wide product unless intact rows have a gap between the matrices.
-# The same compiled graph receives both layouts; decide on the actual GPU
-# strides. The contiguous data input also covers a column-strided activation.
-_PAIR_SOURCE = """
-    if (layout_strides[0] != K && layout_strides[1] == K && layout_strides[2] == 1) {
-        const uint out = threadgroup_position_in_grid.y * 8 +
-                         simdgroup_index_in_threadgroup * 4;
-        #pragma unroll
-        for (int m = 0; m < 2; ++m) {
-            float partial[4];
-            qmv_rows<T, K, 4, 0>(d, out, d, 0, x + m * K,
-                                 thread_index_in_simdgroup, partial);
-            if (thread_index_in_simdgroup == 0) {
-                store_rows(omlx_iota<4>(), partial, y + size_t(m) * N + out);
-            }
-        }
-    } else {
-        omlx_wide<T, K, N, 2, false>(w, x, y, 2, threadgroup_position_in_grid,
-                                     simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-    }
-"""
-
-
-@cache
-def pair_kernel(dot, tile, packed="weight"):
-    matrices = kernels.Matrices()
-    inputs = ["layout", "x", *matrices.add("w", tile), *matrices.add("d", dot)]
-    mm = mx.fast.metal_kernel(
-        name=f"omlx_format_decode_pair_{dot.key}_{tile.key}",
-        input_names=inputs,
-        output_names=["y"],
-        ensure_row_contiguous=False,
-        header=matrices.header + kernels.STORE_ROWS + _HEADER,
-        source=matrices.declarations + _PAIR_SOURCE,
-    )
-    names = (packed, *tile.tensors, packed, *dot.tensors)
-    unique = tuple(dict.fromkeys(names))
-    indices = tuple(unique.index(name) for name in names)
-
-    def launch(*, inputs, **kwargs):
-        x, *weights = inputs
-        return mm(
-            inputs=[x, mx.contiguous(x), *(weights[i] for i in indices)], **kwargs
-        )
-
-    return unique, launch
-
-
-def pair_stand_in(plan, metal):
-    dtype, k, _, _, _ = metal
-    arrays = kernels.zeros(
-        ((2, 1, k), dtype), *((a.shape, a.dtype) for a in plan.operands)
-    )
-    _, graph = describe(plan, arrays[0])
-    return arrays, graph
 
 
 def describe(plan, x):

@@ -1506,8 +1506,10 @@ def _digest_records(records) -> str:
 _AFFINE_ALL_DIGEST = (
     "231 6521521ab3c3d0c88af7700c6ea9935406e8a05596fc7119e0e3f252f99f60c8"
 )
+# The decode-pair builder record left with its route (rule 29): 318 -> 294
+# records; re-pinned 2026-11-23 with the C7 fold fix.
 _AFFINE_WIDE_AND_SG8_DIGEST = (
-    "318 51013645da822a4db1867468b1b1f804aa55cf2195e1d6a8fbe787fcf146b8be"
+    "294 33470545c646d84daff7c4a1eba73dedbe0c67cab6563826f6dd1974c4b8ad9c"
 )
 # Re-pinned on wip/a1-a13 together with the 219 affine records: the A13
 # unrolled shared block adds three _Pragma("clang loop unroll(full)") lines
@@ -1652,8 +1654,6 @@ def test_all_shipped_affine_faces_and_builders_are_byte_identical_to_ba421f5c(
             for dtype in (mx.bfloat16, mx.float16):
                 tf = affine.tile_face(bits, gs, dtype)
                 tile_wide.kernel(tf)
-                df = affine.face(bits, gs, True, dtype)
-                tile_wide.pair_kernel.__wrapped__(df, tf)
     for bits in affine._CODE_BITS:
         for gs in affine._GROUP_SIZES:
             for sd in affine._CODE_TYPES:

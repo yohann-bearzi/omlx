@@ -125,6 +125,163 @@ def _equal(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and mx.array_equal(a, b).item()
 
 
+def test_the_decode_mlx_route_table_holds_the_measured_losing_cells():
+    """The DATA of the C7 receipts: 5- and 7-row decodes on both chips, plus
+    the four measured M3 Ultra cells (512x2560 and 640x2560 at 1-2 rows,
+    2560x2560 at 1, and 2560x640 at 3-4 and 6-8), are MLX's own qmv for a
+    Qwen-attached stock layer; every other measured bucket stays the format
+    route."""
+    rows = linear._decode_mlx_rows
+    for arch in ("applegpu_g17s",):
+        for n, k in (
+            (12288, 2560),
+            (512, 2560),
+            (2560, 6144),
+            (10240, 2560),
+            (6144, 2560),
+            (2560, 2560),
+            (640, 2560),
+        ):
+            assert rows(arch, n, k) == frozenset({5, 7}), (arch, n, k)
+    assert rows("applegpu_g17s", 2560, 640) == frozenset({5, 7})
+    assert rows("applegpu_g15d", 12288, 2560) == frozenset({5, 7})
+    assert rows(None, 2560, 640) == frozenset({5, 7})
+    assert rows("applegpu_g15d", 512, 2560) == frozenset({1, 2, 5, 7})
+    assert rows("applegpu_g15d", 2560, 2560) == frozenset({1, 5, 7})
+    assert rows("applegpu_g15d", 640, 2560) == frozenset({1, 2, 5, 7})
+    assert rows("applegpu_g15d", 2560, 640) == frozenset({3, 4, 5, 6, 7, 8})
+
+
+def test_a_losing_decode_cell_takes_mlx_qmv(monkeypatch):
+    """A Qwen-attached stock layer's 5-row call (a losing bucket) runs MLX's
+    matmul; its 4-row call on a big shape runs the format route."""
+    _, layer = _pair(2560, 12288, bits=8, seed=75)
+    layer._qwen_row_exact = lambda: False
+    calls = []
+    original = type(layer)._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return original(self, x)
+
+    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
+    losing = _x((5, 1, 2560), seed=91)
+    mx.eval(layer(losing))
+    assert calls == [(5, 1, 2560)], calls
+    calls.clear()
+    winning = _x((4, 1, 2560), seed=92)
+    mx.eval(layer(winning))
+    assert calls == [], calls
+
+
+def test_the_m3_2560x640_four_row_cell_takes_mlx_qmv(monkeypatch):
+    """The M3 Ultra's down-projection cell at 4 rows is MLX's; another chip
+    keeps the format route there."""
+    _, layer = _pair(640, 2560, bits=8, seed=76)
+    layer._qwen_row_exact = lambda: False
+    calls = []
+    original = type(layer)._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return original(self, x)
+
+    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
+    layer.__dict__.pop(linear._KEPT, None)
+    x = _x((4, 1, 640), seed=93)
+    mx.eval(layer(x))
+    assert calls == [(4, 1, 640)], calls
+    calls.clear()
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g17s")
+    layer.__dict__.pop(linear._KEPT, None)
+    mx.eval(layer(x))
+    assert calls == [], calls
+
+
+def test_3d_wrong_width_is_refused_before_stock_matmul():
+    """Malformed 3-D widths whose size // k lands in kept.mlx_rows must raise
+    FormatLinear's ValueError instead of reaching MLX's quantized_matmul."""
+    for attach in (False, True):
+        _, layer = _pair(2560, 12288, bits=8, seed=78)
+        if attach:
+            layer._qwen_row_exact = lambda: False
+        for bad_shape in ((5, 2, 1280), (5, 1, 2561)):
+            with pytest.raises(
+                ValueError,
+                match=re.escape(f"x is (..., 2560), not of shape {bad_shape}"),
+            ):
+                layer(_x(bad_shape, seed=95))
+
+
+def test_armed_row_exact_and_bias_on_losing_decode_bucket(monkeypatch):
+    """Unarmed losing buckets add bias on _stock_matmul; armed row-exact calls
+    never take _stock_matmul and match row-by-row serial bits."""
+    quantized, layer = _pair(2560, 12288, bits=8, bias=True, seed=77)
+    assert mx.any(quantized["bias"] != 0).item()
+    calls = []
+    original = type(layer)._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return original(self, x)
+
+    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
+    x = _x((5, 1, 2560), seed=94)
+
+    layer._qwen_row_exact = lambda: False
+    got = layer(x)
+    want = quantized(x)
+    mx.eval(got, want)
+    assert calls == [(5, 1, 2560)], calls
+    assert _same_bits(got, want)
+
+    calls.clear()
+    layer._qwen_row_exact = lambda: True
+    armed_got = layer(x)
+    serial = mx.concatenate([quantized(x[i : i + 1]) for i in range(5)], axis=0)
+    mx.eval(armed_got, serial)
+    assert calls == [], calls
+    assert _same_bits(armed_got, serial)
+
+
+def test_non_qwen_stock_3d_5row_stays_row_exact(monkeypatch):
+    """Non-Qwen stock layers never run tile_wide and stay row-exact on 3-D
+    5-row calls instead of taking _stock_matmul."""
+    quantized, layer = _pair(2560, 12288, bits=8, seed=79)
+    assert layer._qwen_row_exact is None
+    calls = []
+    original = type(layer)._stock_matmul
+
+    def counted(self, x):
+        calls.append(x.shape)
+        return original(self, x)
+
+    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
+    x = _x((5, 1, 2560), seed=96)
+    got = layer(x)
+    serial = mx.concatenate([quantized(x[i : i + 1]) for i in range(5)], axis=0)
+    mx.eval(got, serial)
+    assert calls == [], calls
+    assert _same_bits(got, serial)
+
+
+def test_format_linear_polls_row_exact_once():
+    """FormatLinear.__call__ polls _qwen_row_exact once per cold call across
+    2-D, 3-D winning, 3-D losing, and prefill shapes."""
+    for shape in ((4, 2560), (4, 1, 2560), (5, 1, 2560), (32, 2560)):
+        _, layer = _pair(2560, 2560, bits=8, seed=80)
+        calls = []
+
+        def poll(_calls=calls):
+            _calls.append(1)
+            return False
+
+        layer._qwen_row_exact = poll
+        mx.eval(layer(_x(shape, seed=97)))
+        assert len(calls) == 1, (shape, len(calls))
+
+
 @pytest.mark.parametrize(
     "k,n,bits,dtype,bias",
     [
@@ -883,6 +1040,141 @@ def _want(layer, x, indices=None):
     if "bias" in layer:
         want = want + np.array(layer["bias"])[indices][..., None, :]
     return want
+
+
+def test_a_3d_decode_call_folds_to_one_projection(monkeypatch):
+    """A Qwen-attached layer's unarmed (B, 1, k) call folds to (B, k) and
+    takes the 2-D route once: one launch, one rounding, and no `mx.where`
+    layout selection (rule 28/33)."""
+    _, layer = _pair(2560, 2560, bits=8, seed=71)
+    layer._qwen_row_exact = lambda: False
+    launches = []
+    original = linear._launch
+
+    def counted(*args, **kwargs):
+        launches.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(linear, "_launch", counted)
+    monkeypatch.setattr(
+        mx, "where", lambda *args, **kwargs: pytest.fail("dual layout route")
+    )
+    x = _x((4, 1, 2560))
+    y = layer(x)
+    mx.eval(y)
+    assert y.shape == (4, 1, 2560)
+    assert len(launches) == 1, len(launches)
+
+
+def test_the_steady_decode_call_is_served_by_the_native_fast_path(monkeypatch):
+    """After the first call, the 3-D decode and prefill signatures are
+    registered directly with the native warm dispatcher: the next (4, 1, k),
+    (2, 1, k), and (1, 32, k) calls hit it directly on entry, never
+    `_ordinary` or a fresh projection."""
+    from omlx.custom_kernels.quant_matmul import fast as native
+
+    if not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires the native warm dispatcher")
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
+    _, layer = _pair(2560, 2560, bits=8, seed=74)
+    layer._qwen_row_exact = lambda: False
+    firsts = {}
+    for rows in (4, 2):
+        x = _x((rows, 1, 2560))
+        firsts[rows] = (x, layer(x))
+        mx.eval(firsts[rows][1])
+    fast = layer._fast
+    assert fast is not None, "the 3-D decode call registered no native replay"
+    for rows in (4, 2):
+        x, first = firsts[rows]
+        served = []
+
+        def counting(module, value, _fast=fast, _served=served):
+            y = _fast(module, value)
+            _served.append(y is not None)
+            return y
+
+        with monkeypatch.context() as patch:
+            layer.__dict__["_fast"] = counting
+            patch.setattr(
+                linear.FormatLinear,
+                "_ordinary",
+                lambda *args, **kwargs: pytest.fail("ordinary"),
+            )
+            patch.setattr(
+                linear.FormatLinear,
+                "_project_route",
+                lambda *args, **kwargs: pytest.fail("projected"),
+            )
+            try:
+                again = layer(x)
+                mx.eval(again)
+            finally:
+                layer.__dict__.pop("_fast", None)
+        assert served == [True], f"({rows}, 1, k) missed native dispatch: {served}"
+        assert mx.array_equal(first.view(mx.uint16), again.view(mx.uint16)).item()
+        layer.__dict__["_fast"] = fast
+
+    # Steady-state 3-D prefill registers its 3-D signature on _fast directly.
+    prefill_x = _x((1, 32, 2560), seed=75)
+    prefill_first = layer(prefill_x)
+    mx.eval(prefill_first)
+    prefill_fast = layer._fast
+    assert prefill_fast is not None, "3-D prefill registered no native replay"
+    prefill_served = []
+
+    def counting_prefill(module, value):
+        y = prefill_fast(module, value)
+        prefill_served.append(y is not None)
+        return y
+
+    layer.__dict__["_fast"] = counting_prefill
+    try:
+        prefill_again = layer(prefill_x)
+        mx.eval(prefill_again)
+    finally:
+        layer.__dict__["_fast"] = prefill_fast
+    assert prefill_served == [True], prefill_served
+    assert mx.array_equal(
+        prefill_first.view(mx.uint16), prefill_again.view(mx.uint16)
+    ).item()
+
+
+def test_a_3d_decode_call_meets_the_fp32_reference():
+    """A (B, 1, k) call's error stays inside the bar for 1..8 streams
+    (rule 33: the route may reorder; the FP32 reference decides)."""
+    _, layer = _pair(2560, 2560, bits=8, seed=72)
+    layer._qwen_row_exact = lambda: False
+    decoded = mx.dequantize(
+        layer["weight"], layer["scales"], layer["biases"], group_size=32, bits=8
+    ).astype(mx.float32)
+    for rows in range(1, 9):
+        x = _x((rows, 1, 2560), seed=80 + rows)
+        y = layer(x)
+        mx.eval(y)
+        reference = x.reshape(rows, 2560).astype(mx.float32) @ decoded.T
+        got = y.reshape(rows, 2560).astype(mx.float32)
+        error = mx.sqrt(mx.sum((got - reference) ** 2)) / mx.sqrt(mx.sum(reference**2))
+        assert float(error) <= 1e-2, (rows, float(error))
+
+
+def test_the_second_3d_call_replays_the_kept_graph(monkeypatch):
+    """After the first call the kept graph serves the next one: no launch,
+    same bits."""
+    _, layer = _pair(2560, 2560, bits=8, seed=73)
+    layer._qwen_row_exact = lambda: False
+    x = _x((4, 1, 2560))
+    first = layer(x)
+    mx.eval(first)
+    launches = []
+    original = linear._launch
+    monkeypatch.setattr(
+        linear, "_launch", lambda *a, **k: launches.append(1) or original(*a, **k)
+    )
+    again = layer(x)
+    mx.eval(again)
+    assert not launches
+    assert mx.array_equal(first.view(mx.uint16), again.view(mx.uint16)).item()
 
 
 def test_a_tensor_of_float64_is_no_face_and_the_layer_runs_composed(

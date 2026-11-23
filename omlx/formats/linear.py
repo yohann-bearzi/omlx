@@ -57,6 +57,27 @@ def packed_name(layer) -> str:
 # explicitly row-exact Qwen call uses several such groups.
 MAX_ROWS = 16
 
+# C7 (2026-11-23) receipts: the decode row buckets where tile_wide's ragged
+# V geometry loses to MLX's own qmv for a Qwen-attached stock layer (5 and 7
+# rows on both chips, plus four M3 Ultra chip-shape cells in
+# c7-attached-m3-clean.json: 512x2560 and 640x2560 at 1-2 rows, 2560x2560 at
+# 1 row, and 2560x640 at 3-4 and 6-8 rows; none on M5). DATA: those buckets
+# take MLX's matmul; the format route serves every other bucket. The kernel
+# gap itself is DEFERRED (tile_wide tiles=(rows+4)//5).
+_DECODE_MLX_ROWS = frozenset({5, 7})
+_DECODE_MLX_CELLS = {
+    ("applegpu_g15d", 512, 2560): _DECODE_MLX_ROWS | frozenset({1, 2}),
+    ("applegpu_g15d", 2560, 2560): _DECODE_MLX_ROWS | frozenset({1}),
+    ("applegpu_g15d", 640, 2560): _DECODE_MLX_ROWS | frozenset({1, 2}),
+    ("applegpu_g15d", 2560, 640): _DECODE_MLX_ROWS | frozenset({3, 4, 6, 8}),
+}
+
+
+def _decode_mlx_rows(architecture: str | None, n: int, k: int) -> frozenset[int]:
+    """The decode row counts a stock layer of this (n, k) runs on MLX's qmv."""
+    return _DECODE_MLX_CELLS.get((architecture, n, k), _DECODE_MLX_ROWS)
+
+
 # Outside the rows kernel a switch layer decodes its whole stack at once for
 # a call of at least _AT_ONCE_PAIRS pairs per matrix (where that is measured
 # faster than pieces) when the stack is within _DECODE_AT_ONCE_BYTES (in the
@@ -304,28 +325,6 @@ def _ordinary_tile(layer, k, n, route, build_kernel):
         f"quant format face {face.key}: {route} kernel failed; rows kernel fallback",
     )
     return _Tile(face, kernel, operands, proof, said)
-
-
-def _decode_pair(layer, plan):
-    tile = formats.tile(layer, plan.k, plan.n)
-    if tile is None or kernels.table_bytes(plan.face, tile) > formats.TABLE_BYTES:
-        return None
-    names, kernel = tile_wide.pair_kernel(plan.face, tile, packed_name(layer))
-    # These weight buffers are fixed until a layer write retires the plan.
-    operands = tuple(mx.contiguous(layer[name]) for name in names)
-    proof = kernels.proof(
-        "format_linear_decode_pair",
-        plan.face,
-        tile,
-        tuple(a.dtype for a in operands),
-        plan.k,
-        plan.n,
-    )
-    said = (
-        f"quant format face {tile.key}: two-request decode kernel engaged",
-        f"quant format face {tile.key}: two-request decode kernel failed",
-    )
-    return _Tile(tile, kernel, operands, proof, said)
 
 
 @cache
@@ -648,13 +647,13 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
     ):
         return None
     codes = tensors.get(fmt.codes_name)
-    if codes is not None and codes.ndim >= 2 and (
-        codes.shape[-2] < 8 or codes.shape[-2] % 8
+    if (
+        codes is not None
+        and codes.ndim >= 2
+        and (codes.shape[-2] < 8 or codes.shape[-2] % 8)
     ):
         return None
-    stored = tuple(
-        name for name, (_, dtype) in (layout or {}).items() if dtype is None
-    )
+    stored = tuple(name for name, (_, dtype) in (layout or {}).items() if dtype is None)
     probes = (
         (
             {
@@ -681,9 +680,7 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
         plan = _plan(stand_in)
         if plan is None:
             continue
-        dtypes = tuple(
-            dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype)
-        )
+        dtypes = tuple(dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype))
         if not dtypes:
             continue
         n = plan.n
@@ -919,12 +916,14 @@ class _Kept:
         "dense",
         "dense_fast",
         "sorted",
+        "mlx_rows",
     )
 
-    def __init__(self, plan, bias, weight):
+    def __init__(self, plan, bias, weight, mlx_rows=frozenset()):
         self.plan = plan
         self.bias = bias
         self.weight = weight
+        self.mlx_rows = mlx_rows
         self.routes = {}
         self.wide = _UNBUILT
         self.dense = _UNBUILT
@@ -1248,7 +1247,18 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        kept = self.__dict__[_KEPT] = _Kept(_plan(self), bias, self[packed_name(self)])
+        kept = self.__dict__[_KEPT] = _Kept(
+            _plan(self),
+            bias,
+            self[packed_name(self)],
+            (
+                _decode_mlx_rows(
+                    _metal_architecture(), self.output_dims, self.input_dims
+                )
+                if self._stock and not self._STACK
+                else frozenset()
+            ),
+        )
         return kept
 
     def _dense_tile(self, kept: _Kept) -> tile_dense.DensePlan | None:
@@ -1456,57 +1466,10 @@ class FormatLinear(_FormatLayer):
         geometry = (plan.n, plan.k, self.group_size, architecture)
         folded = traversal(rows, *geometry, bits=self.bits)
         if folded[0] not in ("rows", "wide"):
-            if (
-                folded[0] in ("qmm", "split_k")
-                and rows <= MAX_ROWS
-                and (x.ndim < 3 or rows == x.shape[-2])
-            ):
-                return self._prefill(kept, x, rows)
+            if folded[0] in ("qmm", "split_k") and rows <= MAX_ROWS:
+                return self._prefill(kept, x, rows, armed=False)
             return None
-        if (
-            signature[0][:-1] == (2, 1)
-            and folded[0] == "wide"
-            and plan.n % 8 == 0
-            and plan.face.exact_for(x.dtype)
-        ):
-            routes = kept.routes
-            if "decode_pair" not in routes:
-                routes["decode_pair"] = _decode_pair(self, plan)
-            pair = routes["decode_pair"]
-            if pair is not None:
-                graph = pair.proof.graphs.get(signature)
-                if graph is not None:
-                    self._register_fast(kept, pair, signature)
-                    return graph(x, *pair.operands)
-                y = _launch(
-                    pair, signature, tile_wide.describe, tile_wide.pair_stand_in, x
-                )
-                if y is not None:
-                    self._register_fast(kept, pair, signature)
-                    return y
-        single = x.ndim < 3 or rows == x.shape[-2]
-        route_sig = signature if single else ("batched", *signature)
-        batched = None
-        if not single:
-            # MLX folds the leading axes if the input is row-contiguous or it
-            # must copy each matrix. A gap between intact matrices keeps M per
-            # matrix instead. The same trace can receive either physical
-            # layout. A per-matrix route with no face returns the composed
-            # path for the whole call, so the folded launch would be wasted.
-            batched = traversal(x.shape[-2], *geometry, bits=self.bits, batched=True)
-            if batched[0] not in ("rows", "wide"):
-                return None
-        result = self._project_route(kept, x, route_sig, folded)
-        if result is None or single:
-            return result
-        if batched == folded:
-            return result
-        separate = self._project_route(kept, x, route_sig, batched)
-        if separate is None:
-            return None
-        from .tile_layout import per_matrix
-
-        return mx.where(per_matrix(x), separate, result)
+        return self._project_route(kept, x, signature, folded)
 
     def _project_route(self, kept, x, signature, choice):
         plan, routes = kept.plan, kept.routes
@@ -1529,11 +1492,10 @@ class FormatLinear(_FormatLayer):
             return None
         graph = tile.proof.graphs.get(signature)
         if graph is not None:
-            if len(signature) == 2:
-                self._register_fast(kept, tile, signature)
+            self._register_fast(kept, tile, signature)
             return graph(x, *tile.operands)
         y = _launch(tile, signature, tile_wide.describe, tile_wide.stand_in, x)
-        if y is not None and len(signature) == 2:
+        if y is not None:
             self._register_fast(kept, tile, signature)
         return y
 
@@ -1549,7 +1511,7 @@ class FormatLinear(_FormatLayer):
         if graph is None:
             return
         # Each plan binds its own operands and live proof. A layer can switch
-        # between a prefill's wide graph, dense graph and two-request decode.
+        # between a prefill's wide graph and dense graph.
         # Dense prefill keeps its own slot so declining an ordinary route never
         # allocates kept.routes.
         is_dense = tile is kept.dense
@@ -1581,13 +1543,15 @@ class FormatLinear(_FormatLayer):
         fast.__self__.register(signature)
         self.__dict__[_FAST] = fast
 
-    def _prefill(self, kept, x, rows):
+    def _prefill(self, kept, x, rows, *, armed: bool | None = None):
         """A dense call above MAX_ROWS over the format's tile face via the
         unified direct dense skeleton; None where the call decodes instead."""
         if x.dtype not in (mx.float16, mx.bfloat16):
             return None
-        row_exact = self._qwen_row_exact
-        if row_exact is not None and row_exact():
+        if armed is None:
+            row_exact = self._qwen_row_exact
+            armed = row_exact is not None and row_exact()
+        if armed:
             # Armed row-exact exactness: rows go serial, bitwise to decode.
             return None
         plan = kept.dense
@@ -1602,7 +1566,7 @@ class FormatLinear(_FormatLayer):
         if policy is not None and policy.backend == "rows":
             return self._ordinary_rows(kept, x)
         y = tile_dense.project(plan, x)
-        if y is not None and (x.ndim < 3 or rows == x.shape[-2]):
+        if y is not None:
             self._register_fast(
                 kept, plan, (x.shape, x.dtype), proof_state=plan.binding.state
             )
@@ -1621,18 +1585,28 @@ class FormatLinear(_FormatLayer):
         plan, bias = kept.plan, kept.bias
         row_exact = self._qwen_row_exact
         if row_exact is not None and plan is not None:
-            if kept.wide is not _UNBUILT and not row_exact():
-                wide = kept.wide
-                graph = wide.proof.graphs.get((shape, dtype))
-                if graph is not None:
-                    if fast is not None:
-                        self._register_fast(kept, wide, (shape, dtype))
-                    y = graph(x, *wide.operands)
+            armed = row_exact()
+            if not armed:
+                if (
+                    x.ndim == 3
+                    and shape[-1] == plan.k
+                    and x.size // plan.k in kept.mlx_rows
+                ):
+                    # DATA (C7 receipts): this bucket is MLX's own qmv's.
+                    y = self._stock_matmul(x)
                     return y if bias is None else y + bias
+                if kept.wide is not _UNBUILT:
+                    wide = kept.wide
+                    graph = wide.proof.graphs.get((shape, dtype))
+                    if graph is not None:
+                        if fast is not None:
+                            self._register_fast(kept, wide, (shape, dtype))
+                        y = graph(x, *wide.operands)
+                        return y if bias is None else y + bias
             if not shape or shape[-1] != plan.k:
                 raise ValueError(f"x is (..., {plan.k}), not of shape {shape}")
             if x.size > plan.k:
-                if row_exact():
+                if armed:
                     if x.size > MAX_ROWS * plan.k:
                         y = _exact_rows(plan, x)
                         if y is not None:
@@ -1641,6 +1615,8 @@ class FormatLinear(_FormatLayer):
                     y = self._ordinary(kept, x, (shape, dtype))
                     if y is not None:
                         return y if bias is None else y + bias
+        else:
+            armed = row_exact is not None and row_exact()
         # A decode step is this, its kept graph's replay and the bias.
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
@@ -1656,15 +1632,14 @@ class FormatLinear(_FormatLayer):
             # No row materializes a matrix, stock or plugin.
             if y is None and rows == 0:
                 y = mx.zeros((*shape[:-1], self.output_dims), dtype=dtype)
-            exact = row_exact is not None and row_exact()
-            if y is None and rows > 0 and self._stock and (rows <= MAX_ROWS or exact):
+            if y is None and rows > 0 and self._stock and (rows <= MAX_ROWS or armed):
                 # A short call whose matrix has no plan (qmv_quad's K 64 or
                 # 128, too few scales for a face) keeps MLX's own matmul, as
                 # it ran before the switch; an armed verification step takes
                 # it a row at a time (at any row count, as row_exact_qmv
                 # does), never the dense tile or decoded fallback. Unarmed
                 # calls above MAX_ROWS go to the format's dense route below.
-                if exact and rows > 1:
+                if armed and rows > 1:
                     flat = x.reshape(rows, k)
                     first = self._stock_matmul(flat[:1])
                     if first is not None:
@@ -1680,11 +1655,11 @@ class FormatLinear(_FormatLayer):
                         )
                 else:
                     y = self._stock_matmul(x)
-            if y is None and rows > MAX_ROWS and not exact:
-                y = self._prefill(kept, x, rows)
+            if y is None and rows > MAX_ROWS and not armed:
+                y = self._prefill(kept, x, rows, armed=False)
             if y is None:
                 decoded = self._decoded().astype(dtype).T
-                if exact and rows > 1:
+                if armed and rows > 1:
                     flat = x.reshape(rows, k)
                     y = mx.concatenate(
                         [flat[r : r + 1] @ decoded for r in range(rows)],
@@ -1732,9 +1707,7 @@ class FormatEmbedding(_FormatLayer):
         # promise through the rows rule (its layout with N first). Checked
         # after the tensor validation above, so a missing or 1-D codes
         # tensor is the ValueError it is for every format layer.
-        if not formats.stackable(
-            fmt, input_dims, self.output_dims, bits, group_size
-        ):
+        if not formats.stackable(fmt, input_dims, self.output_dims, bits, group_size):
             raise ValueError(
                 f"quant format {fmt.mode!r} cannot hold a token embedding: its "
                 f"rows are not independent, so a lookup could not decode the "

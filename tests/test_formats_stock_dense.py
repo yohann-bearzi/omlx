@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from omlx import formats
-from omlx.formats import dot, kernels, linear, testing, tile
+from omlx.formats import kernels, linear, testing, tile
 from omlx.formats.affine import AffineFormat
 from omlx.formats.linear import FormatLinear
 from omlx.patches.format_load import loading
@@ -293,44 +293,33 @@ def _gapped_rows(rows, k, key, *, matrices=2):
 
 
 @pytest.mark.parametrize("mode", ["stock", "affine_plugin", "plugin"])
-def test_gapped_single_row_matrices_use_each_formats_dot(
+def test_gapped_single_row_matrices_fold_to_the_dense_route(
     mode, build_layer, monkeypatch
 ):
     k, n = 2560, 48
     layer, packed, key = _equivalent_layer(mode, build_layer, n, k)
-    # Three matrices exercise the general layout selection beyond DecodePair.
+    # MLX rounds each gapped singleton matrix on its own; the single folded
+    # route (rule 33) keeps the dense rounding and reorders inside the bar,
+    # so the same data must answer alike in either layout.
     gapped = _gapped_rows(1, k, key, matrices=3)
     dense = mx.contiguous(gapped)
-    face = dot(layer, k, n)
-    operands = [layer[name] for name in (formats.tensor_names(layer)[0], *face.tensors)]
-    singles = mx.stack([testing.dot_rows(face, operands, x[0], n) for x in gapped])
-    singles = singles[:, None, :]
-    stock = _stock(gapped, packed, 8)
-    stock_singles = mx.stack([_stock(x, packed, 8) for x in gapped])
-    np.testing.assert_array_equal(stock_singles.view(mx.uint16), stock.view(mx.uint16))
     folded = _stock(dense, packed, 8)
+    stock = _stock(gapped, packed, 8)
     assert not mx.array_equal(stock.view(mx.uint16), folded.view(mx.uint16)).item()
-    # Only the centered-byte plugin multiplies x by (q - 128) in its Dot.
-    # The affine Dot accumulates q*x and applies the bias separately.
-    if mode == "plugin":
-        assert not mx.array_equal(singles.view(mx.uint16), stock.view(mx.uint16)).item()
-    else:
-        np.testing.assert_array_equal(singles.view(mx.uint16), stock.view(mx.uint16))
-    _compare(layer, packed, dense, monkeypatch)
-    _compare(layer, packed, gapped, monkeypatch, expected=singles)
+    got = _compare(layer, packed, dense, monkeypatch)
+    _compare(layer, packed, gapped, monkeypatch, expected=got)
     _compare(layer, packed, dense, monkeypatch)
 
 
 @pytest.mark.parametrize("mode", ["stock", "plugin"])
-def test_batched_format_calls_keep_the_stock_traversal_on_warm_views(
-    mode, build_layer, monkeypatch
-):
+def test_batched_format_calls_fold_to_the_dense_route(mode, build_layer, monkeypatch):
     rows, k, n = 5, 2560, 48
     layer, packed, key = _equivalent_layer(mode, build_layer, n, k)
     gapped = _gapped_rows(rows, k, key)
     dense = mx.contiguous(gapped)
-    for x in (dense, gapped, dense):
-        _compare(layer, packed, x, monkeypatch)
+    got = _compare(layer, packed, dense, monkeypatch)
+    _compare(layer, packed, gapped, monkeypatch, expected=got)
+    _compare(layer, packed, dense, monkeypatch)
 
 
 @pytest.mark.parametrize("mode", ["stock", "plugin"])
@@ -503,39 +492,33 @@ def test_native_last_wide_replay_misses_on_shape_or_dtype_change():
 
 @pytest.mark.parametrize("mode", ["stock", "plugin"])
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
-def test_ordinary_two_request_decode_replays_one_graph_for_live_layouts(
+def test_two_request_decode_folds_one_graph_for_live_layouts(
     mode, dtype, build_layer, monkeypatch
 ):
     from omlx.custom_kernels.quant_matmul import fast as native
 
     if not native.has_symbol("FormatLinearFast"):
         pytest.skip("requires the native warm dispatcher")
-    k, n = 2560, 512
+    k, n = 2560, 256
     layer, packed, key = _equivalent_layer(mode, build_layer, n, k, dtype=dtype)
     if mode == "stock":
         assert layer.scales is packed[1] and layer.biases is packed[2]
+    # MLX rounds each gapped singleton matrix on its own; the fold answers
+    # every layout with the dense rounding (rule 33). The folded 2-D call
+    # registers the native warm dispatcher, so later calls replay it.
     gapped = mx.repeat(_gapped_rows(1, k, key).astype(dtype), 2, axis=0)[::2]
     dense = mx.contiguous(gapped)
     folded = _stock(dense, packed, 8)
-    separate = mx.stack([layer(row) for row in gapped])
-    assert not mx.array_equal(folded.view(mx.uint16), separate.view(mx.uint16)).item()
     _compare(layer, packed, dense, monkeypatch, expected=folded)
-    assert layer._fast is not None, "two-request layout has no native replay"
+    assert layer._fast is not None, "folded call registered no native replay"
 
     broadcast = mx.broadcast_to(gapped[:1], gapped.shape)
     column = mx.repeat(dense, 2, axis=-1)[..., ::2]
-    layouts = [(dense, folded), (gapped, separate), (dense, folded)]
-    for x in (broadcast, column):
-        # Stock copies these layouts before folding the two singleton matrices.
-        stock = _stock(x, packed, 8)
-        contiguous = _stock(mx.contiguous(x), packed, 8)
-        singletons = mx.stack([_stock(row, packed, 8) for row in x])
-        np.testing.assert_array_equal(stock.view(mx.uint16), contiguous.view(mx.uint16))
-        assert not mx.array_equal(
-            stock.view(mx.uint16), singletons.view(mx.uint16)
-        ).item()
-        layouts.append((x, stock))
-
+    folded_broadcast = _stock(
+        mx.contiguous(broadcast.reshape(2, k)), packed, 8
+    ).reshape(2, 1, n)
+    layouts = [(dense, folded), (gapped, folded), (broadcast, folded_broadcast)]
+    layouts.append((column, folded))
     for x, expected in layouts:
         got = layer._fast(layer, x)
         assert got is not None, "two-request layout missed native replay"
@@ -547,23 +530,31 @@ def test_ordinary_two_request_decode_replays_one_graph_for_live_layouts(
         )
 
     ordinary = dense.reshape(2, k)
-    for x, expected in (
-        (ordinary, folded[:, 0]),
-        (gapped, separate),
-        (ordinary, folded[:, 0]),
-    ):
-        _compare(layer, packed, x, monkeypatch, expected=expected)
+    for x in (ordinary, ordinary):
+        _compare(layer, packed, x, monkeypatch, expected=folded[:, 0])
         native_y = layer._fast(layer, x)
         assert native_y is not None, "warm call kept a different plan's dispatcher"
         np.testing.assert_array_equal(
-            native_y.view(mx.uint16), expected.view(mx.uint16)
+            native_y.view(mx.uint16), folded[:, 0].view(mx.uint16)
         )
+    separate = mx.stack([layer(row) for row in dense])
+    assert not mx.array_equal(folded.view(mx.uint16), separate.view(mx.uint16)).item()
     set_verify_qmm_armed(True, row_exact=True)
     try:
         assert layer._fast(layer, dense) is None
         _compare(layer, packed, dense, monkeypatch, expected=separate)
     finally:
         set_verify_qmm_armed(False)
+
+
+def test_planned_plugin_3d_5row_does_not_take_stock_matmul(build_layer, monkeypatch):
+    """Only stock layers divert to _stock_matmul on losing decode buckets; a
+    planned plugin layer stays on its format route."""
+    layer, packed, key = _equivalent_layer("plugin", build_layer, 160, 2560)
+    assert not layer._stock
+    assert layer._qwen_row_exact is not None
+    x = mx.random.normal((5, 1, 2560), key=key).astype(mx.float16)
+    _compare(layer, packed, x, monkeypatch)
 
 
 @pytest.mark.parametrize("change", ["replace", "union", "placeholder"])
@@ -595,8 +586,7 @@ def test_writer_mutation_retires_native_replay(change, build_layer, tmp_path):
 @pytest.mark.parametrize(
     "k,group", [(192, 128), (320, 128), (2560, 4096), (2560, 1 << 30)]
 )
-@pytest.mark.parametrize("pair", [False, True])
-def test_wide_reads_the_partial_final_tile_group(k, group, pair, build_layer):
+def test_wide_reads_the_partial_final_tile_group(k, group, build_layer):
     from tests.test_formats_kernels import _toy
     from tests.test_formats_tile_prefill import _TILE, _tile_toy, _ToyFormat
 
@@ -613,14 +603,11 @@ def test_wide_reads_the_partial_final_tile_group(k, group, pair, build_layer):
     x[:, 0] = mx.array([3, 4])
     x[:, -1] = mx.array([5, -2])
     expected = mx.array([[8], [2]], mx.float16) * (weights.astype(mx.float16) - 128)
-    if pair:
-        x = x[:, None, :]
-        expected = expected[:, None, :]
     for _ in range(2):
         np.testing.assert_array_equal(
             layer(x).view(mx.uint16), expected.view(mx.uint16)
         )
-    tag = "format_linear_decode_pair" if pair else "format_linear_wide"
+    tag = "format_linear_wide"
     assert any(
         key[0] == tag and face in key and proof.ran
         for key, proof in kernels._PROOFS.items()
@@ -643,19 +630,6 @@ def test_unrecognized_metal_architecture_uses_existing_format_path(
     monkeypatch.setattr(linear, "_ordinary_tile", forbidden)
     x = mx.random.normal((2, 2560), key=key).astype(mx.float16)
     np.testing.assert_array_equal(qwen(x).view(mx.uint16), other(x).view(mx.uint16))
-
-
-def test_decode_pair_leaves_partial_output_pack_to_wide(build_layer, monkeypatch):
-    from omlx.formats import linear
-
-    layer, packed, key = _equivalent_layer("stock", build_layer, 13, 2560)
-    x = mx.random.normal((2, 1, 2560), key=key).astype(mx.float16)
-
-    def refuse_pair(*args):
-        pytest.fail("two-request Dot requires complete output packs")
-
-    monkeypatch.setattr(linear, "_decode_pair", refuse_pair)
-    _compare(layer, packed, x, monkeypatch)
 
 
 def test_native_graph_adds_the_loaded_bias(build_layer):
@@ -688,23 +662,6 @@ def test_nested_qwen_text_config_selects_ordinary_traversal(tmp_path, monkeypatc
     with testing.verified("wrapper", "qwen4_exp"), loading(tmp_path):
         layer = FormatLinear("affine", 4, 64, 2560, arrays)
     assert layer._qwen_row_exact is not None
-
-
-def test_decode_pair_counts_both_faces_tables(build_layer):
-    from dataclasses import replace
-
-    from omlx.formats import Table, linear
-
-    layer, _, _ = _equivalent_layer("plugin", build_layer, 16, 2560)
-    layer.fmt.dot_face = replace(
-        layer.fmt.dot_face, tables=(Table("dot_lut", mx.float32, (0.0,) * 1024),)
-    )
-    layer.fmt.tile_face = replace(
-        layer.fmt.tile_face, tables=(Table("tile_lut", mx.uint8, (1,)),)
-    )
-    plan = linear._plan(layer)
-    assert kernels.table_bytes(plan.face, layer.fmt.tile_face) == 4097
-    assert linear._decode_pair(layer, plan) is None
 
 
 def test_native_replay_tracks_worker_replacement_and_eviction():
@@ -766,57 +723,6 @@ def test_wide_masks_the_last_input_group_and_output_pack():
         init_value=-31,
     )
     np.testing.assert_array_equal(np.asarray(got), [k] * n + [-31] * (16 - n))
-
-
-def test_decode_pair_binds_strided_static_operands_once(build_layer, monkeypatch):
-    from omlx.formats import linear
-
-    n, k = 16, 2560
-    _, packed, key = _projection(build_layer, n, k, 8, mx.float16)
-    strided = tuple(mx.repeat(a, 2, axis=-1)[..., ::2] for a in packed)
-    names = ("weight", "scales", "biases")
-    layer = build_layer("affine", 8, 64, k, dict(zip(names, strided)))
-    x = mx.random.normal((2, 1, k), key=key).astype(mx.float16)
-    want = _stock(x, packed, 8)
-    mx.eval(want)
-    contiguous = mx.contiguous
-    seen = []
-
-    def observe(array, *args, **kwargs):
-        for name in names:
-            if array is layer[name]:
-                seen.append(name)
-        return contiguous(array, *args, **kwargs)
-
-    monkeypatch.setattr(mx, "contiguous", observe)
-    for _ in range(2):
-        np.testing.assert_array_equal(layer(x).view(mx.uint16), want.view(mx.uint16))
-    assert sorted(seen) == sorted(names), "bind each strided operand exactly once"
-    kept = vars(layer)[linear._KEPT]
-    assert kept.routes["decode_pair"] is not None
-    assert layer._fast is not None
-
-    replacement = mx.zeros_like(strided[1])
-    layer["scales"] = replacement
-    want = _stock(x, (packed[0], replacement, packed[2]), 8)
-    for _ in range(2):
-        np.testing.assert_array_equal(layer(x).view(mx.uint16), want.view(mx.uint16))
-    assert sorted(seen) == sorted(2 * names)
-
-
-def test_decode_pair_first_binds_inside_a_compiled_layer_call(build_layer):
-    n, k = 16, 2560
-    layer, packed, key = _projection(build_layer, n, k, 8, mx.float16)
-    x = mx.random.normal((2, 1, k), key=key).astype(mx.float16)
-    step = mx.compile(lambda value: layer(value), inputs=layer.state)
-    want = _stock(x, packed, 8)
-    for call in (step, layer, step):
-        np.testing.assert_array_equal(call(x).view(mx.uint16), want.view(mx.uint16))
-    replacement = mx.zeros_like(packed[2])
-    layer["biases"] = replacement
-    want = _stock(x, (packed[0], packed[1], replacement), 8)
-    for call in (step, layer):
-        np.testing.assert_array_equal(call(x).view(mx.uint16), want.view(mx.uint16))
 
 
 def test_planless_stock_affine_row_exact_matches_serial_decode(

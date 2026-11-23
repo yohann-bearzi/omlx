@@ -142,16 +142,6 @@ def test_tensor_names_docstring_does_not_claim_mlx_layers_have_no_face():
     assert "run no format's face" not in (formats.tensor_names.__doc__ or "")
 
 
-def test_the_packed_name_of_a_pair_kernel_is_weight_by_default():
-    """``tile_wide.pair_kernel`` names its packed input ``weight`` unless a
-    caller passes the format's codes name: the default is MLX's."""
-    from omlx.formats import tile_wide
-
-    face = _toy("pair_default")
-    names, _ = tile_wide.pair_kernel(face, face)
-    assert names[0] == "weight"
-
-
 def test_rows_stack_docstring_names_codes_not_weight():
     doc = testing.rows_stack.__doc__ or ""
     assert "``weight``" not in doc
