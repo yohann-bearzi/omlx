@@ -12872,12 +12872,12 @@ class _OQRefineWriter:
         return (self.quant_fmt.codes_name, *self.quant_fmt.tensors)
 
     def is_format(self, base: str) -> bool:
-        if self.quant_fmt is None:
+        if self.quant_fmt is None or base in self.skip:
             return False
         entry = self.quantization.get(base)
-        if not isinstance(entry, dict) or entry.get("mode", "affine") == "affine":
+        if not isinstance(entry, dict) or entry.get("mode") != self.quant_fmt.mode:
             return False
-        return any(f"{base}.{part}" in self.weight_map for part in self._parts())
+        return all(f"{base}.{part}" in self.weight_map for part in self._parts())
 
     def spec(self, base: str) -> tuple[int, int] | None:
         if base in self.skip:
@@ -13035,12 +13035,16 @@ def _refine_format_tensors(fmt, reader, name, w, tensors, hessian, bits, group_s
         dtype_ok = (
             got.dtype == dtype
             if dtype is not None
-            else mx.issubdtype(got.dtype, mx.floating)
+            else (
+                got.dtype == tensors[part].dtype
+                and mx.issubdtype(got.dtype, mx.floating)
+            )
         )
         if tuple(got.shape) != want or not dtype_ok:
+            expected = dtype if dtype is not None else tensors[part].dtype
             raise ValueError(
                 f"refine({name}).{part} is {got.shape} {got.dtype}, not "
-                f"{want} {dtype}"
+                f"{want} {expected}"
             )
     mx.eval(*refined.values())
     before = _format_hessian_error(reader, w, tensors, hessian, bits, group_size)

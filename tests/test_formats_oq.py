@@ -3797,6 +3797,7 @@ def test_refine_fail_closed_on_bad_return_and_keeps_regression(
     fmt = _RefiningCodec()
     monkeypatch.setitem(formats._FORMATS, "toy", fmt)
     original = _RefiningCodec.refine
+    original_hessian = oq._format_hessian_error
 
     def run(name):
         return _quantize(source, tmp_path / name, quant_format="toy")
@@ -3839,6 +3840,24 @@ def test_refine_fail_closed_on_bad_return_and_keeps_regression(
     assert refine["format_layers"]["refined"] == 0
     assert refine["format_layers"]["kept"] > 0
     set_refine(original)
+    for pair in ((float("inf"), 0.0), (1.0, float("-inf"))):
+        state = {"i": 0}
+
+        def nonfinite(reader, w, tensors, hessian, bits, group_size, _pair=pair, _state=state):
+            value = _pair[_state["i"] % 2]
+            _state["i"] += 1
+            return value
+
+        monkeypatch.setattr(oq, "_format_hessian_error", nonfinite)
+        output = tmp_path / f"nonfinite-{pair[0]}-{pair[1]}"
+        _quantize(source, output, quant_format="toy")
+        refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+        assert refine["format_layers"]["refined"] == 0
+        assert refine["format_layers"]["kept"] > 0
+    monkeypatch.setattr(oq, "_format_hessian_error", original_hessian)
+    monkeypatch.setattr(_RefiningCodec, "can_refine", lambda self, k, n, b, g: 1)
+    with pytest.raises(TypeError):
+        run("non-bool")
     monkeypatch.setattr(_RefiningCodec, "can_refine", lambda self, k, n, b, g: False)
     output = tmp_path / "declined"
     _quantize(source, output, quant_format="toy")
@@ -3946,7 +3965,11 @@ _DECODES = []
 
 
 class _ReadingCodec(_RefiningCodec):
-    """accept() hands back a reader of its own that records its decodes."""
+    """accept() hands back a reader of its own that records its decodes; the
+    format's own decode refuses, so only the reader can score the objective."""
+
+    def decode(self, tensors, bits, group_size):
+        raise AssertionError("refinement used writer.decode, not reader.decode")
 
     def accept(self, record):
         super().accept(record)
@@ -3985,7 +4008,7 @@ def test_refine_inplace_mutation_cannot_bypass_objective(source, tmp_path, monke
     monkeypatch.setitem(formats._FORMATS, "toy", fmt)
 
     def mutate(self, w, tensors, hessian, bits, group_size):
-        tensors["codes"] = tensors["codes"] + 1
+        tensors["codes"][:] = tensors["codes"] + 1
         return tensors
 
     monkeypatch.setattr(_RefiningCodec, "refine", mutate)
@@ -4037,6 +4060,75 @@ def test_format_hessian_error_shared_2d_hessian(toy):
         for e in range(3)
     )
     assert abs(shared - loop) < 1e-5
+
+
+def test_refine_switch_rejects_none_dtype_chunk_mismatch(
+    source, tmp_path, monkeypatch
+):
+    """A None-dtype side tensor keeps the encoded dtype across expert chunks;
+    a refined chunk that changes it raises instead of upcasting the stack."""
+
+    class NoneDtype(_RefiningCodec):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def layout(self, k, n, bits, group_size):
+            if n == 128:
+                return None
+            return {
+                "codes": ((n, k), mx.uint8),
+                "group_scales": ((n,), None),
+            }
+
+        def encode(self, w, importance, bits, group_size):
+            out = super().encode(w, importance, bits, group_size)
+            return {
+                **out,
+                "group_scales": out["group_scales"].astype(mx.float16),
+            }
+
+        def refine(self, w, tensors, hessian, bits, group_size):
+            if w.ndim != 3:
+                return None
+            self.calls += 1
+            if self.calls == 1:
+                return {
+                    **tensors,
+                    "group_scales": tensors["group_scales"].astype(mx.float32),
+                }
+            return None
+
+    fmt = NoneDtype()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    monkeypatch.setattr(oq, "_OQE_REFINE_EXPERT_BYTES", 1)
+    with pytest.raises(ValueError):
+        _quantize(source, tmp_path / "none-chunk", quant_format="toy")
+    assert fmt.calls == 1
+
+
+def test_refine_writer_is_format_requires_exact_mode_and_all_parts(tmp_path, toy):
+    output = tmp_path / "out"
+    output.mkdir()
+    weight_map = {"layers.0.a.group_scales": "s.safetensors"}
+    other = {"layers.0.a": {"mode": "nvfp4", "bits": 4, "group_size": 16}}
+    writer = oq._OQRefineWriter(output, weight_map, other, quant_fmt=toy)
+    assert not writer.is_format("layers.0.a")
+    assert writer.spec("layers.0.a") is None
+    own = {"layers.0.a": {"mode": "toy", "bits": 8, "group_size": 1}}
+    writer = oq._OQRefineWriter(output, weight_map, own, quant_fmt=toy)
+    assert not writer.is_format("layers.0.a")  # codes_name missing
+    weight_map["layers.0.a.codes"] = "s.safetensors"
+    writer = oq._OQRefineWriter(output, weight_map, own, quant_fmt=toy)
+    assert writer.is_format("layers.0.a")
+    other_full = oq._OQRefineWriter(output, weight_map, other, quant_fmt=toy)
+    assert not other_full.is_format("layers.0.a")
+    assert other_full.spec("layers.0.a") is None
+    skipped = oq._OQRefineWriter(
+        output, weight_map, own, frozenset({"layers.0.a"}), quant_fmt=toy
+    )
+    assert not skipped.is_format("layers.0.a")
+    assert skipped.last_layer == {}
 
 
 def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
