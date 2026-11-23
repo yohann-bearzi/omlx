@@ -29,7 +29,12 @@ def _append_package_path(package: Any, path: Path) -> None:
 
 
 def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
-    """Expose ``mlx_vlm.models.qwen4_exp`` from oMLX's vendor tree."""
+    """Expose ``mlx_vlm.models.qwen4_exp`` from oMLX's vendor tree.
+
+    False only when mlx-vlm itself is not installed (a non-VLM environment
+    has nothing to patch); every other failure propagates, so a qwen4_exp
+    load can never continue on a half-applied patch.
+    """
     global _APPLIED
     with _LOCK:
         if _APPLIED:
@@ -68,26 +73,29 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
         try:
             import mlx_vlm
             import mlx_vlm.models
-
-            _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
-            _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
-            importlib.import_module("mlx_vlm.models.qwen4_exp")
-            from mlx_vlm.models.qwen3_5 import language as qwen35_language
-
-            from ..mlx_vlm_mtp import (
-                qwen35_verify_attention,
-                qwen35_verify_linear,
-            )
-
-            # Reuse the shared primitives without replacing Qwen4's HC trunk.
-            qwen35_verify_linear.apply()
-            qwen35_verify_attention.apply(qwen35_language)
-            _patch_prompt_utils()
-            _patch_prompt_loop()
-            _patch_model_file_bypass()
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("Qwen4-Exp mlx-vlm registration failed: %s", exc)
+        except ImportError:
+            logger.debug("mlx-vlm is not installed; the qwen4_exp patch is skipped")
             return False
+
+        # From here every failure propagates: the vendor import already
+        # registers the family module, so a load that went on would run a
+        # half-patched model. The engine turns the error into PreLoadPatchError.
+        _append_package_path(mlx_vlm, _VENDOR_MLX_VLM)
+        _append_package_path(mlx_vlm.models, _VENDOR_MLX_VLM / "models")
+        importlib.import_module("mlx_vlm.models.qwen4_exp")
+        from mlx_vlm.models.qwen3_5 import language as qwen35_language
+
+        from ..mlx_vlm_mtp import (
+            qwen35_verify_attention,
+            qwen35_verify_linear,
+        )
+
+        # Reuse the shared primitives without replacing Qwen4's HC trunk.
+        qwen35_verify_linear.apply()
+        qwen35_verify_attention.apply(qwen35_language)
+        _patch_prompt_utils()
+        _patch_prompt_loop()
+        _patch_model_file_bypass()
 
         _APPLIED = True
         logger.info("Qwen4-Exp mlx-vlm compatibility patch applied")

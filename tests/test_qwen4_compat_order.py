@@ -239,3 +239,33 @@ def test_apply_snapshots_sys_modules_and_serializes_threads(monkeypatch):
     assert not errors, errors
     assert import_calls == 1
     assert sorted(results) == [False, True]
+
+
+def test_configure_qwen4_exp_runtime_propagates_a_compat_failure(
+    monkeypatch, tmp_path
+):
+    """A failure after the vendor import propagates out of the configure
+    call; the engine wraps it into PreLoadPatchError, so a qwen4_exp load
+    never continues on a half-applied patch."""
+    import pytest
+
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    monkeypatch.setattr(compat, "_APPLIED", False)
+
+    def broken() -> None:
+        raise RuntimeError("bypass broken")
+
+    monkeypatch.setattr(compat, "_patch_model_file_bypass", broken)
+    with pytest.raises(RuntimeError, match="bypass broken"):
+        compat.configure_qwen4_exp_runtime(tmp_path)
+
+
+def test_apply_compat_returns_false_only_without_mlx_vlm(monkeypatch):
+    """A non-VLM environment has nothing to patch, so the apply call says so;
+    every other failure propagates (see above)."""
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    monkeypatch.setattr(compat, "_APPLIED", False)
+    monkeypatch.setitem(sys.modules, "mlx_vlm", None)
+    assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() is False
