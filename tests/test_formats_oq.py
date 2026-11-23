@@ -127,6 +127,62 @@ class _Codec(_ToyFormat):
         self.accepted.append(record)
 
 
+class _RefiningCodec(_Codec):
+    """The toy codec with a Hessian refinement: one pass of scalar
+    coordinate descent on its codes (the REF spec's toy delta)."""
+
+    def __init__(self):
+        super().__init__()
+        self.refined = []
+
+    def layout(self, k, n, bits, group_size):
+        if n == 128:
+            self.offered.append((k, n, bits, group_size))
+            return None
+        return super().layout(k, n, bits, group_size)
+
+    def can_refine(self, k, n, bits, group_size):
+        return n != 128
+
+    def refine(self, w, tensors, hessian, bits, group_size):
+        self.refined.append((w.shape, bits, group_size))
+        wf = np.asarray(w.astype(mx.float32))
+        hf = np.asarray(hessian.astype(mx.float32))
+        codes = np.asarray(tensors["codes"])
+        scales = np.asarray(tensors["group_scales"])
+        lead = wf.shape[:-2]
+        w2 = wf.reshape(-1, *wf.shape[-2:]).astype(np.float64)
+        c2 = codes.reshape(-1, *codes.shape[-2:])
+        s2 = scales.reshape(-1, scales.shape[-1])
+        if hf.ndim == 2:
+            hf = hf[None]
+        out = c2.astype(np.float64)
+        for e in range(w2.shape[0]):
+            target = w2[e]
+            scale = s2[e].astype(np.float64)
+            gram = hf[e].astype(np.float64)
+            cur = out[e]
+            decoded = (cur - 128.0) * scale[:, None]
+            grad = (decoded - target) @ gram
+            for r in range(decoded.shape[0]):
+                alpha = scale[r]
+                for j in range(decoded.shape[1]):
+                    den = float(gram[j, j])
+                    if den == 0.0:
+                        continue
+                    want = decoded[r, j] - grad[r, j] / den
+                    code = int(round(want / alpha)) + 128
+                    code = min(255, max(0, code))
+                    delta = (code - cur[r, j]) * alpha
+                    if delta == 0.0:
+                        continue
+                    cur[r, j] = code
+                    decoded[r, j] += delta
+                    grad[r, :] += delta * gram[j, :]
+        refined = out.reshape(codes.shape).astype(np.uint8) if lead else out[0].astype(np.uint8)
+        return {**tensors, "codes": mx.array(refined)}
+
+
 @pytest.fixture
 def toy(monkeypatch):
     """The toy codec, registered by hand."""
@@ -3692,6 +3748,295 @@ def test_oqh_and_a_quant_format_refuse_each_other_before_a_read(
             )
     assert list(tmp_path.iterdir()) == []
     assert toy.offered == [] and toy.encoded == [] and toy.accepted == []
+
+
+def test_refining_format_lowers_hessian_error_and_reloads(
+    source, plain, tmp_path, monkeypatch, caplog
+):
+    """A format whose refine() answers takes part in #5292: its layers are
+    refined, reported, and the checkpoint still loads and runs."""
+    caplog.set_level(logging.INFO, logger="omlx.oq")
+    fmt = _RefiningCodec()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    output = tmp_path / "oqe-toy-refined"
+    tensors, config, applied = _quantize(source, output, quant_format="toy")
+    entries = _in_format(config)
+    assert entries and fmt.refined
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["status"] == "done"
+    assert refine["format_layers"]["mode"] == "toy"
+    assert refine["format_layers"]["refined"] > 0
+    assert refine["format_layers"]["kept"] == 0
+    assert refine["format_layers"]["skipped"] == 0
+    assert refine["format_layers"]["hessian_error_reduction"] > 0
+    # A format layer's refined codes differ from its plain encode.
+    weights = mx.load(str(source / "model.safetensors"))
+    changed = 0
+    for name, entry in entries.items():
+        w = weights[f"{name.removeprefix('language_model.')}.weight"]
+        initial = _Codec().encode(w, None, entry["bits"], entry["group_size"])
+        ours = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
+        if not _same(ours, initial):
+            changed += 1
+    assert changed > 0
+    # The affine layers are the stock build's, refined alike.
+    _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
+    # The refined checkpoint loads and runs.
+    model, _ = load_model(output)
+    ids = mx.array([[1, 2, 3, 4, 5, 6, 7, 8]])
+    logits = model(ids)
+    mx.eval(logits)
+    assert mx.all(mx.isfinite(logits))
+
+
+def test_refine_fail_closed_on_bad_return_and_keeps_regression(
+    source, tmp_path, monkeypatch
+):
+    """A format's refine() answer is validated: malformed shapes/types raise,
+    None/non-finite/regressed answers keep the encoded tensors."""
+    fmt = _RefiningCodec()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    original = _RefiningCodec.refine
+
+    def run(name):
+        return _quantize(source, tmp_path / name, quant_format="toy")
+
+    def set_refine(fn):
+        monkeypatch.setattr(_RefiningCodec, "refine", fn)
+
+    set_refine(
+        lambda self, w, t, h, b, g: {
+            "codes": [1],
+            "group_scales": t["group_scales"],
+        }
+    )
+    with pytest.raises(TypeError):
+        run("bad-type")
+    set_refine(lambda self, w, t, h, b, g: {"codes": t["codes"]})
+    with pytest.raises(ValueError):
+        run("bad-keys")
+    set_refine(
+        lambda self, w, t, h, b, g: {**t, "codes": t["codes"][:, :-1]}
+    )
+    with pytest.raises(ValueError):
+        run("bad-shape")
+    set_refine(lambda self, w, t, h, b, g: None)
+    output = tmp_path / "none"
+    tensors, config, _ = _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["format_layers"]["refined"] == 0
+    assert refine["format_layers"]["kept"] > 0
+    weights = mx.load(str(source / "model.safetensors"))
+    for name, entry in _in_format(config).items():
+        w = weights[f"{name.removeprefix('language_model.')}.weight"]
+        initial = _Codec().encode(w, None, entry["bits"], entry["group_size"])
+        ours = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
+        assert _same(ours, initial)
+    set_refine(lambda self, w, t, h, b, g: {**t, "codes": t["codes"] + 1})
+    output = tmp_path / "regressed"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["format_layers"]["refined"] == 0
+    assert refine["format_layers"]["kept"] > 0
+    set_refine(original)
+    monkeypatch.setattr(_RefiningCodec, "can_refine", lambda self, k, n, b, g: False)
+    output = tmp_path / "declined"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    layers = refine["format_layers"]
+    assert layers["refined"] == 0 and layers["kept"] == 0
+    entries = _in_format(json.loads((output / "config.json").read_text()))
+    assert layers["skipped"] == len(entries)
+
+
+def test_refine_writer_flushes_format_only_shard_after_last_layer(tmp_path, toy):
+    """A shard holding only format tensors (no .scales!) flushes after the
+    last layer that owns one, and untouched tensors stay bit-identical."""
+    output = tmp_path / "out"
+    output.mkdir()
+    codes = mx.zeros((8, 64), mx.uint8)
+    scales = mx.ones((8,), mx.float32)
+    untouched = mx.arange(4, dtype=mx.float32).reshape(2, 2)
+    weights = {"z.weight": untouched}
+    for layer in (0, 1):
+        base = f"layers.{layer}.mlp.b"
+        weights[f"{base}.codes"] = codes
+        weights[f"{base}.group_scales"] = scales
+    shard = "model-00001.safetensors"
+    mx.save_safetensors(str(output / shard), weights)
+    weight_map = {name: shard for name in weights}
+    quantization = {
+        f"layers.{layer}.mlp.b": {"mode": "toy", "bits": 8, "group_size": 1}
+        for layer in (0, 1)
+    }
+    writer = oq._OQRefineWriter(output, weight_map, quantization, quant_fmt=toy)
+    assert writer.is_format("layers.0.mlp.b")
+    assert writer.spec("layers.0.mlp.b") == (8, 1)
+    writer.write(
+        "layers.0.mlp.b", {"codes": codes + 1, "group_scales": scales}
+    )
+    writer.write(
+        "layers.1.mlp.b", {"codes": codes + 2, "group_scales": scales}
+    )
+    writer.layer_done(0)
+    # Both layers own this shard: nothing is flushed until the last one.
+    before = mx.load(str(output / shard))
+    assert mx.array_equal(before["layers.0.mlp.b.codes"], codes)
+    writer.layer_done(1)
+    after = mx.load(str(output / shard))
+    assert mx.array_equal(after["layers.0.mlp.b.codes"], codes + 1)
+    assert mx.array_equal(after["layers.1.mlp.b.codes"], codes + 2)
+    assert mx.array_equal(after["z.weight"], untouched)
+
+
+def test_refining_format_streamed_matches_resident(source, tmp_path, monkeypatch):
+    """The streamed calibration walk refines a format's tensors bit-identically
+    to the resident one."""
+    fmt = _RefiningCodec()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    resident = tmp_path / "resident"
+    tensors, config, _ = _quantize(source, resident, quant_format="toy")
+    streamed = tmp_path / "streamed"
+    other, other_config, _ = _quantize(
+        source, streamed, quant_format="toy", stream_calibration=True
+    )
+    entries = _in_format(config)
+    for name in entries:
+        for part in ("codes", "group_scales"):
+            assert mx.array_equal(
+                tensors[f"{name}.{part}"], other[f"{name}.{part}"]
+            ), (name, part)
+
+
+def test_refine_accepts_none_dtype_side_tensor(source, tmp_path, monkeypatch):
+    """A layout that declares a side tensor's dtype None takes a floating
+    answer and refuses a non-floating one."""
+
+    class NoneDtype(_RefiningCodec):
+        def layout(self, k, n, bits, group_size):
+            if n == 128:
+                return None
+            return {
+                "codes": ((n, k), mx.uint8),
+                "group_scales": ((n,), None),
+            }
+
+        def refine(self, w, tensors, hessian, bits, group_size):
+            return dict(tensors)
+
+    fmt = NoneDtype()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    output = tmp_path / "none-dtype"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["format_layers"]["refined"] > 0
+
+    class IntDtype(NoneDtype):
+        def refine(self, w, tensors, hessian, bits, group_size):
+            return {**tensors, "group_scales": tensors["group_scales"].astype(
+                mx.int32
+            )}
+
+    monkeypatch.setitem(formats._FORMATS, "toy", IntDtype())
+    with pytest.raises(ValueError):
+        _quantize(source, tmp_path / "int-dtype", quant_format="toy")
+
+
+_DECODES = []
+
+
+class _ReadingCodec(_RefiningCodec):
+    """accept() hands back a reader of its own that records its decodes."""
+
+    def accept(self, record):
+        super().accept(record)
+        outer = self
+
+        class Reader(formats.QuantFormat):
+            mode = outer.mode
+            tensors = outer.tensors
+            codes_name = outer.codes_name
+            contract = outer.contract
+
+            def layout(self, k, n, bits, group_size):
+                return {
+                    "codes": ((n, k), mx.uint8),
+                    "group_scales": ((n,), mx.float32),
+                }
+
+            def decode(self, tensors, bits, group_size):
+                _DECODES.append(1)
+                codes = tensors["codes"].astype(mx.float32) - 128.0
+                return codes * mx.expand_dims(tensors["group_scales"], -1)
+
+        return Reader()
+
+
+def test_refine_uses_checkpoint_reader(source, tmp_path, monkeypatch):
+    fmt = _ReadingCodec()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+    _DECODES.clear()
+    _quantize(source, tmp_path / "reader", quant_format="toy")
+    assert _DECODES
+
+
+def test_refine_inplace_mutation_cannot_bypass_objective(source, tmp_path, monkeypatch):
+    fmt = _RefiningCodec()
+    monkeypatch.setitem(formats._FORMATS, "toy", fmt)
+
+    def mutate(self, w, tensors, hessian, bits, group_size):
+        tensors["codes"] = tensors["codes"] + 1
+        return tensors
+
+    monkeypatch.setattr(_RefiningCodec, "refine", mutate)
+    output = tmp_path / "inplace"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert refine["format_layers"]["refined"] == 0
+    assert refine["format_layers"]["kept"] > 0
+
+
+def test_can_refine_only_and_disabled_refine_keep_skip_note(source, tmp_path, monkeypatch):
+    class CanOnly(_Codec):
+        def layout(self, k, n, bits, group_size):
+            if n == 128:
+                return None
+            return super().layout(k, n, bits, group_size)
+
+        def can_refine(self, k, n, bits, group_size):
+            return True
+
+    assert not oq._format_supports_refinement(CanOnly())
+    monkeypatch.setitem(formats._FORMATS, "toy", CanOnly())
+    output = tmp_path / "can-only"
+    _quantize(source, output, quant_format="toy")
+    refine = json.loads((output / "oq_imatrix_report.json").read_text())["refine"]
+    assert "reason" in refine["format_layers"]
+    fmt = _RefiningCodec()
+    fmt.refine = None
+    assert not oq._format_supports_refinement(fmt)
+
+
+def test_quantize_docstring_names_format_refinement():
+    assert "re-picks affine codes only" not in oq.quantize_oq_streaming.__doc__
+
+
+def test_format_hessian_error_shared_2d_hessian(toy):
+    mx.random.seed(3)
+    w = mx.random.normal((3, 8, 8)).astype(mx.float32)
+    codes = mx.zeros((3, 8, 8), mx.uint8)
+    scales = mx.ones((3, 8), mx.float32)
+    tensors = {"codes": codes, "group_scales": scales}
+    gram = mx.array(np.diag(np.arange(1.0, 9.0)), dtype=mx.float32)
+    shared = oq._format_hessian_error(toy, w, tensors, gram, 8, 1)
+    loop = sum(
+        oq._format_hessian_error(toy, w[e : e + 1], {
+            "codes": codes[e : e + 1],
+            "group_scales": scales[e : e + 1],
+        }, gram, 8, 1)
+        for e in range(3)
+    )
+    assert abs(shared - loop) < 1e-5
 
 
 def test_a_format_build_refines_its_affine_layers_alone_and_says_so(

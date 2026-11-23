@@ -1918,6 +1918,6 @@ def test_quant_format_can_refine_detects_override_and_allows_narrowing():
 def test_quant_format_contract_docs_name_refine():
     page = (Path(__file__).resolve().parents[1] / "docs/quant-formats.md").read_text()
     assert "can_refine" in page and "refine" in page
-    assert "not wired yet" in page
+    assert "not wired yet" not in page and "format_layers" in page
     doc = " ".join(formats.QuantFormat.refine.__doc__.split())
-    assert "not wired yet" in doc
+    assert "not wired yet" not in doc

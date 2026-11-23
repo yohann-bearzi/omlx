@@ -86,8 +86,12 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
   shapes and dtypes. oQ keeps them only when their Hessian error
   `tr((W^- - W) H (W^- - W)^T)` does not exceed the encoded ones', and still
   verifies the written checkpoint. A format may narrow matrices by geometry
-  through `can_refine`. oQ's format-refinement pass is not wired yet; until
-  then oQ skips format layers.
+  through `can_refine`. oQ refines a format's layers when the format
+  overrides `refine` and `can_refine` admits their geometry; the report's
+  `refine.format_layers` then names the `mode`, how many tensors were
+  `refined`, `kept` (a `None`/non-finite/regressed answer) and `skipped`
+  (`can_refine` declined), and the `hessian_error_reduction`. A format with
+  the default `refine` keeps the older note: oQ skips its layers.
 - A mode has one format. A second format for a registered mode is refused.
 - A format states the revision of this page it is written for (`contract`). One that states none, or a revision this oMLX does not run, is refused. See [Versions](#versions).
 - oMLX's own formats (`BUILTIN`) register first, through the same `register`, so a plugin cannot replace one.

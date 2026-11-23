@@ -565,8 +565,9 @@ class QuantFormat:
         exactly :meth:`layout`'s names, shapes and dtypes; None leaves the
         encoded tensors. oQ keeps the refined tensors only when their Hessian
         error does not exceed the encoded ones', and skips a matrix whose
-        :meth:`can_refine` is false. oQ's format-refinement pass is not wired
-        yet; until then oQ skips format layers. The default declines."""
+        :meth:`can_refine` is false. oQ refines a format that overrides
+        ``refine`` and reports the result in ``refine.format_layers``; the
+        default declines."""
         return None
 
     def record(self) -> dict:

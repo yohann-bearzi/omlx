@@ -8973,10 +8973,12 @@ def quantize_oq_streaming(
             for is offered to the format, at the bits and group size oQ
             gives it, and is written as the format's tensors under the
             format's mode. What the format leaves, and every other tensor,
-            is written as without it. Requires enhanced. A format's layers
-            keep the format's encoding: the oQe code refinement (#5292) re-picks
-            affine codes only, and the build's oq_imatrix_report.json says how
-            many format layers it skipped.
+            is written as without it. Requires enhanced. The oQe code
+            refinement (#5292) runs on the format's layers too when the
+            format overrides refine and can_refine admits their geometry;
+            the build's oq_imatrix_report.json reports the refined, kept and
+            skipped format layers in refine.format_layers. A format with the
+            default refine keeps the format's encoding.
         hadamard: Build oQh: the decoder linears become rotated uniform codes
             with one scale per row (see omlx/oqh/format.py), quantized against
             their input Gram. The bytes the affine plan gives them buy the
@@ -9390,9 +9392,9 @@ def quantize_oq_streaming(
 
     if enhanced and upstream_writer is None and not hadamard:
         # oQe's code refinement (#5292), as upstream runs it on every oQe build.
-        # A quant format's layers are left as the format encoded them: the
-        # refinement re-picks affine codes against the affine scales, which a
-        # format layer has none of. Refining format layers is release-3.
+        # A format that overrides refine takes part, its layers refined
+        # against its own tensors; one with the default keeps its encoding.
+        refining = bool(format_bases) and _format_supports_refinement(quant_fmt)
         refine_report = _refine_oqe_output(
             source,
             output,
@@ -9403,21 +9405,48 @@ def quantize_oq_streaming(
             requires_proxy=_model_requires_proxy,
             trust_remote_code=trust_remote_code,
             progress_callback=cb,
-            skip=frozenset(format_bases),
+            skip=frozenset() if refining else frozenset(format_bases),
+            quant_fmt=quant_fmt if refining else None,
+            reader=reader if refining else None,
         )
         if format_bases and refine_report.get("status") == "done":
-            logger.info(
-                "oQe refine: %d layers in quant format %s skipped (format "
-                "layers keep their encoding)",
-                len(format_bases),
-                quant_fmt.mode,
-            )
-            refine_report["format_layers"] = {
-                "mode": quant_fmt.mode,
-                "skipped": len(format_bases),
-                "reason": "the refinement re-picks affine codes; format "
-                "layers keep the format's encoding",
-            }
+            if refining:
+                totals = refine_report.pop("format_totals", {})
+                refined = int(totals.get("refined", 0))
+                kept = int(totals.get("kept", 0))
+                before = float(totals.get("before", 0.0))
+                after = float(totals.get("after", 0.0))
+                gain = 1.0 - after / before if before > 0 else 0.0
+                refine_report["format_layers"] = {
+                    "mode": quant_fmt.mode,
+                    "refined": refined,
+                    "kept": kept,
+                    "skipped": len(format_bases) - refined - kept,
+                    "hessian_error_reduction": round(gain, 4),
+                }
+                logger.info(
+                    "oQe refine: %d format layers in quant format %s refined "
+                    "(%d kept, Hessian error -%.1f%%), %d skipped",
+                    refined,
+                    quant_fmt.mode,
+                    kept,
+                    100.0 * gain,
+                    len(format_bases) - refined - kept,
+                )
+            else:
+                refine_report.pop("format_totals", None)
+                logger.info(
+                    "oQe refine: %d layers in quant format %s skipped (format "
+                    "layers keep their encoding)",
+                    len(format_bases),
+                    quant_fmt.mode,
+                )
+                refine_report["format_layers"] = {
+                    "mode": quant_fmt.mode,
+                    "skipped": len(format_bases),
+                    "reason": "the refinement re-picks affine codes; format "
+                    "layers keep the format's encoding",
+                }
         if imatrix_report is not None:
             imatrix_report["refine"] = refine_report
 
@@ -12801,6 +12830,7 @@ class _OQRefineWriter:
     """Read affine tensors from the output shards and write refined ones back.
 
     A shard is rewritten after the last layer that owns a refinable tensor in it.
+    With ``quant_fmt``/``reader`` a shard's quant-format tensors refine too.
     """
 
     def __init__(
@@ -12809,6 +12839,9 @@ class _OQRefineWriter:
         weight_map: dict[str, str],
         quantization: dict,
         skip: frozenset = frozenset(),
+        *,
+        quant_fmt=None,
+        reader=None,
     ):
         self.output = output
         self.weight_map = weight_map
@@ -12816,20 +12849,42 @@ class _OQRefineWriter:
         # Layers left as written: a quant format's (their mode is never affine,
         # _open_oq_run refuses MLX's modes, but the writer names them).
         self.skip = skip
+        self.quant_fmt = quant_fmt
+        self.reader = quant_fmt if reader is None else reader
         self.pending: dict[str, dict[str, mx.array]] = {}
         self.last_layer: dict[str, int] = {}
         self._read_name: str | None = None
         self._read_tensors: dict[str, mx.array] = {}
         for key, shard in weight_map.items():
-            if not key.endswith(".scales") or self.spec(key[:-7]) is None:
+            base = key.rsplit(".", 1)[0]
+            if self.is_format(base):
+                if not any(key == f"{base}.{part}" for part in self._parts()):
+                    continue
+            elif not key.endswith(".scales") or self.spec(base) is None:
                 continue
-            layer = _extract_layer_index(key[:-7])
+            layer = _extract_layer_index(base)
             layer = layer if layer >= 0 else sys.maxsize
             self.last_layer[shard] = max(self.last_layer.get(shard, -1), layer)
+
+    def _parts(self) -> tuple[str, ...]:
+        if self.quant_fmt is None:
+            return ()
+        return (self.quant_fmt.codes_name, *self.quant_fmt.tensors)
+
+    def is_format(self, base: str) -> bool:
+        if self.quant_fmt is None:
+            return False
+        entry = self.quantization.get(base)
+        if not isinstance(entry, dict) or entry.get("mode", "affine") == "affine":
+            return False
+        return any(f"{base}.{part}" in self.weight_map for part in self._parts())
 
     def spec(self, base: str) -> tuple[int, int] | None:
         if base in self.skip:
             return None
+        if self.is_format(base):
+            entry = self.quantization[base]
+            return int(entry["bits"]), int(entry["group_size"])
         for part in ("weight", "biases"):
             if f"{base}.{part}" not in self.weight_map:
                 return None
@@ -12847,7 +12902,20 @@ class _OQRefineWriter:
         parts = ("weight", "scales", "biases")
         return tuple(self._read_tensors[f"{base}.{part}"] for part in parts)
 
+    def read_format(self, base: str) -> dict[str, mx.array]:
+        shard = self.weight_map[f"{base}.{self.quant_fmt.codes_name}"]
+        if self._read_name != shard:
+            self._read_tensors = mx.load(str(self.output / shard))
+            self._read_name = shard
+        return {part: self._read_tensors[f"{base}.{part}"] for part in self._parts()}
+
     def write(self, base: str, packed) -> None:
+        if isinstance(packed, dict):
+            shard = self.weight_map[f"{base}.{self.quant_fmt.codes_name}"]
+            pending = self.pending.setdefault(shard, {})
+            for part, tensor in packed.items():
+                pending[f"{base}.{part}"] = tensor
+            return
         shard = self.weight_map[f"{base}.weight"]
         self.pending.setdefault(shard, {})[f"{base}.weight"] = packed
 
@@ -12880,6 +12948,112 @@ class _OQRefineWriter:
         os.replace(tmp, path)
         del tensors, pending
         mx.clear_cache()
+
+
+def _format_supports_refinement(quant_fmt) -> bool:
+    """Whether a quant format takes part in oQe's #5292 code refinement."""
+    from . import formats
+
+    if quant_fmt is None:
+        return False
+    refine = getattr(quant_fmt, "refine", None)
+    return (
+        callable(refine)
+        and refine is not formats.QuantFormat.refine
+        and getattr(refine, "__func__", None) is not formats.QuantFormat.refine
+    )
+
+
+def _format_hessian_error(reader, w, tensors, hessian, bits, group_size) -> float:
+    """The shrunk-Gram objective of decoded ``tensors`` against ``w``.
+
+    Decodes whole matrices only (a plugin's side tensors may not slice along
+    rows): 3-D stacks are chunked on the expert axis, 2-D matrices on rows."""
+    wf = w.astype(mx.float32)
+    if wf.ndim == 2 and hessian.ndim == 3:
+        hessian = hessian[0]
+    if wf.ndim == 3:
+        e, n, k = wf.shape
+        chunk = max(1, _OQE_REFINE_CHUNK_ELEMS // (2 * n * k))
+        total = 0.0
+        for e0 in range(0, e, chunk):
+            e1 = min(e, e0 + chunk)
+            part = reader.decode(
+                {name: tensor[e0:e1] for name, tensor in tensors.items()},
+                bits,
+                group_size,
+            ).astype(mx.float32)
+            diff = part - wf[e0:e1]
+            grams = hessian[e0:e1] if hessian.ndim == 3 else hessian
+            total += float(mx.sum((diff @ grams) * diff))
+            del diff, part
+            mx.clear_cache()
+        return total
+    k = int(wf.shape[-1])
+    decoded = reader.decode(tensors, bits, group_size).astype(mx.float32)
+    rows = max(1, _OQE_REFINE_CHUNK_ELEMS // k)
+    total = 0.0
+    for r0 in range(0, wf.shape[0], rows):
+        r1 = min(wf.shape[0], r0 + rows)
+        diff = decoded[r0:r1] - wf[r0:r1]
+        total += float(mx.sum((diff @ hessian) * diff))
+        del diff
+    return total
+
+
+def _refine_format_tensors(fmt, reader, name, w, tensors, hessian, bits, group_size):
+    """A format's refine(...) for one tensor, validated fail-closed.
+
+    Returns (refined, before, after) when the answer fits the reader's layout
+    and does not raise the shrunk-Gram objective, else None (the encoded
+    tensors stand)."""
+    n, k = int(w.shape[-2]), int(w.shape[-1])
+    layout = reader.layout(k, n, bits, group_size)
+    if layout is None:
+        return None
+    experts = int(w.shape[0]) if w.ndim == 3 else None
+    if w.ndim == 2 and hessian.ndim == 3:
+        hessian = hessian[0]
+    refined = fmt.refine(
+        w, {part: mx.array(tensor) for part, tensor in tensors.items()},
+        hessian, bits, group_size,
+    )
+    if refined is None:
+        return None
+    if not isinstance(refined, dict) or any(
+        not isinstance(tensor, mx.array) for tensor in refined.values()
+    ):
+        raise TypeError(f"refine({name}) must return a dict of arrays or None")
+    if set(refined) != set(layout):
+        raise ValueError(
+            f"refine({name}) returned {sorted(refined)}, not its layout's "
+            f"{sorted(layout)}"
+        )
+    for part, (shape, dtype) in layout.items():
+        want = (experts, *shape) if experts is not None else tuple(shape)
+        got = refined[part]
+        dtype_ok = (
+            got.dtype == dtype
+            if dtype is not None
+            else mx.issubdtype(got.dtype, mx.floating)
+        )
+        if tuple(got.shape) != want or not dtype_ok:
+            raise ValueError(
+                f"refine({name}).{part} is {got.shape} {got.dtype}, not "
+                f"{want} {dtype}"
+            )
+    mx.eval(*refined.values())
+    before = _format_hessian_error(reader, w, tensors, hessian, bits, group_size)
+    after = _format_hessian_error(reader, w, refined, hessian, bits, group_size)
+    if not (math.isfinite(before) and math.isfinite(after) and after <= before):
+        logger.warning(
+            "oQe refine: %s kept its format encoding (objective %s -> %s)",
+            name,
+            before,
+            after,
+        )
+        return None
+    return refined, before, after
 
 
 def _load_oqe_refine_calibration(tokenizer, num_samples: int, seq_length: int):
@@ -12923,40 +13097,86 @@ def _token_rows(tokenizer, texts, seq_length: int):
     return mx.array(ids[:usable], dtype=mx.int32).reshape(-1, seq_length)
 
 
-def _refine_switch_codes(collector, owner, targets):
+def _refine_switch_codes(collector, owner, targets, writer):
+    """Refine every target of one routed expert stack, per expert chunk.
+
+    Affine targets re-pick their packed codes; format targets call their
+    format's refine on the chunk; a mixed owner shares the chunk's hessian."""
     n_exp, in_dim = int(targets[0][1].shape[0]), int(targets[0][1].shape[-1])
     out_dim = int(targets[0][1].shape[-2])
-    parts = [[] for _ in targets]
-    sums = [[0.0, 0.0, False] for _ in targets]
+    outputs = []
+    for target in targets:
+        if target[2] == "format":
+            outputs.append({part: [] for part in target[3]})
+        else:
+            outputs.append([])
+    sums = [[0.0, 0.0] for _ in targets]
+    changed = [False] * len(targets)
     for first, stop in collector.expert_ranges(owner, n_exp, in_dim, out_dim):
         hessian = _shrunk_gram(collector.switch_gram(owner, first, stop))
-        for i, (_, weight, packed, scales, biases, bits, gs) in enumerate(targets):
-            result = _refine_affine_codes(
-                weight[first:stop],
-                packed[first:stop],
-                scales[first:stop],
-                biases[first:stop],
-                hessian,
-                bits,
-                gs,
-            )
-            if result is None:
-                parts[i].append(packed[first:stop])
-                continue
-            parts[i].append(result[0])
+        for i, (name, weight, kind, payload, bits, gs) in enumerate(targets):
+            if kind == "affine":
+                packed, scales, biases = payload
+                result = _refine_affine_codes(
+                    weight[first:stop],
+                    packed[first:stop],
+                    scales[first:stop],
+                    biases[first:stop],
+                    hessian,
+                    bits,
+                    gs,
+                )
+                if result is None:
+                    outputs[i].append(packed[first:stop])
+                    continue
+                outputs[i].append(result[0])
+            else:
+                sub = {part: tensor[first:stop] for part, tensor in payload.items()}
+                result = _refine_format_tensors(
+                    writer.quant_fmt,
+                    writer.reader,
+                    name,
+                    weight[first:stop],
+                    sub,
+                    hessian,
+                    bits,
+                    gs,
+                )
+                if result is None:
+                    for part, tensor in sub.items():
+                        outputs[i][part].append(tensor)
+                    continue
+                for part, tensor in result[0].items():
+                    outputs[i][part].append(tensor)
             sums[i][0] += result[1]
             sums[i][1] += result[2]
-            sums[i][2] = True
+            changed[i] = True
         del hessian
         mx.clear_cache()
-    return [
-        (mx.concatenate(p, axis=0), before, after) if changed else None
-        for p, (before, after, changed) in zip(parts, sums)
-    ]
+    results = []
+    for i, (_, _weight, kind, _payload, _bits, _gs) in enumerate(targets):
+        before, after = sums[i]
+        if not changed[i]:
+            results.append(None)
+        elif kind == "affine":
+            results.append((mx.concatenate(outputs[i], axis=0), before, after))
+        else:
+            results.append(
+                (
+                    {
+                        part: mx.concatenate(chunks, axis=0)
+                        for part, chunks in outputs[i].items()
+                    },
+                    before,
+                    after,
+                )
+            )
+    return results
 
 
 def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
     groups: dict[str, list] = {}
+    is_format = getattr(writer, "is_format", None)
     for name, module in modules.items():
         spec = writer.spec(name)
         weight = getattr(module, "weight", None)
@@ -12965,6 +13185,23 @@ def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
         if weight.dtype not in (mx.bfloat16, mx.float16, mx.float32):
             stats["quantized"] += 1
             continue
+        if is_format is not None and is_format(name):
+            ok = writer.quant_fmt.can_refine(
+                int(weight.shape[-1]), int(weight.shape[-2]), spec[0], spec[1]
+            )
+            if type(ok) is not bool:
+                raise TypeError(
+                    f"{type(writer.quant_fmt).__name__}.can_refine returned "
+                    f"{ok!r}, not a bool"
+                )
+            if not ok:
+                continue
+            tensors = writer.read_format(name)
+            owner = collector.aliases.get(name, name)
+            groups.setdefault(owner, []).append(
+                (name, weight, "format", tensors, *spec)
+            )
+            continue
         packed, scales, biases = writer.read(name)
         if tuple(packed.shape[:-1]) != tuple(weight.shape[:-1]):
             continue
@@ -12972,30 +13209,49 @@ def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
             continue
         owner = collector.aliases.get(name, name)
         groups.setdefault(owner, []).append(
-            (name, weight, packed, scales, biases, *spec)
+            (name, weight, "affine", (packed, scales, biases), *spec)
         )
     for owner in list(groups):
         targets = groups.pop(owner)
         if owner in collector.grams:
             hessian = _shrunk_gram(collector.grams.pop(owner))
-            results = [
-                _refine_affine_codes(w, p, s, b, hessian, bits, gs)
-                for _, w, p, s, b, bits, gs in targets
-            ]
+            results = []
+            for name, w, kind, payload, bits, gs in targets:
+                if kind == "affine":
+                    results.append(
+                        _refine_affine_codes(w, *payload, hessian, bits, gs)
+                    )
+                else:
+                    results.append(
+                        _refine_format_tensors(
+                            writer.quant_fmt, writer.reader, name, w, payload,
+                            hessian, bits, gs,
+                        )
+                    )
             del hessian
         elif owner in collector.switch_rows:
-            results = _refine_switch_codes(collector, owner, targets)
+            results = _refine_switch_codes(
+                collector, owner, targets, writer
+            )
             collector.switch_rows.pop(owner)
         else:
             continue
         for target, result in zip(targets, results):
             if result is None:
-                stats["kept"] += 1
+                if target[2] == "format":
+                    stats["format_kept"] += 1
+                else:
+                    stats["kept"] += 1
                 continue
             writer.write(target[0], result[0])
-            stats["tensors"] += 1
-            stats["before"] += result[1]
-            stats["after"] += result[2]
+            if target[2] == "format":
+                stats["format_tensors"] += 1
+                stats["format_before"] += result[1]
+                stats["format_after"] += result[2]
+            else:
+                stats["tensors"] += 1
+                stats["before"] += result[1]
+                stats["after"] += result[2]
         del targets, results
         mx.clear_cache()
 
@@ -13233,6 +13489,8 @@ def _refine_oqe_output(
     trust_remote_code: bool,
     progress_callback,
     skip: frozenset = frozenset(),
+    quant_fmt=None,
+    reader=None,
 ) -> dict | None:
     """Hessian code refinement of a finished oQe build, written in place.
 
@@ -13251,7 +13509,9 @@ def _refine_oqe_output(
             "has no streamed calibration walk, skipped"
         )
         return {"status": "skipped", "reason": "calibrated through a proxy"}
-    writer = _OQRefineWriter(output, weight_map, quantization, skip)
+    writer = _OQRefineWriter(
+        output, weight_map, quantization, skip, quant_fmt=quant_fmt, reader=reader
+    )
     stats = {
         "tensors": 0,
         "kept": 0,
@@ -13259,6 +13519,10 @@ def _refine_oqe_output(
         "skipped_layers": 0,
         "before": 0.0,
         "after": 0.0,
+        "format_tensors": 0,
+        "format_kept": 0,
+        "format_before": 0.0,
+        "format_after": 0.0,
     }
     started = _time.monotonic()
 
@@ -13297,7 +13561,7 @@ def _refine_oqe_output(
             "oQe refine: %d modules with quantized source weights kept their rounding",
             stats["quantized"],
         )
-    return {
+    report = {
         "status": "done",
         "tensors": stats["tensors"],
         "kept": stats["kept"],
@@ -13306,6 +13570,14 @@ def _refine_oqe_output(
         "hessian_error_reduction": round(gain, 4),
         "seconds": round(seconds, 1),
     }
+    if stats["format_tensors"] or stats["format_kept"]:
+        report["format_totals"] = {
+            "refined": stats["format_tensors"],
+            "kept": stats["format_kept"],
+            "before": stats["format_before"],
+            "after": stats["format_after"],
+        }
+    return report
 
 
 def _plan_oqh_bits(
