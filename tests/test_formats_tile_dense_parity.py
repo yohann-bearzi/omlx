@@ -849,7 +849,7 @@ def test_a_rows_bucket_that_declines_is_refused_at_construction(tmp_path, monkey
     # Decline only one covered remainder chunk (48+4 = 52 -> remainder 4).
     seen = []
 
-    def selective(self, rows):
+    def selective(self, rows, **_):
         seen.append(rows)
         return rows != 4
 
@@ -863,7 +863,9 @@ def test_a_rows_bucket_that_declines_is_refused_at_construction(tmp_path, monkey
             assert tile_dense.policy_for(plan, r, mx.bfloat16).backend != "rows"
         assert layer.__dict__.get(linear._KEPT) is kept_before
         # Declining chunk 16 refuses the entire 44..52 rows range.
-        monkeypatch.setattr(FormatLinear, "_ordinary_serves", lambda self, r: r != 16)
+        monkeypatch.setattr(
+            FormatLinear, "_ordinary_serves", lambda self, r, **_: r != 16
+        )
         plan_all = tile_dense.build_plan(layer, tensor_units=False, chip=chip)
         assert plan_all is not None
         assert all(pol.backend != "rows" for _hi, pol in plan_all.schedule)
@@ -1201,6 +1203,26 @@ def test_in_tree_tuning_tables_serve_m3_m5_gate2_shapes_and_44_52_rows_range():
     )
 
 
+def _assert_c2(got, want, x, quantized):
+    weight = mx.dequantize(
+        quantized["weight"],
+        quantized["scales"].astype(mx.float32),
+        quantized["biases"].astype(mx.float32),
+        group_size=quantized.group_size,
+        bits=quantized.bits,
+    )
+    ref = x.astype(mx.float32) @ weight.T.astype(mx.float32)
+
+    def rel(a):
+        return (
+            mx.sqrt(mx.sum((a.astype(mx.float32) - ref) ** 2))
+            / mx.sqrt(mx.sum(ref**2))
+        ).item()
+
+    got_err, want_err = rel(got), rel(want)
+    assert got_err <= 1.05 * want_err + 1e-6, (got_err, want_err)
+
+
 def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_decode(
     monkeypatch,
 ):
@@ -1243,11 +1265,15 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     p48_m3 = tile_dense.build_plan(
         in_proj, tensor_units=False, chip="applegpu_g15d_c80"
     )
+    assert tile_dense.policy_for(p48_m3, 17, mx.bfloat16).backend == "mlx"
+    assert tile_dense.policy_for(p48_m3, 18, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p48_m3, 24, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p48_m3, 33, mx.bfloat16).backend == "mlx"
     assert tile_dense.policy_for(p48_m3, 128, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p48_m3, 256, mx.bfloat16).backend == "mlx"
     p1_m3 = tile_dense.build_plan(gate, tensor_units=False, chip="applegpu_g15d_c80")
+    assert tile_dense.policy_for(p1_m3, 17, mx.bfloat16).backend == "mlx"
+    assert tile_dense.policy_for(p1_m3, 18, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p1_m3, 64, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p1_m3, 512, mx.bfloat16).backend == "mlx"
     p48_m5 = tile_dense.build_plan(in_proj, tensor_units=True, chip="applegpu_g17s_c40")
@@ -1259,22 +1285,25 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     assert tile_dense.policy_for(p1_m5, 1024, mx.bfloat16).split_k == 40
 
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
-    for n in (48, 1):
-        quantized, layer = _layer(n, 2560, 8, 64)
-        for rows in (24, 33, 48, 64, 128, 256, 512):
-            x = _x((rows, 2560), seed=rows + n)
+
+    for n, k in ((48, 2560), (1, 2560), (4, 10240)):
+        quantized, layer = _layer(n, k, 8, 64)
+        for rows in (17, 24, 33, 48, 64, 128, 256, 512, 1024):
+            x = _x((rows, k), seed=rows + n)
             with testing.fresh_proofs():
                 got = layer(x)
             want = quantized(x)
             mx.eval(got, want)
-            assert (
-                float(
-                    mx.abs(got.astype(mx.float32) - want.astype(mx.float32))
-                    .max()
-                    .item()
-                )
-                <= 0.0625
-            )
+            kept = layer.__dict__.get(linear._KEPT)
+            assert kept is not None and kept.dense not in (None, linear._UNBUILT)
+            policy = tile_dense.policy_for(kept.dense, rows, x.dtype)
+            assert policy is not None
+            if policy.backend == "mlx":
+                assert mx.array_equal(
+                    got.view(mx.uint16), want.view(mx.uint16)
+                ).item(), (n, rows)
+            else:
+                _assert_c2(got, want, x, quantized)
 
 
 def test_unarmed_qmm_threshold_12_to_16_uses_prefill_matching_mlx_bitwise(monkeypatch):
@@ -1322,27 +1351,71 @@ def test_nax_refuses_klt_exceeding_tgp():
         mx.eval(tile_dense._launch(mm, bad, x, ops))
 
 
-@needs_nax
 @pytest.mark.parametrize(
     "policy,n,rows",
     [
         (tuning.DenseTilePolicy("nax", 64, 128, 64, 2, 2, True), 128, 64),
         (tuning.DenseTilePolicy("nax", 32, 32, 64, 1, 1, True), 64, 32),
+        (tuning.DenseTilePolicy("nax", 48, 64, 64, 3, 1, True), 64, 48),
+        (tuning.DenseTilePolicy("nax", 64, 192, 32, 4, 2, True), 192, 64),
     ],
 )
-def test_nax_klt_equals_bn_matches_reference(policy, n, rows):
-    # When kTGP == BN (kTPR = 1), every Ws row 0..BN-1 must still be loaded.
+def test_nax_klt_equals_bn_is_refused_at_construction(policy, n, rows):
     k = 512
-    quantized, _ = _layer(n, k, 4, 64)
-    x = _x((rows, k), seed=n + rows)
     face = affine.tile_face(4, 64, mx.bfloat16)
-    ops = (quantized["weight"], quantized["scales"], quantized["biases"])
-    mm = tile_dense._kernel(face, policy)
-    got = tile_dense._launch(mm, policy, x, ops)
-    want = quantized(x)
-    mx.eval(got, want)
-    diff = float(mx.abs(got.astype(mx.float32) - want.astype(mx.float32)).max().item())
-    assert diff <= 0.0625, f"max diff {diff} for {policy}"
+    assert not policy.is_legal(face, k, n, rows, "applegpu_g17s_c40", mx.bfloat16)
+
+
+def test_resolve_cell_falls_back_on_klt_equals_bn(monkeypatch):
+    tuning.reset_cache()
+    for refused, n in (
+        (tuning.DenseTilePolicy("nax", 64, 128, 64, wm=1, wn=2), 128),
+        (tuning.DenseTilePolicy("nax", 32, 32, 64, wm=1, wn=1), 64),
+        (tuning.DenseTilePolicy("nax", 48, 64, 64, wm=3, wn=1), 64),
+        (tuning.DenseTilePolicy("nax", 64, 192, 32, wm=4, wn=2), 192),
+    ):
+        _, layer = _layer(n, 512, 4, 64)
+        monkeypatch.setattr(tuning, "lookup", lambda *a, _p=refused, **k: _p)
+        plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+        assert plan is not None
+        for _hi, pol in plan.schedule:
+            assert pol.backend != "nax" or pol.wm * pol.wn * 32 >= 2 * pol.bn, (
+                refused,
+                pol,
+            )
+
+    legal_boundary = tuning.DenseTilePolicy("nax", 32, 64, 64, wm=2, wn=2, sched="seg")
+    _, layer = _layer(64, 512, 4, 64)
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: legal_boundary)
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    assert plan is not None
+    assert tile_dense.policy_for(plan, 512, mx.bfloat16) == legal_boundary
+
+
+def test_default_policy_never_emits_an_illegal_nax_cell():
+    tuning.reset_cache()
+    ns = list(range(1, 64)) + list(range(64, 1025, 16))
+    for bits in (2, 3, 4, 8):
+        face = affine.tile_face(bits, 64, mx.bfloat16)
+        for n in ns:
+            _, layer = _layer(n, 512, bits, 64)
+            for chip, tensor_units in (
+                ("applegpu_g15d_c80", False),
+                ("applegpu_g17s_c40", True),
+            ):
+                plan = tile_dense.build_plan(
+                    layer, tensor_units=tensor_units, chip=chip
+                )
+                assert plan is not None, (chip, bits, n)
+                for rows in (1, 17, 33, 512):
+                    for _hi, pol in plan.schedule:
+                        assert pol.is_legal(face, 512, n, rows, chip, mx.bfloat16), (
+                            chip,
+                            bits,
+                            n,
+                            rows,
+                            pol,
+                        )
 
 
 def test_dense_nax_barriers_are_threadgroup_uniform():
@@ -1359,3 +1432,101 @@ def test_build_plan_rejects_nax_table_entry_when_tensor_units_false():
     assert plan is not None
     pol = tile_dense.policy_for(plan, 512, mx.bfloat16)
     assert pol is not None and pol.backend == "steel"
+
+
+def test_c2_helper_rejects_error_above_1_05x_mlx():
+    quantized, _ = _layer(48, 2560, 8, 64)
+    x = _x((33, 2560), seed=33)
+    want = quantized(x)
+    weight = mx.dequantize(
+        quantized["weight"],
+        quantized["scales"].astype(mx.float32),
+        quantized["biases"].astype(mx.float32),
+        group_size=quantized.group_size,
+        bits=quantized.bits,
+    )
+    ref = x.astype(mx.float32) @ weight.T.astype(mx.float32)
+    mx.eval(want, ref)
+    _assert_c2(want, want, x, quantized)
+    near_bad = ref + 1.2 * (want.astype(mx.float32) - ref)
+    biased = (want.astype(mx.float32) + 0.05).astype(mx.bfloat16)
+    mx.eval(near_bad, biased)
+    with pytest.raises(AssertionError):
+        _assert_c2(near_bad, want, x, quantized)
+    with pytest.raises(AssertionError):
+        _assert_c2(biased, want, x, quantized)
+
+
+def test_narrow_n_judges_the_plan_the_layer_built_on_an_untuned_chip(monkeypatch):
+    monkeypatch.setattr(linear, "_nax_host", lambda: False)
+    monkeypatch.setattr(tuning, "current_chip", lambda: "applegpu_g16s_c16")
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    tuning.reset_cache()
+    try:
+        quantized, layer = _layer(48, 2560, 8, 64)
+        x = _x((33, 2560))
+        with testing.fresh_proofs():
+            got = layer(x)
+        want = quantized(x)
+        mx.eval(got, want)
+        kept = layer.__dict__.get(linear._KEPT)
+        assert kept is not None and kept.dense not in (None, linear._UNBUILT)
+        policy = tile_dense.policy_for(kept.dense, 33, x.dtype)
+        assert policy is not None and policy.backend == "steel"
+        _assert_c2(got, want, x, quantized)
+    finally:
+        tuning.reset_cache()
+
+
+def test_project_returns_none_for_rows_backend(monkeypatch):
+    tuning.reset_cache()
+    monkeypatch.setattr(tuning, "current_chip", lambda: "applegpu_g15s_c20")
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15s")
+    _, layer = _layer(64, 512, 4, 64)
+    rows_pol = tuning.DenseTilePolicy("rows", 0, 0, 0)
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: rows_pol)
+    plan = tile_dense.build_plan(layer, tensor_units=False, chip="applegpu_g15d_c80")
+    assert plan is not None
+    assert tile_dense.policy_for(plan, 48, mx.bfloat16).backend == "rows"
+    assert tile_dense.project(plan, _x((48, 512))) is None
+    other_pol = tuning.DenseTilePolicy("other", 0, 0, 0)
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: other_pol)
+    other_plan = tile_dense.build_plan(
+        layer, tensor_units=False, chip="applegpu_g15d_c80"
+    )
+    assert other_plan is not None
+    assert tile_dense.policy_for(other_plan, 48, mx.bfloat16).backend == "other"
+    assert tile_dense.project(other_plan, _x((48, 512))) is None
+
+
+def test_ordinary_serves_judges_the_target_chip(monkeypatch):
+    _, layer = _layer(2560, 2560, 4, 64)
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
+    assert layer._ordinary_serves(16, chip="applegpu_g15d_c80") is True
+    assert layer._ordinary_serves(16, chip="applegpu_g15d") is True
+    assert layer._ordinary_serves(16, chip="applegpu_g15s_c40") is False
+    assert layer._ordinary_serves(16, chip="applegpu_g15s") is False
+    assert layer._ordinary_serves(16, chip="") is False
+
+
+def test_build_plan_fails_closed_on_an_empty_chip():
+    _, layer = _layer(64, 512, 4, 64)
+    with pytest.raises(ValueError, match="chip"):
+        tile_dense.build_plan(layer, tensor_units=False, chip="")
+
+
+def test_build_plan_rows_bucket_uses_target_chip_not_host_arch(monkeypatch):
+    tuning.reset_cache()
+    _, layer = _layer(2560, 2560, 4, 64)
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15s")
+    plan = tile_dense.build_plan(layer, tensor_units=False, chip="applegpu_g15d_c80")
+    assert plan is not None
+    assert tile_dense.policy_for(plan, 48, mx.bfloat16).backend == "rows"
+    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
+    rows_pol = tuning.DenseTilePolicy("rows", 0, 0, 0)
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: rows_pol)
+    declined = tile_dense.build_plan(
+        layer, tensor_units=False, chip="applegpu_g15s_c40"
+    )
+    assert declined is not None
+    assert tile_dense.policy_for(declined, 48, mx.bfloat16).backend == "steel"

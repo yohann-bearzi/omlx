@@ -1410,11 +1410,13 @@ class FormatLinear(_FormatLayer):
             mode=self.mode,
         )
 
-    def _ordinary_serves(self, rows: int) -> bool:
+    def _ordinary_serves(self, rows: int, *, chip: str | None = None) -> bool:
         """Whether the ordinary rows kernel serves this layer at ``rows``:
         the construction-time check a "rows" table bucket must pass for
         every chunk size it can issue (rule 28, fail closed)."""
-        architecture = _metal_architecture()
+        architecture = (
+            _metal_architecture() if chip is None else chip.partition("_c")[0]
+        )
         if not architecture:
             return False
         kept = self.__dict__.get(_KEPT)

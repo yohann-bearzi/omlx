@@ -143,7 +143,10 @@ class DenseTilePolicy:
                 return False
             if self.sched == "db" and tn % 2 != 0:
                 return False
-            if self.wm * self.wn * 32 < self.bn:
+            if self.wm * self.wn * 32 < 2 * self.bn:
+                # kTGP < BN leaves Ws uninitialized; BN <= kTGP < 2*BN selects
+                # kLT == BN (measured 1.33x stock rel_l2 on M5, n=64 k=512
+                # rows=32 4b g64; DEFERRED: kLT==BN NAX precision).
                 return False
         tgp = self.wm * self.wn * 32
         if tgp > 1024:

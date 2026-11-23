@@ -1082,13 +1082,13 @@ def _rows_chunks(lo: int, hi: int | None, max_rows: int = 16) -> tuple[int, ...]
     return tuple(sorted(chunks))
 
 
-def _rows_bucket_ok(layer, lo: int, hi: int | None) -> bool:
+def _rows_bucket_ok(layer, lo: int, hi: int | None, *, chip: str | None = None) -> bool:
     """Whether ``layer``'s ordinary rows route serves every chunk size a
     ``[lo, hi]`` bucket can issue (rule 28, fail closed)."""
     serves = getattr(layer, "_ordinary_serves", None)
     if serves is None:
         return False
-    return all(serves(chunk) for chunk in _rows_chunks(lo, hi))
+    return all(serves(chunk, chip=chip) for chunk in _rows_chunks(lo, hi))
 
 
 def _resolve_cell(
@@ -1114,13 +1114,17 @@ def _resolve_cell(
         rows=sample,
         chip=chip,
     )
+    if pol is not None and pol.backend == "nax" and pol.wm * pol.wn * 32 < 2 * pol.bn:
+        # Explicit entries are refused by is_legal; a resolved cell never
+        # loads a refused config (DEFERRED: kLT==BN NAX precision).
+        pol = None
     if pol is not None and not tensor_units and pol.backend == "nax":
         pol = None
     if pol is None:
         return _default_policy(tensor_units, layer.bits, sample, n, k)
     if pol.backend == "mlx" and layer.mode != "affine":
         return _default_policy(tensor_units, layer.bits, sample, n, k)
-    if pol.backend == "rows" and not _rows_bucket_ok(layer, lo, hi):
+    if pol.backend == "rows" and not _rows_bucket_ok(layer, lo, hi, chip=chip):
         return _default_policy(tensor_units, layer.bits, sample, n, k)
     return pol
 
@@ -1171,6 +1175,8 @@ def build_plan(
     face = formats.tile(layer, k, n)
     if face is None:
         return None
+    if chip == "":
+        raise ValueError("tuning: a dense plan names its chip")
     chip_id = tuning.current_chip() if chip is None else chip
     plan_dtypes = tuple(
         dt for dt in (mx.bfloat16, mx.float16) if face.exact_for(dt)
@@ -1395,6 +1401,9 @@ def _project_cold(
         _keep_local(plan, sig, compiled)
         return result
 
+    if policy.backend not in ("steel", "nax"):
+        return None
+
     align_n = policy.align_n and (plan.n % policy.bn == 0)
     even_tn = policy.backend == "nax" and (policy.bn // (16 * policy.wn)) % 2 == 0
     sched_eff = (
@@ -1408,11 +1417,7 @@ def _project_cold(
         )
         else "seg"
     )
-    split_eff = (
-        _split_k_geometry(plan.k, policy.bk, policy.split_k)[0]
-        if policy.backend in ("steel", "nax")
-        else 1
-    )
+    split_eff = _split_k_geometry(plan.k, policy.bk, policy.split_k)[0]
     eff_policy = (
         policy
         if (

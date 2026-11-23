@@ -809,9 +809,9 @@ def test_the_nax_rule_mirrors_tile_matmad_nax():
             policy = schema.DenseTilePolicy(
                 "nax", 16 * 2 * tm, 16 * 2 * tn, 64, wm=2, wn=2, align_n=False
             )
-            assert policy.is_legal(
-                face, 5120, 2560, 2048, "applegpu_g17s_c40"
-            ) == legal(tm, tn), (tm, tn, conditions)
+            assert policy.is_legal(face, 5120, 2560, 2048, "applegpu_g17s_c40") == (
+                legal(tm, tn) and policy.wm * policy.wn * 32 >= 2 * policy.bn
+            ), (tm, tn, conditions)
 
 
 def test_the_element_size_comes_from_the_dtype():
@@ -1633,16 +1633,36 @@ def test_nax_is_legal_rejects_klt_exceeding_tgp():
         )
         is False
     )
-    # kTGP == BN uses kLT = BN (kTPR = 1, 1 thread per Ws row) and is legal.
+    # kTGP == BN and BN < kTGP < 2 * BN both select kLT == BN (kTPR == 1) and
+    # are refused until the kLT == BN mapping is fixed (DEFERRED).
     assert (
         schema.DenseTilePolicy("nax", 64, 128, 64, wm=2, wn=2).is_legal(
             _face(), 2560, 2560, 64, "applegpu_g17s_c40"
         )
-        is True
+        is False
     )
     assert (
         schema.DenseTilePolicy("nax", 32, 32, 64, wm=1, wn=1).is_legal(
             _face(), 2560, 2560, 32, "applegpu_g17s_c40"
+        )
+        is False
+    )
+    assert (
+        schema.DenseTilePolicy("nax", 48, 64, 64, wm=3, wn=1).is_legal(
+            _face(), 512, 64, 48, "applegpu_g17s_c40"
+        )
+        is False
+    )
+    assert (
+        schema.DenseTilePolicy("nax", 64, 192, 32, wm=4, wn=2).is_legal(
+            _face(), 512, 192, 64, "applegpu_g17s_c40"
+        )
+        is False
+    )
+    # Boundary: kTGP == 2 * BN selects kLT == 2 * BN (kTPR == 2) and stays legal.
+    assert (
+        schema.DenseTilePolicy("nax", 64, 64, 64, wm=2, wn=2).is_legal(
+            _face(), 512, 64, 64, "applegpu_g17s_c40"
         )
         is True
     )
