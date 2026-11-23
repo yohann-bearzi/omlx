@@ -21,6 +21,7 @@ import logging
 import math
 import re
 import threading
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cache
@@ -832,6 +833,25 @@ class _Kept(threading.local):
 _KEEPING = threading.Lock()
 
 
+class ProofBinding:
+    """A plan's own kept graphs, retired with the proof's failure.
+
+    A proof's ``_kept`` is the calling thread's; a plan keeps its graphs in
+    its own binding so that a failure on one plan's launch reaches every
+    plan that shares the proof, on every thread. The binding is weak: the
+    proof never keeps a plan alive.
+    """
+
+    __slots__ = ("state", "__weakref__")
+
+    def __init__(self) -> None:
+        self.state: dict = {"_kept": _Kept()}
+
+    @property
+    def kept(self) -> _Kept | None:
+        return self.state.get("_kept")
+
+
 @dataclass
 class Proof:
     """What is known of the launches that one kernel compiles from the same
@@ -864,6 +884,19 @@ class Proof:
     ran: set = field(default_factory=set)  # the launches that compiled
     failed: bool = False
     _kept: _Kept = field(default_factory=_Kept, init=False, repr=False, compare=False)
+    _bindings: weakref.WeakSet = field(
+        default_factory=weakref.WeakSet, init=False, repr=False, compare=False
+    )
+
+    def bind(self) -> ProofBinding:
+        """A plan's own kept graphs, cleared with this proof's failure."""
+        binding = ProofBinding()
+        with _KEEPING:
+            if self.failed:
+                binding.state.clear()
+            else:
+                self._bindings.add(binding)
+        return binding
 
     @property
     def graphs(self) -> dict:
@@ -972,7 +1005,11 @@ class Proof:
         with _KEEPING:
             self.failed = True
             ended, self._kept = self._kept, _Kept()
-        del ended
+            retired = tuple(self._bindings)
+            self._bindings.clear()
+            for binding in retired:
+                binding.state.clear()
+        del ended, retired
 
 
 # The graphs a thread keeps of one proof: a decode step's, those of the short

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import threading
 from dataclasses import dataclass
 from functools import cache
@@ -52,6 +53,7 @@ __all__ = [
     "register_skeleton",
     "register_tuning_path",
     "reset_cache",
+    "row_bounds",
     "row_exact_policy",
     "row_index_width",
     "rows_bucket",
@@ -190,9 +192,10 @@ def reset_cache() -> None:
     """Drop the loaded tables (a test or a newly registered path only)."""
     with _LOCK:
         _CHIPS.clear()
-    clear = getattr(current_chip, "cache_clear", None)
-    if clear is not None:
-        clear()
+    for fn in (current_chip, face_digest):
+        clear = getattr(fn, "cache_clear", None)
+        if clear is not None:
+            clear()
 
 
 def table_profile(face) -> str:
@@ -203,6 +206,7 @@ def table_profile(face) -> str:
     return "lut_small" if size <= 256 else "lut_tg"
 
 
+@cache
 def face_digest(face) -> str:
     """A face's identity for a tuning entry: what its Metal is built from."""
     source = getattr(face, "emitted_source", None) or face.source
@@ -262,6 +266,28 @@ def _dtype_name(dtype) -> str:
     return {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(text, text)
 
 
+_ROWS_SPAN_RE = re.compile(r"^(?:(\d+)-(\d+)|(\d+)\+|<(\d+)|(\d+))$")
+
+
+def _parse_rows_span(bucket: object) -> tuple[int | None, int | None] | None:
+    """Parse a row bucket or explicit row range (e.g. ``44-52``, ``2049+``)."""
+    if not isinstance(bucket, str):
+        return None
+    match = _ROWS_SPAN_RE.match(bucket)
+    if match is None:
+        return None
+    lo_s, hi_s, plus_s, lt_s, exact_s = match.groups()
+    if lo_s is not None:
+        lo, hi = int(lo_s), int(hi_s)
+        return (lo, hi) if lo <= hi else None
+    if plus_s is not None:
+        return (int(plus_s), None)
+    if lt_s is not None:
+        return (None, int(lt_s) - 1)
+    n = int(exact_s)
+    return (n, n)
+
+
 @dataclass(frozen=True)
 class _Entry:
     key: dict
@@ -270,6 +296,7 @@ class _Entry:
     measured_at: str
     params: object
     exactness: str
+    rows_span: tuple[int | None, int | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -292,10 +319,17 @@ def _check_key(path: Path, key: dict) -> None:
         )
     rows_bucket = key.get("rows_bucket")
     allowed = _ROWS_BUCKET_NAMES.get(route)
+    span = _parse_rows_span(rows_bucket)
+    custom = (
+        span is not None
+        and span[0] is not None
+        and span[1] is not None
+        and 1 <= span[0] < span[1]
+    )
     if (
         not isinstance(rows_bucket, str)
         or not rows_bucket
-        or (allowed is not None and rows_bucket not in allowed)
+        or (allowed is not None and rows_bucket not in allowed and not custom)
     ):
         raise ValueError(
             f"tuning: {path} key rows_bucket {rows_bucket!r} is not one this "
@@ -373,8 +407,24 @@ def _read_table(path: Path, chips: dict[str, list[_Entry]]) -> None:
         if not isinstance(measured, str) or not measured:
             raise ValueError(f"tuning: {path} has an entry without measured_at")
         params = schema.params_from_json(key.get("route"), raw.get("params"))
+        rows_bucket = key.get("rows_bucket")
+        allowed = _ROWS_BUCKET_NAMES.get(key.get("route"))
         parsed.append(
-            _Entry(dict(key), face_sha, skeleton, measured, params, exactness)
+            _Entry(
+                dict(key),
+                face_sha,
+                skeleton,
+                measured,
+                params,
+                exactness,
+                # A route's named buckets keep their label comparison; only
+                # a custom span (e.g. "44-52") outside them becomes a span.
+                (
+                    None
+                    if allowed is not None and rows_bucket in allowed
+                    else _parse_rows_span(rows_bucket)
+                ),
+            )
         )
 
 
@@ -427,32 +477,63 @@ class _Query:
     group: int
     n: int
     k: int
+    rows: int
     rows_bucket: str
     n_bucket: str
     k_bucket: str
 
 
-def _matches(entry: _Entry, query: _Query) -> int:
+def _matches(entry: _Entry, query: _Query) -> tuple[int, int]:
     key = entry.key
     if (
         key.get("route") != query.route
         or key.get("dtype") != query.dtype
         or key.get("bits") != query.bits
         or key.get("group") != query.group
-        or key.get("rows_bucket") != query.rows_bucket
     ):
-        return 0
+        return (0, 0)
+    span = entry.rows_span
+    if span is not None:
+        lo, hi = span
+        if (lo is not None and query.rows < lo) or (hi is not None and query.rows > hi):
+            return (0, 0)
+        span_rank = (
+            -(hi - lo + 1) if (lo is not None and hi is not None) else -(1 << 30)
+        )
+    else:
+        if key.get("rows_bucket") != query.rows_bucket:
+            return (0, 0)
+        span_rank = -(1 << 29)
     face_id = key.get("face_id")
     exact_face = face_id == query.face_key
     if not exact_face and face_id != f"*:{query.profile}":
-        return 0
+        return (0, 0)
     if "n" in key and "k" in key:
         if key["n"] != query.n or key["k"] != query.k:
-            return 0
-        return 4 if exact_face else 2
+            return (0, 0)
+        return (4 if exact_face else 2, span_rank)
     if key.get("n_bucket") != query.n_bucket or key.get("k_bucket") != query.k_bucket:
-        return 0
-    return 3 if exact_face else 1
+        return (0, 0)
+    return (3 if exact_face else 1, span_rank)
+
+
+def row_bounds(route: str, *, chip: str | None = None) -> tuple[int, ...]:
+    """Sorted upper-edge row counts where ``lookup(route, ...)`` can change on
+    ``chip`` (the route's fixed buckets plus any custom row-span edges in the
+    chip's table). Resolved once at plan construction (rule 28)."""
+    buckets = _ROWS_BUCKETS.get(route, ())
+    cuts = {hi for _lo, hi, _name in buckets}
+    chip_id = current_chip() if chip is None else chip
+    table = _index_for_chip(chip_id)
+    for entry in table.entries:
+        if entry.key.get("route") != route or entry.rows_span is None:
+            continue
+        lo, hi = entry.rows_span
+        if lo is not None and lo > 1:
+            cuts.add(lo - 1)
+        if hi is not None and hi >= 1:
+            cuts.add(hi)
+    return tuple(sorted(cut for cut in cuts if cut >= 1))
 
 
 def lookup(
@@ -485,16 +566,17 @@ def lookup(
         group=group,
         n=n,
         k=k,
+        rows=rows,
         rows_bucket=rows_bucket(route, rows),
         n_bucket=_n_bucket(n),
         k_bucket=_k_bucket(k),
     )
     digest: str | None = None
-    best_score = 0
+    best_rank = (0, 0)
     best_params = None
     for entry in table.entries:
-        score = _matches(entry, query)
-        if score <= best_score:
+        rank = _matches(entry, query)
+        if rank[0] == 0 or rank <= best_rank:
             continue
         if entry.skeleton_sha256 != skeleton:
             continue
@@ -505,9 +587,7 @@ def lookup(
                 continue
         if not entry.params.is_legal(face, k, n, rows, chip_id, dtype=dtype):
             continue
-        if score == 4:
-            return entry.params
-        best_score = score
+        best_rank = rank
         best_params = entry.params
     return best_params
 

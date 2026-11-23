@@ -285,12 +285,13 @@ def _metal_digest(recorded):
 
 # B8's kernels on the compact skeletons (U3b), as served: the existing
 # builders (the format linear's shared-rows kernels among them) and 36
-# plain, SwiGLU and row-mapped tile kernels. Adding support for tables must
-# preserve their Metal byte for byte when the face declares none.
+# plain, SwiGLU and row-mapped tile kernels (updated in PFX-1 only for the
+# 18 8-bit tile kernels switching packed_uint2 to aligned uint2 when
+# K % 8 == 0; all 568 dot kernels and 18 4-bit tile kernels byte-identical).
 # The 144 verify-gather builders use wide offsets. Bounded ordered blocks
 # add 72 kernels using 32-bit input and output offsets, and bounded blocks'
 # unordered gathers add the other 72.
-_METAL_DIGEST = "604 2cf655a1ca8b425edb5362e96e042326fce36783b794e74acd545fac2902ab60"
+_METAL_DIGEST = "604 edaeb8956d43e00ee369aeea61b1d957a014c9da526893dbe80fbb9fb47db08b"
 
 
 def test_kernels_without_tables_are_the_same_text_as_before(monkeypatch):
@@ -314,9 +315,10 @@ def _steel_sources(monkeypatch):
 
 def test_affine_steel_gathers_keep_the_table_free_face_text(monkeypatch):
     records = _steel_sources(monkeypatch)
-    # B8's independently captured table-free face headers and declarations
-    # with the steel loader and launch body, excluding installed MLX headers.
-    expected = "971f95d75c083dedf8a50bff3181289665c9cc5aaacd26a62780c2b37136b222"
+    # Table-free face headers and declarations with the steel loader and launch
+    # body, excluding installed MLX headers (updated in PFX-1 only for the 6
+    # 8-bit faces' aligned uint2 Stored typedef).
+    expected = "adfa9fa942a3db6714f38a415fc7877d6d7b7e71010ff725f9bec72fa698a0aa"
     assert _metal_digest(records) == f"12 {expected}"
 
 

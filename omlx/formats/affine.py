@@ -635,8 +635,8 @@ _TILE_BITS = (2, 3, 4, 8)
 _TILE_FACE_BITS = (2, 3, 4, 5, 6, 8)
 
 # A run of 8 codes is BITS bytes: two bytes at 2 bits, three at 3, one 32-bit
-# word at 4, two at 8, read where they lie (an 8-bit run is two words, which a
-# weight's slice aligns to 4 bytes, not 8: a packed_uint2; a 3-bit run takes
+# word at 4, two at 8, read where they lie (an 8-bit run is two words, aligned
+# to 8 bytes as uint2 whenever K % 8 == 0, else packed_uint2; a 3-bit run takes
 # three byte loads; 5 and 6 bits pack into a 64-bit word). Each width's source
 # has its run's type, its fetch and the code at position i alone. K is asserted
 # whole groups in the constructor, not in the class: a failed assert there
@@ -746,7 +746,7 @@ _RUNS = {
       return (q >> (4 * i)) & 0xFu;
     }""",
     8: r"""    using Codes = uint2;
-    using Stored = packed_uint2;
+    using Stored = metal::conditional_t<K % 8 == 0, uint2, packed_uint2>;
     const device Stored* c;
     static uint code_at(uint2 q, int i) {
       return ((i < 4 ? q.x : q.y) >> (8 * (i & 3))) & 0xFFu;

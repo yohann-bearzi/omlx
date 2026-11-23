@@ -1498,15 +1498,16 @@ def _digest_records(records) -> str:
 
 
 # Baseline digests captured from untouched wip/3 head ba421f5c, re-pinned on
-# wip/a1-a13 (A13 shared-rows skeleton) and extended in T23 when
-# affine._TILE_BITS gained 2 and 3 bits (+12 tile face records: 219 -> 231;
-# +24 tile_wide/pair_kernel builders: 294 -> 318; all 219 existing face
-# records and 294 existing builders verified byte-identical).
+# wip/a1-a13 (A13 shared-rows skeleton), extended in T23 (+12 2/3-bit tile
+# faces: 219 -> 231; +24 wide/pair builders: 294 -> 318), and updated in PFX
+# only for the 6 8-bit tile faces (+12 builders) whose Stored switched to
+# conditional_t<K % 8 == 0, uint2, packed_uint2> (all other 225 faces and
+# 306 builders verified byte-identical to 5b4d413d/c3185e2b).
 _AFFINE_ALL_DIGEST = (
-    "231 39ddda59ca82a5835c9e339557fafe6b6cb936887c9465fb904e2d22d7f9826b"
+    "231 6521521ab3c3d0c88af7700c6ea9935406e8a05596fc7119e0e3f252f99f60c8"
 )
 _AFFINE_WIDE_AND_SG8_DIGEST = (
-    "318 5905b3dfbb0349daa688a5c2f7384858cb4e5dd1d7aecfa97ff2a49e0eea39e5"
+    "318 51013645da822a4db1867468b1b1f804aa55cf2195e1d6a8fbe787fcf146b8be"
 )
 # Re-pinned on wip/a1-a13 together with the 219 affine records: the A13
 # unrolled shared block adds three _Pragma("clang loop unroll(full)") lines

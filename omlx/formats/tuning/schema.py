@@ -83,10 +83,10 @@ def _elem_bytes(dtype: Any) -> int | None:
 class DenseTilePolicy:
     """A direct dense tile's compile-time geometry (release-3 spec §3.2)."""
 
-    backend: Literal["steel", "nax"]
-    bm: int
-    bn: int
-    bk: int
+    backend: Literal["steel", "nax", "wide", "mlx", "rows"]
+    bm: int = 0
+    bn: int = 0
+    bk: int = 0
     wm: int = 2
     wn: int = 2
     align_n: bool = True
@@ -96,6 +96,7 @@ class DenseTilePolicy:
     vec_store: bool = False
     pad_bytes: int = 0
     gx: int = 0
+    sched: Literal["seg", "db"] = "seg"
 
     def is_legal(
         self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
@@ -103,6 +104,18 @@ class DenseTilePolicy:
         """Whether this geometry runs on ``face``'s tables, its shape and chip."""
         if self.backend not in _BACKENDS:
             return False
+        if k < 1 or n < 1 or m < 1:
+            return False
+        if self.backend in _ROUTE_ONLY_BACKENDS:
+            return (
+                self.bm == 0
+                and self.bn == 0
+                and self.bk == 0
+                and self.split_k == 1
+                and self.sched == "seg"
+                and self.pad_bytes == 0
+                and self.gx == 0
+            )
         if self.backend == "nax":
             match = _CHIP_GEN_RE.match((chip or "").lower())
             if match is None:
@@ -128,10 +141,12 @@ class DenseTilePolicy:
             tn = self.bn // (frag * self.wn)
             if not (tn % 2 == 0 or (tn == 1 and tm % 2 == 0)):
                 return False
+            if self.sched == "db" and tn % 2 != 0:
+                return False
+            if self.wm * self.wn * 32 < self.bn:
+                return False
         tgp = self.wm * self.wn * 32
         if tgp > 1024:
-            return False
-        if k < 1 or n < 1 or m < 1:
             return False
         if self.split_k < 1 or k % (self.split_k * self.bk):
             return False
@@ -139,25 +154,43 @@ class DenseTilePolicy:
             return False
         if self.x_nreads not in _X_NREADS:
             return False
+        if self.sched not in _SCHEDS:
+            return False
+        if self.sched == "db" and (
+            self.backend != "nax" or not self.align_n or k % self.bk != 0
+        ):
+            return False
         if self.backend == "steel":
-            # mlx::steel::BlockLoader (steel/gemm/loader.h:22-24,74-96) writes
-            # TROWS rows per pass; BM must be a whole multiple of TROWS.
-            trows = tgp // (self.bk // self.x_nreads)
-            if self.bm % trows:
+            # mlx::steel::BlockLoader (steel/gemm/loader.h:22-24,74-96) tiles
+            # BK into TCOLS = BK / x_nreads columns and BM into TROWS = TGP / TCOLS
+            # rows; omlx_steel_dense::WeightLoader splits BN * BK evenly across TGP.
+            if self.bk % self.x_nreads:
+                return False
+            tcols = self.bk // self.x_nreads
+            if tgp % tcols:
+                return False
+            trows = tgp // tcols
+            if trows < 1 or self.bm % trows:
+                return False
+            if (self.bn * self.bk) % tgp:
+                return False
+            values = (self.bn * self.bk) // tgp
+            if values < 8 or self.bk % values:
                 return False
         if not isinstance(self.param_staging, ParamStaging):
             return False
         if self.pad_bytes < 0 or self.gx < 0:
             return False
-        # The staging the kernels actually allocate: tile_gather stages both
-        # operands (`xs[BM*stride]`, `ws[BN*stride]`), the NAX face kernel its
-        # weight buffer alone, with `stride = BK + 16 / sizeof(T)` and
-        # `Ws[...] + PAD / sizeof(T)`.  Keep this beside those sources.
+        # The staging the kernels actually allocate: tile_dense steel stages
+        # both operands (`xs[BM*stride]`, `ws[BN*stride]`), NAX stages its
+        # weight buffer (2x when double-buffered), with `stride = BK + 16 /
+        # sizeof(T)` and `Ws[...] + PAD / sizeof(T)`. Keep beside those sources.
         elem_bytes = _elem_bytes(dtype)
         if elem_bytes is None:
             return False
         stride = self.bk + 16 // elem_bytes
-        weight_bytes = elem_bytes * self.bn * stride
+        weight_buffers = 2 if self.sched == "db" else 1
+        weight_bytes = elem_bytes * weight_buffers * self.bn * stride
         activations = 0 if self.backend == "nax" else elem_bytes * self.bm * stride
         tg = weight_bytes + activations + self.pad_bytes + kernels.table_bytes(face)
         return tg <= _THREADGROUP_BYTES
@@ -221,7 +254,9 @@ def mma_asserts() -> tuple[tuple[str, str], ...]:
     )
 
 
-_BACKENDS = ("steel", "nax")
+_BACKENDS = ("steel", "nax", "wide", "mlx", "rows")
+_ROUTE_ONLY_BACKENDS = ("wide", "mlx", "rows")
+_SCHEDS = ("seg", "db")
 _CHIP_GEN_RE = re.compile(r"^applegpu_g(\d+)([a-z]?)(?:_|$)")
 _BKS = (32, 64, 128)
 _X_NREADS = (4, 8)
@@ -267,8 +302,6 @@ def params_from_json(route: str, data: Any):
             f"tuning: {route} backend is one of {_BACKENDS}, not "
             f"{data.get('backend')!r}"
         )
-    if "bk" in data and (isinstance(data["bk"], bool) or data["bk"] not in _BKS):
-        raise ValueError(f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}")
     hints = get_type_hints(cls)
     for name, hint in hints.items():
         if name not in data:
@@ -291,6 +324,31 @@ def params_from_json(route: str, data: Any):
                 f"tuning: {route} param {name!r} is not a valid "
                 f"{getattr(hint, '__name__', hint)}: {value!r}"
             )
+    if cls is DenseTilePolicy:
+        backend = data.get("backend")
+        if backend in _ROUTE_ONLY_BACKENDS:
+            for dim in ("bm", "bn", "bk"):
+                if dim in data and data[dim] != 0:
+                    raise ValueError(
+                        f"tuning: {route} {backend!r} route takes {dim}=0, "
+                        f"not {data[dim]!r}"
+                    )
+        else:
+            for dim in ("bm", "bn", "bk"):
+                if dim not in data:
+                    raise ValueError(
+                        f"tuning: {route} {backend!r} params require {dim!r}"
+                    )
+            if data["bk"] not in _BKS:
+                raise ValueError(
+                    f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}"
+                )
+        if "sched" in data and data["sched"] not in _SCHEDS:
+            raise ValueError(
+                f"tuning: {route} sched is one of {_SCHEDS}, not {data['sched']!r}"
+            )
+    elif "bk" in data and data["bk"] not in _BKS:
+        raise ValueError(f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}")
     if "param_staging" in data:
         try:
             data = {**data, "param_staging": ParamStaging(data["param_staging"])}

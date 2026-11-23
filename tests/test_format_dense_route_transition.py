@@ -65,7 +65,9 @@ def test_one_layer_reuses_wide_and_dense_plans_across_requests(
     build = _builder(tmp_path)
 
     def make_layer():
-        layer, _, _ = _equivalent_layer(mode, build, 512, 2560)
+        # N=1024 takes wide at M=2 and the steel/NAX dense tile at M=64 on both
+        # chips (narrow N=512 8b keeps the MLX policy on short chunks for rule 32).
+        layer, _, _ = _equivalent_layer(mode, build, 1024, 2560)
         return layer
 
     x = mx.random.normal((64, 2560), key=mx.random.key(83)).astype(mx.float16)
@@ -84,15 +86,15 @@ def test_one_layer_reuses_wide_and_dense_plans_across_requests(
     layer = make_layer()
     built = []
     wide_tile = linear._ordinary_tile
-    dense_tile = linear._tile
+    dense_tile = tile_dense.build_plan
 
     def wide(*args):
         built.append("wide")
         return wide_tile(*args)
 
-    def dense(held):
+    def dense(held, **kwargs):
         built.append("dense")
-        return dense_tile(held)
+        return dense_tile(held, **kwargs)
 
     projected = []
     project = tile_dense.project
@@ -102,7 +104,7 @@ def test_one_layer_reuses_wide_and_dense_plans_across_requests(
         return project(tile, z, **kwargs)
 
     monkeypatch.setattr(linear, "_ordinary_tile", wide)
-    monkeypatch.setattr(linear, "_tile", dense)
+    monkeypatch.setattr(tile_dense, "build_plan", dense)
     monkeypatch.setattr(tile_dense, "project", record)
     for m in schedule:
         actual = np.asarray(layer(x[:m]).view(mx.uint16))

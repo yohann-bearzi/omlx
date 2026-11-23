@@ -194,19 +194,26 @@ architectures use the format layer's existing fallback.
 | `FormatSwitchLinear`, other calls with a dot face | one launch, one mat-vec per pair |
 | either, with no dot face that is exact for `x`'s dtype, or a K under 8; a switch layer, or a layer of a face of no `vpt`, with an N that is not a multiple of 8 | `decode`, then MLX's matmul. A switch layer decodes the matrices its indices name or, from as many indices as its stack has matrices, the stack once (then MLX's `gather_mm`). The bits are those of the MLX kernel the call lands on, not a pair's own. |
 
-Above 16 rows a format's own dense route is the tile face's dense launch (see below), for a stock affine layer and a plugin's alike; the split-K partition route is gone. The route a stock affine layer takes per shape is decided by PFX's measured per-chip dense tile table (candidates: MLX's matmul, the steel tile, the NAX tile, the rows kernel), not by a rule here.
+Above 16 rows a format's own dense route is the unified direct dense tile
+skeleton (`omlx/formats/tile_dense.py`), for a stock affine layer and a
+plugin's alike; the split-K partition route is gone. At layer construction
+time `tile_dense.build_plan` resolves the layer's per-chip schedule via
+`omlx.formats.tuning.lookup` over `omlx/formats/tuning/v1/<chip>.json`
+(candidates: `steel`, `nax`, `wide`, `rows`, or `mlx` for affine shapes;
+falling back to the skeleton's per-chip parity floor when no entry matches).
 
  A switch layer's decode outside the rows kernel decodes its whole stack at once for a call of at least 20 pairs per matrix (`linear._AT_ONCE_PAIRS`) when the stack is within 2 GiB (`linear._DECODE_AT_ONCE_BYTES`), counted in the decode's dtype and, when `x`'s differs, in `x`'s too: on Flash-Next's stack (512 matrices of 640 × 2560) with affine's decode and bfloat16 `x`, 40,960 sorted pairs peak at 1.56 GiB above the inputs, in 33 ms on an M5 Max and 43 ms on an M3 Ultra, against 63 and 144 ms in pieces. Below 20 pairs per matrix pieces are faster (at 5,120 pairs a decode at once takes 1.16 times their time on an M5 Max, 1.06 on an M3 Ultra; at 10,240 the two tie on an M5 Max), so a stack of more matrices than a piece holds is decoded a piece at a time there (pairs counted with their rows of `x`), and above the budget: 256 MiB of them (`linear._DECODE_BYTES`) counted as float32 and in `x`'s dtype. Fewer indices than the stack has matrices are decoded alone: at once when a piece holds them (broadcast over `x`), else a pair at a time while the pairs of `x` and the indices are fewer than the stack's matrices, and over the stack when they are not, so that a call never decodes more matrices than the stack has. MLX keeps every piece of one evaluation in flight and frees a buffer when its command buffer completes, so only many small pieces, which split its command buffers, hold less than a decode at once (seven pieces of 81 matrices peaked at 1.86 GiB there): a float32 decode of the same stack peaks at 1.40 GiB instead of 4.69, in 104 ms instead of 119 on an M5 Max and 172 instead of 142 on an M3 Ultra. Over the stack each piece's `gather_mm` takes every pair, so a call costs pieces × the gather's work; each pair keeps the product of the piece that holds its matrix. With a decode that works element by element, as affine's does, a pair keeps the bits of a decode at once: over the stack, and over the matrices of the indices when `x` has one row for each index, as a model calls a switch layer; with more rows MLX's matmul may choose another kernel for a piece's smaller batch. A switch layer's kernel takes any number of pairs, one mat-vec each. Over affine weights on an M5 Max, up to 256 pairs it takes 0.8 to 1.1 of the time of MLX's `gather_qmm`, and at a prefill's 1024 to 8192 pairs MLX's sorted `gather_qmm` is 1.6 to 6.2 times faster. The rows kernel is proved as every kernel in a model's forward (see [Kernels over faces](#kernels-over-faces)): a face that does not compile is logged with the compiler's messages (`quant format face <key>: rows kernel failed; decode fallback`), and the layers of the same face, tensor dtypes and shape run through `decode`. A layer's first launch is safe inside a function that `mx.compile` traces, where `x`, the indices and, in a function compiled over the model's state (`inputs=`), the layer's own tensors cannot be evaluated. The layer proves the launch on a stand-in: the smallest launch that MLX generates the same Metal for, over zeros in the place of `x`, of the indices and of the tensors. It evaluates nothing of the call, and what fails in `x`, in the indices or in a tensor is raised where the caller evaluates the result. The stand-in's zeros are made on the GPU's stream and evaluated by the proof ahead of the launch, and the stream is synchronized: what fails in making them, or what an earlier evaluation left pending on the GPU, is raised by the call and fails no proof. Inside a function compiled over the model's state, such an error leaves the state's arrays as MLX's trace left them, placeholders without a value (MLX restores a compiled function's state only when the function returns): the model is loaded again. The call raises it all the same: an error left pending is an earlier evaluation's, which nothing else would report. A matrix's stand-in is one vector over zeros of each tensor's whole shape, once for a layout and a dtype of `x`, or for rows in the shared-rows launch one group of rows over the first tile of outputs, once for a dtype and a group: what follows the rows in a matrix's tensors is the format's own, so no part of one is known to be all that a row reads. A stack's stand-in has the fewest matrices that leave each tensor 8 elements (one, unless a tensor has fewer than 8 elements a matrix), and of `x` one row with its pairs where the call has fewer than 8 pairs, or the fewest rows that have 8 pairs between them: MLX binds fewer than 8 indices another way.
 
-For dense prefill above 16 rows, both backends treat a format matrix as one
-expert. Both accept fp16 or bf16, positive K in multiples of 32 and positive
-N. Tensor units require whole 32-column tiles and fewer than 2³¹ rows; the
-steel matrix kernels accept a partial output tile and fewer than 2³⁰ rows.
-The output has the bits of a one-expert sorted gather over the decoded
-matrix rounded to the activation dtype. This can change prefill by one ulp
-compared with `x @ W.T` on a dense plugin checkpoint, including the 27B down
-projection through 2,048 rows on the M5 Max. A changed prefix can affect
-later greedy tokens. Stock MLX checkpoint linears keep their own kernels.
+For dense prefill above 16 rows, `omlx/formats/tile_dense.py` runs one
+parameterized direct dense skeleton (steel or NAX) over the format's tile
+face with zero MoE schedule, offsets or params buffers. Both accept fp16 or
+bf16, positive K in multiples of 32 and positive N (including partial output
+tiles and split-K partitions); tensor units accept fewer than 2³¹ rows and
+steel fewer than 2³⁰ rows. Without split-K the output matches a one-expert
+sorted gather over the decoded matrix rounded to the activation dtype; split-K
+accumulates float32 partial sums across K partitions and stays within MLX's
+float32 reference error bound (rule 17; stock affine checkpoints also obey
+rule 32 KL/greedy bars).
 
 During row-exact verification, a dot face computes groups of up to 16 rows
 with their individual decode bits. Each thread keeps separate graphs for
@@ -759,8 +766,9 @@ The values a thread decodes are whole groups or lie in one group: hence a `GROUP
 Three things to know when writing one:
 
 - A run of eight b-bit codes occupies b bytes. For 2-, 4- and 8-bit codes,
-  read a run as a `ushort`, `uint` or `packed_uint2` when the base is aligned to
-  2, 4 or 4 bytes respectively. Byte loads also work on unaligned storage.
+  read a run as a `ushort`, `uint` or `uint2` (`packed_uint2` when K is not a
+  multiple of 8) when the base is aligned to 2, 4 or 8 (4 for packed) bytes
+  respectively. Byte loads also work on unaligned storage.
   A 3-bit run takes three byte loads, or one byte and an aligned `ushort`. A
   four-byte load at the last run of the last matrix reads past the array (rule 1).
 - A face's source is a function of its `key`: whatever the source is built from goes in the key (the bit width, the group size). A table of values that a checkpoint carries is no part of the source: it is the face's `tables` (see [Tables](#tables)), and faces of two checkpoints with different tables are two kernels whatever their keys.
@@ -1332,7 +1340,7 @@ Its tile face gives each weight as `scale * q + bias` computed in float32, which
 
 | | Covered |
 |---|---|
-| Bits | 2, 3, 4, 5, 6 and 8 (both `AffineFormat.tile` and `affine.tile_face`): a run of 8 codes is 2, 3, 4, 5, 6 or 8 bytes at its own alignment (`ushort` at 2 bits, three byte loads at 3, `uint` at 4, `uint8_t[5]` at 5, `ushort[3]` at 6, `packed_uint2` at 8; `affine._RUNS`). |
+| Bits | 2, 3, 4, 5, 6 and 8 (both `AffineFormat.tile` and `affine.tile_face`): a run of 8 codes is 2, 3, 4, 5, 6 or 8 bytes at its own alignment (`ushort` at 2 bits, three byte loads at 3, `uint` at 4, `uint8_t[5]` at 5, `ushort[3]` at 6, `uint2` when `K % 8 == 0` else `packed_uint2` at 8; `affine._RUNS`). |
 | Group size | 32, 64, 128 |
 | Scales and biases | both bf16 or both fp16, one of each for each group of a row: exact for activations of that dtype. |
 | Weights | 32-bit words, a matrix or a stack of them, K whole groups (its `Runs<K>` asserts it), scales of 8 elements or more |

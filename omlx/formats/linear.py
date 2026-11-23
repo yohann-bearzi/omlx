@@ -262,28 +262,25 @@ class _Plan(NamedTuple):
 
 
 def _tile(layer) -> _Tile | None:
-    """Bind the tile backend for this GPU with its own proof and operands."""
+    """Bind the sorted-gather tile backend for a switch layer on this GPU."""
     face = formats.tile(layer, layer.input_dims, layer.output_dims)
     if face is None:
         return None
     if _nax_host():
         from ..patches import m5_gather_qmm_nax as nax
 
-        kernel = nax._face_kernel(face, "plain" if layer._STACK else "one_run")
-        route = "format_switch_tile_nax" if layer._STACK else "format_linear_tile_nax"
+        kernel = nax._face_kernel(face, "plain")
+        route = "format_switch_tile_nax"
     else:
         from . import tile_gather
 
         kernel = tile_gather.kernel(face)
-        route = (
-            "format_switch_tile_steel" if layer._STACK else "format_linear_tile_steel"
-        )
+        route = "format_switch_tile_steel"
     if kernel is None:
         return None
-    fallback = "rows kernel" if layer._STACK else "decode"
     said = (
         f"quant format face {face.key}: tile kernel engaged",
-        f"quant format face {face.key}: tile kernel failed; {fallback} fallback",
+        f"quant format face {face.key}: tile kernel failed; rows kernel fallback",
     )
     operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
     dtypes = tuple(a.dtype for a in operands)
@@ -913,7 +910,16 @@ class _Kept:
     array the record was worked out over; another array retires it whole,
     as a write of any tensor or attribute does."""
 
-    __slots__ = ("plan", "bias", "weight", "routes", "wide", "dense", "sorted")
+    __slots__ = (
+        "plan",
+        "bias",
+        "weight",
+        "routes",
+        "wide",
+        "dense",
+        "dense_fast",
+        "sorted",
+    )
 
     def __init__(self, plan, bias, weight):
         self.plan = plan
@@ -922,6 +928,7 @@ class _Kept:
         self.routes = {}
         self.wide = _UNBUILT
         self.dense = _UNBUILT
+        self.dense_fast = None
         self.sorted = _UNBUILT
 
 
@@ -1244,10 +1251,11 @@ class _FormatLayer(nn.Module):
         kept = self.__dict__[_KEPT] = _Kept(_plan(self), bias, self[packed_name(self)])
         return kept
 
-    def _dense_tile(self, kept: _Kept) -> _Tile | None:
-        """The dense-prefill tile, built once; None where the layer's format
-        has no face this GPU's tile kernel takes. It dies with the record."""
-        kept.dense = _tile(self)
+    def _dense_tile(self, kept: _Kept) -> tile_dense.DensePlan | None:
+        """The dense-prefill plan, built once with this chip's schedule; None
+        where the layer's format has no face this GPU's tile skeleton takes.
+        It dies with the record."""
+        kept.dense = tile_dense.build_plan(self, tensor_units=_nax_host())
         return kept.dense
 
     def __delitem__(self, key: str) -> None:
@@ -1402,6 +1410,41 @@ class FormatLinear(_FormatLayer):
             mode=self.mode,
         )
 
+    def _ordinary_serves(self, rows: int) -> bool:
+        """Whether the ordinary rows kernel serves this layer at ``rows``:
+        the construction-time check a "rows" table bucket must pass for
+        every chunk size it can issue (rule 28, fail closed)."""
+        architecture = _metal_architecture()
+        if not architecture:
+            return False
+        kept = self.__dict__.get(_KEPT)
+        plan = _plan(self) if kept is None else kept.plan
+        if plan is None:
+            return False
+        folded = traversal(
+            rows, plan.n, plan.k, self.group_size, architecture, bits=self.bits
+        )
+        return folded[0] in ("rows", "wide")
+
+    def _ordinary_rows(self, kept, x):
+        """The ordinary rows kernel, chunked to MAX_ROWS rows a call: what
+        prefill ran before the dense tile replaced it."""
+        if kept.plan is None:
+            return None
+        k = self.input_dims
+        n = self.output_dims
+        rows = x.size // k
+        flat = x.reshape(-1, k)
+        pieces = []
+        for start in range(0, rows, MAX_ROWS):
+            part = flat[start : start + MAX_ROWS]
+            y = self._ordinary(kept, part, (part.shape, part.dtype))
+            if y is None:
+                return None
+            pieces.append(y)
+        out = pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=0)
+        return out.reshape(*x.shape[:-1], n)
+
     def _ordinary(self, kept, x, signature):
         plan = kept.plan
         architecture = _metal_architecture()
@@ -1411,6 +1454,12 @@ class FormatLinear(_FormatLayer):
         geometry = (plan.n, plan.k, self.group_size, architecture)
         folded = traversal(rows, *geometry, bits=self.bits)
         if folded[0] not in ("rows", "wide"):
+            if (
+                folded[0] in ("qmm", "split_k")
+                and rows <= MAX_ROWS
+                and (x.ndim < 3 or rows == x.shape[-2])
+            ):
+                return self._prefill(kept, x, rows)
             return None
         if (
             signature[0][:-1] == (2, 1)
@@ -1486,14 +1535,23 @@ class FormatLinear(_FormatLayer):
             self._register_fast(kept, tile, signature)
         return y
 
-    def _register_fast(self, kept, tile: _Tile, signature: tuple) -> None:
-        graph = tile.proof.graphs.get(signature)
+    def _register_fast(
+        self, kept, tile, signature: tuple, *, proof_state: dict | None = None
+    ) -> None:
+        if proof_state is None:
+            graph = tile.proof.graphs.get(signature)
+            proof_state = vars(tile.proof)
+        else:
+            kept_local = proof_state.get("_kept")
+            graph = None if kept_local is None else kept_local.graphs.get(signature)
         if graph is None:
             return
         # Each plan binds its own operands and live proof. A layer can switch
-        # between a prefill's wide graph and the two-request decode graph.
-        binding = ("native", id(tile))
-        fast = kept.routes.get(binding)
+        # between a prefill's wide graph, dense graph and two-request decode.
+        # Dense prefill keeps its own slot so declining an ordinary route never
+        # allocates kept.routes.
+        is_dense = tile is kept.dense
+        fast = kept.dense_fast if is_dense else kept.routes.get(("native", id(tile)))
         if fast is None:
             try:
                 from ..custom_kernels.quant_matmul import fast as native
@@ -1508,31 +1566,45 @@ class FormatLinear(_FormatLayer):
                 kept.weight,
                 kept.bias,
                 tile.operands,
-                vars(tile.proof),
+                proof_state,
                 packed_name(self),
             )
             if fast is None:
                 _log_native_fallback()
                 return
-            kept.routes[binding] = fast
+            if is_dense:
+                kept.dense_fast = fast
+            else:
+                kept.routes[("native", id(tile))] = fast
         fast.__self__.register(signature)
         self.__dict__[_FAST] = fast
 
     def _prefill(self, kept, x, rows):
-        """A dense call above MAX_ROWS over the format's tile face, as one
-        run of expert zero; None where the call decodes instead."""
-        n = self.output_dims
-        tensor_units = _nax_host()
-        if (
-            x.dtype not in (mx.float16, mx.bfloat16)
-            or self.input_dims % 32
-            or n <= 0
-            or (tensor_units and n % 32)
-            or rows >= (2**31 if tensor_units else 2**30)
-        ):
+        """A dense call above MAX_ROWS over the format's tile face via the
+        unified direct dense skeleton; None where the call decodes instead."""
+        if x.dtype not in (mx.float16, mx.bfloat16):
             return None
-        tile = kept.dense if kept.dense is not _UNBUILT else self._dense_tile(kept)
-        return tile_dense.project(tile, x, tensor_units=tensor_units)
+        row_exact = self._qwen_row_exact
+        if row_exact is not None and row_exact():
+            # Armed row-exact exactness: rows go serial, bitwise to decode.
+            return None
+        plan = kept.dense
+        if plan is _UNBUILT:
+            if self.input_dims % 32 or self.output_dims <= 0:
+                kept.dense = None
+                return None
+            plan = self._dense_tile(kept)
+        if plan is None or rows >= plan.row_limit:
+            return None
+        policy = tile_dense.policy_for(plan, rows, x.dtype)
+        if policy is not None and policy.backend == "rows":
+            return self._ordinary_rows(kept, x)
+        y = tile_dense.project(plan, x)
+        if y is not None and (x.ndim < 3 or rows == x.shape[-2]):
+            self._register_fast(
+                kept, plan, (x.shape, x.dtype), proof_state=plan.binding.state
+            )
+        return y
 
     def __call__(self, x: mx.array) -> mx.array:
         fast = self._fast

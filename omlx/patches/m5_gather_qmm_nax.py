@@ -1254,31 +1254,6 @@ _SCANNED_TILE = """omlx_gqmm::tile_of<GX>(
             tiles, tile_count[0], threadgroup_position_in_grid, params[0],
             desc, y_col)"""
 
-_ONE_RUN_HEADER = """
-namespace omlx_gqmm {
-// A dense matrix has just expert zero. Use the gather plan's grid order and
-// derive its single run directly, including the last partial tile.
-template <int GX, int BM>
-METAL_FUNC bool one_run_tile(
-    uint rows, uint3 tid, int N, thread uint4& desc, thread int& y_col) {
-  uint t = tid.y;
-  uint c = tid.x;
-  if constexpr (GX > 0) {
-    const uint n_cols = (uint(N) + kBN - 1) / kBN;
-    t = (tid.y / n_cols) * GX + tid.x;
-    c = tid.y % n_cols;
-  }
-  if (t >= (rows + BM - 1) / BM) {
-    return false;
-  }
-  const uint row = t * BM;
-  desc = uint4(row, 0, min(uint(BM), rows - row), 0);
-  y_col = int(c) * kBN;
-  return true;
-}
-} // namespace omlx_gqmm
-"""
-
 _FACE_SOURCE_TMPL = """
     using G = omlx_gqmm::Geo<BM, BK>;
     constexpr int BKP = BK + 16 / sizeof(T);
@@ -1295,9 +1270,9 @@ _FACE_SOURCE_TMPL = """
         omlx_gqmm::ActArgs<T>{{{args}}});
 """
 
-# The kernels over a face, by kind: the plain matmul, the dense one run, and
-# its activation epilogue on a fused [gate; up] matrix, on the sorted rows or
-# through the row map: (name suffix, source, inputs after params).
+# The kernels over a face, by kind: the plain sorted gather and its activation
+# epilogue on a fused [gate; up] matrix, on the sorted rows or through the row
+# map: (name suffix, source, inputs after params).
 _FACE_KINDS = {
     "plain": (
         "",
@@ -1307,21 +1282,6 @@ _FACE_KINDS = {
             epi="0",
             mapped="false",
             rmap="tiles",
-            args="",
-        ),
-        [],
-    ),
-    "one_run": (
-        "_one_run",
-        _FACE_SOURCE_TMPL.format(
-            tile=(
-                "omlx_gqmm::one_run_tile<GX, BM>(params[1], "
-                "threadgroup_position_in_grid, params[0], desc, y_col)"
-            ),
-            align_n="ALIGN_N",
-            epi="0",
-            mapped="false",
-            rmap="nullptr",
             args="",
         ),
         [],
@@ -1633,12 +1593,10 @@ def _get_kernel(kind: str):
 
 def _face_kernel(face: Tile, kind: str = "plain"):
     """Build (once) the kernel of ``kind`` (``_FACE_KINDS``) over tile face
-    ``face``, ``omlx_gqmm_<key>[_one_run|_swiglu[_map]]``: its inputs are
-    ``x``, the face's matrix (``w_weight`` and ``w_<tensor>``) and ``params``;
-    all kinds but ``one_run`` also take ``tiles`` and ``tile_count`` before
-    ``params``, and the
-    activation kinds the epilogue's ``lim``, the mapped one the row map
-    ``rmap``. ``one_run`` derives a single expert's run from the grid."""
+    ``face``, ``omlx_gqmm_<key>[_swiglu[_map]]``: its inputs are ``x``, the
+    face's matrix (``w_weight`` and ``w_<tensor>``), ``tiles``, ``tile_count``,
+    and ``params``, plus the activation kinds' ``lim`` and the mapped one's
+    row map ``rmap``."""
     global _header_failed, _act_header_failed
     kernel = _kernels.get((face, kind))
     act = kind in ("act", "act_map")
@@ -1663,10 +1621,7 @@ def _face_kernel(face: Tile, kind: str = "plain"):
             return None
         suffix, source, extra = _FACE_KINDS[kind]
         matrices = format_kernels.Matrices()
-        inputs = ["x", *matrices.add("w", face)]
-        if kind != "one_run":
-            inputs.extend(("tiles", "tile_count"))
-        inputs.append("params")
+        inputs = ["x", *matrices.add("w", face), "tiles", "tile_count", "params"]
         staged = matrices.staged_bytes
         if staged:
             # The face's staged tables take threadgroup memory: the pad,
@@ -1683,8 +1638,7 @@ def _face_kernel(face: Tile, kind: str = "plain"):
             + matrices.header
             + _MM_HEADER
             + (_ACT_HEADER if act else "")
-            + _FACE_HEADER
-            + (_ONE_RUN_HEADER if kind == "one_run" else ""),
+            + _FACE_HEADER,
             source=matrices.declarations + source,
         )
         _kernels[(face, kind)] = kernel
@@ -2068,10 +2022,7 @@ def _self_test(key: tuple) -> Optional[bool]:
             ok = bool(mx.array_equal(out, ref).item())
             detail = "not bit-identical to mlx's sorted kernel"
         else:
-            ref = (
-                x.astype(mx.float32)
-                @ wd[idx].swapaxes(-1, -2).astype(mx.float32)
-            )
+            ref = x.astype(mx.float32) @ wd[idx].swapaxes(-1, -2).astype(mx.float32)
             err = mx.abs(out.astype(mx.float32) - ref).max().item()
             scale = mx.abs(ref).max().item()
             ok = err <= scale / 64
@@ -2391,8 +2342,19 @@ def sorted_gather_qmm_swiglu(
         ):
             return None
     return _launch(
-        x, w, scales, biases, indices, group_size, bits, mode, plan, stream,
-        epi=epi, limit=limit, row_map=row_map,
+        x,
+        w,
+        scales,
+        biases,
+        indices,
+        group_size,
+        bits,
+        mode,
+        plan,
+        stream,
+        epi=epi,
+        limit=limit,
+        row_map=row_map,
     )
 
 
@@ -2457,7 +2419,19 @@ def sorted_gather_qmm_swiglu_oai(
         ):
             return None
     return _launch(
-        x, w, scales, None, indices, group_size, bits, mode, plan, stream,
-        epi=_EPI_OAI, limit=consts, row_map=row_map, up=(wu, su),
+        x,
+        w,
+        scales,
+        None,
+        indices,
+        group_size,
+        bits,
+        mode,
+        plan,
+        stream,
+        epi=_EPI_OAI,
+        limit=consts,
+        row_map=row_map,
+        up=(wu, su),
         expert_scales=expert_scales,
     )

@@ -314,9 +314,44 @@ def test_lookup_is_thread_safe_and_reads_a_table_once(tmp_path, monkeypatch):
 
 
 def test_every_in_tree_entry_is_current(tmp_path):
-    # The in-tree tables ship empty; when they gain entries this lists every
-    # stale one (a skeleton or face hash that no longer matches) as one failure.
-    assert tuning.stale_entries([tuning._V1]) == []
+    # Re-register the live dense_tile skeleton (fresh_tuner swaps in a dummy
+    # digest) and validate every shipped entry's skeleton_sha256, face_sha256,
+    # and legality against all shipped affine tile faces.
+    from omlx.formats import affine, tile_dense
+
+    tuning.register_skeleton("dense_tile", tile_dense._SKELETON_TEXT)
+    faces = {
+        face.key: face
+        for dt in (mx.bfloat16, mx.float16)
+        for bits in (2, 3, 4, 5, 6, 8)
+        for gs in (32, 64, 128)
+        for face in (affine.tile_face(bits, gs, dt),)
+    }
+    chips: dict[str, list] = {}
+    files = sorted(tuning._V1.glob("*.json"))
+    assert {p.stem for p in files} >= {"applegpu_g15d_c80", "applegpu_g17s_c40"}
+    for path in files:
+        tuning._read_table(path, chips)
+    assert len(chips["applegpu_g15d_c80"]) > 0
+    assert len(chips["applegpu_g17s_c40"]) > 0
+    for chip, entries in chips.items():
+        for entry in entries:
+            face = faces[entry.key["face_id"]]
+            span = entry.rows_span
+            sample_m = (
+                span[1]
+                if (span is not None and span[1] is not None)
+                else max(4096, (span[0] if span and span[0] else 17))
+            )
+            assert entry.params.is_legal(
+                face,
+                entry.key["k"],
+                entry.key["n"],
+                sample_m,
+                chip,
+                dtype=entry.key["dtype"],
+            ), f"illegal in-tree entry on {chip}: {entry}"
+    assert tuning.stale_entries([tuning._V1], faces) == []
 
 
 def test_stale_entries_lists_a_skeleton_and_a_face(tmp_path):
@@ -1244,7 +1279,9 @@ def test_read_table_refuses_each_malformed_key_field(tmp_path, change, match):
 def test_read_table_rejects_unknown_bucket_labels(tmp_path):
     face = _face()
     for key_change in (
-        {"rows_bucket": "1024-2048"},
+        # A custom lo-hi span is a legal label (PFX's row spans); a reversed
+        # range is not, so an unknown-label typo still fails closed.
+        {"rows_bucket": "33-32"},
         {"n_bucket": "N1024-4096", "k_bucket": "K>4096"},
         {"n_bucket": "N1025-4096", "k_bucket": "K>=4096"},
     ):
@@ -1322,6 +1359,8 @@ def test_direct_is_legal_refuses_a_bad_param_staging():
     assert not schema.DenseTilePolicy(
         "nax", 64, 64, 64, param_staging="bogus"
     ).is_legal(face, 5120, 2560, 2048, CHIP)
+
+
 def _stub_face():
     from types import SimpleNamespace
 
@@ -1344,12 +1383,8 @@ def test_mma_tile_is_legal_checks_tg_limits_and_dtype():
     from omlx.formats.tuning.schema import MmaTilePolicy
 
     face = _stub_face()
-    assert not MmaTilePolicy(16, 32, 64).is_legal(
-        face, 2048, 64, 8, "applegpu_g15d"
-    )
-    assert not MmaTilePolicy(16, 32, 16).is_legal(
-        face, 2560, 4096, 24, "applegpu_g15d"
-    )
+    assert not MmaTilePolicy(16, 32, 64).is_legal(face, 2048, 64, 8, "applegpu_g15d")
+    assert not MmaTilePolicy(16, 32, 16).is_legal(face, 2560, 4096, 24, "applegpu_g15d")
     assert not MmaTilePolicy(16, 32, 16).is_legal(
         face, 2560, 64, 8, "applegpu_g15d", dtype="fp32"
     )
@@ -1358,7 +1393,14 @@ def test_mma_tile_is_legal_checks_tg_limits_and_dtype():
     )
     assert MmaTilePolicy(16, 32, 16).is_legal(face, 2560, 64, 8, "applegpu_g15d")
     assert not MmaTilePolicy(8, 32, 36).is_legal(face, 1152, 64, 8, "applegpu_g15d")
-    for m, legal in ((1, True), (7, True), (8, True), (9, False), (16, False), (17, False)):
+    for m, legal in (
+        (1, True),
+        (7, True),
+        (8, True),
+        (9, False),
+        (16, False),
+        (17, False),
+    ):
         assert (
             MmaTilePolicy(16, 64, 12).is_legal(face, 768, 64, m, "applegpu_g15d")
             is legal
@@ -1457,3 +1499,177 @@ def test_register_skeleton_refuses_a_route_without_row_buckets():
     with pytest.raises(ValueError, match="no row buckets"):
         tuning.register_skeleton("unbucketed", "skeleton")
     tuning.register_skeleton("mma_tile", "skeleton")
+
+
+def test_dense_tile_route_only_backends_and_nax_sched_decode_and_check_legality():
+    face = _face()
+    for backend in ("mlx", "wide", "rows"):
+        pol = schema.params_from_json("dense_tile", {"backend": backend})
+        assert pol == schema.DenseTilePolicy(backend)
+        assert pol.is_legal(face, 2560, 2560, 48, "applegpu_g15d_c80")
+        assert not schema.DenseTilePolicy(backend, bm=32).is_legal(
+            face, 2560, 2560, 48, "applegpu_g15d_c80"
+        )
+        with pytest.raises(ValueError, match="bm|bn|bk"):
+            schema.params_from_json("dense_tile", {"backend": backend, "bm": 32})
+    db = schema.params_from_json(
+        "dense_tile",
+        {
+            "backend": "nax",
+            "bm": 32,
+            "bn": 64,
+            "bk": 64,
+            "wm": 2,
+            "wn": 2,
+            "align_n": True,
+            "sched": "db",
+        },
+    )
+    assert db.sched == "db"
+    assert db.is_legal(face, 2560, 2560, 24, "applegpu_g17s_c40")
+    # Double-buffered NAX requires aligned N, aligned K, even TN, and 2x Ws TG budget.
+    assert not schema.DenseTilePolicy(
+        "nax", 32, 64, 64, 2, 2, align_n=False, sched="db"
+    ).is_legal(face, 2560, 2560, 24, "applegpu_g17s_c40")
+    assert not schema.DenseTilePolicy(
+        "nax", 64, 64, 128, 2, 2, align_n=True, sched="db"
+    ).is_legal(face, 2560, 2560, 64, "applegpu_g17s_c40")
+    assert not schema.DenseTilePolicy(
+        "steel", 32, 64, 64, 2, 2, align_n=True, sched="db"
+    ).is_legal(face, 2560, 2560, 64, "applegpu_g15d_c80")
+    with pytest.raises(ValueError, match="sched"):
+        schema.params_from_json(
+            "dense_tile",
+            {"backend": "nax", "bm": 64, "bn": 64, "bk": 64, "sched": "bogus"},
+        )
+    # Steel WeightLoader requires (BN*BK)/TGP >= 8 and dividing BK.
+    assert not schema.DenseTilePolicy(
+        "steel", 64, 16, 32, wm=4, wn=1, x_nreads=8
+    ).is_legal(face, 2560, 2560, 64, "applegpu_g15d_c80")
+
+
+def test_narrow_rows_span_beats_enclosing_bucket_and_exposes_row_bounds(tmp_path):
+    face = _face()
+    chip = "applegpu_g15d_c80"
+    broad_lo = _entry(
+        face,
+        n=2560,
+        k=2560,
+        rows_bucket="33-48",
+        params={
+            "backend": "steel",
+            "bm": 16,
+            "bn": 16,
+            "bk": 128,
+            "wm": 2,
+            "wn": 2,
+            "align_n": True,
+            "x_nreads": 8,
+            "param_staging": "per_step",
+            "vec_store": True,
+        },
+    )
+    broad_hi = _entry(
+        face,
+        n=2560,
+        k=2560,
+        rows_bucket="49-64",
+        params={
+            "backend": "steel",
+            "bm": 32,
+            "bn": 16,
+            "bk": 128,
+            "wm": 2,
+            "wn": 2,
+            "align_n": True,
+            "x_nreads": 8,
+            "param_staging": "per_step",
+        },
+    )
+    narrow = _entry(
+        face,
+        n=2560,
+        k=2560,
+        rows_bucket="44-52",
+        params={"backend": "rows"},
+    )
+    # Write broad entries BEFORE narrow to confirm span specificity wins over order.
+    _write(tmp_path / "v1", chip, [broad_lo, broad_hi, narrow])
+    tuning.reset_cache()
+
+    assert "row_bounds" in tuning.__all__
+    bounds = tuning.row_bounds("dense_tile", chip=chip)
+    assert 43 in bounds and 52 in bounds
+
+    p43 = _lookup(face, n=2560, k=2560, rows=43, chip=chip)
+    assert p43 is not None and (p43.backend, p43.bm, p43.bk) == ("steel", 16, 128)
+    for r in range(44, 53):
+        pr = _lookup(face, n=2560, k=2560, rows=r, chip=chip)
+        assert pr is not None and pr.backend == "rows", r
+    p53 = _lookup(face, n=2560, k=2560, rows=53, chip=chip)
+    assert p53 is not None and (p53.backend, p53.bm, p53.bk) == ("steel", 32, 128)
+
+
+def test_lookup_empty_chip_fails_closed(tmp_path, monkeypatch):
+    face = _face()
+    _write(tmp_path / "v1", CHIP, [_entry(face)])
+    monkeypatch.setattr(tuning, "current_chip", lambda: CHIP)
+    tuning.reset_cache()
+    assert _lookup(face, chip=None) is not None
+    assert _lookup(face, chip="") is None
+
+
+def test_nax_is_legal_rejects_klt_exceeding_tgp():
+    # kTGP = wm * wn * 32 < BN leaves rows of Ws uninitialized even at kTPR = 1.
+    assert (
+        schema.DenseTilePolicy("nax", 64, 128, 64, wm=1, wn=2).is_legal(
+            _face(), 2560, 2560, 64, "applegpu_g17s_c40"
+        )
+        is False
+    )
+    assert (
+        schema.DenseTilePolicy("nax", 32, 64, 64, wm=1, wn=1).is_legal(
+            _face(), 2560, 2560, 32, "applegpu_g17s_c40"
+        )
+        is False
+    )
+    # kTGP == BN uses kLT = BN (kTPR = 1, 1 thread per Ws row) and is legal.
+    assert (
+        schema.DenseTilePolicy("nax", 64, 128, 64, wm=2, wn=2).is_legal(
+            _face(), 2560, 2560, 64, "applegpu_g17s_c40"
+        )
+        is True
+    )
+    assert (
+        schema.DenseTilePolicy("nax", 32, 32, 64, wm=1, wn=1).is_legal(
+            _face(), 2560, 2560, 32, "applegpu_g17s_c40"
+        )
+        is True
+    )
+
+
+def test_row_bounds_preserves_custom_spans_below_17(tmp_path):
+    face = _face()
+    entry = _entry(face, n=2560, k=2560, rows_bucket="12-14", params={"backend": "mlx"})
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.reset_cache()
+    bounds = tuning.row_bounds("dense_tile", chip=CHIP)
+    assert 11 in bounds and 14 in bounds
+
+
+def test_face_digest_caches_per_face(monkeypatch):
+    import hashlib
+
+    calls = 0
+    real_sha = hashlib.sha256
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return real_sha(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "sha256", counted)
+    face = _face(key="cache_test_face_digest")
+    first = tuning.face_digest(face)
+    second = tuning.face_digest(face)
+    assert first == second and calls == 1
