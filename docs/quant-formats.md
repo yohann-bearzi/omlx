@@ -371,7 +371,18 @@ An in-process model loaded from such a checkpoint also refuses sharding.
 Verification covers the stock model implementation. A checkpoint carrying a
 format refuses a custom `model_file` or class resolver. External drafters and
 their native MTP splitters refuse format checkpoints at entry. An embedded MTP
-head follows its target model's checked load.
+head follows its target model's checked load: Qwen4-Exp's head is built inside
+the same `format_load.loading` context as the trunk when the model settings
+enable it. A checkpoint may name the head in its quantization map under
+`mtp.`, `model.mtp.`, `language_model.mtp.`, `model.language_model.mtp.` or
+`language_model.model.mtp.`: mlx-vlm's load resolves them at the runtime
+`mtp.` path through `_quantization_path_aliases` →
+`Model.quantization_path_aliases`, and oMLX's check accepts those spellings
+(`format_load._entry_names`).
+A head carrying format layers is also run
+by `oq_verify` before a written checkpoint is published (one token, finite
+logits), so a head whose forward fails or yields empty or non-finite logits
+fails the write instead of passing a trunk-only forward.
 
 When a caller supplies `model_config` to mlx-lm, oMLX checks both the
 on-disk family and the family selected by the override before opening
