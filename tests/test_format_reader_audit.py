@@ -1286,22 +1286,12 @@ EXPECTED = {
         "hasattr bits",
     ),
     ("omlx/patches/qwen35_gdn_prework.py", "_canonical_projection"): (
-        "QuantizedLinear",
-        "isinstance " "QuantizedLinear",
         "read bits",
         "read group_size",
-        "read scales",
     ),
     ("omlx/patches/qwen35_gdn_prework.py", "_format_projection"): (
         "read bits",
         "read group_size",
-    ),
-    ("omlx/patches/qwen35_gdn_prework.py", "_one_row_fused_projections"): (
-        "QuantizedLinear",
-        "isinstance " "QuantizedLinear",
-        "read bits",
-        "read " "group_size",
-        "read scales",
     ),
     ("omlx/patches/qwen35_gdn_prework.py", "_stack_format_inputs"): (
         "read bits",

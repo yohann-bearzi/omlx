@@ -121,3 +121,62 @@ def test_the_qwen4_adapter_wires_the_qwen35_q4_patches_in_load_first():
     assert calls
     assert "apply_qwen35_q4_mlp_patch" in calls
     assert "apply_qwen35_q4_prefill_linear_patch" in calls
+
+
+GDN = ROOT / "omlx/patches/qwen35_gdn_prework.py"
+ROW_EXACT = ROOT / "omlx/patches/row_exact_qmv.py"
+
+
+def test_row_exact_qmv_releases_the_one_row_launch():
+    text = ROW_EXACT.read_text()
+    assert "OneRowQmv" not in text
+    assert "one_row_qmv" not in text
+    tree = ast.parse(text)
+    assert not any(
+        isinstance(node, ast.Name) and node.id in ("OneRowQmv", "one_row_qmv")
+        for node in ast.walk(tree)
+    )
+    assert not any(
+        isinstance(node, (ast.ClassDef, ast.FunctionDef))
+        and node.name in ("OneRowQmv", "one_row_qmv")
+        for node in ast.walk(tree)
+    )
+    exported = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "__all__"
+            for target in node.targets
+        )
+    )
+    values = {
+        node.value
+        for node in ast.walk(exported.value)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert "OneRowQmv" not in values and "one_row_qmv" not in values
+
+
+def test_gdn_prework_releases_the_legacy_quantized_paths():
+    tree = ast.parse(GDN.read_text())
+    imported = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.ImportFrom)
+            and node.module
+            and node.module.endswith("row_exact_qmv")
+        ):
+            imported.update(alias.name for alias in node.names)
+    assert "one_row_qmv" not in imported and "rows_qmv" not in imported
+    functions = {
+        node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+    }
+    assert "_one_row_fused_projections" not in functions
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert "_ALLOWED_BITS" not in names and "_ALLOWED_GROUPS" not in names
+    assert not any(
+        isinstance(node, ast.Attribute)
+        and node.attr in ("quantized_matmul", "QuantizedLinear")
+        for node in ast.walk(tree)
+    )

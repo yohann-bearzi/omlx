@@ -67,7 +67,13 @@ def _reference():
 
 
 def _spec_digest(spec) -> str:
-    parts = [spec["name"], spec["header"], spec["source"], *spec["inputs"], *spec["outputs"]]
+    parts = [
+        spec["name"],
+        spec["header"],
+        spec["source"],
+        *spec["inputs"],
+        *spec["outputs"],
+    ]
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()
 
 
@@ -83,8 +89,12 @@ def test_a13_affine_240_specs_byte_identical_to_eae63b6c():
             want["bits"], want["group_size"], want["fast"]
         )
         spec = row_exact_skeleton.kernel_spec(
-            ops, want["bits"], want["group_size"], want["fast"],
-            want["unrolled"], want["count"],
+            ops,
+            want["bits"],
+            want["group_size"],
+            want["fast"],
+            want["unrolled"],
+            want["count"],
         )
         got = {
             "name": spec["name"],
@@ -94,8 +104,15 @@ def test_a13_affine_240_specs_byte_identical_to_eae63b6c():
             "outputs": list(spec["output_names"]),
         }
         if got != {k: want[k] for k in got}:
-            mismatches.append((want["bits"], want["group_size"], want["fast"],
-                               want["unrolled"], want["count"]))
+            mismatches.append(
+                (
+                    want["bits"],
+                    want["group_size"],
+                    want["fast"],
+                    want["unrolled"],
+                    want["count"],
+                )
+            )
         digest.update(_spec_digest(got).encode())
     assert not mismatches, mismatches[:4]
     assert digest.hexdigest() == A13_DIGEST, digest.hexdigest()
@@ -315,8 +332,13 @@ def test_affine_row_ops_size_t64_widens_offsets_while_int32_stays_byte_identical
     want = mx.concatenate(
         [
             mx.quantized_matmul(
-                x[r : r + 1], w, scales=s, biases=b, transpose=True,
-                group_size=64, bits=8,
+                x[r : r + 1],
+                w,
+                scales=s,
+                biases=b,
+                transpose=True,
+                group_size=64,
+                bits=8,
             )
             for r in range(rows)
         ]
@@ -336,7 +358,7 @@ def test_dot_row_ops_compiles_rev1_plugin_face_through_same_skeleton(k, n, unrol
         ops, fast, unrolled, 0, f"omlx_test_plugin_{k}_{n}_{int(unrolled)}"
     )
     assert "omlx_revision" not in spec["header"]
-    assert '#line ' not in spec["header"]
+    assert "#line " not in spec["header"]
     assert kernels.hand_tables(spec["header"]) == ()
 
     mx.random.seed(k + n)
@@ -496,8 +518,13 @@ def test_dot_row_ops_mixed_affine_and_plugin_group_runs_same_skeleton():
     want0 = mx.concatenate(
         [
             mx.quantized_matmul(
-                x[r : r + 1], w0, scales=s0, biases=b0, transpose=True,
-                group_size=64, bits=8,
+                x[r : r + 1],
+                w0,
+                scales=s0,
+                biases=b0,
+                transpose=True,
+                group_size=64,
+                bits=8,
             )
             for r in range(rows)
         ]
@@ -696,7 +723,16 @@ def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
 
     try:
         w, s, b = mk_w(6144, 2560, 8, 64)
-        p1 = row_exact_qmv.one_row_qmv(w, s, b, 8, 64, "affine", mx.bfloat16, 1)
+        p1 = row_exact_qmv.rows_qmv(
+            w,
+            s,
+            b,
+            8,
+            64,
+            "affine",
+            mx.bfloat16,
+            qwen35_gdn_prework._qwen4_verify_out_tile,
+        )
         cur[0] = "gdn_out_m1"
         p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 6144)))
         pm = row_exact_qmv.rows_qmv(
@@ -715,7 +751,16 @@ def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
             pm(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 6144)))
 
         w, s, b = mk_w(2560, 16480, 8, 64)
-        p1 = row_exact_qmv.one_row_qmv(w, s, b, 8, 64, "affine", mx.bfloat16, 2)
+        p1 = row_exact_qmv.rows_qmv(
+            w,
+            s,
+            b,
+            8,
+            64,
+            "affine",
+            mx.bfloat16,
+            qwen35_gdn_prework._qwen4_verify_in_tile,
+        )
         cur[0] = "gdn_in_m1"
         p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 2560)))
         pm = row_exact_qmv.rows_qmv(
@@ -806,9 +851,9 @@ class _Bf16PluginFormat(formats.QuantFormat):
         return self._face
 
     def decode(self, tensors, bits: int, group_size: int) -> mx.array:
-        return (tensors["codes"].astype(mx.float32) - 128.0) * tensors[
-            "group_scales"
-        ][:, None]
+        return (tensors["codes"].astype(mx.float32) - 128.0) * tensors["group_scales"][
+            :, None
+        ]
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -928,9 +973,7 @@ def test_row_exact_plan_uses_slots_and_preflattened_checks():
     at construction so warm hits avoid zip/nested loops and __dict__ reads."""
     assert hasattr(row_exact_skeleton.RowExactPlan, "__slots__")
     face = affine.face(8, 64, True, mx.bfloat16)
-    w, s, b = mx.quantize(
-        mx.zeros((32, 256), dtype=mx.bfloat16), group_size=64, bits=8
-    )
+    w, s, b = mx.quantize(mx.zeros((32, 256), dtype=mx.bfloat16), group_size=64, bits=8)
     single = row_exact_skeleton.build_plan(
         (face,),
         (32,),
@@ -1002,9 +1045,7 @@ def test_format_rows_qmv_isolates_graphs_across_output_widths_and_geometries(
     assert got_narrow.shape == (1, rows, 32), got_narrow.shape
     assert got_wide.shape == (1, rows, 64), got_wide.shape
     for layer, got in zip(layers, (got_narrow, got_wide)):
-        want = mx.concatenate(
-            [layer(x[:, r : r + 1]) for r in range(rows)], axis=1
-        )
+        want = mx.concatenate([layer(x[:, r : r + 1]) for r in range(rows)], axis=1)
         assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
 
     # Same width and input shape, a second geometry: its own graph, so the
@@ -1055,7 +1096,11 @@ def test_build_plan_rejects_direct_input_with_padding_or_group():
     )
     assert (
         row_exact_skeleton.build_plan(
-            (face,), rows=4, geometry=(2, 4, False), direct_input=True, grouped=True,
+            (face,),
+            rows=4,
+            geometry=(2, 4, False),
+            direct_input=True,
+            grouped=True,
             **common,
         )
         is None
@@ -1124,7 +1169,6 @@ def test_quantized_linears_tiled_recovers_after_bias_removed():
     assert row_exact_qmv._group_plan((layer, second), x, rows) is None
     del second["bias"]
     assert row_exact_qmv._group_plan((layer, second), x, rows) is not None
-
 
 
 def test_quantized_linears_tiled_single_layer_invalidates_on_weight_and_bias():

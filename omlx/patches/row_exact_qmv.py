@@ -19,9 +19,7 @@ how many columns a simdgroup owns or how many rows share the threadgroup).
 Both stock MLX affine layers and ``FormatLinear`` layers route through the
 unified ``omlx.formats.row_exact_skeleton`` (``RowExactPlan`` built once at
 construction / first signature); one launch may run several projections of
-one input. ``one_row_qmv`` runs it for the one-row decode call itself, with
-a narrower column tile than stock ``qmv_fast`` so more threadgroups stream
-the weights; it replaces ``quantized_matmul`` bit for bit.
+one input.
 """
 
 from __future__ import annotations
@@ -167,9 +165,7 @@ def _module_launch(
     names = tuple(formats.tensor_names(linear)[0] for linear in linears)
     operand_keys = tuple((name, *face.tensors) for name, face in zip(names, faces))
     operands = tuple(
-        linear[key]
-        for linear, keys in zip(linears, operand_keys)
-        for key in keys
+        linear[key] for linear, keys in zip(linears, operand_keys) for key in keys
     )
     sizes = tuple(int(linear[name].shape[0]) for linear, name in zip(linears, names))
     vpt = faces[0].vpt
@@ -557,11 +553,7 @@ def quantized_linears(linears, x: mx.array) -> tuple:
     shape = x.shape
     k = shape[-1]
     rows = x.size // k if k else 0
-    plan = (
-        _group_plan(linears, x, rows)
-        if rows > 1 and 1 < len(linears) <= 4
-        else None
-    )
+    plan = _group_plan(linears, x, rows) if rows > 1 and 1 < len(linears) <= 4 else None
     if plan is None:
         return tuple(quantized_linear(linear, x) for linear in linears)
     return _launch_group(plan, x, rows, shape)
@@ -669,46 +661,6 @@ def format_rows_qmv(linear, dtype, geometry):
     return project
 
 
-class OneRowQmv:
-    """``mx.quantized_matmul`` of one row on a ``qmv_fast`` shape, bit for bit.
-
-    Stock one-row ``quantized_matmul`` runs ``qmv_fast`` with 8 output columns
-    per threadgroup (4 per simdgroup). A column's arithmetic (its lanes' K-block
-    accumulation and the closing ``simd_sum``) does not depend on how many
-    columns its simdgroup owns, so the same tile kernel with ``2 * rps``
-    columns per threadgroup gives the same bits with more threadgroups in
-    flight. At the Qwen4 GDN decode projections (1x2560 -> 16480 6-bit and
-    1x6144 -> 2560 5-bit) that runs nearer the DRAM floor than the stock
-    kernel, whose launch geometry is fixed.
-    """
-
-    __slots__ = ("_plan",)
-
-    def __init__(self, weight, scales, biases, bits, group_size, dtype, rps):
-        n = int(weight.shape[0])
-        k = int(scales.shape[-1]) * group_size
-        face = _affine_face(bits, group_size, dtype)
-        self._plan = row_exact_skeleton.build_plan(
-            (face,),
-            (n,),
-            k,
-            1,
-            dtype,
-            (1, rps, False),
-            operands=(weight, scales, biases),
-            names=("weight",),
-            operand_keys=(("weight", "scales", "biases"),),
-            grouped=False,
-            direct_input=True,
-        )
-        if self._plan is None:
-            raise ValueError(f"row-exact tile: no plan for {n} outputs of {k} inputs")
-
-    def __call__(self, x: mx.array) -> mx.array:
-        """``x`` is one row ``[..., K]`` of the planned dtype."""
-        return self._plan(x)[0]
-
-
 def _affine_face(bits: int, group_size: int, dtype) -> Dot:
     """The ``qmv_fast`` face of affine tensors taken by position, of scales
     and activations of ``dtype`` (float32 too: GLM's)."""
@@ -748,15 +700,8 @@ def _qmv_fast_layout(
     )
 
 
-def one_row_qmv(weight, scales, biases, bits, group_size, mode, dtype, rps):
-    """A ``OneRowQmv`` on a ``_qmv_fast_layout``, else None."""
-    if not _qmv_fast_layout(weight, scales, biases, bits, group_size, mode, dtype, rps):
-        return None
-    return OneRowQmv(weight, scales, biases, bits, group_size, dtype, rps)
-
-
 class RowsQmv:
-    """``OneRowQmv`` for a block of rows: every row of ``x`` gets one-row
+    """Row-exact affine projection for a block of rows: every row of ``x`` gets one-row
     ``qmv_fast`` bits. ``geometry(rows)`` gives the output columns per
     simdgroup and the rows each threadgroup applies its decoded weight tile
     to (a divisor of ``rows``); launch parameters are kept per row count.
@@ -866,9 +811,7 @@ def rows_qmv(
 
 __all__ = [
     "MAX_ROWS",
-    "OneRowQmv",
     "RowsQmv",
-    "one_row_qmv",
     "quantized_linear",
     "quantized_linears",
     "quantized_linears_tiled",

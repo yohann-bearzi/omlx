@@ -47,7 +47,7 @@ from ..formats.linear import FormatLinear
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
 from .qwen35_verify_qmm import is_row_exact_armed
-from .row_exact_qmv import format_rows_qmv, one_row_qmv, rows_qmv
+from .row_exact_qmv import format_rows_qmv
 
 logger = logging.getLogger(__name__)
 
@@ -1131,8 +1131,22 @@ def _qwen4_decode_step_kernel():
 
 
 def qwen4_decode_step_fused(
-    qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps,
-    hk, hv, dk, dv,
+    qkv,
+    z,
+    b,
+    a,
+    conv_state,
+    conv_w,
+    q_scale,
+    A_log,
+    dt_bias,
+    state,
+    norm_w,
+    eps,
+    hk,
+    hv,
+    dk,
+    dv,
 ):
     """The B1/T1 prework, recurrence and norm-gate in one launch (dk = dv = 128).
 
@@ -1142,7 +1156,20 @@ def qwen4_decode_step_fused(
     """
     rows = dv // 8
     return _qwen4_decode_step_kernel()(
-        inputs=[qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
+        inputs=[
+            qkv,
+            z,
+            b,
+            a,
+            conv_state,
+            conv_w,
+            q_scale,
+            A_log,
+            dt_bias,
+            state,
+            norm_w,
+            eps,
+        ],
         template=[
             ("T", qkv.dtype),
             ("HK", hk),
@@ -1195,8 +1222,22 @@ _QWEN4_BATCH_DECODE_STEP_KERNEL = None
 
 
 def qwen4_batch_decode_step_fused(
-    qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps,
-    hk, hv, dk, dv,
+    qkv,
+    z,
+    b,
+    a,
+    conv_state,
+    conv_w,
+    q_scale,
+    A_log,
+    dt_bias,
+    state,
+    norm_w,
+    eps,
+    hk,
+    hv,
+    dk,
+    dv,
 ):
     """``qwen4_decode_step_fused`` for each of B rows ([B, 1, ...] inputs and
     [B, ...] states) in one launch."""
@@ -1205,8 +1246,18 @@ def qwen4_batch_decode_step_fused(
         _QWEN4_BATCH_DECODE_STEP_KERNEL = mx.fast.metal_kernel(
             name="omlx_qwen4_gdn_batch_decode_step",
             input_names=[
-                "qkv", "z", "b_in", "a_in", "conv_state", "conv_w", "q_scale",
-                "A_log", "dt_bias", "state_in", "norm_w", "eps",
+                "qkv",
+                "z",
+                "b_in",
+                "a_in",
+                "conv_state",
+                "conv_w",
+                "q_scale",
+                "A_log",
+                "dt_bias",
+                "state_in",
+                "norm_w",
+                "eps",
             ],
             output_names=["conv_out", "state_out", "out"],
             header=_QWEN4_DECODE_HEADER,
@@ -1215,7 +1266,20 @@ def qwen4_batch_decode_step_fused(
     batch = qkv.shape[0]
     rows = dv // 8
     return _QWEN4_BATCH_DECODE_STEP_KERNEL(
-        inputs=[qkv, z, b, a, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps],
+        inputs=[
+            qkv,
+            z,
+            b,
+            a,
+            conv_state,
+            conv_w,
+            q_scale,
+            A_log,
+            dt_bias,
+            state,
+            norm_w,
+            eps,
+        ],
         template=[
             ("T", qkv.dtype),
             ("HK", hk),
@@ -1259,7 +1323,9 @@ def _qwen4_verify_step_kernel(states: bool):
 
 
 @functools.cache
-def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv, history=True):
+def _qwen4_verify_step_launch(
+    steps, dtype, state_dtype, c_dim, hk, hv, dk, dv, history=True
+):
     """Launch parameters of ``qwen4_verify_step_fused`` for one block shape."""
     history = history and steps > 1
     rows = dv // 8
@@ -1285,7 +1351,19 @@ def _qwen4_verify_step_launch(steps, dtype, state_dtype, c_dim, hk, hv, dk, dv, 
 
 
 def qwen4_verify_step_fused(
-    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    proj,
+    conv_state,
+    conv_w,
+    q_scale,
+    A_log,
+    dt_bias,
+    state,
+    norm_w,
+    eps,
+    hk,
+    hv,
+    dk,
+    dv,
     history=True,
 ):
     """``S = proj.shape[1]`` decode steps from (conv_state, state) in one launch
@@ -1323,8 +1401,6 @@ def configure_qwen4_decode(model, *, wide_projections: bool) -> None:
             module._omlx_qwen4_wide_projections = wide_projections
 
 
-_ALLOWED_BITS = frozenset({2, 3, 4, 5, 6, 8})
-_ALLOWED_GROUPS = frozenset({32, 64, 128})
 _QWEN4_HIDDEN_SIZE = 2560
 
 
@@ -1400,33 +1476,12 @@ def _exact_format_face(linear, k, n, dtype):
 
 
 def _canonical_projection(linear, rows, signatures, dtype, in_dim=_QWEN4_HIDDEN_SIZE):
-    # The q4 prefill routing reclasses these projections to a QuantizedLinear
-    # subclass; the fused decode reads their packed storage, not their forward.
-    if isinstance(linear, FormatLinear):
-        return (
-            signatures is None or (linear.bits, linear.group_size) in signatures
-        ) and _format_projection(linear, rows, in_dim, dtype)
-    if not isinstance(linear, nn.QuantizedLinear) or linear.mode != "affine":
-        return False
-    signature = (linear.bits, linear.group_size)
-    if signatures is not None and signature not in signatures:
-        return False
-    if signature[0] not in _ALLOWED_BITS or signature[1] not in _ALLOWED_GROUPS:
-        return False
-    bits, group_size = signature
-    if in_dim % group_size:
-        return False
-    packed_cols = in_dim * bits // 32
-    scale_cols = in_dim // group_size
+    """The format projection's geometry: a format layer whose bits/group the
+    caller's signatures admit and whose packed storage fits ``in_dim``."""
     return (
-        linear.weight.shape == (rows, packed_cols)
-        and linear.weight.dtype == mx.uint32
-        and linear.scales.shape == (rows, scale_cols)
-        and linear.scales.dtype == dtype
-        and linear.biases is not None
-        and linear.biases.shape == (rows, scale_cols)
-        and linear.biases.dtype == dtype
-        and "bias" not in linear
+        isinstance(linear, FormatLinear)
+        and (signatures is None or (linear.bits, linear.group_size) in signatures)
+        and _format_projection(linear, rows, in_dim, dtype)
     )
 
 
@@ -1475,57 +1530,6 @@ def _qwen4_decode_static_check(module) -> bool:
         out_signatures,
         dtype,
         in_dim=module.num_v_heads * module.head_v_dim,
-    )
-
-
-def _one_row_fused_projections(linears, dtype):
-    """Operands of mlx-vlm's one-row fused in-projection, or None when it keeps four.
-
-    ``_target_verify_linears`` runs one-row decode through
-    ``_decode_quantized_linears_fused``: one ``quantized_matmul`` over the
-    row-concatenated projections, split back, when all four share bits, group
-    size and mode. This mirrors its gate (the input is always one row of the
-    layer's compute ``dtype`` here) and shares its concatenation cache on the
-    first projection.
-    """
-    first = linears[0]
-    if not all(
-        isinstance(linear, nn.QuantizedLinear)
-        and linear.bits == first.bits
-        and linear.group_size == first.group_size
-        and linear.mode == first.mode
-        and linear.biases is not None
-        and linear.scales.dtype == dtype
-        and linear.biases.dtype == dtype
-        and "bias" not in linear
-        for linear in linears
-    ):
-        return None
-    cache_key = tuple(
-        (id(linear.weight), id(linear.scales), id(linear.biases)) for linear in linears
-    )
-    cached = getattr(first, "_fused_decode_linears", None)
-    if cached is None or cached[0] != cache_key:
-        weights = mx.concatenate([linear.weight for linear in linears], axis=0)
-        scales = mx.concatenate([linear.scales for linear in linears], axis=0)
-        biases = mx.concatenate([linear.biases for linear in linears], axis=0)
-        split_indices = []
-        offset = 0
-        for linear in linears[:-1]:
-            offset += linear.weight.shape[0]
-            split_indices.append(offset)
-        mx.eval(weights, scales, biases)
-        cached = (cache_key, weights, scales, biases, split_indices)
-        first._fused_decode_linears = cached
-    _, weights, scales, biases, split_indices = cached
-    return (
-        weights,
-        scales,
-        biases,
-        split_indices,
-        first.group_size,
-        first.bits,
-        first.mode,
     )
 
 
@@ -1587,34 +1591,16 @@ def _build_qwen4_decode_plan(module):
         module.in_proj_b,
         module.in_proj_a,
     )
-    fused = _one_row_fused_projections(projections, dtype)
-    in_qmv = None
-    if isinstance(projections[0], FormatLinear):
-        stacked = _stacked_format_inputs(module)
-        if stacked is not None:
-            in_qmv = format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
-    elif fused is not None:
-        weights, scales, biases, _, group_size, bits, mode = fused
-        in_qmv = one_row_qmv(
-            weights, scales, biases, bits, group_size, mode, dtype, _QWEN4_IN_QMV_RPS
-        )
+    stacked = _stacked_format_inputs(module)
+    in_qmv = (
+        format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
+        if stacked is not None
+        else None
+    )
     out = module.out_proj
-    if isinstance(out, FormatLinear):
-        out_qmv = format_rows_qmv(out, dtype, _qwen4_verify_out_geometry)
-    else:
-        out_qmv = one_row_qmv(
-            out.weight,
-            out.scales,
-            out.biases,
-            out.bits,
-            out.group_size,
-            out.mode,
-            dtype,
-            _QWEN4_OUT_QMV_RPS,
-        )
+    out_qmv = format_rows_qmv(out, dtype, _qwen4_verify_out_geometry)
     return (
         projections,
-        fused,
         module.conv1d.weight,
         mx.array(module.head_k_dim**-0.5, dtype=dtype),
         module.A_log,
@@ -1710,8 +1696,24 @@ def _qwen4_verify_out_geometry(rows):
 # Ultra (oQ5e: 6-bit in-, 5-bit out-projection), each inside the unrolled
 # tile's register envelope at every bit width the kernel serves (at most 16
 # values per lane). Other block sizes keep the pairs above.
-_QWEN4_VERIFY_IN_TILES = {2: (1, 2), 3: (2, 3), 4: (4, 2), 5: (2, 5), 6: (4, 3), 7: (8, 1), 8: (4, 2)}
-_QWEN4_VERIFY_OUT_TILES = {2: (4, 1), 3: (4, 3), 4: (2, 4), 5: (2, 5), 6: (4, 3), 7: (4, 1), 8: (2, 4)}
+_QWEN4_VERIFY_IN_TILES = {
+    2: (1, 2),
+    3: (2, 3),
+    4: (4, 2),
+    5: (2, 5),
+    6: (4, 3),
+    7: (8, 1),
+    8: (4, 2),
+}
+_QWEN4_VERIFY_OUT_TILES = {
+    2: (4, 1),
+    3: (4, 3),
+    4: (2, 4),
+    5: (2, 5),
+    6: (4, 3),
+    7: (4, 1),
+    8: (2, 4),
+}
 
 
 def _qwen4_verify_in_tile(rows):
@@ -1747,41 +1749,11 @@ def _build_qwen4_verify_plan(module):
         and _canonical_projection(out, _QWEN4_HIDDEN_SIZE, None, dtype, in_dim=48 * 128)
     ):
         return None
-    if isinstance(projections[0], FormatLinear):
-        stacked = _stacked_format_inputs(module)
-        if stacked is None:
-            return None
-        in_rows = format_rows_qmv(stacked, dtype, _qwen4_verify_in_tile)
-    else:
-        fused = _one_row_fused_projections(projections, dtype)
-        if fused is None:
-            return None
-        weights, scales, biases, _, group_size, bits, mode = fused
-        in_rows = rows_qmv(
-            weights,
-            scales,
-            biases,
-            bits,
-            group_size,
-            mode,
-            dtype,
-            _qwen4_verify_in_tile,
-            unrolled=True,
-        )
-    if isinstance(out, FormatLinear):
-        out_rows = format_rows_qmv(out, dtype, _qwen4_verify_out_tile)
-    else:
-        out_rows = rows_qmv(
-            out.weight,
-            out.scales,
-            out.biases,
-            out.bits,
-            out.group_size,
-            out.mode,
-            dtype,
-            _qwen4_verify_out_tile,
-            unrolled=True,
-        )
+    stacked = _stacked_format_inputs(module)
+    if stacked is None:
+        return None
+    in_rows = format_rows_qmv(stacked, dtype, _qwen4_verify_in_tile)
+    out_rows = format_rows_qmv(out, dtype, _qwen4_verify_out_tile)
     if in_rows is None or out_rows is None:
         return None
     return (
@@ -1804,7 +1776,9 @@ def _qwen4_verify_plan(module):
     """The cached verify plan of an ``nn.Module`` Qwen4 GDN layer, else None."""
     if not _is_qwen4_gdn(module):
         return None
-    return cached_per_module(module, "_omlx_qwen4_verify_plan", _build_qwen4_verify_plan)
+    return cached_per_module(
+        module, "_omlx_qwen4_verify_plan", _build_qwen4_verify_plan
+    )
 
 
 def _qwen4_verify_state_eligible(inputs, cache, dtype) -> bool:
@@ -1857,17 +1831,45 @@ def _qwen4_verify(plan, inputs, cache):
         and qwen35_gdn_verify_fused.deferred_states_ready(cache, 1, steps)
     )
     conv_state, window, states, state, gated = qwen4_verify_step_fused(
-        proj, conv_start, conv_w, q_scale, A_log, dt_bias, start, norm_w,
-        eps, hk, hv, dk, dv, not deferred,
+        proj,
+        conv_start,
+        conv_w,
+        q_scale,
+        A_log,
+        dt_bias,
+        start,
+        norm_w,
+        eps,
+        hk,
+        hv,
+        dk,
+        dv,
+        not deferred,
     )
     cache.record_speculative_window(0, window, 3)
     cache[0] = conv_state
     if deferred:
         qwen35_gdn_verify_fused.record_deferred_states(
-            cache, 1, start, state, steps,
+            cache,
+            1,
+            start,
+            state,
+            steps,
             functools.partial(
-                _qwen4_state_after, proj, conv_start, conv_w, q_scale, A_log, dt_bias,
-                start, norm_w, eps, hk, hv, dk, dv,
+                _qwen4_state_after,
+                proj,
+                conv_start,
+                conv_w,
+                q_scale,
+                A_log,
+                dt_bias,
+                start,
+                norm_w,
+                eps,
+                hk,
+                hv,
+                dk,
+                dv,
             ),
         )
     else:
@@ -1877,7 +1879,19 @@ def _qwen4_verify(plan, inputs, cache):
 
 
 def _qwen4_state_after(
-    proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, hk, hv, dk, dv,
+    proj,
+    conv_state,
+    conv_w,
+    q_scale,
+    A_log,
+    dt_bias,
+    state,
+    norm_w,
+    eps,
+    hk,
+    hv,
+    dk,
+    dv,
     keep,
 ):
     """The recurrent state after the first ``keep`` rows of a verify block:
@@ -1885,8 +1899,20 @@ def _qwen4_state_after(
     after row ``keep - 1`` bit for bit (row t's arithmetic does not depend
     on the block length)."""
     return qwen4_verify_step_fused(
-        proj[:, :keep], conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w,
-        eps, hk, hv, dk, dv, False,
+        proj[:, :keep],
+        conv_state,
+        conv_w,
+        q_scale,
+        A_log,
+        dt_bias,
+        state,
+        norm_w,
+        eps,
+        hk,
+        hv,
+        dk,
+        dv,
+        False,
     )[3]
 
 
@@ -1923,12 +1949,25 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
 
     Up to ``_QWEN4_BATCH_ROW_EXACT_ROWS`` rows take the verify plan's per-row
     projections (one-row qmv bits), so each row is bit-identical to that row
-    decoded alone; wider batches take one stock quantized matmul per
-    projection, which reads the weights once for all rows (faster from four
-    rows on, M5 Ultra)."""
+    decoded alone; wider batches (or a mixed allocation with no verify plan)
+    take one per-call projection each: the format layer's own forward, or a
+    stock layer's quantized matmul, which reads the weights once for all rows
+    (faster from four rows on, M5 Ultra)."""
     (
-        projections, fused, conv_w, q_scale, A_log, dt_bias, norm_w, eps, out_proj,
-        hk, hv, dk, dv, _, _,
+        projections,
+        conv_w,
+        q_scale,
+        A_log,
+        dt_bias,
+        norm_w,
+        eps,
+        out_proj,
+        hk,
+        hv,
+        dk,
+        dv,
+        _,
+        _,
     ) = plan
     rows = inputs.shape[0]
     verify = _qwen4_verify_plan(module) if rows <= _QWEN4_BATCH_ROW_EXACT_ROWS else None
@@ -1937,18 +1976,25 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
         proj = verify[0](inputs.reshape(1, rows, -1)).reshape(rows, 1, -1)
         split = [c_dim, c_dim + hv * dv, c_dim + hv * dv + hv]
         mixed_qkv, z, b, a = mx.split(proj, split, axis=-1)
-    elif fused is not None:
-        weights, w_scales, w_biases, split, group_size, bits, mode = fused
-        proj = mx.quantized_matmul(
-            inputs, weights, scales=w_scales, biases=w_biases, transpose=True,
-            group_size=group_size, bits=bits, mode=mode,
-        )
-        mixed_qkv, z, b, a = mx.split(proj, split, axis=-1)
     else:
         mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
     conv_state, state, gated = qwen4_batch_decode_step_fused(
-        mixed_qkv, z, b, a, cache[0], conv_w, q_scale, A_log, dt_bias, cache[1], norm_w,
-        eps, hk, hv, dk, dv,
+        mixed_qkv,
+        z,
+        b,
+        a,
+        cache[0],
+        conv_w,
+        q_scale,
+        A_log,
+        dt_bias,
+        cache[1],
+        norm_w,
+        eps,
+        hk,
+        hv,
+        dk,
+        dv,
     )
     if verify is not None:
         result = verify[1](gated.reshape(1, rows, -1)).reshape(rows, 1, -1)
@@ -2096,7 +2142,6 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         norm-gate) and out-projection, each switchable back to its stock form."""
         (
             projections,
-            fused,
             conv_w,
             q_scale,
             A_log,
@@ -2114,29 +2159,41 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         if in_qmv is not None and _QWEN4_DECODE_QMV:
             projected = in_qmv(inputs)
             mixed_qkv, z, b, a = mx.split(projected, _QWEN4_GDN_SPLITS, axis=-1)
-        elif fused is None:
-            mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
         else:
-            weights, w_scales, w_biases, split_indices, group_size, bits, mode = fused
-            projected = mx.quantized_matmul(
-                inputs,
-                weights,
-                scales=w_scales,
-                biases=w_biases,
-                transpose=True,
-                group_size=group_size,
-                bits=bits,
-                mode=mode,
-            )
-            mixed_qkv, z, b, a = mx.split(projected, split_indices, axis=-1)
+            mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
         if _QWEN4_DECODE_STEP_FUSED:
             conv_state, state, gated = qwen4_decode_step_fused(
-                mixed_qkv, z, b, a, cache[0], conv_w, q_scale, A_log, dt_bias,
-                cache[1], norm_w, eps, hk, hv, dk, dv,
+                mixed_qkv,
+                z,
+                b,
+                a,
+                cache[0],
+                conv_w,
+                q_scale,
+                A_log,
+                dt_bias,
+                cache[1],
+                norm_w,
+                eps,
+                hk,
+                hv,
+                dk,
+                dv,
             )
         else:
             q, k, v, conv_state, g, beta = qwen4_decode_prework_fused(
-                mixed_qkv, cache[0], conv_w, q_scale, b, a, A_log, dt_bias, hk, hv, dk, dv
+                mixed_qkv,
+                cache[0],
+                conv_w,
+                q_scale,
+                b,
+                a,
+                A_log,
+                dt_bias,
+                hk,
+                hv,
+                dk,
+                dv,
             )
             out, state = _qwen4_decode_recurrence(q, k, v, g, beta, cache[1])
             gated = _qwen4_norm_gate(out, z, norm_w, eps, hv, dv)
@@ -2165,7 +2222,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         if _QWEN4_DECODE_PLAN_ENABLED and mask is None and cache is not None:
             plan = _qwen4_decode_plan(self)
             if plan is not None:
-                dtype = plan[2].dtype  # conv_w: the layer's compute dtype
+                dtype = plan[1].dtype  # conv_w: the layer's compute dtype
                 if _qwen4_decode_state_eligible(inputs, cache, dtype):
                     return qwen4_decode(self, plan, inputs, cache)
                 if _qwen4_batch_decode_state_eligible(inputs, cache, dtype):
@@ -2304,7 +2361,9 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 global _QWEN4_VERIFY_ENGAGED_LOGGED
                 if not _QWEN4_VERIFY_ENGAGED_LOGGED:
                     _QWEN4_VERIFY_ENGAGED_LOGGED = True
-                    logger.info("[gdn-prework] Qwen4 fused verify engaged (S=%d)", length)
+                    logger.info(
+                        "[gdn-prework] Qwen4 fused verify engaged (S=%d)", length
+                    )
                 return result
         # Qwen4 one-row MTP steps take the fused prework too, so their q/k/v
         # match the fused B1/T1 decode kernel (same L2 arithmetic).

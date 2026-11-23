@@ -21,6 +21,8 @@ from mlx_vlm.speculative.cache_state import start_speculative_cache
 from mlx_vlm.speculative.ops import linear as linear_ops
 
 
+from omlx.formats import testing
+from omlx.formats.linear import FormatLinear
 from omlx.patches import qwen35_gdn_prework as prework_mod
 
 
@@ -44,7 +46,6 @@ from omlx.patches.qwen35_gdn_prework import (
     qwen4_decode_norm_gate_fused,
     qwen4_decode_prework_fused,
 )
-from omlx.patches.qwen35_q4_mlp import _VLMQuantizedPrefillLinear
 
 HK, HV, DK, DV = 16, 48, 128, 128
 C = 2 * HK * DK + HV * DV
@@ -371,16 +372,37 @@ def test_qwen4_verify_prework_rows_equal_serial_decode_steps(seq):
     q_scale = mx.array(DK**-0.5, dtype=mx.bfloat16)
 
     verify = gdn_prework_fused(
-        qkv, state, conv_w, q_scale, mx.array(1.0, dtype=mx.bfloat16), HK, HV, DK, DV, l2=True
+        qkv,
+        state,
+        conv_w,
+        q_scale,
+        mx.array(1.0, dtype=mx.bfloat16),
+        HK,
+        HV,
+        DK,
+        DV,
+        l2=True,
     )
     serial_state = state
     for row in range(seq):
         q, k, v, serial_state, _, _ = qwen4_decode_prework_fused(
-            qkv[:, row : row + 1], serial_state, conv_w, q_scale, b, a, A_log, dt_bias,
-            HK, HV, DK, DV,
+            qkv[:, row : row + 1],
+            serial_state,
+            conv_w,
+            q_scale,
+            b,
+            a,
+            A_log,
+            dt_bias,
+            HK,
+            HV,
+            DK,
+            DV,
         )
         for name, step, window in zip(("q", "k", "v"), (q, k, v), verify[:3]):
-            assert mx.array_equal(step[:, 0], window[:, row]).item(), f"{name} row {row}"
+            assert mx.array_equal(
+                step[:, 0], window[:, row]
+            ).item(), f"{name} row {row}"
     assert mx.array_equal(serial_state, verify[3]).item()
 
 
@@ -441,8 +463,22 @@ def test_qwen4_decode_step_kernel_equals_its_three_launches(dtype, seed):
         y, state_ref = prework_mod._qwen4_decode_recurrence(q, k, v, g, beta, state_ref)
         gated_ref = prework_mod._qwen4_norm_gate(y, z, norm_w, eps, HV, DV)
         conv_new, state_new, gated_new = prework_mod.qwen4_decode_step_fused(
-            qkv, z, b, a, conv_new, conv_w, q_scale, A_log, dt_bias, state_new, norm_w,
-            eps, HK, HV, DK, DV,
+            qkv,
+            z,
+            b,
+            a,
+            conv_new,
+            conv_w,
+            q_scale,
+            A_log,
+            dt_bias,
+            state_new,
+            norm_w,
+            eps,
+            HK,
+            HV,
+            DK,
+            DV,
         )
         for name, expected, observed in (
             ("conv_state", conv_ref, conv_new),
@@ -485,13 +521,10 @@ def test_qwen4_prefill_route_is_bit_exact_across_chunks(monkeypatch, dtype):
         hidden_act="silu",
     )
     module = Qwen4ExpGatedDeltaNet(config)
-    module.update(
-        tree_map(lambda p: (p * 0.2).astype(dtype), module.parameters())
-    )
+    module.update(tree_map(lambda p: (p * 0.2).astype(dtype), module.parameters()))
     module.eval()
     chunks = [
-        (mx.random.normal((1, rows, 2560)) * 0.5).astype(dtype)
-        for rows in (80, 67)
+        (mx.random.normal((1, rows, 2560)) * 0.5).astype(dtype) for rows in (80, 67)
     ]
 
     def run(fused):
@@ -575,21 +608,13 @@ def test_qwen4_decode_dynamic_gate_is_strictly_b1_t1_nonverify(monkeypatch):
 def _fake_quantized_linear(
     input_dims, output_dims, bits, group_size, dtype=mx.bfloat16
 ):
-    linear = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
-    nn.Module.__init__(linear)
-    linear.bits = bits
-    linear.group_size = group_size
-    linear.mode = "affine"
-    linear.weight = mx.zeros(
-        (output_dims, input_dims * bits // 32),
-        dtype=mx.uint32,
-    )
-    linear.scales = mx.zeros(
-        (output_dims, input_dims // group_size),
-        dtype=dtype,
-    )
-    linear.biases = mx.zeros_like(linear.scales)
-    return linear
+    tensors = {
+        "weight": mx.zeros((output_dims, input_dims * bits // 32), dtype=mx.uint32),
+        "scales": mx.zeros((output_dims, input_dims // group_size), dtype=dtype),
+        "biases": mx.zeros((output_dims, input_dims // group_size), dtype=dtype),
+    }
+    with testing.verified("qwen4_exp"):
+        return FormatLinear("affine", bits, group_size, input_dims, tensors)
 
 
 def _canonical_qwen4_decode_module(signatures, dtype=mx.bfloat16):
@@ -691,7 +716,6 @@ def test_qwen4_decode_static_gate_community_allocations_are_opt_in(
 @pytest.mark.parametrize(
     "attribute,value",
     [
-        ("mode", "mxfp4"),
         ("group_size", 96),  # not a group size the quantizer implements
         ("group_size", 16),  # nvfp4-only: mx.quantize rejects it
         ("group_size", 256),  # ditto: affine tops out at 128
@@ -751,16 +775,6 @@ def test_qwen4_decode_wide_projections_are_bit_exact_either_way():
         assert concat_applies == homogeneous, signatures
 
 
-def test_qwen4_decode_wide_allow_list_matches_the_quantizer():
-    from omlx import oq
-
-    assert prework_mod._ALLOWED_GROUPS == frozenset(oq._AFFINE_GROUP_SIZES)
-    for bits in sorted(prework_mod._ALLOWED_BITS):
-        mx.quantize(mx.zeros((64, 2560)), group_size=64, bits=bits, mode="affine")
-    for group in sorted(prework_mod._ALLOWED_GROUPS):
-        mx.quantize(mx.zeros((64, 2560)), group_size=group, bits=8, mode="affine")
-
-
 @pytest.mark.parametrize("hidden_size", [5120, 4096, 2048])
 def test_qwen4_decode_wide_opt_in_stays_within_the_2560_family(hidden_size):
     module = _canonical_qwen4_decode_module(((8, 64), (8, 64), (8, 64), (8, 64)))
@@ -796,13 +810,103 @@ def test_qwen4_decode_static_gate_fails_closed_on_noncanonical_bias():
     assert not prework_mod._qwen4_decode_static_eligible(module)
 
 
-def test_qwen4_decode_static_gate_survives_prefill_linear_reclass():
-    """The VLM engine reclasses projections for q4 prefill routing (#3755)."""
-    module = _canonical_qwen4_decode_module(((6, 64), (6, 64), (6, 64), (6, 64)))
-    for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"):
-        getattr(module, name).__class__ = _VLMQuantizedPrefillLinear
+def _mlx_quantized_linear(input_dims, output_dims, bits, group_size, dtype=mx.bfloat16):
+    linear = nn.QuantizedLinear.__new__(nn.QuantizedLinear)
+    nn.Module.__init__(linear)
+    linear.bits, linear.group_size, linear.mode = bits, group_size, "affine"
+    linear.weight = mx.zeros((output_dims, input_dims * bits // 32), dtype=mx.uint32)
+    linear.scales = mx.zeros((output_dims, input_dims // group_size), dtype=dtype)
+    linear.biases = mx.zeros_like(linear.scales)
+    return linear
 
-    assert prework_mod._qwen4_decode_static_eligible(module)
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_sharded_quantized_linear_gdn_keeps_the_model_path(monkeypatch):
+    """A sharded stock load keeps MLX's nn.QuantizedLinear projections
+    (DEFERRED 29/45): the planned decode declines and the model's own forward
+    serves it, with no format plan invented for the layer."""
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 9)
+    assert prework_mod._qwen4_decode_plan(module) is not None
+    assert prework_mod._qwen4_verify_plan(module) is not None
+    for name in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"):
+        rows = getattr(module, name).output_dims
+        setattr(module, name, _mlx_quantized_linear(2560, rows, 8, 64))
+    module.out_proj = _mlx_quantized_linear(6144, 2560, 8, 64)
+    assert prework_mod._qwen4_decode_plan(module) is None
+    assert prework_mod._qwen4_verify_plan(module) is None
+    assert not prework_mod._qwen4_decode_static_eligible(module)
+    q35 = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+    fallbacks = []
+
+    def stock(self, inputs, mask=None, cache=None):
+        fallbacks.append(inputs.shape)
+        return inputs
+
+    monkeypatch.setattr(prework_mod, "_PATCHED", False)
+    monkeypatch.setattr(q35.Qwen3_5GatedDeltaNet, "__call__", stock)
+    assert prework_mod.apply_qwen35_gdn_prework_patch()
+    _decode_steps(
+        module,
+        [mx.zeros((1, 1, 2560), dtype=mx.bfloat16)],
+        mx.zeros((1, 3, C), dtype=mx.bfloat16),
+        mx.zeros((1, HV, DV, DK)),
+    )
+    assert fallbacks == [(1, 1, 2560)]
+
+
+def test_the_sharded_metal_test_skips_without_metal():
+    marks = getattr(
+        test_sharded_quantized_linear_gdn_keeps_the_model_path, "pytestmark", []
+    )
+    assert any(mark.name == "skipif" for mark in marks)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_qwen4_batch_decode_mixed_allocation_uses_the_per_call_projections(
+    patched_decode,
+):
+    """A mixed allocation has no verify plan; a >1-row batch then takes one
+    per-call projection (the format forward), the batched step and the out
+    projection, bit-identical to the explicit chain."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    module = _real_qwen4_decode_module(((4, 64), (5, 128), (5, 128), (5, 128)), 17)
+    assert prework_mod._qwen4_verify_plan(module) is None
+    rows = 2
+    mx.random.seed(61)
+    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    recurrent = mx.random.normal((rows, HV, DV, DK)) * 0.05
+    batch = ArraysCache(size=2)
+    batch[0], batch[1] = conv_state, recurrent
+    got = module(inputs, cache=batch)
+    mx.eval(got, batch[0], batch[1])
+    projections = (
+        module.in_proj_qkv,
+        module.in_proj_z,
+        module.in_proj_b,
+        module.in_proj_a,
+    )
+    mixed = [projection(inputs) for projection in projections]
+    want_conv, want_state, gated = prework_mod.qwen4_batch_decode_step_fused(
+        *mixed,
+        conv_state,
+        module.conv1d.weight,
+        mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
+        module.A_log,
+        module.dt_bias,
+        recurrent,
+        module.norm.weight,
+        mx.array(module.norm.eps, mx.float32),
+        HK,
+        HV,
+        DK,
+        DV,
+    )
+    want = module.out_proj(gated)
+    mx.eval(want, want_conv, want_state)
+    assert _same(want, got)
+    assert _same(want_conv, batch[0]) and _same(want_state, batch[1])
 
 
 def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
@@ -1078,6 +1182,7 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
         return kernel(main, replay)
 
     monkeypatch.setattr(fused_mod, "_kernel", record)
+
     def same(actual, reference):
         if dtype == mx.bfloat16:
             return mx.array_equal(actual, reference).item()
@@ -1097,9 +1202,7 @@ def test_fused_verify_replays_committed_rows_in_the_next_block(
 @pytest.mark.parametrize(
     "seq,retained", [(8, [8, 8, 8]), (8, [1, 8, 5]), (16, [3, 16, 11])]
 )
-def test_qwen4_verify_records_replay_rows_instead_of_states(
-    monkeypatch, seq, retained
-):
+def test_qwen4_verify_records_replay_rows_instead_of_states(monkeypatch, seq, retained):
     """The L2 verify keeps the stock output kernel but records the block rows,
     so a batched transaction holds no state per position. Outputs and
     committed states stay bit-exact to the stock recording across two blocks."""
@@ -1192,13 +1295,12 @@ def _bits(array):
 
 def _random_projection(input_dims, output_dims, bits, group_size, dtype=mx.bfloat16):
     weight = (mx.random.normal((output_dims, input_dims)) * 0.05).astype(dtype)
-    linear = nn.QuantizedLinear(
-        input_dims, output_dims, bias=False, group_size=group_size, bits=bits
-    )
-    linear.weight, linear.scales, linear.biases = mx.quantize(
+    codes, scales, biases = mx.quantize(
         weight, group_size=group_size, bits=bits, mode="affine"
     )
-    return linear
+    tensors = {"weight": codes, "scales": scales, "biases": biases}
+    with testing.verified("qwen4_exp"):
+        return FormatLinear("affine", bits, group_size, input_dims, tensors)
 
 
 def _real_qwen4_decode_module(signatures, seed, dtype=mx.bfloat16):
@@ -1292,24 +1394,29 @@ def patched_decode(monkeypatch):
 def test_qwen4_planned_decode_is_bit_identical_to_per_call_path(
     monkeypatch, patched_decode, signatures, seed, step_fused, qmv
 ):
-    from omlx.patches.row_exact_qmv import OneRowQmv
-
     monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_STEP_FUSED", step_fused)
     monkeypatch.setattr(prework_mod, "_QWEN4_DECODE_QMV", qmv)
     launches = []
     step = prework_mod.qwen4_decode_step_fused
-    projection = OneRowQmv.__call__
+    plan_rows = prework_mod.format_rows_qmv
 
     def counted_step(*args):
         launches.append("step")
         return step(*args)
 
-    def counted_projection(self, x):
-        launches.append("qmv")
-        return projection(self, x)
+    def counted_format(linear, dtype, geometry):
+        project = plan_rows(linear, dtype, geometry)
+        if project is None:
+            return None
+
+        def counted(x):
+            launches.append("qmv")
+            return project(x)
+
+        return counted
 
     monkeypatch.setattr(prework_mod, "qwen4_decode_step_fused", counted_step)
-    monkeypatch.setattr(OneRowQmv, "__call__", counted_projection)
+    monkeypatch.setattr(prework_mod, "format_rows_qmv", counted_format)
     module = _real_qwen4_decode_module(signatures, seed)
     _assert_planned_decode_matches_per_call_path(monkeypatch, module, 3, seed)
     # The planned steps ran the new launches: the step kernel, the out-projection
@@ -1419,7 +1526,9 @@ def _verify_block(module, inputs, conv_state, recurrent_state, *, row_exact=True
     try:
         # The compat vendor's verifier, or upstream mlx-vlm's when a test
         # earlier in the session imported that first (as the patch resolves).
-        verifier = (getattr(q4, "_Qwen4Verifier", None) or q4.Qwen4ExpBatchInvariantForward)()
+        verifier = (
+            getattr(q4, "_Qwen4Verifier", None) or q4.Qwen4ExpBatchInvariantForward
+        )()
         out = verifier._gated_delta(module, inputs, None, cache)
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
@@ -1475,7 +1584,9 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     monkeypatch.setattr(
         prework_mod.qwen35_gdn_verify_fused, "replay_eligible", lambda *args: False
     )
-    want, want_cache, want_tx = _verify_block(module, inputs, conv_state, recurrent_state)
+    want, want_cache, want_tx = _verify_block(
+        module, inputs, conv_state, recurrent_state
+    )
     assert qwen4_verify == []
     monkeypatch.setattr(prework_mod.qwen35_gdn_verify_fused, "replay_eligible", replay)
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_FUSED", True)
@@ -1637,8 +1748,19 @@ def test_qwen4_batched_decode_step_equals_one_row_steps(rows):
     for r in range(rows):
         row = slice(r, r + 1)
         want = prework_mod.qwen4_decode_step_fused(
-            qkv[row], z[row], b[row], a[row], conv_state[row], *operands, state[row],
-            norm_w, eps, HK, HV, DK, DV,
+            qkv[row],
+            z[row],
+            b[row],
+            a[row],
+            conv_state[row],
+            *operands,
+            state[row],
+            norm_w,
+            eps,
+            HK,
+            HV,
+            DK,
+            DV,
         )
         for have, expected in zip((conv_out[row], state_out[row], out[row]), want):
             assert _same(expected, have), r
@@ -1652,8 +1774,10 @@ def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows
     """The FP32 instantiation carries the unrounded conv, q/k/v, recurrence
     output and gate products that BF16 rounds away."""
     if dtype == mx.float32 and rows > 9:
-        pytest.skip("FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
-                    "served verify windows are 16-bit")
+        pytest.skip(
+            "FP32 staging exceeds 32 KB of threadgroup memory past 15 rows; "
+            "served verify windows are 16-bit"
+        )
     mx.random.seed(seed)
     conv_w = (mx.random.normal((C, 4, 1)) * 0.3).astype(dtype)
     q_scale = mx.array(DK**-0.5, dtype=dtype)
@@ -1666,16 +1790,44 @@ def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows
     proj = (mx.random.normal((1, rows, P)) * 0.8).astype(dtype)
 
     conv_out, window, history, final, out = prework_mod.qwen4_verify_step_fused(
-        proj, conv_state, conv_w, q_scale, A_log, dt_bias, state, norm_w, eps, HK, HV, DK, DV
+        proj,
+        conv_state,
+        conv_w,
+        q_scale,
+        A_log,
+        dt_bias,
+        state,
+        norm_w,
+        eps,
+        HK,
+        HV,
+        DK,
+        DV,
     )
     assert (history is None) == (rows == 1)
     assert _same(mx.concatenate([conv_state, proj[..., :C]], axis=1), window)
     conv, recurrent = conv_state, state
     for t in range(rows):
-        qkv, z, b, a = mx.split(proj[:, t : t + 1], [C, C + HV * DV, C + HV * DV + HV], axis=-1)
+        qkv, z, b, a = mx.split(
+            proj[:, t : t + 1], [C, C + HV * DV, C + HV * DV + HV], axis=-1
+        )
         conv, recurrent, gated = prework_mod.qwen4_decode_step_fused(
-            qkv, z, b, a, conv, conv_w, q_scale, A_log, dt_bias, recurrent, norm_w, eps,
-            HK, HV, DK, DV,
+            qkv,
+            z,
+            b,
+            a,
+            conv,
+            conv_w,
+            q_scale,
+            A_log,
+            dt_bias,
+            recurrent,
+            norm_w,
+            eps,
+            HK,
+            HV,
+            DK,
+            DV,
         )
         assert _same(gated[:, 0], out[:, t]), t
         if t < rows - 1:
@@ -2144,9 +2296,7 @@ def test_gdn_stock_affine_plan_matches_serial_calls(monkeypatch, rows):
         x = mx.random.randint(-8, 9, (1, rows, 2560)).astype(mx.bfloat16)
         expected = mx.concatenate(
             [
-                mx.concatenate(
-                    [linear(x[:, i : i + 1]) for linear in parts], axis=-1
-                )
+                mx.concatenate([linear(x[:, i : i + 1]) for linear in parts], axis=-1)
                 for i in range(rows)
             ],
             axis=1,

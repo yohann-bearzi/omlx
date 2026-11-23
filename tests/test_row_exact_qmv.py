@@ -209,53 +209,6 @@ def _quantized(k, n, bits, group_size, dtype, seed):
     return mx.quantize(weight, group_size=group_size, bits=bits)
 
 
-# FP32 rows expose the unrounded accumulations that a BF16 output hides.
-@pytest.mark.parametrize(
-    "k, n, bits, group_size",
-    [
-        (2560, 16480, 6, 64),  # DeltaNet stacked qkv/z/b/a in-projection
-        (6144, 2560, 5, 128),  # DeltaNet out-projection
-        (2560, 1024, 4, 64),
-        (1024, 520, 8, 32),
-        (768, 1024, 8, 64),  # 8-bit qmv_fast block is 256 wide
-    ],
-)
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rps", [1, 2, 4])
-def test_one_row_qmv_equals_quantized_matmul(k, n, bits, group_size, dtype, rps):
-    for seed in (5, 23):
-        weight, scales, biases = _quantized(k, n, bits, group_size, dtype, seed + rps)
-        x = mx.random.normal((1, 1, k)).astype(dtype)
-        launch = row_exact_qmv.one_row_qmv(
-            weight, scales, biases, bits, group_size, "affine", dtype, rps
-        )
-        expected = mx.quantized_matmul(
-            x, weight, scales, biases, transpose=True, group_size=group_size, bits=bits
-        )
-        observed = launch(x)
-        assert observed.shape == expected.shape and observed.dtype == dtype
-        view = mx.uint32 if dtype == mx.float32 else mx.uint16
-        assert mx.array_equal(observed.view(view), expected.view(view)).item()
-
-
-@pytest.mark.parametrize(
-    "k, n, rps",
-    [
-        (640, 2560, 1),  # stock runs qmv, not qmv_fast (K off the 256 block)
-        (2560, 1, 1),  # the two-column tile does not divide N
-        (2560, 40, 8),  # the 16-column tile does not divide N
-    ],
-)
-def test_one_row_qmv_declines_unsupported_layouts(k, n, rps):
-    weight, scales, biases = _quantized(k, n, 8, 64, mx.bfloat16, 1)
-    assert (
-        row_exact_qmv.one_row_qmv(
-            weight, scales, biases, 8, 64, "affine", mx.bfloat16, rps
-        )
-        is None
-    )
-
-
 @pytest.mark.parametrize(
     "bits, group_size, words",
     [(7, 64, "no decode of 7-bit weights"), (4, 8, "no MLX transcription")],
@@ -264,9 +217,29 @@ def test_a_tile_is_built_only_for_a_width_mlx_has_code_for(bits, group_size, wor
     weight = mx.zeros((8, 512 * bits // 32), mx.uint32)
     scales = mx.zeros((8, 512 // group_size), mx.bfloat16)
     with pytest.raises(ValueError, match=words):
-        row_exact_qmv.OneRowQmv(
-            weight, scales, scales, bits, group_size, mx.bfloat16, 4
+        row_exact_qmv.RowsQmv(
+            weight, scales, scales, bits, group_size, mx.bfloat16, lambda _: (1, 1)
         )
+
+
+@pytest.mark.parametrize("k, n", [(640, 2560), (2560, 1)])
+def test_rows_qmv_declines_unsupported_layouts(k, n):
+    weight, scales, biases = _quantized(k, n, 8, 64, mx.bfloat16, 1)
+    assert (
+        row_exact_qmv.rows_qmv(
+            weight, scales, biases, 8, 64, "affine", mx.bfloat16, lambda _: (1, 1)
+        )
+        is None
+    )
+
+
+def test_rows_qmv_rejects_an_n_the_tile_does_not_divide():
+    weight, scales, biases = _quantized(2560, 40, 8, 64, mx.bfloat16, 1)
+    qmv = row_exact_qmv.RowsQmv(
+        weight, scales, biases, 8, 64, mx.bfloat16, lambda _: (8, 1)
+    )
+    with pytest.raises(ValueError, match="tile"):
+        qmv(mx.zeros((2, 2560), mx.bfloat16))
 
 
 @pytest.mark.parametrize("bits", [2, 3])
@@ -275,26 +248,18 @@ def test_the_tile_declines_the_widths_it_does_not_decode(bits):
     decodes 4, 5, 6 and 8 bits), and so do 2- and 3-bit affine tensors taken
     by position."""
     weight, scales, biases = _quantized(2560, 64, bits, 64, mx.bfloat16, 1)
-    one_row = row_exact_qmv.one_row_qmv
-    assert one_row(weight, scales, biases, bits, 64, "affine", mx.bfloat16, 1) is None
+    assert (
+        row_exact_qmv.rows_qmv(
+            weight, scales, biases, bits, 64, "affine", mx.bfloat16, lambda _: (1, 1)
+        )
+        is None
+    )
     x = mx.zeros((1, 2560), mx.bfloat16)
     assert row_exact_qmv._face(_linear(2560, 64, bits, 64, 1), x) is None
     with pytest.raises(ValueError, match=f"no decode of {bits}-bit weights"):
-        row_exact_qmv.OneRowQmv(weight, scales, biases, bits, 64, mx.bfloat16, 1)
-
-
-@pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16, mx.float32])
-@pytest.mark.parametrize("rps", [1, 2])
-def test_one_row_qmv_partial_outputs_equal_quantized_matmul(dtype, rps):
-    weight, scales, biases = _quantized(512, 12, 4, 64, dtype, 5)
-    x = mx.random.normal((1, 1, 512)).astype(dtype)
-    launch = row_exact_qmv.one_row_qmv(
-        weight, scales, biases, 4, 64, "affine", dtype, rps
-    )
-    assert launch is not None
-    expected = mx.quantized_matmul(x, weight, scales, biases, group_size=64, bits=4)
-    view = mx.uint32 if dtype == mx.float32 else mx.uint16
-    assert mx.array_equal(launch(x).view(view), expected.view(view)).item()
+        row_exact_qmv.RowsQmv(
+            weight, scales, biases, bits, 64, mx.bfloat16, lambda _: (1, 1)
+        )
 
 
 # Every (columns per simdgroup, rows per threadgroup) tile gives each row the
@@ -443,6 +408,7 @@ _UNROLLED_HEADER = '#define ROW_EXACT_UNROLL _Pragma("clang loop unroll(full)")'
 def _miscompiled(factory):
     """``factory`` whose unrolled kernels return every output off by one, as a
     GPU whose compiler gets the unrolled tile wrong would."""
+
     def make(spec):
         kernel = factory(spec)
         if _UNROLLED_HEADER not in spec["header"]:
@@ -918,7 +884,7 @@ def test_format_verify_rechecks_the_face_when_a_loaded_tensor_changes(monkeypatc
 
 
 @pytest.mark.parametrize("bits", [6, 8])
-def test_one_row_and_rows_qmv_decline_constant_bound_scales(bits):
+def test_rows_qmv_declines_constant_bound_scales(bits):
     """MLX binds a tensor of fewer than 8 elements as a constant; the tile
     reads scales and biases from device memory, so the layout is declined at
     plan time and the layer keeps its composed path."""
@@ -926,12 +892,6 @@ def test_one_row_and_rows_qmv_decline_constant_bound_scales(bits):
         mx.zeros((2, 256), dtype=mx.bfloat16), group_size=128, bits=bits
     )
     assert scales.size == 4
-    assert (
-        row_exact_qmv.one_row_qmv(
-            weight, scales, biases, bits, 128, "affine", mx.bfloat16, 1
-        )
-        is None
-    )
     assert (
         row_exact_qmv.rows_qmv(
             weight, scales, biases, bits, 128, "affine", mx.bfloat16, lambda _: (1, 1)
@@ -1103,9 +1063,6 @@ def test_rows_qmv_rejects_empty_rows_or_non_positive_geometry():
         )
         with pytest.raises(ValueError, match="tile"):
             qmv(rows)
-    with pytest.raises(ValueError, match="plan"):
-        row_exact_qmv.OneRowQmv(weight, scales, biases, 8, 64, mx.bfloat16, 0)
-
 
 
 @testing.verified("qwen4_exp")
@@ -1198,7 +1155,6 @@ def test_warm_format_group_hit_checks_stored_tokens_without_isinstance(monkeypat
 
     monkeypatch.setattr(row_exact_qmv, "FormatLinear", _Trap)
     assert row_exact_qmv._group_plan((first, second), x, 3) is warm
-
 
 
 def test_warm_quantized_linear_reuses_cached_packed_name(monkeypatch):
