@@ -315,8 +315,8 @@ A8FACE = "takes the built-in affine FormatLinear face"
 
 PATH_DECISIONS = {
     "omlx/models/vlm.py": (
-        GATED,
-        "Bonsai-family restore; gated by model_type, not invoked for stock qwen4_exp",
+        "declines (rebinds exact OneBitLinear/OneBitEmbedding only; no-op on FormatLinear/FormatEmbedding)",
+        "omlx/models/vlm.py:66-76",
     ),
     "omlx/patches/deepseek_v4/decode_consistency.py": (UNSERVED, "family not ported"),
     "omlx/patches/deepseek_v4/moe_offload.py": (UNSERVED, "family not ported"),
@@ -355,8 +355,8 @@ PATH_DECISIONS = {
         "the PLE reader reads the format layer's own shards",
     ),
     "omlx/scheduler.py": (
-        FACE,
-        "reads the KV template's scales; FormatLinear exposes the same tensors",
+        "reads embed_tokens.scales (returns None dtype when absent on plugin FormatEmbedding)",
+        "omlx/scheduler.py:1626-1635",
     ),
     "omlx/speculative/dflash/__init__.py": (
         GATED,

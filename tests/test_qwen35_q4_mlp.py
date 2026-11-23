@@ -1194,3 +1194,34 @@ def test_qwen35_q4_prefill_linear_patch_keeps_the_qwen4_exp_trunk(monkeypatch):
     model = SimpleNamespace(named_modules=lambda: [("attention", attention)])
     assert patch.apply_qwen35_q4_prefill_linear_patch(model) is True
     assert type(attention.q_proj) is patch._VLMQuantizedPrefillLinear
+
+
+def test_vlm_format_prefill_linear_early_returns(tmp_path, monkeypatch):
+    import json
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatLinear
+    from omlx.patches import qwen35_q4_mlp as q4_mlp
+    from omlx.patches.format_load import loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    mx.random.seed(103)
+    weight = (mx.random.normal((128, 256)) * 0.1).astype(mx.float16)
+    arrays = dict(zip(("weight", "scales", "biases"), mx.quantize(weight, bits=4)))
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        layer = FormatLinear("affine", 4, 64, 256, arrays)
+    layer.__class__ = q4_mlp._VLMFormatPrefillLinear
+    calls = []
+    monkeypatch.setattr(
+        q4_mlp, "_try_backend", lambda linear, x: calls.append(tuple(x.shape)) or None
+    )
+    monkeypatch.setattr(q4_mlp, "_q8_backend_candidate", lambda linear, x: True)
+
+    layer(mx.zeros((4, 256)))
+    layer(mx.zeros((1, 1, 256)))
+    layer(mx.zeros((1, 1, 4, 256)))
+    assert calls == []
+    layer(mx.zeros((1, 2, 256)))
+    assert calls == [(1, 2, 256)]

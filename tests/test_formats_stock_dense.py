@@ -33,9 +33,7 @@ def build_layer(tmp_path, monkeypatch):
         (tmp_path / "config.json").write_text(json.dumps(config))
         with monkeypatch.context() as patch:
             if mode == "affine":
-                patch.setattr(
-                    format_load, "PORTED", format_load.PORTED | {family}
-                )
+                patch.setattr(format_load, "PORTED", format_load.PORTED | {family})
             with testing.verified(family), loading(tmp_path):
                 return FormatLinear(fmt, bits, group, k, tensors)
 
@@ -155,6 +153,8 @@ def _affine_plugin(build, n, k, bits, dtype):
         dict(zip(("weight", "scales", "biases"), packed)),
     )
     return layer, packed, keys[1]
+
+
 @pytest.mark.parametrize("mode", ["stock", "plugin"])
 def test_ordinary_and_row_exact_calls_keep_separate_arithmetic(mode, build_layer):
     k, n, rows = 2560, 160, 5
@@ -857,6 +857,8 @@ def test_planless_stock_affine_row_exact_matches_serial_decode(
             y = layer(x)
             assert y.shape == (*shape[:-1], 256)
             assert mx.array_equal(y, want).item()
+
+
 def test_plugin_qmm_returns_before_allocating_routes(build_layer):
     # 513 rows at N 512 / K 2560 traverse one part (qmm), a route no plugin
     # face serves: the call returns before it keeps a routes slot.
@@ -864,6 +866,8 @@ def test_plugin_qmm_returns_before_allocating_routes(build_layer):
     got = layer(mx.zeros((513, 2560), mx.float16))
     mx.eval(got)
     assert vars(layer)[linear._KEPT].routes == {}
+
+
 def test_plugin_rows_traversal_keeps_the_rows_route(build_layer, monkeypatch):
     # On a g13/g14 GPU two rows traverse the rows route; a plugin layer must
     # keep it (the shared-rows launch whose rows have their one-row bits).
@@ -993,9 +997,7 @@ def test_planless_stock_affine_short_batch_uses_stock_matmul_up_to_max_rows(
         x = mx.random.normal((rows_count, 128), key=mx.random.key(23)).astype(
             mx.bfloat16
         )
-        want = mx.quantized_matmul(
-            x, *packed, transpose=True, bits=8, group_size=128
-        )
+        want = mx.quantized_matmul(x, *packed, transpose=True, bits=8, group_size=128)
         y = layer(x)
         assert y.shape == (rows_count, 256)
         assert mx.array_equal(y.view(mx.uint16), want.view(mx.uint16)).item()
@@ -1223,3 +1225,105 @@ def test_decision_backbone_format_linear_head(tmp_path, build_layer):
     backbone._lm_head = placeholder_head
     with pytest.raises(ValueError, match="placeholder"):
         backbone.output_rows(ids)
+
+
+def test_decision_backbone_non_stackable_head_selects_rows(build_layer):
+    from omlx import formats
+    from omlx.formats import QuantFormat
+    from omlx.models.decision import DecisionBackbone
+
+    class _RowCentered(QuantFormat):
+        mode = "row_centered_decision_test"
+        codes_name = "payload"
+        tensors = ("meta_s", "meta_b")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return None
+
+        def decode(self, tensors, bits, group_size):
+            decoded = mx.dequantize(
+                tensors["payload"],
+                tensors["meta_s"],
+                tensors["meta_b"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+            return decoded - decoded.mean(axis=-2, keepdims=True)
+
+    mx.random.seed(97)
+    weight = (mx.random.normal((16, 256)) * 0.1).astype(mx.float16)
+    packed = mx.quantize(weight, bits=4, group_size=64)
+    arrays = {"payload": packed[0], "meta_s": packed[1], "meta_b": packed[2]}
+    head = build_layer(_RowCentered(), 4, 64, 256, arrays)
+    assert not formats.stackable(head.fmt, head.input_dims, head.output_dims, 4, 64)
+    backbone = DecisionBackbone.__new__(DecisionBackbone)
+    backbone._lm_head = head
+    ids = mx.array([0, 3, 15])
+    rows = backbone.output_rows(ids)
+    mx.eval(rows)
+    want = head._decoded()[ids]
+    mx.eval(want)
+    assert rows.shape == (3, 256)
+    assert mx.array_equal(rows.view(mx.uint16), want.view(mx.uint16))
+
+
+def test_decision_backbone_two_dimensional_ids(build_layer):
+    from omlx.formats import QuantFormat
+    from omlx.models.decision import DecisionBackbone
+
+    seen = []
+
+    class _Recording(QuantFormat):
+        mode = "recording_decision_test"
+        codes_name = "payload"
+        tensors = ("meta_s", "meta_b")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "payload": ((n, k * bits // 32), mx.uint32),
+                "meta_s": ((n, k // group_size), None),
+                "meta_b": ((n, k // group_size), None),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            seen.append(tuple(tensors["payload"].shape))
+            return mx.dequantize(
+                tensors["payload"],
+                tensors["meta_s"],
+                tensors["meta_b"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+
+    mx.random.seed(101)
+    weight = (mx.random.normal((16, 256)) * 0.1).astype(mx.float16)
+    packed = mx.quantize(weight, bits=4, group_size=64)
+    arrays = {"payload": packed[0], "meta_s": packed[1], "meta_b": packed[2]}
+    head = build_layer(_Recording(), 4, 64, 256, arrays)
+    backbone = DecisionBackbone.__new__(DecisionBackbone)
+    backbone._lm_head = head
+    scalar = backbone.output_rows(mx.array(3))
+    mx.eval(scalar)
+    matrix_ids = mx.array([[0, 1], [3, 15]])
+    rows = backbone.output_rows(matrix_ids)
+    mx.eval(rows)
+    assert scalar.shape == (256,)
+    assert rows.shape == (2, 2, 256)
+    assert seen == [
+        (1, packed[0].shape[1]),
+        (4, packed[0].shape[1]),
+    ], seen
+    assert mx.array_equal(
+        rows.view(mx.uint16),
+        head._decoded(matrix_ids.reshape(-1)).reshape(2, 2, 256).view(mx.uint16),
+    )
+    assert mx.array_equal(
+        scalar.view(mx.uint16),
+        head._decoded(mx.array([3])).reshape(256).view(mx.uint16),
+    )

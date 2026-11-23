@@ -1690,3 +1690,33 @@ def test_engine_loaders_propagate_oq_a8_value_error(monkeypatch):
     monkeypatch.setattr(dispatch, "apply_qwen35_oq_a8_patch", raise_runtime_error)
     vlm_engine._apply_oq_a8_prefill()
     batched_engine._apply_oq_a8_prefill()
+
+
+def test_has_routed_a8_guards(monkeypatch):
+    import mlx.nn as nn
+
+    from omlx.patches import qwen35_oq_a8 as dispatch
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.a_live_block = nn.Module()
+            self.z_mtp_block = nn.Module()
+
+    model = Model()
+    blocks = (model.z_mtp_block, model.a_live_block)
+    monkeypatch.setattr(
+        dispatch, "_is_fused_routed_glu", lambda module: module in blocks
+    )
+    monkeypatch.setattr(dispatch, "_routed_a8_eligible", lambda module, act: True)
+    monkeypatch.setattr(dispatch, "_is_measured_family", lambda m: False)
+    assert dispatch._has_routed_a8(model, set()) is False
+    monkeypatch.setattr(dispatch, "_is_measured_family", lambda m: True)
+    assert dispatch._has_routed_a8(model, {id(model.z_mtp_block)}) is True
+    assert dispatch._has_routed_a8(model, {id(model.a_live_block)}) is True
+    assert (
+        dispatch._has_routed_a8(model, {id(model.z_mtp_block), id(model.a_live_block)})
+        is False
+    )
+    monkeypatch.setattr(dispatch, "_routed_a8_eligible", lambda module, act: False)
+    assert dispatch._has_routed_a8(model, set()) is False
