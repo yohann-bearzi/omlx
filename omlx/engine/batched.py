@@ -580,7 +580,7 @@ class BatchedEngine(BaseEngine):
 
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
-        # the patch itself falls through for anything it cannot route.
+        # the patch refuses unsupported format/dead opt-ins with ValueError.
         # A8 and ANE prefill read affine weights; oQh linears have none.
         oqh = is_oqh_checkpoint(self._model_name)
         if oqh and a8_prefill_on(self._model_settings):

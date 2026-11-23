@@ -2818,7 +2818,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # oQ mixed-bit QxA8 prefill kernels. Gated on the per-model setting
         # because it quantizes activations to INT8, which changes numerics;
-        # the patch itself falls through for anything it cannot route.
+        # the patch refuses unsupported format/dead opt-ins with ValueError.
         # DeepSeek V4.1 applies the setting in its own loader.
         a8_on = a8_prefill_on(self._model_settings)
         if a8_on and oqh:

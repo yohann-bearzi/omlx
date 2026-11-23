@@ -17,7 +17,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from ..formats.affine import AffineFormat
-from ..formats.linear import FormatLinear
+from ..formats.linear import FormatLinear, FormatSwitchLinear
 from .m5_gather_qmm_a8 import (
     _eligible as _routed_a8_eligible,
 )
@@ -91,16 +91,25 @@ def _is_q8_linear(module: Any) -> bool:
     ) and getattr(module, "bits", None) == 8
 
 
+def _is_stock_affine_fmt(layer: Any) -> bool:
+    """Built-in affine format (not a plugin subclass with a custom mode)."""
+    return (
+        type(getattr(layer, "fmt", None)) is AffineFormat
+        and getattr(layer, "mode", None) == "affine"
+    )
+
+
 def _is_stock_affine_layer(linear: Any) -> bool:
     """A stock checkpoint's dense projection: the built-in affine format's
     layer holds the same packed weight, scales and biases as MLX's layer."""
-    return isinstance(linear, FormatLinear) and isinstance(linear.fmt, AffineFormat)
+    return isinstance(linear, FormatLinear) and _is_stock_affine_fmt(linear)
 
 
 _MLP_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 _GDN_PROJECTIONS = ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b")
 _ATTN_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _STANDALONE_PROJECTIONS = ("out_proj",)
+_SWITCH_PROJECTIONS = ("gate_up_proj", "gate_proj", "up_proj", "down_proj")
 _QWEN_PREFIXES = (
     "mlx_vlm.models.qwen3_5.language",
     "mlx_vlm.models.qwen3_5_moe.language",
@@ -129,6 +138,20 @@ def _has_routed_a8(model: Any, mtp_ids: set[int]) -> bool:
     return False
 
 
+def _non_affine_switch_error(module: Any) -> str | None:
+    """Error message when ``module`` holds a non-affine routed expert stack."""
+    for sw_name in _SWITCH_PROJECTIONS:
+        switch = getattr(module, sw_name, None)
+        if isinstance(switch, FormatSwitchLinear) and not _is_stock_affine_fmt(switch):
+            return (
+                f"oq_a8: {type(module).__name__}.{sw_name} is a non-affine "
+                f"{type(switch).__name__} (mode="
+                f"{getattr(switch, 'mode', None)}); the A8 prefill kernels "
+                "cannot take its experts. Disable a8_prefill."
+            )
+    return None
+
+
 def _refuse_unclassified(model: Any) -> None:
     """Refuse the opt-in only where a format layer would be silently skipped.
 
@@ -136,18 +159,28 @@ def _refuse_unclassified(model: Any) -> None:
     sensitive projection or an N=48 GDN gate has always stayed on the old
     path, and real checkpoints must keep loading. What the stock switch adds
     is a format layer the backends cannot see at all -- a closed design must
-    refuse that, and only that, inside the Qwen language modules this patch
-    serves. A model whose Qwen projections are all unclassified (and with no
-    eligible routed A8 SwitchGLU) refuses too, so an entirely dead opt-in
-    cannot pass as a tagged model.
+    refuse non-affine dense projections and non-affine routed switch expert
+    stacks (fused or unfused) inside the Qwen models this patch serves,
+    excluding the MTP draft head. A model whose Qwen projections are all
+    unclassified (and with no eligible routed A8 SwitchGLU) refuses too, so
+    an entirely dead opt-in cannot pass as a tagged model.
     """
     mtp_ids = _mtp_module_ids(model)
-    seen = 0
+    has_qwen = _is_measured_family(model)
+    switch_err: str | None = None
     classified = 0
+    qwen_seen = 0
     for _, module in model.named_modules():
         if id(module) in mtp_ids:
             continue
-        if not type(module).__module__.startswith(_QWEN_PREFIXES):
+        if switch_err is None:
+            switch_err = _non_affine_switch_error(module)
+        is_qwen = type(module).__module__.startswith(_QWEN_PREFIXES)
+        if is_qwen:
+            has_qwen = True
+        if switch_err is not None and has_qwen:
+            raise ValueError(switch_err)
+        if not is_qwen:
             continue
         names: list[str] = []
         for projections in (_MLP_PROJECTIONS, _GDN_PROJECTIONS):
@@ -156,11 +189,13 @@ def _refuse_unclassified(model: Any) -> None:
         for name in (*_ATTN_PROJECTIONS, *_STANDALONE_PROJECTIONS):
             if hasattr(module, name):
                 names.append(name)
+        if not names:
+            continue
+        qwen_seen += 1
         for name in names:
             linear = getattr(module, name)
             if not isinstance(linear, (nn.QuantizedLinear, FormatLinear, PackedLinear)):
                 continue
-            seen += 1
             if classify_linear(linear) is not None:
                 classified += 1
                 continue
@@ -184,7 +219,7 @@ def _refuse_unclassified(model: Any) -> None:
                     "prefill kernels need a multiple of 64. Disable "
                     "a8_prefill."
                 )
-    if seen and not classified and not _has_routed_a8(model, mtp_ids):
+    if qwen_seen and not classified and not _has_routed_a8(model, mtp_ids):
         raise ValueError(
             "oq_a8: no Qwen projection in this model classifies for the A8 "
             "prefill kernels; the opt-in would be dead. Disable a8_prefill."

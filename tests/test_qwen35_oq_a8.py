@@ -1720,3 +1720,514 @@ def test_has_routed_a8_guards(monkeypatch):
     )
     monkeypatch.setattr(dispatch, "_routed_a8_eligible", lambda module, act: False)
     assert dispatch._has_routed_a8(model, set()) is False
+
+
+def test_refuse_unclassified_rejects_unquantized_qwen_model(tmp_path, monkeypatch):
+    import json
+
+    import mlx.nn as nn
+    from mlx_lm.models.switch_layers import SwiGLU
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    class Mlp(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(256, 128, bias=False)
+            self.up_proj = nn.Linear(256, 128, bias=False)
+            self.down_proj = nn.Linear(128, 256, bias=False)
+
+    Mlp.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    class Model(nn.Module):
+        def __init__(self, switch_mlp=None):
+            super().__init__()
+            self.mlp = Mlp()
+            if switch_mlp is not None:
+                self.switch_mlp = switch_mlp
+
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    model = Model()
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda m: set())
+    with pytest.raises(ValueError, match="no Qwen projection"):
+        dispatch._refuse_unclassified(model)
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+    stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+    parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+    tensors = {
+        "weight": mx.stack([part[0] for part in parts]),
+        "scales": mx.stack([part[1] for part in parts]),
+        "biases": mx.stack([part[2] for part in parts]),
+    }
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        gate_up = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+        down = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+
+    class RoutedSwitchGLU(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = gate_up
+            self.down_proj = down
+            self.activation = SwiGLU()
+
+    RoutedSwitchGLU.__module__ = "mlx_vlm.models.switch_layers"
+    dispatch._refuse_unclassified(Model(switch_mlp=RoutedSwitchGLU()))
+
+
+def test_refuse_unclassified_rejects_non_affine_switch_experts(tmp_path, monkeypatch):
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+
+    stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+    parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+    tensors = {
+        "weight": mx.stack([part[0] for part in parts]),
+        "scales": mx.stack([part[1] for part in parts]),
+        "biases": mx.stack([part[2] for part in parts]),
+    }
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        switch = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+    object.__setattr__(switch, "fmt", object())
+
+    class Experts(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = switch
+
+    Experts.__module__ = "mlx_lm.models.switch_layers"
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = Experts()
+
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    model = Model()
+    monkeypatch.setattr(dispatch, "_mtp_module_ids", lambda m: set())
+    with pytest.raises(ValueError, match="gate_up_proj"):
+        dispatch._refuse_unclassified(model)
+
+
+def test_refuse_unclassified_real_switch_namespace(tmp_path):
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.formats import QuantFormat
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    class Plugin(QuantFormat):
+        mode = "plugin_sw_test"
+        codes_name = "weight"
+        tensors = ("scales", "biases")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, k // group_size), None),
+                "biases": ((n, k // group_size), None),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return mx.dequantize(
+                tensors["weight"],
+                tensors["scales"],
+                tensors["biases"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "omlx_quant_formats": {"affine": {}, Plugin.mode: {}},
+            }
+        )
+    )
+
+    def switch(fmt):
+        stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+        parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+        tensors = {
+            "weight": mx.stack([part[0] for part in parts]),
+            "scales": mx.stack([part[1] for part in parts]),
+            "biases": mx.stack([part[2] for part in parts]),
+        }
+        with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+            return FormatSwitchLinear(fmt, 4, 64, 256, tensors)
+
+    class Experts(nn.Module):
+        def __init__(self, up, down):
+            super().__init__()
+            self.gate_up_proj = up
+            self.down_proj = down
+
+    Experts.__module__ = "mlx_lm.models.switch_layers"
+
+    class Model(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.switch_mlp = experts
+
+    # Top-level VLM wrapper: measured family, outside _QWEN_PREFIXES.
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+
+    with pytest.raises(ValueError, match="gate_up_proj.*plugin_sw_test"):
+        dispatch._refuse_unclassified(
+            Model(Experts(switch(Plugin()), switch("affine")))
+        )
+    with pytest.raises(ValueError, match="down_proj.*plugin_sw_test"):
+        dispatch._refuse_unclassified(
+            Model(Experts(switch("affine"), switch(Plugin())))
+        )
+    dispatch._refuse_unclassified(Model(Experts(switch("affine"), switch("affine"))))
+
+    class MtpModel(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.mtp = experts
+
+        def get_mtp_module(self):
+            return self.mtp
+
+    MtpModel.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+    dispatch._refuse_unclassified(MtpModel(Experts(switch(Plugin()), switch("affine"))))
+
+
+def test_refuse_unclassified_unfused_switch_namespace(tmp_path):
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.formats import QuantFormat
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    class Plugin(QuantFormat):
+        mode = "plugin_sw_unfused_test"
+        codes_name = "weight"
+        tensors = ("scales", "biases")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return None
+
+        def decode(self, tensors, bits, group_size):
+            return mx.dequantize(
+                tensors["weight"],
+                tensors["scales"],
+                tensors["biases"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "omlx_quant_formats": {"affine": {}, Plugin.mode: {}},
+            }
+        )
+    )
+    stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+    parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+    tensors = {
+        "weight": mx.stack([part[0] for part in parts]),
+        "scales": mx.stack([part[1] for part in parts]),
+        "biases": mx.stack([part[2] for part in parts]),
+    }
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        plugin = FormatSwitchLinear(Plugin(), 4, 64, 256, tensors)
+        affine = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+
+    class Experts(nn.Module):
+        def __init__(self, gate, up, down):
+            super().__init__()
+            self.gate_proj = gate
+            self.up_proj = up
+            self.down_proj = down
+
+    Experts.__module__ = "mlx_lm.models.switch_layers"
+
+    class Model(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.switch_mlp = experts
+
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    with pytest.raises(ValueError, match="gate_proj.*plugin_sw_unfused_test"):
+        dispatch._refuse_unclassified(Model(Experts(plugin, affine, affine)))
+    with pytest.raises(ValueError, match="up_proj.*plugin_sw_unfused_test"):
+        dispatch._refuse_unclassified(Model(Experts(affine, plugin, affine)))
+    with pytest.raises(ValueError, match="down_proj.*plugin_sw_unfused_test"):
+        dispatch._refuse_unclassified(Model(Experts(affine, affine, plugin)))
+    dispatch._refuse_unclassified(Model(Experts(affine, affine, affine)))
+
+
+def test_refuse_unclassified_rejects_affine_subclass_plugin(tmp_path, monkeypatch):
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.custom_kernels.quant_matmul import fast
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.affine import AffineFormat
+    from omlx.formats.linear import FormatLinear, FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    class Plugin(AffineFormat):
+        mode = "custom_affine_test"
+
+    class SameModeSubclass(AffineFormat):
+        pass
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "omlx_quant_formats": {"affine": {}, Plugin.mode: {}},
+            }
+        )
+    )
+
+    stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+    parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+    sw_tensors = {
+        "weight": mx.stack([part[0] for part in parts]),
+        "scales": mx.stack([part[1] for part in parts]),
+        "biases": mx.stack([part[2] for part in parts]),
+    }
+    dense_w = mx.random.normal((64, 256)).astype(mx.float16)
+    dense_q4 = dict(
+        zip(("weight", "scales", "biases"), mx.quantize(dense_w, bits=4, group_size=64))
+    )
+    dense_q6 = dict(
+        zip(("weight", "scales", "biases"), mx.quantize(dense_w, bits=6, group_size=64))
+    )
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        sw_plugin = FormatSwitchLinear(Plugin(), 4, 64, 256, sw_tensors)
+        sw_affine = FormatSwitchLinear("affine", 4, 64, 256, sw_tensors)
+        lin_plugin = FormatLinear(Plugin(), 4, 64, 256, dense_q4)
+        lin_bad_mode = FormatLinear("affine", 4, 64, 256, dense_q4)
+        lin_subclass_same_mode = FormatLinear("affine", 4, 64, 256, dense_q4)
+        lin_stock_q6 = FormatLinear("affine", 6, 64, 256, dense_q6)
+    object.__setattr__(lin_bad_mode, "mode", "custom_mode")
+    object.__setattr__(lin_subclass_same_mode, "fmt", SameModeSubclass())
+
+    class Experts(nn.Module):
+        def __init__(self, gate_up, down):
+            super().__init__()
+            self.gate_up_proj = gate_up
+            self.down_proj = down
+
+    Experts.__module__ = "mlx_lm.models.switch_layers"
+
+    class SwitchModel(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.switch_mlp = experts
+
+    SwitchModel.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    with pytest.raises(ValueError, match="gate_up_proj.*custom_affine_test"):
+        dispatch._refuse_unclassified(SwitchModel(Experts(sw_plugin, sw_affine)))
+
+    class DenseBlock(nn.Module):
+        def __init__(self, out_proj):
+            super().__init__()
+            self.q_proj = _quantized_linear(256, 128, 4)
+            self.out_proj = out_proj
+
+    DenseBlock.__module__ = "mlx_vlm.models.qwen4_exp.language"
+
+    with pytest.raises(ValueError, match="out_proj.*custom_affine_test"):
+        dispatch._refuse_unclassified(DenseBlock(lin_plugin))
+    with pytest.raises(ValueError, match="out_proj.*custom_mode"):
+        dispatch._refuse_unclassified(DenseBlock(lin_bad_mode))
+    with pytest.raises(ValueError, match="out_proj.*affine"):
+        dispatch._refuse_unclassified(DenseBlock(lin_subclass_same_mode))
+    assert dispatch.classify_linear(lin_subclass_same_mode) is None
+    # Genuine stock affine Q6 (unclassified for A8) is still accepted when
+    # the native A8 is present; without it every projection classifies None
+    # and the dead-opt-in guard is the correct answer.
+    if fast.oq_a8_available():
+        dispatch._refuse_unclassified(DenseBlock(lin_stock_q6))
+
+
+def test_refuse_unclassified_unmeasured_qwen35_moe_switch_and_non_qwen(tmp_path):
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.formats import QuantFormat
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import qwen35_oq_a8 as dispatch
+    from omlx.patches.format_load import loading
+
+    class Plugin(QuantFormat):
+        mode = "plugin_q35_test"
+        codes_name = "weight"
+        tensors = ("scales", "biases")
+        bits = (4,)
+        group_sizes = (64,)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "weight": ((n, k * bits // 32), mx.uint32),
+                "scales": ((n, k // group_size), None),
+                "biases": ((n, k // group_size), None),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return mx.dequantize(
+                tensors["weight"],
+                tensors["scales"],
+                tensors["biases"],
+                group_size=group_size,
+                bits=bits,
+                mode="affine",
+            )
+
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen4_exp",
+                "omlx_quant_formats": {"affine": {}, Plugin.mode: {}},
+            }
+        )
+    )
+    stacked = mx.random.normal((2, 16, 256)).astype(mx.float16)
+    parts = [mx.quantize(stacked[i], bits=4, group_size=64) for i in range(2)]
+    tensors = {
+        "weight": mx.stack([part[0] for part in parts]),
+        "scales": mx.stack([part[1] for part in parts]),
+        "biases": mx.stack([part[2] for part in parts]),
+    }
+    with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+        plugin = FormatSwitchLinear(Plugin(), 4, 64, 256, tensors)
+        affine = FormatSwitchLinear("affine", 4, 64, 256, tensors)
+
+    class Experts(nn.Module):
+        def __init__(self, up, down):
+            super().__init__()
+            self.gate_up_proj = up
+            self.down_proj = down
+
+    Experts.__module__ = "mlx_lm.models.switch_layers"
+
+    class SparseMoeBlock(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.switch_mlp = experts
+
+    SparseMoeBlock.__module__ = "mlx_lm.models.qwen3_next"
+
+    class DecoderLayer(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.mlp = SparseMoeBlock(experts)
+
+    DecoderLayer.__module__ = "mlx_lm.models.qwen3_5"
+
+    class Model(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.layer = DecoderLayer(experts)
+
+    Model.__module__ = "mlx_lm.models.qwen3_5"
+
+    model = Model(Experts(plugin, affine))
+    assert dispatch._is_measured_family(model) is False
+    with pytest.raises(ValueError, match="gate_up_proj.*plugin_q35_test"):
+        dispatch._refuse_unclassified(model)
+
+    # Reverse visit order: switch_layers visited before the mlx_lm.models.qwen3_5
+    # module, proving the single pass preserves switch_err across iterations.
+    class QwenMarker(nn.Module):
+        pass
+
+    QwenMarker.__module__ = "mlx_lm.models.qwen3_5"
+
+    class Outer(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.first = SparseMoeBlock(experts)
+            self.second = QwenMarker()
+
+    Outer.__module__ = "mlx_lm.models.qwen3_next"
+    experts_rev = Experts(plugin, affine)
+    outer = Outer(experts_rev)
+    visited = [m for _, m in outer.named_modules()]
+    if visited.index(experts_rev) > visited.index(outer.second):
+        outer = Outer.__new__(Outer)
+        nn.Module.__init__(outer)
+        outer.second = QwenMarker()
+        outer.first = SparseMoeBlock(experts_rev)
+        visited = [m for _, m in outer.named_modules()]
+    assert visited.index(experts_rev) < visited.index(outer.second)
+    with pytest.raises(ValueError, match="gate_up_proj.*plugin_q35_test"):
+        dispatch._refuse_unclassified(outer)
+
+    # Unmeasured mlx_vlm qwen3_5_moe model with switch_mlp.
+    class VlmModel(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.switch_mlp = experts
+
+    VlmModel.__module__ = "mlx_vlm.models.qwen3_5_moe.language"
+    vlm_model = VlmModel(Experts(plugin, affine))
+    assert dispatch._is_measured_family(vlm_model) is False
+    with pytest.raises(ValueError, match="gate_up_proj.*plugin_q35_test"):
+        dispatch._refuse_unclassified(vlm_model)
+
+    # Non-Qwen model holding the same SwitchGLU is not refused.
+    class LlamaModel(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.mlp = SparseMoeBlock(experts)
+
+    LlamaModel.__module__ = "mlx_lm.models.llama"
+    dispatch._refuse_unclassified(LlamaModel(Experts(plugin, affine)))
+
+    # Unmeasured Qwen model whose plugin SwitchGLU lives in MTP is excluded.
+    class MtpModel(nn.Module):
+        def __init__(self, experts):
+            super().__init__()
+            self.layer = QwenMarker()
+            self.mtp = SparseMoeBlock(experts)
+
+        def get_mtp_module(self):
+            return self.mtp
+
+    MtpModel.__module__ = "mlx_lm.models.qwen3_5"
+    dispatch._refuse_unclassified(MtpModel(Experts(plugin, affine)))
