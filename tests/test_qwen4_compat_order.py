@@ -259,6 +259,12 @@ def test_configure_qwen4_exp_runtime_propagates_a_compat_failure(
     monkeypatch.setattr(compat, "_patch_model_file_bypass", broken)
     with pytest.raises(RuntimeError, match="bypass broken"):
         compat.configure_qwen4_exp_runtime(tmp_path)
+    # A failed patch is never recorded as applied: a retry re-runs it and
+    # fails the same way instead of trusting a half-applied patch.
+    assert not compat.is_applied()
+    with pytest.raises(RuntimeError, match="bypass broken"):
+        compat.configure_qwen4_exp_runtime(tmp_path)
+    assert not compat.is_applied()
 
 
 def test_apply_compat_returns_false_only_without_mlx_vlm(monkeypatch):
@@ -269,3 +275,27 @@ def test_apply_compat_returns_false_only_without_mlx_vlm(monkeypatch):
     monkeypatch.setattr(compat, "_APPLIED", False)
     monkeypatch.setitem(sys.modules, "mlx_vlm", None)
     assert compat.apply_mlx_vlm_qwen4_exp_compat_patch() is False
+    assert not compat.is_applied()
+
+
+def test_apply_compat_propagates_broken_mlx_vlm_transitive_import(monkeypatch):
+    """A broken mlx-vlm install is not an absent one: only a missing
+    mlx_vlm returns False, a failing dependency propagates."""
+    import builtins
+
+    import pytest
+
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    monkeypatch.setattr(compat, "_APPLIED", False)
+    real_import = builtins.__import__
+
+    def broken_import(name, *args, **kwargs):
+        if name == "mlx_vlm":
+            raise ModuleNotFoundError("No module named 'some_dep'", name="some_dep")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", broken_import)
+    with pytest.raises(ModuleNotFoundError, match="some_dep"):
+        compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    assert not compat.is_applied()

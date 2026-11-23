@@ -31,9 +31,10 @@ def _append_package_path(package: Any, path: Path) -> None:
 def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
     """Expose ``mlx_vlm.models.qwen4_exp`` from oMLX's vendor tree.
 
-    False only when mlx-vlm itself is not installed (a non-VLM environment
-    has nothing to patch); every other failure propagates, so a qwen4_exp
-    load can never continue on a half-applied patch.
+    Returns False when already applied or when mlx-vlm itself is not
+    installed (a non-VLM environment has nothing to patch); every other
+    failure propagates, so a qwen4_exp load can never continue on a
+    half-applied patch.
     """
     global _APPLIED
     with _LOCK:
@@ -72,10 +73,12 @@ def apply_mlx_vlm_qwen4_exp_compat_patch() -> bool:
 
         try:
             import mlx_vlm
-            import mlx_vlm.models
-        except ImportError:
+        except ModuleNotFoundError as exc:
+            if exc.name != "mlx_vlm":
+                raise
             logger.debug("mlx-vlm is not installed; the qwen4_exp patch is skipped")
             return False
+        import mlx_vlm.models
 
         # From here every failure propagates: the vendor import already
         # registers the family module, so a load that went on would run a
