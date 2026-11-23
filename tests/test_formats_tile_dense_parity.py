@@ -1581,7 +1581,7 @@ def test_rows_17_24_passes_c2_on_the_host_table(n, k, bits, group):
     else:
         chip, tensor_units = "applegpu_g15d_c80", False
     top = _wide_window_top(n, k, bits, group)
-    probe = range(17, top + 1) if top >= 17 else (17, 18, 24)
+    probe = range(17, top + 2) if top >= 17 else (17, 18, 24)
     for dtype in (mx.bfloat16, mx.float16):
         quantized, layer = _layer(n, k, bits, group, dtype)
         plan = tile_dense.build_plan(layer, tensor_units=tensor_units, chip=chip)
@@ -1597,8 +1597,13 @@ def test_rows_17_24_passes_c2_on_the_host_table(n, k, bits, group):
 
 def test_m3_wide_rows17_takes_mlx_and_passes_c2():
     # applegpu_g15d's QMV limit is 18 for width 2560, so MLX runs qmv_wide at
-    # rows=17; the 17-17 span takes mlx and must be bitwise to stock while
-    # row 18 keeps the measured non-mlx route.
+    # rows=17; the 17-17 span takes mlx and must be bitwise to stock, and
+    # row 18 keeps the parity-default steel route. The row-18 C2 check is
+    # gated to a non-NAX host: on a NAX host the C2 reference is that host's
+    # own MLX route, not the one this table was tuned against (the host
+    # sweep above judges the M5's own table), but the routing assertions and
+    # row-17 parity are checked everywhere.
+    probe = (17,) if linear._nax_host() else (17, 18)
     for n, k, bits in (
         (640, 2560, 8),
         (2560, 2560, 8),
@@ -1613,12 +1618,32 @@ def test_m3_wide_rows17_takes_mlx_and_passes_c2():
             assert plan is not None
             assert tile_dense.policy_for(plan, 17, dtype).backend == "mlx"
             assert tile_dense.policy_for(plan, 18, dtype).backend != "mlx"
-            x = _x((17, k), dtype=dtype, seed=n + k + bits)
-            got = tile_dense.project(plan, x)
-            want = quantized(x)
-            mx.eval(got, want)
-            assert mx.array_equal(got.view(mx.uint16), want.view(mx.uint16)).item()
-            _assert_c2(got, want, x, quantized)
+            for rows in probe:
+                x = _x((rows, k), dtype=dtype, seed=n + k + bits + rows)
+                got = tile_dense.project(plan, x)
+                want = quantized(x)
+                mx.eval(got, want)
+                if rows == 17:
+                    assert mx.array_equal(
+                        got.view(mx.uint16), want.view(mx.uint16)
+                    ).item()
+                _assert_c2(got, want, x, quantized)
+
+
+def test_m3_wide_rows17_checks_policy_and_row17_on_nax(monkeypatch):
+    """On a NAX host the g15d routing (rows 17/18 policies) and row-17
+    bitwise parity are still checked; only row 18's C2 is host-gated."""
+    monkeypatch.setattr(linear, "_nax_host", lambda: True)
+    seen: list[int] = []
+    real_policy = tile_dense.policy_for
+
+    def spy_policy(plan, rows, dtype):
+        seen.append(rows)
+        return real_policy(plan, rows, dtype)
+
+    monkeypatch.setattr(tile_dense, "policy_for", spy_policy)
+    test_m3_wide_rows17_takes_mlx_and_passes_c2()
+    assert 17 in seen and 18 in seen
 
 
 def test_narrow_n_c2_evaluates_all_rows(monkeypatch):
@@ -1663,6 +1688,8 @@ def test_narrow_n_c2_evaluates_all_rows(monkeypatch):
 
 
 def test_host_sweep_covers_wide_window_and_fp16(monkeypatch):
+    """Every row of the host's qmv_wide window is C2-checked, plus the first
+    non-mlx row past it (top + 1), which must project too."""
     seen: set[tuple[int, mx.Dtype]] = set()
     real_project = tile_dense.project
 
@@ -1676,7 +1703,7 @@ def test_host_sweep_covers_wide_window_and_fp16(monkeypatch):
     assert top >= 31, f"expected 2048x2048 wide window top >= 31, got {top}"
     expected = {
         (rows, dtype)
-        for rows in range(17, top + 1)
+        for rows in range(17, top + 2)
         for dtype in (mx.bfloat16, mx.float16)
     }
     assert seen == expected

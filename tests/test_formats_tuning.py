@@ -1701,6 +1701,25 @@ def test_single_row_span_is_accepted_and_reversed_is_refused(tmp_path):
                 )
                 is None
             )
+        first = _entry(
+            face, n=2560, k=2560, rows_bucket="1-1", params={"backend": "mlx"}
+        )
+        _write(tmp_path / "v1", CHIP, [first])
+        tuning.reset_cache()
+        assert (
+            tuning.lookup(
+                "dense_tile",
+                face,
+                dtype=mx.bfloat16,
+                bits=4,
+                group=64,
+                n=2560,
+                k=2560,
+                rows=1,
+                chip=CHIP,
+            )
+            is not None
+        )
         bad = _entry(
             face, n=2560, k=2560, rows_bucket="18-17", params={"backend": "mlx"}
         )
@@ -1735,6 +1754,26 @@ def test_bare_integer_rows_bucket_outside_route_is_refused(tmp_path):
             params={"bn": 16, "bk": 32, "nsg": 8},
         ),
         _entry(face, n=2560, k=2560, rows_bucket="0-0", params={"backend": "mlx"}),
+        _entry(face, n=2560, k=2560, rows_bucket="17-17\n", params={"backend": "mlx"}),
+        _entry(face, n=2560, k=2560, rows_bucket="017-24", params={"backend": "mlx"}),
+        _entry(
+            face,
+            n=2560,
+            k=2560,
+            rows_bucket="\u0661\u0667-\u0661\u0667",
+            params={"backend": "mlx"},
+        ),
+        _entry(face, n=2560, k=2560, rows_bucket="17-024", params={"backend": "mlx"}),
+        _entry(
+            face, n=2560, k=2560, rows_bucket="1\u0667-24", params={"backend": "mlx"}
+        ),
+        _entry(
+            face,
+            n=2560,
+            k=2560,
+            rows_bucket="17-\u0662\u0664",
+            params={"backend": "mlx"},
+        ),
     )
     try:
         for bad in bad_cases:

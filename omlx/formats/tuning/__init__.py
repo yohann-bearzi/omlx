@@ -266,7 +266,9 @@ def _dtype_name(dtype) -> str:
     return {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(text, text)
 
 
-_ROWS_SPAN_RE = re.compile(r"^(?:(\d+)-(\d+)|(\d+)\+|<(\d+)|(\d+))$")
+_ROWS_SPAN_RE = re.compile(
+    r"\A(?:([1-9][0-9]*)-([1-9][0-9]*)|([1-9][0-9]*)\+|<([1-9][0-9]*)|([1-9][0-9]*))\Z"
+)
 
 
 def _parse_rows_span(bucket: object) -> tuple[int | None, int | None] | None:
