@@ -2527,6 +2527,16 @@ class VLMBatchedEngine(BaseEngine):
         except Exception:
             logger.warning("Qwen packed 4-bit projections not applied", exc_info=True)
 
+        # Warm post-fusion MoE kernels before starting the engine. Fail closed:
+        # a warm error fails the load rather than serving cold compiles.
+        from ..patches.qwen35_moe_routed_decode import warm_moe_model
+
+        mtp_warm = bool(getattr(self._model_settings, "mtp_enabled", False))
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            lambda: warm_moe_model(self._vlm_model, mtp_enabled=mtp_warm),
+        )
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:

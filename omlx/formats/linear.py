@@ -622,51 +622,398 @@ def _switch_stand_in(plan: _Plan, metal):
 
 
 # The activation dtypes oMLX serves a format's layers with: bfloat16, and
-# float16 when activations are recast. A load builds their Metals ahead.
+# float16 when activations are recast. A load builds only its checkpoint's
+# floating dtype when known, falling back to both otherwise.
 _WARM_DTYPES = (mx.bfloat16, mx.float16)
+_NO_EPILOGUE = object()
 
 
-def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
-    """Build, in a worker thread, the dot Metal that the first call of a
-    layer of ``layer_cls`` would prove: one build for each served
-    activation dtype its face is exact for, on a zero stand-in the call's
-    own Metal reads whole -- a row of ``k`` and every tensor at the shape
-    the layout declares -- from the declared tensors alone. The stand-in
-    layer made here is dropped, so no tensor of the checkpoint's is kept by
-    a warm-up.
+def _infer_warm_dtypes(tensors, layout, dtypes) -> tuple[mx.Dtype, ...]:
+    """The served floating dtypes to warm for one layer."""
+    if dtypes is not None:
+        return tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
+    stored = (
+        {name for name, (_, dt) in layout.items() if dt is None}
+        if layout is not None
+        else set()
+    )
+    found = [
+        t.dtype
+        for name, t in tensors.items()
+        if name not in stored and t.dtype in _WARM_DTYPES
+    ]
+    if found:
+        return tuple(dt for dt in _WARM_DTYPES if dt in found)
+    return _WARM_DTYPES
 
-    Returns the futures of the builds, or None when the call would take
-    its composed path:
-    a stack (its route builds with the served experts' geometry), a k or
-    an n the rows kernel does not take, no face for the matrix, or no
-    served activation dtype the face is exact for."""
-    if (
-        getattr(layer_cls, "_STACK", 0)
-        or issubclass(layer_cls, FormatEmbedding)
-        or k < 8
-    ):
+
+def _switch_stand_in_specs(operands) -> tuple[tuple[tuple[int, ...], mx.Dtype], ...]:
+    """Fewest matrices of a switch stack that preserve MLX input binding."""
+    experts = operands[0].shape[0]
+    matrices = max(
+        (-(-8 * a.shape[0] // a.size)) if a.size >= 8 else a.shape[0] for a in operands
+    )
+    matrices = min(experts, matrices)
+    return tuple(((matrices, *a.shape[1:]), a.dtype) for a in operands)
+
+
+def _nax_face_plans(experts: int, k: int, n: int) -> tuple:
+    """Every distinct NAX sorted-gather plan reachable for ``(experts, k, n)``."""
+    from ..patches import m5_gather_qmm_nax as nax
+
+    e = max(1, experts)
+    samples = (16, 36 * e, 48 * e, 96 * e, 120 * e)
+    return tuple(dict.fromkeys(nax.face_plan(r, experts, k, n) for r in samples))
+
+
+def _record_proof(proofs: dict, inst, proof_obj, metal) -> None:
+    targets = proofs.setdefault(inst, [])
+    entry = (proof_obj, metal)
+    if entry not in targets:
+        targets.append(entry)
+
+
+def _plan_switch_warm(
+    stand_in,
+    k: int,
+    target_dtypes: tuple[mx.Dtype, ...],
+    per_rows: tuple[int, ...],
+    epilogue_limit,
+    instances: dict,
+    proofs: dict,
+    proof_tasks: list,
+) -> None:
+    """Collect rows, tile_gather and optional NAX epilogue warms for a switch layer."""
+    plan = _plan(stand_in)
+    if plan is not None:
+        op_specs = _switch_stand_in_specs(plan.operands)
+        op_shapes = tuple(s for s, _ in op_specs)
+        n = plan.n
+        for dtype in target_dtypes:
+            if not plan.face.exact_for(dtype):
+                continue
+            for per_row in dict.fromkeys(per_rows):
+                few_opts = (False,) if per_row >= 8 else (False, True)
+                for few in few_opts:
+                    rows = 1 if few else -(-8 // per_row)
+                    pairs = rows * per_row
+                    in_specs = (((rows, k), dtype), *op_specs, ((pairs,), mx.uint32))
+                    in_shapes = ((rows, k), *op_shapes, (pairs,))
+                    inst = kernels.planned(
+                        plan.kernel,
+                        in_specs,
+                        [dtype],
+                        template=[
+                            ("T", dtype),
+                            ("K_SIZE", k),
+                            ("N_SIZE", n),
+                            ("PAIRS_PER_ROW", per_row),
+                        ],
+                    )
+
+                    def switch_recipe(
+                        in_shapes=in_shapes,
+                        out_shapes=((pairs, n),),
+                        grid=(32, 2 * pairs, 1),
+                    ):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=grid,
+                            threadgroup=(32, 2, 1),
+                        )
+
+                    instances.setdefault(inst, switch_recipe)
+                    _record_proof(proofs, inst, plan.proof, (dtype, per_row, few))
+
+    tile = _tile(stand_in)
+    if tile is None:
+        return
+    experts = tile.operands[0].shape[0]
+    n = stand_in.output_dims
+    op_specs = _switch_stand_in_specs(tile.operands)
+    if not _nax_host():
+        from . import tile_gather
+
+        if k % 32 or n <= 0 or experts <= 0:
+            return
+        mm = tile.kernel
+        for dtype in target_dtypes:
+            if not tile.face.exact_for(dtype):
+                continue
+            metal = (dtype, k, n % 32 == 0)
+
+            def build_steel(stream, mm=mm, dtype=dtype, k=k, op_specs=op_specs):
+                arrays = kernels.zeros(
+                    ((16, 1, k), dtype), ((16,), mx.uint32), *op_specs, stream=stream
+                )
+                return arrays, lambda x, idx, *ops: tile_gather.launch(mm, x, ops, idx)
+
+            proof_tasks.append((tile.proof, metal, build_steel))
+        return
+
+    from ..patches import m5_gather_qmm_nax as nax
+
+    if not (0 < experts <= nax._MAX_EXPERTS and n > 0 and n % 32 == 0 and k % 32 == 0):
+        return
+    configs = _nax_face_plans(experts, k, n)
+    mm = tile.kernel
+    for dtype in target_dtypes:
+        if not tile.face.exact_for(dtype):
+            continue
+        for config in configs:
+            metal = (dtype, k, config, n % 64 == 0)
+
+            def build_nax(
+                stream, mm=mm, dtype=dtype, k=k, op_specs=op_specs, config=config
+            ):
+                arrays = kernels.zeros(
+                    ((16, 1, k), dtype), ((16,), mx.uint32), *op_specs, stream=stream
+                )
+                return (
+                    arrays,
+                    lambda x, idx, *ops: nax._launch_face(
+                        mm, x, ops, idx, config, stream
+                    ),
+                )
+
+            proof_tasks.append((tile.proof, metal, build_nax))
+        if epilogue_limit is not _NO_EPILOGUE and n % 64 == 0 and plan is not None:
+            epi_mm = nax._face_kernel(tile.face, "act_map")
+            if epi_mm is None:
+                continue
+            epi_proof = _epilogue_proof(tile, plan, mapped=True)
+            epi = nax._EPI_SWIGLU if epilogue_limit is None else nax._EPI_CLAMPED
+            limit = epilogue_limit
+            for config in configs:
+                metal = (dtype, k, config, epi, True)
+
+                def build_epi(
+                    stream,
+                    epi_mm=epi_mm,
+                    dtype=dtype,
+                    k=k,
+                    op_specs=op_specs,
+                    config=config,
+                    epi=epi,
+                    limit=limit,
+                ):
+                    arrays = kernels.zeros(
+                        ((1, 1, k), dtype),
+                        ((16,), mx.uint32),
+                        ((16,), mx.uint32),
+                        *op_specs,
+                        stream=stream,
+                    )
+                    return (
+                        arrays,
+                        lambda x, idx, rmap, *ops: nax._launch_face(
+                            epi_mm, x, ops, idx, config, stream, epi, limit, rmap
+                        ),
+                    )
+
+                proof_tasks.append((epi_proof, metal, build_epi))
+
+
+def _plan_dense_warm(
+    stand_in,
+    fmt,
+    bits: int,
+    group_size: int,
+    k: int,
+    target_dtypes: tuple[mx.Dtype, ...],
+    instances: dict,
+    proofs: dict,
+) -> None:
+    """Collect rows, shared rows, tile_wide and tile_dense warms for a FormatLinear."""
+    n = stand_in.output_dims
+    is_stackable = fmt.mode == "affine" or (
+        n > 16384 and formats.stackable(fmt, k, n, bits, group_size)
+    )
+    plan = _plan(stand_in)
+    if plan is not None:
+        _, op_specs = tile_dense._stand_in_operands(
+            plan.operands, n, min(n, 8), stackable=is_stackable
+        )
+        op_shapes = tuple(s for s, _ in op_specs)
+        for dtype in target_dtypes:
+            if not plan.face.exact_for(dtype):
+                continue
+            if n % 8 == 0:
+                in_shapes = ((k,), *op_shapes)
+                inst = kernels.planned(
+                    plan.kernel,
+                    (((k,), dtype), *op_specs),
+                    [dtype],
+                    template=[("T", dtype), ("K_SIZE", k), ("N_SIZE", n)],
+                )
+
+                def row_recipe(in_shapes=in_shapes):
+                    # One tile of outputs: the rows kernel's first 8, one threadgroup.
+                    return kernels.StandIn(
+                        input_shapes=in_shapes,
+                        output_shapes=((8,),),
+                        grid=(32, 2, 1),
+                        threadgroup=(32, 2, 1),
+                    )
+
+                instances.setdefault(inst, row_recipe)
+                _record_proof(proofs, inst, plan.proof, dtype)
+            if plan.shared is not None:
+                groups = set()
+                if n % 8:
+                    groups.add(1)
+                for r in range(2, MAX_ROWS + 1):
+                    g = _group(r, plan.face.vpt, n)
+                    if g > 1:
+                        groups.add(g)
+                for group in sorted(groups):
+                    in_shapes = ((group, k), *op_shapes)
+                    inst = kernels.planned(
+                        plan.shared,
+                        (((group, k), dtype), *op_specs),
+                        [dtype],
+                        template=[
+                            ("T", dtype),
+                            ("K_SIZE", k),
+                            ("N_SIZE", n),
+                            ("ROWS", group),
+                            ("VPT", plan.face.vpt),
+                        ],
+                    )
+
+                    def shared_recipe(in_shapes=in_shapes, out_shapes=((group, n),)):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=(32, 2, 1),
+                            threadgroup=(32, 2, 1),
+                        )
+
+                    instances.setdefault(inst, shared_recipe)
+                    _record_proof(proofs, inst, plan.proof, (dtype, group))
+
+    arch = _metal_architecture()
+    wide_tile = (
+        _ordinary_tile(stand_in, k, n, "wide", tile_wide.kernel) if arch else None
+    )
+    if wide_tile is not None:
+        wide_modes = set()
+        for r in range(2, MAX_ROWS + 1):
+            if traversal(r, n, k, group_size, arch, bits=bits)[0] == "wide":
+                tiles = (r + 4) // 5
+                vectors = (r + tiles - 1) // tiles
+                wide_modes.add((vectors, r % vectors != 0))
+        if wide_modes:
+            _, wide_ops = tile_dense._stand_in_operands(
+                wide_tile.operands, n, min(n, 8), stackable=is_stackable
+            )
+            wide_shapes = tuple(s for s, _ in wide_ops)
+            for dtype in target_dtypes:
+                if not wide_tile.face.exact_for(dtype):
+                    continue
+                for vectors, partial_m in sorted(wide_modes):
+                    rows = 2 * vectors - 1 if partial_m else vectors
+                    tiles = (rows + 4) // 5
+                    inst = kernels.planned(
+                        wide_tile.kernel,
+                        (((rows, k), dtype), *wide_ops),
+                        [dtype],
+                        template=[
+                            ("T", dtype),
+                            ("K", k),
+                            ("N", n),
+                            ("V", vectors),
+                            ("PARTIAL_M", partial_m),
+                        ],
+                    )
+                    in_shapes = ((rows, k), *wide_shapes)
+
+                    def wide_recipe(
+                        in_shapes=in_shapes,
+                        out_shapes=((rows, n),),
+                        grid=(32 * tiles, 2, 1),
+                    ):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=grid,
+                            threadgroup=(32, 2, 1),
+                        )
+
+                    instances.setdefault(inst, wide_recipe)
+                    _record_proof(
+                        proofs,
+                        inst,
+                        wide_tile.proof,
+                        (dtype, k, n, vectors, partial_m),
+                    )
+
+    td_instances, td_proofs = tile_dense.warm_specs(
+        stand_in, target_dtypes, tensor_units=_nax_host(), stackable=is_stackable
+    )
+    for inst, recipe in td_instances.items():
+        instances.setdefault(inst, recipe)
+        for proof_obj, metal in td_proofs.get(inst, ()):
+            _record_proof(proofs, inst, proof_obj, metal)
+
+
+def warm_layer(
+    layer_cls,
+    fmt,
+    bits,
+    group_size,
+    k,
+    tensors,
+    layout,
+    *,
+    dtypes=None,
+    per_rows=(1,),
+    epilogue_limit=_NO_EPILOGUE,
+):
+    """Build, in worker threads, all Metal kernels that ``layer_cls`` serves.
+
+    Covers:
+    - ``FormatLinear``: 1-row dot, shared-rows (unaligned N and verify groups),
+      ``tile_wide`` (all reachable ``(V, PARTIAL_M)``), and ``tile_dense``;
+    - ``FormatSwitchLinear``: switch ``rows``, sorted ``tile_gather`` (steel on
+      M3, NAX on M5), and optional NAX mapped SwiGLU epilogue.
+
+    Warms only the checkpoint's floating dtype when provided (or inferred from
+    non-placeholder tensors), dropping the stand-in layer immediately so no
+    checkpoint tensor is kept by a warm-up. Populates each ``Proof.ran`` once
+    its build succeeds so the first served call pays zero compile proofs.
+
+    Returns the submitted futures, or None when nothing applies.
+    """
+    if issubclass(layer_cls, FormatEmbedding) or k < 8:
         return None
     codes = tensors.get(fmt.codes_name)
-    if (
-        codes is not None
-        and codes.ndim >= 2
-        and (codes.shape[-2] < 8 or codes.shape[-2] % 8)
-    ):
+    if codes is not None and codes.ndim >= 2 and codes.shape[-2] == 0:
+        return None
+    warm_dtypes = _infer_warm_dtypes(tensors, layout, dtypes)
+    if not warm_dtypes:
         return None
     stored = tuple(name for name, (_, dtype) in (layout or {}).items() if dtype is None)
     probes = (
-        (
-            {
-                name: mx.zeros(t.shape, dtype) if name in stored else t
-                for name, t in tensors.items()
-            }
-            for dtype in _WARM_DTYPES
+        tuple(
+            (
+                dtype,
+                {
+                    name: mx.zeros(t.shape, dtype) if name in stored else t
+                    for name, t in tensors.items()
+                },
+            )
+            for dtype in warm_dtypes
         )
         if stored
-        else (tensors,)
+        else ((None, tensors),)
     )
-    instances = {}
-    for probe in probes:
+    instances: dict = {}
+    proofs: dict = {}
+    proof_tasks: list = []
+    stacked = bool(getattr(layer_cls, "_STACK", 0))
+    for probe_dtype, probe in probes:
         stand_in = layer_cls(
             fmt,
             bits,
@@ -677,35 +1024,124 @@ def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
             placeholders=False,
             _load_layout=layout,
         )
-        plan = _plan(stand_in)
-        if plan is None:
-            continue
-        dtypes = tuple(dtype for dtype in _WARM_DTYPES if plan.face.exact_for(dtype))
-        if not dtypes:
-            continue
-        n = plan.n
-        shapes = ((k,), *(operand.shape for operand in plan.operands))
-        slots = tuple((operand.shape, operand.dtype) for operand in plan.operands)
-
-        def recipe(shapes=shapes):
-            # One tile of outputs: the rows kernel's first 8, one threadgroup.
-            return kernels.StandIn(
-                input_shapes=shapes,
-                output_shapes=((8,),),
-                grid=(32, 2, 1),
-                threadgroup=(32, 2, 1),
+        target_dtypes = (probe_dtype,) if probe_dtype is not None else warm_dtypes
+        if stacked:
+            _plan_switch_warm(
+                stand_in,
+                k,
+                target_dtypes,
+                per_rows,
+                epilogue_limit,
+                instances,
+                proofs,
+                proof_tasks,
             )
+        else:
+            _plan_dense_warm(
+                stand_in,
+                fmt,
+                bits,
+                group_size,
+                k,
+                target_dtypes,
+                instances,
+                proofs,
+            )
+    futures = []
+    if instances:
+        futures.extend(kernels.warm(_attach_proofs(instances, proofs)))
+    if proof_tasks:
+        futures.extend(kernels.warm_proofs(proof_tasks))
+    return tuple(futures) if futures else None
 
-        for dtype in dtypes:
-            instances[
-                kernels.planned(
-                    plan.kernel,
-                    ((shapes[0], dtype), *slots),
-                    [dtype],
-                    template=[("T", dtype), ("K_SIZE", k), ("N_SIZE", n)],
-                )
-            ] = recipe
-    return kernels.warm(instances) if instances else None
+
+def _attach_proofs(instances: dict, proofs: dict) -> dict:
+    return {
+        inst: (kernels._WarmRecipe(recipe, proofs[inst]) if inst in proofs else recipe)
+        for inst, recipe in instances.items()
+    }
+
+
+def warm_existing_switch(
+    layer: FormatSwitchLinear,
+    *,
+    dtypes: tuple[mx.Dtype, ...],
+    per_rows: tuple[int, ...] = (1,),
+    epilogue_limit=_NO_EPILOGUE,
+):
+    """Submit warm futures for an already-loaded (e.g. post-fusion) switch layer."""
+    warm_dtypes = tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
+    if not warm_dtypes or layer.input_dims < 8 or layer.output_dims <= 0:
+        return None
+    instances: dict = {}
+    proofs: dict = {}
+    proof_tasks: list = []
+    _plan_switch_warm(
+        layer,
+        layer.input_dims,
+        warm_dtypes,
+        per_rows,
+        epilogue_limit,
+        instances,
+        proofs,
+        proof_tasks,
+    )
+    futures = []
+    if instances:
+        futures.extend(kernels.warm(_attach_proofs(instances, proofs)))
+    if proof_tasks:
+        futures.extend(kernels.warm_proofs(proof_tasks))
+    return tuple(futures) if futures else None
+
+
+def warm_existing_dense(
+    model,
+    *,
+    dtypes: tuple[mx.Dtype, ...] = (mx.float16,),
+):
+    """Submit warm futures for every already-loaded dense ``FormatLinear`` in ``model``."""
+    warm_dtypes = tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
+    if not warm_dtypes:
+        return None
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return None
+    instances: dict = {}
+    proofs: dict = {}
+    seen: set[tuple] = set()
+    for _, mod in named_modules():
+        if not isinstance(mod, FormatLinear):
+            continue
+        k, n = mod.input_dims, mod.output_dims
+        if k < 8 or n <= 0:
+            continue
+        tensor_dtypes = tuple(
+            (name, mod[name].dtype) for name in mod._tensors if name in mod
+        )
+        key = (
+            mod.fmt.mode,
+            mod.bits,
+            mod.group_size,
+            k,
+            n,
+            tensor_dtypes,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        _plan_dense_warm(
+            mod,
+            mod.fmt,
+            mod.bits,
+            mod.group_size,
+            k,
+            warm_dtypes,
+            instances,
+            proofs,
+        )
+    if not instances:
+        return None
+    return tuple(kernels.warm(_attach_proofs(instances, proofs)))
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):

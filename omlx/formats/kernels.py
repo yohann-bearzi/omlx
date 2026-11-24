@@ -832,6 +832,16 @@ class _Kept(threading.local):
 # launch is built keeps no graph of it.
 _KEEPING = threading.Lock()
 
+# Monotonic count of runtime Proof.prove() compilations (never incremented by
+# load-time warming or warm Proof.ran hits).
+_PROOF_COUNT = 0
+_PROOF_COUNT_LOCK = threading.Lock()
+
+
+def proof_count() -> int:
+    """Number of runtime ``Proof.prove`` compilations executed so far."""
+    return _PROOF_COUNT
+
 
 class ProofBinding:
     """A plan's own kept graphs, retired with the proof's failure.
@@ -887,6 +897,48 @@ class Proof:
     _bindings: weakref.WeakSet = field(
         default_factory=weakref.WeakSet, init=False, repr=False, compare=False
     )
+    _warm_locks: dict = field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
+
+    def _mark_warm(self, metal) -> None:
+        """Record ``metal`` as built ahead of serving (does not touch proof_count)."""
+        with _KEEPING:
+            if not self.failed:
+                self.ran.add(metal)
+
+    def warm(self, metal, build) -> None:
+        """Compile ``metal`` on ``_warm_stream()`` ahead of the first served call.
+
+        Marks ``metal`` in ``ran`` only after evaluation succeeds. Fails closed:
+        any build or evaluation error propagates to the caller.
+        """
+        if self.failed:
+            raise RuntimeError("cannot warm a proof that has already failed")
+        if metal in self.ran:
+            return
+        with _KEEPING:
+            lock = self._warm_locks.setdefault(metal, threading.Lock())
+        with lock:
+            if self.failed:
+                raise RuntimeError("cannot warm a proof that has already failed")
+            if metal in self.ran:
+                return
+            stream = _warm_stream()
+            with mx.stream(stream):
+                inputs, launch = build(stream)
+                inputs = tuple(inputs)
+                mx.eval(*inputs)
+                launched = launch(*inputs)
+                outputs = (
+                    list(launched)
+                    if isinstance(launched, (list, tuple))
+                    else [launched]
+                )
+                if not outputs or not all(isinstance(a, mx.array) for a in outputs):
+                    raise RuntimeError(f"warm launch for {metal!r} returned no arrays")
+                mx.eval(*outputs)
+            self._mark_warm(metal)
 
     def bind(self) -> ProofBinding:
         """A plan's own kept graphs, cleared with this proof's failure."""
@@ -956,6 +1008,9 @@ class Proof:
         mx.eval(*inputs)
         mx.synchronize(mx.gpu)
         launched = launch(*inputs)
+        global _PROOF_COUNT
+        with _PROOF_COUNT_LOCK:
+            _PROOF_COUNT += 1
         try:
             # Surface a kernel build failure while the call can still fall
             # back.
@@ -1217,6 +1272,26 @@ def _warm_stream():
     return stream
 
 
+class _WarmRecipe:
+    """Callable StandIn recipe carrying the (Proof, metal) pairs it warms."""
+
+    __slots__ = ("recipe", "proofs")
+
+    def __init__(self, recipe, proofs=()):
+        self.recipe = recipe
+        self.proofs = list(proofs)
+
+    def __call__(self):
+        return self.recipe()
+
+
+def _warm_instance(instance, build) -> None:
+    instance.build(build)
+    if isinstance(build, _WarmRecipe):
+        for proof_obj, metal in build.proofs:
+            proof_obj._mark_warm(metal)
+
+
 def warm(instances):
     """Start building the specified Metals and return one future per entry.
 
@@ -1226,8 +1301,16 @@ def warm(instances):
     and evaluates the actual kernel. Future.result() raises any build error.
     """
     return tuple(
-        _WARM_POOL.submit(instance.build, build)
+        _WARM_POOL.submit(_warm_instance, instance, build)
         for instance, build in instances.items()
+    )
+
+
+def warm_proofs(tasks):
+    """Start warming ``(proof, metal, build)`` tasks on ``_WARM_POOL``."""
+    return tuple(
+        _WARM_POOL.submit(proof_obj.warm, metal, build)
+        for proof_obj, metal, build in tasks
     )
 
 

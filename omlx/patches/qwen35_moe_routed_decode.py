@@ -95,6 +95,7 @@ nothing to bound here. Only scheduling changes.
 from __future__ import annotations
 
 import logging
+import math
 from functools import cache, partial, wraps
 from typing import NamedTuple
 
@@ -1384,17 +1385,19 @@ def _token(launches: _Launches, folded: bool):
     return graph
 
 
-def _ranked(rows: int, experts: int, dtype) -> mx.array:
+def _ranked(rows: int, experts: int, dtype, *, stream=None) -> mx.array:
     """Router logits for ``rows`` rows that rank the experts in order: each
     row selects the first top-k. Made on the GPU's stream, as a stand-in's
     zeros are (``kernels.zeros``)."""
-    gpu = mx.gpu
+    gpu = mx.gpu if stream is None else stream
     column = mx.zeros((rows, 1), mx.float32, stream=gpu)
     ranked = mx.subtract(column, mx.arange(experts, stream=gpu), stream=gpu)
     return mx.astype(ranked, dtype, stream=gpu)
 
 
-def _stand_in(launches: _Launches, logits, folded: bool, outside, operands):
+def _stand_in(
+    launches: _Launches, logits, folded: bool, outside, operands, *, stream=None
+):
     """The smallest launches of a block's rows that MLX generates the Metal
     of the call's for, over zeros: the rows, the router's weight, the whole
     of each shared matrix, what the block computes outside the launches,
@@ -1431,7 +1434,12 @@ def _stand_in(launches: _Launches, logits, folded: bool, outside, operands):
             launched.append(launches.router(x, *stand_ins[0]))
         return launched
 
-    zeros = kernels.zeros(*(spec for group in groups for spec in group))
+    specs = tuple(spec for group in groups for spec in group)
+    zeros = (
+        kernels.zeros(*specs)
+        if stream is None
+        else kernels.zeros(*specs, stream=stream)
+    )
     return [logits, *zeros], launch
 
 
@@ -1718,3 +1726,283 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
     _ensure_verify_window_patch(cls)
     logger.info("Qwen MoE fused routed-expert decode patch applied")
     return True
+
+
+class _Spec:
+    """Shape/dtype descriptor for stand-in planning without holding arrays."""
+
+    __slots__ = ("shape", "dtype", "size")
+
+    def __init__(self, shape: tuple[int, ...], dtype: mx.Dtype) -> None:
+        self.shape = tuple(shape)
+        self.dtype = dtype
+        size = 1
+        for dim in self.shape:
+            size *= dim
+        self.size = size
+
+
+def _infer_block_dtype(block) -> mx.Dtype | None:
+    """Infer the serving floating dtype (bf16 or fp16) of a loaded MoE block."""
+    candidates = [block.get("gate"), block.get("shared_expert")]
+    switch_mlp = block.get("switch_mlp")
+    if switch_mlp is not None:
+        candidates.extend((switch_mlp.get("gate_up_proj"), switch_mlp.get("down_proj")))
+    for mod in candidates:
+        if mod is None or not isinstance(mod, nn.Module):
+            continue
+        for _, param in mod.named_modules():
+            for val in param.values():
+                if isinstance(val, mx.array) and val.dtype in (mx.bfloat16, mx.float16):
+                    return val.dtype
+    return None
+
+
+def warm_moe_model(model, *, mtp_enabled: bool = False) -> None:
+    """Post-load warm for fused MoE kernels on ``kernels._WARM_POOL``.
+
+    Warms once per distinct block geometry:
+    - fused ``FormatSwitchLinear`` ``gate_up_proj`` (``rows`` with
+      ``per_row=1`` and ``per_row=top_k``, ``tile_gather``, and M5 NAX mapped
+      SwiGLU epilogue) and ``down_proj``;
+    - ``routed_decode`` (1 row);
+    - ``routed_verify_window`` (rows 2, 3, 4; plus 6, 8, 9, 12, 16 when
+      ``mtp_enabled``);
+    - ``moe_verify_gather`` (rows 2..MAX_ROWS).
+
+    Fails closed: awaits all submitted warm futures and re-raises the first
+    error. Never falls back silently.
+    """
+    if model is None or not mx.metal.is_available():
+        return
+    named_modules = getattr(model, "named_modules", None)
+    if named_modules is None:
+        return
+
+    from ..formats import linear
+    from . import m5_gather_qmm, moe_verify_gather
+
+    window_rows = (2, 3, 4, 6, 8, 9, 12, 16) if mtp_enabled else (2, 3, 4)
+    futures = []
+    proof_tasks: list[tuple] = []
+    seen_proofs: set[tuple] = set()
+    seen_switch: set[tuple] = set()
+
+    def add_task(proof_obj, metal, build) -> None:
+        key = (id(proof_obj), metal)
+        if key not in seen_proofs:
+            seen_proofs.add(key)
+            proof_tasks.append((proof_obj, metal, build))
+
+    exc_in_body = False
+    try:
+        if getattr(model, "_omlx_fp16_recast", False):
+            planned_dense = linear.warm_existing_dense(model, dtypes=(mx.float16,))
+            if planned_dense:
+                futures.extend(planned_dense)
+
+        for _, mod in named_modules():
+            switch_mlp = getattr(mod, "switch_mlp", None)
+            top_k = getattr(mod, "top_k", None)
+            num_experts = getattr(mod, "num_experts", None)
+            if (
+                not isinstance(switch_mlp, nn.Module)
+                or type(top_k) is not int
+                or top_k <= 0
+                or type(num_experts) is not int
+                or num_experts <= 0
+            ):
+                continue
+            dtype = _infer_block_dtype(mod)
+            if dtype is None:
+                continue
+
+            gate_up = switch_mlp.get("gate_up_proj")
+            down = switch_mlp.get("down_proj")
+
+            # 1. Post-fusion FormatSwitchLinear rows / tile_gather / M5 NAX act_map.
+            if isinstance(gate_up, FormatSwitchLinear):
+                epi_limit = linear._NO_EPILOGUE
+                if "bias" not in gate_up and "global_scale" not in gate_up:
+                    lim = m5_gather_qmm._swiglu_limit(
+                        getattr(switch_mlp, "activation", None)
+                    )
+                    if lim is not m5_gather_qmm._UNSUPPORTED and (
+                        lim is None
+                        or (
+                            isinstance(lim, (int, float))
+                            and not isinstance(lim, bool)
+                            and math.isfinite(lim)
+                        )
+                    ):
+                        epi_limit = lim
+                sw_key = (
+                    "gu",
+                    gate_up.fmt.mode,
+                    gate_up.bits,
+                    gate_up.group_size,
+                    gate_up.input_dims,
+                    gate_up.output_dims,
+                    gate_up.num_experts,
+                    dtype,
+                    top_k,
+                    epi_limit,
+                )
+                if sw_key not in seen_switch:
+                    seen_switch.add(sw_key)
+                    planned = linear.warm_existing_switch(
+                        gate_up,
+                        dtypes=(dtype,),
+                        per_rows=(1, top_k),
+                        epilogue_limit=epi_limit,
+                    )
+                    if planned:
+                        futures.extend(planned)
+
+            if isinstance(down, FormatSwitchLinear):
+                sw_key = (
+                    "dn",
+                    down.fmt.mode,
+                    down.bits,
+                    down.group_size,
+                    down.input_dims,
+                    down.output_dims,
+                    down.num_experts,
+                    dtype,
+                )
+                if sw_key not in seen_switch:
+                    seen_switch.add(sw_key)
+                    planned = linear.warm_existing_switch(
+                        down,
+                        dtypes=(dtype,),
+                        per_rows=(1,),
+                    )
+                    if planned:
+                        futures.extend(planned)
+
+            # 2. routed_decode (1-row) and routed_verify_window (cache plan so
+            #    the first served decode token skips 288 _expert_view syncs).
+            plan = _cached_plan(mod, dtype)
+            if plan is not None and not plan.proof.failed:
+                launches = plan.launches
+                op_specs = tuple(
+                    tuple(_Spec(a.shape, a.dtype) for a in group)
+                    for group in plan.operands
+                )
+                if router_eligible(_Spec((1, launches.hidden), dtype), plan.experts):
+                    folded_1 = _topk_folds(launches, _Spec((1, plan.experts), dtype))
+                    outside_1: tuple = ()
+                    if not launches.fold:
+                        outside_1 = (
+                            _Spec((1, launches.hidden), dtype),
+                            _Spec((1, 1), dtype),
+                        )
+                    if launches.router is None:
+                        outside_1 = (_Spec((1, plan.experts), dtype), *outside_1)
+                    metal_1 = (plan.experts, folded_1)
+
+                    def build_decode(
+                        stream,
+                        launches=launches,
+                        experts=plan.experts,
+                        dtype=dtype,
+                        folded=folded_1,
+                        outside=outside_1,
+                        op_specs=op_specs,
+                    ):
+                        logits = _ranked(1, experts, dtype, stream=stream)
+                        return _stand_in(
+                            launches, logits, folded, outside, op_specs, stream=stream
+                        )
+
+                    add_task(plan.proof, metal_1, build_decode)
+
+                if (
+                    plan.window is not None
+                    and not plan.window.failed
+                    and (launches.router is not None or plan.quantized_router)
+                ):
+                    for rows in window_rows:
+                        if rows > WINDOW_MAX_ROWS:
+                            continue
+                        if not router_eligible(
+                            _Spec((rows, launches.hidden), dtype),
+                            plan.experts,
+                            WINDOW_MAX_ROWS,
+                        ):
+                            continue
+                        folded_w = _topk_folds(
+                            launches, _Spec((rows, plan.experts), dtype)
+                        )
+                        outside_w = (
+                            (_Spec((rows, plan.experts), dtype),)
+                            if plan.quantized_router
+                            else ()
+                        )
+                        metal_w = (rows, plan.experts, folded_w)
+
+                        def build_window(
+                            stream,
+                            launches=launches,
+                            rows=rows,
+                            experts=plan.experts,
+                            dtype=dtype,
+                            folded=folded_w,
+                            outside=outside_w,
+                            op_specs=op_specs,
+                        ):
+                            logits = _ranked(rows, experts, dtype, stream=stream)
+                            return _stand_in(
+                                launches,
+                                logits,
+                                folded,
+                                outside,
+                                op_specs,
+                                stream=stream,
+                            )
+
+                        add_task(plan.window, metal_w, build_window)
+
+            # 3. moe_verify_gather (rows 2..MAX_ROWS).
+            if gate_up is not None and down is not None:
+                if isinstance(gate_up, FormatSwitchLinear):
+                    width = gate_up.input_dims
+                elif isinstance(down, nn.Module):
+                    names = formats.tensor_names(down)
+                    w = down.get(names[0]) if names else None
+                    if not (isinstance(w, mx.array) and w.ndim == 3):
+                        continue
+                    width = int(w.shape[1])
+                else:
+                    continue
+                for proof_obj, metal, build in moe_verify_gather.warm_tasks(
+                    switch_mlp, width, top_k, dtype
+                ):
+                    add_task(proof_obj, metal, build)
+
+        if proof_tasks:
+            futures.extend(kernels.warm_proofs(proof_tasks))
+    except BaseException:
+        exc_in_body = True
+        raise
+    finally:
+        first_error = None
+        for future in futures:
+            try:
+                future.result()
+            except Exception as error:  # noqa: BLE001
+                if first_error is None:
+                    first_error = error
+                else:
+                    logger.warning(
+                        "additional MoE warm build error while joining load",
+                        exc_info=True,
+                    )
+        if first_error is not None:
+            if exc_in_body:
+                logger.warning(
+                    "MoE warm build error while joining after load failure",
+                    exc_info=first_error,
+                )
+            else:
+                raise first_error

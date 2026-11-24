@@ -6881,3 +6881,209 @@ def test_use_target_verify_dense_declines_format_linear_when_armed(monkeypatch):
     monkeypatch.setattr(qwen35_verify_qmm, "_is_armed", lambda: False)
     assert ops._use_target_verify_dense(layer, x) is True
     assert calls == [(1, 3, 320)]
+
+
+def test_batch_policy_ignores_cycles_that_compiled_a_proof(monkeypatch):
+    """Cycles where kernels.proof_count() advances never feed BatchPolicy."""
+    from omlx.formats import kernels
+    from omlx.patches.mlx_lm_mtp import fused_batch
+    from omlx.patches.mlx_lm_mtp.batch_policy import BatchPolicy
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        model = _model("v41")
+        prompts = [[3, 4, 5, 6, 7, 8, 9, 10], [5, 6, 7, 8, 9, 10, 11]]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, [24, 24])
+        model._omlx_mtp_decode_enabled = True
+
+        count = [kernels.proof_count()]
+        monkeypatch.setattr(kernels, "proof_count", lambda: count[0])
+
+        mtp_cycles = 0
+        std_calls = 0
+        mtp_observed_flags = []
+        std_observed_ms = []
+        parked = []
+        clock_modes = []
+
+        orig_advance = fused_batch.advance
+        orig_observe_mtp = BatchPolicy.observe_mtp
+        orig_observe_std = BatchPolicy.observe_standard
+        orig_park = BatchPolicy.park
+        orig_cycle_time = BatchPolicy.cycle_time_ms
+        cur_cycle_proved = [False]
+
+        def wrapped_advance(gen_batch, batch_state):
+            nonlocal mtp_cycles
+            mtp_cycles += 1
+            # Simulate a proof compile during the first 4 MTP cycles (enough to
+            # trip clear_losing >= 4 parking if unguarded).
+            if mtp_cycles <= 4:
+                count[0] += 1
+                cur_cycle_proved[0] = True
+            else:
+                cur_cycle_proved[0] = False
+            return orig_advance(gen_batch, batch_state)
+
+        def wrapped_cycle_time(self, mode, started, finished):
+            clock_modes.append(mode)
+            orig_cycle_time(self, mode, started, finished)
+            if mode == "standard":
+                return 500.0 if std_calls == 1 else 10.0
+            # Huge latency during proof cycles, fast otherwise.
+            return 500.0 if cur_cycle_proved[0] else 5.0
+
+        def wrapped_observe_mtp(self, depth, accepted, milliseconds, *, stable):
+            mtp_observed_flags.append((cur_cycle_proved[0], milliseconds))
+            return orig_observe_mtp(self, depth, accepted, milliseconds, stable=stable)
+
+        def wrapped_observe_std(self, milliseconds):
+            std_observed_ms.append(milliseconds)
+            return orig_observe_std(self, milliseconds)
+
+        def wrapped_park(self):
+            parked.append(True)
+            return orig_park(self)
+
+        # Also bump proof_count during the 1st standard calibration step by
+        # hooking model.__call__ while BatchPolicy.needs_standard() is True.
+        orig_model_call = type(model).__call__
+        in_standard = [False]
+        orig_needs_std = BatchPolicy.needs_standard
+
+        def wrapped_needs_std(self):
+            res = orig_needs_std(self)
+            in_standard[0] = res
+            return res
+
+        def wrapped_model_call(self, *args, **kwargs):
+            nonlocal std_calls
+            if self is model and in_standard[0]:
+                in_standard[0] = False
+                std_calls += 1
+                if std_calls == 1:
+                    count[0] += 1
+            return orig_model_call(self, *args, **kwargs)
+
+        monkeypatch.setattr(fused_batch, "advance", wrapped_advance)
+        monkeypatch.setattr(BatchPolicy, "needs_standard", wrapped_needs_std)
+        monkeypatch.setattr(type(model), "__call__", wrapped_model_call)
+        monkeypatch.setattr(BatchPolicy, "cycle_time_ms", wrapped_cycle_time)
+        monkeypatch.setattr(BatchPolicy, "observe_mtp", wrapped_observe_mtp)
+        monkeypatch.setattr(BatchPolicy, "observe_standard", wrapped_observe_std)
+        monkeypatch.setattr(BatchPolicy, "park", wrapped_park)
+
+        actual, _ = generate(model, prompts, [24, 24])
+        assert actual == expected
+        assert mtp_cycles > 4
+        # Every proof-compiling MTP cycle was skipped by observe_mtp; normal ones fed it.
+        assert mtp_observed_flags
+        assert all(not proved for proved, _ in mtp_observed_flags)
+        assert not parked, "proof-compiling cycles must not park MTP"
+        # cycle_time_ms still ran on every MTP cycle (advancing finished_at).
+        assert clock_modes.count("mtp") == mtp_cycles
+        # The 1st standard calibration step compiled a proof -> passed None, not 500.0.
+        assert std_observed_ms and std_observed_ms[0] is None
+        assert 500.0 not in std_observed_ms
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_singleton_controller_ignores_timing_on_proof_step(monkeypatch):
+    """Singleton MTP cycles that compile a proof pass time_sample=False."""
+    from omlx.formats import kernels
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    prev_depth = mlx_lm_mtp.get_mtp_depth()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        mlx_lm_mtp.set_mtp_depth(2)
+        model = _model("qwen4")
+        model._omlx_mtp_depth_fixed = False
+        prompt = [[3, 4, 5, 6, 7, 8, 9, 10]]
+        model._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompt, [16])
+        model._omlx_mtp_decode_enabled = True
+
+        count = [kernels.proof_count()]
+        monkeypatch.setattr(kernels, "proof_count", lambda: count[0])
+
+        cycles = 0
+        samples = []
+        orig_call = bg._call_backbone_captured
+        orig_observe = bg._DepthController.observe
+
+        def wrapped_backbone(*args, **kwargs):
+            nonlocal cycles
+            cycles += 1
+            if cycles == 2:
+                count[0] += 1
+            return orig_call(*args, **kwargs)
+
+        def wrapped_observe(self, k, m, ms, *, time_sample=True):
+            samples.append((cycles, time_sample))
+            return orig_observe(self, k, m, ms, time_sample=time_sample)
+
+        monkeypatch.setattr(bg, "_call_backbone_captured", wrapped_backbone)
+        monkeypatch.setattr(bg._DepthController, "observe", wrapped_observe)
+
+        actual, _ = generate(model, prompt, [16])
+        assert actual == expected
+        assert any(c == 2 and not ts for c, ts in samples), f"samples={samples}"
+        assert any(c != 2 and ts for c, ts in samples), f"samples={samples}"
+    finally:
+        mlx_lm_mtp.set_mtp_depth(prev_depth)
+        mlx_lm_mtp.set_mtp_active(previous)
+
+
+def test_std_tax_probe_ignores_proof_step(monkeypatch):
+    """LOW 5: singleton post-park std tax probe skips steps that compiled a proof."""
+    from mlx_lm.generate import BatchGenerator
+
+    from omlx.formats import kernels
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    bg_inst = None
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        bg.apply()
+        model = _model("qwen4")
+        model._omlx_mtp_decode_enabled = True
+        prompt = [[3, 4, 5, 6, 7, 8, 9, 10]]
+
+        count = [kernels.proof_count()]
+        monkeypatch.setattr(kernels, "proof_count", lambda: count[0])
+        monkeypatch.setattr(bg, "_is_mtp_eligible", lambda _self: False)
+
+        orig_call = type(model).__call__
+
+        def bumping_call(self, *args, **kwargs):
+            if self is model:
+                count[0] += 1
+            return orig_call(self, *args, **kwargs)
+
+        probe = {"skip": 0, "samples": [], "uid": None}
+        bg_inst = BatchGenerator(model)
+        bg_inst.insert(prompt, [8])
+        # Advance until _generation_batch holds the active singleton request.
+        while len(bg_inst._generation_batch) == 0:
+            bg_inst.next()
+        bg_inst._generation_batch._omlx_mtp_tax_probe = probe
+        # Step 1 compiles a proof -> must NOT record a tax sample.
+        monkeypatch.setattr(type(model), "__call__", bumping_call)
+        bg_inst.next()
+        assert (
+            probe["samples"] == []
+        ), f"expected no tax samples on proof step, got {probe['samples']}"
+        # Step 2 does NOT compile a proof -> MUST record a tax sample (non-vacuous).
+        monkeypatch.setattr(type(model), "__call__", orig_call)
+        bg_inst.next()
+        assert (
+            len(probe["samples"]) == 1
+        ), f"expected 1 tax sample on clean step, got {probe['samples']}"
+    finally:
+        if bg_inst is not None:
+            bg_inst.close()
+        mlx_lm_mtp.set_mtp_active(previous)

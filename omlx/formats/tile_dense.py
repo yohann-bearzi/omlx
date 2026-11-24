@@ -1350,6 +1350,251 @@ def _metal_key(plan, x, policy) -> tuple:
     )
 
 
+def _effective_policy(policy: DenseTilePolicy, k: int, n: int) -> DenseTilePolicy:
+    align_n = policy.align_n and (n % policy.bn == 0)
+    even_tn = policy.backend == "nax" and (policy.bn // (16 * policy.wn)) % 2 == 0
+    sched_eff = (
+        "db"
+        if (
+            policy.backend == "nax"
+            and policy.sched == "db"
+            and align_n
+            and k % policy.bk == 0
+            and even_tn
+        )
+        else "seg"
+    )
+    split_eff = _split_k_geometry(k, policy.bk, policy.split_k)[0]
+    if (
+        align_n == policy.align_n
+        and sched_eff == policy.sched
+        and split_eff == policy.split_k
+    ):
+        return policy
+    return DenseTilePolicy(
+        policy.backend,
+        policy.bm,
+        policy.bn,
+        policy.bk,
+        policy.wm,
+        policy.wn,
+        align_n,
+        split_eff,
+        policy.x_nreads,
+        policy.param_staging,
+        policy.vec_store,
+        policy.pad_bytes,
+        policy.gx,
+        sched_eff,
+    )
+
+
+def _stand_in_operands(
+    operands: tuple, n: int, need_rows: int, *, align: int = 1, stackable: bool = False
+) -> tuple[int, tuple[tuple[tuple[int, ...], mx.Dtype], ...]]:
+    """Smallest safe operand (shape, dtype) specs preserving MLX input binding."""
+    if not stackable or not all(a.shape and a.shape[0] == n for a in operands):
+        return n, tuple((a.shape, a.dtype) for a in operands)
+    min_rows = max(
+        need_rows,
+        *(
+            (-(-8 * a.shape[0] // a.size)) if a.size >= 8 else a.shape[0]
+            for a in operands
+        ),
+    )
+    if align > 1:
+        min_rows = -(-min_rows // align) * align
+    stand_n = min(n, min_rows)
+    return stand_n, tuple(((stand_n, *a.shape[1:]), a.dtype) for a in operands)
+
+
+def warm_specs(
+    layer,
+    dtypes: tuple[mx.Dtype, ...],
+    *,
+    tensor_units: bool,
+    stackable: bool = False,
+) -> tuple[dict, dict]:
+    """Plan load-time ``(instances, proofs)`` for every dense schedule bucket.
+
+    Returns ``({instance: recipe}, {instance: [(proof, metal), ...]})``.
+    Closures capture only plain shapes, dtypes and ints — never ``mx.array``.
+    """
+    if layer.input_dims % 32 or layer.output_dims <= 0:
+        return {}, {}
+    plan = build_plan(layer, tensor_units=tensor_units)
+    if plan is None:
+        return {}, {}
+    instances: dict = {}
+    proofs: dict = {}
+    op_flags = tuple((a.size < 8, a.ndim == 0) for a in plan.operands)
+    stand_rows = 16
+    for dtype in dtypes:
+        if not plan.face.exact_for(dtype):
+            continue
+        schedule = plan.schedules.get(dtype, plan.schedule)
+        lo = 1
+        for hi, policy in schedule:
+            bucket_lo = lo
+            lo = (hi + 1) if hi is not None else lo
+            if policy.backend == "wide":
+                mm_wide = tile_wide.kernel(plan.face)
+                if mm_wide is None:
+                    continue
+                _, wide_ops = _stand_in_operands(
+                    plan.operands, plan.n, min(plan.n, 8), stackable=stackable
+                )
+                wide_shapes = tuple(s for s, _ in wide_ops)
+                hi_row = min(hi, 64) if hi is not None else max(bucket_lo + 4, 32)
+                modes = set()
+                for rows in range(max(2, bucket_lo), hi_row + 1):
+                    tiles = (rows + 4) // 5
+                    vectors = (rows + tiles - 1) // tiles
+                    modes.add((vectors, rows % vectors != 0))
+                for vectors, partial_m in sorted(modes):
+                    rows = 2 * vectors - 1 if partial_m else vectors
+                    tiles = (rows + 4) // 5
+                    inst = kernels.planned(
+                        mm_wide,
+                        (((rows, plan.k), dtype), *wide_ops),
+                        [dtype],
+                        template=[
+                            ("T", dtype),
+                            ("K", plan.k),
+                            ("N", plan.n),
+                            ("V", vectors),
+                            ("PARTIAL_M", partial_m),
+                        ],
+                    )
+                    in_shapes = ((rows, plan.k), *wide_shapes)
+                    out_shapes = ((rows, plan.n),)
+                    grid = (32 * tiles, 2, 1)
+
+                    def wide_recipe(
+                        in_shapes=in_shapes, out_shapes=out_shapes, grid=grid
+                    ):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=grid,
+                            threadgroup=(32, 2, 1),
+                        )
+
+                    instances.setdefault(inst, wide_recipe)
+                    proofs.setdefault(inst, []).append(
+                        (
+                            plan.proof,
+                            ("wide", dtype, plan.k, plan.n, vectors, partial_m),
+                        )
+                    )
+                continue
+            if policy.backend not in ("steel", "nax"):
+                continue
+            eff = _effective_policy(policy, plan.k, plan.n)
+            mm = _kernel(plan.face, eff)
+            if mm is None:
+                continue
+            bm, bn, bk, wm, wn = eff.bm, eff.bn, eff.bk, eff.wm, eff.wn
+            split_k, k_part = _split_k_geometry(plan.k, bk, eff.split_k)
+            stand_n, op_specs = _stand_in_operands(
+                plan.operands,
+                plan.n,
+                min(plan.n, bn),
+                align=bn if eff.align_n else 1,
+                stackable=stackable,
+            )
+            op_shapes = tuple(s for s, _ in op_specs)
+            n_cols = (stand_n + bn - 1) // bn
+            n_rows = (stand_rows + bm - 1) // bm
+            out_shape = (
+                (split_k, stand_rows, stand_n) if split_k > 1 else (stand_rows, stand_n)
+            )
+            out_dtype = mx.float32 if split_k > 1 else dtype
+            if eff.backend == "nax":
+                even_tn = (bn // (16 * wn)) % 2 == 0
+                sched = (
+                    1
+                    if (
+                        eff.sched == "db"
+                        and eff.align_n
+                        and plan.k % bk == 0
+                        and even_tn
+                    )
+                    else 0
+                )
+                gx = eff.gx
+                if gx > 0:
+                    gx_eff = min(gx, n_rows)
+                    tg_x = gx_eff
+                    tg_y = ((n_rows + gx_eff - 1) // gx_eff) * n_cols
+                else:
+                    tg_x = n_cols
+                    tg_y = n_rows
+                template = [
+                    ("T", dtype),
+                    ("K", plan.k),
+                    ("BM", bm),
+                    ("BN", bn),
+                    ("BK", bk),
+                    ("WM", wm),
+                    ("WN", wn),
+                    ("ALIGN_N", eff.align_n),
+                    ("SCHED", sched),
+                    ("GX", gx),
+                    ("PAD", eff.pad_bytes),
+                    ("SPLIT_K", split_k),
+                    ("K_PART", k_part),
+                ]
+                grid = (tg_x * 32, tg_y * wn, wm * split_k)
+                threadgroup = (32, wn, wm)
+            else:
+                tgp = wm * wn * 32
+                cache_p = eff.param_staging is ParamStaging.GROUP_STEPS_COUNTER
+                template = [
+                    ("T", dtype),
+                    ("K", plan.k),
+                    ("BM", bm),
+                    ("BN", bn),
+                    ("BK", bk),
+                    ("WM", wm),
+                    ("WN", wn),
+                    ("ALIGN_N", eff.align_n),
+                    ("VEC_STORE", eff.vec_store),
+                    ("CACHE_P", cache_p),
+                    ("X_NREADS", eff.x_nreads),
+                    ("SPLIT_K", split_k),
+                    ("K_PART", k_part),
+                ]
+                grid = (tgp * n_cols, n_rows, split_k)
+                threadgroup = (tgp, 1, 1)
+            inst = kernels.planned(
+                mm,
+                (((stand_rows, plan.k), dtype), *op_specs),
+                [out_dtype],
+                template=template,
+            )
+            in_shapes = ((stand_rows, plan.k), *op_shapes)
+
+            def dense_recipe(
+                in_shapes=in_shapes,
+                out_shapes=(out_shape,),
+                grid=grid,
+                threadgroup=threadgroup,
+            ):
+                return kernels.StandIn(
+                    input_shapes=in_shapes,
+                    output_shapes=out_shapes,
+                    grid=grid,
+                    threadgroup=threadgroup,
+                )
+
+            instances.setdefault(inst, dense_recipe)
+            proofs.setdefault(inst, []).append(
+                (plan.proof, (dtype, plan.k, eff, op_flags))
+            )
+    return instances, proofs
+
+
 def _project_cold(
     plan: DensePlan, x: mx.array, sig: tuple[tuple[int, ...], mx.Dtype]
 ) -> mx.array | None:
@@ -1404,44 +1649,7 @@ def _project_cold(
     if policy.backend not in ("steel", "nax"):
         return None
 
-    align_n = policy.align_n and (plan.n % policy.bn == 0)
-    even_tn = policy.backend == "nax" and (policy.bn // (16 * policy.wn)) % 2 == 0
-    sched_eff = (
-        "db"
-        if (
-            policy.backend == "nax"
-            and policy.sched == "db"
-            and align_n
-            and plan.k % policy.bk == 0
-            and even_tn
-        )
-        else "seg"
-    )
-    split_eff = _split_k_geometry(plan.k, policy.bk, policy.split_k)[0]
-    eff_policy = (
-        policy
-        if (
-            align_n == policy.align_n
-            and sched_eff == policy.sched
-            and split_eff == policy.split_k
-        )
-        else DenseTilePolicy(
-            policy.backend,
-            policy.bm,
-            policy.bn,
-            policy.bk,
-            policy.wm,
-            policy.wn,
-            align_n,
-            split_eff,
-            policy.x_nreads,
-            policy.param_staging,
-            policy.vec_store,
-            policy.pad_bytes,
-            policy.gx,
-            sched_eff,
-        )
-    )
+    eff_policy = _effective_policy(policy, plan.k, plan.n)
     shared_key = (x.shape, x.dtype, plan.n, eff_policy)
     graph = plan.proof.graphs.get(shared_key)
     if graph is not None:

@@ -277,7 +277,7 @@ def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:
 _FAILED = "expert-ordered verify gather failed; composed fallback"
 
 
-def _stand_in(plan: _Plan, metal):
+def _stand_in(plan: _Plan, metal, *, stream=None):
     """The smallest launches of a block that MLX generates the Metal of
     ``metal`` for, over zeros. The pairs and a row's experts are template
     values, so x has the block's rows and the indices its pairs, of their
@@ -308,7 +308,69 @@ def _stand_in(plan: _Plan, metal):
             _gather_qmv(down, hidden, rhs, 1, order),
         ]
 
-    return kernels.zeros(*specs), launch
+    arrays = (
+        kernels.zeros(*specs)
+        if stream is None
+        else kernels.zeros(*specs, stream=stream)
+    )
+    return arrays, launch
+
+
+def warm_tasks(switch_mlp, width: int, top_k: int, dtype: mx.Dtype) -> list[tuple]:
+    """Return ``(proof, metal, build)`` warm tasks for all served verify rows.
+
+    Closures capture only plain shapes, dtypes and operand-free projection
+    metadata — never live ``mx.array`` weights.
+    """
+    plan = _build_plan(switch_mlp, width, top_k)
+    if plan is None or plan.proof.failed:
+        return []
+    if not (plan.gate_up.face.exact_for(dtype) and plan.down.face.exact_for(dtype)):
+        return []
+    stacks = tuple(
+        ((_experts(projection), *a.shape[1:]), a.dtype)
+        for projection in (plan.gate_up, plan.down)
+        for a in projection.operands
+    )
+    cut = len(plan.gate_up.operands)
+    gate_up_meta = plan.gate_up._replace(operands=())
+    down_meta = plan.down._replace(operands=())
+    half_n = plan.gate_up.n // 2
+    tasks = []
+    for rows in range(2, MAX_ROWS + 1):
+        pairs = rows * top_k
+        if not plan.few_pairs < pairs <= _MAX_PAIRS or rows * width < 8:
+            continue
+        metal = (rows, top_k, dtype, mx.uint32)
+        specs = (
+            ((pairs,), mx.uint32),
+            ((rows, plan.width), dtype),
+            ((pairs, half_n), dtype),
+            *stacks,
+        )
+
+        def build(
+            stream,
+            specs=specs,
+            cut=cut,
+            gate_up_meta=gate_up_meta,
+            down_meta=down_meta,
+            top_k=top_k,
+            pairs=pairs,
+        ):
+            def launch(rhs, x, hidden, *stack_arrays):
+                gate_up = gate_up_meta._replace(operands=stack_arrays[:cut])
+                down = down_meta._replace(operands=stack_arrays[cut:])
+                order = _order(rhs) if pairs >= ORDERED_PAIRS else None
+                return [
+                    _gather_qmv(gate_up, x, rhs, top_k, order),
+                    _gather_qmv(down, hidden, rhs, 1, order),
+                ]
+
+            return kernels.zeros(*specs, stream=stream), launch
+
+        tasks.append((plan.proof, metal, build))
+    return tasks
 
 
 def _experts(projection: Projection) -> int:

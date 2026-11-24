@@ -504,6 +504,16 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
+        # Warm post-fusion MoE kernels before starting the engine. Fail closed:
+        # a warm error fails the load rather than serving cold compiles.
+        from ..patches.qwen35_moe_routed_decode import warm_moe_model
+
+        mtp_warm = bool(getattr(self._model_settings, "mtp_enabled", False))
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            lambda: warm_moe_model(self._model, mtp_enabled=mtp_warm),
+        )
+
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
         # into one launch (the composed argpartition chain is ~2 ms/token on
         # the 256-expert 35B-A3B).

@@ -11,7 +11,7 @@ import mlx.nn as nn
 import pytest
 
 from omlx.formats import QuantFormat, kernels, testing
-from omlx.formats.linear import FormatLinear, FormatSwitchLinear, warm_dot
+from omlx.formats.linear import FormatLinear, FormatSwitchLinear, warm_layer
 from tests.test_formats_kernels import _matrix, _toy
 
 
@@ -246,9 +246,7 @@ def test_a_load_waits_for_its_metal_builds_and_drops_them(tmp_path):
     assert (first.awaited, second.awaited) == (1, 1)
 
 
-def test_a_build_that_failed_is_logged_and_the_load_goes_on(tmp_path, caplog):
-    import logging
-
+def test_a_build_that_failed_fails_closed_after_awaiting_trailing(tmp_path):
     from omlx.patches import format_load
 
     checkpoint = format_load._Checkpoint(tmp_path)
@@ -256,11 +254,8 @@ def test_a_build_that_failed_is_logged_and_the_load_goes_on(tmp_path, caplog):
     checkpoint.warmers.extend(
         (_Future(RuntimeError("the Metal did not build")), trailing)
     )
-    with caplog.at_level(logging.WARNING, logger=format_load.__name__):
+    with pytest.raises(RuntimeError, match="the Metal did not build"):
         checkpoint.join_warmers()
-    (record,) = caplog.records
-    assert record.levelno == logging.WARNING
-    assert "did not build" in record.getMessage()
     assert trailing.awaited == 1
 
 
@@ -272,11 +267,13 @@ def test_a_checkpoint_starts_each_face_and_geometry_once(monkeypatch, tmp_path):
     checkpoint = format_load._Checkpoint(tmp_path)
     planned = []
 
-    def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
+    def fake_warm_layer(
+        layer_cls, fmt, bits, group_size, k, tensors, layout, *, dtypes=None
+    ):
         planned.append((layer_cls, fmt.mode, bits, group_size, k))
         return [_Future()]
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", fake_warm_layer)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     for _ in range(2):
         format_load._warm_layer(
@@ -292,33 +289,28 @@ def test_a_layer_without_a_face_starts_nothing(monkeypatch, tmp_path):
     from omlx.patches import format_load
 
     checkpoint = format_load._Checkpoint(tmp_path)
-    monkeypatch.setattr(format_load, "warm_dot", lambda *arguments: None)
+    monkeypatch.setattr(format_load, "warm_layer", lambda *a, **kw: None)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     format_load._warm_layer(built, SimpleNamespace(mode="toy"), {}, 320, {}, checkpoint)
     assert checkpoint.warmers == [] and checkpoint.warmed == set()
 
 
-def test_a_plan_that_raised_is_logged_and_the_layer_keeps_its_first_call(
-    monkeypatch, tmp_path, caplog
-):
-    import logging
+def test_a_plan_that_raised_fails_closed(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     from omlx.patches import format_load
 
-    def warm_dot(*arguments):
+    def failing_warm_layer(*arguments, **keywords):
         raise RuntimeError("the plan failed")
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", failing_warm_layer)
     checkpoint = format_load._Checkpoint(tmp_path)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
-    with caplog.at_level(logging.WARNING, logger=format_load.__name__):
+    with pytest.raises(RuntimeError, match="the plan failed"):
         format_load._warm_layer(
             built, SimpleNamespace(mode="toy"), {}, 320, {}, checkpoint
         )
-    (record,) = caplog.records
-    assert record.levelno == logging.WARNING
-    assert checkpoint.warmers == [] and len(checkpoint.warmed) == 1
+    assert checkpoint.warmers == [] and checkpoint.warmed == set()
 
 
 class _Only(QuantFormat):
@@ -338,7 +330,7 @@ class _Only(QuantFormat):
 
 
 def _warm_plan(monkeypatch, tensors, layout, dtypes, n=16, k=320):
-    """warm_dot's result and what it recorded: (specs, template) per
+    """warm_layer's result and what it recorded: (specs, template) per
     planned instance, and each recipe's StandIn."""
     seen = {"specs": [], "recipes": []}
 
@@ -353,7 +345,7 @@ def _warm_plan(monkeypatch, tensors, layout, dtypes, n=16, k=320):
 
     monkeypatch.setattr("omlx.formats.linear.kernels.planned", planned)
     monkeypatch.setattr("omlx.formats.linear.kernels.warm", warm)
-    planned_result = warm_dot(
+    planned_result = warm_layer(
         FormatLinear, _Only(dtypes, n, k), 8, 1, k, tensors, layout
     )
     return planned_result, seen
@@ -409,23 +401,25 @@ def test_warm_dot_starts_nothing_without_a_served_dtype(monkeypatch):
     )
     with testing.verified("llama"):
         assert (
-            warm_dot(FormatLinear, _Only((mx.float32,)), 8, 1, 320, tensors, layout)
+            warm_layer(FormatLinear, _Only((mx.float32,)), 8, 1, 320, tensors, layout)
             is None
         )
 
 
-def test_warm_dot_skips_non_tile_aligned_n(monkeypatch):
+def test_warm_dot_skips_non_tile_aligned_n_for_vpt0_face(monkeypatch):
     from omlx.formats import testing
 
     (codes, scales), _, _ = _matrix(12, 320)
     tensors = {"codes": codes, "group_scales": scales}
     layout = {"codes": ((12, 320), mx.uint8), "group_scales": ((12,), mx.float32)}
+    fmt = _Only(())
+    fmt.face = replace(fmt.face, vpt=0, shared="")
     monkeypatch.setattr(
         "omlx.formats.linear.kernels.warm",
         lambda instances: pytest.fail("warmed a non-tile N"),
     )
     with testing.verified("llama"):
-        assert warm_dot(FormatLinear, _Only(()), 8, 1, 320, tensors, layout) is None
+        assert warm_layer(FormatLinear, fmt, 8, 1, 320, tensors, layout) is None
 
 
 def test_a_checkpoint_warms_each_geometry_separately(monkeypatch, tmp_path):
@@ -436,13 +430,13 @@ def test_a_checkpoint_warms_each_geometry_separately(monkeypatch, tmp_path):
     checkpoint = format_load._Checkpoint(tmp_path)
     planned = []
 
-    def warm_dot(layer_cls, fmt, bits, group_size, k, tensors, layout):
-        planned.append(
-            (layer_cls.__name__, fmt.mode, k, bits, group_size)
-        )
+    def fake_warm_layer(
+        layer_cls, fmt, bits, group_size, k, tensors, layout, *, dtypes=None
+    ):
+        planned.append((layer_cls.__name__, fmt.mode, k, bits, group_size))
         return [_Future()]
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", fake_warm_layer)
 
     def built(**changes):
         return SimpleNamespace(
@@ -612,27 +606,26 @@ def test_a_stand_in_of_another_input_count_is_refused(monkeypatch):
         future.result(timeout=5)
 
 
-def test_a_stack_does_not_query_its_dot_face(monkeypatch):
+def test_warm_layer_warms_switch_rows(monkeypatch):
     from omlx import formats
     from tests.test_formats_linear import _toy_switch, _ToyFormat
 
     monkeypatch.setitem(formats._FORMATS, "toy", _ToyFormat(_toy("stack")))
-    monkeypatch.setattr(
-        "omlx.formats.linear.kernels.planned",
-        lambda *arguments, **keywords: pytest.fail("planned a stack's Metal"),
-    )
-    monkeypatch.setattr(
-        "omlx.formats.linear.kernels.warm",
-        lambda *arguments, **keywords: pytest.fail("warmed a stack's Metal"),
-    )
+    planned_keys = []
+
+    def fake_warm(instances):
+        planned_keys.extend(instances.keys())
+        return (_Future(),)
+
+    monkeypatch.setattr("omlx.formats.linear.kernels.warm", fake_warm)
     with testing.verified("llama"):
         switch = _toy_switch(8, 320)
         tensors = {name: switch[name] for name in switch._tensors}
         fmt = switch.fmt
-        monkeypatch.setattr(
-            fmt, "dot", lambda *arguments: pytest.fail("asked a stack's face")
+        result = warm_layer(
+            FormatSwitchLinear, fmt, 8, 1, 320, tensors, None, dtypes=(mx.bfloat16,)
         )
-        assert warm_dot(FormatSwitchLinear, fmt, 8, 1, 320, tensors, None) is None
+        assert result is not None and planned_keys
 
 
 def test_a_verification_load_starts_no_warm(monkeypatch, tmp_path):
@@ -643,11 +636,11 @@ def test_a_verification_load_starts_no_warm(monkeypatch, tmp_path):
     checkpoint = format_load._Checkpoint(tmp_path)
     called = []
 
-    def warm_dot(*arguments):
+    def fake_warm_layer(*arguments, **keywords):
         called.append(arguments)
         return None
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", fake_warm_layer)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     with format_load.verifying(tmp_path):
         format_load._warm_layer(
@@ -671,13 +664,13 @@ def test_concurrent_warm_layer_plans_once_and_joins_on_exit(monkeypatch, tmp_pat
     entered, release = threading.Event(), threading.Event()
     calls = []
 
-    def warm_dot(*arguments):
+    def fake_warm_layer(*arguments, **keywords):
         calls.append(arguments)
         entered.set()
         assert release.wait(10)
         return [future]
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", fake_warm_layer)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     first = threading.Thread(
         target=format_load._warm_layer,
@@ -716,7 +709,7 @@ def test_warm_layer_uses_cached_checkpoint_shown(monkeypatch, tmp_path):
     monkeypatch.setattr(
         format_load, "_shown", lambda path: pytest.fail("resolved the path again")
     )
-    monkeypatch.setattr(format_load, "warm_dot", lambda *arguments: None)
+    monkeypatch.setattr(format_load, "warm_layer", lambda *a, **kw: None)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     format_load._warm_layer(built, SimpleNamespace(mode="toy"), {}, 320, {}, checkpoint)
 
@@ -849,7 +842,7 @@ def test_warm_dot_starts_nothing_without_a_face(monkeypatch):
         lambda instances: pytest.fail("warmed a layer with no face"),
     )
     with testing.verified("llama"):
-        assert warm_dot(FormatLinear, NoFace(), 8, 1, 320, tensors, layout) is None
+        assert warm_layer(FormatLinear, NoFace(), 8, 1, 320, tensors, layout) is None
 
 
 def test_warm_dot_skips_k_under_eight(monkeypatch):
@@ -866,11 +859,11 @@ def test_warm_dot_skips_k_under_eight(monkeypatch):
             pytest.fail("built stand-in layer for k under 8")
 
     with testing.verified("llama"):
-        assert warm_dot(FailInit, fmt, 8, 1, 4, tensors, layout) is None
+        assert warm_layer(FailInit, fmt, 8, 1, 4, tensors, layout) is None
         (codes7, scales7), _, _ = _matrix(16, 7)
         tensors7 = {"codes": codes7, "group_scales": scales7}
         layout7 = {"codes": ((16, 7), mx.uint8), "group_scales": ((16,), mx.float32)}
-        assert warm_dot(FailInit, fmt, 8, 1, 7, tensors7, layout7) is None
+        assert warm_layer(FailInit, fmt, 8, 1, 7, tensors7, layout7) is None
         (codes8, scales8), _, _ = _matrix(16, 8)
         tensors8 = {"codes": codes8, "group_scales": scales8}
         layout8 = {"codes": ((16, 8), mx.uint8), "group_scales": ((16,), mx.float32)}
@@ -900,7 +893,8 @@ def test_warm_dot_passes_the_declared_layout(monkeypatch):
     tensors = {"codes": codes, "group_scales": scales}
     layout = {"codes": ((16, 320), mx.uint8), "group_scales": ((16,), mx.float32)}
     monkeypatch.setattr(
-        "omlx.formats.linear.kernels.warm", lambda instances: (("future",),)
+        "omlx.formats.linear.kernels.warm",
+        lambda instances: (("future",),),
     )
     monkeypatch.setattr(
         "omlx.formats.linear.kernels.planned",
@@ -908,8 +902,7 @@ def test_warm_dot_passes_the_declared_layout(monkeypatch):
     )
     with testing.verified("llama"):
         assert (
-            warm_dot(FormatLinear, Counting(), 8, 1, 320, tensors, layout)
-            is not None
+            warm_layer(FormatLinear, Counting(), 8, 1, 320, tensors, layout) is not None
         )
     assert layouts == []
 
@@ -962,11 +955,11 @@ def test_a_layer_without_a_face_is_queried_once_per_geometry(monkeypatch, tmp_pa
     checkpoint = format_load._Checkpoint(tmp_path)
     calls = []
 
-    def warm_dot(*arguments):
+    def fake_warm_layer(*arguments, **keywords):
         calls.append(arguments)
         return None
 
-    monkeypatch.setattr(format_load, "warm_dot", warm_dot)
+    monkeypatch.setattr(format_load, "warm_layer", fake_warm_layer)
     built = SimpleNamespace(output_dims=8, bits=4, group_size=64)
     for _ in range(2):
         format_load._warm_layer(
@@ -1074,16 +1067,33 @@ def test_warm_stream_creates_one_stream_under_concurrency(monkeypatch):
     assert results[0] is first_stream and results[1] is first_stream
 
 
-def test_warm_dot_skips_non_tile_aligned_n_without_querying_dot(monkeypatch):
-    (codes, scales), _, _ = _matrix(12, 320)
-    tensors = {"codes": codes, "group_scales": scales}
-    layout = {"codes": ((12, 320), mx.uint8), "group_scales": ((12,), mx.float32)}
-    fmt = _Only(())
-    monkeypatch.setattr(
-        fmt, "dot", lambda *arguments: pytest.fail("queried dot for non-tile N")
-    )
-    with testing.verified("llama"):
-        assert warm_dot(FormatLinear, fmt, 8, 1, 320, tensors, layout) is None
+def test_warm_layer_warms_unaligned_n_with_shared_rows(monkeypatch):
+    from omlx.formats.affine import AffineFormat
+
+    fmt = AffineFormat()
+    layout = fmt.layout(512, 1, 8, 64)
+    tensors = {
+        name: mx.zeros(shape, mx.uint32 if dtype is mx.uint32 else mx.float32)
+        for name, (shape, dtype) in layout.items()
+    }
+    captured = {}
+
+    def fake_warm(instances):
+        captured["instances"] = instances
+        return (_Future(),)
+
+    monkeypatch.setattr("omlx.formats.linear.kernels.warm", fake_warm)
+    with testing.verified("qwen4_exp"):
+        result = warm_layer(
+            FormatLinear, fmt, 8, 64, 512, tensors, layout, dtypes=(mx.bfloat16,)
+        )
+    assert result is not None and captured["instances"]
+    metals = [
+        m
+        for recipe in captured["instances"].values()
+        for _, m in getattr(recipe, "proofs", ())
+    ]
+    assert (mx.bfloat16, 1) in metals
 
 
 def test_warm_skips_already_built_instance(monkeypatch):
@@ -1148,7 +1158,7 @@ def test_warm_dot_recipe_holds_no_checkpoint_tensors(monkeypatch):
     tensors = {"codes": codes, "group_scales": scales}
     layout = {"codes": ((16, 320), mx.uint8), "group_scales": ((16,), mx.float32)}
     with testing.verified("llama"):
-        planned = warm_dot(
+        planned = warm_layer(
             FormatLinear, _Only((mx.bfloat16,)), 8, 1, 320, tensors, layout
         )
     assert planned == (("future",),) and len(captured) == 1
@@ -1260,7 +1270,7 @@ def test_warm_dot_skips_zero_n_without_querying_dot(monkeypatch):
         lambda instances: pytest.fail("warmed an n == 0 matrix"),
     )
     with testing.verified("llama"):
-        assert warm_dot(FormatLinear, NoQuery(), 8, 1, 320, tensors, layout) is None
+        assert warm_layer(FormatLinear, NoQuery(), 8, 1, 320, tensors, layout) is None
 
 
 def test_warm_dot_skips_format_embedding(monkeypatch):
@@ -1278,7 +1288,7 @@ def test_warm_dot_skips_format_embedding(monkeypatch):
         lambda instances: pytest.fail("warmed a format embedding"),
     )
     with testing.verified("llama"):
-        assert warm_dot(FormatEmbedding, fmt, 8, 1, 320, tensors, layout) is None
+        assert warm_layer(FormatEmbedding, fmt, 8, 1, 320, tensors, layout) is None
 
 
 def test_warm_dot_warms_stored_float_affine_placeholders(monkeypatch):
@@ -1291,17 +1301,20 @@ def test_warm_dot_warms_stored_float_affine_placeholders(monkeypatch):
         for name, (shape, dtype) in layout.items()
     }
     captured = {}
-    monkeypatch.setattr(
-        "omlx.formats.linear.kernels.warm",
-        lambda instances: captured.setdefault("instances", instances),
-    )
+
+    def fake_warm(instances):
+        captured["instances"] = instances
+        return (_Future(),)
+
+    monkeypatch.setattr("omlx.formats.linear.kernels.warm", fake_warm)
     with testing.verified("qwen4_exp"):
-        result = warm_dot(FormatLinear, fmt, 4, 64, 256, tensors, layout)
-    assert result is not None and len(captured["instances"]) == 2
-    warmed_dtypes = {key.outputs[0] for key in captured["instances"]}
-    assert warmed_dtypes == {mx.bfloat16, mx.float16}
+        result = warm_layer(
+            FormatLinear, fmt, 4, 64, 256, tensors, layout, dtypes=(mx.bfloat16,)
+        )
+    assert result is not None and captured["instances"]
+    input_dtypes = {key.inputs[0][0] for key in captured["instances"]}
+    assert input_dtypes == {mx.bfloat16}
     for key in captured["instances"]:
-        act_dtype = key.outputs[0]
-        assert key.inputs[0][0] == act_dtype
-        assert key.inputs[2][0] == act_dtype
-        assert key.inputs[3][0] == act_dtype
+        assert key.inputs[0][0] == mx.bfloat16
+        assert key.inputs[2][0] == mx.bfloat16
+        assert key.inputs[3][0] == mx.bfloat16

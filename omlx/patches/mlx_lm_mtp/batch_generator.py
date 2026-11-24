@@ -28,6 +28,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from omlx.prefill_progress import get_prefill_tracker
 
+from ...formats import kernels as _format_kernels
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
 from . import prompt_priming as _prompt_priming
@@ -167,12 +168,15 @@ def apply() -> bool:
                     _drop_mtp_batch_state(
                         self, "batch-standard-calibration", log_stats=True
                     )
+                    proofs_before = _format_kernels.proof_count()
                     started = time.perf_counter()
                     result = original_next(self, *args, **kwargs)
                     if tuple(self.uids) == policy.uids:
                         elapsed = policy.cycle_time_ms(
                             "standard", started, time.perf_counter()
                         )
+                        if _format_kernels.proof_count() != proofs_before:
+                            elapsed = None
                         policy.observe_standard(elapsed)
                         if elapsed is not None:
                             logger.debug(
@@ -234,9 +238,13 @@ def apply() -> bool:
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
             park_state = _mtp_park_state_for_batch(self)
             if tax_probe is not None or park_state is not None:
+                proofs_before = _format_kernels.proof_count()
                 step_t0 = time.perf_counter()
                 result = original_next(self, *args, **kwargs)
-                if tax_probe is not None:
+                if (
+                    tax_probe is not None
+                    and _format_kernels.proof_count() == proofs_before
+                ):
                     _record_std_tax_sample(
                         self, (time.perf_counter() - step_t0) * 1000.0
                     )
@@ -3711,6 +3719,7 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
                 )
     _clip_to_shared_window(states)
     sync = _cluster_mtp(gen_batch.model)
+    proofs_before = _format_kernels.proof_count()
     started = time.perf_counter()
     try:
         if sync is not None:
@@ -3735,10 +3744,12 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
         if policy is not None
         else 0.0
     )
+    proved = _format_kernels.proof_count() != proofs_before
     park = False
     if (
         policy is not None
         and not copied
+        and not proved
         and tuple(gen_batch.uids) == policy.uids
         and len(set(depths)) == 1
         and depths[0] > 0
@@ -4601,6 +4612,7 @@ def _run_verify_cycle_chain(
     # tokens this cycle — the verify window follows the actual drafts.
     k = int(state.drafts.shape[0])
     copy_cycle = state.copy_drafts
+    proofs_before = _format_kernels.proof_count()
     cycle_t0 = time.perf_counter()
 
     inputs = mx.concatenate([state.next_main, state.drafts])  # (k+1,)
@@ -4954,6 +4966,7 @@ def _run_verify_cycle_chain(
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
         untimed, state.copy_untimed = state.copy_untimed, False
+        proved = _format_kernels.proof_count() != proofs_before
         if state.controller is not None and not copy_cycle:
             was_warmup = bool(state.controller._warmup)
             keepalive = bool(getattr(state.mtp_cache, "fold_keepalive", False))
@@ -4966,7 +4979,7 @@ def _run_verify_cycle_chain(
                 + (time.perf_counter() - finish_t0) * 1000
                 + verify_ms
                 + shared_commit_ms,
-                time_sample=not keepalive and not untimed,
+                time_sample=not keepalive and not untimed and not proved,
             )
             _maybe_finish_mtp_reentry_probe(
                 gen_batch,

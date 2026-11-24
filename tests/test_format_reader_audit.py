@@ -564,6 +564,10 @@ SCOPE_DECISIONS = {
         A8FACE,
         "tests/test_qwen35_moe_verify_window.py::test_stock_affine_format_router_takes_the_fused_window",
     ),
+    ("omlx/patches/qwen35_moe_routed_decode.py", "warm_moe_model"): (
+        OWN,
+        "tests/test_release3_warm.py::test_zero_new_proofs_on_first_served_request_after_load",
+    ),
     ("omlx/patches/qwen35_gdn_prework.py", "_format_projection"): (
         FACE,
         "tests/test_qwen35_gdn_prework.py (stock affine plan vs serial bitwise)",
@@ -1325,6 +1329,10 @@ EXPECTED = {
         "read bits",
         "read group_size",
     ),
+    ("omlx/patches/qwen35_moe_routed_decode.py", "warm_moe_model"): (
+        "read bits",
+        "read group_size",
+    ),
     ("omlx/patches/qwen35_oq_a8.py", "OqA8Plan.kernel"): (
         "read bits",
         "read group_size",
@@ -1598,6 +1606,22 @@ def test_audit_module_binding_and_short_alias():
     # Class bases and class_predicate / type-is are detected.
     subclass = _scan_source("s.py", "class C(nn.QuantizedLinear):\n    pass\n")
     assert ("s.py", "C") in subclass
+
+
+def test_release3_warm_audit_citations_exist():
+    """NIT 8: every tests/test_release3_warm.py::* citation in SCOPE_DECISIONS exists."""
+    import tests.test_release3_warm as warm_tests
+
+    prefix = "tests/test_release3_warm.py::"
+    checked = 0
+    for _key, (_decision, proof) in SCOPE_DECISIONS.items():
+        if proof.startswith(prefix):
+            name = proof.removeprefix(prefix).split()[0]
+            assert hasattr(
+                warm_tests, name
+            ), f"missing cited test {name!r} in tests/test_release3_warm.py"
+            checked += 1
+    assert checked > 0
     type_is = _scan_source(
         "s.py", "def k(x):\n    return type(x) is nn.QuantizedLinear\n"
     )
