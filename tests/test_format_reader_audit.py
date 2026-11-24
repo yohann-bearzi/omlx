@@ -1606,6 +1606,14 @@ def test_audit_module_binding_and_short_alias():
     # Class bases and class_predicate / type-is are detected.
     subclass = _scan_source("s.py", "class C(nn.QuantizedLinear):\n    pass\n")
     assert ("s.py", "C") in subclass
+    type_is = _scan_source(
+        "s.py", "def k(x):\n    return type(x) is nn.QuantizedLinear\n"
+    )
+    assert "type-is QuantizedLinear" in type_is[("s.py", "k")]
+    pred = _scan_source(
+        "s.py", "def p(m):\n    return quantize(m, class_predicate=fn)\n"
+    )
+    assert "class_predicate" in pred[("s.py", "p")]
 
 
 def test_release3_warm_audit_citations_exist():
@@ -1622,11 +1630,3 @@ def test_release3_warm_audit_citations_exist():
             ), f"missing cited test {name!r} in tests/test_release3_warm.py"
             checked += 1
     assert checked > 0
-    type_is = _scan_source(
-        "s.py", "def k(x):\n    return type(x) is nn.QuantizedLinear\n"
-    )
-    assert "type-is QuantizedLinear" in type_is[("s.py", "k")]
-    pred = _scan_source(
-        "s.py", "def p(m):\n    return quantize(m, class_predicate=fn)\n"
-    )
-    assert "class_predicate" in pred[("s.py", "p")]

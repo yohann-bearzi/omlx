@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import threading
 from functools import cache
 from typing import Any, NamedTuple
@@ -1168,7 +1169,11 @@ def _build_schedule(
 
 
 def build_plan(
-    layer, *, tensor_units: bool, chip: str | None = None
+    layer,
+    *,
+    tensor_units: bool,
+    chip: str | None = None,
+    _schedule_cache: dict | None = None,
 ) -> DensePlan | None:
     """Build a layer's construction-time dense prefill plan once."""
     k, n = layer.input_dims, layer.output_dims
@@ -1181,10 +1186,46 @@ def build_plan(
     plan_dtypes = tuple(
         dt for dt in (mx.bfloat16, mx.float16) if face.exact_for(dt)
     ) or (mx.bfloat16, mx.float16)
-    schedules = {
-        dt: _build_schedule(layer, face, dt, tensor_units=tensor_units, chip=chip_id)
-        for dt in plan_dtypes
-    }
+    kept_rec = layer.__dict__.get("_omlx_format_call")
+    from .linear import FormatLinear
+
+    use_cache = (
+        _schedule_cache is not None
+        and kept_rec is not None
+        and isinstance(layer, FormatLinear)
+        and type(layer)._ordinary_serves is FormatLinear._ordinary_serves
+        and "_ordinary_serves" not in layer.__dict__
+    )
+    if use_cache:
+        plan_ready = kept_rec.plan is not None
+        schedules = {}
+        for dt in plan_dtypes:
+            cache_key = (
+                layer.mode,
+                face,
+                dt,
+                layer.bits,
+                layer.group_size,
+                k,
+                n,
+                tensor_units,
+                chip_id,
+                plan_ready,
+            )
+            sched = _schedule_cache.get(cache_key)
+            if sched is None:
+                sched = _build_schedule(
+                    layer, face, dt, tensor_units=tensor_units, chip=chip_id
+                )
+                _schedule_cache[cache_key] = sched
+            schedules[dt] = sched
+    else:
+        schedules = {
+            dt: _build_schedule(
+                layer, face, dt, tensor_units=tensor_units, chip=chip_id
+            )
+            for dt in plan_dtypes
+        }
     schedule = schedules[plan_dtypes[0]]
     route = "format_linear_tile_nax" if tensor_units else "format_linear_tile_steel"
     packed = layer.fmt.codes_name
@@ -1595,6 +1636,98 @@ def warm_specs(
     return instances, proofs
 
 
+def _make_mlx_route(bits: int, gs: int):
+    def mlx_route(
+        z,
+        weight,
+        scales,
+        biases=None,
+        _qmm=mx.quantized_matmul,
+        _gs=gs,
+        _bits=bits,
+    ):
+        return _qmm(z, weight, scales, biases, True, _gs, _bits, "affine")
+
+    return mlx_route
+
+
+def warm_graph(
+    plan: DensePlan | None, x_shape: tuple[int, ...], dtype: mx.Dtype
+) -> bool:
+    """Pre-compile and keep this thread's dense graph for ``(x_shape, dtype)``.
+
+    Traces on a lazy zero array (never evaluates a GPU kernel) and inserts into
+    ``plan.proof.graphs`` / ``plan.binding.kept.graphs`` ONLY when the target
+    Metal is already warmed in ``plan.proof.ran`` (or the backend is ``mlx``).
+    Returns True when ``sig`` is populated on this thread and ready for fast
+    dispatch, False otherwise.
+    """
+    if plan is None or plan.proof.failed or not plan.face.exact_for(dtype):
+        return False
+    if len(x_shape) < 2 or x_shape[-1] != plan.k:
+        return False
+    rows = math.prod(x_shape[:-1])
+    if rows <= 0 or rows >= plan.row_limit:
+        return False
+    sig = (x_shape, dtype)
+    kept = plan.binding.kept
+    if kept is None:
+        return False
+    if sig in kept.graphs:
+        return True
+    policy = _policy_for_rows(plan.schedules.get(dtype, plan.schedule), rows)
+
+    if policy.backend == "mlx":
+        _keep_local(plan, sig, _make_mlx_route(plan.bits, plan.group_size))
+        return True
+
+    if policy.backend == "wide":
+        shared_key = ("wide", x_shape, dtype, plan.n)
+        graph = plan.proof.graphs.get(shared_key)
+        if graph is not None:
+            _keep_local(plan, sig, graph)
+            return True
+        mm = tile_wide.kernel(plan.face)
+        if mm is None:
+            return False
+        binding = _WideBinding(mm, plan.operands)
+        x_dummy = mx.zeros(x_shape, dtype)
+        metal, graph = tile_wide.describe(binding, x_dummy)
+        if ("wide", *metal) not in plan.proof.ran:
+            return False
+        compiled = mx.compile(graph)
+        compiled(x_dummy, *plan.operands)
+        plan.proof.keep(shared_key, compiled)
+        _keep_local(plan, sig, compiled)
+        return True
+
+    if policy.backend not in ("steel", "nax"):
+        return False
+
+    eff_policy = _effective_policy(policy, plan.k, plan.n)
+    shared_key = (x_shape, dtype, plan.n, eff_policy)
+    graph = plan.proof.graphs.get(shared_key)
+    if graph is not None:
+        _keep_local(plan, sig, graph)
+        return True
+    mm = _kernel(plan.face, eff_policy)
+    if mm is None:
+        return False
+    x_dummy = mx.zeros(x_shape, dtype)
+    metal = _metal_key(plan, x_dummy, eff_policy)
+    if metal not in plan.proof.ran:
+        return False
+
+    def graph_fn(z, *operands):
+        return _launch(mm, eff_policy, z, operands)
+
+    compiled = mx.compile(graph_fn)
+    compiled(x_dummy, *plan.operands)
+    plan.proof.keep(shared_key, compiled)
+    _keep_local(plan, sig, compiled)
+    return True
+
+
 def _project_cold(
     plan: DensePlan, x: mx.array, sig: tuple[tuple[int, ...], mx.Dtype]
 ) -> mx.array | None:
@@ -1606,19 +1739,7 @@ def _project_cold(
     policy = _policy_for_rows(plan.schedules.get(x.dtype, plan.schedule), rows)
 
     if policy.backend == "mlx":
-        bits, gs = plan.bits, plan.group_size
-
-        def mlx_route(
-            z,
-            weight,
-            scales,
-            biases=None,
-            _qmm=mx.quantized_matmul,
-            _gs=gs,
-            _bits=bits,
-        ):
-            return _qmm(z, weight, scales, biases, True, _gs, _bits, "affine")
-
+        mlx_route = _make_mlx_route(plan.bits, plan.group_size)
         _keep_local(plan, sig, mlx_route)
         return mlx_route(x, *plan.operands)
 

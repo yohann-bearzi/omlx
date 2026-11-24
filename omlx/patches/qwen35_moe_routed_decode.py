@@ -1758,8 +1758,166 @@ def _infer_block_dtype(block) -> mx.Dtype | None:
     return None
 
 
-def warm_moe_model(model, *, mtp_enabled: bool = False) -> None:
-    """Post-load warm for fused MoE kernels on ``kernels._WARM_POOL``.
+def _warm_routed_dispatch(model, *, mtp_enabled: bool = False) -> None:
+    """Pre-compile routed_decode and routed_verify_window graphs on this thread.
+
+    Traces on lazy zero inputs (never evaluates GPU work) and inserts into
+    ``Proof.graphs`` ONLY when the target Metal is already warm in ``Proof.ran``.
+    """
+    if model is None or not mx.metal.is_available():
+        return
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+    window_rows = (2, 3, 4, 6, 8, 9, 12, 16) if mtp_enabled else (2, 3, 4)
+    for _, mod in named_modules():
+        switch_mlp = getattr(mod, "switch_mlp", None)
+        top_k = getattr(mod, "top_k", None)
+        num_experts = getattr(mod, "num_experts", None)
+        if (
+            not isinstance(switch_mlp, nn.Module)
+            or type(top_k) is not int
+            or top_k <= 0
+            or type(num_experts) is not int
+            or num_experts <= 0
+        ):
+            continue
+        dtype = _infer_block_dtype(mod)
+        if dtype is None:
+            continue
+        plan = _cached_plan(mod, dtype)
+        if plan is None or plan.proof.failed:
+            continue
+        launches = plan.launches
+        x1_shape = (1, 1, launches.hidden)
+        sig1 = (x1_shape, dtype, plan.experts)
+        if sig1 not in plan.proof.graphs and router_eligible(
+            _Spec((1, launches.hidden), dtype), plan.experts
+        ):
+            folded_1 = _topk_folds(launches, _Spec((1, plan.experts), dtype))
+            if (plan.experts, folded_1) in plan.proof.ran:
+                outside: tuple = ()
+                if not launches.fold:
+                    outside = (
+                        mx.zeros((1, 1, launches.hidden), dtype),
+                        mx.zeros((1, 1, 1), dtype),
+                    )
+                if launches.router is None:
+                    outside = (mx.zeros((1, 1, plan.experts), dtype), *outside)
+                x1_dummy = mx.zeros(x1_shape, dtype)
+                compiled = mx.compile(_token(launches, folded_1))
+                compiled(x1_dummy, outside, plan.operands)
+                plan.proof.keep(sig1, compiled)
+        if (
+            plan.window is not None
+            and not plan.window.failed
+            and (launches.router is not None or plan.quantized_router)
+        ):
+            win_shapes: list[tuple[int, int, int]] = [
+                (rows, 1, launches.hidden) for rows in (2, 4) if rows <= WINDOW_MAX_ROWS
+            ]
+            if mtp_enabled:
+                win_shapes.extend(
+                    (1, rows, launches.hidden)
+                    for rows in window_rows
+                    if rows <= WINDOW_MAX_ROWS
+                )
+            for xw_shape in win_shapes:
+                rows = xw_shape[0] * xw_shape[1]
+                if not router_eligible(
+                    _Spec((rows, launches.hidden), dtype),
+                    plan.experts,
+                    WINDOW_MAX_ROWS,
+                ):
+                    continue
+                win_sig = (xw_shape, dtype, plan.experts, plan.quantized_router)
+                if win_sig in plan.window.graphs:
+                    continue
+                folded_w = _topk_folds(launches, _Spec((rows, plan.experts), dtype))
+                if (rows, plan.experts, folded_w) not in plan.window.ran:
+                    continue
+                xw_dummy = mx.zeros(xw_shape, dtype)
+                if plan.quantized_router:
+                    compiled = mx.compile(_window_logits(launches, folded_w))
+                    compiled(
+                        xw_dummy,
+                        mx.zeros((rows, plan.experts), dtype),
+                        plan.operands,
+                    )
+                else:
+                    compiled = mx.compile(_window(launches, folded_w))
+                    compiled(xw_dummy, plan.operands)
+                plan.window.keep(win_sig, compiled)
+
+
+def engine_prefill_lengths(scheduler) -> tuple[int, ...]:
+    """Served prefill chunk lengths for ``scheduler`` (2047/2048 plus its
+    first-chunk and steady-state step sizes)."""
+    from ..formats import linear
+
+    lengths: list[int] = [2047, 2048]
+    base = getattr(scheduler, "_base_prefill_step_size", None)
+    if callable(base):
+        step0 = base(0, 1 << 30)
+        step1 = base(step0, 1 << 30) if type(step0) is int and step0 > 0 else 0
+        for step in (step0, step1):
+            if type(step) is int and step > linear.MAX_ROWS:
+                lengths.extend((step - 1, step))
+    return tuple(dict.fromkeys(lengths))
+
+
+def warm_engine_dispatch(
+    model,
+    stream,
+    *,
+    prefill_step_size: int = 2048,
+    prefill_lengths: tuple[int, ...] | None = None,
+    mtp_enabled: bool = False,
+) -> None:
+    """Warm per-thread compiled graphs and native fast dispatch on the engine's
+    own inference thread and stream before accepting requests."""
+    if model is None or not mx.metal.is_available():
+        return
+    from ..formats import linear
+
+    if prefill_lengths is None:
+        resolved_lengths: tuple[int, ...] = (
+            (prefill_step_size - 1, prefill_step_size)
+            if type(prefill_step_size) is int and prefill_step_size > linear.MAX_ROWS
+            else ()
+        )
+    else:
+        resolved_lengths = tuple(
+            dict.fromkeys(
+                r for r in prefill_lengths if type(r) is int and r > linear.MAX_ROWS
+            )
+        )
+    if stream is not None:
+        with mx.stream(stream):
+            linear.warm_model_dispatch(
+                model,
+                prefill_lengths=resolved_lengths,
+                mtp_enabled=mtp_enabled,
+            )
+            _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+    else:
+        linear.warm_model_dispatch(
+            model,
+            prefill_lengths=resolved_lengths,
+            mtp_enabled=mtp_enabled,
+        )
+        _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+
+
+def warm_moe_model(
+    model,
+    *,
+    mtp_enabled: bool = False,
+    prefill_lengths: tuple[int, ...] = (2047, 2048),
+    warm_dispatch: bool = True,
+) -> None:
+    """Post-load warm for fused MoE kernels on ``kernels._WARM_POOL`` and
+    construction-time format layer plans.
 
     Warms once per distinct block geometry:
     - fused ``FormatSwitchLinear`` ``gate_up_proj`` (``rows`` with
@@ -1769,6 +1927,12 @@ def warm_moe_model(model, *, mtp_enabled: bool = False) -> None:
     - ``routed_verify_window`` (rows 2, 3, 4; plus 6, 8, 9, 12, 16 when
       ``mtp_enabled``);
     - ``moe_verify_gather`` (rows 2..MAX_ROWS).
+
+    Then resolves thread-independent format layer plans (``prepare_layer_plans``)
+    and, when ``warm_dispatch`` is True (direct callers; engine loaders pass
+    ``warm_dispatch=False`` and run ``warm_engine_dispatch`` on the engine's own
+    inference thread), pre-compiles served graphs and registers native fast
+    dispatch on the calling thread.
 
     Fails closed: awaits all submitted warm futures and re-raises the first
     error. Never falls back silently.
@@ -2006,3 +2170,12 @@ def warm_moe_model(model, *, mtp_enabled: bool = False) -> None:
                 )
             else:
                 raise first_error
+    if warm_dispatch:
+        linear.warm_model_dispatch(
+            model,
+            prefill_lengths=prefill_lengths,
+            mtp_enabled=mtp_enabled,
+        )
+        _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+    else:
+        linear.prepare_layer_plans(model)

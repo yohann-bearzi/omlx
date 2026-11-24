@@ -277,7 +277,7 @@ def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:
 _FAILED = "expert-ordered verify gather failed; composed fallback"
 
 
-def _stand_in(plan: _Plan, metal, *, stream=None):
+def _stand_in(plan: _Plan, metal):
     """The smallest launches of a block that MLX generates the Metal of
     ``metal`` for, over zeros. The pairs and a row's experts are template
     values, so x has the block's rows and the indices its pairs, of their
@@ -308,21 +308,22 @@ def _stand_in(plan: _Plan, metal, *, stream=None):
             _gather_qmv(down, hidden, rhs, 1, order),
         ]
 
-    arrays = (
-        kernels.zeros(*specs)
-        if stream is None
-        else kernels.zeros(*specs, stream=stream)
-    )
-    return arrays, launch
+    return kernels.zeros(*specs), launch
 
 
 def warm_tasks(switch_mlp, width: int, top_k: int, dtype: mx.Dtype) -> list[tuple]:
     """Return ``(proof, metal, build)`` warm tasks for all served verify rows.
 
-    Closures capture only plain shapes, dtypes and operand-free projection
-    metadata — never live ``mx.array`` weights.
+    Caches ``_omlx_verify_gather_plan`` on ``switch_mlp`` (matching
+    ``fused_switch``) while returned closures capture only plain shapes, dtypes
+    and operand-free projection metadata — never live ``mx.array`` weights.
     """
-    plan = _build_plan(switch_mlp, width, top_k)
+    plan = cached_per_module(
+        switch_mlp,
+        "_omlx_verify_gather_plan",
+        lambda switch: _build_plan(switch, width, top_k),
+        flags=(width, top_k),
+    )
     if plan is None or plan.proof.failed:
         return []
     if not (plan.gate_up.face.exact_for(dtype) and plan.down.face.exact_for(dtype)):

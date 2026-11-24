@@ -909,3 +909,685 @@ def test_surviving_mutants_config_experts_stackable_and_mtp_rows(monkeypatch, tm
         src = (root / rel).read_text()
         assert 'getattr(self._model_settings, "mtp_enabled", False)' in src
         assert "warm_moe_model(" in src and "mtp_enabled=mtp_warm" in src
+
+
+def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
+    monkeypatch, tmp_path
+):
+    """First served request runs 0 _keep, build_plan, mx.compile, _register_fast."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+    from mlx_vlm.models.switch_layers import SwiGLU
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from omlx.formats import tile_dense
+
+    _write_qwen_config(tmp_path, dtype="bfloat16")
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    hidden, inter, experts, top_k = 512, 256, 128, 8
+    prefill_len = 64
+
+    class _ServedModel(nn.Module):
+        def __init__(self, checkpoint):
+            super().__init__()
+            # Two sibling layers of identical geometry to prove shared compiled
+            # dense graph + per-layer fast dispatch registration at load.
+            self.proj_a, lay_a = _quantized_format_linear(
+                fmt, 256, hidden, 8, 64, dtype, seed=201
+            )
+            self.proj_b, lay_b = _quantized_format_linear(
+                fmt, 256, hidden, 8, 64, dtype, seed=202
+            )
+            self.proj_b._qwen_row_exact = qwen35_verify_qmm.is_row_exact_armed
+            self.proj_n1, lay_n1 = _quantized_format_linear(
+                fmt, 1, hidden, 8, 64, dtype, seed=203
+            )
+            self.moe = nn.Module()
+            self.moe.num_experts = experts
+            self.moe.top_k = top_k
+            self.moe.gate = nn.Linear(hidden, experts, bias=False)
+            self.moe.gate.weight = mx.random.normal(
+                (experts, hidden), dtype=dtype
+            ) * mx.array(0.05, dtype=dtype)
+            mx.eval(self.moe.gate.weight)
+
+            sw = VLMSwitchGLU.__new__(VLMSwitchGLU)
+            nn.Module.__init__(sw)
+            sw.activation = SwiGLU()
+            sw.gate_proj, lay_g = _quantized_format_switch(
+                fmt, experts, inter, hidden, 4, 64, dtype, seed=210
+            )
+            sw.up_proj, lay_u = _quantized_format_switch(
+                fmt, experts, inter, hidden, 4, 64, dtype, seed=211
+            )
+            sw.down_proj, lay_d = _quantized_format_switch(
+                fmt, experts, hidden, inter, 4, 64, dtype, seed=212
+            )
+            self.moe.switch_mlp = sw
+
+            sh = Qwen3_5MLP.__new__(Qwen3_5MLP)
+            nn.Module.__init__(sh)
+            sh.gate_proj, lay_sg = _quantized_format_linear(
+                fmt, inter, hidden, 8, 64, dtype, seed=220
+            )
+            sh.up_proj, lay_su = _quantized_format_linear(
+                fmt, inter, hidden, 8, 64, dtype, seed=221
+            )
+            sh.down_proj, lay_sd = _quantized_format_linear(
+                fmt, hidden, inter, 8, 64, dtype, seed=222
+            )
+            self.moe.shared_expert = sh
+            self.moe.shared_expert_gate = self.proj_n1
+
+            for mod, lay in (
+                (self.proj_a, lay_a),
+                (self.proj_b, lay_b),
+                (self.proj_n1, lay_n1),
+                (sw.gate_proj, lay_g),
+                (sw.up_proj, lay_u),
+                (sw.down_proj, lay_d),
+                (sh.gate_proj, lay_sg),
+                (sh.up_proj, lay_su),
+                (sh.down_proj, lay_sd),
+            ):
+                tensors = {n: mod[n] for n in mod._tensors}
+                format_load._warm_layer(
+                    mod, fmt, lay, mod.input_dims, tensors, checkpoint
+                )
+
+    with format_load.loading(tmp_path) as checkpoint:
+        checkpoint.verified = True
+        checkpoint.verified_modes = frozenset({"affine"})
+        model = _ServedModel(checkpoint)
+        model.eval()
+
+    qwen35_moe_gate_up._fuse_one(model.moe.switch_mlp)
+    qwen35_moe_routed_decode.warm_moe_model(
+        model, mtp_enabled=True, prefill_lengths=(prefill_len, prefill_len + 1)
+    )
+
+    keep_calls: list[object] = []
+    build_plan_calls: list[object] = []
+    compile_calls: list[object] = []
+    register_fast_calls: list[object] = []
+
+    orig_keep = linear._FormatLayer._keep
+    orig_build_plan = tile_dense.build_plan
+    orig_compile = mx.compile
+    orig_register_fast = linear.FormatLinear._register_fast
+
+    def spy_keep(self):
+        keep_calls.append(self)
+        return orig_keep(self)
+
+    def spy_build_plan(*args, **kwargs):
+        build_plan_calls.append(args[0])
+        return orig_build_plan(*args, **kwargs)
+
+    def spy_compile(*args, **kwargs):
+        compile_calls.append(args[0] if args else None)
+        return orig_compile(*args, **kwargs)
+
+    def spy_register_fast(self, *args, **kwargs):
+        register_fast_calls.append((self, args[1] if len(args) > 1 else None))
+        return orig_register_fast(self, *args, **kwargs)
+
+    monkeypatch.setattr(linear._FormatLayer, "_keep", spy_keep)
+    monkeypatch.setattr(tile_dense, "build_plan", spy_build_plan)
+    monkeypatch.setattr(mx, "compile", spy_compile)
+    monkeypatch.setattr(linear.FormatLinear, "_register_fast", spy_register_fast)
+
+    before_proofs = kernels.proof_count()
+
+    mx.random.seed(77)
+    x_pre = mx.random.normal((1, prefill_len, hidden), dtype=dtype)
+    x_pre2 = mx.random.normal((1, prefill_len + 1, hidden), dtype=dtype)
+    x_dec = mx.random.normal((1, 1, hidden), dtype=dtype)
+    x_b2 = mx.random.normal((2, 1, hidden), dtype=dtype)
+    x_b4 = mx.random.normal((4, 1, hidden), dtype=dtype)
+    x_ver = mx.random.normal((1, 4, hidden), dtype=dtype)
+    n_sorted = prefill_len * top_k
+    x_sw = mx.random.normal((n_sorted, 1, hidden), dtype=dtype)
+    idx_sw = mx.sort(mx.random.randint(0, experts, (n_sorted,), dtype=mx.uint32))
+    x_sw_dn = mx.random.normal((n_sorted, 1, inter), dtype=dtype)
+    mx.eval(x_pre, x_pre2, x_dec, x_b2, x_b4, x_ver, x_sw, idx_sw, x_sw_dn)
+
+    # First served prefill (L and L+1) + decode + batched decode (b2/b4 -> prefill)
+    # + armed verify + switch + routed MoE.
+    y_pre_a = model.proj_a(x_pre)
+    y_pre_b = model.proj_b(x_pre)
+    y_pre2_a = model.proj_a(x_pre2)
+    y_pre_n1 = model.proj_n1(x_pre)
+    y_dec_a = model.proj_a(x_dec)
+    y_dec_b = model.proj_b(x_dec)
+    y_b2_b = model.proj_b(x_b2)
+    y_b4_b = model.proj_b(x_b4)
+    y_pre_b_again = model.proj_b(x_pre)
+    y_dec_n1 = model.proj_n1(x_dec)
+
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        y_ver_a = model.proj_a(x_ver)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=False)
+
+    gu = model.moe.switch_mlp.gate_up_proj
+    dn = model.moe.switch_mlp.down_proj
+    y_sw_gu = gu(x_sw, idx_sw, sorted_indices=True)
+    y_sw_dn = dn(x_sw_dn, idx_sw, sorted_indices=True)
+    y_sw_epi = None
+    if linear._nax_host():
+        tok = mx.random.normal((prefill_len, 1, hidden), dtype=dtype)
+        row_map = mx.arange(n_sorted, dtype=mx.uint32) // top_k
+        mx.eval(tok, row_map)
+        y_sw_epi = gu._sorted_swiglu(x_sw, idx_sw, None, (tok, row_map))
+        assert y_sw_epi is not None
+
+    y_rd = qwen35_moe_routed_decode.routed_verify_window(model.moe, x_dec)
+    y_rb2 = qwen35_moe_routed_decode.routed_verify_window(model.moe, x_b2)
+    y_rw = qwen35_moe_routed_decode.routed_verify_window(model.moe, x_ver)
+    assert y_rd is not None and y_rb2 is not None and y_rw is not None
+
+    to_eval = [
+        y_pre_a,
+        y_pre_b,
+        y_pre2_a,
+        y_pre_n1,
+        y_dec_a,
+        y_dec_b,
+        y_b2_b,
+        y_b4_b,
+        y_pre_b_again,
+        y_dec_n1,
+        y_ver_a,
+        y_sw_gu,
+        y_sw_dn,
+        y_rd,
+        y_rb2,
+        y_rw,
+    ]
+    if y_sw_epi is not None:
+        to_eval.append(y_sw_epi)
+    mx.eval(*to_eval)
+
+    assert keep_calls == [], f"unexpected _keep calls: {len(keep_calls)}"
+    assert (
+        build_plan_calls == []
+    ), f"unexpected build_plan calls: {len(build_plan_calls)}"
+    assert compile_calls == [], f"unexpected mx.compile calls: {len(compile_calls)}"
+    assert (
+        register_fast_calls == []
+    ), f"unexpected _register_fast calls: {len(register_fast_calls)}"
+    assert kernels.proof_count() == before_proofs
+
+    # Negative control + bitwise exact check: clear caches on proj_a and proj_b and
+    # verify spies fire AND outputs are bitwise identical (uint16).
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    model.proj_a.__dict__.pop("_omlx_format_call", None)
+    model.proj_a.__dict__.pop("_fast", None)
+    model.proj_b.__dict__.pop("_omlx_format_call", None)
+    model.proj_b.__dict__.pop("_fast", None)
+    y_cold_pre = model.proj_a(x_pre)
+    y_cold_dec = model.proj_a(x_dec)
+    y_cold_b2 = model.proj_b(x_b2)
+    y_cold_pre_b = model.proj_b(x_pre)
+    mx.eval(y_cold_pre, y_cold_dec, y_cold_b2, y_cold_pre_b)
+    assert len(keep_calls) >= 1
+    assert len(build_plan_calls) >= 1
+    assert len(compile_calls) >= 1
+    assert len(register_fast_calls) >= 1
+    assert mx.array_equal(y_pre_a.view(mx.uint16), y_cold_pre.view(mx.uint16)).item()
+    assert mx.array_equal(y_dec_a.view(mx.uint16), y_cold_dec.view(mx.uint16)).item()
+    assert mx.array_equal(y_b2_b.view(mx.uint16), y_cold_b2.view(mx.uint16)).item()
+    assert mx.array_equal(
+        y_pre_b_again.view(mx.uint16), y_cold_pre_b.view(mx.uint16)
+    ).item()
+
+
+def test_warm_engine_dispatch_populates_engine_thread_and_preserves_thread_safety(
+    monkeypatch, tmp_path
+):
+    """warm_engine_dispatch warms the engine thread while keeping other threads safe."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    import concurrent.futures
+
+    from omlx.formats import tile_dense
+
+    _write_qwen_config(tmp_path, dtype="bfloat16")
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    hidden = 512
+
+    class _Model(nn.Module):
+        def __init__(self, checkpoint):
+            super().__init__()
+            self.p0, lay0 = _quantized_format_linear(
+                fmt, 256, hidden, 8, 64, dtype, seed=240
+            )
+            self.p1, lay1 = _quantized_format_linear(
+                fmt, 256, hidden, 8, 64, dtype, seed=241
+            )
+            for mod, lay in ((self.p0, lay0), (self.p1, lay1)):
+                tensors = {n: mod[n] for n in mod._tensors}
+                format_load._warm_layer(
+                    mod, fmt, lay, mod.input_dims, tensors, checkpoint
+                )
+
+    with format_load.loading(tmp_path) as checkpoint:
+        checkpoint.verified = True
+        checkpoint.verified_modes = frozenset({"affine"})
+        model = _Model(checkpoint)
+        model.eval()
+
+    # Loader thread warms Metals + thread-independent plans only (warm_dispatch=False).
+    qwen35_moe_routed_decode.warm_moe_model(
+        model, mtp_enabled=False, warm_dispatch=False
+    )
+    assert "_omlx_format_call" in model.p0.__dict__
+    assert model.p0.__dict__["_omlx_format_call"].dense is not linear._UNBUILT
+
+    mx.random.seed(242)
+    x_64 = mx.random.normal((1, 64, hidden), dtype=dtype)
+    x_65 = mx.random.normal((1, 65, hidden), dtype=dtype)
+    x_1 = mx.random.normal((1, 1, hidden), dtype=dtype)
+    mx.eval(x_64, x_65, x_1)
+
+    engine_stream = mx.new_thread_local_stream(mx.gpu)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as engine_exec:
+        engine_exec.submit(
+            qwen35_moe_routed_decode.warm_engine_dispatch,
+            model,
+            engine_stream,
+            prefill_step_size=65,
+            mtp_enabled=False,
+        ).result()
+
+        counts = {"keep": 0, "build_plan": 0, "compile": 0, "register_fast": 0}
+        orig_keep = linear._FormatLayer._keep
+        orig_build_plan = tile_dense.build_plan
+        orig_compile = mx.compile
+        orig_register_fast = linear.FormatLinear._register_fast
+
+        def _wrap(name, fn):
+            def wrapped(*args, **kwargs):
+                counts[name] += 1
+                return fn(*args, **kwargs)
+
+            return wrapped
+
+        monkeypatch.setattr(linear._FormatLayer, "_keep", _wrap("keep", orig_keep))
+        monkeypatch.setattr(
+            tile_dense, "build_plan", _wrap("build_plan", orig_build_plan)
+        )
+        monkeypatch.setattr(mx, "compile", _wrap("compile", orig_compile))
+        monkeypatch.setattr(
+            linear.FormatLinear,
+            "_register_fast",
+            _wrap("register_fast", orig_register_fast),
+        )
+
+        before = kernels.proof_count()
+
+        def _serve():
+            with mx.stream(engine_stream):
+                y64 = model.p0(x_64)
+                y65 = model.p1(x_65)
+                y1 = model.p0(x_1)
+                mx.eval(y64, y65, y1)
+                return y64, y65, y1
+
+        y64_t1, y65_t1, y1_t1 = engine_exec.submit(_serve).result()
+        assert counts == {
+            "keep": 0,
+            "build_plan": 0,
+            "compile": 0,
+            "register_fast": 0,
+        }
+        assert kernels.proof_count() == before
+
+    # A second independent thread must safely build its own thread-local graphs
+    # and produce bitwise-identical outputs (protocol rule 14).
+    other_stream = mx.new_thread_local_stream(mx.gpu)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as other_exec:
+
+        def _serve_other():
+            with mx.stream(other_stream):
+                y64 = model.p0(x_64)
+                y65 = model.p1(x_65)
+                y1 = model.p0(x_1)
+                mx.eval(y64, y65, y1)
+                return y64, y65, y1
+
+        y64_t2, y65_t2, y1_t2 = other_exec.submit(_serve_other).result()
+
+    assert mx.array_equal(y64_t1.view(mx.uint16), y64_t2.view(mx.uint16)).item()
+    assert mx.array_equal(y65_t1.view(mx.uint16), y65_t2.view(mx.uint16)).item()
+    assert mx.array_equal(y1_t1.view(mx.uint16), y1_t2.view(mx.uint16)).item()
+
+
+def test_prepare_layer_plans_fails_closed_on_placeholder_and_never_keeps_unproven_graph(
+    monkeypatch,
+):
+    """Fail closed on placeholders; never insert unproven Metals into graphs."""
+    from omlx.formats import tile_dense
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    layout = fmt.layout(256, 256, 8, 64)
+
+    class _Holder(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layer = layer
+
+    with testing.verified("qwen4_exp"):
+        placeholder_layer = FormatLinear(
+            fmt,
+            8,
+            64,
+            256,
+            {
+                name: mx.zeros(shape, dtype if dt is None else dt)
+                for name, (shape, dt) in layout.items()
+            },
+            None,
+            placeholders=True,
+            _load_layout=layout,
+        )
+        unproven_layer, _ = _quantized_format_linear(
+            fmt, 256, 256, 8, 64, dtype, seed=250
+        )
+
+    with pytest.raises(ValueError, match="placeholder"):
+        linear.prepare_layer_plans(_Holder(placeholder_layer))
+
+    # Without load-time Metal warming, Proof.ran is empty; warm_model_dispatch
+    # must NOT insert unproven Metal graphs into proof.graphs or binding.kept.graphs.
+    holder = _Holder(unproven_layer)
+    linear.warm_model_dispatch(holder, prefill_lengths=(64,), mtp_enabled=False)
+    kept = unproven_layer.__dict__["_omlx_format_call"]
+    assert kept.plan is not None
+    assert kept.plan.proof.graphs == {}
+    steel_plan = tile_dense.build_plan(unproven_layer, tensor_units=False)
+    assert steel_plan is not None
+    steel_policy = tile_dense._default_steel_policy(128, 256, 256)
+    forced_steel = tile_dense.DensePlan(
+        face=steel_plan.face,
+        operands=steel_plan.operands,
+        proof=kernels.proof("test_unproven_steel", steel_plan.face),
+        said=steel_plan.said,
+        schedule=((None, steel_policy),),
+        schedules={dtype: ((None, steel_policy),)},
+        k=steel_plan.k,
+        n=steel_plan.n,
+        bits=steel_plan.bits,
+        group_size=steel_plan.group_size,
+        row_limit=steel_plan.row_limit,
+        binding=kernels.proof("test_unproven_steel", steel_plan.face).bind(),
+    )
+    assert tile_dense.warm_graph(forced_steel, (1, 128, 256), dtype) is False
+    assert forced_steel.proof.graphs == {}
+    assert forced_steel.binding.kept.graphs == {}
+
+
+def test_engine_load_wires_warm_engine_dispatch_with_fail_closed_cleanup():
+    """Engine loaders run warm_engine_dispatch on the engine thread & fail closed."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for rel in ("omlx/engine/batched.py", "omlx/engine/vlm.py"):
+        src = (root / rel).read_text()
+        assert "warm_dispatch=False" in src
+        assert "warm_engine_dispatch(" in src
+        assert "engine_prefill_lengths(scheduler)" in src
+        assert "self._engine.engine._mlx_executor" in src
+        assert "self._engine.engine._mlx_stream" in src
+        assert "await self.stop()" in src
+        assert src.index("scheduler.refresh_ssd_layer_signature()") < src.index(
+            "warm_engine_dispatch("
+        )
+    vlm_src = (root / "omlx/engine/vlm.py").read_text()
+    assert vlm_src.index("apply_qwen35_q4_prefill_linear_patch(") < vlm_src.index(
+        "warm_engine_dispatch("
+    )
+
+    class _FakeSched:
+        def __init__(self, first, later):
+            self._first = first
+            self._later = later
+
+        def _base_prefill_step_size(self, processed, _remaining):
+            return self._first if processed == 0 else self._later
+
+    assert qwen35_moe_routed_decode.engine_prefill_lengths(_FakeSched(2048, 2048)) == (
+        2047,
+        2048,
+    )
+    assert qwen35_moe_routed_decode.engine_prefill_lengths(_FakeSched(4096, 4096)) == (
+        2047,
+        2048,
+        4095,
+        4096,
+    )
+    assert qwen35_moe_routed_decode.engine_prefill_lengths(_FakeSched(2048, 4096)) == (
+        2047,
+        2048,
+        4095,
+        4096,
+    )
+
+
+def test_warm_existing_switch_skips_already_failed_tile_proof(monkeypatch):
+    """pre-a1-c936f207 LOW 1: already-failed tile/epilogue proofs do not crash load."""
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    with testing.verified("qwen4_exp"):
+        layer, _ = _quantized_format_switch(fmt, 4, 128, 64, 4, 64, dtype, seed=260)
+
+    tile = linear._tile(layer)
+    plan = linear._plan(layer)
+    assert tile is not None and plan is not None
+    tile.proof.fail()
+    if linear._nax_host():
+        linear._epilogue_proof(tile, plan, mapped=True).fail()
+
+    futs = linear.warm_existing_switch(
+        layer, dtypes=(dtype,), per_rows=(1,), epilogue_limit=None
+    )
+    for fut in futs or ():
+        fut.result()
+
+
+def test_c936_comment_review_mutants(monkeypatch):
+    """Kill all 5 surviving mutants from pre-a1-c936f207 review."""
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+
+    # Mutant 1: primary exception is not masked when an already-submitted future raises.
+    class _Block(nn.Module):
+        def __init__(self, seed):
+            super().__init__()
+            self.top_k = 2
+            self.num_experts = 4
+            self.switch_mlp = nn.Module()
+            self.switch_mlp.gate_up_proj, _ = _quantized_format_switch(
+                fmt, 4, 128, 64, 4, 64, dtype, seed=seed
+            )
+            self.switch_mlp.down_proj, _ = _quantized_format_switch(
+                fmt, 4, 64, 64, 4, 64, dtype, seed=seed + 1
+            )
+
+    class _TwoBlocks(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.b0 = _Block(seed=270)
+            self.b1 = _Block(seed=275)
+
+    with testing.verified("qwen4_exp"):
+        two = _TwoBlocks()
+
+    failing_future = _Future(error=RuntimeError("secondary warm failure"))
+    calls = [0]
+
+    def fake_warm_switch(layer, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            return (failing_future,)
+        raise ValueError("primary plan boom")
+
+    monkeypatch.setattr(linear, "warm_existing_switch", fake_warm_switch)
+    with pytest.raises(ValueError, match="primary plan boom"):
+        qwen35_moe_routed_decode.warm_moe_model(two, mtp_enabled=False)
+    assert failing_future.awaited == 1
+
+    # Mutant 2 & 3: invalid num_experts (0 / True) skipped; bool epilogue limit ignored.
+    seen_limits = []
+    monkeypatch.setattr(
+        linear,
+        "warm_existing_switch",
+        lambda layer, **kwargs: (
+            seen_limits.append(kwargs.get("epilogue_limit", linear._NO_EPILOGUE)) or ()
+        ),
+    )
+    monkeypatch.setattr(kernels, "warm", lambda _inst: ())
+    monkeypatch.setattr(kernels, "warm_proofs", lambda _tasks: ())
+
+    class _BoolLimitAct:
+        limit = True
+
+    class _EdgeContainer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bad_e0 = nn.Module()
+            self.bad_e0.top_k = 2
+            self.bad_e0.num_experts = 0
+            self.bad_e0.switch_mlp = nn.Module()
+            self.bad_eb = nn.Module()
+            self.bad_eb.top_k = 2
+            self.bad_eb.num_experts = True
+            self.bad_eb.switch_mlp = nn.Module()
+            self.bool_lim = _Block(seed=280)
+            self.bool_lim.switch_mlp.activation = _BoolLimitAct()
+
+    from omlx.patches import m5_gather_qmm
+
+    monkeypatch.setattr(
+        m5_gather_qmm,
+        "_swiglu_limit",
+        lambda act: (
+            True if isinstance(act, _BoolLimitAct) else m5_gather_qmm._UNSUPPORTED
+        ),
+    )
+    with testing.verified("qwen4_exp"):
+        edge = _EdgeContainer()
+        edge.eval()
+        qwen35_moe_routed_decode.warm_moe_model(edge, mtp_enabled=False)
+    assert seen_limits and all(lim is linear._NO_EPILOGUE for lim in seen_limits)
+
+    # Mutant 4: _nax_face_plans queries all 5 sample row counts.
+    from omlx.patches import m5_gather_qmm_nax as nax
+
+    queried_rows = []
+    monkeypatch.setattr(
+        nax,
+        "face_plan",
+        lambda r, e, k, n: queried_rows.append(r) or ("plan", r),
+    )
+    linear._nax_face_plans(8, 256, 256)
+    assert queried_rows == [16, 36 * 8, 48 * 8, 96 * 8, 120 * 8]
+
+    # Mutant 5: warm_existing_dense dedup key includes tensor_dtypes.
+    planned_dtypes = []
+    monkeypatch.setattr(
+        linear,
+        "_plan_dense_warm",
+        lambda mod, *args: planned_dtypes.append(mod["scales"].dtype),
+    )
+
+    class _MixedDtypeModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.bf, _ = _quantized_format_linear(
+                fmt, 256, 256, 8, 64, mx.bfloat16, seed=290
+            )
+            self.fp, _ = _quantized_format_linear(
+                fmt, 256, 256, 8, 64, mx.float16, seed=291
+            )
+
+    with testing.verified("qwen4_exp"):
+        mixed = _MixedDtypeModel()
+    linear.warm_existing_dense(mixed, dtypes=(mx.float16,))
+    assert set(planned_dtypes) == {mx.bfloat16, mx.float16}
+
+
+def test_tile_dense_schedule_cache_matches_uncached_and_respects_subclasses(
+    monkeypatch,
+):
+    """build_plan(_schedule_cache=...) matches uncached and skips subclasses."""
+    from omlx.formats import tile_dense, tuning
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    with testing.verified("qwen4_exp"):
+        a, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=301)
+        b, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=302)
+
+    class _NoOrdinaryRows(FormatLinear):
+        def _ordinary_serves(self, rows: int, *, chip: str | None = None) -> bool:
+            return False
+
+    c = _NoOrdinaryRows.__new__(_NoOrdinaryRows)
+    with testing.verified("qwen4_exp"):
+        c._init_tensors(
+            fmt,
+            8,
+            64,
+            512,
+            {n: a[n] for n in a._tensors},
+            None,
+            layout=fmt.layout(512, 256, 8, 64),
+        )
+
+    a._keep()
+    b._keep()
+    c._keep()
+
+    cache: dict = {}
+    p_uncached = tile_dense.build_plan(a, tensor_units=False)
+    p_a = tile_dense.build_plan(a, tensor_units=False, _schedule_cache=cache)
+
+    lookups = []
+    orig_lookup = tuning.lookup
+
+    def spy_lookup(*args, **kwargs):
+        lookups.append(args)
+        return orig_lookup(*args, **kwargs)
+
+    monkeypatch.setattr(tuning, "lookup", spy_lookup)
+    p_b = tile_dense.build_plan(b, tensor_units=False, _schedule_cache=cache)
+    assert lookups == [], "identical FormatLinear should reuse _schedule_cache"
+
+    p_c = tile_dense.build_plan(c, tensor_units=False, _schedule_cache=cache)
+    assert len(lookups) > 0, "subclass overriding _ordinary_serves must bypass cache"
+    assert (
+        p_uncached is not None
+        and p_a is not None
+        and p_b is not None
+        and p_c is not None
+    )
+    assert p_a.schedules == p_uncached.schedules
+    assert p_b.schedules == p_uncached.schedules
+    assert p_c.schedules == tile_dense.build_plan(c, tensor_units=False).schedules
+    assert len(cache) == len(p_a.schedules)

@@ -504,14 +504,22 @@ class BatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("MoE gate+up fusion not applied", exc_info=True)
 
-        # Warm post-fusion MoE kernels before starting the engine. Fail closed:
-        # a warm error fails the load rather than serving cold compiles.
-        from ..patches.qwen35_moe_routed_decode import warm_moe_model
+        # Warm post-fusion MoE kernels and construction-time format plans before
+        # starting the engine. Fail closed: a warm error fails the load rather
+        # than serving cold compiles. Per-thread dispatch traces run below on
+        # the engine's own inference thread.
+        from ..patches.qwen35_moe_routed_decode import (
+            engine_prefill_lengths,
+            warm_engine_dispatch,
+            warm_moe_model,
+        )
 
         mtp_warm = bool(getattr(self._model_settings, "mtp_enabled", False))
         await loop.run_in_executor(
             get_mlx_executor(),
-            lambda: warm_moe_model(self._model, mtp_enabled=mtp_warm),
+            lambda: warm_moe_model(
+                self._model, mtp_enabled=mtp_warm, warm_dispatch=False
+            ),
         )
 
         # Qwen MoE decode router: fuse the top-k select + renormalize chain
@@ -827,6 +835,30 @@ class BatchedEngine(BaseEngine):
                 )
                 scheduler._set_model_info_for_monitor()
         scheduler.refresh_ssd_layer_signature()
+
+        # Warm per-thread compiled graphs and native fast dispatch on the
+        # engine's own inference thread/stream after all model patches have
+        # settled and before accepting requests.
+        try:
+            prefill_lengths = engine_prefill_lengths(scheduler)
+            await loop.run_in_executor(
+                self._engine.engine._mlx_executor,
+                lambda: warm_engine_dispatch(
+                    self._model,
+                    self._engine.engine._mlx_stream,
+                    prefill_lengths=prefill_lengths,
+                    mtp_enabled=mtp_warm,
+                ),
+            )
+        except BaseException:
+            try:
+                await self.stop()
+            except Exception:
+                logger.warning(
+                    "Error stopping engine after dispatch warm failure",
+                    exc_info=True,
+                )
+            raise
 
         # SpecPrefill: load draft model and pass to scheduler
         if self._model_settings is not None:

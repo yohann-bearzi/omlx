@@ -735,7 +735,7 @@ def _plan_switch_warm(
     if not _nax_host():
         from . import tile_gather
 
-        if k % 32 or n <= 0 or experts <= 0:
+        if tile.proof.failed or k % 32 or n <= 0 or experts <= 0:
             return
         mm = tile.kernel
         for dtype in target_dtypes:
@@ -761,28 +761,34 @@ def _plan_switch_warm(
     for dtype in target_dtypes:
         if not tile.face.exact_for(dtype):
             continue
-        for config in configs:
-            metal = (dtype, k, config, n % 64 == 0)
+        if not tile.proof.failed:
+            for config in configs:
+                metal = (dtype, k, config, n % 64 == 0)
 
-            def build_nax(
-                stream, mm=mm, dtype=dtype, k=k, op_specs=op_specs, config=config
-            ):
-                arrays = kernels.zeros(
-                    ((16, 1, k), dtype), ((16,), mx.uint32), *op_specs, stream=stream
-                )
-                return (
-                    arrays,
-                    lambda x, idx, *ops: nax._launch_face(
-                        mm, x, ops, idx, config, stream
-                    ),
-                )
+                def build_nax(
+                    stream, mm=mm, dtype=dtype, k=k, op_specs=op_specs, config=config
+                ):
+                    arrays = kernels.zeros(
+                        ((16, 1, k), dtype),
+                        ((16,), mx.uint32),
+                        *op_specs,
+                        stream=stream,
+                    )
+                    return (
+                        arrays,
+                        lambda x, idx, *ops: nax._launch_face(
+                            mm, x, ops, idx, config, stream
+                        ),
+                    )
 
-            proof_tasks.append((tile.proof, metal, build_nax))
+                proof_tasks.append((tile.proof, metal, build_nax))
         if epilogue_limit is not _NO_EPILOGUE and n % 64 == 0 and plan is not None:
             epi_mm = nax._face_kernel(tile.face, "act_map")
             if epi_mm is None:
                 continue
             epi_proof = _epilogue_proof(tile, plan, mapped=True)
+            if epi_proof.failed:
+                continue
             epi = nax._EPI_SWIGLU if epilogue_limit is None else nax._EPI_CLAMPED
             limit = epilogue_limit
             for config in configs:
@@ -1144,6 +1150,472 @@ def warm_existing_dense(
     return tuple(kernels.warm(_attach_proofs(instances, proofs)))
 
 
+def prepare_layer_plans(model) -> None:
+    """Resolve construction-time plans for every format layer in ``model``.
+
+    Thread-independent: populates each ``FormatLinear``'s ``_Kept``, dense
+    prefill ``DensePlan`` (deduplicating per-chip schedule lookups across
+    identical layer geometries within this pass) and optional ``wide`` tile,
+    and each ``FormatSwitchLinear``'s ``_Kept`` and sorted ``_Tile``. Fails
+    closed if any layer still holds an unloaded placeholder.
+    """
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+    tensor_units = _nax_host()
+    arch = _metal_architecture()
+    schedule_cache: dict = {}
+    for _, mod in named_modules():
+        if isinstance(mod, FormatLinear):
+            kept = mod.__dict__.get(_KEPT)
+            if kept is None or kept.weight is not mod[packed_name(mod)]:
+                kept = mod._keep()
+            if kept.dense is _UNBUILT:
+                if mod.input_dims % 32 or mod.output_dims <= 0:
+                    kept.dense = None
+                else:
+                    kept.dense = tile_dense.build_plan(
+                        mod,
+                        tensor_units=tensor_units,
+                        _schedule_cache=schedule_cache,
+                    )
+            if (
+                mod._qwen_row_exact is not None
+                and kept.plan is not None
+                and arch
+                and "wide" not in kept.routes
+            ):
+                wide = _ordinary_tile(
+                    mod, kept.plan.k, kept.plan.n, "wide", tile_wide.kernel
+                )
+                kept.routes["wide"] = wide
+                if wide is not None:
+                    kept.wide = wide
+        elif isinstance(mod, FormatSwitchLinear):
+            kept = mod.__dict__.get(_KEPT)
+            if kept is None or kept.weight is not mod[packed_name(mod)]:
+                kept = mod._keep()
+            mod._sorted_tile(kept)
+
+
+def _infer_model_dtype(model) -> mx.Dtype | None:
+    """First serving floating dtype (bf16/fp16) found on ``model``'s modules."""
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return None
+    for _, mod in named_modules():
+        if isinstance(mod, _FormatLayer):
+            for name in mod._tensors:
+                arr = mod.get(name)
+                if isinstance(arr, mx.array) and arr.dtype in _WARM_DTYPES:
+                    return arr.dtype
+        elif isinstance(mod, nn.Module):
+            for val in dict.values(mod):
+                if isinstance(val, mx.array) and val.dtype in _WARM_DTYPES:
+                    return val.dtype
+    return None
+
+
+def _layer_warm_dtypes(
+    layer: _FormatLayer,
+    model_dtype: mx.Dtype | None,
+    explicit: tuple[mx.Dtype, ...] | None,
+    *,
+    fp16_recast: bool,
+) -> tuple[mx.Dtype, ...]:
+    if explicit is not None:
+        return explicit
+    if fp16_recast:
+        return (mx.float16,)
+    found = [
+        layer[name].dtype
+        for name in layer._tensors
+        if name in layer and layer[name].dtype in _WARM_DTYPES
+    ]
+    if found:
+        return tuple(dt for dt in _WARM_DTYPES if dt in found)
+    if model_dtype is not None:
+        return (model_dtype,)
+    return _WARM_DTYPES
+
+
+def _warm_linear_rows_graph(
+    plan: _Plan | None,
+    x_shape: tuple[int, ...],
+    dtype: mx.Dtype,
+    *,
+    key: tuple,
+) -> None:
+    """Compile and keep a rows graph on this thread if its Metal is warm."""
+    if plan is None or plan.proof.failed or not plan.face.exact_for(dtype):
+        return
+    if key in plan.proof.graphs:
+        return
+    x_dummy = mx.zeros(x_shape, dtype)
+    metal, graph = _linear(plan, x_dummy)
+    if metal not in plan.proof.ran:
+        return
+    compiled = mx.compile(graph)
+    compiled(x_dummy, *plan.operands)
+    plan.proof.keep(key, compiled)
+
+
+def _warm_linear_wide_graph(
+    tile: _Tile | None,
+    x_shape: tuple[int, ...],
+    dtype: mx.Dtype,
+) -> bool:
+    """Compile and keep a tile_wide graph on this thread if its Metal is warm."""
+    if tile is None or tile.proof.failed or not tile.face.exact_for(dtype):
+        return False
+    sig = (x_shape, dtype)
+    if sig in tile.proof.graphs:
+        return True
+    x_dummy = mx.zeros(x_shape, dtype)
+    metal, graph = tile_wide.describe(tile, x_dummy)
+    if metal not in tile.proof.ran:
+        return False
+    compiled = mx.compile(graph)
+    compiled(x_dummy, *tile.operands)
+    tile.proof.keep(sig, compiled)
+    return True
+
+
+def _warm_switch_prefill_graph(
+    layer: FormatSwitchLinear,
+    kept: _Kept,
+    rows: int,
+    dtype: mx.Dtype,
+    *,
+    seq_len: int | None = None,
+    epilogue_limit=_NO_EPILOGUE,
+) -> None:
+    """Compile and keep sorted prefill switch graphs on this thread if warm."""
+    plan = kept.plan
+    tile = layer._sorted_tile(kept)
+    if plan is None or tile is None or not tile.face.exact_for(dtype):
+        return
+    experts = plan.operands[0].shape[0]
+    k, n = plan.k, plan.n
+    if rows < 16 or rows < 4 * experts or k % 32 or n <= 0 or experts <= 0:
+        return
+    nax_host = _nax_host()
+    if nax_host:
+        from ..patches import m5_gather_qmm_nax as nax
+
+        if experts > nax._MAX_EXPERTS or n % 32:
+            return
+    if not tile.proof.failed:
+        x_shape = (rows, 1, k)
+        idx_shape = (rows,)
+        tile_sig = (x_shape, dtype, idx_shape, mx.uint32, n, experts)
+        if tile_sig not in tile.proof.graphs:
+            x_dummy = mx.zeros(x_shape, dtype)
+            idx_dummy = mx.zeros(idx_shape, mx.uint32)
+            metal, graph = _sorted(plan, tile.kernel, x_dummy, idx_dummy)
+            if metal in tile.proof.ran:
+                compiled = mx.compile(graph)
+                compiled(x_dummy, idx_dummy, *tile.operands)
+                tile.proof.keep(tile_sig, compiled)
+    if (
+        nax_host
+        and epilogue_limit is not _NO_EPILOGUE
+        and kept.bias is None
+        and seq_len is not None
+        and seq_len > 0
+        and n % 64 == 0
+        and seq_len * k < 2**32
+    ):
+        if epilogue_limit is not None and not (
+            isinstance(epilogue_limit, (int, float))
+            and not isinstance(epilogue_limit, bool)
+            and math.isfinite(epilogue_limit)
+        ):
+            return
+        epi_proof = _epilogue_proof(tile, plan, mapped=True)
+        if epi_proof.failed:
+            return
+        tok_shape = (seq_len, 1, k)
+        epi_sig = (
+            "swiglu",
+            tok_shape,
+            dtype,
+            (rows,),
+            n,
+            experts,
+            epilogue_limit,
+            True,
+        )
+        if epi_sig in epi_proof.graphs:
+            return
+        from ..patches import m5_gather_qmm_nax as nax
+
+        kernel = nax._face_kernel(tile.face, "act_map")
+        if kernel is None:
+            return
+        config = nax.face_plan(rows, experts, k, n)
+        epi = nax._EPI_SWIGLU if epilogue_limit is None else nax._EPI_CLAMPED
+        metal = (dtype, k, config, epi, True)
+        if metal not in epi_proof.ran:
+            return
+        tok_dummy = mx.zeros(tok_shape, dtype)
+        idx_dummy = mx.zeros((rows,), mx.uint32)
+        rmap_dummy = mx.zeros((rows,), mx.uint32)
+
+        def epi_graph(x, indices, row_map, *operands):
+            return nax._launch_face(
+                kernel, x, operands, indices, config, None, epi, epilogue_limit, row_map
+            )
+
+        compiled = mx.compile(epi_graph)
+        compiled(tok_dummy, idx_dummy, rmap_dummy, *tile.operands)
+        epi_proof.keep(epi_sig, compiled)
+
+
+def warm_model_dispatch(
+    model,
+    *,
+    dtypes: tuple[mx.Dtype, ...] | None = None,
+    prefill_lengths: tuple[int, ...] = (2047, 2048),
+    decode_batch_sizes: tuple[int, ...] = (1, 2, 4),
+    mtp_enabled: bool = False,
+    verify_rows: tuple[int, ...] = (2, 3, 4),
+) -> None:
+    """Populate per-layer plans, compiled graphs and native fast dispatch on
+    the calling thread so the first served request does none of that work.
+
+    Must run on the thread that will serve requests (``Proof._kept`` and MLX's
+    compile cache are thread-local). Only traces graphs whose Metals are
+    already warmed in ``Proof.ran``; never inserts an unproven Metal.
+    """
+    if model is None or not mx.metal.is_available():
+        return
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+
+    prepare_layer_plans(model)
+
+    explicit = (
+        tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
+        if dtypes is not None
+        else None
+    )
+    if explicit is not None and not explicit:
+        return
+    fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
+    model_dtype = (
+        None if explicit is not None or fp16_recast else _infer_model_dtype(model)
+    )
+    prefills = tuple(
+        dict.fromkeys(r for r in prefill_lengths if type(r) is int and r > MAX_ROWS)
+    )
+    batches = tuple(
+        dict.fromkeys(
+            b for b in decode_batch_sizes if type(b) is int and 1 < b <= MAX_ROWS
+        )
+    )
+    verifies = (
+        tuple(
+            dict.fromkeys(
+                s for s in verify_rows if type(s) is int and 1 < s <= MAX_ROWS
+            )
+        )
+        if mtp_enabled
+        else ()
+    )
+    arch = _metal_architecture()
+
+    from ..patches import m5_gather_qmm
+
+    for _, mod in named_modules():
+        if isinstance(mod, FormatLinear):
+            kept = mod.__dict__.get(_KEPT)
+            if kept is None:
+                continue
+            k, n = mod.input_dims, mod.output_dims
+            if k < 8 or n <= 0:
+                continue
+            layer_dtypes = _layer_warm_dtypes(
+                mod, model_dtype, explicit, fp16_recast=fp16_recast
+            )
+            qwen = mod._qwen_row_exact is not None
+            for dtype in layer_dtypes:
+                # 1. Single-row decode (1, 1, K).
+                _warm_linear_rows_graph(
+                    kept.plan, (1, 1, k), dtype, key=((1, 1, k), dtype)
+                )
+                # 2. Multi-row decode (B, 1, K) and armed verify (1, S, K).
+                for b in batches:
+                    b_shape = (b, 1, k)
+                    if qwen:
+                        if b in kept.mlx_rows or kept.plan is None or not arch:
+                            continue
+                        choice = traversal(
+                            b, n, k, mod.group_size, arch, bits=mod.bits
+                        )[0]
+                        if choice == "rows":
+                            _warm_linear_rows_graph(
+                                kept.plan,
+                                b_shape,
+                                dtype,
+                                key=("ordinary_rows", b_shape, dtype),
+                            )
+                        elif choice == "wide" and kept.wide is not _UNBUILT:
+                            if _warm_linear_wide_graph(kept.wide, b_shape, dtype):
+                                mod._register_fast(kept, kept.wide, (b_shape, dtype))
+                        elif (
+                            choice in ("qmm", "split_k")
+                            and kept.dense is not None
+                            and tile_dense.warm_graph(kept.dense, b_shape, dtype)
+                        ):
+                            mod._register_fast(
+                                kept,
+                                kept.dense,
+                                (b_shape, dtype),
+                                proof_state=kept.dense.binding.state,
+                            )
+                    else:
+                        _warm_linear_rows_graph(
+                            kept.plan, b_shape, dtype, key=(b_shape, dtype)
+                        )
+                for s in verifies:
+                    s_shape = (1, s, k)
+                    _warm_linear_rows_graph(
+                        kept.plan, s_shape, dtype, key=(s_shape, dtype)
+                    )
+                # 3. Prefill (1, L, K) -> dense graph + native FormatLinearFast.
+                if kept.dense is not None:
+                    for length in prefills:
+                        if length >= kept.dense.row_limit:
+                            continue
+                        policy = tile_dense.policy_for(kept.dense, length, dtype)
+                        if policy is not None and policy.backend == "rows":
+                            if kept.plan is not None and arch:
+                                chunks = (
+                                    (MAX_ROWS, length % MAX_ROWS)
+                                    if length % MAX_ROWS
+                                    else (MAX_ROWS,)
+                                )
+                                for chunk in chunks:
+                                    c_shape = (chunk, k)
+                                    choice = traversal(
+                                        chunk, n, k, mod.group_size, arch, bits=mod.bits
+                                    )[0]
+                                    if choice == "rows":
+                                        _warm_linear_rows_graph(
+                                            kept.plan,
+                                            c_shape,
+                                            dtype,
+                                            key=("ordinary_rows", c_shape, dtype),
+                                        )
+                                    elif choice == "wide":
+                                        if "wide" not in kept.routes:
+                                            wide = _ordinary_tile(
+                                                mod,
+                                                kept.plan.k,
+                                                kept.plan.n,
+                                                "wide",
+                                                tile_wide.kernel,
+                                            )
+                                            kept.routes["wide"] = wide
+                                            if wide is not None:
+                                                kept.wide = wide
+                                        if (
+                                            kept.wide is not _UNBUILT
+                                            and _warm_linear_wide_graph(
+                                                kept.wide, c_shape, dtype
+                                            )
+                                        ):
+                                            mod._register_fast(
+                                                kept, kept.wide, (c_shape, dtype)
+                                            )
+                            continue
+                        p_shape = (1, length, k)
+                        if tile_dense.warm_graph(kept.dense, p_shape, dtype):
+                            mod._register_fast(
+                                kept,
+                                kept.dense,
+                                (p_shape, dtype),
+                                proof_state=kept.dense.binding.state,
+                            )
+            continue
+
+        # 4. MoE FormatSwitchLinear sorted prefill (+ M5 NAX mapped SwiGLU).
+        switch_mlp = getattr(mod, "switch_mlp", None)
+        top_k = getattr(mod, "top_k", None)
+        num_experts = getattr(mod, "num_experts", None)
+        if (
+            not isinstance(switch_mlp, nn.Module)
+            or type(top_k) is not int
+            or top_k <= 0
+            or type(num_experts) is not int
+            or num_experts <= 0
+            or not prefills
+        ):
+            continue
+        gate_up = switch_mlp.get("gate_up_proj")
+        down = switch_mlp.get("down_proj")
+        if isinstance(gate_up, FormatSwitchLinear):
+            kept_gu = gate_up.__dict__.get(_KEPT)
+            if kept_gu is not None:
+                epi_limit = _NO_EPILOGUE
+                if "bias" not in gate_up and "global_scale" not in gate_up:
+                    lim = m5_gather_qmm._swiglu_limit(
+                        getattr(switch_mlp, "activation", None)
+                    )
+                    if lim is not m5_gather_qmm._UNSUPPORTED and (
+                        lim is None
+                        or (
+                            isinstance(lim, (int, float))
+                            and not isinstance(lim, bool)
+                            and math.isfinite(lim)
+                        )
+                    ):
+                        epi_limit = lim
+                gu_dtypes = _layer_warm_dtypes(
+                    gate_up, model_dtype, explicit, fp16_recast=fp16_recast
+                )
+                for dtype in gu_dtypes:
+                    for length in prefills:
+                        _warm_switch_prefill_graph(
+                            gate_up,
+                            kept_gu,
+                            length * top_k,
+                            dtype,
+                            seq_len=length,
+                            epilogue_limit=epi_limit,
+                        )
+        elif gate_up is None:
+            for proj_name in ("gate_proj", "up_proj"):
+                proj = switch_mlp.get(proj_name)
+                if isinstance(proj, FormatSwitchLinear):
+                    kept_p = proj.__dict__.get(_KEPT)
+                    if kept_p is not None:
+                        p_dtypes = _layer_warm_dtypes(
+                            proj, model_dtype, explicit, fp16_recast=fp16_recast
+                        )
+                        for dtype in p_dtypes:
+                            for length in prefills:
+                                _warm_switch_prefill_graph(
+                                    proj, kept_p, length * top_k, dtype
+                                )
+        if isinstance(down, FormatSwitchLinear):
+            kept_dn = down.__dict__.get(_KEPT)
+            if kept_dn is not None:
+                dn_dtypes = _layer_warm_dtypes(
+                    down, model_dtype, explicit, fp16_recast=fp16_recast
+                )
+                for dtype in dn_dtypes:
+                    for length in prefills:
+                        _warm_switch_prefill_graph(
+                            down,
+                            kept_dn,
+                            length * top_k,
+                            dtype,
+                        )
+
+
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
     """``arrays`` (x, then a stack's indices) through the rows kernel, the
     first time for ``signature``, or None: the layer has no plan, its proof
@@ -1351,6 +1823,7 @@ class _Kept:
         "wide",
         "dense",
         "dense_fast",
+        "dense_fast_sigs",
         "sorted",
         "mlx_rows",
     )
@@ -1364,6 +1837,7 @@ class _Kept:
         self.wide = _UNBUILT
         self.dense = _UNBUILT
         self.dense_fast = None
+        self.dense_fast_sigs = None
         self.sorted = _UNBUILT
 
 
@@ -1928,7 +2402,13 @@ class FormatLinear(_FormatLayer):
             return None
         graph = tile.proof.graphs.get(signature)
         if graph is not None:
-            self._register_fast(kept, tile, signature)
+            tile_fast = kept.routes.get(("native", id(tile)))
+            if tile_fast is not None and signature in kept.routes.get(
+                ("native_sigs", id(tile)), ()
+            ):
+                self.__dict__[_FAST] = tile_fast
+            else:
+                self._register_fast(kept, tile, signature)
             return graph(x, *tile.operands)
         y = _launch(tile, signature, tile_wide.describe, tile_wide.stand_in, x)
         if y is not None:
@@ -1977,6 +2457,17 @@ class FormatLinear(_FormatLayer):
             else:
                 kept.routes[("native", id(tile))] = fast
         fast.__self__.register(signature)
+        if len(tile.operands) < 16:
+            if is_dense:
+                sigs = kept.dense_fast_sigs
+                if sigs is None:
+                    sigs = kept.dense_fast_sigs = set()
+            else:
+                sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
+            if signature not in sigs:
+                if len(sigs) == 64:
+                    sigs.clear()
+                sigs.add(signature)
         self.__dict__[_FAST] = fast
 
     def _prefill(self, kept, x, rows, *, armed: bool | None = None):
@@ -2003,9 +2494,15 @@ class FormatLinear(_FormatLayer):
             return self._ordinary_rows(kept, x)
         y = tile_dense.project(plan, x)
         if y is not None:
-            self._register_fast(
-                kept, plan, (x.shape, x.dtype), proof_state=plan.binding.state
-            )
+            sig = (x.shape, x.dtype)
+            if (
+                kept.dense_fast is not None
+                and kept.dense_fast_sigs is not None
+                and sig in kept.dense_fast_sigs
+            ):
+                self.__dict__[_FAST] = kept.dense_fast
+            else:
+                self._register_fast(kept, plan, sig, proof_state=plan.binding.state)
         return y
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -2031,12 +2528,19 @@ class FormatLinear(_FormatLayer):
                     # DATA (C7 receipts): this bucket is MLX's own qmv's.
                     y = self._stock_matmul(x)
                     return y if bias is None else y + bias
-                if kept.wide is not _UNBUILT:
+                if kept.wide is not _UNBUILT and x.size > plan.k:
                     wide = kept.wide
                     graph = wide.proof.graphs.get((shape, dtype))
                     if graph is not None:
                         if fast is not None:
-                            self._register_fast(kept, wide, (shape, dtype))
+                            wide_fast = kept.routes.get(("native", id(wide)))
+                            if wide_fast is not None and (
+                                shape,
+                                dtype,
+                            ) in kept.routes.get(("native_sigs", id(wide)), ()):
+                                self.__dict__[_FAST] = wide_fast
+                            else:
+                                self._register_fast(kept, wide, (shape, dtype))
                         y = graph(x, *wide.operands)
                         return y if bias is None else y + bias
             if not shape or shape[-1] != plan.k:
