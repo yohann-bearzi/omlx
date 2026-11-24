@@ -61,6 +61,8 @@ _PADDED_ROWS_MIN_WEIGHT_BYTES = 128 * 1024 * 1024
 # geometry) from then on. Verdicts are per compiled shape: the bug is in code
 # generation, not in the weight values.
 _UNROLLED_VERDICTS: dict = {}
+_UNROLLED_LOCKS_GUARD = threading.Lock()
+_UNROLLED_LOCKS: dict = {}
 
 
 def unrolled_tile_verified(
@@ -72,19 +74,27 @@ def unrolled_tile_verified(
     time; checked once per shape."""
     verdict = _UNROLLED_VERDICTS.get(shape)
     if verdict is None:
-        x = (mx.random.normal((rows, k), key=mx.random.key(rows)) * 0.5).astype(dtype)
-        got, want = run(x), reference(x)
-        mx.eval(got, want)
-        verdict = all(
-            mx.array_equal(a.reshape(b.shape), b).item() for a, b in zip(got, want)
-        )
-        verdict = _UNROLLED_VERDICTS.setdefault(shape, verdict)
-        if not verdict:
-            logger.warning(
-                "row-exact unrolled tile %s differs from the one-row call on this "
-                "GPU; it runs the rolled tile instead",
-                shape,
-            )
+        with _UNROLLED_LOCKS_GUARD:
+            lock = _UNROLLED_LOCKS.setdefault(shape, threading.Lock())
+        with lock:
+            verdict = _UNROLLED_VERDICTS.get(shape)
+            if verdict is None:
+                x = (mx.random.normal((rows, k), key=mx.random.key(rows)) * 0.5).astype(
+                    dtype
+                )
+                got, want = run(x), reference(x)
+                mx.eval(got, want)
+                verdict = all(
+                    mx.array_equal(a.reshape(b.shape), b).item()
+                    for a, b in zip(got, want)
+                )
+                verdict = _UNROLLED_VERDICTS.setdefault(shape, verdict)
+                if not verdict:
+                    logger.warning(
+                        "row-exact unrolled tile %s differs from the one-row call on "
+                        "this GPU; it runs the rolled tile instead",
+                        shape,
+                    )
     return verdict
 
 
@@ -154,20 +164,17 @@ def _unrolled_ok(bits: int, rps: int, rows_per_group: int) -> bool:
     return kernels.unrolled_tile_ok(values_per_thread(bits, True), rps, rows_per_group)
 
 
-def _module_launch(
-    linears, faces, x: mx.array, rows: int, geometry=None, *, grouped: bool = True
-) -> RowExactPlan | None:
-    """Build a ``RowExactPlan`` for ``linears`` (layers over ``faces``) at
-    ``rows`` rows of ``x``, on ``geometry`` ``(rows_per_group, rps, unrolled)``
-    or the default policy; None where ``geometry`` does not fit or a plugin
-    face fails cold proof."""
-    k = int(x.shape[-1])
-    names = tuple(formats.tensor_names(linear)[0] for linear in linears)
-    operand_keys = tuple((name, *face.tensors) for name, face in zip(names, faces))
-    operands = tuple(
-        linear[key] for linear, keys in zip(linears, operand_keys) for key in keys
-    )
-    sizes = tuple(int(linear[name].shape[0]) for linear, name in zip(linears, names))
+def _resolve_geometry(
+    linears,
+    faces,
+    sizes: tuple[int, ...],
+    k: int,
+    rows: int,
+    geometry,
+    *,
+    grouped: bool,
+) -> tuple[int, int, bool] | None:
+    """Resolve ``(rows_per_group, rps, unrolled)`` for ``linears`` at ``rows``."""
     vpt = faces[0].vpt
     if geometry is None:
         first = linears[0]
@@ -203,6 +210,29 @@ def _module_launch(
         if per_group < 1 or rps < 1 or rows % per_group:
             return None
     unrolled = unrolled and kernels.unrolled_tile_ok(vpt, rps, per_group)
+    return per_group, rps, unrolled
+
+
+def _module_launch(
+    linears, faces, x: mx.array, rows: int, geometry=None, *, grouped: bool = True
+) -> RowExactPlan | None:
+    """Build a ``RowExactPlan`` for ``linears`` (layers over ``faces``) at
+    ``rows`` rows of ``x``, on ``geometry`` ``(rows_per_group, rps, unrolled)``
+    or the default policy; None where ``geometry`` does not fit or a plugin
+    face fails cold proof."""
+    k = int(x.shape[-1])
+    names = tuple(formats.tensor_names(linear)[0] for linear in linears)
+    operand_keys = tuple((name, *face.tensors) for name, face in zip(names, faces))
+    operands = tuple(
+        linear[key] for linear, keys in zip(linears, operand_keys) for key in keys
+    )
+    sizes = tuple(int(linear[name].shape[0]) for linear, name in zip(linears, names))
+    resolved = _resolve_geometry(
+        linears, faces, sizes, k, rows, geometry, grouped=grouped
+    )
+    if resolved is None:
+        return None
+    per_group, rps, unrolled = resolved
     plan = row_exact_skeleton.build_plan(
         faces,
         sizes,
@@ -809,6 +839,610 @@ def rows_qmv(
     return RowsQmv(weight, scales, biases, bits, group_size, dtype, geometry, unrolled)
 
 
+_QUANTIZED_TYPES = (FormatLinear, nn.QuantizedLinear)
+_VERIFY_WARM_ROWS = (2, 3, 4)
+
+
+def _fused_attn_tile(rows: int) -> tuple[int, int, bool]:
+    """Matches ``qwen4_exp/language.py:_fused_tile`` without importing it eagerly."""
+    if rows == 1:
+        return 1, 2, False
+    return (2, 4, True) if rows % 2 == 0 else (1, 4, True)
+
+
+def _linear_in_out(layer) -> tuple[int, int] | None:
+    if isinstance(layer, FormatLinear):
+        return layer.input_dims, layer.output_dims
+    if isinstance(layer, nn.QuantizedLinear):
+        w = layer.get("weight")
+        if not isinstance(w, mx.array) or w.ndim != 2 or not layer.bits:
+            return None
+        return int(w.shape[1]) * 32 // int(layer.bits), int(w.shape[0])
+    return None
+
+
+def _linear_sig(layer) -> tuple | None:
+    dims = _linear_in_out(layer)
+    if dims is None:
+        return None
+    bits = layer.bits if type(layer.bits) is int else None
+    group_size = layer.group_size if type(layer.group_size) is int else None
+    return (
+        type(layer).__name__,
+        getattr(layer, "mode", "affine"),
+        bits,
+        group_size,
+        dims[0],
+        dims[1],
+        "bias" in layer,
+    )
+
+
+def _plan_stand_in(
+    plan: RowExactPlan, k: int, dtype: mx.Dtype
+) -> tuple[tuple[tuple[tuple[int, ...], mx.Dtype], ...], kernels.StandIn]:
+    """Minimal safe stand-in specs and StandIn for one tile of ``plan``.
+
+    Launches a single threadgroup ``(tile=0, row0=0)`` reading rows ``0..ROWS-1``
+    of ``x`` and columns ``0..min(N_i, 2 * RPS)-1`` of projection 0's tensors
+    while preserving MLX's ``size < 8`` / ``0-d`` constant-buffer binding.
+    Holds zero ``mx.array`` references.
+    """
+    tpl = dict(plan.template)
+    per_group = int(tpl["ROWS"])
+    rps = int(tpl["RPS"])
+    op_specs: list[tuple[tuple[int, ...], mx.Dtype]] = [((per_group, k), dtype)]
+    pos = 0
+    for out_shape, keys in zip(plan.output_shapes, plan.operand_keys):
+        n_j = int(out_shape[-1])
+        for _ in keys:
+            arr = plan.operands[pos]
+            pos += 1
+            if arr.ndim >= 1 and arr.shape[0] == n_j:
+                if arr.size >= 8:
+                    min_rows = max(2 * rps, -(-8 * n_j // arr.size))
+                    stand_n = min(n_j, min_rows)
+                    shape = (stand_n, *arr.shape[1:])
+                else:
+                    shape = tuple(arr.shape)
+            else:
+                shape = tuple(arr.shape)
+            op_specs.append((shape, arr.dtype))
+    in_specs = tuple(op_specs)
+    in_shapes = tuple(s for s, _ in in_specs)
+    out_shapes = tuple((per_group, int(s[-1])) for s in plan.output_shapes)
+    stand_in = kernels.StandIn(
+        input_shapes=in_shapes,
+        output_shapes=out_shapes,
+        grid=(32, 2, 1),
+        threadgroup=(32, 2, 1),
+    )
+    return in_specs, stand_in
+
+
+def _register_rolled_instance(
+    plan: RowExactPlan, k: int, dtype: mx.Dtype, instances: dict
+) -> None:
+    in_specs, stand_in = _plan_stand_in(plan, k, dtype)
+    inst = kernels.planned(
+        plan.kernel,
+        in_specs,
+        plan.output_dtypes,
+        template=plan.template,
+    )
+    instances.setdefault(inst, lambda si=stand_in: si)
+
+
+def _plan_warm_target(
+    linears: tuple,
+    k: int,
+    rows: int,
+    dtype: mx.Dtype,
+    geometry,
+    *,
+    grouped: bool,
+    instances: dict,
+    unrolled_tasks: dict,
+    ref_proof_tasks: dict,
+) -> None:
+    """Register load-time Metal warm work for one ``row_exact_qmv`` launch."""
+    probe = mx.zeros((1, k), dtype)
+    faces = [_face(lin, probe) for lin in linears]
+    if not faces or any(face is None for face in faces):
+        return
+    if grouped:
+        if (
+            len({face.vpt for face in faces}) != 1
+            or any("bias" in lin for lin in linears)
+            or kernels.table_bytes(*faces) > formats.TABLE_BYTES
+        ):
+            return
+    elif len(linears) != 1 or kernels.table_bytes(faces[0]) > formats.TABLE_BYTES:
+        return
+    names = tuple(formats.tensor_names(lin)[0] for lin in linears)
+    operand_keys = tuple((name, *face.tensors) for name, face in zip(names, faces))
+    operands = tuple(
+        lin[key] for lin, keys in zip(linears, operand_keys) for key in keys
+    )
+    sizes = tuple(int(lin[name].shape[0]) for lin, name in zip(linears, names))
+    resolved = _resolve_geometry(
+        linears, faces, sizes, k, rows, geometry, grouped=grouped
+    )
+    if resolved is None:
+        return
+    per_group, rps, unrolled = resolved
+    plan = row_exact_skeleton.build_plan(
+        tuple(faces),
+        sizes,
+        k,
+        rows,
+        dtype,
+        (per_group, rps, unrolled),
+        operands=operands,
+        names=names,
+        operand_keys=operand_keys,
+        grouped=grouped,
+    )
+    if plan is None:
+        return
+    if plan.shape is None:
+        _register_rolled_instance(plan, k, dtype, instances)
+        return
+    if plan.shape in unrolled_tasks:
+        return
+
+    from ..formats import linear as linear_mod
+
+    for lin in linears:
+        if not isinstance(lin, FormatLinear):
+            continue
+        s_plan = linear_mod._plan(lin)
+        if s_plan is None:
+            continue
+        metal = (dtype, 1) if s_plan.n % 8 else dtype
+        if (
+            (s_plan.n % 8 and s_plan.shared is None)
+            or not s_plan.face.exact_for(dtype)
+            or metal in s_plan.proof.ran
+        ):
+            continue
+        # Do not skip s_plan.proof.failed so Proof.warm fails closed.
+        ref_proof_tasks.setdefault(
+            (id(s_plan.proof), metal),
+            (
+                s_plan.proof,
+                metal,
+                lambda _stream, sp=s_plan, m=metal: linear_mod._linear_stand_in(sp, m),
+            ),
+        )
+
+    def _run_unrolled(
+        plan=plan,
+        linears=linears,
+        faces=tuple(faces),
+        sizes=sizes,
+        k=k,
+        rows=rows,
+        dtype=dtype,
+        per_group=per_group,
+        rps=rps,
+        operands=operands,
+        names=names,
+        operand_keys=operand_keys,
+        grouped=grouped,
+    ) -> None:
+        stream = kernels._warm_stream()
+        with mx.stream(stream):
+            ran_unrolled = False
+
+            def run(p):
+                nonlocal ran_unrolled
+                ran_unrolled = True
+                outputs = plan(p)
+                return [_biased(m, y) for m, y in zip(linears, outputs)]
+
+            def reference(p):
+                return [_one_row_calls(lin, p) for lin in linears]
+
+            verdict = unrolled_tile_verified(plan.shape, run, reference, rows, k, dtype)
+            if verdict:
+                in_specs, stand_in = _plan_stand_in(plan, k, dtype)
+                inst = kernels.planned(
+                    plan.kernel,
+                    in_specs,
+                    plan.output_dtypes,
+                    template=plan.template,
+                )
+                if ran_unrolled:
+                    # plan.kernel already compiled and evaluated on real weights.
+                    with inst.kernel._locks.setdefault(inst, threading.Lock()):
+                        inst.kernel._built.add(inst)
+                else:
+                    inst.build(lambda si=stand_in: si)
+            else:
+                rolled = row_exact_skeleton.build_plan(
+                    faces,
+                    sizes,
+                    k,
+                    rows,
+                    dtype,
+                    (per_group, rps, False),
+                    operands=operands,
+                    names=names,
+                    operand_keys=operand_keys,
+                    grouped=grouped,
+                )
+                if rolled is not None:
+                    in_specs, stand_in = _plan_stand_in(rolled, k, dtype)
+                    inst = kernels.planned(
+                        rolled.kernel,
+                        in_specs,
+                        rolled.output_dtypes,
+                        template=rolled.template,
+                    )
+                    inst.build(lambda si=stand_in: si)
+
+    unrolled_tasks[plan.shape] = _run_unrolled
+
+
+def _attn_warm_dtypes(q_proj, model_dtype, *, fp16_recast: bool) -> tuple:
+    from ..formats import linear as linear_mod
+
+    if isinstance(q_proj, FormatLinear):
+        return linear_mod._layer_warm_dtypes(
+            q_proj, model_dtype, None, fp16_recast=fp16_recast
+        )
+    scales = q_proj.get("scales")
+    if isinstance(scales, mx.array) and scales.dtype in linear_mod._WARM_DTYPES:
+        return (scales.dtype,)
+    if model_dtype is not None:
+        return (model_dtype,)
+    return linear_mod._WARM_DTYPES
+
+
+def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
+    """Warm served ``omlx_row_exact_qmv`` Metal libraries on ``kernels._WARM_POOL``.
+
+    Always warms the 1-row Qwen4 GDN (stacked in-proj, out-proj) and fused
+    Attention (group4 Q/K/V/index_qk, group1 o_proj) libraries. When
+    ``mtp_enabled`` is True, also warms and verifies the verify-window GDN
+    (rows 2..4), Attention fused (even/odd unrolled group4/group1), and
+    Attention group3 (Q/K/V) libraries.
+
+    Returns futures submitted to ``kernels._WARM_POOL``; callers must await
+    them and fail closed on any error.
+    """
+    if model is None or not mx.metal.is_available():
+        return ()
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return ()
+
+    from ..formats import linear as linear_mod
+    from . import qwen35_gdn_prework
+
+    fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
+    model_dtype = None if fp16_recast else linear_mod._infer_model_dtype(model)
+
+    instances: dict = {}
+    unrolled_tasks: dict = {}
+    ref_proof_tasks: dict = {}
+    seen_attn: set[tuple] = set()
+    seen_gdn: set[tuple] = set()
+
+    for _, mod in named_modules():
+        # 1. Qwen4 GatedDeltaNet (1-row in/out + verify in/out when mtp_enabled).
+        if qwen35_gdn_prework._is_qwen4_gdn(mod):
+            projs = tuple(
+                getattr(mod, name, None)
+                for name in (
+                    "in_proj_qkv",
+                    "in_proj_z",
+                    "in_proj_b",
+                    "in_proj_a",
+                    "out_proj",
+                )
+            )
+            conv = getattr(mod, "conv1d", None)
+            conv_w = getattr(conv, "weight", None)
+            if (
+                isinstance(conv_w, mx.array)
+                and conv_w.dtype in qwen35_gdn_prework._COMPUTE_DTYPES
+                and all(isinstance(p, _QUANTIZED_TYPES) for p in projs)
+            ):
+                dtype = conv_w.dtype
+                wide_flag = bool(
+                    mod.__dict__.get("_omlx_qwen4_wide_projections", False)
+                )
+                gdn_key = (
+                    dtype,
+                    wide_flag,
+                    tuple(_linear_sig(p) for p in projs),
+                )
+                if gdn_key not in seen_gdn:
+                    seen_gdn.add(gdn_key)
+                    dec_plan = qwen35_gdn_prework._qwen4_decode_plan(mod)
+                    stacked = (
+                        qwen35_gdn_prework._stacked_format_inputs(mod)
+                        if dec_plan is not None
+                        else None
+                    )
+                    out_proj = mod.out_proj
+                    out_dims = _linear_in_out(out_proj)
+                    if dec_plan is not None:
+                        if stacked is not None:
+                            _plan_warm_target(
+                                (stacked,),
+                                stacked.input_dims,
+                                1,
+                                dtype,
+                                (1, qwen35_gdn_prework._QWEN4_IN_QMV_RPS, False),
+                                grouped=False,
+                                instances=instances,
+                                unrolled_tasks=unrolled_tasks,
+                                ref_proof_tasks=ref_proof_tasks,
+                            )
+                        if out_dims is not None:
+                            _plan_warm_target(
+                                (out_proj,),
+                                out_dims[0],
+                                1,
+                                dtype,
+                                (1, qwen35_gdn_prework._QWEN4_OUT_QMV_RPS, False),
+                                grouped=False,
+                                instances=instances,
+                                unrolled_tasks=unrolled_tasks,
+                                ref_proof_tasks=ref_proof_tasks,
+                            )
+                    if (
+                        mtp_enabled
+                        and qwen35_gdn_prework._qwen4_verify_plan(mod) is not None
+                    ):
+                        if stacked is None:
+                            stacked = qwen35_gdn_prework._stacked_format_inputs(mod)
+                        for rows in _VERIFY_WARM_ROWS:
+                            if stacked is not None:
+                                rps, grp = qwen35_gdn_prework._qwen4_verify_in_tile(
+                                    rows
+                                )
+                                _plan_warm_target(
+                                    (stacked,),
+                                    stacked.input_dims,
+                                    rows,
+                                    dtype,
+                                    (grp, rps, True),
+                                    grouped=False,
+                                    instances=instances,
+                                    unrolled_tasks=unrolled_tasks,
+                                    ref_proof_tasks=ref_proof_tasks,
+                                )
+                            if out_dims is not None:
+                                rps, grp = qwen35_gdn_prework._qwen4_verify_out_tile(
+                                    rows
+                                )
+                                _plan_warm_target(
+                                    (out_proj,),
+                                    out_dims[0],
+                                    rows,
+                                    dtype,
+                                    (grp, rps, True),
+                                    grouped=False,
+                                    instances=instances,
+                                    unrolled_tasks=unrolled_tasks,
+                                    ref_proof_tasks=ref_proof_tasks,
+                                )
+            continue
+
+        # 2. Qwen4 Attention (group4 + group1 always; even/odd _u + group3 if MTP).
+        q_proj = getattr(mod, "q_proj", None)
+        k_proj = getattr(mod, "k_proj", None)
+        v_proj = getattr(mod, "v_proj", None)
+        o_proj = getattr(mod, "o_proj", None)
+        if not (
+            isinstance(q_proj, _QUANTIZED_TYPES)
+            and isinstance(k_proj, _QUANTIZED_TYPES)
+            and isinstance(v_proj, _QUANTIZED_TYPES)
+            and isinstance(o_proj, _QUANTIZED_TYPES)
+        ):
+            continue
+        indexer = getattr(mod, "indexer", None)
+        idx_proj = getattr(indexer, "index_qk_proj", None)
+        has_idx = isinstance(idx_proj, _QUANTIZED_TYPES)
+        if not has_idx and not mtp_enabled:
+            continue
+        q_dims = _linear_in_out(q_proj)
+        o_dims = _linear_in_out(o_proj)
+        if q_dims is None or o_dims is None:
+            continue
+        dtypes = _attn_warm_dtypes(q_proj, model_dtype, fp16_recast=fp16_recast)
+        projs = (
+            (q_proj, k_proj, v_proj, o_proj, idx_proj)
+            if has_idx
+            else (
+                q_proj,
+                k_proj,
+                v_proj,
+                o_proj,
+            )
+        )
+        attn_key = (dtypes, has_idx, tuple(_linear_sig(p) for p in projs))
+        if attn_key in seen_attn:
+            continue
+        seen_attn.add(attn_key)
+
+        for dtype in dtypes:
+            if has_idx:
+                g4 = (q_proj, k_proj, v_proj, idx_proj)
+                _plan_warm_target(
+                    g4,
+                    q_dims[0],
+                    1,
+                    dtype,
+                    _fused_attn_tile(1),
+                    grouped=True,
+                    instances=instances,
+                    unrolled_tasks=unrolled_tasks,
+                    ref_proof_tasks=ref_proof_tasks,
+                )
+                _plan_warm_target(
+                    (o_proj,),
+                    o_dims[0],
+                    1,
+                    dtype,
+                    _fused_attn_tile(1),
+                    grouped=True,
+                    instances=instances,
+                    unrolled_tasks=unrolled_tasks,
+                    ref_proof_tasks=ref_proof_tasks,
+                )
+                if mtp_enabled:
+                    for rows in (2, 3):
+                        tile = _fused_attn_tile(rows)
+                        _plan_warm_target(
+                            g4,
+                            q_dims[0],
+                            rows,
+                            dtype,
+                            tile,
+                            grouped=True,
+                            instances=instances,
+                            unrolled_tasks=unrolled_tasks,
+                            ref_proof_tasks=ref_proof_tasks,
+                        )
+                        _plan_warm_target(
+                            (o_proj,),
+                            o_dims[0],
+                            rows,
+                            dtype,
+                            tile,
+                            grouped=True,
+                            instances=instances,
+                            unrolled_tasks=unrolled_tasks,
+                            ref_proof_tasks=ref_proof_tasks,
+                        )
+            if mtp_enabled:
+                g3 = (q_proj, k_proj, v_proj)
+                for rows in _VERIFY_WARM_ROWS:
+                    _plan_warm_target(
+                        g3,
+                        q_dims[0],
+                        rows,
+                        dtype,
+                        None,
+                        grouped=True,
+                        instances=instances,
+                        unrolled_tasks=unrolled_tasks,
+                        ref_proof_tasks=ref_proof_tasks,
+                    )
+
+    # Pre-warm every reference FormatLinear 1-row Metal via Proof.warm before
+    # launching unrolled verification workers (zero Proof.prove() races or
+    # proof_count() bumps; fail closed and never orphan futures on scan error).
+    if ref_proof_tasks:
+        ref_futures = kernels.warm_proofs(tuple(ref_proof_tasks.values()))
+        first_err: BaseException | None = None
+        for fut in ref_futures:
+            try:
+                fut.result()
+            except BaseException as err:  # noqa: BLE001
+                if first_err is None:
+                    first_err = err
+                else:
+                    logger.warning(
+                        "row_exact_qmv reference proof warm also failed: %s", err
+                    )
+        if first_err is not None:
+            raise first_err
+
+    futures = list(kernels.warm(instances)) if instances else []
+    for task in unrolled_tasks.values():
+        futures.append(kernels._WARM_POOL.submit(task))
+    return tuple(futures)
+
+
+def warm_model_dispatch(model, *, mtp_enabled: bool = False) -> None:
+    """Pre-populate ``row_exact_qmv`` plans and per-thread compiled GDN graphs
+    on the engine's inference thread before accepting requests."""
+    if model is None or not mx.metal.is_available():
+        return
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return
+
+    from ..formats import linear as linear_mod
+    from . import qwen35_gdn_prework
+
+    fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
+    model_dtype = None if fp16_recast else linear_mod._infer_model_dtype(model)
+
+    for _, mod in named_modules():
+        if qwen35_gdn_prework._is_qwen4_gdn(mod):
+            dec_plan = qwen35_gdn_prework._qwen4_decode_plan(mod)
+            if dec_plan is not None:
+                dtype = mod.conv1d.weight.dtype
+                in_qmv, out_qmv = dec_plan[-2], dec_plan[-1]
+                if in_qmv is not None:
+                    in_qmv(
+                        mx.zeros((1, 1, qwen35_gdn_prework._QWEN4_HIDDEN_SIZE), dtype)
+                    )
+                if out_qmv is not None:
+                    out_qmv(mx.zeros((1, 1, mod.num_v_heads * mod.head_v_dim), dtype))
+            if mtp_enabled:
+                ver_plan = qwen35_gdn_prework._qwen4_verify_plan(mod)
+                if ver_plan is not None:
+                    dtype = mod.conv1d.weight.dtype
+                    in_rows, out_rows = ver_plan[0], ver_plan[1]
+                    for rows in _VERIFY_WARM_ROWS:
+                        in_rows(
+                            mx.zeros(
+                                (1, rows, qwen35_gdn_prework._QWEN4_HIDDEN_SIZE),
+                                dtype,
+                            )
+                        )
+                        out_rows(
+                            mx.zeros((1, rows, mod.num_v_heads * mod.head_v_dim), dtype)
+                        )
+            continue
+
+        q_proj = getattr(mod, "q_proj", None)
+        k_proj = getattr(mod, "k_proj", None)
+        v_proj = getattr(mod, "v_proj", None)
+        o_proj = getattr(mod, "o_proj", None)
+        if not (
+            isinstance(q_proj, _QUANTIZED_TYPES)
+            and isinstance(k_proj, _QUANTIZED_TYPES)
+            and isinstance(v_proj, _QUANTIZED_TYPES)
+            and isinstance(o_proj, _QUANTIZED_TYPES)
+        ):
+            continue
+        q_dims = _linear_in_out(q_proj)
+        o_dims = _linear_in_out(o_proj)
+        if q_dims is None or o_dims is None:
+            continue
+        indexer = getattr(mod, "indexer", None)
+        idx_proj = getattr(indexer, "index_qk_proj", None)
+        has_idx = isinstance(idx_proj, _QUANTIZED_TYPES)
+        if not has_idx and not mtp_enabled:
+            continue
+        dtypes = _attn_warm_dtypes(q_proj, model_dtype, fp16_recast=fp16_recast)
+        for dtype in dtypes:
+            x_q = mx.zeros((1, q_dims[0]), dtype)
+            x_o = mx.zeros((1, o_dims[0]), dtype)
+            if has_idx:
+                g4 = (q_proj, k_proj, v_proj, idx_proj)
+                _group_plan(g4, x_q, 1, _fused_attn_tile(1))
+                _group_plan((o_proj,), x_o, 1, _fused_attn_tile(1))
+                if mtp_enabled:
+                    for rows in _VERIFY_WARM_ROWS:
+                        tile = _fused_attn_tile(rows)
+                        _group_plan(g4, x_q, rows, tile)
+                        _group_plan((o_proj,), x_o, rows, tile)
+            if mtp_enabled:
+                g3 = (q_proj, k_proj, v_proj)
+                for rows in _VERIFY_WARM_ROWS:
+                    _group_plan(g3, x_q, rows)
+
+
 __all__ = [
     "MAX_ROWS",
     "RowsQmv",
@@ -816,4 +1450,6 @@ __all__ = [
     "quantized_linears",
     "quantized_linears_tiled",
     "rows_qmv",
+    "warm_model",
+    "warm_model_dispatch",
 ]

@@ -1860,10 +1860,34 @@ def engine_prefill_lengths(scheduler) -> tuple[int, ...]:
     if callable(base):
         step0 = base(0, 1 << 30)
         step1 = base(step0, 1 << 30) if type(step0) is int and step0 > 0 else 0
-        for step in (step0, step1):
+        step2 = base(step0 + step1, 1 << 30) if type(step1) is int and step1 > 0 else 0
+        for step in (step0, step1, step2):
             if type(step) is int and step > linear.MAX_ROWS:
                 lengths.extend((step - 1, step))
     return tuple(dict.fromkeys(lengths))
+
+
+def _join_warm_futures(futures, *, exc_in_body: bool = False) -> None:
+    first_error = None
+    for future in futures:
+        try:
+            future.result()
+        except Exception as error:  # noqa: BLE001
+            if first_error is None:
+                first_error = error
+            else:
+                logger.warning(
+                    "additional warm build error while joining load",
+                    exc_info=True,
+                )
+    if first_error is not None:
+        if exc_in_body:
+            logger.warning(
+                "warm build error while joining after load failure",
+                exc_info=first_error,
+            )
+        else:
+            raise first_error
 
 
 def warm_engine_dispatch(
@@ -1879,6 +1903,7 @@ def warm_engine_dispatch(
     if model is None or not mx.metal.is_available():
         return
     from ..formats import linear
+    from . import row_exact_qmv
 
     if prefill_lengths is None:
         resolved_lengths: tuple[int, ...] = (
@@ -1892,6 +1917,11 @@ def warm_engine_dispatch(
                 r for r in prefill_lengths if type(r) is int and r > linear.MAX_ROWS
             )
         )
+    # Catch any post-configure_qwen4_decode wide GDN row_exact_qmv Metals
+    # (O(1) no-op for libraries already warmed in warm_moe_model).
+    row_futures = row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled)
+    if row_futures:
+        _join_warm_futures(row_futures)
     if stream is not None:
         with mx.stream(stream):
             linear.warm_model_dispatch(
@@ -1900,6 +1930,7 @@ def warm_engine_dispatch(
                 mtp_enabled=mtp_enabled,
             )
             _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+            row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
     else:
         linear.warm_model_dispatch(
             model,
@@ -1907,6 +1938,7 @@ def warm_engine_dispatch(
             mtp_enabled=mtp_enabled,
         )
         _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
 
 
 def warm_moe_model(
@@ -1944,7 +1976,7 @@ def warm_moe_model(
         return
 
     from ..formats import linear
-    from . import m5_gather_qmm, moe_verify_gather
+    from . import m5_gather_qmm, moe_verify_gather, row_exact_qmv
 
     window_rows = (2, 3, 4, 6, 8, 9, 12, 16) if mtp_enabled else (2, 3, 4)
     futures = []
@@ -2146,30 +2178,14 @@ def warm_moe_model(
 
         if proof_tasks:
             futures.extend(kernels.warm_proofs(proof_tasks))
+        row_futures = row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled)
+        if row_futures:
+            futures.extend(row_futures)
     except BaseException:
         exc_in_body = True
         raise
     finally:
-        first_error = None
-        for future in futures:
-            try:
-                future.result()
-            except Exception as error:  # noqa: BLE001
-                if first_error is None:
-                    first_error = error
-                else:
-                    logger.warning(
-                        "additional MoE warm build error while joining load",
-                        exc_info=True,
-                    )
-        if first_error is not None:
-            if exc_in_body:
-                logger.warning(
-                    "MoE warm build error while joining after load failure",
-                    exc_info=first_error,
-                )
-            else:
-                raise first_error
+        _join_warm_futures(futures, exc_in_body=exc_in_body)
     if warm_dispatch:
         linear.warm_model_dispatch(
             model,
@@ -2177,5 +2193,6 @@ def warm_moe_model(
             mtp_enabled=mtp_enabled,
         )
         _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
+        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
     else:
         linear.prepare_layer_plans(model)

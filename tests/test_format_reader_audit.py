@@ -584,6 +584,26 @@ SCOPE_DECISIONS = {
         FACE,
         "tests/test_qwen35_moe_verify_window.py (window rows equal one-token decode)",
     ),
+    ("omlx/patches/row_exact_qmv.py", "<module>"): (
+        OWN,
+        "tests/test_release3_warm.py::test_warm_row_exact_qmv_zero_compiles_on_first_request",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "_linear_in_out"): (
+        OWN,
+        "tests/test_release3_warm.py::test_warm_row_exact_qmv_zero_compiles_on_first_request",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "_linear_sig"): (
+        OWN,
+        "tests/test_release3_warm.py::test_warm_row_exact_qmv_zero_compiles_on_first_request",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "warm_model"): (
+        OWN,
+        "tests/test_release3_warm.py::test_warm_row_exact_qmv_zero_compiles_on_first_request",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "warm_model_dispatch"): (
+        OWN,
+        "tests/test_release3_warm.py::test_warm_row_exact_qmv_zero_compiles_on_first_request",
+    ),
 }
 
 
@@ -1452,6 +1472,7 @@ EXPECTED = {
         "read group_size",
     ),
     ("omlx/patches/raon1_mini/raon1_mini_model.py", "_share_parts"): ("read scales",),
+    ("omlx/patches/row_exact_qmv.py", "<module>"): ("QuantizedLinear",),
     ("omlx/patches/row_exact_qmv.py", "_face"): (
         "QuantizedLinear",
         "isinstance QuantizedLinear",
@@ -1460,6 +1481,23 @@ EXPECTED = {
     ("omlx/patches/row_exact_qmv.py", "_format_plans"): (
         "read bits",
         "read group_size",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "_linear_in_out"): (
+        "QuantizedLinear",
+        "isinstance QuantizedLinear",
+        "read bits",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "_linear_sig"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "warm_model"): (
+        "QuantizedLinear",
+        "isinstance QuantizedLinear",
+    ),
+    ("omlx/patches/row_exact_qmv.py", "warm_model_dispatch"): (
+        "QuantizedLinear",
+        "isinstance QuantizedLinear",
     ),
     ("omlx/patches/sdpa256_attention.py", "_should_route"): ("hasattr bits",),
     (

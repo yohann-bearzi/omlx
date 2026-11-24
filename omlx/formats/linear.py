@@ -29,7 +29,7 @@ import logging
 import math
 from copy import copy
 from functools import cache
-from threading import local
+from threading import Lock, local
 from typing import Any, NamedTuple
 
 import mlx.core as mx
@@ -625,6 +625,7 @@ def _switch_stand_in(plan: _Plan, metal):
 # float16 when activations are recast. A load builds only its checkpoint's
 # floating dtype when known, falling back to both otherwise.
 _WARM_DTYPES = (mx.bfloat16, mx.float16)
+_FAST_LOCK = Lock()
 _NO_EPILOGUE = object()
 
 
@@ -1199,13 +1200,19 @@ def prepare_layer_plans(model) -> None:
 
 
 def _infer_model_dtype(model) -> mx.Dtype | None:
-    """First serving floating dtype (bf16/fp16) found on ``model``'s modules."""
+    """First serving floating dtype (bf16/fp16) found on ``model``'s modules.
+
+    Format layers' fixed-dtype storages (e.g. an fp16 ``scales``) are not the
+    activation dtype: scan non-format module arrays and format layers' stored
+    floats / bias first, falling back to other ``_tensors`` only if none match.
+    """
     named_modules = getattr(model, "named_modules", None)
     if not callable(named_modules):
         return None
-    for _, mod in named_modules():
+    modules = list(named_modules())
+    for _, mod in modules:
         if isinstance(mod, _FormatLayer):
-            for name in mod._tensors:
+            for name in (*mod._stored_floats, "bias"):
                 arr = mod.get(name)
                 if isinstance(arr, mx.array) and arr.dtype in _WARM_DTYPES:
                     return arr.dtype
@@ -1213,6 +1220,12 @@ def _infer_model_dtype(model) -> mx.Dtype | None:
             for val in dict.values(mod):
                 if isinstance(val, mx.array) and val.dtype in _WARM_DTYPES:
                     return val.dtype
+    for _, mod in modules:
+        if isinstance(mod, _FormatLayer):
+            for name in mod._tensors:
+                arr = mod.get(name)
+                if isinstance(arr, mx.array) and arr.dtype in _WARM_DTYPES:
+                    return arr.dtype
     return None
 
 
@@ -1228,9 +1241,9 @@ def _layer_warm_dtypes(
     if fp16_recast:
         return (mx.float16,)
     found = [
-        layer[name].dtype
-        for name in layer._tensors
-        if name in layer and layer[name].dtype in _WARM_DTYPES
+        arr.dtype
+        for name in (*layer._stored_floats, "bias")
+        if isinstance((arr := layer.get(name)), mx.array) and arr.dtype in _WARM_DTYPES
     ]
     if found:
         return tuple(dt for dt in _WARM_DTYPES if dt in found)
@@ -1526,6 +1539,7 @@ def warm_model_dispatch(
                                             and _warm_linear_wide_graph(
                                                 kept.wide, c_shape, dtype
                                             )
+                                            and qwen
                                         ):
                                             mod._register_fast(
                                                 kept, kept.wide, (c_shape, dtype)
@@ -1539,6 +1553,8 @@ def warm_model_dispatch(
                                 (p_shape, dtype),
                                 proof_state=kept.dense.binding.state,
                             )
+                    if kept.dense_fast is not None:
+                        mod.__dict__[_FAST] = kept.dense_fast
             continue
 
         # 4. MoE FormatSwitchLinear sorted prefill (+ M5 NAX mapped SwiGLU).
@@ -2402,16 +2418,17 @@ class FormatLinear(_FormatLayer):
             return None
         graph = tile.proof.graphs.get(signature)
         if graph is not None:
-            tile_fast = kept.routes.get(("native", id(tile)))
-            if tile_fast is not None and signature in kept.routes.get(
-                ("native_sigs", id(tile)), ()
-            ):
-                self.__dict__[_FAST] = tile_fast
-            else:
-                self._register_fast(kept, tile, signature)
+            if self._qwen_row_exact is not None:
+                tile_fast = kept.routes.get(("native", id(tile)))
+                if tile_fast is not None and signature in kept.routes.get(
+                    ("native_sigs", id(tile)), ()
+                ):
+                    self.__dict__[_FAST] = tile_fast
+                else:
+                    self._register_fast(kept, tile, signature)
             return graph(x, *tile.operands)
         y = _launch(tile, signature, tile_wide.describe, tile_wide.stand_in, x)
-        if y is not None:
+        if y is not None and self._qwen_row_exact is not None:
             self._register_fast(kept, tile, signature)
         return y
 
@@ -2431,44 +2448,47 @@ class FormatLinear(_FormatLayer):
         # Dense prefill keeps its own slot so declining an ordinary route never
         # allocates kept.routes.
         is_dense = tile is kept.dense
-        fast = kept.dense_fast if is_dense else kept.routes.get(("native", id(tile)))
-        if fast is None:
-            try:
-                from ..custom_kernels.quant_matmul import fast as native
-            except ImportError:
-                _log_native_fallback()
-                return
-
-            if not native.has_symbol("FormatLinearFast"):
-                _log_native_fallback()
-                return
-            fast = native.format_linear_fast(
-                kept.weight,
-                kept.bias,
-                tile.operands,
-                proof_state,
-                packed_name(self),
+        with _FAST_LOCK:
+            fast = (
+                kept.dense_fast if is_dense else kept.routes.get(("native", id(tile)))
             )
             if fast is None:
-                _log_native_fallback()
-                return
-            if is_dense:
-                kept.dense_fast = fast
-            else:
-                kept.routes[("native", id(tile))] = fast
-        fast.__self__.register(signature)
-        if len(tile.operands) < 16:
-            if is_dense:
-                sigs = kept.dense_fast_sigs
-                if sigs is None:
-                    sigs = kept.dense_fast_sigs = set()
-            else:
-                sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
-            if signature not in sigs:
-                if len(sigs) == 64:
-                    sigs.clear()
-                sigs.add(signature)
-        self.__dict__[_FAST] = fast
+                try:
+                    from ..custom_kernels.quant_matmul import fast as native
+                except ImportError:
+                    _log_native_fallback()
+                    return
+
+                if not native.has_symbol("FormatLinearFast"):
+                    _log_native_fallback()
+                    return
+                fast = native.format_linear_fast(
+                    kept.weight,
+                    kept.bias,
+                    tile.operands,
+                    proof_state,
+                    packed_name(self),
+                )
+                if fast is None:
+                    _log_native_fallback()
+                    return
+                if is_dense:
+                    kept.dense_fast = fast
+                else:
+                    kept.routes[("native", id(tile))] = fast
+            fast.__self__.register(signature)
+            if len(tile.operands) < 16:
+                if is_dense:
+                    sigs = kept.dense_fast_sigs
+                    if sigs is None:
+                        sigs = kept.dense_fast_sigs = set()
+                else:
+                    sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
+                if signature not in sigs:
+                    if len(sigs) == 64:
+                        sigs.clear()
+                    sigs.add(signature)
+            self.__dict__[_FAST] = fast
 
     def _prefill(self, kept, x, rows, *, armed: bool | None = None):
         """A dense call above MAX_ROWS over the format's tile face via the
