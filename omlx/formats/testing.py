@@ -201,6 +201,22 @@ def no_dot_defects():
         )
 
 
+def transform_reference(layer, x: mx.array) -> mx.array:
+    """``x @ W_plain.T`` for a layer whose format rotates its input: the
+    reference in ``x.dtype`` a test compares every route with."""
+    from . import transforms
+
+    return transforms.transform_reference(layer, x)
+
+
+def assert_transform_applied(layer, x: mx.array, *, atol=1e-2) -> None:
+    """Fail when ``layer(x)`` is the rotated product rather than the plain
+    basis one: a route that forgot the format's input transform."""
+    from . import transforms
+
+    transforms.check_transform_applied(layer, x, atol=atol)
+
+
 @cache
 def _dot_rows_kernel(face: Dot, staged: bool):
     matrices = kernels.Matrices()

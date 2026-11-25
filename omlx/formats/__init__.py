@@ -43,6 +43,7 @@ from importlib.metadata import EntryPoint, entry_points
 import mlx.core as mx
 import mlx.nn as nn
 
+from ..patches.module_cache import cached_per_module
 from ..patches.module_cache import epoch as cache_epoch
 from ..patches.module_cache import publish as cache_publish
 from .reads import (
@@ -97,7 +98,11 @@ FLOATS: tuple[mx.Dtype, ...] = (mx.float16, mx.bfloat16, mx.float32)
 ENTRY_POINT_GROUP = "omlx.quant_formats"
 
 # Formats that ship with oMLX, as entry-point values ("module:attribute").
-BUILTIN: tuple[str, ...] = ("omlx.formats.affine:FORMAT",)
+BUILTIN: tuple[str, ...] = (
+    "omlx.formats.affine:FORMAT",
+    "omlx.formats.oqh:OQH",
+    "omlx.formats.oqh:OQH_AFFINE",
+)
 
 # The revision of the contract (docs/quant-formats.md, Versions) that this
 # oMLX implements, and the oldest one whose formats it still runs.
@@ -601,6 +606,12 @@ class QuantFormat:
         raise NotImplementedError(
             f"quant format {self.mode!r} does not encode its own layers"
         )
+
+    def input_transform(self, layer) -> transforms.InputTransform | None:
+        """The rotation every route applies to ``layer``'s activation before
+        its faces read it, or None: a format whose weights are in a rotated
+        basis declares it here (``omlx.formats.transforms``)."""
+        return None
 
     def record(self) -> dict:
         """What a checkpoint written in the format keeps of it beside its
@@ -1148,6 +1159,58 @@ def _stackable_layout(fmt: QuantFormat, k: int, n: int, bits: int, group_size: i
     return None
 
 
+def input_transform(layer, *, refuse: bool = True) -> tuple | None:
+    """``(tx, tensors)`` of ``layer``'s format's input transform, or None:
+    the descriptor and this layer's arrays of its ``shared_tensors``, bound
+    once per module (the format is asked once). A format layer that still
+    holds a load's placeholder is refused here when ``refuse`` is true (the
+    default), ahead of its faces; pass ``refuse=False`` only when the caller
+    has already called ``refuse_placeholders()``. A transform that names a
+    tensor its format does not share, or is not an ``InputTransform``, is
+    refused: a checkpoint whose writer meant another rotation must not run
+    with this one."""
+    fmt = getattr(layer, "fmt", None)
+    if not isinstance(fmt, QuantFormat):
+        return None
+    if refuse:
+        check = getattr(layer, "refuse_placeholders", None)
+        if check is not None:
+            check()
+    if (
+        type(fmt).input_transform is QuantFormat.input_transform
+        and "input_transform" not in fmt.__dict__
+    ):
+        return None
+    if not isinstance(layer, nn.Module):
+        return _bound_transform(fmt, layer, transforms)
+    return cached_per_module(
+        layer,
+        "_omlx_input_transform",
+        lambda layer: _bound_transform(fmt, layer, transforms),
+        depth=0,
+        flags=(id(fmt), fmt, tuple(dict.keys(layer))),
+    )
+
+
+def _bound_transform(fmt, layer, transforms):
+    transform = fmt.input_transform(layer)
+    if transform is None:
+        return None
+    if not isinstance(transform, transforms.InputTransform):
+        raise TypeError(
+            f"quant format {fmt.mode!r}: input_transform gives "
+            f"{type(transform).__name__}, not an InputTransform"
+        )
+    stray = [name for name in transform.tensors if name not in fmt.shared_tensors]
+    if stray:
+        raise ValueError(
+            f"quant format {fmt.mode!r}: its input transform reads "
+            f"{', '.join(stray)}, not among its shared_tensors"
+        )
+    tensors = tuple(layer[name] for name in transform.tensors)
+    return transform, tensors
+
+
 def dot(layer, k: int, n: int) -> Dot | None:
     """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None when
     its format (``layer.mode``) is unknown or has none for it.
@@ -1314,3 +1377,6 @@ def _checked_face(fmt: QuantFormat, layer, k: int, n: int, kind: type, name: str
             "does not take"
         )
     return face
+
+
+from . import transforms  # noqa: E402  (it reads this module's API lazily)

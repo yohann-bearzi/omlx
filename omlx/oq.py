@@ -13020,7 +13020,29 @@ def _format_hessian_error(reader, w, tensors, hessian, bits, group_size) -> floa
     """The shrunk-Gram objective of decoded ``tensors`` against ``w``.
 
     Decodes whole matrices only (a plugin's side tensors may not slice along
-    rows): 3-D stacks are chunked on the expert axis, 2-D matrices on rows."""
+    rows): 3-D stacks are chunked on the expert axis, 2-D matrices on rows.
+    A format whose weights are in a rotated basis is inverted first: ``w``
+    and ``hessian`` are in the source's plain basis."""
+    from . import formats
+    from .formats import transforms
+
+    class _DecodeProxy(dict):
+        pass
+
+    proxy = _DecodeProxy(tensors)
+    proxy.fmt = reader
+    proxy.mode = getattr(reader, "mode", None)
+    proxy.bits = bits
+    proxy.group_size = group_size
+    proxy.input_dims = int(w.shape[-1])
+    proxy.output_dims = int(w.shape[-2])
+    bound = formats.input_transform(proxy, refuse=False)
+
+    def plain(value):
+        if bound is None:
+            return value.astype(mx.float32)
+        return transforms.inverse_weight(value, *bound).astype(mx.float32)
+
     wf = w.astype(mx.float32)
     if wf.ndim == 2 and hessian.ndim == 3:
         hessian = hessian[0]
@@ -13031,14 +13053,16 @@ def _format_hessian_error(reader, w, tensors, hessian, bits, group_size) -> floa
         total = 0.0
         for e0 in range(0, e, chunk):
             e1 = min(e, e0 + chunk)
-            part = reader.decode(
-                {
-                    name: tensor if name in shared else tensor[e0:e1]
-                    for name, tensor in tensors.items()
-                },
-                bits,
-                group_size,
-            ).astype(mx.float32)
+            part = plain(
+                reader.decode(
+                    {
+                        name: tensor if name in shared else tensor[e0:e1]
+                        for name, tensor in tensors.items()
+                    },
+                    bits,
+                    group_size,
+                )
+            )
             diff = part - wf[e0:e1]
             grams = hessian[e0:e1] if hessian.ndim == 3 else hessian
             total += float(mx.sum((diff @ grams) * diff))
@@ -13046,7 +13070,7 @@ def _format_hessian_error(reader, w, tensors, hessian, bits, group_size) -> floa
             mx.clear_cache()
         return total
     k = int(wf.shape[-1])
-    decoded = reader.decode(tensors, bits, group_size).astype(mx.float32)
+    decoded = plain(reader.decode(tensors, bits, group_size))
     rows = max(1, _OQE_REFINE_CHUNK_ELEMS // k)
     total = 0.0
     for r0 in range(0, wf.shape[0], rows):

@@ -584,6 +584,55 @@ def test_stacked_outputs_refuses_shared_tensor_dtype_mismatch(registered):
         la._stacked_outputs(lb)
 
 
+def test_format_hessian_error_inverts_the_input_transform():
+    from omlx.formats import transforms
+    from tests.test_formats_transforms import _Rotated
+
+    class _RefiningRotated(_Rotated):
+        def __init__(self, target):
+            super().__init__()
+            self.target = target
+
+        def refine(self, w, tensors, hessian, bits, group_size):
+            return {"codes": self.target, "signs": tensors["signs"]}
+
+    fmt = _Rotated()
+    k, n = 256, 8
+    mx.random.seed(7)
+    plain = mx.random.normal((n, k)).astype(mx.float32) * 0.1
+    signs = mx.ones((k // 128, 128), mx.float32)
+    tx = transforms.SignedWhtTransform(block=128, tensors=("signs",))
+    exact = tx.apply(plain, signs)
+    noisy = exact + 0.1 * (plain - exact)
+    tensors = {"codes": exact, "signs": signs}
+    hessian = mx.eye(k)
+    before = oq._format_hessian_error(fmt, plain, tensors, hessian, 8, 1)
+    noisy_tensors = {"codes": noisy, "signs": signs}
+    after = oq._format_hessian_error(fmt, plain, noisy_tensors, hessian, 8, 1)
+    assert before < 1e-6
+    assert after > before
+    ref2 = oq._refine_format_tensors(
+        _RefiningRotated(exact), fmt, "w", plain, noisy_tensors, hessian, 8, 1
+    )
+    assert ref2 is not None and ref2[2] < 1e-6 < ref2[1]
+
+    plain3 = mx.random.normal((2, n, k)).astype(mx.float32) * 0.1
+    exact3 = tx.apply(plain3, signs)
+    noisy3 = exact3 + 0.1 * (plain3 - exact3)
+    hessian3 = mx.broadcast_to(hessian, (2, k, k))
+    before3 = oq._format_hessian_error(
+        fmt, plain3, {"codes": exact3, "signs": signs}, hessian3, 8, 1
+    )
+    noisy3_tensors = {"codes": noisy3, "signs": signs}
+    after3 = oq._format_hessian_error(fmt, plain3, noisy3_tensors, hessian3, 8, 1)
+    assert before3 < 1e-6
+    assert after3 > before3
+    ref3 = oq._refine_format_tensors(
+        _RefiningRotated(exact3), fmt, "w3", plain3, noisy3_tensors, hessian3, 8, 1
+    )
+    assert ref3 is not None and ref3[2] < 1e-6 < ref3[1]
+
+
 def test_configured_format_shared_tensors_mismatch_is_named(registered, tmp_path):
     other = _Shared()
     other.shared_tensors = ("signs", "extra")
