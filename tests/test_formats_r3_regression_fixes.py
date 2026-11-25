@@ -5,15 +5,18 @@ batched verify route), and C (FormatLinear (1, 1, K) native dense_fast).
 
 from __future__ import annotations
 
+import cProfile
+import pstats
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from omlx.formats.mlx import traversal as mlx_traversal
 
 from omlx.custom_kernels.quant_matmul import fast as native
 from omlx.formats import affine, linear, testing, tile_dense, tuning
-from omlx.formats.mlx import traversal as mlx_traversal
 from omlx.patches import qwen35_moe_routed_decode, qwen35_verify_qmm
 
 # Every 2-D quantized dense FormatLinear shape in Qwen3.8-Flash-Next (P32).
@@ -950,3 +953,399 @@ def test_one_row_dense_fast_safety_proof_fail_tile_dense_project_and_threads(
     fallback = fl(x1)
     mx.eval(fallback)
     assert _same_bits(fallback, ref)
+
+
+# ---------------------------------------------------------------------------
+# Part D: Zero per-call host overhead on FormatLinear small rows (Rule 28)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize(
+    "shape",
+    [(1, 2048), (2, 2048), (4, 2048), (8, 2048), (2, 1, 2048), (4, 1, 2048)],
+)
+def test_format_linear_small_rows_python_fallback_zero_extra_calls(
+    bits, shape, monkeypatch
+):
+    """On the Python warm path (native disabled), small-row FormatLinear calls
+    must make zero calls to verify.is_armed(), _is_armed(), packed_name(),
+    builtins.len(), or _register_fast() while verify is disarmed."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+    _, fl = _pair(4096, 2048, bits=bits, group_size=64, qwen=False, seed=901 + bits)
+    x = _x(shape, dtype=mx.bfloat16, seed=910 + sum(shape))
+
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "has_symbol", lambda _name: False)
+        # Warm the plan graph and establish no_native on the cold call.
+        warm0 = fl(x)
+        mx.eval(warm0)
+        assert fl._fast is None
+        assert fl.__dict__[linear._KEPT].verify is not None
+
+        is_armed_calls = 0
+        orig_is_armed = qwen35_verify_qmm._FormatVerifyPlan.is_armed
+
+        def spy_is_armed(self):
+            nonlocal is_armed_calls
+            is_armed_calls += 1
+            return orig_is_armed(self)
+
+        packed_calls = 0
+        orig_packed = linear.packed_name
+
+        def spy_packed(layer):
+            nonlocal packed_calls
+            packed_calls += 1
+            return orig_packed(layer)
+
+        reg_calls = 0
+        orig_reg = linear.FormatLinear._register_fast
+
+        def spy_reg(self, *a, **kw):
+            nonlocal reg_calls
+            reg_calls += 1
+            return orig_reg(self, *a, **kw)
+
+        patch.setattr(qwen35_verify_qmm._FormatVerifyPlan, "is_armed", spy_is_armed)
+        patch.setattr(linear, "packed_name", spy_packed)
+        patch.setattr(linear.FormatLinear, "_register_fast", spy_reg)
+
+        pr = cProfile.Profile()
+        pr.enable()
+        y = warm0
+        for _ in range(32):
+            y = fl(x)
+        pr.disable()
+        mx.eval(y)
+
+    assert is_armed_calls == 0, f"verify.is_armed() called {is_armed_calls} times"
+    assert packed_calls == 0, f"packed_name() called {packed_calls} times"
+    assert reg_calls == 0, f"_register_fast() called {reg_calls} times"
+    callee_names = {fn[2] for fn in pstats.Stats(pr).stats if fn[2] != "disable"}
+    assert "len" not in callee_names, f"per-call len() on warm path: {callee_names}"
+    assert (
+        "_is_armed" not in callee_names
+    ), f"per-call _is_armed() on warm path: {callee_names}"
+
+
+def test_bind_plan_fast_in_layer_calls_keeps_raw_graph():
+    """A (1,1,K) bind inside testing.layer_calls() caches the raw graph, not
+    the recorder wrapper (no leak through native dense_fast afterwards)."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+    with testing.fresh_proofs():
+        _, fl = _pair(256, 256, bits=8, group_size=64, qwen=False, seed=970)
+        linear.prepare_layer_plans(fl)
+        x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=971)
+        with testing.layer_calls() as calls:
+            mx.eval(fl(x1))
+        assert len(calls) == 1
+        kept = fl.__dict__[linear._KEPT]
+        raw = kept.plan.proof._kept.graphs[(x1.shape, x1.dtype)]
+        assert kept.dense.binding.kept.graphs[(x1.shape, x1.dtype)] is raw
+
+
+def test_init_verify_active_partial_and_armed_module(monkeypatch):
+    """A partially imported verify module (no lock yet) and an armed stub both
+    leave the counter consistent; a concurrent import cannot raise."""
+    import sys
+    import types
+
+    stub = types.ModuleType(linear._VERIFY_QMM_MOD_NAME)
+    monkeypatch.setitem(sys.modules, linear._VERIFY_QMM_MOD_NAME, stub)
+    linear._init_verify_active()
+    assert linear._VERIFY_ACTIVE == 0
+    stub._ROW_EXACT_LOCK = threading.Lock()
+    stub._VERIFY_ACTIVE = 2
+    try:
+        linear._init_verify_active()
+        assert linear._VERIFY_ACTIVE == 2
+    finally:
+        linear._VERIFY_ACTIVE = 0
+
+
+@pytest.mark.parametrize("bits", [4, 8])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_format_linear_small_rows_bind_native_plan_fast_and_stay_bitwise(
+    bits, with_bias, monkeypatch
+):
+    """Small-row 2-D and 3-D bare FormatLinear calls bind native plan_fast
+    (including after prefill binds dense_fast), stay bitwise identical to the
+    Python route, keep kept.routes empty, isolate tile_dense.project, and
+    respect proof failure, weight mutation, and armed verify."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+    with testing.fresh_proofs():
+        _check_small_rows_bind_native_plan_fast(bits, with_bias, monkeypatch)
+
+
+def _check_small_rows_bind_native_plan_fast(bits, with_bias, monkeypatch):
+
+    k = 2048
+    _, fl = _pair(
+        k, k, bits=bits, group_size=64, bias=with_bias, qwen=False, seed=920 + bits
+    )
+    _, fl_py = _pair(
+        k, k, bits=bits, group_size=64, bias=with_bias, qwen=False, seed=920 + bits
+    )
+
+    shapes = ((1, k), (2, k), (4, k), (8, k), (2, 1, k), (4, 1, k), (1, 4, k))
+    inputs = {s: _x(s, dtype=mx.bfloat16, seed=930 + sum(s)) for s in shapes}
+
+    # Reference outputs with native disabled (pure Python Dot route).
+    refs = {}
+    with monkeypatch.context() as patch:
+        patch.setattr(native, "has_symbol", lambda _name: False)
+        for s, x in inputs.items():
+            refs[s] = fl_py(x)
+        mx.eval(*refs.values())
+
+    # 1. Small 2-D rows bind plan_fast without allocating kept.routes.
+    for s in ((1, k), (2, k), (4, k), (8, k)):
+        x = inputs[s]
+        first = fl(x)
+        mx.eval(first)
+        assert _same_bits(first, refs[s]), s
+        kept = fl.__dict__[linear._KEPT]
+        assert kept.plan_fast is not None
+        assert fl._fast is kept.plan_fast
+        assert kept.routes == {}
+        replay = fl._fast(fl, x)
+        assert replay is not None, s
+        mx.eval(replay)
+        assert _same_bits(replay, refs[s]), s
+
+    # 2. Prefill binds dense_fast; subsequent 3-D 2/4-stream calls switch back
+    #    to plan_fast and serve directly from C++ (0 Python fallback hits).
+    xp = _x((33, k), dtype=mx.bfloat16, seed=950)
+    mx.eval(fl(xp))
+    kept = fl.__dict__[linear._KEPT]
+    assert kept.dense_fast is not None
+    assert fl._fast is kept.dense_fast
+
+    for s in ((2, 1, k), (4, 1, k), (1, 4, k)):
+        x = inputs[s]
+        first = fl(x)
+        mx.eval(first)
+        assert _same_bits(first, refs[s]), s
+        assert fl._fast is kept.plan_fast
+        served: list[bool] = []
+        fast = kept.plan_fast
+
+        def counting(module, value, _fast=fast, _served=served):
+            y = _fast(module, value)
+            _served.append(y is not None)
+            return y
+
+        with monkeypatch.context() as patch:
+            fl.__dict__[linear._FAST] = counting
+            patch.setattr(
+                linear.FormatLinear,
+                "_keep",
+                lambda *a, **kw: pytest.fail("Python _keep on warm small-row"),
+            )
+            patch.setattr(
+                qwen35_verify_qmm._FormatVerifyPlan,
+                "is_armed",
+                lambda *a, **kw: pytest.fail("verify.is_armed on warm small-row"),
+            )
+            try:
+                again = fl(x)
+                mx.eval(again)
+            finally:
+                fl.__dict__[linear._FAST] = fast
+        assert served == [True], s
+        assert _same_bits(again, refs[s]), s
+
+    # 3. Direct tile_dense.project on 4 rows must never see a Dot graph from plan_fast.
+    assert kept.dense is not None
+    assert ((4, k), mx.bfloat16) not in (
+        kept.dense.binding.kept.graphs if kept.dense.binding.kept is not None else {}
+    )
+    assert ((1, 4, k), mx.bfloat16) not in (
+        kept.dense.binding.kept.graphs if kept.dense.binding.kept is not None else {}
+    )
+    td_out = tile_dense.project(kept.dense, inputs[(4, k)])
+    assert td_out is not None
+    mx.eval(td_out)
+    assert td_out.shape == (4, k)
+
+    # 3b. A tile of at least 16 operands refuses native before caching.
+    class _Wide:
+        failed = False
+        operands = tuple(range(16))
+
+    saved = (kept.plan, kept.dense, kept.plan_fast, kept.dense_fast, kept.no_native)
+    try:
+        kept.plan = _Wide()
+        kept.dense = _Wide()
+        kept.plan_fast = None
+        kept.dense_fast = None
+        kept.no_native = False
+        graph = object()
+        from types import SimpleNamespace
+
+        state = {"_kept": SimpleNamespace(graphs={((1, k), mx.bfloat16): graph})}
+        fl._register_fast(kept, kept.plan, ((1, k), mx.bfloat16), proof_state=state)
+        assert kept.plan_fast is None
+        assert kept.dense_fast is None
+        assert kept.no_native is True
+        kept.no_native = False
+        fl._register_fast(kept, kept.dense, ((1, k), mx.bfloat16), proof_state=state)
+        assert kept.plan_fast is None
+        assert kept.dense_fast is None
+        assert kept.no_native is True
+    finally:
+        (
+            kept.plan,
+            kept.dense,
+            kept.plan_fast,
+            kept.dense_fast,
+            kept.no_native,
+        ) = saved
+
+    # 4. Multi-threaded warm plan_fast stays bitwise identical.
+    x2 = inputs[(2, 1, k)]
+
+    def worker():
+        out = fl(x2)
+        mx.eval(out)
+        return _same_bits(out, refs[(2, 1, k)])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(worker)
+        f2 = pool.submit(worker)
+        assert f1.result() and f2.result()
+
+    # 5. Armed verify bypasses plan_fast; disarming restores unpoisoned replay.
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+    try:
+        assert fl._fast(fl, x2) is None
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    post = fl._fast(fl, x2)
+    assert post is not None
+    mx.eval(post)
+    assert _same_bits(post, refs[(2, 1, k)])
+
+    # 5b. Armed row-exact calls (cold and warm) never bind plan_fast; >=16
+    #     operands marks kept.no_native without setting _fast.
+    if not with_bias:
+        _, fl_re = _pair(k, k, bits=bits, group_size=64, qwen=True, seed=955 + bits)
+        x1 = inputs[(1, k)]
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+        try:
+            mx.eval(fl_re(x1))
+            assert fl_re._fast is None
+            mx.eval(fl_re(x1))
+            assert fl_re._fast is None
+        finally:
+            qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+        _, fl_wide_ops = _pair(
+            256, 256, bits=bits, group_size=64, qwen=False, seed=956 + bits
+        )
+        kept_ops = fl_wide_ops._keep()
+        sig_ops = ((1, 256), mx.bfloat16)
+        kept_ops.plan.proof.keep(sig_ops, lambda x, *ops: x)
+        fake_tile = type(
+            "_BigTile",
+            (),
+            {"operands": (kept_ops.weight,) * 16, "proof": kept_ops.plan.proof},
+        )()
+        fl_wide_ops._register_fast(kept_ops, fake_tile, sig_ops)
+        assert kept_ops.no_native is True
+        assert fl_wide_ops._fast is None
+
+    # 6. Weight mutation retires plan_fast cleanly; plan.proof.fail() retires
+    #    plan_fast immediately and falls back bitwise on 1-row stock matmul.
+    if with_bias:
+        fl["weight"] = mx.array(fl["weight"])
+        assert fl._fast is None
+        rebound = fl(x2)
+        mx.eval(rebound)
+        assert _same_bits(rebound, refs[(2, 1, k)])
+        assert fl._fast is fl.__dict__[linear._KEPT].plan_fast
+    else:
+        kept.plan.proof.fail()
+        x1_2d = inputs[(1, k)]
+        assert fl._fast(fl, x2) is None
+        assert fl._fast(fl, x1_2d) is None
+        fb = fl(x1_2d)
+        mx.eval(fb)
+        assert _same_bits(fb, refs[(1, k)])
+
+
+def test_verify_active_counter_transitions_threads_and_unpatched_guard(monkeypatch):
+    """linear._VERIFY_ACTIVE tracks armed non-row-exact verify threads cleanly
+    across idempotent calls, row_exact transitions, concurrent threads, and
+    _QL_PATCHED=False guards."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert linear._VERIFY_ACTIVE == 0
+
+    # Idempotent disarm and arm on one thread.
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert linear._VERIFY_ACTIVE == 0
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+    try:
+        assert linear._VERIFY_ACTIVE == 1
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+        assert linear._VERIFY_ACTIVE == 1
+        # Transition verify -> row_exact clears _VERIFY_ACTIVE.
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+        assert linear._VERIFY_ACTIVE == 0
+        # Transition row_exact -> verify restores _VERIFY_ACTIVE.
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+        assert linear._VERIFY_ACTIVE == 1
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert linear._VERIFY_ACTIVE == 0
+
+    # Concurrent threads: 2 armed threads give _VERIFY_ACTIVE == 2, then 0.
+    barrier = threading.Barrier(2)
+    observed: list[int] = []
+
+    def arm_worker():
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+        try:
+            barrier.wait(timeout=5.0)
+            observed.append(linear._VERIFY_ACTIVE)
+            barrier.wait(timeout=5.0)
+        finally:
+            qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(arm_worker)
+        f2 = pool.submit(arm_worker)
+        f1.result()
+        f2.result()
+    assert observed == [2, 2]
+    assert linear._VERIFY_ACTIVE == 0
+
+    # Unpatched guard while _VERIFY_ACTIVE > 0 must still skip verify route.
+    _, fl = _pair(4096, 2560, bits=8, group_size=64, qwen=False, seed=960)
+    x_ver = _x((4, 2, 2560), dtype=mx.bfloat16, seed=961)
+    unarmed_ref = fl(x_ver)
+    mx.eval(unarmed_ref)
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+    try:
+        assert linear._VERIFY_ACTIVE == 1
+        with monkeypatch.context() as patch:
+            patch.setattr(qwen35_verify_qmm, "_QL_PATCHED", False)
+            got = fl(x_ver)
+            mx.eval(got)
+            assert _same_bits(got, unarmed_ref)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert linear._VERIFY_ACTIVE == 0

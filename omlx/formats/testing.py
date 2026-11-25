@@ -1028,7 +1028,24 @@ def _wrappers(linear) -> list:
             _record(thread, [LayerCall(self)])
         return weights
 
+    class _FastMask:
+        """Hides native fast replay on recording threads so warm calls pass
+        through ``Proof.graphs`` and are recorded; non-recording threads keep
+        their native fast path untouched."""
+
+        def __get__(self, obj, owner=None):
+            if obj is None or _RECORDING.thread.blocks:
+                return None
+            return obj.__dict__.get(linear._FAST)
+
+        def __set__(self, obj, value):
+            obj.__dict__[linear._FAST] = value
+
+        def __delete__(self, obj):
+            obj.__dict__.pop(linear._FAST, None)
+
     return [
+        (linear.FormatLinear, "_fast", _FastMask()),
         (linear.FormatLinear, "__call__", linear_called),
         (linear.FormatSwitchLinear, "__call__", switch_called),
         (kernels.Proof, "graphs", property(replays, doc=graphs.__doc__)),

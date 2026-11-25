@@ -76,6 +76,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import threading
 from functools import cache, partial
 
@@ -98,6 +99,15 @@ class _RouteState(threading.local):
 _ROUTE_ARMED = _RouteState()
 _ROW_EXACT_LOCK = threading.Lock()
 _ROW_EXACT_ACTIVE = 0
+_VERIFY_ACTIVE = 0
+_LINEAR_MOD_NAME = f"{(__package__ or 'omlx').partition('.')[0]}.formats.linear"
+
+
+def _sync_linear_verify_active(count: int) -> None:
+    linear_mod = sys.modules.get(_LINEAR_MOD_NAME)
+    if linear_mod is not None:
+        linear_mod._VERIFY_ACTIVE = count
+
 
 _MSG_NSG = 8  # simdgroups per threadgroup for the msg (lm_head) kernel
 
@@ -127,15 +137,30 @@ def set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
     ``nn.QuantizedLinear`` call runs ``row_exact_qmv`` (one-row decode
     arithmetic per row) and the fast verify kernels below stay disarmed.
     """
-    global _ROW_EXACT_ACTIVE
+    global _ROW_EXACT_ACTIVE, _VERIFY_ACTIVE
+    verify = bool(flag) and not row_exact
     armed = bool(flag) and bool(row_exact)
+    prev_verify = _ROUTE_ARMED.value
     prev = _ROUTE_ARMED.row_exact
-    _ROUTE_ARMED.value = bool(flag) and not row_exact
+    # Increment process-wide counters before arming this thread so lock-free
+    # readers never miss an active thread; decrement only after clearing.
+    if (verify and not prev_verify) or (armed and not prev):
+        with _ROW_EXACT_LOCK:
+            if verify and not prev_verify:
+                _VERIFY_ACTIVE += 1
+                _sync_linear_verify_active(_VERIFY_ACTIVE)
+            if armed and not prev:
+                _ROW_EXACT_ACTIVE += 1
+    _ROUTE_ARMED.value = verify
     _ROUTE_ARMED.row_exact = armed
     _ROUTE_ARMED.layers = 0
-    if armed != prev:
+    if (not verify and prev_verify) or (not armed and prev):
         with _ROW_EXACT_LOCK:
-            _ROW_EXACT_ACTIVE += 1 if armed else -1
+            if not verify and prev_verify:
+                _VERIFY_ACTIVE -= 1
+                _sync_linear_verify_active(_VERIFY_ACTIVE)
+            if not armed and prev:
+                _ROW_EXACT_ACTIVE -= 1
     from omlx.custom_kernels.quant_matmul import fast as _native
 
     # Any armed verify (row-exact or batched) must bypass unarmed FormatLinearFast.
@@ -1825,7 +1850,7 @@ class _FormatVerifyPlan:
         self._local = threading.local()
 
     def is_armed(self) -> bool:
-        return _QL_PATCHED and _is_armed()
+        return _QL_PATCHED and _VERIFY_ACTIVE > 0 and _ROUTE_ARMED.value
 
     def _graphs(self) -> dict:
         graphs = getattr(self._local, "graphs", None)

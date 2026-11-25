@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from copy import copy
 from functools import cache
 from threading import Lock, local
@@ -627,6 +628,25 @@ def _switch_stand_in(plan: _Plan, metal):
 _WARM_DTYPES = (mx.bfloat16, mx.float16)
 _FAST_LOCK = Lock()
 _NO_EPILOGUE = object()
+# Mirrors qwen35_verify_qmm._VERIFY_ACTIVE (count of threads with non-row-exact
+# batched verify armed) so FormatLinear.__call__ skips verify.is_armed() in one
+# global check when no thread has verify armed (rule 28).
+_VERIFY_ACTIVE = 0
+_VERIFY_QMM_MOD_NAME = (
+    f"{(__package__ or 'omlx').partition('.')[0]}.patches.qwen35_verify_qmm"
+)
+
+
+def _init_verify_active() -> None:
+    global _VERIFY_ACTIVE
+    qvm = sys.modules.get(_VERIFY_QMM_MOD_NAME)
+    lock = getattr(qvm, "_ROW_EXACT_LOCK", None)
+    if lock is not None:
+        with lock:
+            _VERIFY_ACTIVE = getattr(qvm, "_VERIFY_ACTIVE", 0)
+
+
+_init_verify_active()
 
 
 def _infer_warm_dtypes(tensors, layout, dtypes) -> tuple[mx.Dtype, ...]:
@@ -1465,7 +1485,7 @@ def warm_model_dispatch(
                     mod._bind_one_row_mlx_fast(kept, sig1)
                 else:
                     _warm_linear_rows_graph(kept.plan, (1, 1, k), dtype, key=sig1)
-                    mod._bind_one_row_fast(kept, sig1)
+                    mod._bind_plan_fast(kept, sig1)
                 # 2. Multi-row decode (B, 1, K), armed verify (1, S, K) and
                 #    batched verify (B, S, K).
                 for b in batches:
@@ -1848,20 +1868,34 @@ class _Kept:
         "plan",
         "bias",
         "weight",
+        "weight_key",
         "routes",
         "wide",
         "dense",
         "dense_fast",
         "dense_fast_sigs",
+        "plan_fast",
+        "plan_fast_sigs",
+        "no_native",
         "sorted",
         "mlx_rows",
         "verify",
     )
 
-    def __init__(self, plan, bias, weight, mlx_rows=frozenset(), verify=None):
+    def __init__(
+        self,
+        plan,
+        bias,
+        weight,
+        mlx_rows=frozenset(),
+        verify=None,
+        *,
+        weight_key: str = "weight",
+    ):
         self.plan = plan
         self.bias = bias
         self.weight = weight
+        self.weight_key = weight_key
         self.mlx_rows = mlx_rows
         self.verify = verify
         self.routes = {}
@@ -1869,6 +1903,9 @@ class _Kept:
         self.dense = _UNBUILT
         self.dense_fast = None
         self.dense_fast_sigs = None
+        self.plan_fast = None
+        self.plan_fast_sigs = None
+        self.no_native = False
         self.sorted = _UNBUILT
 
 
@@ -2194,10 +2231,11 @@ class _FormatLayer(nn.Module):
             from ..patches import qwen35_verify_qmm
 
             verify = qwen35_verify_qmm.bind_format_verify(self, bias)
+        weight_key = packed_name(self)
         kept = self.__dict__[_KEPT] = _Kept(
             plan,
             bias,
-            self[packed_name(self)],
+            self[weight_key],
             (
                 _decode_mlx_rows(
                     _metal_architecture(), self.output_dims, self.input_dims
@@ -2206,6 +2244,7 @@ class _FormatLayer(nn.Module):
                 else frozenset()
             ),
             verify=verify,
+            weight_key=weight_key,
         )
         return kept
 
@@ -2466,50 +2505,65 @@ class FormatLinear(_FormatLayer):
         if graph is None:
             return
         # Each plan binds its own operands and live proof. A layer can switch
-        # between a prefill's wide graph and dense graph.
-        # Dense prefill keeps its own slot so declining an ordinary route never
-        # allocates kept.routes.
+        # between a prefill's wide graph, dense graph, and small-row plan graph.
+        # Dense prefill and plan keep their own slots so declining an ordinary
+        # route never allocates kept.routes.
         is_dense = tile is kept.dense
+        is_plan = tile is kept.plan
         with _FAST_LOCK:
-            fast = (
-                kept.dense_fast if is_dense else kept.routes.get(("native", id(tile)))
-            )
+            if len(tile.operands) >= 16:
+                kept.no_native = True
+                return
+            if is_dense:
+                fast = kept.dense_fast
+            elif is_plan:
+                fast = kept.plan_fast
+            else:
+                fast = kept.routes.get(("native", id(tile)))
             if fast is None:
                 try:
                     from ..custom_kernels.quant_matmul import fast as native
                 except ImportError:
                     _log_native_fallback()
+                    kept.no_native = True
                     return
 
                 if not native.has_symbol("FormatLinearFast"):
                     _log_native_fallback()
+                    kept.no_native = True
                     return
                 fast = native.format_linear_fast(
                     kept.weight,
                     kept.bias,
                     tile.operands,
                     proof_state,
-                    packed_name(self),
+                    kept.weight_key,
                 )
                 if fast is None:
                     _log_native_fallback()
+                    kept.no_native = True
                     return
                 if is_dense:
                     kept.dense_fast = fast
+                elif is_plan:
+                    kept.plan_fast = fast
                 else:
                     kept.routes[("native", id(tile))] = fast
             fast.__self__.register(signature)
-            if len(tile.operands) < 16:
-                if is_dense:
-                    sigs = kept.dense_fast_sigs
-                    if sigs is None:
-                        sigs = kept.dense_fast_sigs = set()
-                else:
-                    sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
-                if signature not in sigs:
-                    if len(sigs) == 64:
-                        sigs.clear()
-                    sigs.add(signature)
+            if is_dense:
+                sigs = kept.dense_fast_sigs
+                if sigs is None:
+                    sigs = kept.dense_fast_sigs = set()
+            elif is_plan:
+                sigs = kept.plan_fast_sigs
+                if sigs is None:
+                    sigs = kept.plan_fast_sigs = set()
+            else:
+                sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
+            if signature not in sigs:
+                if len(sigs) == 64:
+                    sigs.clear()
+                sigs.add(signature)
             self.__dict__[_FAST] = fast
 
     def _ensure_dense(self, kept: _Kept) -> tile_dense.DensePlan | None:
@@ -2539,40 +2593,48 @@ class FormatLinear(_FormatLayer):
         )
         self._register_fast(kept, dense, sig, proof_state=dense.binding.state)
 
-    def _bind_one_row_fast(self, kept: _Kept, sig: tuple) -> None:
+    def _bind_plan_fast(self, kept: _Kept, sig: tuple) -> None:
         plan = kept.plan
         if plan is None or plan.proof.failed:
             return
-        graph = plan.proof.graphs.get(sig)
+        graph = plan.proof._kept.graphs.get(sig)
         if graph is None:
             return
-        # Share kept.dense_fast only when kept.dense is already built (by
-        # prepare_layer_plans or an earlier prefill) so one-row-only layers do
-        # not allocate a tile_dense Proof; otherwise bind plan's own native fast.
-        dense = kept.dense
-        if (
-            dense is not _UNBUILT
-            and dense is not None
-            and not dense.proof.failed
-            and len(dense.operands) == len(plan.operands)
-            and all(a is b for a, b in zip(dense.operands, plan.operands))
-        ):
+        shape = sig[0]
+        # Share kept.dense_fast for (1, 1, K) when kept.dense is already built
+        # (by prepare_layer_plans or an earlier prefill) so decode1 and prefill
+        # share one native dispatcher without allocating a tile_dense Proof on
+        # small-row-only layers. Multi-row plan graphs stay on kept.plan_fast so
+        # tile_dense.project never shares bindings with rows > 1 Dot graphs.
+        if len(shape) == 3 and shape[0] == 1 and shape[1] == 1:
+            dense = kept.dense
             if (
-                kept.dense_fast is not None
-                and kept.dense_fast_sigs is not None
-                and sig in kept.dense_fast_sigs
-                and dense.binding.kept is not None
-                and sig in dense.binding.kept.graphs
+                dense is not _UNBUILT
+                and dense is not None
+                and not dense.proof.failed
+                and len(dense.operands) == len(plan.operands)
+                and all(a is b for a, b in zip(dense.operands, plan.operands))
             ):
-                self.__dict__[_FAST] = kept.dense_fast
-                return
-            if plan.proof.attach(dense.binding):
-                tile_dense._keep_local(dense, sig, graph)
-                self._register_fast(kept, dense, sig, proof_state=dense.binding.state)
-                return
-        plan_fast = kept.routes.get(("native", id(plan)))
-        if plan_fast is not None and sig in kept.routes.get(
-            ("native_sigs", id(plan)), ()
+                if (
+                    kept.dense_fast is not None
+                    and kept.dense_fast_sigs is not None
+                    and sig in kept.dense_fast_sigs
+                    and dense.binding.kept is not None
+                    and sig in dense.binding.kept.graphs
+                ):
+                    self.__dict__[_FAST] = kept.dense_fast
+                    return
+                if plan.proof.attach(dense.binding):
+                    tile_dense._keep_local(dense, sig, graph)
+                    self._register_fast(
+                        kept, dense, sig, proof_state=dense.binding.state
+                    )
+                    return
+        plan_fast = kept.plan_fast
+        if (
+            plan_fast is not None
+            and kept.plan_fast_sigs is not None
+            and sig in kept.plan_fast_sigs
         ):
             self.__dict__[_FAST] = plan_fast
         else:
@@ -2616,14 +2678,16 @@ class FormatLinear(_FormatLayer):
                 return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
-        verify = kept.verify
-        verify_armed = verify is not None and verify.is_armed()
-        if verify_armed:
-            y = verify(x)
-            if y is not None:
-                return y
+        verify_armed = False
+        if _VERIFY_ACTIVE:
+            verify = kept.verify
+            if verify is not None and verify.is_armed():
+                verify_armed = True
+                y = verify(x)
+                if y is not None:
+                    return y
         plan, bias = kept.plan, kept.bias
         row_exact = self._qwen_row_exact
         if row_exact is not None and plan is not None:
@@ -2636,7 +2700,12 @@ class FormatLinear(_FormatLayer):
                 ):
                     # DATA (C7 receipts): this bucket is MLX's own qmv's.
                     y = self._stock_matmul(x)
-                    if not verify_armed and shape[0] == 1 and shape[1] == 1:
+                    if (
+                        not verify_armed
+                        and not kept.no_native
+                        and shape[0] == 1
+                        and shape[1] == 1
+                    ):
                         self._bind_one_row_mlx_fast(kept, (shape, dtype))
                     return y if bias is None else y + bias
                 if kept.wide is not _UNBUILT and x.size > plan.k:
@@ -2669,21 +2738,11 @@ class FormatLinear(_FormatLayer):
         else:
             armed = row_exact is not None and row_exact()
         # A decode step is this, its kept graph's replay and the bias.
-        is_one_row = (
-            plan is not None
-            and len(shape) == 3
-            and shape[0] == 1
-            and shape[1] == 1
-            and shape[2] == plan.k
-            and not armed
-            and not verify_armed
-            and not (row_exact is not None and 1 in kept.mlx_rows)
-        )
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
             y = graph(x, *plan.operands)
-            if is_one_row:
-                self._bind_one_row_fast(kept, (shape, dtype))
+            if not armed and not verify_armed and not kept.no_native:
+                self._bind_plan_fast(kept, (shape, dtype))
         else:
             k = self.input_dims
             if not shape or shape[-1] != k:
@@ -2692,8 +2751,13 @@ class FormatLinear(_FormatLayer):
             rows = x.size // k if k else 0
             if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
-                if y is not None and is_one_row:
-                    self._bind_one_row_fast(kept, (shape, dtype))
+                if (
+                    y is not None
+                    and not armed
+                    and not verify_armed
+                    and not kept.no_native
+                ):
+                    self._bind_plan_fast(kept, (shape, dtype))
             # No row materializes a matrix, stock or plugin.
             if y is None and rows == 0:
                 y = mx.zeros((*shape[:-1], self.output_dims), dtype=dtype)
@@ -2926,7 +2990,7 @@ class FormatSwitchLinear(_FormatLayer):
         from ..patches import m5_gather_qmm_nax as nax
 
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
         plan = kept.plan
         if plan is None or kept.bias is not None:
@@ -2976,7 +3040,7 @@ class FormatSwitchLinear(_FormatLayer):
         shape, dtype = x.shape, x.dtype
         signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
         plan, bias = kept.plan, kept.bias
         y = None
