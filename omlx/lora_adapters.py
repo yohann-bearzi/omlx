@@ -483,6 +483,9 @@ def apply_adapter(model: nn.Module, path: str | Path) -> int:
         layer.update_modules(tree_unflatten([(name, wrapped)]))
     # oQh fused MLPs call matmul_rotated on their projections, which a wrapper lacks.
     oqh_runtime.release_wrapped(model)
+    from .formats import transforms
+
+    transforms.release_producers(model, wrapped_only=True)
     # A wrapped HC projection no longer matches the plan built at load.
     hc_fused = sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused")
     if hc_fused is not None:

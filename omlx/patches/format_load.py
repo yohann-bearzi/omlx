@@ -392,7 +392,11 @@ class _Checkpoint:
         supplied.refuse_unverified()
         supplied_mode = supplied._marked_mode()
         if recorded is None and supplied_mode is None:
-            if not ported_family(effective) or oqh_format.is_oqh_config(effective):
+            oqh_changed = not _same_json(
+                disk.get(oqh_format.CONFIG_KEY, _ABSENT),
+                effective.get(oqh_format.CONFIG_KEY, _ABSENT),
+            )
+            if not ported_family(effective) or oqh_changed:
                 self._allow_stock_switch = False
                 self.verified = False
                 self.verified_modes = frozenset()
@@ -1071,8 +1075,7 @@ def _ported(checkpoint: _Checkpoint) -> bool:
         return False
     if not isinstance(config, dict):
         return False
-    if oqh_format.is_oqh_config(config):
-        # The oQh loader swaps its own modules over MLX's quantized layers.
+    if oqh_format.is_oqh_config(config) and checkpoint._marked_mode() is not None:
         return False
     return ported_family(config)
 
@@ -1120,8 +1123,8 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
     stock_allowed = (
         checkpoint._allow_stock_switch
         and sharded is None
-        and not is_oqh
         and ported_family(config)
+        and (not is_oqh or declared is None)
     )
     if mode is None and declared is None:
         # Stock checkpoint (no format record and no non-MLX mode): never
@@ -1187,7 +1190,7 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
                 )
             if written is not _ABSENT:
                 checkpoint._record(wanted)
-            if is_oqh:
+            if is_oqh and (written is not _ABSENT or declared is not None):
                 raise _refused(
                     "oQh checkpoints cannot declare built-in quant format records",
                     wanted,
@@ -1937,8 +1940,18 @@ def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> Non
             loaded = own(*args, **kwargs)
         if checkpoint is not outer:
             # A load joined to an outer one of the checkpoint is checked by
-            # that one, when it returns.
+            # that one, when it returns. Capture built before check() clears it.
+            built = tuple(checkpoint.built)
             checkpoint.check(loaded)
+            if built and any(
+                formats.input_transform(layer, refuse=False) is not None
+                for layer in built
+            ):
+                from ..formats import transforms
+
+                for item in (loaded if isinstance(loaded, tuple) else (loaded,)):
+                    if isinstance(item, nn.Module):
+                        transforms.install_producers(item)
             # mlx_vlm/mlx_lm call model.eval() after load_weights; load_weights
             # builds no HC plans, so build them once here, after the loader's
             # post-load steps.

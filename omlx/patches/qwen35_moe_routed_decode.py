@@ -3483,6 +3483,9 @@ def warm_moe_model(
             hc_futures = hc_fused.warm_model(model)
             if hc_futures:
                 futures.extend(hc_futures)
+        tx_futures = transforms.warm_model(model)
+        if tx_futures:
+            futures.extend(tx_futures)
     except BaseException:
         exc_in_body = True
         raise

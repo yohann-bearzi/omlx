@@ -559,6 +559,17 @@ def test_oqh_key_does_not_bypass_quant_format_family_gate(tmp_path):
     )
     format_load.check_engine_loader(pure_oqh, "vlm")
     with format_load.loading(pure_oqh) as checkpoint:
+        assert checkpoint.verified
+        assert checkpoint.verified_modes == frozenset({"affine"})
+        assert format_load._ported(checkpoint)
+
+    non_ported_oqh = tmp_path / "glm5_pure_oqh"
+    non_ported_oqh.mkdir()
+    (non_ported_oqh / "config.json").write_text(
+        json.dumps({"model_type": "glm5_next", "omlx_oqh": {"version": 1}})
+    )
+    format_load.check_engine_loader(non_ported_oqh, "vlm")
+    with format_load.loading(non_ported_oqh) as checkpoint:
         assert not checkpoint.verified
         assert checkpoint.verified_modes == frozenset()
         assert not format_load._ported(checkpoint)

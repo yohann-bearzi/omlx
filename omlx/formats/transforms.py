@@ -23,13 +23,16 @@ fails closed.
 
 from __future__ import annotations
 
+import math
 import threading
 import weakref
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from functools import cache
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 
 # The revision of the transform record, apart from the format contract: a
 # format's own transform may change without invalidating every kernel hash.
@@ -191,6 +194,81 @@ def _inverse_mlx(w_rot: mx.array, signs: mx.array, block: int) -> mx.array:
     return y * signs.reshape(-1).astype(mx.float32)
 
 
+@dataclass(frozen=True)
+class ProducerSpec:
+    """Fused producer kernels that write a format's rotated basis directly.
+
+    Every callable is optional (None declines that producer fusion).
+    - ``rmsnorm(x, weight, *tensors, eps=...) -> (rot, plain)``: fuses RMSNorm
+      with the rotation and stores ``rot`` in the thread-local memo keyed by
+      ``plain``; requires ``rmsnorm_block`` (0 disables).
+    - ``gated_norm(x, gate, weight, *tensors, eps=...) -> (rot, plain)``: fuses
+      GDN gated RMSNorm with the rotation and hands ``rot`` off through the
+      thread-local handoff; requires ``gated_norm_head_dim`` (0 disables).
+    - ``act_pair(gate_out, up_out, *tensors, limit=None) -> rot``: fuses
+      ``silu(gate_out) * up_out`` with the down projection's rotation for a
+      dense MLP.
+    """
+
+    rmsnorm: Callable[..., tuple[mx.array, mx.array]] | None = None
+    rmsnorm_block: int = 0
+    rmsnorm_max_width: int = 8192
+    gated_norm: Callable[..., tuple[mx.array, mx.array]] | None = None
+    gated_norm_head_dim: int = 128
+    act_pair: Callable[..., mx.array] | None = None
+
+
+@cache
+def _signed_wht_fns(block: int):
+    from ..custom_kernels.oqh import fast
+
+    def apply(x, signs, *rest):
+        if x.dtype == mx.float32:
+            return _rotate_mlx(x, signs, block)
+        return fast.rotate(x, signs, block)
+
+    def apply_split_swiglu(gate_up_out, signs, *rest, limit=None):
+        if gate_up_out.dtype == mx.float32:
+            gate, up = mx.split(gate_up_out, 2, axis=-1)
+            gate = (
+                gate if limit is None else mx.minimum(gate, mx.array(limit, gate.dtype))
+            )
+            up = (
+                up
+                if limit is None
+                else mx.clip(up, -mx.array(limit, up.dtype), mx.array(limit, up.dtype))
+            )
+            activated = mx.sigmoid(gate) * gate * up
+            return _rotate_mlx(activated, signs, block)
+        return fast.act_split_had(gate_up_out, signs, block, limit)
+
+    def inverse_weight(w_rot, signs, *rest):
+        return _inverse_mlx(w_rot, signs, block)
+
+    def _rmsnorm(x, weight, signs, *rest, eps):
+        return fast.rmsnorm_had(x, weight, signs, eps)
+
+    def _gated_norm(x, gate, weight, signs, *rest, eps):
+        return fast.gnorm_had(x, gate, weight, signs, eps, block)
+
+    def _act_pair(a, b, signs, *rest, limit=None):
+        return fast.act_pair_had(a, b, signs, block, limit)
+
+    spec = ProducerSpec(
+        rmsnorm=_rmsnorm if block == 256 else None,
+        rmsnorm_block=256 if block == 256 else 0,
+        rmsnorm_max_width=8192,
+        gated_norm=_gated_norm,
+        gated_norm_head_dim=128,
+        act_pair=_act_pair,
+    )
+
+    def producer_spec(layer=None) -> ProducerSpec:
+        return spec
+
+    return apply, apply_split_swiglu, inverse_weight, producer_spec
+
+
 class SignedWhtTransform(InputTransform):
     """A signed block Walsh-Hadamard rotation: ``x`` times the block Hadamard
     of the equality's signs, as ``omlx.custom_kernels.oqh.fast`` writes it.
@@ -200,35 +278,10 @@ class SignedWhtTransform(InputTransform):
     """
 
     def __new__(cls, block: int, tensors=(), **kwargs):
-        from ..custom_kernels.oqh import fast
-
-        def apply(x, signs, *rest):
-            if x.dtype == mx.float32:
-                return _rotate_mlx(x, signs, block)
-            return fast.rotate(x, signs, block)
-
-        def apply_split_swiglu(gate_up_out, signs, *rest, limit=None):
-            if gate_up_out.dtype == mx.float32:
-                gate, up = mx.split(gate_up_out, 2, axis=-1)
-                gate = (
-                    gate
-                    if limit is None
-                    else mx.minimum(gate, mx.array(limit, gate.dtype))
-                )
-                up = (
-                    up
-                    if limit is None
-                    else mx.clip(
-                        up, -mx.array(limit, up.dtype), mx.array(limit, up.dtype)
-                    )
-                )
-                activated = mx.sigmoid(gate) * gate * up
-                return _rotate_mlx(activated, signs, block)
-            return fast.act_split_had(gate_up_out, signs, block, limit)
-
-        def inverse_weight(w_rot, signs, *rest):
-            return _inverse_mlx(w_rot, signs, block)
-
+        apply, apply_split_swiglu, inverse_weight, producer_spec = _signed_wht_fns(
+            block
+        )
+        kwargs.setdefault("producer_spec", producer_spec)
         # A factory: the descriptor is an InputTransform, not a subclass with
         # fields of its own (returning one skips this class's __init__).
         return InputTransform(
@@ -252,7 +305,7 @@ class _Memo(threading.local):
 
 
 _MEMO = _Memo()
-_MEMO_SIZE = 8
+_MEMO_SIZE = 16
 
 
 def key(tx: InputTransform, tensors: tuple) -> tuple:
@@ -409,3 +462,626 @@ def check_transform_applied(layer, x: mx.array, *, atol=1e-2) -> None:
             f"{layer!r}: its call is {error:.3%} from the plain-basis reference "
             f"(atol {atol}): the input transform was not applied"
         )
+
+
+_SUBCLASSES_LOCK = threading.Lock()
+_SUBCLASSES: dict[tuple[type, type], type] = {}
+_MIXER_INPUTS = (
+    "in_proj_qkv",
+    "in_proj_z",
+    "in_proj_a",
+    "in_proj_b",
+    "q_proj",
+    "k_proj",
+    "v_proj",
+)
+
+
+def _set(obj, name: str, value) -> None:
+    object.__setattr__(obj, name, value)
+
+
+def _rebase(module: nn.Module, mixin: type) -> None:
+    """Give one instance ``mixin``'s forward without altering its class."""
+    base = type(module)
+    if issubclass(base, mixin):
+        return
+    pair = (base, mixin)
+    with _SUBCLASSES_LOCK:
+        cls = _SUBCLASSES.get(pair)
+        if cls is None:
+            cls = type(f"Tx{base.__name__}", (mixin, base), {})
+            _SUBCLASSES[pair] = cls
+    module.__class__ = cls
+
+
+def _producer_spec(tx: InputTransform, layer) -> ProducerSpec | None:
+    if tx.producer_spec is None:
+        return None
+    spec = tx.producer_spec(layer)
+    return spec if isinstance(spec, ProducerSpec) else None
+
+
+def _cast_tensors(tensors: tuple, dtype: mx.Dtype) -> tuple:
+    return tuple(
+        (
+            t.astype(dtype)
+            if isinstance(t, mx.array) and mx.issubdtype(t.dtype, mx.floating)
+            else t
+        )
+        for t in tensors
+    )
+
+
+class _DualNorm:
+    """RMSNorm that also writes the rotated input of its format-layer readers."""
+
+    def __call__(self, x):
+        weight = self["weight"]
+        if x.dtype not in (mx.bfloat16, mx.float16) or x.dtype != weight.dtype:
+            return super().__call__(x)
+        tensors = self._omlx_tx_cast_tensors
+        if self._omlx_tx_weight_dtype != weight.dtype:
+            tensors = _cast_tensors(self._omlx_tx_raw_tensors, weight.dtype)
+            _set(self, "_omlx_tx_cast_tensors", tensors)
+            _set(self, "_omlx_tx_weight_dtype", weight.dtype)
+        rot, plain = self._omlx_tx_rmsnorm(x, weight, *tensors, eps=self.eps)
+        for k, orig in self._omlx_tx_entries:
+            remember(plain, rot, k, orig)
+        return plain
+
+
+class _DualGatedNorm:
+    """GDN gated RMSNorm that hands the rotated input to its format out_proj."""
+
+    def __call__(self, x, gate=None):
+        out_proj = self._omlx_tx_reader
+        if (
+            gate is None
+            or x.ndim < 2
+            or x.shape != gate.shape
+            or x.shape[-1] != self._omlx_tx_head_dim
+            or x.shape[-1] * x.shape[-2] != out_proj.input_dims
+            or gate.dtype not in (mx.bfloat16, mx.float16)
+            or x.dtype not in (gate.dtype, mx.float32)
+        ):
+            return super().__call__(x, gate)
+        rot, plain = self._omlx_tx_gated_norm(
+            x, gate, self["weight"], *self._omlx_tx_tensors, eps=self.eps
+        )
+        hand_off(self._omlx_tx_handoff_key, rot, self._omlx_tx_tensors)
+        return plain
+
+
+class _FusedMLP:
+    """Dense MLP whose SwiGLU fuses into down_proj's InputTransform."""
+
+    def __call__(self, x):
+        gate, up, down = self.gate_proj, self.up_proj, self.down_proj
+        if self._omlx_tx_gu is not None and x.size:
+            rx = prepare_bound(self._omlx_tx_gu, x)
+            g_out = gate._call_prepared(rx)
+            u_out = up._call_prepared(rx)
+        else:
+            g_out = gate(x)
+            u_out = up(x)
+        if (
+            g_out.size
+            and g_out.dtype in (mx.bfloat16, mx.float16)
+            and u_out.dtype == g_out.dtype
+        ):
+            act = self._omlx_tx_act_pair(
+                g_out, u_out, *self._omlx_tx_down_tensors, limit=self._omlx_tx_limit
+            )
+            return down._call_prepared(act)
+        limit = self._omlx_tx_limit
+        if limit is not None:
+            g_out = mx.minimum(g_out, mx.array(limit, g_out.dtype))
+            u_out = mx.clip(
+                u_out,
+                -mx.array(limit, u_out.dtype),
+                mx.array(limit, u_out.dtype),
+            )
+        return down(nn.silu(g_out) * u_out)
+
+
+def _transformed_layers(module, names) -> list:
+    out = []
+    for name in names:
+        child = getattr(module, name, None)
+        if child is not None and bind(child) is not None:
+            out.append(child)
+    return out
+
+
+def _bind_dual_norm(norm, readers: list) -> bool:
+    if not readers or type(norm) is not nn.RMSNorm:
+        return False
+    first = readers[0]
+    first_bound = bind(first)
+    if first_bound is None:
+        return False
+    if not all(same_transform(first, other) for other in readers[1:]):
+        return False
+    tx, tensors = first_bound
+    spec = _producer_spec(tx, first)
+    if spec is None or spec.rmsnorm is None or spec.rmsnorm_block <= 0:
+        return False
+    width = getattr(first, "input_dims", None)
+    if (
+        type(width) is not int
+        or width <= 0
+        or width % spec.rmsnorm_block
+        or width > spec.rmsnorm_max_width
+        or tx.block != spec.rmsnorm_block
+    ):
+        return False
+    weight = norm.get("weight")
+    if not isinstance(weight, mx.array):
+        return False
+    entries: list[tuple[tuple, tuple]] = []
+    seen: set[tuple] = set()
+    for reader in readers:
+        bound = bind(reader)
+        if bound is None:
+            continue
+        k = key(bound[0], bound[1])
+        if k not in seen:
+            seen.add(k)
+            entries.append((k, bound[1]))
+    _set(self := norm, "_omlx_tx_rmsnorm", spec.rmsnorm)
+    _set(self, "_omlx_tx_raw_tensors", tensors)
+    _set(self, "_omlx_tx_cast_tensors", _cast_tensors(tensors, weight.dtype))
+    _set(self, "_omlx_tx_weight_dtype", weight.dtype)
+    _set(self, "_omlx_tx_entries", tuple(entries))
+    _rebase(norm, _DualNorm)
+    return True
+
+
+def _bind_gated_norm(norm, out_proj) -> bool:
+    from .linear import FormatLinear
+
+    if not isinstance(out_proj, FormatLinear) or not isinstance(norm, nn.Module):
+        return False
+    if (
+        getattr(norm, "activation", "silu") != "silu"
+        or type(norm).__name__ == "Glm5NextRMSNormGated"
+    ):
+        return False
+    bound = bind(out_proj)
+    if bound is None:
+        return False
+    tx, tensors = bound
+    spec = _producer_spec(tx, out_proj)
+    if spec is None or spec.gated_norm is None or spec.gated_norm_head_dim <= 0:
+        return False
+    weight = norm.get("weight")
+    if (
+        not isinstance(weight, mx.array)
+        or weight.size != spec.gated_norm_head_dim
+        or out_proj.input_dims % spec.gated_norm_head_dim
+    ):
+        return False
+    _set(norm, "_omlx_tx_gated_norm", spec.gated_norm)
+    _set(norm, "_omlx_tx_head_dim", spec.gated_norm_head_dim)
+    _set(norm, "_omlx_tx_reader", out_proj)
+    _set(norm, "_omlx_tx_handoff_key", key(tx, tensors))
+    _set(norm, "_omlx_tx_tensors", tensors)
+    _rebase(norm, _DualGatedNorm)
+    return True
+
+
+def _install_dense_mlp(mlp) -> tuple[bool, list]:
+    """Fuse a dense FormatLinear MLP's SwiGLU into down_proj's InputTransform;
+    returns ``(installed, gate_up_readers)``. Leaves SwitchGLU untouched."""
+    from .linear import FormatLinear
+
+    gate = getattr(mlp, "gate_proj", None)
+    up = getattr(mlp, "up_proj", None)
+    down = getattr(mlp, "down_proj", None)
+    readers = [m for m in (gate, up) if m is not None and bind(m) is not None]
+    if not (
+        type(gate) is FormatLinear
+        and type(up) is FormatLinear
+        and type(down) is FormatLinear
+    ):
+        return False, readers
+    act = getattr(mlp, "activation", None)
+    if act is not None and act is not nn.silu and type(act).__name__ != "SwiGLU":
+        return False, readers
+    down_bound = bind(down)
+    if down_bound is None:
+        return False, readers
+    d_tx, d_tensors = down_bound
+    spec = _producer_spec(d_tx, down)
+    if spec is None or spec.act_pair is None:
+        return False, readers
+    gu_bound = bind(gate)
+    if gu_bound is not None:
+        if not same_transform(gate, up):
+            return False, readers
+        gu_key = key(gu_bound[0], gu_bound[1])
+        gu_entry = (gu_bound[0], gu_bound[1], gu_key)
+    else:
+        if bind(up) is not None:
+            return False, readers
+        gu_entry = None
+    _set(mlp, "_omlx_tx_gu", gu_entry)
+    _set(mlp, "_omlx_tx_act_pair", spec.act_pair)
+    _set(mlp, "_omlx_tx_down_tensors", d_tensors)
+    _set(mlp, "_omlx_tx_limit", getattr(act, "limit", None))
+    _rebase(mlp, _FusedMLP)
+    return True, readers
+
+
+def install_producers(model: nn.Module) -> int:
+    """Install generalized producer fusion (RMSNorm, GDN gated norm, dense MLP)
+    on ``model`` for every format layer whose ``InputTransform.producer_spec``
+    provides a fused producer kernel. Leaves SwitchGLU to the MoE patches."""
+    from .linear import FormatLinear, FormatSwitchLinear
+
+    count = 0
+    for _, module in model.named_modules():
+        if getattr(module, "_omlx_tx_producers_installed", False):
+            continue
+        installed_here = 0
+        mixer = getattr(module, "linear_attn", None) or getattr(
+            module, "self_attn", None
+        )
+        if mixer is not None:
+            in_norm = getattr(module, "input_layernorm", None)
+            if in_norm is not None:
+                readers = _transformed_layers(mixer, _MIXER_INPUTS)
+                if _bind_dual_norm(in_norm, readers):
+                    installed_here += 1
+            if _bind_gated_norm(
+                getattr(mixer, "norm", None), getattr(mixer, "out_proj", None)
+            ):
+                installed_here += 1
+        mlp = getattr(module, "mlp", None)
+        if mlp is not None:
+            switch = getattr(mlp, "switch_mlp", None)
+            if switch is not None:
+                readers = _transformed_layers(
+                    switch, ("gate_up_proj", "gate_proj", "up_proj")
+                )
+                shared = getattr(mlp, "shared_expert", None)
+                if shared is not None:
+                    ok, shared_readers = _install_dense_mlp(shared)
+                    installed_here += int(ok)
+                    readers += shared_readers
+            else:
+                ok, readers = _install_dense_mlp(mlp)
+                installed_here += int(ok)
+            post_norm = getattr(module, "post_attention_layernorm", None)
+            if post_norm is not None and _bind_dual_norm(post_norm, readers):
+                installed_here += 1
+        elif (
+            not isinstance(module, (FormatLinear, FormatSwitchLinear))
+            and hasattr(module, "gate_proj")
+            and hasattr(module, "up_proj")
+            and hasattr(module, "down_proj")
+            and not isinstance(module, _FusedMLP)
+        ):
+            ok, _ = _install_dense_mlp(module)
+            installed_here += int(ok)
+        if installed_here:
+            _set(module, "_omlx_tx_producers_installed", True)
+            count += installed_here
+    return count
+
+
+def release_producers(model: nn.Module, *, wrapped_only: bool = False) -> int:
+    """Restore producer-fused modules to their original classes.
+
+    With ``wrapped_only=True`` (used when a LoRA adapter wraps a projection),
+    only fused MLPs or gated norms whose projections are no longer bare
+    ``FormatLinear`` instances are restored; ``_DualNorm`` stays installed so
+    wrapped layers keep hitting the rotation memo.
+    """
+    from .linear import FormatLinear
+
+    count = 0
+    for _, module in model.named_modules():
+        cls = type(module)
+        if wrapped_only:
+            if issubclass(cls, _FusedMLP) and not all(
+                type(getattr(module, n, None)) is FormatLinear
+                for n in ("gate_proj", "up_proj", "down_proj")
+            ):
+                module.__class__ = cls.__bases__[1]
+                count += 1
+            norm = getattr(module, "norm", None)
+            if isinstance(norm, _DualGatedNorm):
+                out_proj = getattr(module, "out_proj", None)
+                if type(out_proj) is not FormatLinear or out_proj is not getattr(
+                    norm, "_omlx_tx_reader", None
+                ):
+                    norm.__class__ = type(norm).__bases__[1]
+                    count += 1
+            continue
+        if issubclass(cls, (_DualNorm, _DualGatedNorm, _FusedMLP)):
+            module.__class__ = cls.__bases__[1]
+            count += 1
+        if getattr(module, "_omlx_tx_producers_installed", False):
+            _set(module, "_omlx_tx_producers_installed", False)
+    return count
+
+
+def _tensor_specs(tensors: tuple) -> tuple[tuple[tuple[int, ...], mx.Dtype], ...]:
+    return tuple((tuple(a.shape), a.dtype) for a in tensors)
+
+
+def _submit_warm(
+    futures: list,
+    seen: set,
+    dedup_key: tuple,
+    specs: tuple[tuple[tuple[int, ...], mx.Dtype], ...],
+    invoke: Callable,
+    what: str,
+    *,
+    allow_none: bool = False,
+) -> None:
+    if dedup_key in seen:
+        return
+    seen.add(dedup_key)
+    from . import kernels
+
+    def _run() -> None:
+        stream = kernels._warm_stream()
+        with mx.stream(stream):
+            arrays = kernels.zeros(*specs, stream=stream)
+            mx.eval(*arrays)
+            out = invoke(*arrays)
+            if out is None and allow_none:
+                return
+            outputs = list(out) if isinstance(out, (list, tuple)) else [out]
+            if not outputs or not all(isinstance(a, mx.array) for a in outputs):
+                raise RuntimeError(f"transform warm for {what!r} returned no arrays")
+            mx.eval(*outputs)
+
+    futures.append(kernels._WARM_POOL.submit(_run))
+
+
+def warm_model(model, *, dtypes=None) -> tuple:
+    """Warm served InputTransform and fused producer kernels on ``_WARM_POOL``.
+
+    Submits deduplicated tasks on ``kernels._warm_stream()`` capturing only
+    shape/dtype tuples (never live ``mx.array`` weights) for:
+    - ``tx.apply`` on each distinct transformed format layer;
+    - ``dn_tx.apply_split_swiglu`` (with finite ``_swiglu_limit``) on each
+      transformed ``switch_mlp``;
+    - ``_omlx_tx_rmsnorm``, ``_omlx_tx_gated_norm`` (both activation-dtype and
+      float32 inputs) and ``_omlx_tx_act_pair`` on installed producer mixins.
+
+    Returns submitted futures; callers must await them and fail closed.
+    """
+    if model is None or not mx.metal.is_available():
+        return ()
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return ()
+
+    from ..patches import m5_gather_qmm
+    from . import linear
+
+    explicit = (
+        tuple(dict.fromkeys(dt for dt in dtypes if dt in linear._WARM_DTYPES))
+        if dtypes is not None
+        else None
+    )
+    if explicit is not None and not explicit:
+        return ()
+    fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
+    model_dtype = (
+        None
+        if explicit is not None or fp16_recast
+        else linear._infer_model_dtype(model)
+    )
+    default_dtypes = (
+        explicit
+        if explicit is not None
+        else (
+            (mx.float16,)
+            if fp16_recast
+            else (model_dtype,) if model_dtype is not None else linear._WARM_DTYPES
+        )
+    )
+
+    futures: list = []
+    seen: set = set()
+
+    for _, mod in named_modules():
+        bound = bind(mod)
+        if bound is not None:
+            tx, tensors = bound
+            k = getattr(mod, "input_dims", None)
+            if (
+                type(k) is int
+                and k > 0
+                and all(isinstance(a, mx.array) for a in tensors)
+            ):
+                t_specs = _tensor_specs(tensors)
+                layer_dtypes = (
+                    linear._layer_warm_dtypes(
+                        mod, model_dtype, explicit, fp16_recast=fp16_recast
+                    )
+                    if isinstance(mod, linear._FormatLayer)
+                    else default_dtypes
+                )
+                apply_fn = tx.apply
+                for dt in layer_dtypes:
+                    _submit_warm(
+                        futures,
+                        seen,
+                        ("apply", apply_fn, tx.kind, tx.block, k, dt, t_specs),
+                        (((1, k), dt), *t_specs),
+                        apply_fn,
+                        f"{tx.kind}.apply",
+                    )
+
+        down = getattr(mod, "down_proj", None)
+        if isinstance(down, linear.FormatSwitchLinear):
+            dn_bound = bind(down)
+            if dn_bound is not None and dn_bound[0].apply_split_swiglu is not None:
+                dn_tx, dn_tensors = dn_bound
+                lim = m5_gather_qmm._swiglu_limit(getattr(mod, "activation", None))
+                inter = down.input_dims
+                if (
+                    inter > 0
+                    and lim is not m5_gather_qmm._UNSUPPORTED
+                    and (
+                        lim is None
+                        or (
+                            isinstance(lim, (int, float))
+                            and not isinstance(lim, bool)
+                            and math.isfinite(lim)
+                        )
+                    )
+                    and all(isinstance(a, mx.array) for a in dn_tensors)
+                ):
+                    t_specs = _tensor_specs(dn_tensors)
+                    dn_dtypes = linear._layer_warm_dtypes(
+                        down, model_dtype, explicit, fp16_recast=fp16_recast
+                    )
+                    split_fn = dn_tx.apply_split_swiglu
+                    for dt in dn_dtypes:
+                        _submit_warm(
+                            futures,
+                            seen,
+                            (
+                                "split_swiglu",
+                                split_fn,
+                                dn_tx.kind,
+                                dn_tx.block,
+                                inter,
+                                dt,
+                                t_specs,
+                                lim,
+                            ),
+                            (((1, 2 * inter), dt), *t_specs),
+                            lambda y, *ts, fn=split_fn, limit=lim: fn(
+                                y, *ts, limit=limit
+                            ),
+                            f"{dn_tx.kind}.apply_split_swiglu",
+                            allow_none=True,
+                        )
+
+        if isinstance(mod, _DualNorm):
+            weight = mod.get("weight")
+            raw_tensors = getattr(mod, "_omlx_tx_raw_tensors", ())
+            if (
+                isinstance(weight, mx.array)
+                and weight.ndim >= 1
+                and weight.shape[-1] > 0
+                and weight.dtype in linear._WARM_DTYPES
+                and (explicit is None or weight.dtype in explicit)
+                and all(isinstance(a, mx.array) for a in raw_tensors)
+            ):
+                dt = weight.dtype
+                width = int(weight.shape[-1])
+                w_spec = (tuple(weight.shape), dt)
+                t_specs = tuple(
+                    (
+                        tuple(a.shape),
+                        dt if mx.issubdtype(a.dtype, mx.floating) else a.dtype,
+                    )
+                    for a in raw_tensors
+                )
+                eps = float(mod.eps)
+                norm_fn = mod._omlx_tx_rmsnorm
+                _submit_warm(
+                    futures,
+                    seen,
+                    ("rmsnorm", norm_fn, width, dt, w_spec, t_specs),
+                    (((1, width), dt), w_spec, *t_specs),
+                    lambda x, w, *ts, fn=norm_fn, eps=eps: fn(x, w, *ts, eps=eps),
+                    "producer.rmsnorm",
+                )
+
+        if isinstance(mod, _DualGatedNorm):
+            weight = mod.get("weight")
+            reader = getattr(mod, "_omlx_tx_reader", None)
+            head_dim = getattr(mod, "_omlx_tx_head_dim", 0)
+            g_tensors = getattr(mod, "_omlx_tx_tensors", ())
+            in_dims = getattr(reader, "input_dims", 0)
+            if (
+                isinstance(weight, mx.array)
+                and type(head_dim) is int
+                and head_dim > 0
+                and type(in_dims) is int
+                and in_dims > 0
+                and in_dims % head_dim == 0
+                and all(isinstance(a, mx.array) for a in g_tensors)
+            ):
+                heads = in_dims // head_dim
+                w_spec = (tuple(weight.shape), weight.dtype)
+                t_specs = _tensor_specs(g_tensors)
+                eps = float(mod.eps)
+                gnorm_fn = mod._omlx_tx_gated_norm
+                gate_dtypes = (
+                    linear._layer_warm_dtypes(
+                        reader, model_dtype, explicit, fp16_recast=fp16_recast
+                    )
+                    if isinstance(reader, linear._FormatLayer)
+                    else default_dtypes
+                )
+                for dt in gate_dtypes:
+                    for x_dt in (dt, mx.float32):
+                        _submit_warm(
+                            futures,
+                            seen,
+                            (
+                                "gated_norm",
+                                gnorm_fn,
+                                heads,
+                                head_dim,
+                                x_dt,
+                                dt,
+                                w_spec,
+                                t_specs,
+                            ),
+                            (
+                                ((1, 1, heads, head_dim), x_dt),
+                                ((1, 1, heads, head_dim), dt),
+                                w_spec,
+                                *t_specs,
+                            ),
+                            lambda x, g, w, *ts, fn=gnorm_fn, eps=eps: fn(
+                                x, g, w, *ts, eps=eps
+                            ),
+                            "producer.gated_norm",
+                        )
+
+        if isinstance(mod, _FusedMLP):
+            down_mlp = getattr(mod, "down_proj", None)
+            d_tensors = getattr(mod, "_omlx_tx_down_tensors", ())
+            inter = getattr(down_mlp, "input_dims", 0)
+            if (
+                type(inter) is int
+                and inter > 0
+                and all(isinstance(a, mx.array) for a in d_tensors)
+            ):
+                t_specs = _tensor_specs(d_tensors)
+                lim = getattr(mod, "_omlx_tx_limit", None)
+                act_fn = mod._omlx_tx_act_pair
+                mlp_dtypes = (
+                    linear._layer_warm_dtypes(
+                        down_mlp, model_dtype, explicit, fp16_recast=fp16_recast
+                    )
+                    if isinstance(down_mlp, linear._FormatLayer)
+                    else default_dtypes
+                )
+                for dt in mlp_dtypes:
+                    _submit_warm(
+                        futures,
+                        seen,
+                        ("act_pair", act_fn, inter, dt, t_specs, lim),
+                        (((1, inter), dt), ((1, inter), dt), *t_specs),
+                        lambda a, b, *ts, fn=act_fn, limit=lim: fn(
+                            a, b, *ts, limit=limit
+                        ),
+                        "producer.act_pair",
+                    )
+
+    return tuple(futures)
