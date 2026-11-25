@@ -75,9 +75,7 @@ def no_family_verified(verified):
         patch.setattr(
             format_testing,
             "_VERIFIED_EXTRA",
-            contextvars.ContextVar(
-                "omlx_verified_extra", default=frozenset()
-            ),
+            contextvars.ContextVar("omlx_verified_extra", default=frozenset()),
         )
         yield
 
@@ -116,8 +114,8 @@ class _Codec(_ToyFormat):
             return None
         return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 
-    def encode(self, w, importance, bits, group_size):
-        self.encoded.append((w, importance, bits, group_size))
+    def encode_layer(self, w, importance, context):
+        self.encoded.append((w, importance, context.bits, context.group_size))
         rows = w.astype(mx.float32)
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0
         codes = mx.round(rows / mx.expand_dims(scales, -1)) + 128.0
@@ -179,7 +177,11 @@ class _RefiningCodec(_Codec):
                     cur[r, j] = code
                     decoded[r, j] += delta
                     grad[r, :] += delta * gram[j, :]
-        refined = out.reshape(codes.shape).astype(np.uint8) if lead else out[0].astype(np.uint8)
+        refined = (
+            out.reshape(codes.shape).astype(np.uint8)
+            if lead
+            else out[0].astype(np.uint8)
+        )
         return {**tensors, "codes": mx.array(refined)}
 
 
@@ -210,6 +212,12 @@ def _matrix_bytes(n, k, dtype=mx.float32):
     return n * k * dtype.size + n * k + n * 4
 
 
+def _ctx(w, bits, group_size):
+    return formats.EncodeContext(
+        path="", is_switch=w.ndim == 3, bits=bits, group_size=group_size, config={}
+    )
+
+
 def _same(a, b):
     return a.keys() == b.keys() and all(
         (a[name].shape, a[name].dtype) == (b[name].shape, b[name].dtype)
@@ -226,14 +234,14 @@ def test_a_matrix_is_offered_whole(toy):
     assert given.shape == (8, 64) and mx.array_equal(given, w)
     assert weighed.shape == (64,) and mx.array_equal(weighed, importance)
     assert (bits, group_size) == (4, 32)
-    assert _same(kept, _Codec().encode(w, importance, 4, 32))
+    assert _same(kept, _Codec().encode_layer(w, importance, _ctx(w, 4, 32)))
     # So is a stack that fits a launch, with the importance of each matrix.
     w, importance = _weights(3, 8, 64), mx.arange(3 * 64).reshape(3, 64) + 1.0
     kept = oq._encode_in_format(toy, "experts.weight", w, importance, 4, 32)
     assert toy.offered[1:] == [(64, 8, 4, 32)] and len(toy.encoded) == 2
     given, weighed = toy.encoded[1][:2]
     assert given.shape == (3, 8, 64) and weighed.shape == (3, 64)
-    assert _same(kept, _Codec().encode(w, importance, 4, 32))
+    assert _same(kept, _Codec().encode_layer(w, importance, _ctx(w, 4, 32)))
 
 
 @pytest.mark.parametrize("own", [True, False], ids=["one each", "one for all"])
@@ -256,7 +264,7 @@ def test_a_stack_is_offered_in_runs_of_its_matrices(toy, monkeypatch, own):
         assert (bits, group_size) == (3, 64)
     # The layer keeps the runs' tensors, joined along the stack.
     assert kept["codes"].shape == (e, n, k) and kept["group_scales"].shape == (e, n)
-    assert _same(kept, _Codec().encode(w, importance, 3, 64))
+    assert _same(kept, _Codec().encode_layer(w, importance, _ctx(w, 3, 64)))
 
 
 def test_what_is_no_matrix_or_fits_no_launch_is_not_offered(toy, monkeypatch):
@@ -294,7 +302,7 @@ def test_a_run_counts_its_input_in_its_own_dtype(toy, monkeypatch, dtype, runs):
     w = _weights(10, 8, 64).astype(dtype)
     kept = oq._encode_in_format(toy, "experts.weight", w, mx.ones((64,)), 4, 64)
     assert [given.shape[0] for given, *_ in toy.encoded] == runs
-    assert _same(kept, _Codec().encode(w, mx.ones((64,)), 4, 64))
+    assert _same(kept, _Codec().encode_layer(w, mx.ones((64,)), _ctx(w, 4, 64)))
 
 
 def test_a_stack_whose_tensor_would_not_fit_a_metal_buffer_is_not_offered(
@@ -364,7 +372,7 @@ def test_a_run_holds_at_most_a_launch_s_weights(toy, monkeypatch):
     w = _weights(5, 8, 64)
     kept = oq._encode_in_format(toy, "experts.weight", w, importance, 4, 64)
     assert [given.shape[0] for given, *_ in toy.encoded] == [2, 2, 1]
-    assert _same(kept, _Codec().encode(w, importance, 4, 64))
+    assert _same(kept, _Codec().encode_layer(w, importance, _ctx(w, 4, 64)))
     toy.encoded.clear()
 
     def offer(*shape):
@@ -854,10 +862,10 @@ def test_a_stack_s_join_is_evaluated_once_the_writer_lets_its_source_go(
         events.append("clear cache")
         return clear_cache()
 
-    def encoding(fmt, tensor_name, w, *args):
+    def encoding(fmt, tensor_name, w, *args, **kwargs):
         window.append([])
         runs = len(toy.encoded)
-        tensors = encode(fmt, tensor_name, w, *args)
+        tensors = encode(fmt, tensor_name, w, *args, **kwargs)
         during = window.pop()
         if tensors is not None and len(toy.encoded) - runs > 1:
             released = weakref.ref(w, lambda _: events.append("source released"))
@@ -924,7 +932,7 @@ def test_an_answer_that_is_no_dict_of_arrays_is_refused(toy, answer):
     toy.answer = lambda tensors, w: answer(tensors)
     with pytest.raises(
         TypeError,
-        match="quant format 'toy': encode gives the tensors of a.weight as a dict "
+        match="quant format 'toy': encode_layer gives the tensors of a.weight as a dict "
         "of arrays by name, or None",
     ):
         oq._encode_in_format(toy, "a.weight", _weights(8, 64), mx.ones((64,)), 4, 64)
@@ -1046,14 +1054,14 @@ def test_the_contract_page_s_codec_is_the_toy_s():
     (text,) = (
         text
         for language, text in _BLOCKS
-        if language == "python" and "def encode" in text and "rows" in text
+        if language == "python" and "def encode_layer" in text and "rows" in text
     )
     scope = {"mx": mx}
     exec(textwrap.dedent(text), scope)
     w, importance = _weights(8, 64), mx.ones((64,))
-    kept = scope["encode"](None, w, importance, 8, 1)
-    assert _same(kept, _Codec().encode(w, importance, 8, 1))
-    assert scope["encode"](None, w, importance, 4, 1) is None
+    kept = scope["encode_layer"](None, w, importance, _ctx(w, 8, 1))
+    assert _same(kept, _Codec().encode_layer(w, importance, _ctx(w, 8, 1)))
+    assert scope["encode_layer"](None, w, importance, _ctx(w, 4, 1)) is None
 
 
 def test_a_run_s_tensors_have_the_stack_s_axis(toy):
@@ -1780,10 +1788,14 @@ def test_a_test_takes_families_as_verified_for_its_block_or_itself(tmp_path):
     assert written() is None and asyncio.run(written_async()) is None
     assert before == testing.verified_extra()
     with pytest.raises(RuntimeError), testing.verified("qwen4_exp", "d1"):
-        assert before | {
-            ("qwen4_exp", None),
-            ("d1", None),
-        } == testing.verified_extra()
+        assert (
+            before
+            | {
+                ("qwen4_exp", None),
+                ("d1", None),
+            }
+            == testing.verified_extra()
+        )
         raise RuntimeError
     assert before == testing.verified_extra()
     assert oq._unverified_family(config)[0] == "qwen4_exp"
@@ -2100,17 +2112,17 @@ def test_a_format_object_of_another_class_is_refused(source, toy, tmp_path):
     [
         (
             {"tensors": ("group_scales", "extra")},
-            "quant format 'toy' is configured with tensors ('group_scales', 'extra') "
-            "and codes 'codes' at contract 1, registered with ('group_scales',) and "
-            "codes 'codes' at 1: the checkpoint would not load; report it to the "
-            "plugin",
+            "quant format 'toy' is configured with tensors ('group_scales', 'extra'), "
+            "shared () and codes 'codes' at contract 1, registered with "
+            "('group_scales',), shared () and codes 'codes' at 1: the checkpoint "
+            "would not load; report it to the plugin",
         ),
         (
             {"contract": 2},
-            "quant format 'toy' is configured with tensors ('group_scales',) and "
-            "codes 'codes' at contract 2, registered with ('group_scales',) and "
-            "codes 'codes' at 1: the checkpoint would not load; report it to the "
-            "plugin",
+            "quant format 'toy' is configured with tensors ('group_scales',), "
+            "shared () and codes 'codes' at contract 2, registered with "
+            "('group_scales',), shared () and codes 'codes' at 1: the checkpoint "
+            "would not load; report it to the plugin",
         ),
     ],
 )
@@ -3774,7 +3786,10 @@ def test_refining_format_lowers_hessian_error_and_reloads(
     changed = 0
     for name, entry in entries.items():
         w = weights[f"{name.removeprefix('language_model.')}.weight"]
-        initial = _Codec().encode(w, None, entry["bits"], entry["group_size"])
+        ctx = formats.EncodeContext(
+            name, w.ndim == 3, entry["bits"], entry["group_size"], {}
+        )
+        initial = _Codec().encode_layer(w, None, ctx)
         ours = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
         if not _same(ours, initial):
             changed += 1
@@ -3816,9 +3831,7 @@ def test_refine_fail_closed_on_bad_return_and_keeps_regression(
     set_refine(lambda self, w, t, h, b, g: {"codes": t["codes"]})
     with pytest.raises(ValueError):
         run("bad-keys")
-    set_refine(
-        lambda self, w, t, h, b, g: {**t, "codes": t["codes"][:, :-1]}
-    )
+    set_refine(lambda self, w, t, h, b, g: {**t, "codes": t["codes"][:, :-1]})
     with pytest.raises(ValueError):
         run("bad-shape")
     set_refine(lambda self, w, t, h, b, g: None)
@@ -3830,7 +3843,10 @@ def test_refine_fail_closed_on_bad_return_and_keeps_regression(
     weights = mx.load(str(source / "model.safetensors"))
     for name, entry in _in_format(config).items():
         w = weights[f"{name.removeprefix('language_model.')}.weight"]
-        initial = _Codec().encode(w, None, entry["bits"], entry["group_size"])
+        ctx = formats.EncodeContext(
+            name, w.ndim == 3, entry["bits"], entry["group_size"], {}
+        )
+        initial = _Codec().encode_layer(w, None, ctx)
         ours = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
         assert _same(ours, initial)
     set_refine(lambda self, w, t, h, b, g: {**t, "codes": t["codes"] + 1})
@@ -3843,7 +3859,9 @@ def test_refine_fail_closed_on_bad_return_and_keeps_regression(
     for pair in ((float("inf"), 0.0), (1.0, float("-inf"))):
         state = {"i": 0}
 
-        def nonfinite(reader, w, tensors, hessian, bits, group_size, _pair=pair, _state=state):
+        def nonfinite(
+            reader, w, tensors, hessian, bits, group_size, _pair=pair, _state=state
+        ):
             value = _pair[_state["i"] % 2]
             _state["i"] += 1
             return value
@@ -3891,12 +3909,8 @@ def test_refine_writer_flushes_format_only_shard_after_last_layer(tmp_path, toy)
     writer = oq._OQRefineWriter(output, weight_map, quantization, quant_fmt=toy)
     assert writer.is_format("layers.0.mlp.b")
     assert writer.spec("layers.0.mlp.b") == (8, 1)
-    writer.write(
-        "layers.0.mlp.b", {"codes": codes + 1, "group_scales": scales}
-    )
-    writer.write(
-        "layers.1.mlp.b", {"codes": codes + 2, "group_scales": scales}
-    )
+    writer.write("layers.0.mlp.b", {"codes": codes + 1, "group_scales": scales})
+    writer.write("layers.1.mlp.b", {"codes": codes + 2, "group_scales": scales})
     writer.layer_done(0)
     # Both layers own this shard: nothing is flushed until the last one.
     before = mx.load(str(output / shard))
@@ -3922,9 +3936,10 @@ def test_refining_format_streamed_matches_resident(source, tmp_path, monkeypatch
     entries = _in_format(config)
     for name in entries:
         for part in ("codes", "group_scales"):
-            assert mx.array_equal(
-                tensors[f"{name}.{part}"], other[f"{name}.{part}"]
-            ), (name, part)
+            assert mx.array_equal(tensors[f"{name}.{part}"], other[f"{name}.{part}"]), (
+                name,
+                part,
+            )
 
 
 def test_refine_accepts_none_dtype_side_tensor(source, tmp_path, monkeypatch):
@@ -3952,9 +3967,7 @@ def test_refine_accepts_none_dtype_side_tensor(source, tmp_path, monkeypatch):
 
     class IntDtype(NoneDtype):
         def refine(self, w, tensors, hessian, bits, group_size):
-            return {**tensors, "group_scales": tensors["group_scales"].astype(
-                mx.int32
-            )}
+            return {**tensors, "group_scales": tensors["group_scales"].astype(mx.int32)}
 
     monkeypatch.setitem(formats._FORMATS, "toy", IntDtype())
     with pytest.raises(ValueError):
@@ -4019,7 +4032,9 @@ def test_refine_inplace_mutation_cannot_bypass_objective(source, tmp_path, monke
     assert refine["format_layers"]["kept"] > 0
 
 
-def test_can_refine_only_and_disabled_refine_keep_skip_note(source, tmp_path, monkeypatch):
+def test_can_refine_only_and_disabled_refine_keep_skip_note(
+    source, tmp_path, monkeypatch
+):
     class CanOnly(_Codec):
         def layout(self, k, n, bits, group_size):
             if n == 128:
@@ -4053,18 +4068,23 @@ def test_format_hessian_error_shared_2d_hessian(toy):
     gram = mx.array(np.diag(np.arange(1.0, 9.0)), dtype=mx.float32)
     shared = oq._format_hessian_error(toy, w, tensors, gram, 8, 1)
     loop = sum(
-        oq._format_hessian_error(toy, w[e : e + 1], {
-            "codes": codes[e : e + 1],
-            "group_scales": scales[e : e + 1],
-        }, gram, 8, 1)
+        oq._format_hessian_error(
+            toy,
+            w[e : e + 1],
+            {
+                "codes": codes[e : e + 1],
+                "group_scales": scales[e : e + 1],
+            },
+            gram,
+            8,
+            1,
+        )
         for e in range(3)
     )
     assert abs(shared - loop) < 1e-5
 
 
-def test_refine_switch_rejects_none_dtype_chunk_mismatch(
-    source, tmp_path, monkeypatch
-):
+def test_refine_switch_rejects_none_dtype_chunk_mismatch(source, tmp_path, monkeypatch):
     """A None-dtype side tensor keeps the encoded dtype across expert chunks;
     a refined chunk that changes it raises instead of upcasting the stack."""
 
@@ -4081,8 +4101,8 @@ def test_refine_switch_rejects_none_dtype_chunk_mismatch(
                 "group_scales": ((n,), None),
             }
 
-        def encode(self, w, importance, bits, group_size):
-            out = super().encode(w, importance, bits, group_size)
+        def encode_layer(self, w, importance, context):
+            out = super().encode_layer(w, importance, context)
             return {
                 **out,
                 "group_scales": out["group_scales"].astype(mx.float16),
@@ -4139,6 +4159,7 @@ def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
     the log and the report say how many it skipped (refining format layers is
     release-3)."""
     caplog.set_level(logging.INFO, logger="omlx.oq")
+
     # Layers 128 wide stay affine: the build then holds both a format's layers
     # and affine ones, so the refinement has work only on the affine side.
     class NoWide(_Codec):
@@ -4171,7 +4192,10 @@ def test_a_format_build_refines_its_affine_layers_alone_and_says_so(
     for name, entry in entries.items():
         w = weights[f"{name.removeprefix('language_model.')}.weight"]
         kept = {part: tensors[f"{name}.{part}"] for part in ("codes", "group_scales")}
-        assert _same(kept, _Codec().encode(w, None, entry["bits"], entry["group_size"]))
+        assert _same(
+            kept,
+            _Codec().encode_layer(w, None, _ctx(w, entry["bits"], entry["group_size"])),
+        )
     # Its affine layers are the stock build's, refined alike.
     _assert_same_output(_beside(tensors, config, entries), _beside(*plain[:2], entries))
 
@@ -4282,6 +4306,7 @@ def test_the_refinement_writer_leaves_the_layers_it_is_told_to_skip(tmp_path):
         "model.layers.0.a"
     ) == (4, 64)
 
+
 def test_the_writer_rebases_and_skips_optiq_sidecar(source, tmp_path):
     import shutil
 
@@ -4361,7 +4386,9 @@ def test_the_glm53_fused_in_proj_declines_a_format_layer(toy):
     def format_proj(out_dims, in_dims, seed):
         mx.random.seed(seed)
         weight = mx.random.normal((out_dims, in_dims)).astype(mx.bfloat16)
-        tensors = toy.encode(weight, mx.ones((in_dims,), mx.float32), 4, 32)
+        tensors = toy.encode_layer(
+            weight, mx.ones((in_dims,), mx.float32), _ctx(weight, 4, 32)
+        )
         return FormatLinear("toy", 4, 32, in_dims, tensors)
 
     layer.q_proj = format_proj(qkv, hidden, 1)
@@ -4386,9 +4413,7 @@ def test_the_glm53_fused_in_proj_declines_a_format_layer(toy):
         assert mx.array_equal(part, expected)
 
 
-def test_a_glm53_pair_write_verifies_after_reload(
-    toy, tmp_path, monkeypatch, caplog
-):
+def test_a_glm53_pair_write_verifies_after_reload(toy, tmp_path, monkeypatch, caplog):
     """A tiny GLM-5.3 pair, marked verified for the test, written through the
     level's budget plan: its routed experts stay affine (no format layer is
     built for their SwitchLinear), and the writer verifies after reload."""
@@ -4436,9 +4461,9 @@ def test_a_glm53_pair_write_verifies_after_reload(
         prefix = f"language_model.model.layers.{i}.self_attn."
         wk = weights.pop(prefix + "embed_q.weight").swapaxes(-1, -2)
         wv = weights.pop(prefix + "unembed_out.weight")
-        weights[prefix + "kv_b_proj.weight"] = mx.concatenate(
-            [wk, wv], axis=1
-        ).reshape(-1, text["kv_lora_rank"])
+        weights[prefix + "kv_b_proj.weight"] = mx.concatenate([wk, wv], axis=1).reshape(
+            -1, text["kv_lora_rank"]
+        )
     raw = {}
     for key, value in weights.items():
         key = key.replace("language_model.model.", "model.language_model.")
@@ -4452,9 +4477,7 @@ def test_a_glm53_pair_write_verifies_after_reload(
     payload.update(text_config=text, eos_token_id=[2])
     (source / "config.json").write_text(json.dumps(payload))
     mx.save_safetensors(str(source / "model.safetensors"), raw)
-    monkeypatch.setattr(
-        "mlx_lm.tokenizer_utils.load", lambda *a, **kw: object()
-    )
+    monkeypatch.setattr("mlx_lm.tokenizer_utils.load", lambda *a, **kw: object())
     output = tmp_path / "glm53-oq4e"
     with testing.verified("glm5_next", "glm5_next_text"):
         with caplog.at_level(logging.WARNING, logger="omlx.oq"):
@@ -4495,17 +4518,15 @@ def test_encode_in_format_accepts_stored_float_layout():
                 "scales": ((n, 1), None),
             }
 
-        def encode(self, w, importance, bits, group_size):
+        def encode_layer(self, w, importance, context):
             n, k = w.shape[0], w.shape[1]
             return {
-                "weight": mx.zeros((n, k * bits // 32), mx.uint32),
+                "weight": mx.zeros((n, k * context.bits // 32), mx.uint32),
                 "scales": mx.ones((n, 1), mx.bfloat16),
             }
 
     w = mx.zeros((4, 128), mx.bfloat16)
-    out = oq._encode_in_format(
-        StoredFloat(), "weight", w, mx.zeros((4,)), 4, 64
-    )
+    out = oq._encode_in_format(StoredFloat(), "weight", w, mx.zeros((4,)), 4, 64)
     assert out is not None and out["scales"].dtype == mx.bfloat16
 
 
@@ -4523,10 +4544,10 @@ def test_encode_in_format_rejects_non_float_or_mismatched_stored_float_chunks(
                 "scales": ((n, 1), None),
             }
 
-        def encode(self, w, importance, bits, group_size):
+        def encode_layer(self, w, importance, context):
             n, k = w.shape[-2], w.shape[-1]
             return {
-                "weight": mx.zeros((n, k * bits // 32), mx.uint32),
+                "weight": mx.zeros((n, k * context.bits // 32), mx.uint32),
                 "scales": mx.ones((n, 1), mx.int32),
             }
 
@@ -4546,12 +4567,12 @@ def test_encode_in_format_rejects_non_float_or_mismatched_stored_float_chunks(
                 "scales": ((n, 1), None),
             }
 
-        def encode(self, w, importance, bits, group_size):
+        def encode_layer(self, w, importance, context):
             lead, n, k = w.shape
             dtype = mx.bfloat16 if self.calls == 0 else mx.float16
             self.calls += 1
             return {
-                "weight": mx.zeros((lead, n, k * bits // 32), mx.uint32),
+                "weight": mx.zeros((lead, n, k * context.bits // 32), mx.uint32),
                 "scales": mx.ones((lead, n, 1), dtype),
             }
 
@@ -4565,8 +4586,6 @@ def test_encode_in_format_rejects_non_float_or_mismatched_stored_float_chunks(
     # not 2: weight 1024 + packed 256 + scales 16 = 1296 > 1290 > 1288.
     monkeypatch.setattr(oq, "_QUANTIZE_CHUNK_BYTES", 1290)
     assert (
-        oq._encode_in_format(
-            MixedChunkFloat(), "weight", w, mx.zeros((4,)), 4, 64
-        )
+        oq._encode_in_format(MixedChunkFloat(), "weight", w, mx.zeros((4,)), 4, 64)
         is None
     )

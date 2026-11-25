@@ -42,8 +42,8 @@ class MyFormat(QuantFormat):
     def layout(self, k, n, bits, group_size):
         ...                # what a checkpoint keeps of one matrix
 
-    def encode(self, w, importance, bits, group_size):
-        ...                # the tensors oQ writes of one matrix
+    def encode_layer(self, w, importance, context):
+        ...                # the tensors oQ writes of one matrix (EncodeContext)
 
     def dot(self, layer, k, n) -> Dot | None:
         ...                # the face that oMLX's kernels run them through
@@ -79,8 +79,8 @@ Installing the package is enough. oMLX reads the `omlx.quant_formats` entry poin
 - `can_refine` and `refine` are the contract's refinement methods: a format that
   overrides `refine` (on the class or as a bound attribute of the instance)
   refines its codes, and one that keeps the default leaves exactly the encoding
-  `encode` gave it. oQ calls `refine` with the
-  source's floats `w`, the tensors `encode` returned, the shrunk Gram `H = G + 3
+  `encode_layer` gave it. oQ calls `refine` with the
+  source's floats `w`, the tensors `encode_layer` returned, the shrunk Gram `H = G + 3
   diag(G)` of the layer's inputs (`(k, k)`, or `(e, k, k)` for a stack), and
   the bits and group size; the returned tensors hold exactly `layout`'s names,
   shapes and dtypes. oQ keeps them only when their Hessian error
@@ -410,11 +410,11 @@ Every refusal of a format's checkpoint at load is one exception, `omlx.formats.F
 
 ## Quantize a checkpoint
 
-oQ writes a checkpoint's matrices in a format that encodes them:
+oQ writes a checkpoint's matrices in a format that encodes them with `encode_layer` (the only writer hook, receiving an `EncodeContext(path, is_switch, bits, group_size, config)`):
 
 ```python
-    def encode(self, w, importance, bits, group_size):
-        if bits != 8:
+    def encode_layer(self, w, importance, context):
+        if context.bits != 8:
             return None
         rows = w.astype(mx.float32)
         scales = mx.maximum(mx.abs(rows).max(axis=-1), 1e-6) / 127.0

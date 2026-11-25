@@ -60,8 +60,8 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
             layout["codes"] = ((n, k + 1), mx.uint8)
             return layout
 
-        def encode(self, w, importance, bits, group_size):
-            tensors = super().encode(w, importance, bits, group_size)
+        def encode_layer(self, w, importance, context):
+            tensors = super().encode_layer(w, importance, context)
             codes = tensors["codes"]
             tensors["codes"] = mx.concatenate((codes, codes[..., :1]), axis=-1)
             return tensors

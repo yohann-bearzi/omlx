@@ -124,11 +124,18 @@ def tensor_names(layer) -> tuple[str, ...]:
     indexing ``weight``: on a format layer of a plugin that name is not
     there (D11). A kernel built from a face takes ``tensor_names(layer)[0]``
     for the packed tensor and then the face's own ``tensors``, which may be a
-    subset of the format's or another order."""
+    subset of the format's or another order. A format's ``shared_tensors``
+    are not here: a face reads no tensor that a stack holds once."""
     names = getattr(layer, "_tensors", None)
     if names and isinstance(names, tuple):
         return names
     return ("weight",)
+
+
+def all_tensor_names(fmt: QuantFormat) -> tuple[str, ...]:
+    """Every tensor a layer of ``fmt`` holds: its codes, its tensors and the
+    ``shared_tensors`` one layer keeps once for its whole stack."""
+    return (fmt.codes_name, *fmt.tensors, *fmt.shared_tensors)
 
 
 def _check_tensors(owner: str, tensors) -> None:
@@ -475,21 +482,41 @@ class Codes(_Face):
     simdgroup-matrix operands. See docs/quant-formats.md."""
 
 
+@dataclass(frozen=True)
+class EncodeContext:
+    """The layer oQ asks a format to write: its checkpoint path, whether it
+    is a switch layer's stack, its bits and group size, and the source
+    checkpoint's config. A format that writes per layer differently (a
+    rotation whose signs depend on the producer, a writer that prices a
+    stack as one) overrides ``encode_layer``."""
+
+    path: str
+    is_switch: bool
+    bits: int
+    group_size: int | None
+    config: dict
+
+
 class QuantFormat:
     """One weight format. A subclass sets ``mode``, ``tensors`` and
     ``contract``, and overrides ``decode``, ``layout`` (what loads its
-    checkpoints), ``encode`` (what writes them) and the faces it has; a
+    checkpoints), ``encode_layer`` (what writes them) and the faces it has; a
     kernel whose face a format lacks keeps its composed path.
 
     The tensor that holds the packed codes is ``codes_name``: ``weight`` for
     the built-in affine format, and a name of the plugin's own for a plugin
     (D11: a format layer has no tensor called ``weight``, ``scales``,
     ``biases`` or ``bias``, so code that reads one by hand fails loudly on
-    every family)."""
+    every family).
+
+    ``shared_tensors`` names tensors a layer keeps once for its whole
+    stack (a sign vector, a rotation): ``layout`` includes them, unstacked,
+    and a switch layer's fusion shares them instead of concatenating them."""
 
     mode: str  # a linear's "mode" in the quantization config
     codes_name: str = "weight"  # its packed tensor's name: its codes
     tensors: tuple[str, ...]  # its side parameters beside "bias"
+    shared_tensors: tuple[str, ...] = ()  # its tensors a layer holds once
     contract: int  # the revision of the contract it is written for
     # A format whose faces depend on the layer's training state declares it;
     # the fused HC plan records the flag only for such faces, so a load's
@@ -528,17 +555,6 @@ class QuantFormat:
         whole layout when the format keeps no such matrix."""
         return None
 
-    def encode(
-        self, w: mx.array, importance: mx.array, bits: int, group_size: int
-    ) -> dict[str, mx.array] | None:
-        """The tensors that keep ``w``, by name and as ``layout`` gives them,
-        or None to leave it to oQ's affine. ``w`` is a matrix ``(n, k)``, or
-        ``(e, n, k)`` for some of a stack's, that oQ gives ``bits`` bits in
-        groups of ``group_size``. ``importance`` weighs the squared error of
-        each of the ``k`` inputs: ``(k,)``, or ``(e, k)`` when each of the
-        matrices has its own."""
-        return None
-
     def can_refine(self, k: int, n: int, bits: int, group_size: int) -> bool:
         """Whether this format refines an ``(n, k)`` matrix's codes at these
         bits and group size against the shrunk Gram of its layer's inputs.
@@ -566,7 +582,7 @@ class QuantFormat:
         ``hessian`` (``(k, k)``, or ``(e, k, k)`` for a stack of ``w``'s):
         the codes that minimise ``tr((W^- - W) H (W^- - W)^T)``, where ``H``
         is ``G + 3 diag(G)`` over the layer inputs' Gram ``G``. ``tensors``
-        are ``w``'s as :meth:`encode` returned them. The returned dict holds
+        are ``w``'s as :meth:`encode_layer` returned them. The returned dict holds
         exactly :meth:`layout`'s names, shapes and dtypes; None leaves the
         encoded tensors. oQ keeps the refined tensors only when their Hessian
         error does not exceed the encoded ones', and skips a matrix whose
@@ -574,6 +590,17 @@ class QuantFormat:
         ``refine`` and reports the result in ``refine.format_layers``; the
         default declines."""
         return None
+
+    def encode_layer(
+        self, w: mx.array, importance: mx.array, context: EncodeContext
+    ) -> dict[str, mx.array] | None:
+        """The tensors that keep one run of ``w``, with the layer oQ writes
+        in ``context``: the writer contract. A format that writes checkpoints
+        overrides it (bits and group size are ``context.bits`` and
+        ``context.group_size``); a format that never writes leaves it."""
+        raise NotImplementedError(
+            f"quant format {self.mode!r} does not encode its own layers"
+        )
 
     def record(self) -> dict:
         """What a checkpoint written in the format keeps of it beside its
@@ -636,13 +663,14 @@ class FormatRefusedError(ValueError):
 def check_layout(fmt: QuantFormat, n: int, k: int, layout: dict) -> None:
     """Refuse, in words, a ``layout`` that ``fmt`` gives for an ``(n, k)``
     matrix and that no layer holds: tensors of other names than the codes
-    (``fmt.codes_name``) and the format's ``tensors``, codes of other than
-    two axes, or codes whose first axis is not N (a layer's N is its codes'
-    first axis: a format packs along K, never along N). oQ checks a layout
-    before it encodes a matrix in it, and a layer the layout of the matrix it
-    holds."""
+    (``fmt.codes_name``), the format's ``tensors`` and its
+    ``shared_tensors``; codes of other than two axes, or codes whose first
+    axis is not N (a layer's N is its codes' first axis: a format packs along
+    K, never along N). A shared tensor's shape is the format's own: it is
+    the same for every N. oQ checks a layout before it encodes a matrix in
+    it, and a layer the layout of the matrix it holds."""
     codes = fmt.codes_name
-    names = (codes, *fmt.tensors)
+    names = all_tensor_names(fmt)
     if set(layout) != set(names):
         raise ValueError(
             f"quant format {fmt.mode!r} lays out a ({n}, {k}) matrix as "
@@ -883,6 +911,14 @@ def register(fmt: QuantFormat) -> None:
     if modes is not None:
         modes.add(mode)
     _check_tensors(f"quant format {mode!r}", tensors)
+    shared = getattr(fmt, "shared_tensors", ())
+    _check_tensors(f"quant format {mode!r} shared_tensors", shared)
+    overlap = set(shared) & {getattr(fmt, "codes_name", "weight"), *tensors}
+    if overlap:
+        raise ValueError(
+            f"quant format {mode!r}: {', '.join(sorted(overlap))} is named "
+            "both as a shared tensor and as one of its codes or tensors"
+        )
     builtin = getattr(_REGISTERING_BUILTINS, "registering", False)
     contract = getattr(fmt, "contract", None)
     if type(contract) is not int:
@@ -922,7 +958,7 @@ def register(fmt: QuantFormat) -> None:
     if not builtin:
         # D11: a plugin's format layer has no tensor named like MLX's, so
         # every by-hand reader of a layer fails loudly on every family.
-        reserved = [name for name in (codes, *tensors) if name in _MLX_TENSORS]
+        reserved = [name for name in (codes, *tensors, *shared) if name in _MLX_TENSORS]
         if reserved:
             raise ValueError(
                 f"quant format {mode!r}: {', '.join(sorted(set(reserved)))} is "
@@ -1067,21 +1103,30 @@ def stackable(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int) -> b
 
 
 def _stackable_layout(fmt: QuantFormat, k: int, n: int, bits: int, group_size: int):
-    """The declared N-row layout when two such matrices can stack along N."""
+    """The declared N-row layout when two such matrices can stack along N:
+    the codes and the format's tensors grow to 2N rows, and each shared
+    tensor stays the one a layer holds."""
     if n <= 0:
         return None
+    shared = set(fmt.shared_tensors)
     try:
         one = fmt.layout(k, n, bits, group_size)
-        if not isinstance(one, dict) or one.keys() != {fmt.codes_name, *fmt.tensors}:
+        if not isinstance(one, dict) or one.keys() != set(all_tensor_names(fmt)):
             return None
         two = fmt.layout(k, 2 * n, bits, group_size)
         if (
             isinstance(two, dict)
             and two.keys() == one.keys()
             and all(
-                len(shape) >= 1
-                and shape[0] == n
-                and tuple(two[name][0]) == (2 * n, *shape[1:])
+                (
+                    tuple(two[name][0]) == tuple(shape)
+                    if name in shared
+                    else (
+                        len(shape) >= 1
+                        and shape[0] == n
+                        and tuple(two[name][0]) == (2 * n, *shape[1:])
+                    )
+                )
                 and two[name][1] == dtype
                 for name, (shape, dtype) in one.items()
             )

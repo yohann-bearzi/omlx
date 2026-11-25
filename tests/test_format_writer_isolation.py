@@ -9,8 +9,8 @@ import mlx.core as mx
 import pytest
 
 from omlx import formats, oq
-from omlx.formats import testing as format_testing
 from omlx.formats import linear
+from omlx.formats import testing as format_testing
 from omlx.patches import format_load
 from tests.test_format_writer_permit_guards import _observe_write, _refused
 from tests.test_formats_oq import _Codec, _in_format, _quantize
@@ -60,9 +60,7 @@ def test_face_tensor_writes_preserve_dense_and_switch_checkpoint_bytes(
         "_VERIFIED_EXTRA",
         contextvars.ContextVar(
             "omlx_verified_extra",
-            default=frozenset(
-                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
-            ),
+            default=frozenset((("qwen3_5_moe_text", None), ("qwen3_5_moe", None))),
         ),
     )
     monkeypatch.setattr(
@@ -137,9 +135,7 @@ def test_probe_reads_joined_stack_after_the_writer_releases_its_source(
         "_VERIFIED_EXTRA",
         contextvars.ContextVar(
             "omlx_verified_extra",
-            default=frozenset(
-                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
-            ),
+            default=frozenset((("qwen3_5_moe_text", None), ("qwen3_5_moe", None))),
         ),
     )
     monkeypatch.setattr(
@@ -166,10 +162,10 @@ def test_probe_reads_joined_stack_after_the_writer_releases_its_source(
     monkeypatch.setitem(formats._FORMATS, writer.mode, Codec())
     encode = oq._encode_in_format
 
-    def observe(fmt, tensor_name, w, *args):
+    def observe(fmt, tensor_name, w, *args, **kwargs):
         nonlocal joined_source
         before = len(writer.encoded)
-        tensors = encode(fmt, tensor_name, w, *args)
+        tensors = encode(fmt, tensor_name, w, *args, **kwargs)
         joined = tensors is not None and len(writer.encoded) - before > 1
         joined_source = ref(w) if joined else None
         return tensors

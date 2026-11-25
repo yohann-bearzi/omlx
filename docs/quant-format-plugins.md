@@ -46,7 +46,7 @@ Routes built on faces ([Kernels built on faces](quant-formats.md#kernels-built-o
 | Sorted prefill of format switch layers, tensor-unit GPUs (M5, NAX), with fused SwiGLU | tile |
 | Sorted prefill of format switch layers, M3 (steel gather) | tile |
 
-oQ writes a format with `quantize_oq_streaming(..., enhanced=True, quant_format=...)`, given a mode or a configured format object. It offers the matrices oQe has importance for, held by `nn.Linear` or the mlx-lm/mlx-vlm `SwitchLinear`. Declined matrices stay oQ's affine. oQ checks each `encode` result against `layout` and asks for both faces of each encoded layer. It writes to `<output>.unverified`, loads the staged checkpoint, runs a forward, records `omlx_verification` and `omlx_quant_formats` (plugin, contract, record) in `config.json`, and renames the folder ([Quantize a checkpoint](quant-formats.md#quantize-a-checkpoint)).
+oQ writes a format with `quantize_oq_streaming(..., enhanced=True, quant_format=...)`, given a mode or a configured format object. It offers the matrices oQe has importance for, held by `nn.Linear` or the mlx-lm/mlx-vlm `SwitchLinear`. Declined matrices stay oQ's affine. oQ checks each `encode_layer` result against `layout` and asks for both faces of each encoded layer. It writes to `<output>.unverified`, loads the staged checkpoint, runs a forward, records `omlx_verification` and `omlx_quant_formats` (plugin, contract, record) in `config.json`, and renames the folder ([Quantize a checkpoint](quant-formats.md#quantize-a-checkpoint)).
 
 ## What oMLX guarantees, and what it refuses
 
@@ -87,7 +87,7 @@ class MyFormat(QuantFormat):
         return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
 
     def decode(self, tensors, bits, group_size): ...
-    def encode(self, w, importance, bits, group_size): ...
+    def encode_layer(self, w, importance, context): ...
 
     def dot(self, layer, k, n):
         if k % 8:  # K must be whole runs of the face's VPT (8)

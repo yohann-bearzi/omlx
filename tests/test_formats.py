@@ -1352,7 +1352,15 @@ def test_a_format_without_a_decode_says_so():
 def test_a_format_without_a_layout_or_a_codec_keeps_no_matrix():
     # No layer of a checkpoint is then its to build, and oQ writes none in it.
     assert _Bare().layout(64, 8, 4, 64) is None
-    assert _Bare().encode(mx.zeros((8, 64)), mx.ones((64,)), 4, 64) is None
+    # Rule 26: there is no encode fallback; a format that never writes says so.
+    with pytest.raises(NotImplementedError, match="does not encode"):
+        _Bare().encode_layer(
+            mx.zeros((8, 64)),
+            mx.ones((64,)),
+            formats.EncodeContext(
+                path="bare", is_switch=False, bits=4, group_size=64, config={}
+            ),
+        )
 
 
 class _Counting(_Tiled):

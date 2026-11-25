@@ -1912,9 +1912,11 @@ class _FormatLayer(nn.Module):
         super().__init__()
         mode = fmt.mode
         names = (fmt.codes_name, *fmt.tensors)
-        if set(tensors) != set(names):
+        shared = tuple(getattr(fmt, "shared_tensors", ()))
+        all_names = (*names, *shared)
+        if set(tensors) != set(all_names):
             raise ValueError(
-                f"quant format {mode!r} keeps a matrix as {', '.join(names)}, "
+                f"quant format {mode!r} keeps a matrix as {', '.join(all_names)}, "
                 f"not as {', '.join(sorted(tensors))}"
             )
         packed = tensors[fmt.codes_name]
@@ -1930,7 +1932,14 @@ class _FormatLayer(nn.Module):
             layout = fmt.layout(input_dims, n, bits, group_size)
         if layout is not None:
             formats.check_layout(fmt, n, input_dims, layout)
-        # What lets a stack's matrices be gathered, tensor by tensor.
+        elif shared:
+            raise ValueError(
+                f"{type(self).__name__}: quant format {mode!r} names the shared "
+                f"tensors {', '.join(shared)} and lays out no ({n}, "
+                f"{input_dims}) matrix to hold them"
+            )
+        # What lets a stack's matrices be gathered, tensor by tensor: the
+        # shared tensors are a layer's own, whatever its stack.
         stack = packed.shape[: self._STACK]
         ragged = [name for name in names if tensors[name].shape[: self._STACK] != stack]
         if ragged:
@@ -1954,9 +1963,10 @@ class _FormatLayer(nn.Module):
             _stored_floats=tuple(
                 name for name, (_, dtype) in (layout or {}).items() if dtype is None
             ),
-            _placeholders=dict.fromkeys(names if placeholders else ()),
+            _shared_tensors=shared,
+            _placeholders=dict.fromkeys(all_names if placeholders else ()),
         )
-        for name in names:
+        for name in all_names:
             self[name] = tensors[name]
         if bias is not None:
             self["bias"] = bias
@@ -1989,7 +1999,9 @@ class _FormatLayer(nn.Module):
         self.__dict__.pop(_FAST, None)
         self.__dict__.pop(_FAST2, None)
         held = self.get(key)
-        if held is not None and key in self._tensors:
+        if held is not None and (
+            key in self._tensors or key in self.__dict__.get("_shared_tensors", ())
+        ):
             if value is held:
                 return
             checkpoint = formats._LOADING.get()
@@ -2064,10 +2076,22 @@ class _FormatLayer(nn.Module):
         sources = (self, other, *others)
         for source in sources:
             source.refuse_placeholders()
+        shared = self.__dict__.get("_shared_tensors", ())
         tensors = {
             name: mx.concatenate([source[name] for source in sources], axis=self._STACK)
             for name in self._tensors
         }
+        for name in shared:
+            for source in sources[1:]:
+                if (
+                    self[name].dtype != source[name].dtype
+                    or not mx.array_equal(self[name], source[name]).item()
+                ):
+                    raise ValueError(
+                        f"{type(self).__name__}: the matrices' shared tensor "
+                        f"{name!r} differs: one layer holds one of it"
+                    )
+            tensors[name] = self[name]
         bias = (
             mx.concatenate([source["bias"] for source in sources], axis=-1)
             if "bias" in self
@@ -2188,9 +2212,13 @@ class _FormatLayer(nn.Module):
         ``indices`` of the stack."""
         self.refuse_placeholders()
         fmt = self.fmt
-        tensors = {name: self[name] for name in self._tensors}
-        if indices is not None:
-            tensors = {name: tensor[indices] for name, tensor in tensors.items()}
+        shared = self.__dict__.get("_shared_tensors", ())
+        tensors = {
+            name: (
+                self[name] if indices is None or name in shared else self[name][indices]
+            )
+            for name in self._tensors + tuple(shared)
+        }
         return fmt.decode(tensors, self.bits, self.group_size)
 
     def _extra_repr(self) -> str:
@@ -2223,7 +2251,10 @@ def keeps_dtype(module, key: str) -> bool:
     of the format's layout, which its face reads. The built-in affine's
     stored floats are the exception: the checkpoint fixes their dtype, and
     the face is exact for float16 activations once they are float16."""
-    if not isinstance(module, _FormatLayer) or key not in module._tensors:
+    if not isinstance(module, _FormatLayer):
+        return False
+    own = key in module._tensors or key in module.__dict__.get("_shared_tensors", ())
+    if not own:
         return False
     return not (module.mode in formats._BUILTIN_MODES and key in module._stored_floats)
 
@@ -2573,7 +2604,7 @@ class FormatEmbedding(_FormatLayer):
         codes = self._tensors[0]
         if view is None or view.get(codes) is not self[codes]:
             view = copy(self._linear_prototype)
-            for name in self._tensors:
+            for name in (*self._tensors, *self.__dict__.get("_shared_tensors", ())):
                 view[name] = self[name]
             if "bias" in self:
                 view["bias"] = self["bias"]

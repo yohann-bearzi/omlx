@@ -119,14 +119,16 @@ def _can_fuse(switch_mlp: Any) -> bool:
         # The declaration covers one matrix. Both expert stacks must actually
         # store it, with the same concrete dtype even for a floating placeholder.
         layout = fmt.layout(k, n, gate.bits, gate.group_size)
-        if layout.keys() != {fmt.codes_name, *fmt.tensors}:
+        if layout.keys() != set(formats.all_tensor_names(fmt)):
             return False
+        shared = set(fmt.shared_tensors)
         for name, (shape, dtype) in layout.items():
             a, b = gate.get(name), up.get(name)
+            held = tuple(shape) if name in shared else (gate.num_experts, *shape)
             if (
                 not isinstance(a, mx.array)
                 or not isinstance(b, mx.array)
-                or a.shape != (gate.num_experts, *shape)
+                or a.shape != held
                 or a.shape != b.shape
                 or a.dtype != b.dtype
                 or (
@@ -135,6 +137,8 @@ def _can_fuse(switch_mlp: Any) -> bool:
                     else a.dtype != dtype
                 )
             ):
+                return False
+            if name in shared and not mx.array_equal(a, b).item():
                 return False
     elif not isinstance(gate, (SwitchLinear, VLMSwitchLinear)):
         return False
@@ -180,7 +184,16 @@ def _fuse_one(switch_mlp: Any) -> None:
             setattr(gate_up, name, array)
 
     if keep_views:
+        shared = (
+            set(gate.fmt.shared_tensors)
+            if isinstance(gate, FormatSwitchLinear)
+            else set()
+        )
         for name, array in fused.items():
+            if name in shared:
+                # One layer keeps one of it: the views read it whole.
+                gate[name] = up[name] = array
+                continue
             gate[name], up[name] = mx.split(array, 2, axis=-1 if name == "bias" else 1)
         # Verify uses these views on the engine thread after loading.
         mx.eval([gate[name] for name in fused], [up[name] for name in fused])

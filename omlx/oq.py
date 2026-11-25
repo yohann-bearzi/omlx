@@ -7379,10 +7379,17 @@ def _format_reader(registered, record):
     formats._check_reader_isolation(registered, read, stage="accept")
     if not (
         isinstance(read, formats.QuantFormat)
-        and (read.mode, read.tensors, read.codes_name, read.contract)
+        and (
+            read.mode,
+            read.tensors,
+            read.shared_tensors,
+            read.codes_name,
+            read.contract,
+        )
         == (
             mode,
             registered.tensors,
+            registered.shared_tensors,
             registered.codes_name,
             registered.contract,
         )
@@ -7424,7 +7431,9 @@ def _encodable(shape) -> bool:
     )
 
 
-def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=None):
+def _encode_in_format(
+    fmt, tensor_name, w, importance, bits, group_size, reader=None, *, config=None
+):
     """``w``'s tensors in the quant format ``fmt``, by name, or None when the
     tensor stays oQ's affine: the format lays out or encodes no such matrix,
     ``w`` is empty, neither a matrix nor a stack of matrices that fit a
@@ -7450,13 +7459,17 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
     if layout is None:
         return None
     formats.check_layout(fmt, n, k, layout)
+    shared = set(fmt.shared_tensors)
     # What one matrix holds while it is encoded: its input, and its tensors.
-    sizes = [
-        math.prod(shape) * (4 if dtype is None else dtype.size)
-        for shape, dtype in layout.values()
-    ]
-    matrix = w.nbytes // count + sum(sizes)
-    if matrix > _QUANTIZE_CHUNK_BYTES or max(sizes) * count > _METAL_MAX_BUFFER:
+    sizes = {
+        name: math.prod(shape) * (4 if dtype is None else dtype.size)
+        for name, (shape, dtype) in layout.items()
+    }
+    matrix = w.nbytes // count + sum(sizes.values())
+    max_buffer = max(
+        size if name in shared else size * count for name, size in sizes.items()
+    )
+    if matrix > _QUANTIZE_CHUNK_BYTES or max_buffer > _METAL_MAX_BUFFER:
         return None
     if stack:
         run = min(_QUANTIZE_CHUNK_BYTES // matrix * n * k, _LAUNCH_WEIGHTS)
@@ -7466,8 +7479,15 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
     own = stack and importance.ndim > 1  # each matrix has its importance
     parts = []
     for r0, r1, run in runs:
-        tensors = fmt.encode(
-            run, importance[r0:r1] if own else importance, bits, group_size
+        context = formats.EncodeContext(
+            path=tensor_name,
+            is_switch=bool(stack),
+            bits=bits,
+            group_size=group_size,
+            config={} if config is None else copy.deepcopy(config),
+        )
+        tensors = fmt.encode_layer(
+            run, importance[r0:r1] if own else importance, context
         )
         if tensors is None:
             if parts:
@@ -7480,12 +7500,13 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
             isinstance(tensor, mx.array) for tensor in tensors.values()
         ):
             raise TypeError(
-                f"quant format {fmt.mode!r}: encode gives the tensors of "
+                f"quant format {fmt.mode!r}: encode_layer gives the tensors of "
                 f"{tensor_name} as a dict of arrays by name, or None"
             )
         lead = (r1 - r0,) if stack else ()
         want = {
-            name: ((*lead, *shape), dtype) for name, (shape, dtype) in layout.items()
+            name: ((*lead, *shape) if name not in shared else tuple(shape), dtype)
+            for name, (shape, dtype) in layout.items()
         }
         kept = {name: (tuple(t.shape), t.dtype) for name, t in tensors.items()}
         correct = set(kept) == set(want)
@@ -7523,8 +7544,22 @@ def _encode_in_format(fmt, tensor_name, w, importance, bits, group_size, reader=
     if len(parts) == 1:
         return parts[0]
     # Joined lazily, each name's runs held by its own join alone: the writer
-    # evaluates the joins once it has let the source go.
-    return {name: mx.concatenate([part[name] for part in parts]) for name in layout}
+    # evaluates the joins once it has let the source go. A shared tensor is
+    # one layer's, whatever the stack's runs: every run gives the same one.
+    joined = {}
+    for name in layout:
+        if name in shared:
+            for part in parts[1:]:
+                if not mx.array_equal(part[name], parts[0][name]).item():
+                    raise ValueError(
+                        f"quant format {fmt.mode!r} encoded the runs of "
+                        f"{tensor_name} with different shared tensors {name!r}: "
+                        "a stack keeps one"
+                    )
+            joined[name] = parts[0][name]
+        else:
+            joined[name] = mx.concatenate([part[name] for part in parts])
+    return joined
 
 
 def _probe_faces(layer, tensor_name, k, n):
@@ -8001,15 +8036,23 @@ def _open_oq_run(
                 )
             if (
                 quant_format.tensors,
+                quant_format.shared_tensors,
                 quant_format.codes_name,
                 quant_format.contract,
-            ) != (quant_fmt.tensors, quant_fmt.codes_name, quant_fmt.contract):
+            ) != (
+                quant_fmt.tensors,
+                quant_fmt.shared_tensors,
+                quant_fmt.codes_name,
+                quant_fmt.contract,
+            ):
                 raise ValueError(
                     f"quant format {mode!r} is configured with tensors "
-                    f"{quant_format.tensors} and codes "
+                    f"{quant_format.tensors}, shared "
+                    f"{quant_format.shared_tensors} and codes "
                     f"{quant_format.codes_name!r} at contract "
                     f"{quant_format.contract}, registered with "
-                    f"{quant_fmt.tensors} and codes {quant_fmt.codes_name!r} at "
+                    f"{quant_fmt.tensors}, shared {quant_fmt.shared_tensors} "
+                    f"and codes {quant_fmt.codes_name!r} at "
                     f"{quant_fmt.contract}: "
                     "the checkpoint would not load; report it to the plugin"
                 )
@@ -9191,7 +9234,14 @@ def quantize_oq_streaming(
                 grouped, importance, looked_up, base = offer[:4]
                 if offer.offered:
                     encoded = _encode_in_format(
-                        quant_fmt, tensor_name, w_mx, importance, bits, gs, reader
+                        quant_fmt,
+                        tensor_name,
+                        w_mx,
+                        importance,
+                        bits,
+                        gs,
+                        reader,
+                        config=run.get("config"),
                     )
                 elif offer.unwalked:
                     unwalked.append(base)
@@ -12869,7 +12919,9 @@ class _OQRefineWriter:
     def _parts(self) -> tuple[str, ...]:
         if self.quant_fmt is None:
             return ()
-        return (self.quant_fmt.codes_name, *self.quant_fmt.tensors)
+        from . import formats
+
+        return formats.all_tensor_names(self.quant_fmt)
 
     def is_format(self, base: str) -> bool:
         if self.quant_fmt is None or base in self.skip:
@@ -12973,13 +13025,17 @@ def _format_hessian_error(reader, w, tensors, hessian, bits, group_size) -> floa
     if wf.ndim == 2 and hessian.ndim == 3:
         hessian = hessian[0]
     if wf.ndim == 3:
+        shared = set(getattr(reader, "shared_tensors", ()))
         e, n, k = wf.shape
         chunk = max(1, _OQE_REFINE_CHUNK_ELEMS // (2 * n * k))
         total = 0.0
         for e0 in range(0, e, chunk):
             e1 = min(e, e0 + chunk)
             part = reader.decode(
-                {name: tensor[e0:e1] for name, tensor in tensors.items()},
+                {
+                    name: tensor if name in shared else tensor[e0:e1]
+                    for name, tensor in tensors.items()
+                },
                 bits,
                 group_size,
             ).astype(mx.float32)
@@ -13015,8 +13071,11 @@ def _refine_format_tensors(fmt, reader, name, w, tensors, hessian, bits, group_s
     if w.ndim == 2 and hessian.ndim == 3:
         hessian = hessian[0]
     refined = fmt.refine(
-        w, {part: mx.array(tensor) for part, tensor in tensors.items()},
-        hessian, bits, group_size,
+        w,
+        {part: mx.array(tensor) for part, tensor in tensors.items()},
+        hessian,
+        bits,
+        group_size,
     )
     if refined is None:
         return None
@@ -13029,8 +13088,9 @@ def _refine_format_tensors(fmt, reader, name, w, tensors, hessian, bits, group_s
             f"refine({name}) returned {sorted(refined)}, not its layout's "
             f"{sorted(layout)}"
         )
+    shared = set(getattr(reader, "shared_tensors", ()))
     for part, (shape, dtype) in layout.items():
-        want = (experts, *shape) if experts is not None else tuple(shape)
+        want = tuple(shape) if part in shared or experts is None else (experts, *shape)
         got = refined[part]
         dtype_ok = (
             got.dtype == dtype
@@ -13108,6 +13168,7 @@ def _refine_switch_codes(collector, owner, targets, writer):
     format's refine on the chunk; a mixed owner shares the chunk's hessian."""
     n_exp, in_dim = int(targets[0][1].shape[0]), int(targets[0][1].shape[-1])
     out_dim = int(targets[0][1].shape[-2])
+    shared = set(getattr(writer.reader, "shared_tensors", ()))
     outputs = []
     for target in targets:
         if target[2] == "format":
@@ -13135,7 +13196,10 @@ def _refine_switch_codes(collector, owner, targets, writer):
                     continue
                 outputs[i].append(result[0])
             else:
-                sub = {part: tensor[first:stop] for part, tensor in payload.items()}
+                sub = {
+                    part: tensor if part in shared else tensor[first:stop]
+                    for part, tensor in payload.items()
+                }
                 result = _refine_format_tensors(
                     writer.quant_fmt,
                     writer.reader,
@@ -13158,23 +13222,29 @@ def _refine_switch_codes(collector, owner, targets, writer):
         del hessian
         mx.clear_cache()
     results = []
-    for i, (_, _weight, kind, _payload, _bits, _gs) in enumerate(targets):
+    for i, (name, _weight, kind, _payload, _bits, _gs) in enumerate(targets):
         before, after = sums[i]
         if not changed[i]:
             results.append(None)
         elif kind == "affine":
             results.append((mx.concatenate(outputs[i], axis=0), before, after))
         else:
-            results.append(
-                (
-                    {
-                        part: mx.concatenate(chunks, axis=0)
-                        for part, chunks in outputs[i].items()
-                    },
-                    before,
-                    after,
-                )
-            )
+            joined = {}
+            for part, chunks in outputs[i].items():
+                if part in shared:
+                    for chunk in chunks[1:]:
+                        if (
+                            chunk.dtype != chunks[0].dtype
+                            or not mx.array_equal(chunk, chunks[0]).item()
+                        ):
+                            raise ValueError(
+                                f"refine({name}) returned inconsistent shared tensor "
+                                f"{part!r} across expert chunks"
+                            )
+                    joined[part] = chunks[0]
+                else:
+                    joined[part] = mx.concatenate(chunks, axis=0)
+            results.append((joined, before, after))
     return results
 
 
@@ -13222,21 +13292,23 @@ def _refine_captured(collector, modules: dict, writer, stats: dict) -> None:
             results = []
             for name, w, kind, payload, bits, gs in targets:
                 if kind == "affine":
-                    results.append(
-                        _refine_affine_codes(w, *payload, hessian, bits, gs)
-                    )
+                    results.append(_refine_affine_codes(w, *payload, hessian, bits, gs))
                 else:
                     results.append(
                         _refine_format_tensors(
-                            writer.quant_fmt, writer.reader, name, w, payload,
-                            hessian, bits, gs,
+                            writer.quant_fmt,
+                            writer.reader,
+                            name,
+                            w,
+                            payload,
+                            hessian,
+                            bits,
+                            gs,
                         )
                     )
             del hessian
         elif owner in collector.switch_rows:
-            results = _refine_switch_codes(
-                collector, owner, targets, writer
-            )
+            results = _refine_switch_codes(collector, owner, targets, writer)
             collector.switch_rows.pop(owner)
         else:
             continue

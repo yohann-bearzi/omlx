@@ -86,7 +86,8 @@ def layer_by_layer(layers) -> Iterator[None]:
             for module in self.modules():
                 clear_cached(module)
                 if isinstance(module, _FormatLayer):
-                    for name in module.keys() & module._tensors:
+                    shared = module.__dict__.get("_shared_tensors", ())
+                    for name in module.keys() & (*module._tensors, *shared):
                         del module[name]
                         module[name] = empty
             return out
@@ -181,10 +182,7 @@ def source_reference(
     collector keeps the default, so a writer's pair cannot be rewritten by a
     calibration beside it."""
     if name is not None and (
-        not name
-        or name in (".", "..")
-        or "\x00" in name
-        or Path(name).name != name
+        not name or name in (".", "..") or "\x00" in name or Path(name).name != name
     ):
         raise ValueError(f"reference name must be a single file stem, not {name!r}")
     from mlx_lm.tokenizer_utils import load as load_tokenizer
@@ -486,7 +484,7 @@ def verify_written_format_checkpoint(
                             _transpose_qwen35_mlx_vision_patch_embed_on_load,
                         )
 
-                        with (
+                        with (  # noqa: SIM117 (contexts are the runtime patches)
                             _strip_audio_config_if_orphaned(output),
                             _strip_vision_config_if_orphaned(output),
                             _drop_gemma4_mlx_shared_kv_extras_on_load(output),

@@ -325,8 +325,20 @@ class _Checkpoint:
             raise _refused(str(said), fmt.mode, self) from error
         if not (
             isinstance(read, formats.QuantFormat)
-            and (read.mode, read.tensors, read.codes_name, read.contract)
-            == (fmt.mode, fmt.tensors, fmt.codes_name, fmt.contract)
+            and (
+                read.mode,
+                read.tensors,
+                read.shared_tensors,
+                read.codes_name,
+                read.contract,
+            )
+            == (
+                fmt.mode,
+                fmt.tensors,
+                fmt.shared_tensors,
+                fmt.codes_name,
+                fmt.contract,
+            )
         ):
             raise _refused(
                 f"accept returned {read!r}, not a format of its mode, "
@@ -1660,10 +1672,10 @@ def _format_layer(layer, layer_cls, signature, arguments):
                 f"{name}={value!r}",
                 mode,
             )
-    tensors = {
-        name: mx.zeros((*stack, *shape), mx.float32 if dtype is None else dtype)
-        for name, (shape, dtype) in layout.items()
-    }
+    tensors = {}
+    for name, (shape, dtype) in layout.items():
+        held = shape if name in fmt.shared_tensors else (*stack, *shape)
+        tensors[name] = mx.zeros(held, mx.float32 if dtype is None else dtype)
     built = layer_cls(
         fmt,
         bits,

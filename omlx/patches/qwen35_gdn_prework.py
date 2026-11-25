@@ -1440,9 +1440,11 @@ def _qwen4_gdn_geometry_ok(module) -> bool:
 
 def _matches_format_rows(linear, layout):
     """Check the stored rows against a declared layout with the same row contents."""
+    shared = set(linear.fmt.shared_tensors)
     return all(
         isinstance(linear.get(name), mx.array)
-        and linear[name].shape == (linear.output_dims, *shape[1:])
+        and linear[name].shape
+        == (tuple(shape) if name in shared else (linear.output_dims, *shape[1:]))
         and (
             mx.issubdtype(linear[name].dtype, mx.floating)
             if dtype is None
@@ -1555,6 +1557,12 @@ def _stack_format_inputs(module):
         layer[name].dtype != first[name].dtype
         for layer in layers[1:]
         for name in layout
+    ):
+        return None
+    if any(
+        not mx.array_equal(layer[name], first[name]).item()
+        for layer in layers[1:]
+        for name in first.fmt.shared_tensors
     ):
         return None
     stacked = first._stacked_outputs(*layers[1:], layout=layout)

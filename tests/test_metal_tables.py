@@ -734,7 +734,7 @@ class _Hand(formats.QuantFormat):
     def layout(self, k, n, bits, group_size):
         return {"weight": ((n, k), mx.uint8), "scales": ((n,), mx.float32)}
 
-    def encode(self, w, importance, bits, group_size):
+    def encode_layer(self, w, importance, context):
         return {"weight": mx.zeros(w.shape, mx.uint8), "scales": mx.ones(w.shape[:-1])}
 
 

@@ -611,8 +611,21 @@ def rows_stack(
                 f"quant format {fmt.mode}: {name!r} has {first[name].dtype} "
                 f"in first and {second[name].dtype} in second"
             )
+        if (
+            name in fmt.shared_tensors
+            and not mx.array_equal(first[name], second[name]).item()
+        ):
+            raise AssertionError(
+                f"quant format {fmt.mode}: shared tensor {name!r} differs "
+                "between first and second"
+            )
     stacked = {
-        name: mx.concatenate([first[name], second[name]], axis=0) for name in first
+        name: (
+            first[name]
+            if name in fmt.shared_tensors
+            else mx.concatenate([first[name], second[name]], axis=0)
+        )
+        for name in first
     }
     whole = fmt.decode(stacked, bits, group_size)
     parts = [fmt.decode(m, bits, group_size) for m in (first, second)]

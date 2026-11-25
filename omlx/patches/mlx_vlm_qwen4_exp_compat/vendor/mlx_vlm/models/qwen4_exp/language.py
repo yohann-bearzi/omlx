@@ -3879,6 +3879,7 @@ class ShardedEmbedding(nn.Module):
         origin = first.__dict__.get("_load_origin")
         active_load = origin is not None and origin[1].active
         names = tuple(first._tensors)
+        shared = tuple(first.__dict__.get("_shared_tensors", ()))
         for shard in shards:
             if (
                 shard.fmt is not first.fmt
@@ -3886,6 +3887,7 @@ class ShardedEmbedding(nn.Module):
                 or shard.bits != first.bits
                 or shard.group_size != first.group_size
                 or tuple(shard._tensors) != names
+                or tuple(shard.__dict__.get("_shared_tensors", ())) != shared
                 or ("bias" in shard) != ("bias" in first)
             ):
                 return False
@@ -3899,6 +3901,13 @@ class ShardedEmbedding(nn.Module):
                 if (
                     shard[name].dtype != first[name].dtype
                     or shard[name].shape[1:] != first[name].shape[1:]
+                ):
+                    return False
+            for name in shared:
+                if (
+                    shard[name].dtype != first[name].dtype
+                    or shard[name].shape != first[name].shape
+                    or not mx.array_equal(shard[name], first[name]).item()
                 ):
                     return False
         total_rows = sum(int(shard[names[0]].shape[0]) for shard in shards)
@@ -3916,7 +3925,7 @@ class ShardedEmbedding(nn.Module):
                 sources = None
             else:
                 for shard, source in zip(shards, sources):
-                    for name in (*names, "bias" if "bias" in first else None):
+                    for name in (*names, *shared, "bias" if "bias" in first else None):
                         if name is None:
                             continue
                         value = held(source, name)
@@ -3934,6 +3943,8 @@ class ShardedEmbedding(nn.Module):
             name: mx.concatenate([held(holder, name) for holder in chosen], axis=0)
             for name in names
         }
+        for name in shared:
+            tensors[name] = held(chosen[0], name)
         bias = (
             mx.concatenate([held(holder, "bias") for holder in chosen], axis=0)
             if "bias" in first
