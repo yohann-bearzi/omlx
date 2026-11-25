@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from functools import wraps
 from typing import Any
 
@@ -48,8 +49,10 @@ from mlx_vlm.models.switch_layers import (
 )
 
 from .. import formats
+from ..formats import transforms
 from ..formats.linear import FormatSwitchLinear
 from ..scheduler import _sync_and_clear_cache
+from . import m5_gather_qmm as _m5
 from . import moe_verify_gather
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
@@ -203,12 +206,32 @@ def _fuse_one(switch_mlp: Any) -> None:
         del switch_mlp.up_proj
 
 
+def _bind_with_key(layer):
+    bound = formats.input_transform(layer)
+    return None if bound is None else (*bound, transforms.key(*bound))
+
+
+def _stack_transforms(switch_mlp):
+    """The gate/up and down input transforms of a fused stack, bound once."""
+    return (
+        _bind_with_key(getattr(switch_mlp, "gate_up_proj", None)),
+        _bind_with_key(getattr(switch_mlp, "down_proj", None)),
+    )
+
+
 def _make_patched_call(orig_call):
     def patched(self, x: mx.array, indices: mx.array) -> mx.array:
         gate_up = getattr(self, "gate_up_proj", None)
         if gate_up is None:
             return orig_call(self, x, indices)
 
+        pair = cached_per_module(self, "_omlx_stack_transforms", _stack_transforms)
+        gu, dn = (None, None) if pair is None else pair
+        down = self.down_proj
+        prepared = gu is not None
+        if prepared and x.size:
+            # Rotate the token rows once, before sorting expands them.
+            x = transforms.prepare_bound(gu, x)
         x = mx.expand_dims(x, (-2, -3))
         do_sort = indices.size >= 64
         idx = indices
@@ -222,7 +245,8 @@ def _make_patched_call(orig_call):
         if self.training:
             idx = mx.stop_gradient(idx)
         x_act = None
-        if do_sort and not self.training:
+        rotated = False
+        if do_sort and not self.training and gu is None and dn is None:
             # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
             # on INT8 operands and the A16 Down; None keeps the A16 path.
             routed = try_routed_a8(
@@ -235,20 +259,48 @@ def _make_patched_call(orig_call):
             if routed is not None:
                 x = _scatter_unsort(routed, inv_order, indices.shape)
                 return x.squeeze(-2)
+        if do_sort and not self.training:
             # Sorted prefill on M5: the activation in the [gate; up]
             # matmul's epilogue, token rows read in place (bit-identical;
-            # None keeps this path).
+            # None keeps this path). When ``prepared`` is true the rows are
+            # already rotated.
             x_act = fused_gate_up_activation(
-                gate_up, x, idx, self.activation, token_rows=token_rows
+                gate_up,
+                x,
+                idx,
+                self.activation,
+                token_rows=token_rows,
+                **({"prepared": True} if prepared else {}),
             )
+            # The epilogue's activation is in the plain basis: the down
+            # projection applies its own transform when it is called.
         if x_act is None:
-            x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
-            x_act = self.activation(x_up, x_gate)
-        x = self.down_proj(
-            x_act,
-            idx,
-            sorted_indices=do_sort,
+            x_gate_up = (
+                gate_up._call_prepared(x, idx, sorted_indices=do_sort)
+                if prepared
+                else gate_up(x, idx, sorted_indices=do_sort)
+            )
+            limit = _m5._swiglu_limit(self.activation) if dn is not None else None
+            if (
+                dn is not None
+                and dn[0].apply_split_swiglu is not None
+                and x_gate_up.size
+                and limit is not _m5._UNSUPPORTED
+                and (limit is None or math.isfinite(limit))
+            ):
+                # The M3 steel route: split, SwiGLU and rotation in one pass.
+                x_act = dn[0].apply_split_swiglu(x_gate_up, *dn[1], limit=limit)
+                rotated = x_act is not None
+            if x_act is None:
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+                x_act = self.activation(x_up, x_gate)
+                if dn is not None and x_act.size:
+                    x_act = transforms.prepare_bound(dn, x_act)
+                    rotated = True
+        x = (
+            down._call_prepared(x_act, idx, sorted_indices=do_sort)
+            if rotated
+            else down(x_act, idx, sorted_indices=do_sort)
         )
         if do_sort:
             x = _scatter_unsort(x, inv_order, indices.shape)
@@ -290,7 +342,11 @@ def _unsorted_switch(plan, x, indices):
     activation and ``down_proj(..., sorted_indices=False)`` through
     mlx-vlm's ``QuantizedSwitchLinear.__call__``.
     """
-    (gw, gs, gb, g_group, g_bits, g_mode), (dw, ds, db, d_group, d_bits, d_mode), act = plan
+    (
+        (gw, gs, gb, g_group, g_bits, g_mode),
+        (dw, ds, db, d_group, d_bits, d_mode),
+        act,
+    ) = plan
     x_gate_up = mx.gather_qmm(
         mx.expand_dims(x, (-2, -3)),
         gw,
@@ -336,7 +392,9 @@ def _make_vlm_patched_call(original):
             return self._combine(routed, weights, shared, residual)
         if indices.size < 64:
             # fused_call's unsorted branch (decode rows) with cached operands.
-            plan = cached_per_module(self, "_omlx_gate_up_decode_plan", _build_decode_plan)
+            plan = cached_per_module(
+                self, "_omlx_gate_up_decode_plan", _build_decode_plan
+            )
             if plan is not None:
                 routed = _unsorted_switch(plan, x, indices)
                 return self._combine(routed, weights, shared, residual)

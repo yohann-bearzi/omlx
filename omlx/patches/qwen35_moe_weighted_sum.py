@@ -12,13 +12,18 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 from collections.abc import Callable
 from typing import Any
 
 import mlx.core as mx
 
+from .. import formats
+from ..formats import transforms
+from . import m5_gather_qmm as _m5
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
+from .module_cache import cached_per_module
 from .moe_routes import sort_routes
 
 logger = logging.getLogger(__name__)
@@ -72,6 +77,29 @@ def _should_route(self: Any, x: mx.array, target_verify: bool, min_tokens: int) 
     )
 
 
+def _bind_with_key(layer):
+    bound = formats.input_transform(layer)
+    return None if bound is None else (*bound, transforms.key(*bound))
+
+
+def _weighted_sum_transforms(switch_mlp):
+    """The gate/up (or shared unfused gate+up) and down transforms, bound once."""
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    if gate_up is not None:
+        gu = _bind_with_key(gate_up)
+    else:
+        gate = getattr(switch_mlp, "gate_proj", None)
+        up = getattr(switch_mlp, "up_proj", None)
+        gu = (
+            _bind_with_key(gate)
+            if gate is not None
+            and up is not None
+            and transforms.same_transform(gate, up)
+            else None
+        )
+    return gu, _bind_with_key(getattr(switch_mlp, "down_proj", None))
+
+
 def _native_switch_weighted_sum(
     switch_mlp: Any,
     x: mx.array,
@@ -83,16 +111,27 @@ def _native_switch_weighted_sum(
     oqh_experts = getattr(switch_mlp, "oqh_experts", None)
     if oqh_experts is not None:
         x = switch_mlp.oqh_rotated_input(x)
-    # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
-    # computed when the gate/up kernel reads the token rows in place.
-    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
-    if oqh_experts is not None:
+        x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
         return weighted_sum(
             mx.contiguous(oqh_experts(x_tok[row_map], idx, sorted_indices=True)),
             mx.contiguous(inv_order.astype(mx.uint32)),
             mx.contiguous(scores.astype(mx.float32)),
         )
-    if not switch_mlp.training:
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    pair = cached_per_module(
+        switch_mlp,
+        "_omlx_weighted_sum_transforms",
+        _weighted_sum_transforms,
+    )
+    gu, dn = (None, None) if pair is None else pair
+    prepared = gu is not None
+    if prepared and x.size:
+        # Rotate the token rows once, before sorting expands them.
+        x = transforms.prepare_bound(gu, x)
+    # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
+    # computed when the gate/up kernel reads the token rows in place.
+    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+    if not switch_mlp.training and gu is None and dn is None:
         # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up on
         # INT8 operands and the A16 Down; None keeps the A16 path below.
         routed = try_routed_a8(
@@ -108,32 +147,62 @@ def _native_switch_weighted_sum(
     if switch_mlp.training:
         idx = mx.stop_gradient(idx)
 
-    gate_up = getattr(switch_mlp, "gate_up_proj", None)
     x_act = None
+    rotated = False
     if gate_up is not None:
         if not switch_mlp.training:
             # M5: the activation in the [gate; up] matmul's epilogue, rows
             # read through the row map (bit-identical; None keeps the split
-            # + activation below).
+            # + activation below). When ``prepared`` is true the rows are
+            # already rotated.
             x_act = fused_gate_up_activation(
                 gate_up,
                 x_sorted,
                 idx,
                 switch_mlp.activation,
                 token_rows=(x_tok, row_map),
+                **({"prepared": True} if prepared else {}),
             )
+            # The epilogue's activation is in the plain basis: the down
+            # projection applies its own transform when it is called.
         if x_act is None:
-            x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
-            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_gate_up = (
+                gate_up._call_prepared(x_sorted, idx, sorted_indices=True)
+                if prepared
+                else gate_up(x_sorted, idx, sorted_indices=True)
+            )
+            limit = _m5._swiglu_limit(switch_mlp.activation) if dn is not None else None
+            if (
+                dn is not None
+                and dn[0].apply_split_swiglu is not None
+                and x_gate_up.size
+                and limit is not _m5._UNSUPPORTED
+                and (limit is None or math.isfinite(limit))
+            ):
+                x_act = dn[0].apply_split_swiglu(x_gate_up, *dn[1], limit=limit)
+                rotated = x_act is not None
+            if x_act is None:
+                x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
     else:
-        x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
-        x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+        x_up = (
+            switch_mlp.up_proj._call_prepared(x_sorted, idx, sorted_indices=True)
+            if prepared
+            else switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
+        )
+        x_gate = (
+            switch_mlp.gate_proj._call_prepared(x_sorted, idx, sorted_indices=True)
+            if prepared
+            else switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+        )
     if x_act is None:
         x_act = switch_mlp.activation(x_up, x_gate)
-    x_sorted = switch_mlp.down_proj(
-        x_act,
-        idx,
-        sorted_indices=True,
+        if dn is not None and x_act.size:
+            x_act = transforms.prepare_bound(dn, x_act)
+            rotated = True
+    x_sorted = (
+        switch_mlp.down_proj._call_prepared(x_act, idx, sorted_indices=True)
+        if rotated
+        else switch_mlp.down_proj(x_act, idx, sorted_indices=True)
     )
     return weighted_sum(
         mx.contiguous(x_sorted),
@@ -226,9 +295,7 @@ def apply_qwen35_moe_weighted_sum_patch() -> bool:
     patched |= _patch_class(
         "mlx_lm.models.qwen3_moe", "Qwen3MoeSparseMoeBlock", min_tokens
     )
-    patched |= _patch_class(
-        "mlx_lm.models.qwen3_5", "SparseMoeBlock", min_tokens
-    )
+    patched |= _patch_class("mlx_lm.models.qwen3_5", "SparseMoeBlock", min_tokens)
 
     _PATCHED = patched
     if patched:

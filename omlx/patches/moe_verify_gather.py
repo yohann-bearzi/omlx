@@ -27,7 +27,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .. import formats
-from ..formats import Dot, kernels
+from ..formats import Dot, kernels, transforms
 from .module_cache import cached_per_module
 
 logger = logging.getLogger(__name__)
@@ -209,6 +209,8 @@ class _Plan(NamedTuple):
     proof: kernels.Proof  # of a block's launches (and its order's)
     width: int  # the K of gate_up: a row of x
     few_pairs: int  # blocks of this many pairs or fewer keep the composed path
+    gu_tx: Any = None  # bound (tx, tensors, key) for gate_up, or None
+    dn_tx: Any = None  # bound (tx, tensors, key) for down, or None
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -271,7 +273,11 @@ def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:
         down.n,
         few_pairs,
     )
-    return _Plan(gate_up, down, proof, width, few_pairs)
+    gu_b = formats.input_transform(layers[0], refuse=False)
+    dn_b = formats.input_transform(layers[1], refuse=False)
+    gu_tx = None if gu_b is None else (*gu_b, transforms.key(*gu_b))
+    dn_tx = None if dn_b is None else (*dn_b, transforms.key(*dn_b))
+    return _Plan(gate_up, down, proof, width, few_pairs, gu_tx, dn_tx)
 
 
 _FAILED = "expert-ordered verify gather failed; composed fallback"
@@ -437,6 +443,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         )
     ):
         return None
+    if plan.gu_tx is not None:
+        x = transforms.prepare_bound(plan.gu_tx, x)
     pairs = indices.reshape(pair_count)
     order = _order(pairs) if pair_count >= ORDERED_PAIRS else None
     gate_up = _gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
@@ -446,6 +454,8 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         # Not the rows that the down launch is planned and proven for.
         # Nothing is kept of it: the next block asks its activation again.
         return None
+    if plan.dn_tx is not None:
+        hidden = transforms.prepare_bound(plan.dn_tx, hidden)
     down = _gather_qmv(plan.down, hidden, pairs, 1, order)
     return down.reshape(batch, length, top_k, -1)
 

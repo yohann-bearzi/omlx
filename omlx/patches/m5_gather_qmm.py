@@ -251,7 +251,9 @@ def _swiglu_limit(activation):
     return _UNSUPPORTED
 
 
-def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
+def fused_gate_up_activation(
+    proj, x, indices, activation, token_rows=None, prepared=False
+):
     """``activation(x_up, x_gate)`` of a fused ``[gate; up]`` projection in
     one kernel, or None.
 
@@ -273,7 +275,8 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     (``moe_routes.sort_routes``) lets the kernel read the sorted rows from
     the token rows in place, so a lazy ``x`` is never materialised
     (bit-identical). If the row-mapped kernel declines, ``x`` is used as
-    before.
+    before. ``prepared`` says the caller already rotated the rows (or their
+    tokens) for a format's input transform.
     """
     limit = _swiglu_limit(activation)
     if limit is _UNSUPPORTED:
@@ -289,7 +292,11 @@ def fused_gate_up_activation(proj, x, indices, activation, token_rows=None):
     if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
         return None
     if isinstance(proj, FormatSwitchLinear):
-        return proj._sorted_swiglu(x, indices, limit, token_rows)
+        return proj._sorted_swiglu(x, indices, limit, token_rows, prepared=prepared)
+    if prepared:
+        # Only a format's transform reads a prepared input; the stock kernels
+        # would apply their weights to a rotated activation.
+        return None
     w = proj.get("weight")
     scales = proj.get("scales")
     if not isinstance(w, mx.array) or not isinstance(scales, mx.array):
