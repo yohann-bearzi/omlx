@@ -1180,7 +1180,7 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
             written = checkpoint._written(wanted)[0]
             if isinstance(written, dict) and written.get("plugin") is not None:
                 raise _refused(
-                    f"{wanted} is one of MLX's modes, which a plugin does not "
+                    f"{wanted} is a built-in mode, which a plugin does not "
                     f"write: its record says {written['plugin']!r}",
                     wanted,
                     checkpoint,
@@ -1617,6 +1617,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
         # other checkpoint of an MLX mode keeps MLX's layer, as before.
         if (
             mode in formats._BUILTIN_MODES
+            and formats._mlx_runs(mode)
             and not kept_record
             and (
                 checkpoint is None

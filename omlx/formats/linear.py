@@ -1959,7 +1959,7 @@ class _FormatLayer(nn.Module):
         # was). Kept beside the parameters, not among them.
         self.__dict__.update(
             _tensors=names,
-            _stock=mode in formats._BUILTIN_MODES,
+            _stock=mode in formats._BUILTIN_MODES and formats._mlx_runs(mode),
             _stored_floats=tuple(
                 name for name, (_, dtype) in (layout or {}).items() if dtype is None
             ),

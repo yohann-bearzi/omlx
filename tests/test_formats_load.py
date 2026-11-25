@@ -984,7 +984,7 @@ def test_a_format_s_layer_is_built_only_in_a_load_that_passed_the_gate(
         (
             "affine",
             {"affine": {"plugin": "shadow 0.1.0", "contract": 1, "record": {}}},
-            "affine is one of MLX's modes, which a plugin does not write: its "
+            "affine is a built-in mode, which a plugin does not write: its "
             "record says 'shadow 0.1.0'",
         ),
         (

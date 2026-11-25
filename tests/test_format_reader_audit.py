@@ -336,6 +336,7 @@ PATH_DECISIONS = {
     ),
     "omlx/formats/__init__.py": (OWN, "the format face builder itself"),
     "omlx/formats/affine.py": (OWN, "the affine format's own implementation"),
+    "omlx/formats/oqh.py": (OWN, "the built-in oQh formats' own implementation"),
     "omlx/formats/kernels.py": (OWN, "the format kernel builders"),
     "omlx/formats/tile_dense.py": (
         OWN,
@@ -760,6 +761,12 @@ EXPECTED = {
         "read bits",
         "read group_size",
     ),
+    ("omlx/formats/oqh.py", "OqhAffineFormat.codes"): ("read bits", "read group_size"),
+    ("omlx/formats/oqh.py", "OqhAffineFormat.dot"): ("read bits", "read group_size"),
+    ("omlx/formats/oqh.py", "OqhAffineFormat.tile"): ("read bits", "read group_size"),
+    ("omlx/formats/oqh.py", "OqhFormat.codes"): ("read bits",),
+    ("omlx/formats/oqh.py", "OqhFormat.dot"): ("read bits",),
+    ("omlx/formats/oqh.py", "OqhFormat.tile"): ("read bits",),
     ("omlx/formats/tile_dense.py", "_resolve_cell"): ("read bits", "read group_size"),
     ("omlx/formats/tile_dense.py", "build_plan"): ("read bits", "read group_size"),
     ("omlx/lora_adapters.py", "_linear_dims"): (

@@ -1124,9 +1124,14 @@ def _resolve_cell(
     k, n = layer.input_dims, layer.output_dims
     bound = sample if hi is None else hi
     candidates: list[tuple[int, str, str, object]] = []
+    table_face = (
+        affine.tile_face(layer.bits, layer.group_size, dtype)
+        if layer.mode == "oqh_affine"
+        else face
+    )
     pol = tuning.lookup(
         "dense_tile",
-        face,
+        table_face,
         dtype=dtype,
         bits=layer.bits,
         group=layer.group_size,
@@ -1154,7 +1159,7 @@ def _resolve_cell(
     ):
         data = tuning.lookup(
             route_name,
-            face,
+            table_face,
             dtype=dtype,
             bits=layer.bits,
             group=layer.group_size,
@@ -1174,7 +1179,7 @@ def _resolve_cell(
             key=lambda item: (
                 tuning.match_rank(
                     item[1],
-                    face,
+                    table_face,
                     dtype=dtype,
                     bits=layer.bits,
                     group=layer.group_size,
