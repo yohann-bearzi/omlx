@@ -257,8 +257,33 @@ def mma_asserts() -> tuple[tuple[str, str], ...]:
     )
 
 
+@dataclass(frozen=True)
+class RoutedWindowPolicy:
+    """One single-stream verify-window gate+up coalescing policy (rule 27/28)."""
+
+    coalesce: Literal["none", "folded", "unfolded"] = "none"
+
+    def is_legal(
+        self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
+    ) -> bool:
+        """Whether this coalescing mode runs on ``face``'s shape."""
+        if self.coalesce not in _ROUTED_WINDOW_COALESCE:
+            return False
+        if k < 1 or n < 1 or m < 1:
+            return False
+        if self.coalesce != "none":
+            if getattr(face, "vpt", 0) < 1:
+                return False
+            if m < 2 or m > 4:
+                return False
+            if self.coalesce == "folded" and m > 3:
+                return False
+        return True
+
+
 _BACKENDS = ("steel", "nax", "wide", "mlx", "rows")
 _ROUTE_ONLY_BACKENDS = ("wide", "mlx", "rows")
+_ROUTED_WINDOW_COALESCE = ("none", "folded", "unfolded")
 _SCHEDS = ("seg", "db")
 _CHIP_GEN_RE = re.compile(r"^applegpu_g(\d+)([a-z]?)(?:_|$)")
 _BKS = (32, 64, 128)
@@ -277,6 +302,7 @@ _THREADGROUP_BYTES = 32768
 _ROUTES: dict[str, type] = {
     "dense_tile": DenseTilePolicy,
     "mma_tile": MmaTilePolicy,
+    "routed_window": RoutedWindowPolicy,
 }
 
 
@@ -349,6 +375,14 @@ def params_from_json(route: str, data: Any):
         if "sched" in data and data["sched"] not in _SCHEDS:
             raise ValueError(
                 f"tuning: {route} sched is one of {_SCHEDS}, not {data['sched']!r}"
+            )
+    elif cls is RoutedWindowPolicy:
+        if "coalesce" not in data:
+            raise ValueError(f"tuning: {route} params require 'coalesce'")
+        if data["coalesce"] not in _ROUTED_WINDOW_COALESCE:
+            raise ValueError(
+                f"tuning: {route} coalesce is one of {_ROUTED_WINDOW_COALESCE}, "
+                f"not {data['coalesce']!r}"
             )
     elif "bk" in data and data["bk"] not in _BKS:
         raise ValueError(f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}")

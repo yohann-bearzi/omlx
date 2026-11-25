@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 from functools import cache, partial, wraps
 from typing import NamedTuple
 
@@ -104,7 +105,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .. import formats
-from ..formats import Dot, kernels
+from ..formats import Dot, kernels, tuning
 from ..formats.affine import AffineFormat
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 from .module_cache import cached_per_module
@@ -874,7 +875,8 @@ class _Launches(NamedTuple):
     window_inter: int = 0
     window_shared_width: int = 0
     window_fast: bool = False  # the measured fast path (for the plan's report)
-    window_coalesced: bool = False  # launches.window_coalesced_kernel runs
+    window_coalesced: bool = False  # any single-stream row count coalesces
+    window_coalesce_modes: tuple[str, ...] = ("none",) * (_COALESCE_MAX_ROWS + 1)
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
@@ -947,6 +949,32 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     )
 
 
+_TUNING_LOCK = threading.Lock()
+
+
+def _routed_window_skeleton_text() -> str:
+    """Skeleton text hashed by ``omlx.formats.tuning`` for the ``routed_window``
+    per-chip coalescing table."""
+    return "\n".join(
+        (
+            _GATE_UP_WINDOW_COALESCED,
+            _GATE_UP_TOPK_COALESCED,
+            _GATE_UP_WINDOW_HEAD,
+            _GATE_UP_TOPK_HEAD,
+        )
+    )
+
+
+def _ensure_tuning_registered() -> None:
+    """Register the ``routed_window`` skeleton with ``omlx.formats.tuning``
+    (thread-safe, idempotent; re-registers after test cache clears)."""
+    if tuning.skeleton_digest("routed_window") is not None:
+        return
+    with _TUNING_LOCK:
+        if tuning.skeleton_digest("routed_window") is None:
+            tuning.register_skeleton("routed_window", _routed_window_skeleton_text())
+
+
 def _window_fast(gate_up, gu_fmt, hidden: int, inter: int) -> bool:
     """Whether a folded block takes the measured verify-window fast path: a
     table-backed routed gate+up face and a ``(hidden, inter, bits)`` the
@@ -959,6 +987,45 @@ def _window_fast(gate_up, gu_fmt, hidden: int, inter: int) -> bool:
         and type(bits) is int
         and (hidden, inter, bits) in _WINDOW_FAST_SHAPES
     )
+
+
+def _window_coalesce_modes(
+    gate_up,
+    gu_fmt,
+    hidden: int,
+    inter: int,
+    dtype: mx.Dtype,
+    top_k: int,
+    can_coalesce: bool,
+    window_fast: bool,
+) -> tuple[str, ...]:
+    """Per-chip single-stream verify-window coalescing mode per row count
+    (rule 27/28), resolved once at plan construction from ``omlx.formats.tuning``."""
+    none = ("none",) * (_COALESCE_MAX_ROWS + 1)
+    if not (can_coalesce and window_fast):
+        return none
+    bits = getattr(gate_up, "bits", None)
+    group = getattr(gate_up, "group_size", None)
+    if type(bits) is not int or bits < 1 or type(group) is not int or group < 1:
+        return none
+    _ensure_tuning_registered()
+    modes = ["none"] * (_COALESCE_MAX_ROWS + 1)
+    for rows in range(2, _COALESCE_MAX_ROWS + 1):
+        if rows * top_k > _COALESCE_MAX_PAIRS:
+            continue
+        pol = tuning.lookup(
+            "routed_window",
+            gu_fmt,
+            dtype=dtype,
+            bits=bits,
+            group=group,
+            n=2 * inter,
+            k=hidden,
+            rows=rows,
+        )
+        if isinstance(pol, tuning.RoutedWindowPolicy):
+            modes[rows] = pol.coalesce
+    return tuple(modes)
 
 
 def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
@@ -1095,7 +1162,12 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     # them constructs no kernel object for them, which would otherwise move the
     # per-process placement draw of a path whose launches did not change.
     window_fast = _window_fast(gate_up, gu_fmt, hidden, inter)
-    window_coalesced = can_coalesce and window_fast
+    window_coalesce_modes = _window_coalesce_modes(
+        gate_up, gu_fmt, hidden, inter, dtype, top_k, can_coalesce, window_fast
+    )
+    need_unfolded = "unfolded" in window_coalesce_modes
+    need_folded = "folded" in window_coalesce_modes
+    window_coalesced = need_unfolded or need_folded
     window_down_unrolled = (
         _down_window_unrolled_kernel(d_fmt, sd_fmt) if window_fast else None
     )
@@ -1126,12 +1198,12 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         window_down=window_down,
         window_coalesced_kernel=(
             _gate_up_window_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt)
-            if window_coalesced
+            if need_unfolded
             else None
         ),
         window_topk_coalesced_kernel=(
             _gate_up_topk_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt, dtype)
-            if window_coalesced
+            if need_folded
             else None
         ),
         window_down_unrolled_kernel=window_down_unrolled,
@@ -1139,6 +1211,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         window_shared_width=width,
         window_fast=window_fast,
         window_coalesced=window_coalesced,
+        window_coalesce_modes=window_coalesce_modes,
         topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
@@ -1149,7 +1222,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         experts=experts,
         outside=router is None,
         proof=proof,
-        window=kernels.proof("routed_window", *key, window_fast),
+        window=kernels.proof("routed_window", *key, window_fast, window_coalesce_modes),
         quantized_router=quantized_router,
     )
 
@@ -1321,7 +1394,35 @@ def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
     )[0]
 
 
-def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
+def _coalesce_mode(
+    launches: _Launches, rows: int, folded: bool, single_stream: bool
+) -> str:
+    """Coalescing mode for ``rows``: strictly ``"none"`` outside single-stream
+    verify windows (``B == 1, T > 1``), else the plan's per-chip tuning entry."""
+    if not single_stream or rows < 2 or rows >= len(launches.window_coalesce_modes):
+        return "none"
+    mode = launches.window_coalesce_modes[rows]
+    if mode == "folded" and not folded:
+        return "none"
+    return mode
+
+
+def _window_metal(rows: int, experts: int, folded: bool, mode: str) -> tuple:
+    """Proof key for a verify-window Metal variant: the canonical 3-tuple for
+    uncoalesced windows (``mode == "none"``), extended with ``mode`` for
+    coalesced single-stream windows."""
+    return (rows, experts, folded) if mode == "none" else (rows, experts, folded, mode)
+
+
+def _experts(
+    launches: _Launches,
+    x,
+    logits,
+    operands,
+    folded: bool,
+    *beside,
+    single_stream: bool = False,
+):
     """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
     + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for each row
     of ``x`` (one token, or [M, hidden] for a window), on the routing of
@@ -1329,7 +1430,8 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
     where it ``folded``: ``_topk_folds``) and down. Row r of a window runs
     the one-token arithmetic on its own routing. ``beside`` is the composed
     shared expert's output and its gate's, where the launches do not fold
-    them (one token)."""
+    them (one token). Pair-coalescing runs only for single-stream verify
+    windows (``single_stream=True``) per ``launches.window_coalesce_modes``."""
     _, gate_up, down, shared_gate_up, shared_down = operands
     one_token = x.size == launches.hidden
     if one_token:
@@ -1342,21 +1444,24 @@ def _experts(launches: _Launches, x, logits, operands, folded: bool, *beside):
             h = _gate_up(launches, x, indices, gate_up, shared_gate_up)
         return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
     rows = x.shape[0]
-    gen = kernels.gpu_generation()
-    can_unfolded_coal = (
-        launches.window_coalesced
-        and 2 <= rows <= _COALESCE_MAX_ROWS
+    mode = _coalesce_mode(launches, rows, folded, single_stream)
+    if (
+        mode == "unfolded"
+        and launches.window_coalesced_kernel is not None
         and rows * launches.top_k <= _COALESCE_MAX_PAIRS
         and softmax_topk_eligible(logits, WINDOW_MAX_ROWS)
-    )
-    if can_unfolded_coal and ((gen >= 17 and rows >= 3) or rows == 4):
+    ):
         indices, scores, meta, ucount = softmax_topk_coalesce(
             logits, launches.top_k, WINDOW_MAX_ROWS
         )
         h = _window_gate_up_coalesced(
             launches, x, meta, ucount, gate_up, shared_gate_up
         )
-    elif launches.window_coalesced and folded and rows == 2:
+    elif (
+        mode == "folded"
+        and launches.window_topk_coalesced_kernel is not None
+        and folded
+    ):
         h, indices, scores = _window_gate_up_topk_coalesced(
             launches, x, logits, gate_up, shared_gate_up
         )
@@ -1396,7 +1501,14 @@ def _ranked(rows: int, experts: int, dtype, *, stream=None) -> mx.array:
 
 
 def _stand_in(
-    launches: _Launches, logits, folded: bool, outside, operands, *, stream=None
+    launches: _Launches,
+    logits,
+    folded: bool,
+    outside,
+    operands,
+    *,
+    stream=None,
+    single_stream: bool = False,
 ):
     """The smallest launches of a block's rows that MLX generates the Metal
     of the call's for, over zeros: the rows, the router's weight, the whole
@@ -1429,7 +1541,17 @@ def _stand_in(
         (x,), *stand_ins, outside = (
             tuple(next(made) for _ in group) for group in groups
         )
-        launched = [_experts(launches, x, logits, stand_ins, folded, *outside)]
+        launched = [
+            _experts(
+                launches,
+                x,
+                logits,
+                stand_ins,
+                folded,
+                *outside,
+                single_stream=single_stream,
+            )
+        ]
         if launches.router is not None:
             launched.append(launches.router(x, *stand_ins[0]))
         return launched
@@ -1511,7 +1633,7 @@ def _decode(block, plan: _Plan, x, graph):
     return y
 
 
-def _window(launches: _Launches, folded: bool):
+def _window(launches: _Launches, folded: bool, *, single_stream: bool = False):
     """A window's launches as one function of its rows and the plan's
     operands, for MLX's compile: the router, gate+up and down of every row
     of ``x`` ([B, L, hidden]), the rows ([rows, hidden]) out. It closes over
@@ -1520,12 +1642,14 @@ def _window(launches: _Launches, folded: bool):
     def graph(x, operands):
         x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
         logits = launches.router(x, *operands[0])
-        return _experts(launches, x, logits, operands, folded)
+        return _experts(
+            launches, x, logits, operands, folded, single_stream=single_stream
+        )
 
     return graph
 
 
-def _window_logits(launches: _Launches, folded: bool):
+def _window_logits(launches: _Launches, folded: bool, *, single_stream: bool = False):
     """A window's launches as one function of its rows and the routing the
     block's quantized gate computed outside it, for MLX's compile: the rows
     of ``x`` ([B, L, hidden]), their logits ([rows, experts]) and the plan's
@@ -1533,7 +1657,9 @@ def _window_logits(launches: _Launches, folded: bool):
 
     def graph(x, logits, operands):
         x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
-        return _experts(launches, x, logits, operands, folded)
+        return _experts(
+            launches, x, logits, operands, folded, single_stream=single_stream
+        )
 
     return graph
 
@@ -1630,19 +1756,33 @@ def routed_verify_window(block, x):
             return None
     ranked = _ranked(rows, plan.experts, launches.dtype)
     folded = _topk_folds(launches, ranked)
+    single_stream = shape[0] == 1 and shape[1] > 1
+    mode = _coalesce_mode(launches, rows, folded, single_stream)
     outside = () if logits is None else (ranked,)
-    stand_in = partial(_stand_in, launches, ranked, folded, outside, plan.operands)
+    stand_in = partial(
+        _stand_in,
+        launches,
+        ranked,
+        folded,
+        outside,
+        plan.operands,
+        single_stream=single_stream,
+    )
     said = (
         f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
         "fused verify-window experts failed; verifier fallback",
     )
-    if not plan.window.prove((rows, plan.experts, folded), stand_in, logger, *said):
+    if not plan.window.prove(
+        _window_metal(rows, plan.experts, folded, mode), stand_in, logger, *said
+    ):
         return None
     if logits is None:
-        graph = mx.compile(_window(launches, folded))
+        graph = mx.compile(_window(launches, folded, single_stream=single_stream))
         y = graph(x, plan.operands)
     else:
-        graph = mx.compile(_window_logits(launches, folded))
+        graph = mx.compile(
+            _window_logits(launches, folded, single_stream=single_stream)
+        )
         y = graph(x, logits, plan.operands)
     plan.window.keep(window_signature, graph)
     return y
@@ -1834,18 +1974,27 @@ def _warm_routed_dispatch(model, *, mtp_enabled: bool = False) -> None:
                 if win_sig in plan.window.graphs:
                     continue
                 folded_w = _topk_folds(launches, _Spec((rows, plan.experts), dtype))
-                if (rows, plan.experts, folded_w) not in plan.window.ran:
+                single_stream = xw_shape[0] == 1 and xw_shape[1] > 1
+                mode_w = _coalesce_mode(launches, rows, folded_w, single_stream)
+                if (
+                    _window_metal(rows, plan.experts, folded_w, mode_w)
+                    not in plan.window.ran
+                ):
                     continue
                 xw_dummy = mx.zeros(xw_shape, dtype)
                 if plan.quantized_router:
-                    compiled = mx.compile(_window_logits(launches, folded_w))
+                    compiled = mx.compile(
+                        _window_logits(launches, folded_w, single_stream=single_stream)
+                    )
                     compiled(
                         xw_dummy,
                         mx.zeros((rows, plan.experts), dtype),
                         plan.operands,
                     )
                 else:
-                    compiled = mx.compile(_window(launches, folded_w))
+                    compiled = mx.compile(
+                        _window(launches, folded_w, single_stream=single_stream)
+                    )
                     compiled(xw_dummy, plan.operands)
                 plan.window.keep(win_sig, compiled)
 
@@ -2138,29 +2287,38 @@ def warm_moe_model(
                             if plan.quantized_router
                             else ()
                         )
-                        metal_w = (rows, plan.experts, folded_w)
-
-                        def build_window(
-                            stream,
-                            launches=launches,
-                            rows=rows,
-                            experts=plan.experts,
-                            dtype=dtype,
-                            folded=folded_w,
-                            outside=outside_w,
-                            op_specs=op_specs,
-                        ):
-                            logits = _ranked(rows, experts, dtype, stream=stream)
-                            return _stand_in(
-                                launches,
-                                logits,
-                                folded,
-                                outside,
-                                op_specs,
-                                stream=stream,
+                        variants = (False, True) if mtp_enabled else (False,)
+                        for single_stream in variants:
+                            mode_w = _coalesce_mode(
+                                launches, rows, folded_w, single_stream
+                            )
+                            metal_w = _window_metal(
+                                rows, plan.experts, folded_w, mode_w
                             )
 
-                        add_task(plan.window, metal_w, build_window)
+                            def build_window(
+                                stream,
+                                launches=launches,
+                                rows=rows,
+                                experts=plan.experts,
+                                dtype=dtype,
+                                folded=folded_w,
+                                outside=outside_w,
+                                op_specs=op_specs,
+                                single_stream=single_stream,
+                            ):
+                                logits = _ranked(rows, experts, dtype, stream=stream)
+                                return _stand_in(
+                                    launches,
+                                    logits,
+                                    folded,
+                                    outside,
+                                    op_specs,
+                                    stream=stream,
+                                    single_stream=single_stream,
+                                )
+
+                            add_task(plan.window, metal_w, build_window)
 
             # 3. moe_verify_gather (rows 2..MAX_ROWS).
             if gate_up is not None and down is not None:
@@ -2204,3 +2362,6 @@ def warm_moe_model(
         row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
     else:
         linear.prepare_layer_plans(model)
+
+
+_ensure_tuning_registered()

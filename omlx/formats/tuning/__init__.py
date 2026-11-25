@@ -29,6 +29,7 @@ from .schema import (
     LoadLifetime,
     MmaTilePolicy,
     ParamStaging,
+    RoutedWindowPolicy,
     RowExactPolicy,
     RowIndexWidth,
     UnrollPolicy,
@@ -43,6 +44,7 @@ __all__ = [
     "LoadLifetime",
     "MmaTilePolicy",
     "ParamStaging",
+    "RoutedWindowPolicy",
     "RowExactPolicy",
     "RowIndexWidth",
     "UnrollPolicy",
@@ -129,6 +131,11 @@ _ROWS_BUCKETS = {
         (1, 8, "8"),
         (9, 16, "16"),
         (17, 24, "24"),
+    ),
+    "routed_window": (
+        (2, 2, "2"),
+        (3, 3, "3"),
+        (4, 4, "4"),
     ),
     "dense_qmv": (
         (1, 1, "1"),

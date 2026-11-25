@@ -314,18 +314,43 @@ def test_lookup_is_thread_safe_and_reads_a_table_once(tmp_path, monkeypatch):
 
 
 def test_every_in_tree_entry_is_current(tmp_path):
-    # Re-register the live dense_tile skeleton (fresh_tuner swaps in a dummy
-    # digest) and validate every shipped entry's skeleton_sha256, face_sha256,
-    # and legality against all shipped affine tile faces.
+    # Re-register the live dense_tile and routed_window skeletons (fresh_tuner
+    # swaps in a dummy digest) and validate every shipped entry's
+    # skeleton_sha256, face_sha256, and legality against all shipped faces.
     from omlx.formats import affine, tile_dense
+    from omlx.patches import qwen35_moe_routed_decode as routed
 
     tuning.register_skeleton("dense_tile", tile_dense._SKELETON_TEXT)
+    routed._ensure_tuning_registered()
     faces = {
         face.key: face
         for dt in (mx.bfloat16, mx.float16)
         for bits in (2, 3, 4, 5, 6, 8)
         for gs in (32, 64, 128)
         for face in (affine.tile_face(bits, gs, dt),)
+    }
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    vpt_reads = DotReads(apply=ApplyRead())
+    profile_faces = {
+        "*:plain": Dot("profile_plain", vpt_shell, "F", (), vpt=16, reads=vpt_reads),
+        "*:lut_small": Dot(
+            "profile_lut_small",
+            vpt_shell,
+            "F",
+            (),
+            tables=(Table("levels", mx.float16, tuple(range(16))),),
+            vpt=16,
+            reads=vpt_reads,
+        ),
+        "*:lut_tg": Dot(
+            "profile_lut_tg",
+            vpt_shell,
+            "F",
+            (),
+            tables=(Table("pairs", mx.uint32, tuple(range(256))),),
+            vpt=8,
+            reads=vpt_reads,
+        ),
     }
     chips: dict[str, list] = {}
     files = sorted(tuning._V1.glob("*.json"))
@@ -336,13 +361,17 @@ def test_every_in_tree_entry_is_current(tmp_path):
     assert len(chips["applegpu_g17s_c40"]) > 0
     for chip, entries in chips.items():
         for entry in entries:
-            face = faces[entry.key["face_id"]]
+            fid = entry.key["face_id"]
+            face = profile_faces[fid] if fid.startswith("*:") else faces[fid]
             span = entry.rows_span
-            sample_m = (
-                span[1]
-                if (span is not None and span[1] is not None)
-                else max(4096, (span[0] if span and span[0] else 17))
-            )
+            if entry.key["route"] == "routed_window":
+                sample_m = int(entry.key["rows_bucket"])
+            else:
+                sample_m = (
+                    span[1]
+                    if (span is not None and span[1] is not None)
+                    else max(4096, (span[0] if span and span[0] else 17))
+                )
             assert entry.params.is_legal(
                 face,
                 entry.key["k"],
@@ -1820,3 +1849,185 @@ def test_face_digest_caches_per_face(monkeypatch):
     first = tuning.face_digest(face)
     second = tuning.face_digest(face)
     assert first == second and calls == 1
+
+
+def test_routed_window_policy_schema_and_validation(tmp_path):
+    assert "RoutedWindowPolicy" in tuning.__all__
+    assert "routed_window" in schema.route_names()
+    assert tuning.rows_bucket("routed_window", 1) == "<2"
+    assert tuning.rows_bucket("routed_window", 2) == "2"
+    assert tuning.rows_bucket("routed_window", 3) == "3"
+    assert tuning.rows_bucket("routed_window", 4) == "4"
+    assert tuning.rows_bucket("routed_window", 5) == "5+"
+
+    for mode in ("none", "folded", "unfolded"):
+        pol = schema.params_from_json("routed_window", {"coalesce": mode})
+        assert pol == tuning.RoutedWindowPolicy(coalesce=mode)
+
+    for bad in (
+        {},
+        {"coalesce": "pair"},
+        {"coalesce": True},
+        {"coalesce": 1},
+        {"coalesce": "none", "extra": 1},
+        "none",
+    ):
+        with pytest.raises(ValueError, match="routed_window"):
+            schema.params_from_json("routed_window", bad)
+
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    vpt_reads = DotReads(apply=ApplyRead())
+    plain = _face(key="rw_plain")
+    lut_face = Dot(
+        "rw_lut",
+        vpt_shell,
+        "F",
+        (),
+        tables=(Table("levels", mx.float16, tuple(range(16))),),
+        vpt=16,
+        reads=vpt_reads,
+    )
+    no_vpt = Dot(
+        "rw_novpt",
+        _FACE_SHELL,
+        "F",
+        (),
+        tables=(Table("levels", mx.float16, tuple(range(16))),),
+        vpt=0,
+        reads=DotReads(),
+    )
+
+    none_pol = tuning.RoutedWindowPolicy("none")
+    fold_pol = tuning.RoutedWindowPolicy("folded")
+    unfold_pol = tuning.RoutedWindowPolicy("unfolded")
+    assert none_pol.is_legal(no_vpt, 2560, 1280, 1, CHIP)
+    assert none_pol.is_legal(lut_face, 2560, 1280, 4, CHIP)
+    assert not none_pol.is_legal(lut_face, 0, 1280, 4, CHIP)
+    assert not none_pol.is_legal(lut_face, 2560, 0, 4, CHIP)
+    assert not none_pol.is_legal(lut_face, 2560, 1280, 0, CHIP)
+
+    assert fold_pol.is_legal(lut_face, 2560, 1280, 2, CHIP)
+    assert fold_pol.is_legal(lut_face, 2560, 1280, 3, CHIP)
+    assert not fold_pol.is_legal(lut_face, 2560, 1280, 1, CHIP)
+    assert not fold_pol.is_legal(lut_face, 2560, 1280, 4, CHIP)
+    assert not fold_pol.is_legal(no_vpt, 2560, 1280, 2, CHIP)
+
+    assert unfold_pol.is_legal(lut_face, 2560, 1280, 2, CHIP)
+    assert unfold_pol.is_legal(lut_face, 2560, 1280, 4, CHIP)
+    assert not unfold_pol.is_legal(lut_face, 2560, 1280, 1, CHIP)
+    assert not unfold_pol.is_legal(lut_face, 2560, 1280, 5, CHIP)
+    assert not unfold_pol.is_legal(no_vpt, 2560, 1280, 4, CHIP)
+
+    tuning.register_skeleton("routed_window", "rw-skel-v1")
+    entry = {
+        "key": {
+            "route": "routed_window",
+            "face_id": "*:lut_small",
+            "dtype": "bf16",
+            "bits": 4,
+            "group": 64,
+            "rows_bucket": "4",
+            "n": 1280,
+            "k": 2560,
+        },
+        "face_sha256": "",
+        "skeleton_sha256": tuning.skeleton_digest("routed_window"),
+        "measured_at": "2026-11-24T20:00:00Z",
+        "exactness": "bitwise",
+        "params": {"coalesce": "unfolded"},
+    }
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.reset_cache()
+    hit = tuning.lookup(
+        "routed_window",
+        lut_face,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=1280,
+        k=2560,
+        rows=4,
+        chip=CHIP,
+    )
+    assert hit == unfold_pol
+    miss = tuning.lookup(
+        "routed_window",
+        plain,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=1280,
+        k=2560,
+        rows=4,
+        chip=CHIP,
+    )
+    assert miss is None
+
+
+def test_in_tree_routed_window_entries_match_chips(monkeypatch):
+    from omlx.patches import qwen35_moe_routed_decode as routed
+
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [tuning._V1])
+    if hasattr(routed, "_ensure_tuning_registered"):
+        routed._ensure_tuning_registered()
+    tuning.reset_cache()
+
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    vpt_reads = DotReads(apply=ApplyRead())
+    lut_face = Dot(
+        "oqel_b4_like",
+        vpt_shell,
+        "F",
+        (),
+        tables=(Table("levels", mx.float16, tuple(range(16))),),
+        vpt=16,
+        reads=vpt_reads,
+    )
+    plain = Dot("plain_like", vpt_shell, "F", (), vpt=16, reads=vpt_reads)
+    expected = {
+        "applegpu_g17s_c40": {2: "unfolded", 3: "unfolded", 4: "unfolded"},
+        "applegpu_g15d_c80": {2: "folded", 3: "none", 4: "unfolded"},
+    }
+    for chip, by_rows in expected.items():
+        for dtype in (mx.bfloat16, mx.float16):
+            for rows, want in by_rows.items():
+                got = tuning.lookup(
+                    "routed_window",
+                    lut_face,
+                    dtype=dtype,
+                    bits=4,
+                    group=64,
+                    n=1280,
+                    k=2560,
+                    rows=rows,
+                    chip=chip,
+                )
+                assert got == tuning.RoutedWindowPolicy(want), (chip, dtype, rows, got)
+            assert (
+                tuning.lookup(
+                    "routed_window",
+                    plain,
+                    dtype=dtype,
+                    bits=4,
+                    group=64,
+                    n=1280,
+                    k=2560,
+                    rows=4,
+                    chip=chip,
+                )
+                is None
+            )
+    assert (
+        tuning.lookup(
+            "routed_window",
+            lut_face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=1280,
+            k=2560,
+            rows=4,
+            chip="applegpu_g99z_c1",
+        )
+        is None
+    )

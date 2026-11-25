@@ -2846,3 +2846,144 @@ def test_d090ff51_surviving_mutants(monkeypatch):
             self.lin = p2_lin
 
     assert linear._infer_model_dtype(_OnlyFmt()) == mx.float16
+
+
+def test_warm_moe_model_warms_batched_and_coalesced_verify_zero_proofs(
+    monkeypatch, tmp_path
+):
+    """When per-chip tuning enables single-stream coalescing for M=4,
+    warm_moe_model(mtp_enabled=True) proves both the uncoalesced batched
+    decode Metal (4, 1, H) and the coalesced single-stream verify Metal
+    (1, 4, H), so serving both triggers 0 new proofs."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+    from mlx_vlm.models.switch_layers import SwiGLU
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from omlx.formats import tuning
+    from tests.test_formats_tables import tabled_dot
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    tabled_dot(monkeypatch)
+
+    hidden, inter, experts, top_k = 2560, 640, 256, 10
+    dtype = mx.bfloat16
+    chip = "applegpu_g17s_c40_warmtest"
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    if hasattr(qwen35_moe_routed_decode, "_ensure_tuning_registered"):
+        qwen35_moe_routed_decode._ensure_tuning_registered()
+        skel = tuning.skeleton_digest("routed_window")
+        (v1_dir / f"{chip}.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "chip": chip,
+                    "entries": [
+                        {
+                            "key": {
+                                "route": "routed_window",
+                                "face_id": "*:lut_small",
+                                "dtype": "bf16",
+                                "bits": 4,
+                                "group": 64,
+                                "rows_bucket": "4",
+                                "n": 2 * inter,
+                                "k": hidden,
+                            },
+                            "face_sha256": "",
+                            "skeleton_sha256": skel,
+                            "measured_at": "2026-11-24T20:00:00Z",
+                            "exactness": "bitwise",
+                            "params": {"coalesce": "unfolded"},
+                        }
+                    ],
+                }
+            )
+        )
+    tuning.reset_cache()
+    try:
+        fmt = affine.AffineFormat()
+
+        class _FlashMiniBlock(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_experts = experts
+                self.top_k = top_k
+                self.gate = nn.Linear(hidden, experts, bias=False)
+                self.gate.weight = mx.zeros((experts, hidden), dtype=dtype)
+                sw = VLMSwitchGLU.__new__(VLMSwitchGLU)
+                nn.Module.__init__(sw)
+                sw.activation = SwiGLU()
+                sw.gate_up_proj, _ = _quantized_format_switch(
+                    fmt, experts, 2 * inter, hidden, 4, 64, dtype, seed=1
+                )
+                sw.down_proj, _ = _quantized_format_switch(
+                    fmt, experts, hidden, inter, 4, 64, dtype, seed=2
+                )
+                self.switch_mlp = sw
+                sh = Qwen3_5MLP.__new__(Qwen3_5MLP)
+                nn.Module.__init__(sh)
+                sh.gate_proj, _ = _quantized_format_linear(
+                    fmt, inter, hidden, 8, 128, dtype, seed=3
+                )
+                sh.up_proj, _ = _quantized_format_linear(
+                    fmt, inter, hidden, 8, 128, dtype, seed=4
+                )
+                sh.down_proj, _ = _quantized_format_linear(
+                    fmt, hidden, inter, 8, 128, dtype, seed=5
+                )
+                self.shared_expert = sh
+                self.shared_expert_gate, _ = _quantized_format_linear(
+                    fmt, 1, hidden, 8, 64, dtype, seed=6
+                )
+
+        with testing.verified("qwen4_exp"):
+            block = _FlashMiniBlock()
+            block.eval()
+
+        compiled_ss: dict[tuple[int, ...], bool] = {}
+        orig_window = qwen35_moe_routed_decode._window
+
+        def spy_window(launches, folded, *, single_stream=False):
+            fn = (
+                orig_window(launches, folded, single_stream=single_stream)
+                if hasattr(qwen35_moe_routed_decode, "_coalesce_mode")
+                else orig_window(launches, folded)
+            )
+
+            def traced(x, operands):
+                compiled_ss[tuple(x.shape)] = single_stream
+                return fn(x, operands)
+
+            return traced
+
+        monkeypatch.setattr(qwen35_moe_routed_decode, "_window", spy_window)
+
+        qwen35_moe_routed_decode.warm_moe_model(block, mtp_enabled=True)
+        before = kernels.proof_count()
+
+        plan = qwen35_moe_routed_decode._cached_plan(block, dtype)
+        assert plan is not None and plan.window is not None
+        assert (4, experts, False) in plan.window.ran
+        assert (4, experts, False, "unfolded") in plan.window.ran
+        assert compiled_ss.get((4, 1, hidden)) is False, compiled_ss
+        assert compiled_ss.get((1, 4, hidden)) is True, compiled_ss
+
+        y_batch = qwen35_moe_routed_decode.routed_verify_window(
+            block, mx.zeros((4, 1, hidden), dtype=dtype)
+        )
+        y_single = qwen35_moe_routed_decode.routed_verify_window(
+            block, mx.zeros((1, 4, hidden), dtype=dtype)
+        )
+        assert y_batch is not None and y_single is not None
+        mx.eval(y_batch, y_single)
+        assert kernels.proof_count() == before
+    finally:
+        tuning.reset_cache()

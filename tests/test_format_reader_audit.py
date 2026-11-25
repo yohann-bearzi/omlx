@@ -560,6 +560,10 @@ SCOPE_DECISIONS = {
         A8FACE,
         "tests/test_qwen35_moe_verify_window.py::test_stock_affine_format_router_takes_the_fused_window",
     ),
+    ("omlx/patches/qwen35_moe_routed_decode.py", "_window_coalesce_modes"): (
+        A8FACE,
+        "tests/test_qwen35_moe_verify_window.py::test_routed_window_coalescing_uses_per_chip_data_not_gpu_generation",
+    ),
     ("omlx/patches/qwen35_moe_routed_decode.py", "_window_router_ok"): (
         A8FACE,
         "tests/test_qwen35_moe_verify_window.py::test_stock_affine_format_router_takes_the_fused_window",
@@ -1348,6 +1352,10 @@ EXPECTED = {
         "QuantizedLinear",
     ),
     ("omlx/patches/qwen35_moe_routed_decode.py", "_window_fast"): ("getattr bits",),
+    ("omlx/patches/qwen35_moe_routed_decode.py", "_window_coalesce_modes"): (
+        "getattr bits",
+        "getattr group_size",
+    ),
     ("omlx/patches/qwen35_moe_routed_decode.py", "_window_router_ok"): (
         "QuantizedLinear",
         "read bits",

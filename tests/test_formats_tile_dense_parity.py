@@ -1544,7 +1544,7 @@ def _rows_17_24_shapes():
             entries = json.load(table)["entries"]
         for entry in entries:
             key = entry["key"]
-            if "n" in key and "k" in key:
+            if key.get("route") == "dense_tile" and "n" in key and "k" in key:
                 shapes.add((key["n"], key["k"], key["bits"], key["group"]))
     for n, k in (
         (12288, 2560),

@@ -669,7 +669,9 @@ def test_a_window_of_format_layers_equals_one_token_decode(monkeypatch, engaged)
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("rows", [2, 3, 4])
-def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows, monkeypatch):
+def test_coalesced_window_kernels_equal_one_token_decode(
+    dtype, rows, monkeypatch, tmp_path
+):
     """Pair-coalesced verify-window kernels (3-launch folded and 4-launch
     meta-driven, decoding each shared expert block once for two rows via the
     dot face's decode/apply contract) and the unrolled window down kernel
@@ -677,47 +679,62 @@ def test_coalesced_window_kernels_equal_one_token_decode(dtype, rows, monkeypatc
     # The coalesced path ships for the measured shape only (Flash-Next's
     # windows); the other activation type takes the same shape, and a shape
     # outside the allowlist is covered by its own gating test.
+    from omlx.formats import tuning
     from tests.test_formats_tables import tabled_dot
 
     tabled_dot(monkeypatch)
-    hidden, inter, top_k = 2560, 640, 10
-    block = _block(7, bits=4, hidden=hidden, inter=inter, top_k=top_k, dtype=dtype)
-    plan = _plan(block, mx.zeros((1, 1, hidden), dtype))
-    launches = plan.launches
-    assert launches.window_fast
-    assert launches.window_coalesced_kernel is not None
-    assert launches.window_topk_coalesced_kernel is not None
-    assert launches.window_down_unrolled_kernel is not None
-    w, gu_op, dn_op, sgu_op, sdn_op = plan.operands
-    for step in range(3):
-        x = _inputs(rows, step, hidden=hidden, dtype=dtype)
-        ref = _serial(block, x).reshape(rows, hidden)
-        x2d = mx.reshape(x, (rows, hidden))
-        logits = launches.router(x2d, *w)
-        # 4-launch coalesced gate+up + unrolled down
-        ind, sc, meta, ucount = router.softmax_topk_coalesce(logits, top_k)
-        h_c2 = routed._window_gate_up_coalesced(
-            launches, x2d, meta, ucount, gu_op, sgu_op
-        )
-        y_c2 = routed._window_down(launches, h_c2, ind, sc, dn_op, sdn_op)
-        # 3-launch folded pair-coalesced gate+up + unrolled down
-        h_fc, ind_fc, sc_fc = routed._window_gate_up_topk_coalesced(
-            launches, x2d, logits, gu_op, sgu_op
-        )
-        y_fc = routed._window_down(launches, h_fc, ind_fc, sc_fc, dn_op, sdn_op)
-        mx.eval(ref, y_c2, y_fc, ind, ind_fc, sc, sc_fc)
-        assert mx.array_equal(ind, ind_fc).item()
-        assert _same_bits(sc, sc_fc)
-        assert _same_bits(y_c2, ref)
-        assert _same_bits(y_fc, ref)
+    chip = "applegpu_g17s_c40_bothcoal"
+    v1_dir = tmp_path / "v1"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    _write_routed_window_table(
+        v1_dir, chip, {2: "folded", 3: "unfolded", 4: "unfolded"}
+    )
+    tuning.reset_cache()
+    try:
+        hidden, inter, top_k = 2560, 640, 10
+        block = _block(7, bits=4, hidden=hidden, inter=inter, top_k=top_k, dtype=dtype)
+        plan = _plan(block, mx.zeros((1, 1, hidden), dtype))
+        launches = plan.launches
+        assert launches.window_fast
+        assert launches.window_coalesced_kernel is not None
+        assert launches.window_topk_coalesced_kernel is not None
+        assert launches.window_down_unrolled_kernel is not None
+        w, gu_op, dn_op, sgu_op, sdn_op = plan.operands
+        for step in range(3):
+            x = _inputs(rows, step, hidden=hidden, dtype=dtype)
+            ref = _serial(block, x).reshape(rows, hidden)
+            x2d = mx.reshape(x, (rows, hidden))
+            logits = launches.router(x2d, *w)
+            # 4-launch coalesced gate+up + unrolled down
+            ind, sc, meta, ucount = router.softmax_topk_coalesce(logits, top_k)
+            h_c2 = routed._window_gate_up_coalesced(
+                launches, x2d, meta, ucount, gu_op, sgu_op
+            )
+            y_c2 = routed._window_down(launches, h_c2, ind, sc, dn_op, sdn_op)
+            # 3-launch folded pair-coalesced gate+up + unrolled down
+            h_fc, ind_fc, sc_fc = routed._window_gate_up_topk_coalesced(
+                launches, x2d, logits, gu_op, sgu_op
+            )
+            y_fc = routed._window_down(launches, h_fc, ind_fc, sc_fc, dn_op, sdn_op)
+            mx.eval(ref, y_c2, y_fc, ind, ind_fc, sc, sc_fc)
+            assert mx.array_equal(ind, ind_fc).item()
+            assert _same_bits(sc, sc_fc)
+            assert _same_bits(y_c2, ref)
+            assert _same_bits(y_fc, ref)
+    finally:
+        tuning.reset_cache()
 
 
 def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
-    monkeypatch, engaged
+    monkeypatch, engaged, tmp_path
 ):
-    """A tabled dot face engages the coalesced window kernels at M=2 and M=4
-    (matching one-token serial decode bit for bit), and the new builders carry
-    no uncalled Metal functions or hand-written lookup tables."""
+    """A tabled dot face engages the coalesced window kernels for configured
+    single-stream rows (matching one-token serial decode bit for bit), and the
+    new builders carry no uncalled Metal functions or hand-written lookup
+    tables."""
+    from omlx.formats import tuning
     from tests.test_formats_tables import tabled_dot
     from tests.test_metal_tables import hand_tables
     from tests.test_qwen35_moe_routed_decode import uncalled
@@ -738,10 +755,20 @@ def test_coalesced_window_kernels_engage_for_tabled_face_and_have_no_dead_code(
     ):
         builder.cache_clear()
     tabled_dot(monkeypatch)
-    block = _block(0, bits=4)
-    for rows in (2, 3, 4):
-        for step in range(3):
-            _check(block, _inputs(rows, step), engaged)
+    chip = "applegpu_g15d_c80_deadcode"
+    v1_dir = tmp_path / "v1"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    _write_routed_window_table(v1_dir, chip, {2: "folded", 3: "none", 4: "unfolded"})
+    tuning.reset_cache()
+    try:
+        block = _block(0, bits=4)
+        for rows in (2, 3, 4):
+            for step in range(3):
+                _check(block, _inputs(rows, step), engaged)
+    finally:
+        tuning.reset_cache()
     names = list(built)
     assert any("gate_up_window_coalesced" in n for n in names), names
     assert any("gate_up_topk_coalesced" in n for n in names), names
@@ -955,3 +982,233 @@ def test_biased_or_non_affine_format_router_declines_fused_window():
     non_affine = _stock_affine_format_layer(block.gate)
     object.__setattr__(non_affine, "fmt", object())
     assert not _window_router_ok(non_affine, mx.bfloat16)
+
+
+def _write_routed_window_table(v1_dir, chip, modes_by_row, *, bits=4, group=64):
+    import json
+
+    from omlx.formats import tuning
+
+    if not hasattr(routed, "_ensure_tuning_registered"):
+        return
+    routed._ensure_tuning_registered()
+    skel = tuning.skeleton_digest("routed_window")
+    entries = []
+    for rows, mode in modes_by_row.items():
+        for dtype_name in ("bf16", "fp16"):
+            entries.append(
+                {
+                    "key": {
+                        "route": "routed_window",
+                        "face_id": "*:lut_small",
+                        "dtype": dtype_name,
+                        "bits": bits,
+                        "group": group,
+                        "rows_bucket": str(rows),
+                        "n": 2 * INTER,
+                        "k": HIDDEN,
+                    },
+                    "face_sha256": "",
+                    "skeleton_sha256": skel,
+                    "measured_at": "2026-11-24T20:00:00Z",
+                    "exactness": "bitwise",
+                    "params": {"coalesce": mode},
+                }
+            )
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    (v1_dir / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+
+
+def test_batched_decode_t1_never_coalesces(monkeypatch, tmp_path):
+    """Independent batched decode (B > 1, T == 1) and multi-stream verify
+    (B > 1, T > 1) must NEVER enter pair-coalescing; coalescing applies only
+    to single-stream verify windows (B == 1, T > 1) when enabled by per-chip
+    tuning data."""
+    from omlx.formats import tuning
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    chip = "applegpu_g17s_c40_t1test"
+    v1_dir = tmp_path / "v1"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    _write_routed_window_table(
+        v1_dir, chip, {2: "folded", 3: "unfolded", 4: "unfolded"}
+    )
+    tuning.reset_cache()
+    try:
+        block = _block(7, bits=4)
+        events: list[tuple[str, int]] = []
+
+        def wrap(mod, name):
+            orig = getattr(mod, name)
+
+            def spy(*args, **kwargs):
+                rows = (
+                    args[1].shape[0]
+                    if name != "softmax_topk_coalesce"
+                    else args[0].shape[0]
+                )
+                events.append((name, int(rows)))
+                return orig(*args, **kwargs)
+
+            monkeypatch.setattr(mod, name, spy)
+
+        wrap(routed, "_window_gate_up_coalesced")
+        wrap(routed, "_window_gate_up_topk_coalesced")
+        wrap(routed, "softmax_topk_coalesce")
+        wrap(routed, "_window_gate_up")
+        wrap(routed, "_gate_up_topk")
+
+        # 1. Batched one-token decode (B > 1, T == 1) via patched_call AND direct
+        #    routed_verify_window must NEVER coalesce.
+        for batch in (2, 3, 4):
+            x = _inputs(batch, batch).reshape(batch, 1, HIDDEN)
+            ref = _serial(block, x)
+            events.clear()
+            got_call = block(x)
+            mx.eval(got_call, ref)
+            assert _same_bits(got_call, ref)
+            names = [n for n, _ in events]
+            assert "_window_gate_up_coalesced" not in names, (batch, events)
+            assert "_window_gate_up_topk_coalesced" not in names, (batch, events)
+            assert "softmax_topk_coalesce" not in names, (batch, events)
+            expected = "_gate_up_topk" if batch <= 3 else "_window_gate_up"
+            assert expected in names, (batch, events)
+
+            # Direct routed_verify_window call on (B, 1, hidden) replays the
+            # uncoalesced graph and must not coalesce either.
+            block.__dict__.pop("_omlx_routed_decode_plan", None)
+            events.clear()
+            got_win = routed.routed_verify_window(block, x)
+            assert got_win is not None
+            mx.eval(got_win)
+            assert _same_bits(got_win, ref.reshape(batch, HIDDEN))
+            names = [n for n, _ in events]
+            assert "_window_gate_up_coalesced" not in names, (batch, events)
+            assert "_window_gate_up_topk_coalesced" not in names, (batch, events)
+            assert "softmax_topk_coalesce" not in names, (batch, events)
+
+        # 2. Multi-stream verify (B == 2, T == 2) must NOT coalesce either.
+        x_multi = _inputs(4, 11).reshape(2, 2, HIDDEN)
+        ref_multi = _serial(block, x_multi).reshape(4, HIDDEN)
+        events.clear()
+        got_multi = routed.routed_verify_window(block, x_multi)
+        assert got_multi is not None
+        mx.eval(got_multi, ref_multi)
+        assert _same_bits(got_multi, ref_multi)
+        names = [n for n, _ in events]
+        assert "_window_gate_up_coalesced" not in names, events
+        assert "_window_gate_up_topk_coalesced" not in names, events
+        assert "softmax_topk_coalesce" not in names, events
+        assert "_window_gate_up" in names, events
+
+        # 3. Single-stream verify (B == 1, T > 1) DOES coalesce per tuning data.
+        for t, expect in (
+            (2, "_window_gate_up_topk_coalesced"),
+            (3, "_window_gate_up_coalesced"),
+            (4, "_window_gate_up_coalesced"),
+        ):
+            x_ss = _inputs(t, 20 + t)
+            assert x_ss.shape == (1, t, HIDDEN)
+            ref_ss = _serial(block, x_ss).reshape(t, HIDDEN)
+            events.clear()
+            got_ss = routed.routed_verify_window(block, x_ss)
+            assert got_ss is not None
+            mx.eval(got_ss, ref_ss)
+            assert _same_bits(got_ss, ref_ss)
+            names = [n for n, _ in events]
+            assert names.count(expect) == 2, (t, events)
+
+        # 4. Quantized-router blocks (_window_logits) obey the same rule.
+        qblock = _block(8, bits=4, router_bits=8)
+        xq_batch = _inputs(4, 30).reshape(4, 1, HIDDEN)
+        events.clear()
+        got_qb = routed.routed_verify_window(qblock, xq_batch)
+        assert got_qb is not None
+        mx.eval(got_qb)
+        assert "_window_gate_up_coalesced" not in [n for n, _ in events], events
+        assert "_window_gate_up" in [n for n, _ in events], events
+
+        xq_ss = _inputs(4, 31)
+        events.clear()
+        got_qs = routed.routed_verify_window(qblock, xq_ss)
+        assert got_qs is not None
+        mx.eval(got_qs)
+        assert [n for n, _ in events].count("_window_gate_up_coalesced") == 2, events
+    finally:
+        tuning.reset_cache()
+
+
+def test_routed_window_coalescing_uses_per_chip_data_not_gpu_generation(
+    monkeypatch, tmp_path
+):
+    """Per-chip coalescing decisions come from omlx.formats.tuning DATA (rule 27),
+    never a hand gpu_generation() predicate, and unused coalesced kernels are
+    never constructed."""
+    from omlx.formats import kernels, tuning
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    v1_dir = tmp_path / "v1"
+    chip_fast = "applegpu_g17s_c40_test"
+    chip_off = "applegpu_g15d_c80_test"
+    chip_unknown = "applegpu_g99x_c1_unknown"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    _write_routed_window_table(v1_dir, chip_fast, {2: "none", 3: "none", 4: "unfolded"})
+    _write_routed_window_table(v1_dir, chip_off, {2: "none", 3: "none", 4: "none"})
+    monkeypatch.setattr(
+        kernels,
+        "gpu_generation",
+        lambda: (_ for _ in ()).throw(AssertionError("hand predicate forbidden")),
+    )
+    active = [chip_fast]
+    monkeypatch.setattr(tuning, "current_chip", lambda: active[0])
+    tuning.reset_cache()
+    try:
+        block = _block(7, bits=4)
+        x1 = _inputs(1, 0)
+        plan_fast = _plan(block, x1)
+        assert plan_fast is not None
+        assert plan_fast.launches.window_fast
+        assert plan_fast.launches.window_coalesced
+        assert plan_fast.launches.window_coalesced_kernel is not None
+        assert plan_fast.launches.window_topk_coalesced_kernel is None
+
+        # Run single-stream M=4 (coalesces) and batched (4, 1) (no coalesce),
+        # with gpu_generation() poisoned.
+        assert routed.routed_verify_window(block, _inputs(4, 1)) is not None
+        assert (
+            routed.routed_verify_window(block, _inputs(4, 2).reshape(4, 1, HIDDEN))
+            is not None
+        )
+
+        # Switch to M3-like table where coalescing is disabled: no coalesced
+        # kernels built, distinct window proof.
+        active[0] = chip_off
+        tuning.reset_cache()
+        block.__dict__.pop("_omlx_routed_decode_plan", None)
+        plan_off = _plan(block, x1)
+        assert plan_off is not None
+        assert plan_off.launches.window_fast
+        assert not plan_off.launches.window_coalesced
+        assert plan_off.launches.window_coalesced_kernel is None
+        assert plan_off.launches.window_topk_coalesced_kernel is None
+        assert plan_off.window is not plan_fast.window
+        assert routed.routed_verify_window(block, _inputs(4, 3)) is not None
+
+        # Unknown chip takes the parity floor (no coalescing).
+        active[0] = chip_unknown
+        tuning.reset_cache()
+        block.__dict__.pop("_omlx_routed_decode_plan", None)
+        plan_unk = _plan(block, x1)
+        assert plan_unk is not None
+        assert not plan_unk.launches.window_coalesced
+        assert plan_unk.launches.window_coalesced_kernel is None
+        assert plan_unk.launches.window_topk_coalesced_kernel is None
+    finally:
+        tuning.reset_cache()

@@ -874,7 +874,9 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     assert flash_plan is not None and flash_plan.launches.window_fast
     launches = flash_plan.launches
     assert launches.window_coalesced_kernel is not None
-    assert launches.window_topk_coalesced_kernel is not None
+    assert (launches.window_topk_coalesced_kernel is not None) == (
+        "folded" in launches.window_coalesce_modes
+    )
     assert launches.window_down_unrolled_kernel is not None
     # The unrolled callable is what runs; the rolled one is not built.
     assert launches.window_down_kernel is None
@@ -1361,11 +1363,11 @@ def test_a_graph_that_cannot_be_built_is_raised_and_not_kept(monkeypatch):
     x = _token_of(block)
     experts, built = routed._experts, []
 
-    def refused(*args):
+    def refused(*args, **kwargs):
         built.append(1)
         if len(built) > 1:  # the stand-in's are built, the call's are not
             raise RuntimeError("no launch")
-        return experts(*args)
+        return experts(*args, **kwargs)
 
     monkeypatch.setattr(routed, "_experts", refused)
     with pytest.raises(RuntimeError, match="no launch"):
@@ -2173,11 +2175,11 @@ def test_a_window_graph_that_cannot_be_built_is_raised_and_not_kept(monkeypatch)
     x = _rows_of(block, 1, 3)
     experts, built = routed._experts, []
 
-    def refused(*args):
+    def refused(*args, **kwargs):
         built.append(1)
         if len(built) > 1:  # the stand-in's are built, the call's are not
             raise RuntimeError("no launch")
-        return experts(*args)
+        return experts(*args, **kwargs)
 
     monkeypatch.setattr(routed, "_experts", refused)
     with pytest.raises(RuntimeError, match="no launch"):

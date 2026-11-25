@@ -8409,6 +8409,120 @@
         "x_nreads": 8,
         "param_staging": "group_steps"
       }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "bf16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "2",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "folded"
+      }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "fp16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "2",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "folded"
+      }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "bf16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "3",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "none"
+      }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "fp16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "3",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "none"
+      }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "bf16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "4",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "unfolded"
+      }
+    },
+    {
+      "key": {
+        "route": "routed_window",
+        "face_id": "*:lut_small",
+        "dtype": "fp16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "4",
+        "n": 1280,
+        "k": 2560
+      },
+      "face_sha256": "",
+      "skeleton_sha256": "0a2998a2f93b",
+      "measured_at": "2026-11-24T21:07:00Z",
+      "exactness": "bitwise",
+      "params": {
+        "coalesce": "unfolded"
+      }
     }
   ]
 }
