@@ -732,6 +732,10 @@ EXPECTED = {
     ("omlx/formats/affine.py", "AffineFormat.tile"): ("read bits", "read group_size"),
     ("omlx/formats/kernels.py", "Tables.add"): ("read bits",),
     ("omlx/formats/kernels.py", "Tables.header"): ("read bits",),
+    ("omlx/formats/linear.py", "FormatLinear._bind_one_row_mlx_fast"): (
+        "read bits",
+        "read group_size",
+    ),
     ("omlx/formats/linear.py", "FormatLinear._ordinary"): (
         "read bits",
         "read group_size",
@@ -1412,6 +1416,10 @@ EXPECTED = {
         "QuantizedLinear",
         "type-is " "QuantizedLinear",
     ),
+    ("omlx/patches/qwen35_verify_qmm.py", "_FormatVerifyPlan._build_entry"): (
+        "read bits",
+        "read group_size",
+    ),
     ("omlx/patches/qwen35_verify_qmm.py", "_patch_verify_swiglu._feed_forward"): (
         "read " "bits",
         "read " "group_size",
@@ -1424,6 +1432,10 @@ EXPECTED = {
         "read " "bits",
         "read " "group_size",
         "read " "scales",
+    ),
+    ("omlx/patches/qwen35_verify_qmm.py", "bind_format_verify"): (
+        "read bits",
+        "read group_size",
     ),
     ("omlx/patches/qwen35_verify_qmm.py", "run_route"): (
         "read bits",

@@ -1617,7 +1617,11 @@ def test_m3_wide_rows17_takes_mlx_and_passes_c2():
             )
             assert plan is not None
             assert tile_dense.policy_for(plan, 17, dtype).backend == "mlx"
-            assert tile_dense.policy_for(plan, 18, dtype).backend != "mlx"
+            if (n, k, bits) == (2560, 2560, 8):
+                # Explicit 18-24 entry takes mlx (steel default measured 1.58x slower).
+                assert tile_dense.policy_for(plan, 18, dtype).backend == "mlx"
+            else:
+                assert tile_dense.policy_for(plan, 18, dtype).backend != "mlx"
             for rows in probe:
                 x = _x((rows, k), dtype=dtype, seed=n + k + bits + rows)
                 got = tile_dense.project(plan, x)

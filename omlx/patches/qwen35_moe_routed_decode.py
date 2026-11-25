@@ -1903,7 +1903,7 @@ def warm_engine_dispatch(
     if model is None or not mx.metal.is_available():
         return
     from ..formats import linear
-    from . import row_exact_qmv
+    from . import qwen35_verify_qmm, row_exact_qmv
 
     if prefill_lengths is None:
         resolved_lengths: tuple[int, ...] = (
@@ -1919,7 +1919,10 @@ def warm_engine_dispatch(
         )
     # Catch any post-configure_qwen4_decode wide GDN row_exact_qmv Metals
     # (O(1) no-op for libraries already warmed in warm_moe_model).
-    row_futures = row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled)
+    row_futures = list(row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled) or ())
+    row_futures.extend(
+        qwen35_verify_qmm.warm_model(model, mtp_enabled=mtp_enabled) or ()
+    )
     if row_futures:
         _join_warm_futures(row_futures)
     if stream is not None:
@@ -2181,6 +2184,11 @@ def warm_moe_model(
         row_futures = row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled)
         if row_futures:
             futures.extend(row_futures)
+        from . import qwen35_verify_qmm
+
+        vq_futures = qwen35_verify_qmm.warm_model(model, mtp_enabled=mtp_enabled)
+        if vq_futures:
+            futures.extend(vq_futures)
     except BaseException:
         exc_in_body = True
         raise

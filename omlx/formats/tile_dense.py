@@ -1736,18 +1736,21 @@ def _project_cold(
     if not plan.face.exact_for(x.dtype):
         return None
     rows = x.size // plan.k
+    keep_local = rows > 1
     policy = _policy_for_rows(plan.schedules.get(x.dtype, plan.schedule), rows)
 
     if policy.backend == "mlx":
         mlx_route = _make_mlx_route(plan.bits, plan.group_size)
-        _keep_local(plan, sig, mlx_route)
+        if keep_local:
+            _keep_local(plan, sig, mlx_route)
         return mlx_route(x, *plan.operands)
 
     if policy.backend == "wide":
         shared_key = ("wide", x.shape, x.dtype, plan.n)
         graph = plan.proof.graphs.get(shared_key)
         if graph is not None:
-            _keep_local(plan, sig, graph)
+            if keep_local:
+                _keep_local(plan, sig, graph)
             return graph(x, *plan.operands)
         mm = tile_wide.kernel(plan.face)
         if mm is None:
@@ -1764,7 +1767,8 @@ def _project_cold(
         compiled = mx.compile(graph)
         result = compiled(x, *plan.operands)
         plan.proof.keep(shared_key, compiled)
-        _keep_local(plan, sig, compiled)
+        if keep_local:
+            _keep_local(plan, sig, compiled)
         return result
 
     if policy.backend not in ("steel", "nax"):
@@ -1774,7 +1778,8 @@ def _project_cold(
     shared_key = (x.shape, x.dtype, plan.n, eff_policy)
     graph = plan.proof.graphs.get(shared_key)
     if graph is not None:
-        _keep_local(plan, sig, graph)
+        if keep_local:
+            _keep_local(plan, sig, graph)
         return graph(x, *plan.operands)
 
     mm = _kernel(plan.face, eff_policy)
@@ -1794,7 +1799,8 @@ def _project_cold(
     compiled = mx.compile(graph)
     result = compiled(x, *plan.operands)
     plan.proof.keep(shared_key, compiled)
-    _keep_local(plan, sig, compiled)
+    if keep_local:
+        _keep_local(plan, sig, compiled)
     return result
 
 
@@ -1803,8 +1809,9 @@ def project(plan: DensePlan | None, x: mx.array) -> mx.array | None:
     if plan is None:
         return None
     sig = (x.shape, x.dtype)
-    kept = plan.binding.kept
-    graph = None if kept is None else kept.graphs.get(sig)
-    if graph is not None:
-        return graph(x, *plan.operands)
+    if x.size > plan.k:
+        kept = plan.binding.kept
+        graph = None if kept is None else kept.graphs.get(sig)
+        if graph is not None:
+            return graph(x, *plan.operands)
     return _project_cold(plan, x, sig)

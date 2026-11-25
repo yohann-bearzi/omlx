@@ -1428,6 +1428,11 @@ def warm_model_dispatch(
             b for b in decode_batch_sizes if type(b) is int and 1 < b <= MAX_ROWS
         )
     )
+    verify_batches = tuple(
+        dict.fromkeys(
+            b for b in decode_batch_sizes if type(b) is int and 1 <= b <= MAX_ROWS
+        )
+    )
     verifies = (
         tuple(
             dict.fromkeys(
@@ -1454,11 +1459,15 @@ def warm_model_dispatch(
             )
             qwen = mod._qwen_row_exact is not None
             for dtype in layer_dtypes:
-                # 1. Single-row decode (1, 1, K).
-                _warm_linear_rows_graph(
-                    kept.plan, (1, 1, k), dtype, key=((1, 1, k), dtype)
-                )
-                # 2. Multi-row decode (B, 1, K) and armed verify (1, S, K).
+                # 1. Single-row decode (1, 1, K) -> native dense_fast.
+                sig1 = ((1, 1, k), dtype)
+                if qwen and 1 in kept.mlx_rows:
+                    mod._bind_one_row_mlx_fast(kept, sig1)
+                else:
+                    _warm_linear_rows_graph(kept.plan, (1, 1, k), dtype, key=sig1)
+                    mod._bind_one_row_fast(kept, sig1)
+                # 2. Multi-row decode (B, 1, K), armed verify (1, S, K) and
+                #    batched verify (B, S, K).
                 for b in batches:
                     b_shape = (b, 1, k)
                     if qwen:
@@ -1497,6 +1506,10 @@ def warm_model_dispatch(
                     _warm_linear_rows_graph(
                         kept.plan, s_shape, dtype, key=(s_shape, dtype)
                     )
+                if mtp_enabled and kept.verify is not None:
+                    for vb in verify_batches:
+                        for vs in verifies:
+                            kept.verify.warm_graph((vb, vs, k), dtype)
                 # 3. Prefill (1, L, K) -> dense graph + native FormatLinearFast.
                 if kept.dense is not None:
                     for length in prefills:
@@ -1842,13 +1855,15 @@ class _Kept:
         "dense_fast_sigs",
         "sorted",
         "mlx_rows",
+        "verify",
     )
 
-    def __init__(self, plan, bias, weight, mlx_rows=frozenset()):
+    def __init__(self, plan, bias, weight, mlx_rows=frozenset(), verify=None):
         self.plan = plan
         self.bias = bias
         self.weight = weight
         self.mlx_rows = mlx_rows
+        self.verify = verify
         self.routes = {}
         self.wide = _UNBUILT
         self.dense = _UNBUILT
@@ -2173,8 +2188,14 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
+        plan = _plan(self)
+        verify = None
+        if self._stock and not self._STACK and self.mode == "affine":
+            from ..patches import qwen35_verify_qmm
+
+            verify = qwen35_verify_qmm.bind_format_verify(self, bias)
         kept = self.__dict__[_KEPT] = _Kept(
-            _plan(self),
+            plan,
             bias,
             self[packed_name(self)],
             (
@@ -2184,6 +2205,7 @@ class _FormatLayer(nn.Module):
                 if self._stock and not self._STACK
                 else frozenset()
             ),
+            verify=verify,
         )
         return kept
 
@@ -2490,6 +2512,72 @@ class FormatLinear(_FormatLayer):
                     sigs.add(signature)
             self.__dict__[_FAST] = fast
 
+    def _ensure_dense(self, kept: _Kept) -> tile_dense.DensePlan | None:
+        plan = kept.dense
+        if plan is _UNBUILT:
+            if self.input_dims % 32 or self.output_dims <= 0:
+                kept.dense = None
+                return None
+            plan = self._dense_tile(kept)
+        return plan
+
+    def _bind_one_row_mlx_fast(self, kept: _Kept, sig: tuple) -> None:
+        dense = self._ensure_dense(kept)
+        if dense is None or dense.proof.failed:
+            return
+        if (
+            kept.dense_fast is not None
+            and kept.dense_fast_sigs is not None
+            and sig in kept.dense_fast_sigs
+            and dense.binding.kept is not None
+            and sig in dense.binding.kept.graphs
+        ):
+            self.__dict__[_FAST] = kept.dense_fast
+            return
+        tile_dense._keep_local(
+            dense, sig, tile_dense._make_mlx_route(self.bits, self.group_size)
+        )
+        self._register_fast(kept, dense, sig, proof_state=dense.binding.state)
+
+    def _bind_one_row_fast(self, kept: _Kept, sig: tuple) -> None:
+        plan = kept.plan
+        if plan is None or plan.proof.failed:
+            return
+        graph = plan.proof.graphs.get(sig)
+        if graph is None:
+            return
+        # Share kept.dense_fast only when kept.dense is already built (by
+        # prepare_layer_plans or an earlier prefill) so one-row-only layers do
+        # not allocate a tile_dense Proof; otherwise bind plan's own native fast.
+        dense = kept.dense
+        if (
+            dense is not _UNBUILT
+            and dense is not None
+            and not dense.proof.failed
+            and len(dense.operands) == len(plan.operands)
+            and all(a is b for a, b in zip(dense.operands, plan.operands))
+        ):
+            if (
+                kept.dense_fast is not None
+                and kept.dense_fast_sigs is not None
+                and sig in kept.dense_fast_sigs
+                and dense.binding.kept is not None
+                and sig in dense.binding.kept.graphs
+            ):
+                self.__dict__[_FAST] = kept.dense_fast
+                return
+            if plan.proof.attach(dense.binding):
+                tile_dense._keep_local(dense, sig, graph)
+                self._register_fast(kept, dense, sig, proof_state=dense.binding.state)
+                return
+        plan_fast = kept.routes.get(("native", id(plan)))
+        if plan_fast is not None and sig in kept.routes.get(
+            ("native_sigs", id(plan)), ()
+        ):
+            self.__dict__[_FAST] = plan_fast
+        else:
+            self._register_fast(kept, plan, sig)
+
     def _prefill(self, kept, x, rows, *, armed: bool | None = None):
         """A dense call above MAX_ROWS over the format's tile face via the
         unified direct dense skeleton; None where the call decodes instead."""
@@ -2501,12 +2589,7 @@ class FormatLinear(_FormatLayer):
         if armed:
             # Armed row-exact exactness: rows go serial, bitwise to decode.
             return None
-        plan = kept.dense
-        if plan is _UNBUILT:
-            if self.input_dims % 32 or self.output_dims <= 0:
-                kept.dense = None
-                return None
-            plan = self._dense_tile(kept)
+        plan = self._ensure_dense(kept)
         if plan is None or rows >= plan.row_limit:
             return None
         policy = tile_dense.policy_for(plan, rows, x.dtype)
@@ -2535,6 +2618,12 @@ class FormatLinear(_FormatLayer):
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[packed_name(self)]:
             kept = self._keep()
+        verify = kept.verify
+        verify_armed = verify is not None and verify.is_armed()
+        if verify_armed:
+            y = verify(x)
+            if y is not None:
+                return y
         plan, bias = kept.plan, kept.bias
         row_exact = self._qwen_row_exact
         if row_exact is not None and plan is not None:
@@ -2547,6 +2636,8 @@ class FormatLinear(_FormatLayer):
                 ):
                     # DATA (C7 receipts): this bucket is MLX's own qmv's.
                     y = self._stock_matmul(x)
+                    if not verify_armed and shape[0] == 1 and shape[1] == 1:
+                        self._bind_one_row_mlx_fast(kept, (shape, dtype))
                     return y if bias is None else y + bias
                 if kept.wide is not _UNBUILT and x.size > plan.k:
                     wide = kept.wide
@@ -2578,9 +2669,21 @@ class FormatLinear(_FormatLayer):
         else:
             armed = row_exact is not None and row_exact()
         # A decode step is this, its kept graph's replay and the bias.
+        is_one_row = (
+            plan is not None
+            and len(shape) == 3
+            and shape[0] == 1
+            and shape[1] == 1
+            and shape[2] == plan.k
+            and not armed
+            and not verify_armed
+            and not (row_exact is not None and 1 in kept.mlx_rows)
+        )
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
             y = graph(x, *plan.operands)
+            if is_one_row:
+                self._bind_one_row_fast(kept, (shape, dtype))
         else:
             k = self.input_dims
             if not shape or shape[-1] != k:
@@ -2589,6 +2692,8 @@ class FormatLinear(_FormatLayer):
             rows = x.size // k if k else 0
             if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
+                if y is not None and is_one_row:
+                    self._bind_one_row_fast(kept, (shape, dtype))
             # No row materializes a matrix, stock or plugin.
             if y is None and rows == 0:
                 y = mx.zeros((*shape[:-1], self.output_dims), dtype=dtype)
