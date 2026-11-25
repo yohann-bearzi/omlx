@@ -35,7 +35,7 @@ import mlx.nn as nn
 
 from .. import formats
 from ..patches.module_cache import cached_per_module
-from . import Dot, Tile, kernels, tile_dense
+from . import Dot, Tile, kernels, tile_dense, transforms
 
 logger = logging.getLogger(__name__)
 
@@ -1717,8 +1717,9 @@ def _swiglu(plan, tile, x, indices, limit, row_map=None):
     return _keep_sorted(tile, proof, signature, metal, graph, arrays, mapped, said)
 
 
-# Where a layer keeps what its calls work out of it once: its plan and its
-# bias.
+# Where a layer keeps what its calls work out of it once: its plan, its
+# bias, and the input transform its format declares (the descriptor, the
+# layer's tensors and their key).
 _KEPT = "_omlx_format_call"
 _FAST = "_fast"
 _FAST2 = "_fast2"
@@ -1750,6 +1751,7 @@ class _Kept:
         "sorted",
         "mlx_rows",
         "_slots",
+        "tx",
     )
 
     def __init__(
@@ -1768,6 +1770,7 @@ class _Kept:
         self.sorted = _UNBUILT
         self.mlx_rows = mlx_rows
         self._slots: dict[str, Any] = {}
+        self.tx = None
 
     @property
     def dense(self):
@@ -2126,8 +2129,13 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
+        plan = _plan(self)
+        # _plan refused a placeholder already; bind without a second check
+        # and attach tx before publishing so no concurrent thread or retry
+        # after an error can observe kept with tx=None.
+        bound = formats.input_transform(self, refuse=False)
         built = _Kept(
-            _plan(self),
+            plan,
             bias,
             weight,
             (
@@ -2139,6 +2147,8 @@ class _FormatLayer(nn.Module):
             ),
             weight_key=weight_key,
         )
+        if bound is not None:
+            built.tx = (*bound, transforms.key(bound[0], bound[1]))
         if existing is None:
             kept = self.__dict__.setdefault(_KEPT, built)
             if kept.weight is weight:
@@ -2147,6 +2157,11 @@ class _FormatLayer(nn.Module):
         self.__dict__.pop(_FAST2, None)
         self.__dict__[_KEPT] = built
         return built
+
+    def _prepare_input(self, x: mx.array, kept: _Kept) -> mx.array:
+        """``x`` in the basis the layer's weights are kept in: the format's
+        rotation once (a producer's or a sibling's copy when one is there)."""
+        return x if kept.tx is None else transforms.prepare_bound(kept.tx, x)
 
     def _dense_tile(self, kept: _Kept) -> tile_dense.DensePlan | None:
         """The dense-prefill plan, built once with this chip's schedule and
@@ -2379,7 +2394,10 @@ class FormatLinear(_FormatLayer):
         overwritten; ``_fast2`` holds a second route when a layer's schedule
         alternates between ``dense_fast`` and ``dot_fast``. Ignores and
         retracts publishes from a ``kept`` retired by concurrent mutation."""
-        if self.__dict__.get(_KEPT) is not kept:
+        if (
+            getattr(kept, "tx", None) is not None
+            or self.__dict__.get(_KEPT) is not kept
+        ):
             return
         first = self.__dict__.setdefault(_FAST, fast)
         if first is fast:
@@ -2400,7 +2418,9 @@ class FormatLinear(_FormatLayer):
         dense route (including mma/msg, which inline ``N_size`` inside their
         compiled graph) shares ``dense_fast``. The replay reads this thread's
         graphs of the plan's proof binding, which a failed proof retires."""
-        if "no_dense_fast" in kept._slots:
+        if "no_dense_fast" in kept._slots or kept.tx is not None:
+            # The native fast layer dispatches on the plain input: a
+            # transformed format must rotate first, on every call.
             return
         kept_local = plan.binding.state.get("_kept")
         if kept_local is None or kept_local.graphs.get(signature) is None:
@@ -2414,7 +2434,7 @@ class FormatLinear(_FormatLayer):
     def _register_dot_fast(self, kept, plan, signature: tuple):
         """Have the Dot plan's native replay hold ``signature``: the plan's
         proof keeps this thread's graph, which a failed proof retires."""
-        if "no_dot_fast" in kept._slots:
+        if "no_dot_fast" in kept._slots or kept.tx is not None:
             return
         kept_local = plan.proof._kept
         if kept_local is None or kept_local.graphs.get(signature) is None:
@@ -2449,10 +2469,26 @@ class FormatLinear(_FormatLayer):
                 y = fast2(self, x)
                 if y is not None:
                     return y
-        shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
+        if kept.tx is not None:
+            k = self.input_dims
+            if not x.shape or x.shape[-1] != k:
+                raise ValueError(f"x is (..., {k}), not of shape {x.shape}")
+            if x.size > 0:
+                x = self._prepare_input(x, kept)
+        return self._call_prepared(x, kept)
+
+    def _call_prepared(self, x: mx.array, kept: _Kept | None = None) -> mx.array:
+        """The dense call with ``x`` already in the layer's basis (or with no
+        transform to apply): a fused producer hands rotated activations here
+        without double-rotating."""
+        if kept is None:
+            kept = self.__dict__.get(_KEPT)
+            if kept is None or kept.weight is not self[kept.weight_key]:
+                kept = self._keep()
+        shape, dtype = x.shape, x.dtype
         plan, bias = kept.plan, kept.bias
         if plan is not None:
             # Fast single-row decode path on the already-fetched shape tuple:
@@ -2596,6 +2632,9 @@ class FormatEmbedding(_FormatLayer):
 
     def __call__(self, ids: mx.array) -> mx.array:
         rows = self._decoded(ids.reshape(-1))
+        bound = formats.input_transform(self, refuse=False)
+        if bound is not None and rows.size:
+            rows = transforms.inverse_weight(rows, *bound).astype(rows.dtype)
         return rows.reshape(*ids.shape, self.dims)
 
     def as_linear(self, x: mx.array) -> mx.array:
@@ -2713,8 +2752,12 @@ class FormatSwitchLinear(_FormatLayer):
             kept.sorted = _tile(self)
         return kept.sorted
 
-    def _sorted_swiglu(self, x, indices, limit, token_rows):
-        """The sorted NAX activation of a fused stack, optionally reading token rows."""
+    def _sorted_swiglu(self, x, indices, limit, token_rows, prepared=False):
+        """The sorted NAX activation of a fused stack, optionally reading token rows.
+
+        With ``prepared`` the caller already rotated the rows; otherwise this
+        layer's transform runs once, on the token rows when there are some
+        and never on the sorted rows."""
         if not _nax_host():
             return None
         from ..patches import m5_gather_qmm_nax as nax
@@ -2754,10 +2797,12 @@ class FormatSwitchLinear(_FormatLayer):
                 and row_map.dtype == mx.uint32
                 and int(tokens.shape[0]) * plan.k < 2**32
             ):
-                y = _swiglu(plan, tile, tokens, indices, limit, row_map)
+                rot_tokens = tokens if prepared else self._prepare_input(tokens, kept)
+                y = _swiglu(plan, tile, rot_tokens, indices, limit, row_map)
                 if y is not None:
                     return y
-        return _swiglu(plan, tile, x, indices, limit)
+        rot_x = x if prepared else self._prepare_input(x, kept)
+        return _swiglu(plan, tile, rot_x, indices, limit)
 
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
@@ -2767,11 +2812,35 @@ class FormatSwitchLinear(_FormatLayer):
         # before (its graphs are its proof's alone: an unsorted call never
         # replays one); the rows kernel runs every pair as one mat-vec, in
         # any order; the decode passes the hint on to MLX's gather_mm.
-        shape, dtype = x.shape, x.dtype
-        signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
+        if kept.tx is not None:
+            k = self.input_dims
+            if x.ndim < 2 or x.shape[-1] != k:
+                raise ValueError(f"x is (..., M, {k}), not of shape {x.shape}")
+            if not mx.issubdtype(indices.dtype, mx.integer):
+                raise ValueError(f"indices are integers, not {indices.dtype}")
+            if x.size > 0 and indices.size > 0:
+                x = self._prepare_input(x, kept)
+        return self._call_prepared(x, indices, sorted_indices, kept)
+
+    def _call_prepared(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        sorted_indices: bool = False,
+        kept: _Kept | None = None,
+    ) -> mx.array:
+        """The call with ``x`` already in the layer's basis (or with no
+        transform to apply): a caller that rotates before sorting routes
+        hands the same rotation here instead of rotating twice."""
+        shape, dtype = x.shape, x.dtype
+        signature = (shape, dtype, indices.shape, indices.dtype)
+        if kept is None:
+            kept = self.__dict__.get(_KEPT)
+            if kept is None or kept.weight is not self[kept.weight_key]:
+                kept = self._keep()
         plan, bias = kept.plan, kept.bias
         y = None
         if sorted_indices and plan is not None and _sorts(plan, x, indices):

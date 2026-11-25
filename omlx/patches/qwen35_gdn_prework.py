@@ -1538,6 +1538,8 @@ def _stack_format_inputs(module):
     """Stack the GDN's unequal input projections once for decode and verify."""
     layers = (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a)
     first = layers[0]
+    if not isinstance(first, FormatLinear):
+        return None
     if not all(
         isinstance(layer, FormatLinear)
         and layer.fmt is first.fmt
@@ -1545,6 +1547,8 @@ def _stack_format_inputs(module):
         == (first.input_dims, first.bits, first.group_size)
         for layer in layers
     ):
+        return None
+    if any(formats.input_transform(layer) is not None for layer in layers):
         return None
     k = first.input_dims
     n = sum(layer.output_dims for layer in layers)
@@ -2505,8 +2509,10 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             )
         return result
 
+    decode._omlx_gdn_prework_original = original
     cls.__call__ = decode
     cls._omlx_gdn_prework_patched = True
+    verify._omlx_gdn_prework_original = original_verify
     Qwen3_5BatchInvariantForward._gated_delta = verify
     qwen35_gdn_verify_fused.apply_arrays_cache_replay_patch()
     _PATCHED = True

@@ -139,6 +139,10 @@ def _face(linear, x: mx.array) -> Dot | None:
     # device memory (linear.py's _plan refuses the same).
     if k < 8:
         return None
+    if formats.input_transform(linear) is not None:
+        # The row-exact kernels read the activation as it arrives: a format
+        # that rotates it must reach them through its own prepared rows.
+        return None
     face = formats.dot(linear, k, int(linear[formats.tensor_names(linear)[0]].shape[0]))
     if face is None or not face.exact_for(x.dtype) or face.vpt < 1 or k % face.vpt:
         return None

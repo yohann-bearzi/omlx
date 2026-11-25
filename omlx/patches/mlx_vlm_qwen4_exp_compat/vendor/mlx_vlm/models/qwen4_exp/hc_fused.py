@@ -709,6 +709,8 @@ def _projection_face(projection, k: int, n: int, dtype, inject: bool):
     if projection is None or type(projection) is not FormatLinear:
         return None
     projection.refuse_placeholders()
+    if formats.input_transform(projection, refuse=False) is not None:
+        return None
     if (
         getattr(projection, "input_dims", None) != k
         or getattr(projection, "output_dims", None) != n
