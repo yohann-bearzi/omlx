@@ -106,7 +106,7 @@ import mlx.nn as nn
 import numpy as np
 
 from .. import formats
-from ..formats import Dot, kernels, tuning
+from ..formats import Dot, kernels, transforms, tuning
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 from . import qwen35_moe_router as _router
 from .module_cache import cached_per_module
@@ -926,6 +926,336 @@ def _down_window_combine_kernel():
     )
 
 
+def _gate_up_tx_shared_source(split_out: bool, shared_x: str) -> str:
+    """Shared-expert gate row and shared-expert gate+up/SwiGLU for a
+    transformed block: ``gt`` always reads plain ``x``; ``sg``/``su`` read
+    ``shared_x`` (``rx`` when sharing the routed transform, else plain ``x``)."""
+    gate_dst = "ys[NS]" if split_out else "y[TOPK * NI + NS]"
+    sh_dst = "ys + out_row" if split_out else "y + TOPK * NI + out_row"
+    return (
+        "    if (b == 0) {\n"
+        "      if (simd_gid == 0) {\n"
+        "        qmv_rows<T, K, 1, 0>(gt, 0, gt, 0, x, simd_lid, result);\n"
+        "        if (simd_lid == 0) {\n"
+        f"          {gate_dst} = static_cast<T>(result[0]);\n"
+        "        }\n"
+        "      }\n"
+        "      return;\n"
+        "    }\n"
+        "    if (b <= NS / ROWS) {\n"
+        "      const int out_row = (b - 1) * ROWS + int(simd_gid) * RPS;\n"
+        "      qmv_rows<T, K, RPS, RPS>("
+        f"sg, out_row, su, out_row, {shared_x}, simd_lid, result);\n"
+        f"      swiglu_store<T, RPS>(result, {sh_dst}, simd_lid);\n"
+        "      return;\n"
+        "    }\n"
+        "    b -= 1 + NS / ROWS;\n"
+    )
+
+
+def _gate_up_tx_routed_source(routed_x: bool, split_out: bool, topk: bool) -> str:
+    """Routed gate+up/SwiGLU for a transformed block."""
+    src = "rx" if routed_x else "x"
+    dst = "yr" if split_out else "y"
+    expert_expr = (
+        "size_t(omlx_router_topk<T, NE>::nth(logits, simd_lid, slot))"
+        if topk
+        else "size_t(rhs[slot])"
+    )
+    return (
+        "    const int slot = b / (NI / ROWS);\n"
+        "    const int out_row = (b % (NI / ROWS)) * ROWS + int(simd_gid) * RPS;\n"
+        f"    const size_t expert = {expert_expr};\n"
+        "    qmv_rows<T, K, RPS, RPS>(\n"
+        "        rt, expert * (2 * NI) + out_row,"
+        " rt, expert * (2 * NI) + NI + out_row,\n"
+        f"        {src}, simd_lid, result);\n"
+        f"    swiglu_store<T, RPS>(result, {dst} + size_t(slot) * NI + out_row,"
+        " simd_lid);\n"
+    )
+
+
+@cache
+def _gate_up_tx_kernel(
+    routed: Dot,
+    shared: Dot,
+    gate: Dot,
+    routed_x: bool,
+    split_out: bool,
+    shared_uses_rx: bool,
+):
+    """Folded one-token gate+up/SwiGLU launch for a block with an input
+    transform on gate+up and/or down."""
+    matrices = kernels.Matrices()
+    inputs = ["x"]
+    if routed_x:
+        inputs.append("rx")
+    inputs += [
+        *matrices.add("rt", routed),
+        "rhs",
+        *_add_shared_gate_up(matrices, shared, gate),
+    ]
+    shared_x = "rx" if (routed_x and shared_uses_rx) else "x"
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_tx_decode_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
+            f"_rx{int(routed_x)}_sp{int(split_out)}_srx{int(shared_uses_rx)}"
+        ),
+        input_names=inputs,
+        output_names=["yr", "ys"] if split_out else ["y"],
+        header=_COMMON + _SWIGLU + matrices.header,
+        source=(
+            matrices.declarations
+            + _GATE_UP_HEAD
+            + _gate_up_tx_shared_source(split_out, shared_x)
+            + _gate_up_tx_routed_source(routed_x, split_out, False)
+        ),
+    )
+
+
+@cache
+def _gate_up_window_tx_kernel(
+    routed: Dot,
+    shared: Dot,
+    gate: Dot,
+    routed_x: bool,
+    split_out: bool,
+    shared_uses_rx: bool,
+):
+    """Folded verify-window gate+up/SwiGLU launch for a transformed block."""
+    matrices = kernels.Matrices()
+    inputs = ["x"]
+    if routed_x:
+        inputs.append("rx")
+    inputs += [
+        *matrices.add("rt", routed),
+        "rhs",
+        *_add_shared_gate_up(matrices, shared, gate),
+    ]
+    head = [
+        "    const uint simd_gid = simdgroup_index_in_threadgroup;",
+        "    const uint simd_lid = thread_index_in_simdgroup;",
+        "    constexpr int ROWS = NSG * RPS;",
+        "    const int window_row = int(threadgroup_position_in_grid.y) % M;",
+        "    int b = int(threadgroup_position_in_grid.y) / M;",
+        "    float result[2 * RPS];",
+        "    const auto x_row = x + window_row * K;",
+    ]
+    if routed_x:
+        head.append("    const auto rx_row = rx + window_row * K;")
+    head.append("    const auto rhs_row = rhs + window_row * TOPK;")
+    if split_out:
+        head.append("    const auto yr_row = yr + window_row * (TOPK * NI);")
+        head.append("    const auto ys_row = ys + window_row * (NS + 1);")
+    else:
+        head.append("    const auto y_row = y + window_row * (TOPK * NI + NS + 1);")
+    head += ["    {", "    const auto x = x_row;"]
+    if routed_x:
+        head.append("    const auto rx = rx_row;")
+    head.append("    const auto rhs = rhs_row;")
+    if split_out:
+        head.append("    const auto yr = yr_row;")
+        head.append("    const auto ys = ys_row;")
+    else:
+        head.append("    const auto y = y_row;")
+    shared_x = "rx" if (routed_x and shared_uses_rx) else "x"
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_tx_window_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
+            f"_rx{int(routed_x)}_sp{int(split_out)}_srx{int(shared_uses_rx)}"
+        ),
+        input_names=inputs,
+        output_names=["yr", "ys"] if split_out else ["y"],
+        header=_COMMON + _SWIGLU + matrices.header,
+        source=(
+            matrices.declarations
+            + "\n".join(head)
+            + "\n"
+            + _gate_up_tx_shared_source(split_out, shared_x)
+            + _gate_up_tx_routed_source(routed_x, split_out, False)
+            + "    }\n"
+        ),
+    )
+
+
+@cache
+def _gate_up_topk_tx_kernel(
+    routed: Dot,
+    shared: Dot,
+    gate: Dot,
+    dtype: mx.Dtype,
+    routed_x: bool,
+    split_out: bool,
+    shared_uses_rx: bool,
+):
+    """Folded gate+up/SwiGLU with router softmax + top-k folded in, for a
+    transformed block (one-token decode and 2..3-row verify windows)."""
+    matrices = kernels.Matrices()
+    inputs = ["x"]
+    if routed_x:
+        inputs.append("rx")
+    inputs += [
+        *matrices.add("rt", routed),
+        "logits",
+        *_add_shared_gate_up(matrices, shared, gate),
+    ]
+    head = [
+        "    const uint simd_gid = simdgroup_index_in_threadgroup;",
+        "    const uint simd_lid = thread_index_in_simdgroup;",
+        "    constexpr int ROWS = NSG * RPS;",
+        "    const int window_row = int(threadgroup_position_in_grid.y) % M;",
+        "    int b = int(threadgroup_position_in_grid.y) / M;",
+        "    float result[2 * RPS];",
+        "    const auto x_row = x + window_row * K;",
+    ]
+    if routed_x:
+        head.append("    const auto rx_row = rx + window_row * K;")
+    head += [
+        "    const auto logits_row = logits + window_row * NE;",
+        "    const auto indices_row = indices + window_row * TOPK;",
+        "    const auto scores_row = scores + window_row * TOPK;",
+    ]
+    if split_out:
+        head.append("    const auto yr_row = yr + window_row * (TOPK * NI);")
+        head.append("    const auto ys_row = ys + window_row * (NS + 1);")
+    else:
+        head.append("    const auto y_row = y + window_row * YW;")
+    head += ["    {", "    const auto x = x_row;"]
+    if routed_x:
+        head.append("    const auto rx = rx_row;")
+    head += [
+        "    const auto logits = logits_row;",
+        "    const auto indices = indices_row;",
+        "    const auto scores = scores_row;",
+    ]
+    if split_out:
+        head.append("    const auto yr = yr_row;")
+        head.append("    const auto ys = ys_row;")
+    else:
+        head.append("    const auto y = y_row;")
+    head += [
+        "    if (b == 0 && simd_gid == 1) {",
+        "      omlx_router_topk<T, NE>::template write<TOPK>("
+        "logits, simd_lid, indices, scores);",
+        "      return;",
+        "    }",
+    ]
+    selection = "bf16" if dtype == mx.bfloat16 else "scan"
+    shared_x = "rx" if (routed_x and shared_uses_rx) else "x"
+    return mx.fast.metal_kernel(
+        name=(
+            f"omlx_qwen35_moe_gate_up_topk_tx_{selection}_{routed.key}"
+            f"_shared_{shared.key}_gate_{gate.key}"
+            f"_rx{int(routed_x)}_sp{int(split_out)}_srx{int(shared_uses_rx)}"
+        ),
+        input_names=inputs,
+        output_names=(
+            ["yr", "ys", "indices", "scores"]
+            if split_out
+            else ["y", "indices", "scores"]
+        ),
+        header=_COMMON + _SWIGLU + topk_header(dtype) + matrices.header,
+        source=(
+            matrices.declarations
+            + "\n".join(head)
+            + "\n"
+            + _gate_up_tx_shared_source(split_out, shared_x)
+            + _gate_up_tx_routed_source(routed_x, split_out, True)
+            + "    }\n"
+        ),
+    )
+
+
+_DOWN_TX_SHARED_ROWS = r"""
+    if (slot == TOPK) {
+      qmv_rows<T, KS, RPS, 0>(sd, out_row, sd, out_row, ys, simd_lid, result);
+    } else
+"""
+
+_DOWN_TX_TAIL = (
+    _DOWN_TAIL.replace("x + slot * K", "yr + slot * K")
+    .replace("SHARED_VALUE", "part[TOPK * RPS + int(simd_lid)]")
+    .replace("GATE_VALUE", "ys[KS]")
+)
+
+_DOWN_TX_WINDOW_HEAD = r"""
+    const uint3 tid = threadgroup_position_in_grid;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const int window_row = int(tid.y) % M;
+    const int out_row = int(tid.y) / M * RPS;
+    const int slot = int(simd_gid);
+    threadgroup T part[NPART * RPS];
+    float result[RPS];
+    const auto yr_row = yr + window_row * (TOPK * K);
+    const auto ys_row = ys + window_row * (KS + 1);
+    const auto rhs_row = rhs + window_row * TOPK;
+    const auto scores_row = scores + window_row * TOPK;
+    const auto y_row = y + window_row * N;
+    {
+    const auto yr = yr_row;
+    const auto ys = ys_row;
+    const auto rhs = rhs_row;
+    const auto scores = scores_row;
+    const auto y = y_row;
+"""
+
+
+@cache
+def _down_tx_kernel(routed: Dot, shared: Dot):
+    """Folded one-token down/combine launch reading separate routed (``yr``,
+    transformed) and shared (``ys``, plain) activations."""
+    matrices = kernels.Matrices(unroll_pairs=True)
+    inputs = [
+        "yr",
+        "ys",
+        *matrices.add("rd", routed),
+        *matrices.add("sd", shared),
+        "rhs",
+        "scores",
+    ]
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_down_combine_tx_decode_{routed.key}_shared_{shared.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=_COMMON + matrices.header,
+        source=matrices.declarations
+        + _DOWN_HEAD
+        + _DOWN_TX_SHARED_ROWS
+        + _DOWN_TX_TAIL,
+    )
+
+
+@cache
+def _down_window_tx_kernel(routed: Dot, shared: Dot):
+    """Folded verify-window down/combine launch reading separate routed
+    (``yr``, transformed) and shared (``ys``, plain) activations."""
+    matrices = kernels.Matrices()
+    inputs = [
+        "yr",
+        "ys",
+        *matrices.add("rd", routed),
+        *matrices.add("sd", shared),
+        "rhs",
+        "scores",
+    ]
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_down_combine_tx_window_{routed.key}_shared_{shared.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=_COMMON + matrices.header,
+        source=(
+            matrices.declarations
+            + _DOWN_TX_WINDOW_HEAD
+            + _DOWN_TX_SHARED_ROWS
+            + _DOWN_TX_TAIL
+            + "    }\n"
+        ),
+    )
+
+
 def _plain(layer, *classes) -> bool:
     # Exactly a class whose call is a bare quantized_matmul / gather_qmm, or
     # a quant format's rows over its dot face; subclasses and repacked layers
@@ -1024,6 +1354,12 @@ class _Launches(NamedTuple):
     topk_kernel: object = None  # gate+up with the router top-k folded in
     topk_blocks: int = 0  # its blocks per row
     topk_width: int = 0  # its gate+up output per row
+    routed_x: bool = False  # gate+up reads rotated rx prepared outside compile
+    split_out: bool = False  # folded gate+up writes separate (yr, ys)
+    split_in: bool = False  # folded down reads separate (yr, ys)
+    shared_uses_rx: bool = False  # folded shared gate/up reuses rx
+    d_tx_apply: object = None  # down's InputTransform.apply (None when plain)
+    inter: int = 0  # routed expert intermediate width (NI)
 
 
 class _Plan(NamedTuple):
@@ -1037,6 +1373,30 @@ class _Plan(NamedTuple):
     proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
     window: kernels.Proof | None = None  # theirs; failed: one token still runs
     quantized_router: bool = False  # a verify window's routing is the gate's rows
+    gu_tx: tuple | None = None  # (tx, tensors, key) for gate+up
+    d_tx: tuple | None = None  # (tx, tensors, key) for down
+
+
+def _bind_with_key(layer):
+    bound = formats.input_transform(layer)
+    if bound is None:
+        return None
+    tx, tensors = bound
+    return tx, tensors, transforms.key(tx, tensors)
+
+
+def _transform_proof_key(bound):
+    if bound is None:
+        return None
+    tx, tensors, _ = bound
+    base = (
+        tx.version,
+        tx.kind,
+        tx.block,
+        tx.tensors,
+        tuple((a.shape, a.dtype) for a in tensors),
+    )
+    return base if tx.kind in transforms.KINDS else (*base, tx.apply)
 
 
 def _projection_dot(layer, k: int, n: int) -> Dot | None:
@@ -1051,9 +1411,12 @@ def _projection_dot(layer, k: int, n: int) -> Dot | None:
     return formats.dot(layer, k, n)
 
 
-def _shared_formats(block, hidden: int, dtype: mx.Dtype):
-    """(gate+up, down, gate) dot faces and operands of a foldable shared
-    expert and gate, or None."""
+def _shared_formats(
+    block, hidden: int, dtype: mx.Dtype, gate_up=None, gu_has_tx: bool = False
+):
+    """(width, gate+up, down, gate) dot faces, operands and whether shared
+    gate/up share the routed ``rx`` of a foldable shared expert and gate, or
+    None."""
     from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
 
     shared, gate = block.get("shared_expert"), block.get("shared_expert_gate")
@@ -1068,6 +1431,26 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
     if not all(_plain(layer, nn.QuantizedLinear, FormatLinear) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
+    if (
+        formats.input_transform(down_proj) is not None
+        or formats.input_transform(gate) is not None
+    ):
+        return None
+    s_gate_tx = formats.input_transform(gate_proj)
+    s_up_tx = formats.input_transform(up_proj)
+    if s_gate_tx is None and s_up_tx is None:
+        shared_uses_rx = False
+    elif (
+        gu_has_tx
+        and gate_up is not None
+        and s_gate_tx is not None
+        and s_up_tx is not None
+        and transforms.same_transform(gate_proj, gate_up)
+        and transforms.same_transform(up_proj, gate_up)
+    ):
+        shared_uses_rx = True
+    else:
+        return None
     width = gate_proj[formats.tensor_names(gate_proj)[0]].shape[0]
     gu_fmt = _projection_dot(gate_proj, hidden, width)
     d_fmt = _projection_dot(down_proj, width, hidden)
@@ -1090,6 +1473,7 @@ def _shared_formats(block, hidden: int, dtype: mx.Dtype):
         + _operands(up_proj, gu_fmt)
         + _operands(gate, g_fmt),
         _operands(down_proj, d_fmt),
+        shared_uses_rx,
     )
 
 
@@ -1304,9 +1688,14 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     ):
         return None
     top_k = block.top_k
+    gu_tx = _bind_with_key(gate_up)
+    d_tx = _bind_with_key(down)
+    routed_x = gu_tx is not None
+    d_tx_apply = d_tx[0].apply if d_tx is not None else None
+    transformed = routed_x or d_tx is not None
     gate_up_operands = tuple(_expert_view(a) for a in _operands(gate_up, gu_fmt))
     down_operands = tuple(_expert_view(a) for a in _operands(down, d_fmt))
-    shared = _shared_formats(block, hidden, dtype)
+    shared = _shared_formats(block, hidden, dtype, gate_up=gate_up, gu_has_tx=routed_x)
     if shared is not None and (
         kernels.table_bytes(gu_fmt, shared[1], shared[3]) > formats.TABLE_BYTES
         or kernels.table_bytes(d_fmt, shared[2]) > formats.TABLE_BYTES
@@ -1331,6 +1720,8 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     operands = gate_up_operands + down_operands
     if shared is not None:
         operands += shared[4] + shared[5]
+    split = shared is not None and d_tx is not None
+    shared_uses_rx = shared[6] if shared is not None else False
     key = (
         gu_fmt,
         d_fmt,
@@ -1342,6 +1733,14 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         router is not None,
         dtype,
     )
+    if transformed:
+        key = (
+            *key,
+            routed_x,
+            split,
+            shared_uses_rx,
+            _transform_proof_key(d_tx),
+        )
     proof = kernels.proof("routed_decode", *key)
     gate_up_template = [
         ("T", dtype),
@@ -1374,6 +1773,9 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             topk_kernel=_gate_up_topk_kernel(gu_fmt, None, None, dtype),
             topk_blocks=1 + top_k * inter // rows,
             topk_width=top_k * inter,
+            routed_x=routed_x,
+            d_tx_apply=d_tx_apply,
+            inter=inter,
         )
         return _Plan(
             launches=launches,
@@ -1381,15 +1783,17 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             experts=experts,
             outside=True,
             proof=proof,
+            gu_tx=gu_tx,
+            d_tx=d_tx,
         )
-    width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down = shared
+    width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down, shared_uses_rx = shared
     can_coalesce = gu_fmt.vpt >= 1 and sgu_fmt.vpt >= 1
     # The fast path is decided once, from the layer's own bit width (never the
     # face's name: a key is a name) and the shapes it was measured on. Its
     # kernels are built only inside this decision: a block that never launches
     # them constructs no kernel object for them, which would otherwise move the
     # per-process placement draw of a path whose launches did not change.
-    window_fast = _window_fast(gate_up, gu_fmt, hidden, inter)
+    window_fast = False if transformed else _window_fast(gate_up, gu_fmt, hidden, inter)
     window_coalesce_modes = _window_coalesce_modes(
         gate_up,
         gu_fmt,
@@ -1404,27 +1808,58 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     need_unfolded = "unfolded" in window_coalesce_modes
     need_folded = "folded" in window_coalesce_modes
     window_coalesced = need_unfolded or need_folded
-    window_down_policies = _window_down_policies(
-        down, d_fmt, sd_fmt, hidden, inter, dtype, window_fast
-    )
-    active_down = window_down_policies[2:]
-    need_fused_u0 = any(p.mode == "fused" and not p.unroll_pairs for p in active_down)
-    need_fused_u2 = any(p.mode == "fused" and p.unroll_pairs for p in active_down)
-    need_split_u0 = any(p.mode == "split" and not p.unroll_pairs for p in active_down)
-    need_split_u2 = any(p.mode == "split" and p.unroll_pairs for p in active_down)
-    need_split = need_split_u0 or need_split_u2
-    window_down_rolled = _down_window_kernel(d_fmt, sd_fmt) if need_fused_u0 else None
-    window_down_unrolled = (
-        _down_window_unrolled_kernel(d_fmt, sd_fmt) if need_fused_u2 else None
-    )
-    window_down = window_down_unrolled if need_fused_u2 else window_down_rolled
+    if split:
+        window_down_policies = (
+            tuning.RoutedDownPolicy("fused", _DOWN_ROWS, False),
+        ) * (WINDOW_MAX_ROWS + 1)
+        need_split_u0 = need_split_u2 = need_split = False
+        down_kernel = _down_tx_kernel(d_fmt, sd_fmt)
+        window_down = _down_window_tx_kernel(d_fmt, sd_fmt)
+        window_down_rolled = window_down
+        window_down_unrolled = None
+    else:
+        window_down_policies = _window_down_policies(
+            down, d_fmt, sd_fmt, hidden, inter, dtype, window_fast
+        )
+        active_down = window_down_policies[2:]
+        need_fused_u0 = any(
+            p.mode == "fused" and not p.unroll_pairs for p in active_down
+        )
+        need_fused_u2 = any(p.mode == "fused" and p.unroll_pairs for p in active_down)
+        need_split_u0 = any(
+            p.mode == "split" and not p.unroll_pairs for p in active_down
+        )
+        need_split_u2 = any(p.mode == "split" and p.unroll_pairs for p in active_down)
+        need_split = need_split_u0 or need_split_u2
+        down_kernel = _down_kernel(d_fmt, sd_fmt)
+        window_down_rolled = (
+            _down_window_kernel(d_fmt, sd_fmt) if need_fused_u0 else None
+        )
+        window_down_unrolled = (
+            _down_window_unrolled_kernel(d_fmt, sd_fmt) if need_fused_u2 else None
+        )
+        window_down = window_down_unrolled if need_fused_u2 else window_down_rolled
+    if routed_x or split:
+        gate_up_kernel = _gate_up_tx_kernel(
+            gu_fmt, sgu_fmt, g_fmt, routed_x, split, shared_uses_rx
+        )
+        window_gate_up_kernel = _gate_up_window_tx_kernel(
+            gu_fmt, sgu_fmt, g_fmt, routed_x, split, shared_uses_rx
+        )
+        topk_kernel = _gate_up_topk_tx_kernel(
+            gu_fmt, sgu_fmt, g_fmt, dtype, routed_x, split, shared_uses_rx
+        )
+    else:
+        gate_up_kernel = _gate_up_kernel(gu_fmt, sgu_fmt, g_fmt)
+        window_gate_up_kernel = _gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt)
+        topk_kernel = _gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype)
     launches = _Launches(
         hidden=hidden,
         dtype=dtype,
         top_k=top_k,
         router=router,
         fold=True,
-        gate_up_kernel=_gate_up_kernel(gu_fmt, sgu_fmt, g_fmt),
+        gate_up_kernel=gate_up_kernel,
         gate_up_template=gate_up_template + [("NS", width)],
         gate_up_grid=(
             32,
@@ -1432,10 +1867,10 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             1,
         ),
         gate_up_output=(top_k * inter + width + 1,),
-        down_kernel=_down_kernel(d_fmt, sd_fmt),
+        down_kernel=down_kernel,
         down_template=down_template + [("KS", width), ("NPART", top_k + 1)],
         down_threadgroup=(32, top_k + 1, 1),
-        window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
+        window_gate_up_kernel=window_gate_up_kernel,
         # Construct only the kernels selected by per-chip DATA so unused paths
         # build zero Metal objects and never shift placement draws.
         window_down_kernel=window_down_rolled,
@@ -1469,9 +1904,15 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         window_fast=window_fast,
         window_coalesced=window_coalesced,
         window_coalesce_modes=window_coalesce_modes,
-        topk_kernel=_gate_up_topk_kernel(gu_fmt, sgu_fmt, g_fmt, dtype),
+        topk_kernel=topk_kernel,
         topk_blocks=1 + width // rows + top_k * inter // rows,
         topk_width=top_k * inter + width + 1,
+        routed_x=routed_x,
+        split_out=split,
+        split_in=split,
+        shared_uses_rx=shared_uses_rx,
+        d_tx_apply=d_tx_apply,
+        inter=inter,
     )
     return _Plan(
         launches=launches,
@@ -1487,6 +1928,8 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             window_down_policies,
         ),
         quantized_router=quantized_router,
+        gu_tx=gu_tx,
+        d_tx=d_tx,
     )
 
 
@@ -1503,16 +1946,42 @@ def _routes(plan: _Plan, x) -> bool:
     )
 
 
-def _gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
+def _gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up, *, rx=None):
     """The one-token gate+up/SwiGLU launch on the routing ``indices``."""
+    inputs = (
+        [x, rx, *gate_up, indices, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, indices, *shared_gate_up]
+    )
     return launches.gate_up_kernel(
-        inputs=[x, *gate_up, indices, *shared_gate_up],
+        inputs=inputs,
         template=launches.gate_up_template,
         grid=launches.gate_up_grid,
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
         output_shapes=[launches.gate_up_output],
         output_dtypes=[launches.dtype],
     )[0]
+
+
+def _gate_up_tx(launches: _Launches, x, rx, indices, gate_up, shared_gate_up):
+    """The folded one-token gate+up/SwiGLU launch with separate routed (``yr``)
+    and shared (``ys``) outputs."""
+    inputs = (
+        [x, rx, *gate_up, indices, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, indices, *shared_gate_up]
+    )
+    return launches.gate_up_kernel(
+        inputs=inputs,
+        template=launches.gate_up_template,
+        grid=launches.gate_up_grid,
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[
+            (launches.top_k, launches.inter),
+            (launches.window_shared_width + 1,),
+        ],
+        output_dtypes=[launches.dtype, launches.dtype],
+    )
 
 
 def _down(launches: _Launches, h, indices, scores, shape, down, shared_down, *beside):
@@ -1536,6 +2005,20 @@ def _down(launches: _Launches, h, indices, scores, shape, down, shared_down, *be
     )[0]
 
 
+def _down_tx(launches: _Launches, yr, ys, indices, scores, shape, down, shared_down):
+    """The folded one-token down/combine launch over separate routed (``yr``)
+    and shared (``ys``) activations."""
+    rps = _down_rows(1)
+    return launches.down_kernel(
+        inputs=[yr, ys, *down, *shared_down, indices, scores],
+        template=launches.down_template + [("RPS", rps)],
+        grid=(32, launches.down_threadgroup[1] * launches.hidden // rps, 1),
+        threadgroup=launches.down_threadgroup,
+        output_shapes=[shape],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
 def _topk_folds(launches: _Launches, logits) -> bool:
     return (
         launches.topk_kernel is not None
@@ -1546,19 +2029,48 @@ def _topk_folds(launches: _Launches, logits) -> bool:
     )
 
 
-def _gate_up_topk(launches: _Launches, x, logits, gate_up, shared_gate_up):
+def _gate_up_topk(launches: _Launches, x, logits, gate_up, shared_gate_up, *, rx=None):
     """Gate+up output, indices and scores of every row of ``x`` from its
     router ``logits`` (the rows' softmax + top-k run inside the launch)."""
     rows = x.size // launches.hidden
     top_k, width = launches.top_k, launches.topk_width
+    inputs = (
+        [x, rx, *gate_up, logits, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, logits, *shared_gate_up]
+    )
     return launches.topk_kernel(
-        inputs=[x, *gate_up, logits, *shared_gate_up],
+        inputs=inputs,
         template=launches.gate_up_template
         + [("NE", logits.shape[-1]), ("M", rows), ("YW", width)],
         grid=(32, _GATE_UP_SIMDGROUPS * launches.topk_blocks * rows, 1),
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
         output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
         output_dtypes=[launches.dtype, mx.uint32, launches.dtype],
+    )
+
+
+def _gate_up_topk_tx(launches: _Launches, x, rx, logits, gate_up, shared_gate_up):
+    """Split-output folded gate+up/SwiGLU with router softmax + top-k."""
+    rows = x.size // launches.hidden
+    top_k = launches.top_k
+    inputs = (
+        [x, rx, *gate_up, logits, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, logits, *shared_gate_up]
+    )
+    return launches.topk_kernel(
+        inputs=inputs,
+        template=launches.gate_up_template + [("NE", logits.shape[-1]), ("M", rows)],
+        grid=(32, _GATE_UP_SIMDGROUPS * launches.topk_blocks * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[
+            (rows, top_k, launches.inter),
+            (rows, launches.window_shared_width + 1),
+            (rows, top_k),
+            (rows, top_k),
+        ],
+        output_dtypes=[launches.dtype, launches.dtype, mx.uint32, launches.dtype],
     )
 
 
@@ -1574,16 +2086,43 @@ def _routing(logits, top_k: int):
     return routing
 
 
-def _window_gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
+def _window_gate_up(
+    launches: _Launches, x, indices, gate_up, shared_gate_up, *, rx=None
+):
     rows = x.shape[0]
+    inputs = (
+        [x, rx, *gate_up, indices, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, indices, *shared_gate_up]
+    )
     return launches.window_gate_up_kernel(
-        inputs=[x, *gate_up, indices, *shared_gate_up],
+        inputs=inputs,
         template=launches.gate_up_template + [("M", rows)],
         grid=(32, launches.gate_up_grid[1] * rows, 1),
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
         output_shapes=[(rows, *launches.gate_up_output)],
         output_dtypes=[launches.dtype],
     )[0]
+
+
+def _window_gate_up_tx(launches: _Launches, x, rx, indices, gate_up, shared_gate_up):
+    rows = x.shape[0]
+    inputs = (
+        [x, rx, *gate_up, indices, *shared_gate_up]
+        if rx is not None
+        else [x, *gate_up, indices, *shared_gate_up]
+    )
+    return launches.window_gate_up_kernel(
+        inputs=inputs,
+        template=launches.gate_up_template + [("M", rows)],
+        grid=(32, launches.gate_up_grid[1] * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[
+            (rows, launches.top_k, launches.inter),
+            (rows, launches.window_shared_width + 1),
+        ],
+        output_dtypes=[launches.dtype, launches.dtype],
+    )
 
 
 def _window_gate_up_coalesced(
@@ -1772,6 +2311,27 @@ def _window_metal(rows: int, experts: int, folded: bool, mode: str) -> tuple:
     return (rows, experts, folded) if mode == "none" else (rows, experts, folded, mode)
 
 
+def _window_down_tx(launches: _Launches, yr, ys, indices, scores, down, shared_down):
+    rows = indices.shape[0]
+    rps = _down_rows(rows)
+    return launches.window_down(
+        inputs=[yr, ys, *down, *shared_down, indices, scores],
+        template=launches.down_template + [("RPS", rps), ("M", rows)],
+        grid=(32, launches.down_threadgroup[1] * launches.hidden // rps * rows, 1),
+        threadgroup=launches.down_threadgroup,
+        output_shapes=[(rows, launches.hidden)],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _apply_down_tx(launches: _Launches, yr, d_tensors):
+    shape = yr.shape
+    rotated = launches.d_tx_apply(yr, *d_tensors)
+    return (
+        rotated if rotated.shape == shape else mx.reshape(rotated, shape, stream=mx.gpu)
+    )
+
+
 def _experts(
     launches: _Launches,
     x,
@@ -1780,6 +2340,8 @@ def _experts(
     folded: bool,
     *beside,
     single_stream: bool = False,
+    rx=None,
+    d_tensors=(),
 ):
     """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
     + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for each row
@@ -1793,13 +2355,51 @@ def _experts(
     _, gate_up, down, shared_gate_up, shared_down = operands
     one_token = x.size == launches.hidden
     if one_token:
+        if launches.fold:
+            if folded:
+                if launches.split_out:
+                    yr, ys, indices, scores = _gate_up_topk_tx(
+                        launches, x, rx, logits, gate_up, shared_gate_up
+                    )
+                else:
+                    h, indices, scores = (
+                        _gate_up_topk(
+                            launches, x, logits, gate_up, shared_gate_up, rx=rx
+                        )
+                        if rx is not None
+                        else _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+                    )
+            else:
+                indices, scores = _routing(logits, launches.top_k)
+                if launches.split_out:
+                    yr, ys = _gate_up_tx(
+                        launches, x, rx, indices, gate_up, shared_gate_up
+                    )
+                else:
+                    h = (
+                        _gate_up(launches, x, indices, gate_up, shared_gate_up, rx=rx)
+                        if rx is not None
+                        else _gate_up(launches, x, indices, gate_up, shared_gate_up)
+                    )
+            if launches.split_out:
+                yr = _apply_down_tx(launches, yr, d_tensors)
+                return _down_tx(
+                    launches, yr, ys, indices, scores, x.shape, down, shared_down
+                )
+            return _down(
+                launches, h, indices, scores, x.shape, down, shared_down, *beside
+            )
+        gu_in = rx if launches.routed_x else x
         if folded:
             h, indices, scores = _gate_up_topk(
-                launches, x, logits, gate_up, shared_gate_up
+                launches, gu_in, logits, gate_up, shared_gate_up
             )
         else:
             indices, scores = _routing(logits, launches.top_k)
-            h = _gate_up(launches, x, indices, gate_up, shared_gate_up)
+            h = _gate_up(launches, gu_in, indices, gate_up, shared_gate_up)
+        if launches.d_tx_apply is not None:
+            h = mx.reshape(h, (launches.top_k, launches.inter), stream=mx.gpu)
+            h = _apply_down_tx(launches, h, d_tensors)
         return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
     rows = x.shape[0]
     mode = _coalesce_mode(launches, rows, folded, single_stream)
@@ -1824,10 +2424,31 @@ def _experts(
             launches, x, logits, gate_up, shared_gate_up
         )
     elif folded:
-        h, indices, scores = _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+        if launches.split_out:
+            yr, ys, indices, scores = _gate_up_topk_tx(
+                launches, x, rx, logits, gate_up, shared_gate_up
+            )
+        else:
+            h, indices, scores = (
+                _gate_up_topk(launches, x, logits, gate_up, shared_gate_up, rx=rx)
+                if rx is not None
+                else _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+            )
     else:
         indices, scores = _routing(logits, launches.top_k)
-        h = _window_gate_up(launches, x, indices, gate_up, shared_gate_up)
+        if launches.split_out:
+            yr, ys = _window_gate_up_tx(
+                launches, x, rx, indices, gate_up, shared_gate_up
+            )
+        else:
+            h = (
+                _window_gate_up(launches, x, indices, gate_up, shared_gate_up, rx=rx)
+                if rx is not None
+                else _window_gate_up(launches, x, indices, gate_up, shared_gate_up)
+            )
+    if launches.split_in:
+        yr = _apply_down_tx(launches, yr, d_tensors)
+        return _window_down_tx(launches, yr, ys, indices, scores, down, shared_down)
     return _window_down(launches, h, indices, scores, down, shared_down)
 
 
@@ -1837,6 +2458,25 @@ def _token(launches: _Launches, folded: bool):
     gate's logits where the gate runs as it is, then a shared expert's
     output and its gate's where the launches do not fold them) and the
     plan's operands. It closes over no array."""
+    if launches.routed_x or launches.d_tx_apply is not None:
+
+        def graph(x, outside, operands, rx, d_tensors):
+            if launches.router is None:
+                logits, *outside = outside
+            else:
+                logits = launches.router(x, *operands[0])
+            return _experts(
+                launches,
+                x,
+                logits,
+                operands,
+                folded,
+                *outside,
+                rx=rx if launches.routed_x else None,
+                d_tensors=d_tensors,
+            )
+
+        return graph
 
     def graph(x, outside, operands):
         if launches.router is None:
@@ -1864,6 +2504,7 @@ def _stand_in(
     folded: bool,
     outside,
     operands,
+    d_tensors=(),
     *,
     stream=None,
     single_stream: bool = False,
@@ -1891,25 +2532,42 @@ def _stand_in(
         tuple(((top_k, *a.shape[1:]), a.dtype) for a in down),
         tuple((a.shape, a.dtype) for a in shared_gate_up),
         tuple((a.shape, a.dtype) for a in shared_down),
+        tuple((a.shape, a.dtype) for a in d_tensors),
         tuple((a.shape, a.dtype) for a in outside),
     )
 
     def launch(logits, *made):
         made = iter(made)
-        (x,), *stand_ins, outside = (
+        (x,), *stand_ins, stand_in_d, outside = (
             tuple(next(made) for _ in group) for group in groups
         )
-        launched = [
-            _experts(
-                launches,
-                x,
-                logits,
-                stand_ins,
-                folded,
-                *outside,
-                single_stream=single_stream,
-            )
-        ]
+        rx = x if launches.routed_x else None
+        if launches.routed_x or launches.d_tx_apply is not None:
+            launched = [
+                _experts(
+                    launches,
+                    x,
+                    logits,
+                    stand_ins,
+                    folded,
+                    *outside,
+                    single_stream=single_stream,
+                    rx=rx,
+                    d_tensors=stand_in_d,
+                )
+            ]
+        else:
+            launched = [
+                _experts(
+                    launches,
+                    x,
+                    logits,
+                    stand_ins,
+                    folded,
+                    *outside,
+                    single_stream=single_stream,
+                )
+            ]
         if launches.router is not None:
             launched.append(launches.router(x, *stand_ins[0]))
         return launched
@@ -1975,18 +2633,28 @@ def _decode(block, plan: _Plan, x, graph):
     launches = plan.launches
     if graph is None and not _routes(plan, x):
         return None
+    transformed = plan.gu_tx is not None or plan.d_tx is not None
+    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
+    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
     outside = _outside(block, plan, x)
     if outside is None:
         return None
     if graph is not None:
+        if transformed:
+            return graph(x, outside, plan.operands, rx, d_tensors)
         return graph(x, outside, plan.operands)
     logits = _ranked(1, plan.experts, launches.dtype)
     folded = _topk_folds(launches, logits)
-    stand_in = partial(_stand_in, launches, logits, folded, outside, plan.operands)
+    stand_in = partial(
+        _stand_in, launches, logits, folded, outside, plan.operands, d_tensors
+    )
     if not plan.proof.prove((plan.experts, folded), stand_in, logger, *_SAID):
         return None
     graph = mx.compile(_token(launches, folded))
-    y = graph(x, outside, plan.operands)
+    if transformed:
+        y = graph(x, outside, plan.operands, rx, d_tensors)
+    else:
+        y = graph(x, outside, plan.operands)
     plan.proof.keep((x.shape, x.dtype, plan.experts), graph)
     return y
 
@@ -1996,6 +2664,21 @@ def _window(launches: _Launches, folded: bool, *, single_stream: bool = False):
     operands, for MLX's compile: the router, gate+up and down of every row
     of ``x`` ([B, L, hidden]), the rows ([rows, hidden]) out. It closes over
     no array."""
+    if launches.routed_x or launches.d_tx_apply is not None:
+
+        def graph(x, operands, rx, d_tensors):
+            x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
+            rx_2d = (
+                mx.reshape(rx, (-1, launches.hidden), stream=mx.gpu)
+                if launches.routed_x
+                else None
+            )
+            logits = launches.router(x, *operands[0])
+            return _experts(
+                launches, x, logits, operands, folded, rx=rx_2d, d_tensors=d_tensors
+            )
+
+        return graph
 
     def graph(x, operands):
         x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
@@ -2012,6 +2695,20 @@ def _window_logits(launches: _Launches, folded: bool, *, single_stream: bool = F
     block's quantized gate computed outside it, for MLX's compile: the rows
     of ``x`` ([B, L, hidden]), their logits ([rows, experts]) and the plan's
     operands, the rows ([rows, hidden]) out. It closes over no array."""
+    if launches.routed_x or launches.d_tx_apply is not None:
+
+        def graph(x, logits, operands, rx, d_tensors):
+            x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
+            rx_2d = (
+                mx.reshape(rx, (-1, launches.hidden), stream=mx.gpu)
+                if launches.routed_x
+                else None
+            )
+            return _experts(
+                launches, x, logits, operands, folded, rx=rx_2d, d_tensors=d_tensors
+            )
+
+        return graph
 
     def graph(x, logits, operands):
         x = mx.reshape(x, (-1, launches.hidden), stream=mx.gpu)
@@ -2093,13 +2790,20 @@ def routed_verify_window(block, x):
     # reads nothing else.
     graph = plan.window.graphs.get(window_signature)
     if graph is not None:
+        transformed = plan.gu_tx is not None or plan.d_tx is not None
+        rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
+        d_tensors = () if plan.d_tx is None else plan.d_tx[1]
         if plan.quantized_router:
             rows = x.size // shape[-1]
             launches = plan.launches
             logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
             if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
                 return None
+            if transformed:
+                return graph(x, logits, plan.operands, rx, d_tensors)
             return graph(x, logits, plan.operands)
+        if transformed:
+            return graph(x, plan.operands, rx, d_tensors)
         return graph(x, plan.operands)
     rows = x.size // shape[-1]
     launches = plan.launches
@@ -2112,6 +2816,8 @@ def routed_verify_window(block, x):
         logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
         if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
             return None
+    transformed = plan.gu_tx is not None or plan.d_tx is not None
+    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
     ranked = _ranked(rows, plan.experts, launches.dtype)
     folded = _topk_folds(launches, ranked)
     single_stream = shape[0] == 1 and shape[1] > 1
@@ -2124,6 +2830,7 @@ def routed_verify_window(block, x):
         folded,
         outside,
         plan.operands,
+        d_tensors,
         single_stream=single_stream,
     )
     said = (
@@ -2134,14 +2841,23 @@ def routed_verify_window(block, x):
         _window_metal(rows, plan.experts, folded, mode), stand_in, logger, *said
     ):
         return None
+    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
     if logits is None:
         graph = mx.compile(_window(launches, folded, single_stream=single_stream))
-        y = graph(x, plan.operands)
+        y = (
+            graph(x, plan.operands, rx, d_tensors)
+            if transformed
+            else graph(x, plan.operands)
+        )
     else:
         graph = mx.compile(
             _window_logits(launches, folded, single_stream=single_stream)
         )
-        y = graph(x, logits, plan.operands)
+        y = (
+            graph(x, logits, plan.operands, rx, d_tensors)
+            if transformed
+            else graph(x, logits, plan.operands)
+        )
     plan.window.keep(window_signature, graph)
     return y
 
@@ -2206,7 +2922,15 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
                 # A decode step is the replay of the graph its thread kept.
                 graph = plan.proof.graphs.get((shape, x.dtype, plan.experts))
                 if graph is not None and not plan.outside:
-                    return graph(x, (), plan.operands)
+                    if plan.gu_tx is None and plan.d_tx is None:
+                        return graph(x, (), plan.operands)
+                    rx = (
+                        ()
+                        if plan.gu_tx is None
+                        else transforms.prepare_bound(plan.gu_tx, x)
+                    )
+                    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
+                    return graph(x, (), plan.operands, rx, d_tensors)
                 y = _decode(self, plan, x, graph)
                 if y is not None:
                     return y
@@ -2287,6 +3011,8 @@ def _warm_routed_dispatch(model, *, mtp_enabled: bool = False) -> None:
         if plan is None or plan.proof.failed:
             continue
         launches = plan.launches
+        transformed = plan.gu_tx is not None or plan.d_tx is not None
+        d_tensors = () if plan.d_tx is None else plan.d_tx[1]
         x1_shape = (1, 1, launches.hidden)
         sig1 = (x1_shape, dtype, plan.experts)
         if sig1 not in plan.proof.graphs and router_eligible(
@@ -2304,7 +3030,11 @@ def _warm_routed_dispatch(model, *, mtp_enabled: bool = False) -> None:
                     outside = (mx.zeros((1, 1, plan.experts), dtype), *outside)
                 x1_dummy = mx.zeros(x1_shape, dtype)
                 compiled = mx.compile(_token(launches, folded_1))
-                compiled(x1_dummy, outside, plan.operands)
+                if transformed:
+                    rx1 = () if plan.gu_tx is None else mx.zeros(x1_shape, dtype)
+                    compiled(x1_dummy, outside, plan.operands, rx1, d_tensors)
+                else:
+                    compiled(x1_dummy, outside, plan.operands)
                 plan.proof.keep(sig1, compiled)
         if (
             plan.window is not None
@@ -2344,16 +3074,31 @@ def _warm_routed_dispatch(model, *, mtp_enabled: bool = False) -> None:
                     compiled = mx.compile(
                         _window_logits(launches, folded_w, single_stream=single_stream)
                     )
-                    compiled(
-                        xw_dummy,
-                        mx.zeros((rows, plan.experts), dtype),
-                        plan.operands,
-                    )
+                    logits_dummy = mx.zeros((rows, plan.experts), dtype)
+                    if transformed:
+                        rxw = () if plan.gu_tx is None else mx.zeros(xw_shape, dtype)
+                        compiled(
+                            xw_dummy,
+                            logits_dummy,
+                            plan.operands,
+                            rxw,
+                            d_tensors,
+                        )
+                    else:
+                        compiled(
+                            xw_dummy,
+                            logits_dummy,
+                            plan.operands,
+                        )
                 else:
                     compiled = mx.compile(
                         _window(launches, folded_w, single_stream=single_stream)
                     )
-                    compiled(xw_dummy, plan.operands)
+                    if transformed:
+                        rxw = () if plan.gu_tx is None else mx.zeros(xw_shape, dtype)
+                        compiled(xw_dummy, plan.operands, rxw, d_tensors)
+                    else:
+                        compiled(xw_dummy, plan.operands)
                 plan.window.keep(win_sig, compiled)
 
 
@@ -2614,6 +3359,11 @@ def warm_moe_model(
                     tuple(_Spec(a.shape, a.dtype) for a in group)
                     for group in plan.operands
                 )
+                d_specs = (
+                    tuple(_Spec(a.shape, a.dtype) for a in plan.d_tx[1])
+                    if plan.d_tx is not None
+                    else ()
+                )
                 if router_eligible(_Spec((1, launches.hidden), dtype), plan.experts):
                     folded_1 = _topk_folds(launches, _Spec((1, plan.experts), dtype))
                     outside_1: tuple = ()
@@ -2634,10 +3384,17 @@ def warm_moe_model(
                         folded=folded_1,
                         outside=outside_1,
                         op_specs=op_specs,
+                        d_specs=d_specs,
                     ):
                         logits = _ranked(1, experts, dtype, stream=stream)
                         return _stand_in(
-                            launches, logits, folded, outside, op_specs, stream=stream
+                            launches,
+                            logits,
+                            folded,
+                            outside,
+                            op_specs,
+                            d_specs,
+                            stream=stream,
                         )
 
                     add_task(plan.proof, metal_1, build_decode)
@@ -2682,6 +3439,7 @@ def warm_moe_model(
                                 folded=folded_w,
                                 outside=outside_w,
                                 op_specs=op_specs,
+                                d_specs=d_specs,
                                 single_stream=single_stream,
                             ):
                                 logits = _ranked(rows, experts, dtype, stream=stream)
@@ -2691,6 +3449,7 @@ def warm_moe_model(
                                     folded,
                                     outside,
                                     op_specs,
+                                    d_specs,
                                     stream=stream,
                                     single_stream=single_stream,
                                 )
