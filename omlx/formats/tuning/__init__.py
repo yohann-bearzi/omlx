@@ -29,6 +29,7 @@ from .schema import (
     LoadLifetime,
     MmaTilePolicy,
     ParamStaging,
+    RoutedDownPolicy,
     RoutedWindowPolicy,
     RowExactPolicy,
     RowIndexWidth,
@@ -44,6 +45,7 @@ __all__ = [
     "LoadLifetime",
     "MmaTilePolicy",
     "ParamStaging",
+    "RoutedDownPolicy",
     "RoutedWindowPolicy",
     "RowExactPolicy",
     "RowIndexWidth",
@@ -137,6 +139,15 @@ _ROWS_BUCKETS = {
         (3, 3, "3"),
         (4, 4, "4"),
     ),
+    "routed_down": (
+        (2, 2, "2"),
+        (3, 3, "3"),
+        (4, 4, "4"),
+        (5, 5, "5"),
+        (6, 8, "6-8"),
+        (9, 12, "9-12"),
+        (13, 16, "13-16"),
+    ),
     "dense_qmv": (
         (1, 1, "1"),
         (2, 2, "2"),
@@ -207,6 +218,8 @@ def reset_cache() -> None:
 
 def table_profile(face) -> str:
     """The table class a face falls in: plain, a small or a large LUT."""
+    if not getattr(face, "tables", ()):
+        return "plain"
     size = kernels.table_bytes(face)
     if size == 0:
         return "plain"

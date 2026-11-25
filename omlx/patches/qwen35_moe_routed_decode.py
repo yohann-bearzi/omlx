@@ -108,6 +108,7 @@ from .. import formats
 from ..formats import Dot, kernels, tuning
 from ..formats.affine import AffineFormat
 from ..formats.linear import FormatLinear, FormatSwitchLinear
+from . import qwen35_moe_router as _router
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
     fused_router_topk,
@@ -254,6 +255,107 @@ _DOWN_SHARED_ROWS = r"""
     if (slot == TOPK) {
       qmv_rows<T, KS, RPS, 0>(sd, out_row, sd, out_row, x + TOPK * K, simd_lid, result);
     } else
+"""
+
+# Split verify-window down path (Candidate 3, rules 27/28): avoids 352-thread
+# threadgroup contention on table-backed faces by running (1) 2-simdgroup
+# routed down rows reading strided h directly, (2) overlapping 2-simdgroup
+# pair-shared expert down rows, and (3) barrier-free bitwise combine.
+_WINDOW_DOWN_ROUTED_ROWS = r"""
+    static_assert(N % (NSG * RPS) == 0, "routed down: N must be whole tiles");
+    const uint pair = threadgroup_position_in_grid.y;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const size_t out_row =
+        size_t(threadgroup_position_in_grid.z) * (NSG * RPS) + simd_gid * RPS;
+    const uint m = pair / uint(TOPK);
+    const uint slot = pair % uint(TOPK);
+    const size_t expert = size_t(rhs[pair]);
+    float result[RPS];
+    qmv_rows<T, K, RPS, 0>(
+        rd, expert * N + out_row, rd, expert * N + out_row,
+        x + size_t(m) * YW + size_t(slot) * K, simd_lid, result);
+    if (simd_lid == 0) {
+      store_rows(omlx_iota<RPS>(), result, y + size_t(pair) * N + out_row);
+    }
+"""
+
+_WINDOW_DOWN_SHARED_ROWS = r"""
+    constexpr int RPS = 4;
+    constexpr int NSG = 2;
+    static_assert(
+        N % (NSG * 2 * RPS) == 0,
+        "shared down: N must be whole tiles of 16 outputs");
+    const uint pair = threadgroup_position_in_grid.y;
+    const uint simd_gid = simdgroup_index_in_threadgroup;
+    const uint simd_lid = thread_index_in_simdgroup;
+    const size_t out_row =
+        size_t(threadgroup_position_in_grid.z) * (NSG * 2 * RPS)
+        + simd_gid * (2 * RPS);
+    const int m0 = int(pair) * 2;
+    const int m1 = m0 + 1;
+    const device T* x0 = x + size_t(m0) * YW + TOPK * K;
+    float r0[2 * RPS], r1[2 * RPS];
+    if constexpr (M % 2 == 0) {
+      const device T* x1 = x + size_t(m1) * YW + TOPK * K;
+      qmv_pair_rows<T, KS, RPS>(
+          sd, out_row, sd, out_row + RPS, x0, x1, simd_lid, r0, r1);
+      if (simd_lid == 0) {
+        store_rows(omlx_iota<2 * RPS>(), r0, y + size_t(m0) * N + out_row);
+        store_rows(omlx_iota<2 * RPS>(), r1, y + size_t(m1) * N + out_row);
+      }
+    } else if (m1 < M) {
+      const device T* x1 = x + size_t(m1) * YW + TOPK * K;
+      qmv_pair_rows<T, KS, RPS>(
+          sd, out_row, sd, out_row + RPS, x0, x1, simd_lid, r0, r1);
+      if (simd_lid == 0) {
+        store_rows(omlx_iota<2 * RPS>(), r0, y + size_t(m0) * N + out_row);
+        store_rows(omlx_iota<2 * RPS>(), r1, y + size_t(m1) * N + out_row);
+      }
+    } else {
+      qmv_rows<T, KS, RPS, RPS>(
+          sd, out_row, sd, out_row + RPS, x0, simd_lid, r0);
+      if (simd_lid == 0) {
+        store_rows(omlx_iota<2 * RPS>(), r0, y + size_t(m0) * N + out_row);
+      }
+    }
+"""
+
+_WINDOW_DOWN_COMBINE = r"""
+    const uint h = thread_position_in_grid.x;
+    const uint m = thread_position_in_grid.y;
+    if (h >= uint(N)) {
+      return;
+    }
+    const device T* rp = part + size_t(m) * (TOPK * N) + h;
+    const device T* sc = scores + size_t(m) * TOPK;
+    T lane[8];
+    _Pragma("clang loop unroll(full)")
+    for (int l = 0; l < 8; ++l) {
+      lane[l] = T(0.0f);
+    }
+    _Pragma("clang loop unroll(full)")
+    for (int j = 0; j < TOPK; ++j) {
+      const T p = T(float(rp[size_t(j) * N]) * float(sc[j]));
+      lane[j % 8] = T(float(p) + float(lane[j % 8]));
+    }
+    T acc = lane[0];
+    _Pragma("clang loop unroll(full)")
+    for (int l = 1; l < 8; ++l) {
+      acc = T(float(lane[l]) + float(acc));
+    }
+    const T gv = x[size_t(m) * YW + TOPK * K + KS];
+    T sg;
+    if constexpr (metal::is_same<T, half>::value) {
+      sg = omlx_mlx_sigmoid<T>(gv);
+    } else {
+      const float g = float(gv);
+      const T e = T(1.0f + float(T(metal::precise::exp(metal::abs(g)))));
+      const T sy = T(metal::precise::divide(1.0f, float(e)));
+      sg = g < 0.0f ? sy : T(1.0f - float(sy));
+    }
+    const T sh = T(float(sg) * float(shared_out[size_t(m) * N + h]));
+    y[size_t(m) * N + h] = T(float(acc) + float(sh));
 """
 
 _DOWN_TAIL = r"""
@@ -783,6 +885,47 @@ def _down_window_unrolled_kernel(routed: Dot, shared: Dot):
     )
 
 
+@cache
+def _down_window_routed_rows_kernel(routed: Dot, unroll_pairs: bool):
+    """2-simdgroup routed down-projection reading strided gate+up output ``h``."""
+    matrices = kernels.Matrices(unroll_pairs=unroll_pairs)
+    inputs = ["x", *matrices.add("rd", routed), "rhs"]
+    tag = "_unrolled" if unroll_pairs else ""
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_down_window_routed{tag}_{routed.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations + _WINDOW_DOWN_ROUTED_ROWS,
+    )
+
+
+@cache
+def _down_window_shared_rows_kernel(shared: Dot):
+    """2-simdgroup pair-shared expert down-projection reading strided ``h``."""
+    matrices = kernels.Matrices()
+    inputs = ["x", *matrices.add("sd", shared, pair=True)]
+    return mx.fast.metal_kernel(
+        name=f"omlx_qwen35_moe_down_window_shared_{shared.key}",
+        input_names=inputs,
+        output_names=["y"],
+        header=matrices.header + kernels.STORE_ROWS,
+        source=matrices.declarations + _WINDOW_DOWN_SHARED_ROWS,
+    )
+
+
+@cache
+def _down_window_combine_kernel():
+    """Barrier-free multi-row combine reproducing ``_DOWN_TAIL`` bitwise."""
+    return mx.fast.metal_kernel(
+        name="omlx_qwen35_moe_down_window_combine",
+        input_names=["x", "part", "shared_out", "scores"],
+        output_names=["y"],
+        header=_COMMON,
+        source=_WINDOW_DOWN_COMBINE,
+    )
+
+
 def _plain(layer, *classes) -> bool:
     # Exactly a class whose call is a bare quantized_matmul / gather_qmm, or
     # a quant format's rows over its dot face; subclasses and repacked layers
@@ -867,11 +1010,16 @@ class _Launches(NamedTuple):
     down_template: list
     down_threadgroup: tuple
     window_gate_up_kernel: object = None  # verify-window launches (fold)
-    window_down_kernel: object = None  # the rolled down kernel (not built when fast)
-    window_down: object = None  # the down kernel the window launches
+    window_down_kernel: object = None  # rolled fused down kernel (built when used)
+    window_down: object = None  # primary fused down kernel (legacy inspection)
     window_coalesced_kernel: object = None
     window_topk_coalesced_kernel: object = None
     window_down_unrolled_kernel: object = None
+    window_down_routed_kernel: object = None
+    window_down_routed_unrolled_kernel: object = None
+    window_down_shared_kernel: object = None
+    window_down_combine_kernel: object = None
+    window_down_policies: tuple[tuning.RoutedDownPolicy, ...] = ()
     window_inter: int = 0
     window_shared_width: int = 0
     window_fast: bool = False  # the measured fast path (for the plan's report)
@@ -957,22 +1105,62 @@ def _routed_window_skeleton_text() -> str:
     per-chip coalescing table."""
     return "\n".join(
         (
-            _GATE_UP_WINDOW_COALESCED,
-            _GATE_UP_TOPK_COALESCED,
+            _COMMON,
+            _SWIGLU,
+            _GATE_UP_SHARED,
+            _GATE_UP_ROUTED,
+            _GATE_UP_TOPK_ROUTED,
             _GATE_UP_WINDOW_HEAD,
             _GATE_UP_TOPK_HEAD,
+            _GATE_UP_WINDOW_COALESCED,
+            _GATE_UP_TOPK_COALESCED,
+            kernels._QMV_ROWS,
+            kernels._QMV_PAIR_ROWS,
+            topk_header(mx.bfloat16),
+            topk_header(mx.float16),
+            topk_indices_header(mx.bfloat16),
+            topk_indices_header(mx.float16),
+            _router._coalesce_header(mx.bfloat16),
+            _router._coalesce_header(mx.float16),
+            _router._SOFTMAX_TOPK_COALESCE_SOURCE,
+        )
+    )
+
+
+def _routed_down_skeleton_text() -> str:
+    """Skeleton text hashed by ``omlx.formats.tuning`` for the ``routed_down``
+    per-chip down-projection table."""
+    return "\n".join(
+        (
+            _COMMON,
+            _DOWN_WINDOW_HEAD,
+            _DOWN_SHARED_ROWS,
+            _DOWN_TAIL,
+            _WINDOW_DOWN_ROUTED_ROWS,
+            _WINDOW_DOWN_SHARED_ROWS,
+            _WINDOW_DOWN_COMBINE,
+            kernels._QMV_ROWS,
+            kernels._ROWS_SKELETONS[1],
+            kernels._QMV_PAIR_ROWS,
+            kernels.STORE_ROWS,
         )
     )
 
 
 def _ensure_tuning_registered() -> None:
-    """Register the ``routed_window`` skeleton with ``omlx.formats.tuning``
-    (thread-safe, idempotent; re-registers after test cache clears)."""
-    if tuning.skeleton_digest("routed_window") is not None:
+    """Register the ``routed_window`` and ``routed_down`` skeletons with
+    ``omlx.formats.tuning`` (thread-safe, idempotent; re-registers after test
+    cache clears)."""
+    if (
+        tuning.skeleton_digest("routed_window") is not None
+        and tuning.skeleton_digest("routed_down") is not None
+    ):
         return
     with _TUNING_LOCK:
         if tuning.skeleton_digest("routed_window") is None:
             tuning.register_skeleton("routed_window", _routed_window_skeleton_text())
+        if tuning.skeleton_digest("routed_down") is None:
+            tuning.register_skeleton("routed_down", _routed_down_skeleton_text())
 
 
 def _window_fast(gate_up, gu_fmt, hidden: int, inter: int) -> bool:
@@ -995,6 +1183,7 @@ def _window_coalesce_modes(
     hidden: int,
     inter: int,
     dtype: mx.Dtype,
+    experts: int,
     top_k: int,
     can_coalesce: bool,
     window_fast: bool,
@@ -1002,7 +1191,12 @@ def _window_coalesce_modes(
     """Per-chip single-stream verify-window coalescing mode per row count
     (rule 27/28), resolved once at plan construction from ``omlx.formats.tuning``."""
     none = ("none",) * (_COALESCE_MAX_ROWS + 1)
-    if not (can_coalesce and window_fast):
+    if (
+        not (can_coalesce and window_fast)
+        or experts < 128
+        or experts % 128
+        or experts > 4096
+    ):
         return none
     bits = getattr(gate_up, "bits", None)
     group = getattr(gate_up, "group_size", None)
@@ -1026,6 +1220,44 @@ def _window_coalesce_modes(
         if isinstance(pol, tuning.RoutedWindowPolicy):
             modes[rows] = pol.coalesce
     return tuple(modes)
+
+
+def _window_down_policies(
+    down,
+    d_fmt: Dot,
+    sd_fmt: Dot,
+    hidden: int,
+    inter: int,
+    dtype: mx.Dtype,
+    window_fast: bool,
+) -> tuple[tuning.RoutedDownPolicy, ...]:
+    """Per-chip verify-window down-projection policy per row count (rule 27/28),
+    resolved once at plan construction from ``omlx.formats.tuning``."""
+    default = tuning.RoutedDownPolicy("fused", _DOWN_ROWS, window_fast)
+    policies = [default] * (WINDOW_MAX_ROWS + 1)
+    bits = getattr(down, "bits", None)
+    group = getattr(down, "group_size", None)
+    if type(bits) is not int or bits < 1 or type(group) is not int or group < 1:
+        return tuple(policies)
+    can_split = sd_fmt.vpt >= 1 and hidden % 16 == 0
+    _ensure_tuning_registered()
+    for rows in range(2, WINDOW_MAX_ROWS + 1):
+        pol = tuning.lookup(
+            "routed_down",
+            d_fmt,
+            dtype=dtype,
+            bits=bits,
+            group=group,
+            n=hidden,
+            k=inter,
+            rows=rows,
+        )
+        if not isinstance(pol, tuning.RoutedDownPolicy):
+            continue
+        if pol.mode == "split" and not can_split:
+            continue
+        policies[rows] = pol
+    return tuple(policies)
 
 
 def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
@@ -1163,17 +1395,33 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     # per-process placement draw of a path whose launches did not change.
     window_fast = _window_fast(gate_up, gu_fmt, hidden, inter)
     window_coalesce_modes = _window_coalesce_modes(
-        gate_up, gu_fmt, hidden, inter, dtype, top_k, can_coalesce, window_fast
+        gate_up,
+        gu_fmt,
+        hidden,
+        inter,
+        dtype,
+        experts,
+        top_k,
+        can_coalesce,
+        window_fast,
     )
     need_unfolded = "unfolded" in window_coalesce_modes
     need_folded = "folded" in window_coalesce_modes
     window_coalesced = need_unfolded or need_folded
+    window_down_policies = _window_down_policies(
+        down, d_fmt, sd_fmt, hidden, inter, dtype, window_fast
+    )
+    active_down = window_down_policies[2:]
+    need_fused_u0 = any(p.mode == "fused" and not p.unroll_pairs for p in active_down)
+    need_fused_u2 = any(p.mode == "fused" and p.unroll_pairs for p in active_down)
+    need_split_u0 = any(p.mode == "split" and not p.unroll_pairs for p in active_down)
+    need_split_u2 = any(p.mode == "split" and p.unroll_pairs for p in active_down)
+    need_split = need_split_u0 or need_split_u2
+    window_down_rolled = _down_window_kernel(d_fmt, sd_fmt) if need_fused_u0 else None
     window_down_unrolled = (
-        _down_window_unrolled_kernel(d_fmt, sd_fmt) if window_fast else None
+        _down_window_unrolled_kernel(d_fmt, sd_fmt) if need_fused_u2 else None
     )
-    window_down = (
-        window_down_unrolled if window_fast else _down_window_kernel(d_fmt, sd_fmt)
-    )
+    window_down = window_down_unrolled if need_fused_u2 else window_down_rolled
     launches = _Launches(
         hidden=hidden,
         dtype=dtype,
@@ -1192,9 +1440,9 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         down_template=down_template + [("KS", width), ("NPART", top_k + 1)],
         down_threadgroup=(32, top_k + 1, 1),
         window_gate_up_kernel=_gate_up_window_kernel(gu_fmt, sgu_fmt, g_fmt),
-        # The window launch reads the chosen callable; the rolled kernel is
-        # not built when the unrolled one runs.
-        window_down_kernel=None if window_fast else window_down,
+        # Construct only the kernels selected by per-chip DATA so unused paths
+        # build zero Metal objects and never shift placement draws.
+        window_down_kernel=window_down_rolled,
         window_down=window_down,
         window_coalesced_kernel=(
             _gate_up_window_coalesced_kernel(gu_fmt, sgu_fmt, g_fmt)
@@ -1207,6 +1455,19 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             else None
         ),
         window_down_unrolled_kernel=window_down_unrolled,
+        window_down_routed_kernel=(
+            _down_window_routed_rows_kernel(d_fmt, False) if need_split_u0 else None
+        ),
+        window_down_routed_unrolled_kernel=(
+            _down_window_routed_rows_kernel(d_fmt, True) if need_split_u2 else None
+        ),
+        window_down_shared_kernel=(
+            _down_window_shared_rows_kernel(sd_fmt) if need_split else None
+        ),
+        window_down_combine_kernel=(
+            _down_window_combine_kernel() if need_split else None
+        ),
+        window_down_policies=window_down_policies,
         window_inter=inter,
         window_shared_width=width,
         window_fast=window_fast,
@@ -1222,7 +1483,13 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         experts=experts,
         outside=router is None,
         proof=proof,
-        window=kernels.proof("routed_window", *key, window_fast, window_coalesce_modes),
+        window=kernels.proof(
+            "routed_window",
+            *key,
+            window_fast,
+            window_coalesce_modes,
+            window_down_policies,
+        ),
         quantized_router=quantized_router,
     )
 
@@ -1381,17 +1648,112 @@ def _window_gate_up_topk_coalesced(
     )
 
 
-def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
+def _window_down_fused(
+    launches: _Launches,
+    policy: tuning.RoutedDownPolicy,
+    h,
+    indices,
+    scores,
+    down,
+    shared_down,
+):
     rows = indices.shape[0]
-    rps = _down_rows(rows)
-    return launches.window_down(
+    rps = policy.rps
+    kernel = (
+        launches.window_down_unrolled_kernel
+        if policy.unroll_pairs
+        else launches.window_down_kernel
+    )
+    return kernel(
         inputs=[h, *down, *shared_down, indices, scores],
         template=launches.down_template + [("RPS", rps), ("M", rows)],
-        grid=(32, launches.down_threadgroup[1] * launches.hidden // rps * rows, 1),
+        grid=(32, launches.down_threadgroup[1] * (launches.hidden // rps) * rows, 1),
         threadgroup=launches.down_threadgroup,
         output_shapes=[(rows, launches.hidden)],
         output_dtypes=[launches.dtype],
     )[0]
+
+
+def _window_down_split(
+    launches: _Launches,
+    policy: tuning.RoutedDownPolicy,
+    h,
+    indices,
+    scores,
+    down,
+    shared_down,
+):
+    rows = indices.shape[0]
+    rps = policy.rps
+    nsg = 2
+    top_k = launches.top_k
+    hidden = launches.hidden
+    inter = launches.window_inter
+    ks = launches.window_shared_width
+    yw = launches.topk_width
+    dtype = launches.dtype
+    routed_kernel = (
+        launches.window_down_routed_unrolled_kernel
+        if policy.unroll_pairs
+        else launches.window_down_routed_kernel
+    )
+    part = routed_kernel(
+        inputs=[h, *down, indices],
+        template=[
+            ("T", dtype),
+            ("K", inter),
+            ("N", hidden),
+            ("TOPK", top_k),
+            ("YW", yw),
+            ("RPS", rps),
+            ("NSG", nsg),
+        ],
+        grid=(32, nsg * rows * top_k, hidden // (nsg * rps)),
+        threadgroup=(32, nsg, 1),
+        output_shapes=[(rows, top_k, hidden)],
+        output_dtypes=[dtype],
+    )[0]
+    shared_out = launches.window_down_shared_kernel(
+        inputs=[h, *shared_down],
+        template=[
+            ("T", dtype),
+            ("K", inter),
+            ("KS", ks),
+            ("N", hidden),
+            ("TOPK", top_k),
+            ("YW", yw),
+            ("M", rows),
+        ],
+        grid=(32, 2 * ((rows + 1) // 2), hidden // 16),
+        threadgroup=(32, 2, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[dtype],
+    )[0]
+    return launches.window_down_combine_kernel(
+        inputs=[h, part, shared_out, scores],
+        template=[
+            ("T", dtype),
+            ("K", inter),
+            ("KS", ks),
+            ("N", hidden),
+            ("TOPK", top_k),
+            ("YW", yw),
+        ],
+        grid=(hidden, rows, 1),
+        threadgroup=(min(256, hidden), 1, 1),
+        output_shapes=[(rows, hidden)],
+        output_dtypes=[dtype],
+    )[0]
+
+
+def _window_down(launches: _Launches, h, indices, scores, down, shared_down):
+    rows = indices.shape[0]
+    policy = launches.window_down_policies[rows]
+    if policy.mode == "split":
+        return _window_down_split(
+            launches, policy, h, indices, scores, down, shared_down
+        )
+    return _window_down_fused(launches, policy, h, indices, scores, down, shared_down)
 
 
 def _coalesce_mode(

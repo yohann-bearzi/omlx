@@ -1519,8 +1519,8 @@ _AFFINE_WIDE_AND_SG8_DIGEST = (
 # face Metal (emitted_source/emitted_shared) is unchanged; measured with the
 # plugin staged at 238b9a9 on M5 Max.
 _OQEL_15_DIGESTS = {
-    False: "15 3a43bdfb1505022e273b2e2d4f5f3fc15799fb27838ea465b413bfa2f02696c3",
-    True: "15 381372b7ba0d84f6589d06c1e881c5dde0e8fc96f20488b7a0e0b373474b3d43",
+    False: "15 09f2ad2093050f4e807bcc404881a865feadf636ce490a90ba3e2ba873d43c88",
+    True: "15 e80731a752d7b44834087416c4de22b1781d43a5c9e66025575fc8679bc81685",
 }
 # Captured on release/3 (7e230438). The oQeL face sources are unchanged from
 # ba421f5c (the 15-face digests above), but these 123 builder records include
@@ -1533,8 +1533,8 @@ _OQEL_15_DIGESTS = {
 # shared skeleton (their header moves with it); the other 111, the rolled
 # skeleton and the citations it sizes match the release-3 baseline.
 _OQEL_BUILDER_DIGESTS = {
-    False: "123 4f3543376bc4513c757ca46a6048f75378877611cc84154cc0622800aecad7fa",
-    True: "123 0f3d0f0fcb8491b9f001d0bfd74c62a8f9f749d1ed99e4a7c2cbe5cc9b061908",
+    False: "123 c7d003c0be322d05888ed4ad5a184b98527ac2a6a8d89c4025aab5c328b25692",
+    True: "123 d96cf538dbbee3c8af5040c7b8284215e7da64e6947fa99b57e5323efb472c92",
 }
 
 

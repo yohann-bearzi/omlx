@@ -1212,3 +1212,343 @@ def test_routed_window_coalescing_uses_per_chip_data_not_gpu_generation(
         assert plan_unk.launches.window_topk_coalesced_kernel is None
     finally:
         tuning.reset_cache()
+
+
+def test_coalescing_disabled_when_experts_not_softmax_topk_eligible(
+    monkeypatch, tmp_path
+):
+    """pre-p3-d32d3543 Finding 3: experts not divisible by 128 (or <128 / >4096)
+    cannot use softmax_topk_coalesce, so coalescing must stay disabled and
+    unused coalesced kernels must not be constructed or warmed."""
+    from omlx.formats import tuning
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    chip = "applegpu_g17s_c40_e192"
+    v1_dir = tmp_path / "v1"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    _write_routed_window_table(
+        v1_dir, chip, {2: "unfolded", 3: "unfolded", 4: "unfolded"}
+    )
+    tuning.reset_cache()
+    try:
+        block = _block(7, bits=4, experts=192)
+        plan = _plan(block, _inputs(1, 0))
+        assert plan is not None and plan.window is not None
+        assert plan.launches.window_coalesce_modes == ("none",) * 5
+        assert not plan.launches.window_coalesced
+        assert plan.launches.window_coalesced_kernel is None
+        assert plan.launches.window_topk_coalesced_kernel is None
+        routed.warm_moe_model(block, mtp_enabled=True)
+        assert (4, 192, False, "unfolded") not in plan.window.ran
+    finally:
+        tuning.reset_cache()
+
+
+def test_coalesce_mode_declines_folded_when_unfolded_call():
+    """pre-p3-d32d3543 surviving mutant: folded mode returns 'none' when
+    folded=False (e.g. a non-folded block or M > _TOPK_FOLD_MAX_ROWS)."""
+    block = _block(11, bits=4)
+    plan = _plan(block, _inputs(1, 0))
+    assert plan is not None
+    launches = plan.launches._replace(
+        window_coalesce_modes=("none", "none", "folded", "none", "unfolded")
+    )
+    assert routed._coalesce_mode(launches, 2, True, True) == "folded"
+    assert routed._coalesce_mode(launches, 2, False, True) == "none"
+    assert routed._coalesce_mode(launches, 2, True, False) == "none"
+
+
+def _write_routed_down_table(v1_dir, chip, policies_by_bucket, *, bits=4, group=64):
+    import json
+
+    from omlx.formats import tuning
+
+    routed._ensure_tuning_registered()
+    skel = tuning.skeleton_digest("routed_down")
+    entries = []
+    for bucket, params in policies_by_bucket.items():
+        for dtype_name in ("bf16", "fp16"):
+            entries.append(
+                {
+                    "key": {
+                        "route": "routed_down",
+                        "face_id": "*:lut_small",
+                        "dtype": dtype_name,
+                        "bits": bits,
+                        "group": group,
+                        "rows_bucket": bucket,
+                        "n": HIDDEN,
+                        "k": INTER,
+                    },
+                    "face_sha256": "",
+                    "skeleton_sha256": skel,
+                    "measured_at": "2026-11-25T01:15:00Z",
+                    "exactness": "bitwise",
+                    "params": params,
+                }
+            )
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    (v1_dir / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+
+
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16], ids=["bf16", "fp16"])
+def test_routed_down_split_and_fused_rps8_bitwise_and_dispatch(
+    dtype, monkeypatch, tmp_path
+):
+    """Candidate 3: per-chip DATA selects 2-SG split down+shared+combine (M5)
+    or fused rps=8 (M3), both 100% bitwise equal to serial 1-row decode across
+    even/odd M and bf16/fp16; unused kernels are never built, proofs separate
+    policies, and emitted Metal has zero uncalled helpers or hand tables."""
+    from omlx.formats import tuning
+    from tests.test_formats_affine import uncalled
+    from tests.test_formats_tables import tabled_dot
+    from tests.test_metal_tables import hand_tables
+
+    tabled_dot(monkeypatch)
+    tag = "bf16" if dtype == mx.bfloat16 else "fp16"
+    v1_dir = tmp_path / "v1"
+    chip_split = f"applegpu_g17s_c40_c3_{tag}"
+    chip_fused8 = f"applegpu_g15d_c80_c3_{tag}"
+    chip_unknown = f"applegpu_g99z_c1_c3_{tag}"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    _write_routed_down_table(
+        v1_dir,
+        chip_split,
+        {
+            "4": {"mode": "split", "rps": 4, "unroll_pairs": True},
+            "5": {"mode": "split", "rps": 8, "unroll_pairs": True},
+            "6-8": {"mode": "split", "rps": 8, "unroll_pairs": True},
+            "9-12": {"mode": "split", "rps": 8, "unroll_pairs": True},
+            "13-16": {"mode": "split", "rps": 8, "unroll_pairs": True},
+        },
+    )
+    _write_routed_down_table(
+        v1_dir,
+        chip_fused8,
+        {
+            "6-8": {"mode": "fused", "rps": 8, "unroll_pairs": False},
+            "9-12": {"mode": "fused", "rps": 8, "unroll_pairs": False},
+            "13-16": {"mode": "fused", "rps": 8, "unroll_pairs": False},
+        },
+    )
+    active = [chip_split]
+    monkeypatch.setattr(tuning, "current_chip", lambda: active[0])
+    tuning.reset_cache()
+
+    built: dict[str, tuple[str, str]] = {}
+    orig_mk = mx.fast.metal_kernel
+
+    def spy_mk(**spec):
+        built[spec["name"]] = (spec.get("header", ""), spec["source"])
+        return orig_mk(**spec)
+
+    monkeypatch.setattr(mx.fast, "metal_kernel", spy_mk)
+    for builder in (
+        routed._down_window_routed_rows_kernel,
+        routed._down_window_shared_rows_kernel,
+        routed._down_window_combine_kernel,
+    ):
+        builder.cache_clear()
+
+    split_calls: list[tuple[int, int, bool]] = []
+    fused_calls: list[tuple[int, int, bool]] = []
+    orig_split = routed._window_down_split
+    orig_fused = routed._window_down_fused
+
+    def spy_split(launches, policy, h, indices, scores, down, shared_down):
+        split_calls.append((int(indices.shape[0]), policy.rps, policy.unroll_pairs))
+        return orig_split(launches, policy, h, indices, scores, down, shared_down)
+
+    def spy_fused(launches, policy, h, indices, scores, down, shared_down):
+        fused_calls.append((int(indices.shape[0]), policy.rps, policy.unroll_pairs))
+        return orig_fused(launches, policy, h, indices, scores, down, shared_down)
+
+    monkeypatch.setattr(routed, "_window_down_split", spy_split)
+    monkeypatch.setattr(routed, "_window_down_fused", spy_fused)
+
+    try:
+        block = _block(13, bits=4, dtype=dtype)
+        x1 = _inputs(1, 0, dtype=dtype)
+
+        # 1. Split table (M5-like): builds split unrolled + fused unrolled ONLY.
+        plan_split = _plan(block, x1)
+        assert plan_split is not None and plan_split.window is not None
+        ls = plan_split.launches
+        assert ls.window_down_kernel is None
+        assert ls.window_down_unrolled_kernel is not None
+        assert ls.window_down_routed_kernel is None
+        assert ls.window_down_routed_unrolled_kernel is not None
+        assert ls.window_down_shared_kernel is not None
+        assert ls.window_down_combine_kernel is not None
+
+        for rows, shape in (
+            (2, (2, 1, HIDDEN)),
+            (4, (4, 1, HIDDEN)),
+            (5, (1, 5, HIDDEN)),
+            (8, (4, 2, HIDDEN)),
+            (9, (1, 9, HIDDEN)),
+            (12, (4, 3, HIDDEN)),
+            (16, (4, 4, HIDDEN)),
+        ):
+            x = _inputs(rows, 50 + rows, dtype=dtype).reshape(shape)
+            ref = _serial(block, x).reshape(rows, HIDDEN)
+            split_calls.clear()
+            fused_calls.clear()
+            got = routed.routed_verify_window(block, x)
+            assert got is not None
+            mx.eval(got, ref)
+            assert _same_bits(got, ref), (dtype, rows, shape)
+            if rows < 4:
+                assert fused_calls and not split_calls, (rows, fused_calls, split_calls)
+            else:
+                want_rps = 4 if rows == 4 else 8
+                assert split_calls and not fused_calls, (rows, split_calls, fused_calls)
+                assert all(r == want_rps and u for _, r, u in split_calls), split_calls
+
+        # Verify zero uncalled helpers on the built tabled split kernels, and
+        # zero hand-written tables on table-free affine builds of all 3 builders.
+        new_names = [
+            n
+            for n in built
+            if "down_window_routed" in n
+            or "down_window_shared" in n
+            or "down_window_combine" in n
+        ]
+        assert len(new_names) == 3, new_names
+        for n in new_names:
+            hdr, src = built[n]
+            assert uncalled(hdr + src) == [], n
+        built.clear()
+        dn_aff = affine.face(4, 64, False, dtype)
+        sh_aff = affine.face(8, 128, False, dtype)
+        routed._down_window_routed_rows_kernel.__wrapped__(dn_aff, False)
+        routed._down_window_routed_rows_kernel.__wrapped__(dn_aff, True)
+        routed._down_window_shared_rows_kernel.__wrapped__(sh_aff)
+        routed._down_window_combine_kernel.__wrapped__()
+        assert len(built) == 4, list(built)
+        for n, (hdr, src) in built.items():
+            assert uncalled(hdr + src) == [], n
+            assert not hand_tables(hdr), n
+            assert not hand_tables(src), n
+
+        # 2. Fused rps=8 table (M3-like): builds NO split kernels, distinct proof.
+        active[0] = chip_fused8
+        tuning.reset_cache()
+        block.__dict__.pop("_omlx_routed_decode_plan", None)
+        plan_f8 = _plan(block, x1)
+        assert plan_f8 is not None and plan_f8.window is not None
+        lf = plan_f8.launches
+        assert lf.window_down_kernel is not None
+        assert lf.window_down_unrolled_kernel is not None
+        assert lf.window_down_routed_kernel is None
+        assert lf.window_down_routed_unrolled_kernel is None
+        assert lf.window_down_shared_kernel is None
+        assert lf.window_down_combine_kernel is None
+        assert plan_f8.window is not plan_split.window
+
+        fused_launch_log: list[tuple[str, int]] = []
+        orig_u0_k = lf.window_down_kernel
+        orig_u2_k = lf.window_down_unrolled_kernel
+
+        def spy_k(tag, fn):
+            def wrapped(**kw):
+                rps_val = dict(kw["template"])["RPS"]
+                fused_launch_log.append((tag, rps_val))
+                return fn(**kw)
+
+            return wrapped
+
+        spied_lf = lf._replace(
+            window_down_kernel=spy_k("u0", orig_u0_k),
+            window_down_unrolled_kernel=spy_k("u2", orig_u2_k),
+        )
+        old_entry = block.__dict__["_omlx_routed_decode_plan"]
+        block.__dict__["_omlx_routed_decode_plan"] = (
+            *old_entry[:-1],
+            plan_f8._replace(launches=spied_lf),
+        )
+
+        for rows, shape in (
+            (4, (4, 1, HIDDEN)),
+            (6, (1, 6, HIDDEN)),
+            (8, (4, 2, HIDDEN)),
+            (16, (4, 4, HIDDEN)),
+        ):
+            x = _inputs(rows, 80 + rows, dtype=dtype).reshape(shape)
+            ref = _serial(block, x).reshape(rows, HIDDEN)
+            split_calls.clear()
+            fused_calls.clear()
+            fused_launch_log.clear()
+            got = routed.routed_verify_window(block, x)
+            assert got is not None
+            mx.eval(got, ref)
+            assert _same_bits(got, ref), (dtype, rows, shape)
+            assert fused_calls and not split_calls
+            want_rps = 4 if rows < 6 else 8
+            want_u2 = rows < 6
+            want_tag = "u2" if want_u2 else "u0"
+            assert all(
+                r == want_rps and u is want_u2 for _, r, u in fused_calls
+            ), fused_calls
+            assert fused_launch_log and all(
+                t == want_tag and r == want_rps for t, r in fused_launch_log
+            ), fused_launch_log
+
+        # 3. Unknown chip: parity default (fused rps=4 unrolled, no split, no rolled).
+        active[0] = chip_unknown
+        tuning.reset_cache()
+        block.__dict__.pop("_omlx_routed_decode_plan", None)
+        plan_unk = _plan(block, x1)
+        assert plan_unk is not None
+        lu = plan_unk.launches
+        assert lu.window_down_kernel is None
+        assert lu.window_down_unrolled_kernel is not None
+        assert lu.window_down_routed_kernel is None
+        assert lu.window_down_routed_unrolled_kernel is None
+        assert lu.window_down_shared_kernel is None
+        assert lu.window_down_combine_kernel is None
+    finally:
+        tuning.reset_cache()
+
+
+def test_routed_down_split_declines_when_shared_face_has_no_vpt(monkeypatch, tmp_path):
+    """When shared_expert.down_proj's Dot face has vpt == 0 (no pair/shared
+    contract), split mode falls back to fused instead of crashing."""
+    from dataclasses import replace
+
+    from omlx.formats import tuning
+    from tests.test_formats_tables import tabled_dot
+
+    tabled_dot(monkeypatch)
+    v1_dir = tmp_path / "v1"
+    chip = "applegpu_g17s_c40_novpt_sh"
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    _write_routed_down_table(
+        v1_dir, chip, {"4": {"mode": "split", "rps": 4, "unroll_pairs": True}}
+    )
+    tuning.reset_cache()
+    orig_proj = routed._projection_dot
+
+    def no_vpt_shared_down(layer, k, n):
+        face = orig_proj(layer, k, n)
+        if face is not None and k == INTER and n == HIDDEN and not face.tables:
+            return replace(face, vpt=0)
+        return face
+
+    monkeypatch.setattr(routed, "_projection_dot", no_vpt_shared_down)
+    try:
+        block = _block(15, bits=4)
+        plan = _plan(block, _inputs(1, 0))
+        assert plan is not None
+        assert plan.launches.window_down_policies[4].mode == "fused"
+        assert plan.launches.window_down_shared_kernel is None
+    finally:
+        tuning.reset_cache()

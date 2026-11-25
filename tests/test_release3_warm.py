@@ -2987,3 +2987,162 @@ def test_warm_moe_model_warms_batched_and_coalesced_verify_zero_proofs(
         assert kernels.proof_count() == before
     finally:
         tuning.reset_cache()
+
+
+def test_warm_moe_model_mtp_false_skips_coalesced_and_warms_routed_down(
+    monkeypatch, tmp_path
+):
+    """pre-p3-d32d3543 surviving mutant (:2287) + Candidate 3 warm:
+    - mtp_enabled=False with a coalescing table must NOT prove coalesced
+      single-stream window metals, while still warming M=4 split routed_down.
+    - mtp_enabled=True with a routed_down split table warms M=4 (rps=4) and
+      M=8/16 (rps=8) split Metals so serving them triggers 0 new proofs."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+    from mlx_vlm.models.switch_layers import SwiGLU
+    from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
+
+    from omlx.formats import tuning
+    from tests.test_formats_tables import tabled_dot
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    tabled_dot(monkeypatch)
+
+    hidden, inter, experts, top_k = 2560, 640, 256, 10
+    dtype = mx.bfloat16
+    chip = "applegpu_g17s_c40_warm_c3"
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    qwen35_moe_routed_decode._ensure_tuning_registered()
+    rw_skel = tuning.skeleton_digest("routed_window")
+    rd_skel = tuning.skeleton_digest("routed_down")
+    assert rd_skel is not None
+    entries = [
+        {
+            "key": {
+                "route": "routed_window",
+                "face_id": "*:lut_small",
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "rows_bucket": "4",
+                "n": 2 * inter,
+                "k": hidden,
+            },
+            "face_sha256": "",
+            "skeleton_sha256": rw_skel,
+            "measured_at": "2026-11-25T01:15:00Z",
+            "exactness": "bitwise",
+            "params": {"coalesce": "unfolded"},
+        },
+        {
+            "key": {
+                "route": "routed_down",
+                "face_id": "*:lut_small",
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "rows_bucket": "4",
+                "n": hidden,
+                "k": inter,
+            },
+            "face_sha256": "",
+            "skeleton_sha256": rd_skel,
+            "measured_at": "2026-11-25T01:15:00Z",
+            "exactness": "bitwise",
+            "params": {"mode": "split", "rps": 4, "unroll_pairs": True},
+        },
+        {
+            "key": {
+                "route": "routed_down",
+                "face_id": "*:lut_small",
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "rows_bucket": "6-8",
+                "n": hidden,
+                "k": inter,
+            },
+            "face_sha256": "",
+            "skeleton_sha256": rd_skel,
+            "measured_at": "2026-11-25T01:15:00Z",
+            "exactness": "bitwise",
+            "params": {"mode": "split", "rps": 8, "unroll_pairs": True},
+        },
+    ]
+    (v1_dir / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    tuning.reset_cache()
+    try:
+        fmt = affine.AffineFormat()
+
+        class _FlashC3Block(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.num_experts = experts
+                self.top_k = top_k
+                self.gate = nn.Linear(hidden, experts, bias=False)
+                self.gate.weight = mx.zeros((experts, hidden), dtype=dtype)
+                sw = VLMSwitchGLU.__new__(VLMSwitchGLU)
+                nn.Module.__init__(sw)
+                sw.activation = SwiGLU()
+                sw.gate_up_proj, _ = _quantized_format_switch(
+                    fmt, experts, 2 * inter, hidden, 4, 64, dtype, seed=11
+                )
+                sw.down_proj, _ = _quantized_format_switch(
+                    fmt, experts, hidden, inter, 4, 64, dtype, seed=12
+                )
+                self.switch_mlp = sw
+                sh = Qwen3_5MLP.__new__(Qwen3_5MLP)
+                nn.Module.__init__(sh)
+                sh.gate_proj, _ = _quantized_format_linear(
+                    fmt, inter, hidden, 8, 128, dtype, seed=13
+                )
+                sh.up_proj, _ = _quantized_format_linear(
+                    fmt, inter, hidden, 8, 128, dtype, seed=14
+                )
+                sh.down_proj, _ = _quantized_format_linear(
+                    fmt, hidden, inter, 8, 128, dtype, seed=15
+                )
+                self.shared_expert = sh
+                self.shared_expert_gate, _ = _quantized_format_linear(
+                    fmt, 1, hidden, 8, 64, dtype, seed=16
+                )
+
+        with testing.verified("qwen4_exp"):
+            block = _FlashC3Block()
+            block.eval()
+
+        # mtp_enabled=False: warms batched M=4 split, skips coalesced single-stream.
+        qwen35_moe_routed_decode.warm_moe_model(block, mtp_enabled=False)
+        plan = qwen35_moe_routed_decode._cached_plan(block, dtype)
+        assert plan is not None and plan.window is not None
+        assert (4, experts, False) in plan.window.ran
+        assert (4, experts, False, "unfolded") not in plan.window.ran
+        before_off = kernels.proof_count()
+        y4 = qwen35_moe_routed_decode.routed_verify_window(
+            block, mx.zeros((4, 1, hidden), dtype=dtype)
+        )
+        assert y4 is not None
+        mx.eval(y4)
+        assert kernels.proof_count() == before_off
+
+        # mtp_enabled=True: also warms M=8 split rps=8 -> zero new proofs at (4, 2, H).
+        qwen35_moe_routed_decode.warm_moe_model(block, mtp_enabled=True)
+        assert (8, experts, False) in plan.window.ran
+        before_mtp = kernels.proof_count()
+        y8 = qwen35_moe_routed_decode.routed_verify_window(
+            block, mx.zeros((4, 2, hidden), dtype=dtype)
+        )
+        assert y8 is not None
+        mx.eval(y8)
+        assert kernels.proof_count() == before_mtp
+    finally:
+        tuning.reset_cache()

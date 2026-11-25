@@ -873,14 +873,26 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     flash_plan = _plan(flash, flash_x)
     assert flash_plan is not None and flash_plan.launches.window_fast
     launches = flash_plan.launches
-    assert launches.window_coalesced_kernel is not None
+    assert (launches.window_coalesced_kernel is not None) == (
+        "unfolded" in launches.window_coalesce_modes
+    )
     assert (launches.window_topk_coalesced_kernel is not None) == (
         "folded" in launches.window_coalesce_modes
     )
-    assert launches.window_down_unrolled_kernel is not None
-    # The unrolled callable is what runs; the rolled one is not built.
-    assert launches.window_down_kernel is None
-    assert launches.window_down is launches.window_down_unrolled_kernel
+    need_fused_u2 = any(
+        p.mode == "fused" and p.unroll_pairs for p in launches.window_down_policies[2:]
+    )
+    need_fused_u0 = any(
+        p.mode == "fused" and not p.unroll_pairs
+        for p in launches.window_down_policies[2:]
+    )
+    assert (launches.window_down_unrolled_kernel is not None) == need_fused_u2
+    assert (launches.window_down_kernel is not None) == need_fused_u0
+    assert launches.window_down is (
+        launches.window_down_unrolled_kernel
+        if need_fused_u2
+        else launches.window_down_kernel
+    )
     other = _block(2048, 512, top_k=8, bits=4)
     other_x = mx.random.normal((1, 1, 2048)).astype(mx.bfloat16)
     other_plan = _plan(other, other_x)
@@ -893,6 +905,19 @@ def test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
     assert other_plan.launches.window_down_unrolled_kernel is None
     assert other_plan.launches.window_down_kernel is not None
     assert other_plan.launches.window_down is other_plan.launches.window_down_kernel
+
+
+def test_window_fast_path_test_holds_on_unknown_chip(monkeypatch):
+    """pre-p3-d32d3543 Finding 2: test_the_window_fast_path_is_only_the_shapes_it_was_measured_on
+    must pass on chips without a v1/<chip>.json tuning table."""
+    from omlx.formats import tuning
+
+    monkeypatch.setattr(tuning, "current_chip", lambda: "applegpu_g99z_c1")
+    tuning.reset_cache()
+    try:
+        test_the_window_fast_path_is_only_the_shapes_it_was_measured_on(monkeypatch)
+    finally:
+        tuning.reset_cache()
 
 
 def test_the_window_proof_separates_window_fast(monkeypatch):

@@ -281,9 +281,38 @@ class RoutedWindowPolicy:
         return True
 
 
+@dataclass(frozen=True)
+class RoutedDownPolicy:
+    """One verify-window down-projection policy (rule 27/28)."""
+
+    mode: Literal["fused", "split"] = "fused"
+    rps: int = 4
+    unroll_pairs: bool = False
+
+    def is_legal(
+        self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
+    ) -> bool:
+        """Whether this down-projection route runs on ``face``'s shape."""
+        if self.mode not in _ROUTED_DOWN_MODES:
+            return False
+        if type(self.rps) is not int or self.rps not in _ROUTED_DOWN_RPS:
+            return False
+        if type(self.unroll_pairs) is not bool:
+            return False
+        if k < 1 or n < 1 or m < 2 or m > 16:
+            return False
+        if self.mode == "fused":
+            return n % self.rps == 0
+        # Split mode uses 2-simdgroup routed rows (2 * rps) and 2-simdgroup
+        # pair-shared down rows (2 * 2 * 4 = 16 outputs per threadgroup).
+        return n % (2 * self.rps) == 0 and n % 16 == 0
+
+
 _BACKENDS = ("steel", "nax", "wide", "mlx", "rows")
 _ROUTE_ONLY_BACKENDS = ("wide", "mlx", "rows")
 _ROUTED_WINDOW_COALESCE = ("none", "folded", "unfolded")
+_ROUTED_DOWN_MODES = ("fused", "split")
+_ROUTED_DOWN_RPS = (4, 8)
 _SCHEDS = ("seg", "db")
 _CHIP_GEN_RE = re.compile(r"^applegpu_g(\d+)([a-z]?)(?:_|$)")
 _BKS = (32, 64, 128)
@@ -303,6 +332,7 @@ _ROUTES: dict[str, type] = {
     "dense_tile": DenseTilePolicy,
     "mma_tile": MmaTilePolicy,
     "routed_window": RoutedWindowPolicy,
+    "routed_down": RoutedDownPolicy,
 }
 
 
@@ -383,6 +413,20 @@ def params_from_json(route: str, data: Any):
             raise ValueError(
                 f"tuning: {route} coalesce is one of {_ROUTED_WINDOW_COALESCE}, "
                 f"not {data['coalesce']!r}"
+            )
+    elif cls is RoutedDownPolicy:
+        for req in ("mode", "rps", "unroll_pairs"):
+            if req not in data:
+                raise ValueError(f"tuning: {route} params require {req!r}")
+        if data["mode"] not in _ROUTED_DOWN_MODES:
+            raise ValueError(
+                f"tuning: {route} mode is one of {_ROUTED_DOWN_MODES}, "
+                f"not {data['mode']!r}"
+            )
+        if data["rps"] not in _ROUTED_DOWN_RPS:
+            raise ValueError(
+                f"tuning: {route} rps is one of {_ROUTED_DOWN_RPS}, "
+                f"not {data['rps']!r}"
             )
     elif "bk" in data and data["bk"] not in _BKS:
         raise ValueError(f"tuning: {route} bk is one of {_BKS}, not {data['bk']!r}")

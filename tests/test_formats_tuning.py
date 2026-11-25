@@ -364,8 +364,10 @@ def test_every_in_tree_entry_is_current(tmp_path):
             fid = entry.key["face_id"]
             face = profile_faces[fid] if fid.startswith("*:") else faces[fid]
             span = entry.rows_span
-            if entry.key["route"] == "routed_window":
-                sample_m = int(entry.key["rows_bucket"])
+            if entry.key["route"] in ("routed_window", "routed_down"):
+                parsed = tuning._parse_rows_span(entry.key["rows_bucket"])
+                assert parsed is not None and parsed[1] is not None, entry
+                sample_m = parsed[1]
             else:
                 sample_m = (
                     span[1]
@@ -2027,6 +2029,323 @@ def test_in_tree_routed_window_entries_match_chips(monkeypatch):
             n=1280,
             k=2560,
             rows=4,
+            chip="applegpu_g99z_c1",
+        )
+        is None
+    )
+
+
+def test_routed_window_skeleton_covers_headers_and_router(monkeypatch):
+    """pre-p3-d32d3543 Finding 1: routed_window skeleton digest must cover
+    kernel headers, baseline bodies, and coalesced router Metal."""
+    from omlx.formats import kernels
+    from omlx.patches import qwen35_moe_routed_decode as routed
+    from omlx.patches import qwen35_moe_router as router
+
+    base = routed._routed_window_skeleton_text()
+    for mod, attr in (
+        (routed, "_COMMON"),
+        (routed, "_SWIGLU"),
+        (routed, "_GATE_UP_SHARED"),
+        (routed, "_GATE_UP_ROUTED"),
+        (routed, "_GATE_UP_TOPK_ROUTED"),
+        (kernels, "_QMV_ROWS"),
+        (kernels, "_QMV_PAIR_ROWS"),
+        (router, "_SOFTMAX_TOPK_COALESCE_SOURCE"),
+    ):
+        with monkeypatch.context() as mp:
+            mp.setattr(mod, attr, getattr(mod, attr) + "\n// probe")
+            assert routed._routed_window_skeleton_text() != base, (mod.__name__, attr)
+    with monkeypatch.context() as mp:
+        mp.setattr(router, "_TOPK_BF16_CORE", router._TOPK_BF16_CORE + "\n// probe")
+        assert routed._routed_window_skeleton_text() != base
+
+
+def test_routed_window_policy_is_legal_rejects_bogus_coalesce():
+    """pre-p3-d32d3543 surviving mutant: RoutedWindowPolicy.is_legal checks coalesce."""
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    face = Dot(
+        "rw_bogus",
+        vpt_shell,
+        "F",
+        (),
+        vpt=8,
+        reads=DotReads(apply=ApplyRead()),
+    )
+    assert tuning.RoutedWindowPolicy("unfolded").is_legal(face, 2560, 1280, 4, CHIP)
+    assert not tuning.RoutedWindowPolicy("bogus").is_legal(face, 2560, 1280, 4, CHIP)
+
+
+def test_routed_down_policy_schema_and_validation(tmp_path):
+    assert "RoutedDownPolicy" in tuning.__all__
+    assert "routed_down" in schema.route_names()
+    assert tuning.rows_bucket("routed_down", 1) == "<2"
+    assert tuning.rows_bucket("routed_down", 2) == "2"
+    assert tuning.rows_bucket("routed_down", 3) == "3"
+    assert tuning.rows_bucket("routed_down", 4) == "4"
+    assert tuning.rows_bucket("routed_down", 5) == "5"
+    assert tuning.rows_bucket("routed_down", 6) == "6-8"
+    assert tuning.rows_bucket("routed_down", 8) == "6-8"
+    assert tuning.rows_bucket("routed_down", 9) == "9-12"
+    assert tuning.rows_bucket("routed_down", 12) == "9-12"
+    assert tuning.rows_bucket("routed_down", 13) == "13-16"
+    assert tuning.rows_bucket("routed_down", 16) == "13-16"
+    assert tuning.rows_bucket("routed_down", 17) == "17+"
+
+    for mode in ("fused", "split"):
+        for rps in (4, 8):
+            for unroll in (False, True):
+                pol = schema.params_from_json(
+                    "routed_down",
+                    {"mode": mode, "rps": rps, "unroll_pairs": unroll},
+                )
+                assert pol == tuning.RoutedDownPolicy(
+                    mode=mode, rps=rps, unroll_pairs=unroll
+                )
+
+    for bad in (
+        {},
+        {"mode": "fused"},
+        {"mode": "fused", "rps": 4},
+        {"mode": "bogus", "rps": 4, "unroll_pairs": False},
+        {"mode": "split", "rps": 2, "unroll_pairs": True},
+        {"mode": "split", "rps": 16, "unroll_pairs": True},
+        {"mode": "split", "rps": True, "unroll_pairs": True},
+        {"mode": "fused", "rps": 4, "unroll_pairs": 1},
+        {"mode": "fused", "rps": 4, "unroll_pairs": False, "extra": 1},
+        "fused",
+    ):
+        with pytest.raises(ValueError, match="routed_down"):
+            schema.params_from_json("routed_down", bad)
+
+    face = _face(key="rd_face")
+    assert tuning.RoutedDownPolicy("fused", 4, False).is_legal(face, 640, 2560, 4, CHIP)
+    assert tuning.RoutedDownPolicy("fused", 8, False).is_legal(face, 640, 2560, 8, CHIP)
+    assert tuning.RoutedDownPolicy("split", 4, True).is_legal(face, 640, 2560, 4, CHIP)
+    assert tuning.RoutedDownPolicy("split", 8, True).is_legal(face, 640, 2560, 16, CHIP)
+    # Reject bogus mode, invalid rps/bool/unroll, bounds, and divisibility.
+    assert not tuning.RoutedDownPolicy("bogus", 4, False).is_legal(
+        face, 640, 2560, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 2, False).is_legal(
+        face, 640, 2560, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", True, False).is_legal(
+        face, 640, 2560, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 4.0, False).is_legal(
+        face, 640, 2560, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 4, 1).is_legal(face, 640, 2560, 4, CHIP)
+    assert not tuning.RoutedDownPolicy("fused", 4, False).is_legal(
+        face, 0, 2560, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 4, False).is_legal(
+        face, 640, 0, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 4, False).is_legal(
+        face, 640, 2560, 1, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 4, False).is_legal(
+        face, 640, 2560, 17, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("fused", 8, False).is_legal(
+        face, 640, 2564, 8, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("split", 4, True).is_legal(
+        face, 640, 2568, 4, CHIP
+    )
+    assert not tuning.RoutedDownPolicy("split", 8, True).is_legal(
+        face, 640, 2568, 8, CHIP
+    )
+
+    tuning.register_skeleton("routed_down", "rd-skel-v1")
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    lut_face = Dot(
+        "rd_lut",
+        vpt_shell,
+        "F",
+        (),
+        tables=(Table("levels", mx.float16, tuple(range(16))),),
+        vpt=8,
+        reads=DotReads(apply=ApplyRead()),
+    )
+    entry = {
+        "key": {
+            "route": "routed_down",
+            "face_id": "*:lut_small",
+            "dtype": "bf16",
+            "bits": 4,
+            "group": 64,
+            "rows_bucket": "6-8",
+            "n": 2560,
+            "k": 640,
+        },
+        "face_sha256": "",
+        "skeleton_sha256": tuning.skeleton_digest("routed_down"),
+        "measured_at": "2026-11-25T01:15:00Z",
+        "exactness": "bitwise",
+        "params": {"mode": "split", "rps": 8, "unroll_pairs": True},
+    }
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.reset_cache()
+    assert tuning.lookup(
+        "routed_down",
+        lut_face,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=2560,
+        k=640,
+        rows=8,
+        chip=CHIP,
+    ) == tuning.RoutedDownPolicy("split", 8, True)
+    assert (
+        tuning.lookup(
+            "routed_down",
+            face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=2560,
+            k=640,
+            rows=8,
+            chip=CHIP,
+        )
+        is None
+    )
+
+
+def test_in_tree_routed_down_entries_and_skeleton(monkeypatch):
+    from omlx.formats import kernels
+    from omlx.patches import qwen35_moe_routed_decode as routed
+
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [tuning._V1])
+    routed._ensure_tuning_registered()
+    tuning.reset_cache()
+
+    base = routed._routed_down_skeleton_text()
+    for mod, attr in (
+        (routed, "_COMMON"),
+        (routed, "_DOWN_WINDOW_HEAD"),
+        (routed, "_DOWN_SHARED_ROWS"),
+        (routed, "_DOWN_TAIL"),
+        (routed, "_WINDOW_DOWN_ROUTED_ROWS"),
+        (routed, "_WINDOW_DOWN_SHARED_ROWS"),
+        (routed, "_WINDOW_DOWN_COMBINE"),
+        (kernels, "_QMV_ROWS"),
+        (kernels, "_QMV_PAIR_ROWS"),
+        (kernels, "STORE_ROWS"),
+    ):
+        with monkeypatch.context() as mp:
+            mp.setattr(mod, attr, getattr(mod, attr) + "\n// probe")
+            assert routed._routed_down_skeleton_text() != base, (mod.__name__, attr)
+
+    vpt_shell = _FACE_SHELL.replace("};", "  __OMLX_READ_APPLY__ { return 0; }\n};")
+    vpt_reads = DotReads(apply=ApplyRead())
+    lut_face = Dot(
+        "oqel_b4p_like",
+        vpt_shell,
+        "F",
+        (),
+        tables=(Table("levels", mx.float16, tuple(range(16))),),
+        vpt=8,
+        reads=vpt_reads,
+    )
+    plain = Dot("plain_dn_like", vpt_shell, "F", (), vpt=8, reads=vpt_reads)
+    m5 = "applegpu_g17s_c40"
+    m3 = "applegpu_g15d_c80"
+    for dtype in (mx.bfloat16, mx.float16):
+        assert (
+            tuning.lookup(
+                "routed_down",
+                lut_face,
+                dtype=dtype,
+                bits=4,
+                group=64,
+                n=2560,
+                k=640,
+                rows=2,
+                chip=m5,
+            )
+            is None
+        )
+        assert tuning.lookup(
+            "routed_down",
+            lut_face,
+            dtype=dtype,
+            bits=4,
+            group=64,
+            n=2560,
+            k=640,
+            rows=4,
+            chip=m5,
+        ) == tuning.RoutedDownPolicy("split", 4, True)
+        for rows in (5, 6, 8, 9, 12, 13, 16):
+            assert tuning.lookup(
+                "routed_down",
+                lut_face,
+                dtype=dtype,
+                bits=4,
+                group=64,
+                n=2560,
+                k=640,
+                rows=rows,
+                chip=m5,
+            ) == tuning.RoutedDownPolicy("split", 8, True), (dtype, rows)
+        for rows in (2, 3, 4, 5):
+            assert (
+                tuning.lookup(
+                    "routed_down",
+                    lut_face,
+                    dtype=dtype,
+                    bits=4,
+                    group=64,
+                    n=2560,
+                    k=640,
+                    rows=rows,
+                    chip=m3,
+                )
+                is None
+            )
+        for rows in (6, 8, 9, 12, 13, 16):
+            assert tuning.lookup(
+                "routed_down",
+                lut_face,
+                dtype=dtype,
+                bits=4,
+                group=64,
+                n=2560,
+                k=640,
+                rows=rows,
+                chip=m3,
+            ) == tuning.RoutedDownPolicy("fused", 8, False), (dtype, rows)
+        for chip in (m5, m3):
+            for rows in (4, 8, 16):
+                assert (
+                    tuning.lookup(
+                        "routed_down",
+                        plain,
+                        dtype=dtype,
+                        bits=4,
+                        group=64,
+                        n=2560,
+                        k=640,
+                        rows=rows,
+                        chip=chip,
+                    )
+                    is None
+                )
+    assert (
+        tuning.lookup(
+            "routed_down",
+            lut_face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=2560,
+            k=640,
+            rows=8,
             chip="applegpu_g99z_c1",
         )
         is None
