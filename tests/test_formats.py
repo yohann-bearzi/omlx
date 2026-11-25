@@ -1929,3 +1929,33 @@ def test_quant_format_contract_docs_name_refine():
     assert "not wired yet" not in page and "format_layers" in page
     doc = " ".join(formats.QuantFormat.refine.__doc__.split())
     assert "not wired yet" not in doc
+
+
+def test_quant_format_docs_cover_shared_tensors_transforms_and_oqh():
+    root = Path(__file__).resolve().parents[1] / "docs"
+    contract = (root / "quant-formats.md").read_text()
+    overview = (root / "quant-format-plugins.md").read_text()
+    for token in (
+        "shared_tensors",
+        "InputTransform",
+        "TRANSFORM_VERSION = 1",
+        "EncodeContext",
+        "def encode_layer(",
+        "inverse_weight",
+        "apply_split_swiglu",
+        "producer_spec",
+        "install_producers",
+        "release_producers",
+        "oqh_affine",
+        "CONTRACT >= 2",
+    ):
+        assert token in contract, f"missing {token!r} in docs/quant-formats.md"
+    assert "def encode(self" not in contract
+    for token in (
+        "encode_layer",
+        "shared_tensors",
+        "InputTransform",
+        "oqh_affine",
+    ):
+        assert token in overview, f"missing {token!r} in docs/quant-format-plugins.md"
+    assert "def encode(self" not in overview

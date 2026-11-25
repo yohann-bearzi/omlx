@@ -251,6 +251,99 @@ of the same shape keeps its own rows launch.
 
 A layer builds a launch once for the shapes and dtypes of its arrays, in each thread that calls it, and replays it at every call after (see [Kernels over faces](#kernels-over-faces)): a decode step is a lookup, MLX's replay of the launch and the bias. The layer works out its plan (its face, its proof and the tensors a launch reads) and finds its bias at its first call, and keeps them until one of its arrays or attributes is assigned or removed, as a load, `update`, `set_dtype` or an attribute's write does: a call reads them back in one step. Over affine weights on an M5 Max, a one-row call takes 1.01 of the time of `nn.QuantizedLinear`'s, for the same bits: 0.9 µs more of Python around a call of 133 to 147 µs, the launch itself taking the time of MLX's.
 
+## Shared tensors and the input transform
+
+A format may keep one layer-wide tensor shared across a whole stack of
+matrices: oQh's rotation signs, `oqh_signs`, have shape `[K / block, block]`
+even when the layer is an `[E, N, K]` expert stack. Declare such tensors in
+`QuantFormat.shared_tensors` (a tuple of identifiers beside `tensors`).
+`layout()` must include them unstacked; `check_layout` and the rows rule accept
+a shared tensor whose shape does not grow with `N` or `E`; a switch layer keeps
+one copy; and gate+up fusion shares it instead of concatenating it. A face never
+reads a shared tensor (`face.tensors` is a subset of `fmt.tensors`), and
+`formats.tensor_names(layer)` returns only the codes and non-shared tensors
+(`("weight",)` for MLX layers), excluding `shared_tensors`.
+
+A format whose weights are stored in a rotated or pre-scaled basis declares
+`QuantFormat.input_transform(layer)`, returning a frozen `InputTransform`
+(`omlx/formats/transforms.py`, `TRANSFORM_VERSION = 1`) or `None`. Its fields:
+
+- `version` (`TRANSFORM_VERSION = 1`), `kind` (e.g. `"signed_wht"`), `tensors`
+  (a subset of `shared_tensors`), `block` (`1..MAX_BLOCK`).
+- `apply(x, *tensors)`: transforms activations into the weight basis.
+- Optional `apply_split_swiglu(gate_up_out, *tensors, limit=None)`: fuses a
+  `gate|up` split, SwiGLU (with optional clamp `limit`), and the down-projection
+  transform in one pass for prefill and `SwitchGLU` routes.
+- Optional `inverse_weight(w_rot, *tensors)`: recovers the plain-basis weight
+  matrix from `decode()` (used by oQe Hessian refinement error checks, float32
+  references, and `transforms.check_transform_applied`).
+- Optional `same_as(other, layer_a, layer_b)` and `producer_spec(layer)`:
+  `same_as` tells fused blocks and norms when two layers share a transformed
+  activation; `producer_spec` returns a `ProducerSpec` naming optional fused
+  producer kernels (`rmsnorm`, `gated_norm`, `act_pair`).
+
+`formats.input_transform(layer)` binds `(tx, tensors)` once per module (resolved
+at construction/plan build). Every route applies the transform at entry: dense
+rows, wide, dense tile, row-exact, switch decode/sorted prefill, verify gather,
+prefill weighted-sum, decoded fallback, and Qwen routed-decode / verify-window
+plans (which prepare `rx` outside `mx.compile` via `transforms.prepare_bound` to
+preserve producer memo/handoff hits, keep router inputs plain, and apply down's
+transform inside the compiled graph on split routed activations). `hc_fused`
+declines transformed projections at plan build.
+
+Generalized producer fusion (`transforms.install_producers(model)` and
+`transforms.release_producers(model, wrapped_only=False)`) rewrites eligible
+`RMSNorm` (`_DualNorm` via `rmsnorm` + thread-local `transforms.remember`),
+GDN gated norm (`_DualGatedNorm` via `gated_norm` + thread-local
+`transforms.hand_off`), and dense `MLP` (`_FusedMLP` via `act_pair` +
+`FormatLinear._call_prepared`), leaving `SwitchGLU` to the MoE patches. LoRA
+adapter wrapping calls `release_producers(model, wrapped_only=True)`.
+
+A checkpoint written in a transformed format stores its transform record as
+`{"transform": {"version": 1, "kind": "signed_wht", "block": n}}` (with
+`"block"` optional) inside `config["omlx_quant_formats"][mode]["record"]`.
+`transforms.read_record` validates that object and refuses unknown revisions,
+kinds, or out-of-range blocks so `accept` fails closed. `decode()` returns the
+weight in the transformed basis; `transforms.inverse_weight` recovers the plain
+basis.
+
+### Writing a third-party transformed plugin
+
+A third-party plugin (such as `oQhL`, SmoothQuant, or QuaRot) inherits every
+fast route automatically without touching oMLX:
+
+1. Declare its shared parameter tensor(s) in `shared_tensors` and return them
+   unstacked from `layout()` and `encode_layer(w, importance, context)`.
+2. Return an `InputTransform` (or `SignedWhtTransform`) from
+   `input_transform(layer)` and validate `"transform"` via
+   `transforms.read_record` in `accept(record)`.
+3. Implement `decode()` in the transformed basis alongside `inverse_weight` so
+   oQe refinement (`_format_hessian_error`) and `testing` guards verify the
+   plain-basis product automatically.
+4. Optionally supply `apply_split_swiglu` and `producer_spec` to opt into fused
+   SwiGLU+transform and dual-norm producer kernels.
+
+### Built-in `oqh` and `oqh_affine`
+
+The built-in formats `oqh` (one `rscale` per row) and `oqh_affine`
+(`oqh_scales`/`oqh_biases` per group) register beside `affine` under
+`CONTRACT = 1`. Both declare `shared_tensors = ("oqh_signs",)` and
+`SignedWhtTransform`; `oqh_affine` reuses affine's `Dot`/`Tile`/`Codes` faces
+(including 5-bit tiles) and per-chip dense tuning cells. Stock oQh checkpoints
+for D10-verified ported families (`qwen4_exp`) bridge onto `FormatSwitchLinear`
+and `FormatLinear` at load while non-verified/TP/sharded families keep upstream
+oQh modules.
+
+### Future `CONTRACT >= 2` sketch (fused on-the-fly dot transform)
+
+`CONTRACT = 1` keeps `InputTransform` purely at route boundaries (host/producer
+pre-transform before `Dot`/`Tile`/`Codes` faces) so no existing face or kernel
+hash changes. A future `CONTRACT >= 2` extension can allow an optional
+in-register `Dot` pre-pass (fusing small-block rotations or per-channel scaling
+directly inside `Lanes<K>::load` before `madd`) for formats whose transform
+fits within a single simdgroup's `K` tile without an intermediate activation
+buffer.
+
 ## Load a checkpoint
 
 mlx-lm and mlx-vlm rebuild a checkpoint's quantized layers with `nn.quantize`: a layer the quantization config names is replaced by its `to_quantized(group_size, bits, mode)`, and the checkpoint's tensors are then loaded over the model's, strictly. oMLX has `nn.Linear` and the `SwitchLinear` of mlx-lm and of mlx-vlm build a `FormatLinear` or a `FormatSwitchLinear` for a mode whose format lays the matrix out:

@@ -14,8 +14,8 @@ A quant format is how a quantized linear's tensors decode into weights. Without 
 
 ```mermaid
 flowchart LR
-    P["plugin package<br/>entry point omlx.quant_formats"] --> R["registry (omlx.formats)<br/>built-in affine first, then plugins"]
-    R --> F["QuantFormat<br/>layout · decode · encode · record/accept"]
+    P["plugin package<br/>entry point omlx.quant_formats"] --> R["registry (omlx.formats)<br/>built-in affine, oqh, oqh_affine first, then plugins"]
+    R --> F["QuantFormat<br/>layout · decode · encode_layer · record/accept · input_transform"]
     F --> D["Dot face<br/>mat-vec"]
     F --> T["Tile face<br/>weight by weight"]
     D --> K["kernels over faces<br/>skeletons, compiled once per face"]
@@ -30,7 +30,7 @@ A format is a `QuantFormat` with a `mode` (the per-layer `mode` in the quantizat
 
 - `layout(k, n, bits, group_size)`: shape and dtype of each tensor of one `(n, k)` matrix, or `None` for a matrix it does not keep.
 - `decode`: the float reference, run where no kernel takes the rows and used by tests ([Decode](quant-formats.md#decode)).
-- `encode`: the tensors oQ writes, given oQe's per-input importance.
+- `encode_layer`: the tensors oQ writes, given oQe's per-input importance and an `EncodeContext`. It is the only writer hook; a format may also declare `shared_tensors` (layer-wide unstacked tensors) and an `InputTransform` (one rotation every route applies, with optional fused producer specs), documented in [quant-formats.md](quant-formats.md#shared-tensors-and-the-input-transform). Built-in `oqh` and `oqh_affine` register beside `affine` using the same contract.
 - `record` / `accept`: a checkpoint's own parameters (a fitted level table, say), and a reader configured from them at load.
 - `dot` / `tile`: the faces for a layer, or `None`.
 
