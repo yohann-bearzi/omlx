@@ -11,6 +11,7 @@ import mlx.nn as nn
 import pytest
 from mlx.utils import tree_flatten
 
+from omlx import formats
 from omlx.cache.paged_ssd_cache import numerics_revision_for_model
 from omlx.formats import testing
 from omlx.formats.affine import AffineFormat
@@ -215,3 +216,49 @@ def test_apply_activation_fp16_keeps_stock_recast_and_disabled_noop(caplog):
         for record in caplog.records
     )
     assert numerics_revision_for_model(fmt_model) is None
+
+
+def test_fp16_recast_reinstalls_oqh_producers(monkeypatch):
+    from omlx.formats import oqh, transforms
+    from tests.test_formats_oqh import _group_case
+
+    formats.load()
+    tensors, _ = _group_case(256, 64, 4, 128, seed=1, block=256)
+    reader = oqh.OqhAffineFormat()
+    reader.block = 256
+    with testing.verified("example"):
+        q_proj = FormatLinear(reader, 4, 128, 256, tensors)
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn_layer = nn.Module()
+            self.attn_layer.input_layernorm = nn.RMSNorm(256)
+            self.attn_layer.input_layernorm.weight = mx.ones((256,), mx.bfloat16)
+            self.attn_layer.self_attn = nn.Module()
+            self.attn_layer.self_attn.q_proj = q_proj
+
+    model = Model()
+    mx.eval(model.parameters())
+    assert transforms.install_producers(model) == 1
+    norm = model.attn_layer.input_layernorm
+    assert isinstance(norm, transforms._DualNorm)
+
+    assert cast_bf16_params_to_fp16(model) > 0
+    assert isinstance(norm, transforms._DualNorm)
+    tx, bound_tensors = transforms.bind(q_proj)
+    assert all(t.dtype == mx.float16 for t in bound_tensors)
+    assert all(t.dtype == mx.float16 for t in norm._omlx_tx_raw_tensors)
+
+    calls = []
+    apply = tx.apply
+
+    def record(*args, **kwargs):
+        calls.append(1)
+        return apply(*args, **kwargs)
+
+    object.__setattr__(tx, "apply", record)
+    x = (mx.random.normal((1, 1, 256)) * 0.1).astype(mx.float16)
+    y = q_proj(norm(x))
+    mx.eval(y)
+    assert not calls

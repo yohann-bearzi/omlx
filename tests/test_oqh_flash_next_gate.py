@@ -210,7 +210,7 @@ def test_flash_next_oqh4_coverage_and_plans(flash_next_oqh4):
         for name, m in model.named_modules()
         if isinstance(m, FormatLinear) and isinstance(m.fmt, AffineFormat)
     ]
-    assert len(named_affine) > 400
+    assert len(named_affine) == 744
     mtp_format = [
         (name, m)
         for name, m in model.named_modules()

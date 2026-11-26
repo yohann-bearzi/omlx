@@ -1713,6 +1713,12 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
         hc_fused = sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused")
         if hc_fused is not None:
             hc_fused.rebuild_plans(model)
+        # Producer mixins cache the transform tensor identities they hand over;
+        # a recast replaces those arrays, so rebuild the fused producers too.
+        from ..formats import transforms
+
+        if transforms.release_producers(model):
+            transforms.install_producers(model)
     return count
 
 
