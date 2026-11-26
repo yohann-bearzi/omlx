@@ -212,7 +212,7 @@ def _group(rows: int, vpt: int, n: int) -> int:
     return next((g for g in groups if rows // g * tiles >= floor), 1)
 
 
-def _occupancy(vpt: int) -> int:
+def _occupancy(vpt: int) -> float:
     """The threadgroups a GPU core needs of a shared launch over a face of
     ``vpt`` values a lane, on this GPU (OCCUPANCY)."""
     table = _occupancy_table(kernels.gpu_generation())

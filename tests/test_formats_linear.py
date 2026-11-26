@@ -450,6 +450,34 @@ def test_a_vpt_not_measured_takes_the_wide_floor_or_stricter(monkeypatch, genera
         linear._occupancy_table.cache_clear()
 
 
+def test_the_m3_ultra_floors_are_exact_and_take_a_float(monkeypatch):
+    """The M3 Ultra's floors are measured decimals, 3.2 threadgroups a core
+    for a face of 16 values a lane and 2 for one of 8: over its 80 cores the
+    edges are 256 and 160 threadgroups, and the floors are floats."""
+    generation, cores = _M3_ULTRA
+    monkeypatch.setattr(kernels, "gpu_generation", lambda: generation)
+    monkeypatch.setattr(kernels, "gpu_cores", lambda: cores)
+    linear._occupancy_table.cache_clear()
+    tile = linear._SHARED_TILE
+    try:
+        assert linear._occupancy(16) == 3.2
+        assert linear._occupancy(8) == 2
+        assert linear._group(2, 16, 256 * tile) == 2
+        assert linear._group(2, 16, 255 * tile) == 1
+        assert linear._group(2, 8, 160 * tile) == 2
+        assert linear._group(2, 8, 159 * tile) == 1
+    finally:
+        linear._occupancy_table.cache_clear()
+
+
+def test_the_occupancy_is_annotated_a_float():
+    """``_occupancy`` returns a measured floor as it is (3.2 on the M3
+    Ultra), so its return annotation is float, not int."""
+    from typing import get_type_hints
+
+    assert get_type_hints(linear._occupancy)["return"] is float
+
+
 def test_a_gpu_generation_not_measured_keeps_the_larger_floors(monkeypatch, caplog):
     monkeypatch.setattr(kernels, "gpu_generation", lambda: 99)
     monkeypatch.setattr(kernels, "gpu_cores", lambda: 80)
