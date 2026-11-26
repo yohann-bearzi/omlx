@@ -34,11 +34,22 @@ pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Me
 
 @pytest.fixture(autouse=True)
 def _patch_routed():
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+    from mlx_vlm.models.qwen3_5_moe import language as vlm_moe
+
     qwen35_moe_router.apply_qwen35_moe_router_patch()
+    cls = vlm_moe.Qwen3_5MoeSparseMoeBlock
+    orig_ff = Qwen3_5BatchInvariantForward._feed_forward
+    orig_call = cls.__call__
+    had_flag = "_omlx_routed_decode" in cls.__dict__
     routed.apply_qwen35_moe_routed_decode_patch()
     transforms.clear()
     yield
     transforms.clear()
+    Qwen3_5BatchInvariantForward._feed_forward = orig_ff
+    cls.__call__ = orig_call
+    if not had_flag and "_omlx_routed_decode" in cls.__dict__:
+        delattr(cls, "_omlx_routed_decode")
 
 
 def _oqh_affine_switch(k, n, experts, bits=4, gs=128, seed=0, block=128):
@@ -573,3 +584,100 @@ def test_warm_engine_dispatch_transformed_block_and_quantized_router(
     assert got_m is not None
     mx.eval(got_m)
     assert kernels.proof_count() == before
+
+
+def test_transformed_routed_decode_merge2_down_policies(monkeypatch, tmp_path):
+    """Merge #2 + oQh guard: under active per-chip routed_down split policies,
+    a split transformed block (d_tx set) builds zero unused plain split/unrolled
+    down kernels and warms single-stream + batched windows with 0 cold proofs;
+    a gate_up-only transformed block (d_tx None) executes cleanly through
+    _window_down using the per-chip routed_down policies."""
+    import json
+
+    from omlx.formats import tuning
+
+    routed._ensure_tuning_registered()
+    v1_dir = tmp_path / "v1"
+    v1_dir.mkdir(parents=True, exist_ok=True)
+    chip = "applegpu_g17s_c40_oqh_split_test"
+    skel = tuning.skeleton_digest("routed_down")
+    entries = []
+    for grp in (64, 128):
+        for dtype_name in ("bf16", "fp16"):
+            entries.append(
+                {
+                    "key": {
+                        "route": "routed_down",
+                        "face_id": "*:plain",
+                        "dtype": dtype_name,
+                        "bits": 4,
+                        "group": grp,
+                        "rows_bucket": "4",
+                        "n": 512,
+                        "k": 256,
+                    },
+                    "face_sha256": "",
+                    "skeleton_sha256": skel,
+                    "measured_at": "2026-11-26T01:30:00Z",
+                    "exactness": "bitwise",
+                    "params": {"mode": "split", "rps": 4, "unroll_pairs": True},
+                }
+            )
+    payload = {
+        "schema_version": 1,
+        "chip": chip,
+        "entries": entries,
+    }
+    (v1_dir / f"{chip}.json").write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1_dir])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    tuning.reset_cache()
+    try:
+        # 1. Both gate_up and down transformed (split=True): zero unused plain
+        #    split/unrolled down kernels, 0 cold proofs on both window shapes.
+        block_both = _transformed_block_for_warm("both", quantized_router=False)
+        routed.warm_moe_model(block_both, mtp_enabled=True, warm_dispatch=True)
+        plan_both = routed._cached_plan(block_both, mx.bfloat16)
+        assert plan_both is not None and not plan_both.proof.failed
+        lb = plan_both.launches
+        assert lb.split_in is True
+        assert lb.window_down_routed_kernel is None
+        assert lb.window_down_routed_unrolled_kernel is None
+        assert lb.window_down_shared_kernel is None
+        assert lb.window_down_combine_kernel is None
+        assert lb.window_down_unrolled_kernel is None
+        assert lb.window_down is not None
+
+        before = kernels.proof_count()
+        for shape in ((1, 4, 512), (2, 2, 512)):
+            x = (mx.random.normal(shape) * 0.5).astype(mx.bfloat16)
+            got = routed.routed_verify_window(block_both, x)
+            assert got is not None
+            mx.eval(got)
+            flat = x.reshape(-1, 512)
+            for r in range(4):
+                ref_r = block_both(flat[r : r + 1].reshape(1, 1, 512))
+                mx.eval(ref_r)
+                assert mx.array_equal(got[r], ref_r[0, 0]).item()
+        assert kernels.proof_count() == before
+
+        # 2. gate_up-only transformed (d_tx=None, split=False): routes through
+        #    merge #2's _window_down policies cleanly.
+        block_gu = _transformed_block_for_warm("gate_up_only", quantized_router=False)
+        plan_gu = routed._cached_plan(block_gu, mx.bfloat16)
+        assert plan_gu is not None and plan_gu.launches.split_in is False
+        for shape in ((1, 4, 512), (2, 2, 512)):
+            x = (mx.random.normal(shape) * 0.5).astype(mx.bfloat16)
+            got = routed.routed_verify_window(block_gu, x)
+            assert got is not None
+            mx.eval(got)
+            flat = x.reshape(-1, 512)
+            for r in range(4):
+                ref_r = block_gu(flat[r : r + 1].reshape(1, 1, 512))
+                mx.eval(ref_r)
+                assert mx.array_equal(got[r], ref_r[0, 0]).item()
+    finally:
+        tuning.reset_cache()

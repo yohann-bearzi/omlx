@@ -2855,6 +2855,8 @@ class _TransformedMixin:
         )
         if bound is not None:
             built.tx = (*bound, transforms.key(bound[0], bound[1]))
+            built._slots["no_dense_fast"] = True
+            built._slots["no_dot_fast"] = True
         if existing is None:
             kept = self.__dict__.setdefault(_KEPT, built)
             if kept.weight is weight:
@@ -2874,7 +2876,7 @@ class _TransformedFormatLinear(_TransformedMixin, FormatLinear):
 
     def __call__(self, x: mx.array) -> mx.array:
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
         if kept.tx is not None:
             k = self.input_dims
@@ -2911,7 +2913,7 @@ class _TransformedFormatSwitchLinear(_TransformedMixin, FormatSwitchLinear):
         from ..patches import m5_gather_qmm_nax as nax
 
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
         plan = kept.plan
         if plan is None or kept.bias is not None:
@@ -2956,7 +2958,7 @@ class _TransformedFormatSwitchLinear(_TransformedMixin, FormatSwitchLinear):
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
     ) -> mx.array:
         kept = self.__dict__.get(_KEPT)
-        if kept is None or kept.weight is not self[packed_name(self)]:
+        if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
         if kept.tx is not None:
             k = self.input_dims

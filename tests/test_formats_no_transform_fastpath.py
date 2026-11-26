@@ -18,6 +18,7 @@ from mlx_vlm.models.switch_layers import SwitchGLU as VLMSwitchGLU
 
 from omlx import formats
 from omlx.formats import affine, oqh, testing, transforms
+from omlx.formats import linear as linear_mod
 from omlx.formats.linear import (
     FormatEmbedding,
     FormatLinear,
@@ -201,8 +202,8 @@ def test_transformed_format_layers_bind_subclass_at_construction():
 def test_routed_decode_plain_hot_path_has_no_transform_checks(monkeypatch):
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
 
-    orig_ff = Qwen3_5BatchInvariantForward._feed_forward
     assert qwen35_moe_router.apply_qwen35_moe_router_patch()
+    orig_ff = Qwen3_5BatchInvariantForward._feed_forward
     orig_call = Qwen3_5MoeSparseMoeBlock.__call__
     had_routed = "_omlx_routed_decode" in Qwen3_5MoeSparseMoeBlock.__dict__
     try:
@@ -462,3 +463,151 @@ def test_custom_switch_glu_subclass_preserves_call_with_transformed_weights(base
     plain_sub.eval()
     qwen35_moe_gate_up._fuse_one(plain_sub)
     assert getattr(type(plain_sub), "_omlx_transformed_switch", False)
+
+
+def test_transformed_linear_one_row_warm_skips_dot_fast_and_packed_name(monkeypatch):
+    """Merge #2 + oQh: a transformed FormatLinear (including custom codes_name)
+    records weight_key, pre-marks no_dot_fast/no_dense_fast on _keep(), never
+    binds _fast/_fast2 during 1-row warm-up, and makes zero _register_dot_fast
+    or packed_name() calls on warm 1-row and multi-row hits."""
+
+    class _CodesOqhAffine(oqh.OqhAffineFormat):
+        mode = "oqh_affine_codes_test"
+        codes_name = "codes"
+
+        def layout(self, k, n, bits, group_size):
+            lay = super().layout(k, n, bits, group_size)
+            if lay is None:
+                return None
+            out = dict(lay)
+            out["codes"] = out.pop("weight")
+            return out
+
+        def decode(self, tensors, bits, group_size):
+            remapped = dict(tensors)
+            remapped["weight"] = remapped.pop("codes")
+            return super().decode(remapped, bits, group_size)
+
+    lin_w, _ = _oqh_linear(256, 64, seed=80)
+    raw_c, _ = _group_case(256, 64, 4, 128, seed=81)
+    tensors_c = dict(raw_c)
+    tensors_c["codes"] = tensors_c.pop("weight")
+    with testing.verified("example"):
+        lin_c = FormatLinear(_CodesOqhAffine(), 4, 128, 256, tensors_c)
+
+    for layer, expected_key in ((lin_w, "weight"), (lin_c, "codes")):
+        linear_mod.prepare_layer_plans(layer)
+        assert layer._fast is None and layer._fast2 is None
+        kept = layer.__dict__[linear_mod._KEPT]
+        assert kept.weight_key == expected_key
+        assert kept._slots.get("no_dot_fast") is True
+        assert kept._slots.get("no_dense_fast") is True
+
+        x1 = (mx.random.normal((1, 1, 256)) * 0.5).astype(mx.bfloat16)
+        x3 = (mx.random.normal((1, 3, 256)) * 0.5).astype(mx.bfloat16)
+        # Ensure both 1-row and 3-row graphs are warm before spying.
+        mx.eval(layer(x1), layer(x3))
+        assert layer._fast is None and layer._fast2 is None
+
+        reg_dot_calls = []
+        packed_calls = []
+        orig_reg_dot = FormatLinear._register_dot_fast
+        orig_packed = linear_mod.packed_name
+
+        def spy_reg_dot(self, k, p, sig, _calls=reg_dot_calls, _orig=orig_reg_dot):
+            _calls.append(sig)
+            return _orig(self, k, p, sig)
+
+        def spy_packed(mod, _calls=packed_calls, _orig=orig_packed):
+            _calls.append(mod)
+            return _orig(mod)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(FormatLinear, "_register_dot_fast", spy_reg_dot)
+            patch.setattr(linear_mod, "packed_name", spy_packed)
+            y1 = layer(x1)
+            y3 = layer(x3)
+            mx.eval(y1, y3)
+
+        assert (
+            not reg_dot_calls
+        ), f"warm transformed hit called _register_dot_fast: {reg_dot_calls}"
+        assert (
+            not packed_calls
+        ), f"warm transformed hit called packed_name: {len(packed_calls)}"
+        assert layer._fast is None and layer._fast2 is None
+        ref1 = testing.transform_reference(layer, x1)
+        ref3 = testing.transform_reference(layer, x3)
+        mx.eval(ref1, ref3)
+        assert mx.allclose(y1, ref1, rtol=3e-2, atol=3e-2).item()
+        assert mx.allclose(y3, ref3, rtol=3e-2, atol=3e-2).item()
+
+
+def test_transformed_switch_warm_uses_weight_key_not_packed_name(monkeypatch):
+    """Merge #2 + oQh: a warm transformed FormatSwitchLinear call reads
+    self[kept.weight_key] with zero packed_name() calls."""
+    sw, _ = _oqh_switch(256, 64, 8, seed=82)
+    x = (mx.random.normal((1, 2, 1, 1, 256)) * 0.5).astype(mx.bfloat16)
+    idx = mx.array([[[0, 1], [2, 3]]], dtype=mx.uint32)
+    ref = sw(x, idx)
+    mx.eval(ref)
+    kept = sw.__dict__[linear_mod._KEPT]
+    assert kept.weight_key == "weight"
+
+    packed_calls = []
+    orig_packed = linear_mod.packed_name
+
+    def spy_packed(mod):
+        packed_calls.append(mod)
+        return orig_packed(mod)
+
+    monkeypatch.setattr(linear_mod, "packed_name", spy_packed)
+    got = sw(x, idx)
+    mx.eval(got)
+    assert (
+        not packed_calls
+    ), f"warm transformed switch called packed_name: {len(packed_calls)}"
+    assert mx.array_equal(got, ref).item()
+
+
+def test_routed_decode_fastpath_test_keeps_router_verify_consistent(monkeypatch):
+    """pre-oqh-5eb678fb5 NIT-1: test_routed_decode_plain_hot_path_has_no_transform_checks
+    must not leave Qwen3_5BatchInvariantForward._feed_forward unpatched while
+    Qwen3_5MoeSparseMoeBlock._omlx_router_fused stays True."""
+    from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    orig_ff = Qwen3_5BatchInvariantForward._feed_forward
+    orig_q35_call = Qwen3_5MoeSparseMoeBlock.__call__
+    orig_q35_fused = Qwen3_5MoeSparseMoeBlock.__dict__.get("_omlx_router_fused")
+    orig_q3n_call = Qwen3NextSparseMoeBlock.__call__
+    orig_q3n_fused = Qwen3NextSparseMoeBlock.__dict__.get("_omlx_router_fused")
+
+    def _dummy_ff(self, layer, h):
+        return orig_ff(self, layer, h)
+
+    try:
+        Qwen3_5BatchInvariantForward._feed_forward = _dummy_ff
+        if "_omlx_router_fused" in Qwen3_5MoeSparseMoeBlock.__dict__:
+            delattr(Qwen3_5MoeSparseMoeBlock, "_omlx_router_fused")
+        if "_omlx_router_fused" in Qwen3NextSparseMoeBlock.__dict__:
+            delattr(Qwen3NextSparseMoeBlock, "_omlx_router_fused")
+
+        test_routed_decode_plain_hot_path_has_no_transform_checks(monkeypatch)
+        assert getattr(
+            Qwen3_5BatchInvariantForward._feed_forward, "_omlx_router_fused", False
+        ) == getattr(Qwen3_5MoeSparseMoeBlock, "_omlx_router_fused", False)
+    finally:
+        Qwen3_5BatchInvariantForward._feed_forward = orig_ff
+        Qwen3_5MoeSparseMoeBlock.__call__ = orig_q35_call
+        Qwen3NextSparseMoeBlock.__call__ = orig_q3n_call
+        if orig_q35_fused is None:
+            if "_omlx_router_fused" in Qwen3_5MoeSparseMoeBlock.__dict__:
+                delattr(Qwen3_5MoeSparseMoeBlock, "_omlx_router_fused")
+        else:
+            Qwen3_5MoeSparseMoeBlock._omlx_router_fused = orig_q35_fused
+        if orig_q3n_fused is None:
+            if "_omlx_router_fused" in Qwen3NextSparseMoeBlock.__dict__:
+                delattr(Qwen3NextSparseMoeBlock, "_omlx_router_fused")
+        else:
+            Qwen3NextSparseMoeBlock._omlx_router_fused = orig_q3n_fused
