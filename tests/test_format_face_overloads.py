@@ -1162,9 +1162,7 @@ def test_expand_slot_handles_prefix_overlapping_slot_names():
 
 def test_a_face_without_declared_reads_is_refused():
     for kind, reads in ((Dot, "DotReads"), (Tile, "TileReads"), (Codes, "CodesReads")):
-        with pytest.raises(
-            ValueError, match=f"declares its read members.*{reads}"
-        ):
+        with pytest.raises(ValueError, match=f"declares its read members.*{reads}"):
             kind("no_reads", "struct F {};", "F", ())
 
 
@@ -1515,26 +1513,31 @@ _AFFINE_WIDE_AND_SG8_DIGEST = (
 # unrolled shared block adds three _Pragma("clang loop unroll(full)") lines
 # (with the pack-fold for ROWS == 3), so its Matrices header differs from the
 # baseline; the rolled block carries no placeholder line, so the rolled
-# headers and the pair/codes citations are the baseline's. The plugin's own
-# face Metal (emitted_source/emitted_shared) is unchanged; measured with the
-# plugin staged at 238b9a9 on M5 Max.
+# headers and the pair/codes citations are the baseline's. Re-pinned on
+# release/4 (ae0d75e5a) for plugin ffe1ca64 (2/15 faces moved from dd9ad49:
+# 4-bit vpt=8 dot faces oqel_b4p and oqel_b4ptc3abe200 replaced their 256-
+# entry pair LUT with a 16-entry half table), then re-pinned 2026-11-26 for
+# the tile rule-4 fix on top of ffe1ca64: only the 3 tile faces moved (the
+# row-scale read moved from Runs(...) into params()), while all 12 dot faces
+# stay byte-identical to ffe1ca64 (10/15 faces byte-identical to dd9ad49).
 _OQEL_15_DIGESTS = {
-    False: "15 09f2ad2093050f4e807bcc404881a865feadf636ce490a90ba3e2ba873d43c88",
-    True: "15 e80731a752d7b44834087416c4de22b1781d43a5c9e66025575fc8679bc81685",
+    False: "15 c7ae4734ac4d883916baa19bc7982bd46b56eac783b6ff820b5e906f4943468f",
+    True: "15 b25d69588287e8d65f61bf0acdede92b6d48f22a1d8a41fe90c6c3223fafb3f3",
 }
-# Captured on release/3 (7e230438). The oQeL face sources are unchanged from
-# ba421f5c (the 15-face digests above), but these 123 builder records include
-# the gather and routed patch sources, which the release-2 fixes changed
-# (moe_verify_gather, qwen35_moe_routed_decode, qwen35_moe_router). A base
-# change re-pins this snapshot; the emission itself is pinned by the face
-# digests inside this test, which also cover the emitted read signatures.
-# Re-measured on wip/a1-a13 with the 15-face digests: 12 of these 123 builder
-# records are the format_linear._shared_kernel builders that emit the unrolled
-# shared skeleton (their header moves with it); the other 111, the rolled
-# skeleton and the citations it sizes match the release-3 baseline.
+# Captured on release/3 (7e230438), re-pinned on release/4 (ae0d75e5a) for
+# plugin ffe1ca64 (18/123 dot builders moved for oqel_b4p / oqel_b4ptc3abe200),
+# then re-pinned 2026-11-26 for the tile rule-4 fix on top of ffe1ca64: only
+# the 15 tile builder records (3 faces x gather/wide/gqmm 3 kinds) moved with
+# the tile rule-4 read; all 108 dot builder records stay byte-identical to
+# ffe1ca64 (90/123 builders byte-identical to dd9ad49). These 123 builder
+# records include the gather and routed patch sources, which the release-2
+# fixes changed (moe_verify_gather, qwen35_moe_routed_decode,
+# qwen35_moe_router). A base change re-pins this snapshot; the emission itself
+# is pinned by the face digests inside this test, which also cover the emitted
+# read signatures.
 _OQEL_BUILDER_DIGESTS = {
-    False: "123 c7d003c0be322d05888ed4ad5a184b98527ac2a6a8d89c4025aab5c328b25692",
-    True: "123 d96cf538dbbee3c8af5040c7b8284215e7da64e6947fa99b57e5323efb472c92",
+    False: "123 a60bfd40da805d96c268c25d188e4feae7c53a81a9e8e4e4a7416bea643b0f5b",
+    True: "123 3de850066f915d383d408c1926e829241cb5591aa4387cc6277a4d0094501445",
 }
 
 
@@ -1759,9 +1762,11 @@ def _oqel_digests(monkeypatch, face_mod, codebook, selects: bool):
 
 @pytest.mark.parametrize("selects", [False, True], ids=["staged", "selects"])
 def test_every_oqel_plugin_face_emits_the_a6480a5_metal(monkeypatch, selects):
-    """The plugin's 15 faces and the 123 served builders on them are
-    byte-identical to a6480a5's literal read members: the declared
-    signatures emit the same Metal at construction."""
+    """The plugin's 15 faces and the 123 served builders on them match the
+    re-pinned release/4 (ffe1ca64) + tile rule-4 fix Metal at construction:
+    the 12 dot faces and 108 dot builders stay byte-identical to ffe1ca64
+    while the 3 tile faces and 15 tile builders reflect the row-scale read
+    moving from Runs(...) into params()."""
     face_mod, codebook = _oqel()
     face_mod.dot.cache_clear()
     face_mod.tile.cache_clear()
@@ -1771,9 +1776,7 @@ def test_every_oqel_plugin_face_emits_the_a6480a5_metal(monkeypatch, selects):
 
 
 def test_plugin_overview_doc_builds_its_dot_face_with_reads():
-    page = (
-        Path(__file__).parents[1] / "docs" / "quant-format-plugins.md"
-    ).read_text()
+    page = (Path(__file__).parents[1] / "docs" / "quant-format-plugins.md").read_text()
     (block,) = (
         text
         for language, text in dot._fenced(page)

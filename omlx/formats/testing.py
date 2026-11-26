@@ -7,6 +7,8 @@ gives ``finish`` sums to scale, ``rows_stack`` checks the rows rule's
 promise of a format, and ``tile_rows`` reads every weight of rows through
 a tile face. ``staged_tables`` reads a face's tables back as a kernel
 stages them. ``codes_rows`` reads integer levels and weights.
+``check_constructor_reads`` checks rule 4: a face's cursor constructor
+computes pointers only and reads no operand data.
 ``no_dot_defects`` reports defective faces and layouts.
 ``layer_calls`` records where format layers' rows ran:
 their face's launch, or the format's decode.
@@ -141,9 +143,9 @@ class _Verified:
         return self
 
     def __exit__(self, *raised):
-        extra_var, extra_token, testing_var, testing_token, token = (
-            self._entries.get()[-1]
-        )
+        extra_var, extra_token, testing_var, testing_token, token = self._entries.get()[
+            -1
+        ]
         testing_var.reset(testing_token)
         extra_var.reset(extra_token)
         self._entries.reset(token)
@@ -859,6 +861,418 @@ def codes_rows(
     if levels.max().item() > 127:
         raise AssertionError(f"codes face {face.key} returned a level above 127")
     return levels, weights
+
+
+# Rule-4 constructor-read probes: for each operand, fill a writable copy with
+# alternate values, construct `early` and evaluate `on_alt`, wait on a device
+# barrier, overwrite the copy with the real operand values, wait again, and
+# compare `early` against a fresh cursor `late`. A compliant constructor only
+# computes pointers, so `early` and `late` read the restored values and match
+# bit for bit; a constructor that read the operand captured the alternate
+# values and diverges from `late`. Comparing `on_alt` against `late` ensures
+# the probe fails closed on degenerate operands that never affect the output.
+_CTOR_TILE_HEADER = r"""
+template <
+    typename T,
+    int K,
+    typename F,
+    typename RP,
+    typename W,
+    typename A,
+    typename B>
+METAL_FUNC void omlx_ctor_tile_probe(
+    const F mw,
+    RP rows,
+    const device uint64_t* meta,
+    device W* work,
+    A alt,
+    B base,
+    device uint32_t* alt_bits,
+    device uint32_t* flags,
+    uint tid,
+    uint nthreads) {
+  if constexpr (omlx_tile_face<F, K>::value) {
+    using R = typename F::template Runs<K>;
+    const size_t num_rows = size_t(meta[0]);
+    const size_t probe_len = size_t(meta[1]);
+    uint32_t local_ctor = 0u;
+    uint32_t local_sens = 0u;
+    for (size_t r = 0; r < num_rows; ++r) {
+      const size_t row = size_t(rows[r]);
+      for (size_t idx = tid; idx < probe_len; idx += nthreads) {
+        work[idx] = alt[idx];
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      const R early(mw, row);
+      const R on_alt(mw, row);
+      for (uint w = tid; w < uint(K); w += nthreads) {
+        const auto p = on_alt.params(int(w / uint(R::GROUP)));
+        const auto c = on_alt.fetch(int(w / uint(R::RUN)));
+        alt_bits[w] = as_type<uint32_t>(R::weight(p, c, int(w % uint(R::RUN))));
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      for (size_t idx = tid; idx < probe_len; idx += nthreads) {
+        work[idx] = base[idx];
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      const R late(mw, row);
+      for (uint w = tid; w < uint(K); w += nthreads) {
+        const auto pe = early.params(int(w / uint(R::GROUP)));
+        const auto ce = early.fetch(int(w / uint(R::RUN)));
+        const uint32_t ve = as_type<uint32_t>(
+            R::weight(pe, ce, int(w % uint(R::RUN))));
+        const auto pl = late.params(int(w / uint(R::GROUP)));
+        const auto cl = late.fetch(int(w / uint(R::RUN)));
+        const uint32_t vl = as_type<uint32_t>(
+            R::weight(pl, cl, int(w % uint(R::RUN))));
+        if (ve != vl) {
+          local_ctor = 1u;
+        }
+        if (alt_bits[w] != vl) {
+          local_sens = 1u;
+        }
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    }
+    flags[tid] = local_ctor;
+    flags[nthreads + tid] = local_sens;
+  }
+}
+"""
+
+_CTOR_CODES_HEADER = r"""
+template <
+    typename T,
+    int K,
+    typename F,
+    typename RP,
+    typename W,
+    typename A,
+    typename B>
+METAL_FUNC void omlx_ctor_codes_probe(
+    const F mw,
+    RP rows,
+    const device uint64_t* meta,
+    device W* work,
+    A alt,
+    B base,
+    device uint32_t* alt_bits,
+    device uint32_t* flags,
+    uint tid,
+    uint nthreads) {
+  using R = typename omlx_code_runs<F, K>::type;
+  const size_t num_rows = size_t(meta[0]);
+  const size_t probe_len = size_t(meta[1]);
+  uint32_t local_ctor = 0u;
+  uint32_t local_sens = 0u;
+  for (size_t r = 0; r < num_rows; ++r) {
+    const size_t row = size_t(rows[r]);
+    for (size_t idx = tid; idx < probe_len; idx += nthreads) {
+      work[idx] = alt[idx];
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    const R early(mw, row);
+    const R on_alt(mw, row);
+    for (uint w = tid; w < uint(K); w += nthreads) {
+      const auto pack = on_alt.fetch(int(w / 8u));
+      const uint pair = R::pair(pack, int(w % 4u));
+      const uint32_t lv = uint32_t(ushort(pair >> ((w & 4) * 4)));
+      const float2 mp = on_alt.params(int(w / uint(R::GROUP)));
+      alt_bits[w] = lv;
+      alt_bits[size_t(K) + size_t(w)] = as_type<uint32_t>(mp.x);
+      alt_bits[size_t(2) * size_t(K) + size_t(w)] = as_type<uint32_t>(mp.y);
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    for (size_t idx = tid; idx < probe_len; idx += nthreads) {
+      work[idx] = base[idx];
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    const R late(mw, row);
+    for (uint w = tid; w < uint(K); w += nthreads) {
+      const auto pe = early.fetch(int(w / 8u));
+      const uint pair_e = R::pair(pe, int(w % 4u));
+      const uint32_t lv_e = uint32_t(ushort(pair_e >> ((w & 4) * 4)));
+      const float2 mp_e = early.params(int(w / uint(R::GROUP)));
+      const auto pl = late.fetch(int(w / 8u));
+      const uint pair_l = R::pair(pl, int(w % 4u));
+      const uint32_t lv_l = uint32_t(ushort(pair_l >> ((w & 4) * 4)));
+      const float2 mp_l = late.params(int(w / uint(R::GROUP)));
+      const uint32_t sx_e = as_type<uint32_t>(mp_e.x);
+      const uint32_t sy_e = as_type<uint32_t>(mp_e.y);
+      const uint32_t sx_l = as_type<uint32_t>(mp_l.x);
+      const uint32_t sy_l = as_type<uint32_t>(mp_l.y);
+      if (lv_e != lv_l || sx_e != sx_l || sy_e != sy_l) {
+        local_ctor = 1u;
+      }
+      if (alt_bits[w] != lv_l || alt_bits[size_t(K) + size_t(w)] != sx_l ||
+          alt_bits[size_t(2) * size_t(K) + size_t(w)] != sy_l) {
+        local_sens = 1u;
+      }
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_device);
+  }
+  flags[tid] = local_ctor;
+  flags[nthreads + tid] = local_sens;
+}
+"""
+
+_CTOR_DOT_HEADER = r"""
+template <typename T, int K, typename L>
+METAL_FUNC float omlx_ctor_dot_eval(
+    thread L& a, const device T* x, uint simd_lid) {
+  constexpr int WHOLE = K - K % L::BLOCK;
+  constexpr int LAST = K % L::BLOCK / L::VPT;
+  x += int(simd_lid) * L::VPT;
+  float x_thread[L::VPT];
+  thread const float* xt = x_thread;
+  float acc = 0.0f;
+  for (int k = 0; k < WHOLE; k += L::BLOCK) {
+    const auto aux = L::load(x, x_thread);
+    acc = L::madd(acc, a.row(0), xt, aux);
+    a.step();
+    x += L::BLOCK;
+  }
+  if constexpr (LAST > 0) {
+    if (simd_lid < uint(LAST)) {
+      const auto aux = L::load(x, x_thread);
+      acc = L::madd(acc, a.row(0), xt, aux);
+    }
+  }
+  return a.finish(0, metal::simd_sum(acc));
+}
+
+template <
+    typename T,
+    int K,
+    typename D,
+    typename RP,
+    typename W,
+    typename A,
+    typename B>
+METAL_FUNC void omlx_ctor_dot_probe(
+    const D mw,
+    const device T* x,
+    RP rows,
+    const device uint64_t* meta,
+    device W* work,
+    A alt,
+    B base,
+    device uint32_t* flags,
+    uint simd_lid) {
+  (void)sizeof(omlx_revision<D::CONTRACT>);
+  using L = typename D::template Lanes<K>;
+  static_assert(
+      L::VPT >= 1,
+      "dot face: Lanes<K>::VPT must be one input or more");
+  if constexpr (L::VPT >= 1) {
+    static_assert(
+        L::BLOCK == 32 * L::VPT,
+        "dot face: Lanes<K>::BLOCK must be VPT inputs for each of a simdgroup's 32 "
+        "lanes");
+    static_assert(
+        K % L::VPT == 0,
+        "dot face: K must be a whole number of a lane's VPT inputs");
+    const size_t num_rows = size_t(meta[0]);
+    const size_t probe_len = size_t(meta[1]);
+    uint32_t local_ctor = 0u;
+    uint32_t local_sens = 0u;
+    for (size_t r = 0; r < num_rows; ++r) {
+      const size_t row = size_t(rows[r]);
+      for (size_t idx = simd_lid; idx < probe_len; idx += 32u) {
+        work[idx] = alt[idx];
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      L early(mw, row, simd_lid);
+      L on_alt(mw, row, simd_lid);
+      const uint32_t va = as_type<uint32_t>(
+          omlx_ctor_dot_eval<T, K>(on_alt, x, simd_lid));
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      for (size_t idx = simd_lid; idx < probe_len; idx += 32u) {
+        work[idx] = base[idx];
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+      L late(mw, row, simd_lid);
+      const uint32_t ve = as_type<uint32_t>(
+          omlx_ctor_dot_eval<T, K>(early, x, simd_lid));
+      const uint32_t vl = as_type<uint32_t>(
+          omlx_ctor_dot_eval<T, K>(late, x, simd_lid));
+      if (ve != vl) {
+        local_ctor = 1u;
+      }
+      if (va != vl) {
+        local_sens = 1u;
+      }
+      metal::threadgroup_barrier(metal::mem_flags::mem_device);
+    }
+    flags[simd_lid] = local_ctor;
+    flags[32u + simd_lid] = local_sens;
+  }
+}
+"""
+
+
+def _alternate_operand(array: mx.array) -> mx.array:
+    """Return an array of the same shape and dtype whose every element differs
+    from ``array`` with finite, non-zero values for floats and inverted bits
+    for integers."""
+    if mx.issubdtype(array.dtype, mx.floating):
+        one = mx.array(1.0, dtype=array.dtype)
+        half = mx.array(0.5, dtype=array.dtype)
+        in_mid = mx.isfinite(array) & (mx.abs(array) > 0.25) & (mx.abs(array) < 64.0)
+        return mx.where(in_mid, -array * half, one)
+    if array.dtype == mx.bool_:
+        return mx.logical_not(array)
+    if mx.issubdtype(array.dtype, mx.integer):
+        return mx.bitwise_invert(array)
+    raise ValueError(f"unsupported operand dtype {array.dtype}")
+
+
+@cache
+def _constructor_reads_kernel(face: Dot | Tile | Codes, probe_idx: int):
+    matrices = kernels.Matrices()
+    face_inputs = matrices.add("m", face)
+    probed_input = face_inputs[probe_idx]
+    member_exprs = [
+        (
+            "(const device uint8_t*)work"
+            if probe_idx == 0
+            else f"(const device uint8_t*){face_inputs[0]}"
+        ),
+        *(
+            "work" if idx == probe_idx else inp
+            for idx, inp in enumerate(face_inputs[1:], start=1)
+        ),
+        *matrices._staged["m"],
+    ]
+    decl = (
+        matrices._tables.prologue
+        + kernels._members_check(face)
+        + f"    const auto mw = {face.type}{{{', '.join(member_exprs)}}};\n"
+        + kernels._named("<kernel>", "")
+    )
+    if isinstance(face, Dot):
+        inputs = ["x", "rows", "meta", "alt", *face_inputs]
+        outputs = ["work", "flags"]
+        extra_header = _CTOR_DOT_HEADER
+        body = (
+            f"    omlx_ctor_dot_probe<T, K>(mw, x, rows, meta, work, alt, "
+            f"{probed_input}, flags, thread_index_in_simdgroup);\n"
+        )
+    elif isinstance(face, Tile):
+        inputs = ["rows", "meta", "alt", *face_inputs]
+        outputs = ["work", "alt_bits", "flags"]
+        extra_header = _CTOR_TILE_HEADER
+        body = (
+            f"    omlx_ctor_tile_probe<T, K>(mw, rows, meta, work, alt, "
+            f"{probed_input}, alt_bits, flags, thread_index_in_threadgroup, "
+            "threads_per_threadgroup.x);\n"
+        )
+    else:
+        inputs = ["rows", "meta", "alt", *face_inputs]
+        outputs = ["work", "alt_bits", "flags"]
+        extra_header = _CTOR_CODES_HEADER
+        body = (
+            f"    omlx_ctor_codes_probe<T, K>(mw, rows, meta, work, alt, "
+            f"{probed_input}, alt_bits, flags, thread_index_in_threadgroup, "
+            "threads_per_threadgroup.x);\n"
+        )
+    return mx.fast.metal_kernel(
+        name=f"omlx_format_ctor_reads_{face.key}_{probe_idx}",
+        input_names=inputs,
+        output_names=outputs,
+        header=matrices.header + extra_header,
+        source=decl + body,
+    )
+
+
+def _ctor_rows_args(face, operands, k, rows, dtype, codes_name="weight"):
+    if isinstance(face, (Tile, Codes)):
+        return _weight_rows_args(face, operands, k, rows, dtype, codes_name)
+    if not (isinstance(k, int) and not isinstance(k, bool) and 0 < k < 1 << 31):
+        raise ValueError(f"k={k} is not a positive int below 2^31")
+    # Reuse the shared operand/row/dtype validation with a valid multiple-of-8 k.
+    rows, operands = _weight_rows_args(face, operands, 8, rows, dtype, codes_name)
+    return rows, operands
+
+
+def check_constructor_reads(
+    face: Dot | Tile | Codes,
+    operands,
+    k: int,
+    rows,
+    dtype: mx.Dtype,
+    *,
+    codes_name: str = "weight",
+) -> None:
+    """Check rule 4: ``face``'s cursor constructor (``Runs(m, row)`` or
+    ``Lanes(m, row, lane)``) computes pointers only and reads no operand data.
+
+    For each operand in ``(codes_name, *face.tensors)``, the probe constructs a
+    cursor while a writable copy of that operand holds alternate values, then
+    overwrites the copy with the real operand values behind a device barrier
+    and compares the early cursor's outputs against a fresh cursor's. A
+    constructor that read the operand captured the alternate values and fails
+    with an ``AssertionError`` naming the face and every offending member.
+    Operands must be non-degenerate (each operand must affect at least one
+    output on the probed rows), or a ``ValueError`` is raised so the check
+    never fails open.
+    """
+    if not isinstance(face, (Dot, Tile, Codes)):
+        raise ValueError(f"{face!r} is not a Dot, Tile, or Codes face")
+    rows, operands = _ctor_rows_args(face, operands, k, rows, dtype, codes_name)
+    names = (codes_name, *face.tensors)
+    flat_ops = [mx.contiguous(op).reshape(-1) for op in operands]
+    rows_arr = mx.array(rows, dtype=mx.uint64)
+    if isinstance(face, Dot):
+        x_len = max(k, 8)
+        x = mx.array(
+            [((i % 7) - 3) * 0.25 + 0.125 for i in range(x_len)],
+            dtype=dtype,
+        )
+        tg = 32
+    else:
+        x = None
+        tg = min(((k + 31) // 32) * 32, 256)
+    read_members: list[str] = []
+    unobserved: list[str] = []
+    for probe_idx, (name, probed) in enumerate(zip(names, flat_ops, strict=True)):
+        alt = _alternate_operand(probed)
+        meta = mx.array([len(rows), probed.size, 0, 0, 0, 0, 0, 0], dtype=mx.uint64)
+        kernel = _constructor_reads_kernel(face, probe_idx)
+        if isinstance(face, Dot):
+            _, flags = kernel(
+                inputs=[x, rows_arr, meta, alt, *flat_ops],
+                template=[("T", dtype), ("K", k)],
+                grid=(tg, 1, 1),
+                threadgroup=(tg, 1, 1),
+                output_shapes=[(probed.size,), (2, tg)],
+                output_dtypes=[probed.dtype, mx.uint32],
+            )
+        else:
+            alt_shape = (3, k) if isinstance(face, Codes) else (k,)
+            _, _, flags = kernel(
+                inputs=[rows_arr, meta, alt, *flat_ops],
+                template=[("T", dtype), ("K", k)],
+                grid=(tg, 1, 1),
+                threadgroup=(tg, 1, 1),
+                output_shapes=[(probed.size,), alt_shape, (2, tg)],
+                output_dtypes=[probed.dtype, mx.uint32, mx.uint32],
+            )
+        mx.eval(flags)
+        if bool(mx.any(flags[0]).item()):
+            read_members.append(name)
+        elif not bool(mx.any(flags[1]).item()):
+            unobserved.append(name)
+    if read_members:
+        raise AssertionError(
+            f"face {face.key}: constructor read {', '.join(read_members)} "
+            "(rule 4: the constructor computes pointers only and reads no data)"
+        )
+    if unobserved:
+        raise ValueError(
+            f"face {face.key}: operand {', '.join(unobserved)} had no observable "
+            "effect on the probed rows; pass non-degenerate operands"
+        )
 
 
 @dataclass(frozen=True, eq=False)

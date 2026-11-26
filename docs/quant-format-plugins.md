@@ -112,7 +112,7 @@ FORMAT = MyFormat()
 myformat = "my_package:FORMAT"
 ```
 
-`SOURCE` is a Metal struct of about 50 lines ([An example](quant-formats.md#an-example), [An example of a tile face](quant-formats.md#an-example-of-a-tile-face)). `omlx.formats.testing` checks the face rules that can be tested at runtime (`dot_rows`, `shared_rows`, `lane_parts`, `finish_rows`, `tile_rows`, `staged_tables`, `rows_stack`) ([Test a format](quant-formats.md#test-a-format)).
+`SOURCE` is a Metal struct of about 50 lines ([An example](quant-formats.md#an-example), [An example of a tile face](quant-formats.md#an-example-of-a-tile-face)). `omlx.formats.testing` checks the face rules that can be tested at runtime (`dot_rows`, `shared_rows`, `lane_parts`, `finish_rows`, `tile_rows`, `codes_rows`, `check_constructor_reads`, `staged_tables`, `rows_stack`) ([Test a format](quant-formats.md#test-a-format)).
 
 [omlx-oqel](https://github.com/yohann-bearzi/omlx-oqel) is a complete plugin: Lloyd-codebook formats at 2, 3 and 4 bits, with a scale byte per group of 16 and a bfloat16 row scale. Its level tables are `Table`s, fitted tables travel in the checkpoint record, and `accept` builds a reader from that record. It gives dot and tile faces.
 
