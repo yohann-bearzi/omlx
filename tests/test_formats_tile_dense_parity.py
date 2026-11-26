@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
@@ -1193,7 +1194,7 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     assert tile_dense.policy_for(p1_m3, 17, mx.bfloat16).backend == "mlx"
     assert tile_dense.policy_for(p1_m3, 18, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p1_m3, 64, mx.bfloat16).split_k == 40
-    assert tile_dense.policy_for(p1_m3, 512, mx.bfloat16).backend == "mlx"
+    assert tile_dense.policy_for(p1_m3, 512, mx.bfloat16).split_k == 20
     p48_m5 = tile_dense.build_plan(in_proj, tensor_units=True, chip="applegpu_g17s_c40")
     assert tile_dense.policy_for(p48_m5, 32, mx.bfloat16).backend == "wide"
     assert tile_dense.policy_for(p48_m5, 128, mx.bfloat16).split_k == 40
@@ -1623,3 +1624,267 @@ def test_host_sweep_covers_wide_window_and_fp16(monkeypatch):
     with pytest.raises(_StopError):
         test_rows_17_24_passes_c2_on_the_host_table(2048, 2048, 4, 64)
     assert recorded == [("applegpu_g15d_c80", False), ("applegpu_g17s_c40", True)]
+
+
+def test_dense_splitk_accum_uses_single_fused_kernel_not_two_pass(monkeypatch):
+    """Split-K dense prefill reduces in one fused Metal pass (not mx.sum + astype),
+    handling arbitrary shapes, dtypes, tiny (<8 elem) buffers, empty tensors,
+    and IDX64 parity with exact ascending FP32 partition order."""
+    accum_k = tile_dense._splitk_accum_kernel()
+    assert accum_k is not None
+
+    # Direct kernel parity: ascending FP32 sum cast once to T across split_k,
+    # dtypes, prime/tiny totals (<8 elements), and 3-D/4-D output shapes.
+    cases = [
+        (2, (2, 1), mx.bfloat16),  # total*sk = 4 < 8 (constant-buffer binding)
+        (3, (17, 1), mx.bfloat16),  # prime total
+        (5, (1, 33, 3), mx.float16),  # 3-D, non-multiple of 4
+        (8, (2, 4, 17), mx.bfloat16),  # 4-D
+        (20, (1, 512, 1), mx.bfloat16),  # > 4-way unroll + remainder
+        (40, (1, 128, 48), mx.float16),  # large split_k
+        (6, (1, 64, 64), mx.float32),  # fp32 output dtype
+    ]
+    for sk, out_shape, dtype in cases:
+        mx.random.seed(100 + sk + out_shape[-1])
+        rows = math.prod(out_shape[:-1])
+        n = out_shape[-1]
+        part = mx.random.normal((sk, rows, n)).astype(mx.float32) * 0.25
+        mx.eval(part)
+        got = tile_dense._splitk_accum(part, out_shape, dtype)
+        got2 = tile_dense._splitk_accum(part, out_shape, dtype)
+        # Sequential ascending FP32 reference (exact same order as kernel).
+        acc = part[0]
+        for i in range(1, sk):
+            acc = acc + part[i]
+        want = acc.astype(dtype).reshape(out_shape)
+        mx.eval(got, got2, want)
+        assert got.shape == out_shape and got.dtype == dtype
+        if dtype == mx.float32:
+            assert mx.array_equal(got.view(mx.uint32), want.view(mx.uint32)).item()
+            assert mx.array_equal(got.view(mx.uint32), got2.view(mx.uint32)).item()
+        else:
+            assert _same_bits(got, want), (sk, out_shape, dtype)
+            assert _same_bits(got, got2), (sk, out_shape, dtype)
+
+    # Empty tensor guard (rows == 0 must not dispatch 0-threadgroup Metal).
+    empty_part = mx.zeros((4, 0, 16), dtype=mx.float32)
+    empty_out = tile_dense._splitk_accum(empty_part, (1, 0, 16), mx.bfloat16)
+    mx.eval(empty_out)
+    assert empty_out.shape == (1, 0, 16) and empty_out.dtype == mx.bfloat16
+
+    # IDX64=True template compiles and is bitwise identical to IDX64=False.
+    mx.random.seed(999)
+    part64 = mx.random.normal((7, 19, 13)).astype(mx.float32)
+    mx.eval(part64)
+    total64 = 19 * 13
+    y32 = accum_k(
+        inputs=[part64],
+        template=[("T", mx.bfloat16), ("SPLIT_K", 7), ("IDX64", False)],
+        grid=(total64, 1, 1),
+        threadgroup=(min(128, total64), 1, 1),
+        output_shapes=[(1, 19, 13)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    y64 = accum_k(
+        inputs=[part64],
+        template=[("T", mx.bfloat16), ("SPLIT_K", 7), ("IDX64", True)],
+        grid=(total64, 1, 1),
+        threadgroup=(min(128, total64), 1, 1),
+        output_shapes=[(1, 19, 13)],
+        output_dtypes=[mx.bfloat16],
+    )[0]
+    mx.eval(y32, y64)
+    assert _same_bits(y32, y64)
+
+    # End-to-end _launch: split_k > 1 invokes fused accum and NEVER calls mx.sum;
+    # split_k == 1 does NOT invoke fused accum.
+    is_nax = linear._nax_host()
+    n, k, rows = 64, 512, 33
+    quantized, _ = _layer(n, k, 8, 64)
+    x = _x((1, rows, k))
+    face = affine.tile_face(8, 64, mx.bfloat16)
+    ops = (quantized["weight"], quantized["scales"], quantized["biases"])
+    pol_sk = (
+        tuning.DenseTilePolicy("nax", 32, 64, 64, 2, 2, True, split_k=4, sched="seg")
+        if is_nax
+        else tuning.DenseTilePolicy(
+            "steel", 32, 32, 32, 2, 2, True, split_k=4, x_nreads=8
+        )
+    )
+    pol_no_sk = (
+        tuning.DenseTilePolicy("nax", 32, 64, 64, 2, 2, True, split_k=1, sched="seg")
+        if is_nax
+        else tuning.DenseTilePolicy(
+            "steel", 32, 32, 32, 2, 2, True, split_k=1, x_nreads=8
+        )
+    )
+    mm = tile_dense._kernel(face, pol_sk)
+    accum_calls: list[int] = []
+    real_accum = tile_dense._splitk_accum
+
+    def spy_accum(part, out_shape, dtype):
+        accum_calls.append(part.shape[0])
+        return real_accum(part, out_shape, dtype)
+
+    def forbid_sum(*args, **kwargs):
+        raise AssertionError("split-K launch must use fused accum, not mx.sum")
+
+    monkeypatch.setattr(tile_dense, "_splitk_accum", spy_accum)
+    monkeypatch.setattr(mx, "sum", forbid_sum)
+    y_sk = tile_dense._launch(mm, pol_sk, x, ops)
+    y_1 = tile_dense._launch(mm, pol_no_sk, x, ops)
+    mx.eval(y_sk, y_1)
+    assert accum_calls == [4]
+    assert y_sk.shape == (1, rows, n) and y_sk.dtype == mx.bfloat16
+    assert y_1.shape == (1, rows, n) and y_1.dtype == mx.bfloat16
+
+
+def test_dense_splitk_accum_warmed_in_warm_specs(monkeypatch):
+    """warm_specs registers the fused split-K accumulate kernel for split_k > 1
+    schedules and omits it when all buckets use split_k == 1."""
+    is_nax = linear._nax_host()
+    chip = "applegpu_g17s_c40" if is_nax else "applegpu_g15d_c80"
+    _, layer = _layer(48, 2560, 8, 64)
+    pol_sk = (
+        tuning.DenseTilePolicy("nax", 32, 64, 64, 2, 2, False, split_k=10, sched="seg")
+        if is_nax
+        else tuning.DenseTilePolicy(
+            "steel", 32, 32, 32, 2, 2, False, split_k=10, x_nreads=8
+        )
+    )
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: pol_sk)
+    plan_sk = tile_dense.build_plan(layer, tensor_units=is_nax, chip=chip)
+    inst_sk, _ = tile_dense.warm_specs(
+        layer, (mx.bfloat16,), tensor_units=is_nax, plan=plan_sk
+    )
+    accum_k = tile_dense._splitk_accum_kernel()
+    accum_matches = [
+        (inst, recipe)
+        for inst, recipe in inst_sk.items()
+        if getattr(inst.kernel, "native", inst.kernel) is accum_k
+    ]
+    assert accum_matches
+    # Execute the registered warm recipe to verify its StandIn builds cleanly.
+    stand_in = accum_matches[0][1]()
+    assert stand_in.input_shapes == ((10, 16, 48),)
+    assert stand_in.output_shapes == ((16, 48),)
+    assert stand_in.grid == (16 * 48, 1, 1)
+
+    pol_1 = (
+        tuning.DenseTilePolicy("nax", 32, 64, 64, 2, 2, False, split_k=1, sched="seg")
+        if is_nax
+        else tuning.DenseTilePolicy(
+            "steel", 32, 32, 32, 2, 2, False, split_k=1, x_nreads=8
+        )
+    )
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **k: pol_1)
+    plan_1 = tile_dense.build_plan(layer, tensor_units=is_nax, chip=chip)
+    inst_1, _ = tile_dense.warm_specs(
+        layer, (mx.bfloat16,), tensor_units=is_nax, plan=plan_1
+    )
+    assert not any(
+        getattr(inst.kernel, "native", inst.kernel) is accum_k for inst in inst_1
+    )
+
+
+def test_dense_splitk_accum_thread_safe():
+    """Concurrent threads share _splitk_accum_kernel() cleanly (Protocol rule 14)."""
+
+    def worker(seed: int):
+        k = tile_dense._splitk_accum_kernel()
+        mx.random.seed(seed)
+        part = mx.random.normal((8, 33, 48)).astype(mx.float32) * 0.25
+        y = tile_dense._splitk_accum(part, (1, 33, 48), mx.bfloat16)
+        acc = part[0]
+        for i in range(1, 8):
+            acc = acc + part[i]
+        want = acc.astype(mx.bfloat16).reshape(1, 33, 48)
+        mx.eval(y, want)
+        assert _same_bits(y, want)
+        return k
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        kernels_seen = list(pool.map(worker, range(4)))
+    assert len({id(k) for k in kernels_seen}) == 1
+
+
+def test_deferred79_fused_splitk_winning_cells_routed_and_pass_c2(monkeypatch):
+    """DEFERRED 79: the 12 winning fused split-K cells (2 M5 Max + 10 M3 Ultra)
+    resolve to their measured policies, FN_k_proj M=128 stays mlx on M3 Ultra,
+    v1 tables stay fresh, and every host winning cell passes C2 in bf16/fp16."""
+    tuning.reset_cache()
+    assert tuning.stale_entries() == []
+
+    m5_wins = [
+        (48, 2560, 8, 64, 128, "nax", 40),
+        (1, 2560, 8, 64, 512, "nax", 20),
+    ]
+    m3_wins = [
+        (512, 2560, 8, 64, 33, "steel", 20),
+        (512, 2560, 8, 64, 512, "steel", 4),
+        (2560, 6144, 8, 64, 17, "steel", 12),
+        (2560, 6144, 8, 64, 64, "steel", 6),
+        (48, 2560, 8, 64, 512, "steel", 8),
+        (48, 2560, 8, 64, 2048, "steel", 5),
+        (640, 2560, 8, 128, 33, "steel", 10),
+        (640, 2560, 8, 128, 128, "steel", 8),
+        (1, 2560, 8, 64, 512, "steel", 20),
+        (1, 2560, 8, 64, 2048, "steel", 10),
+    ]
+    for chip, specs in (
+        ("applegpu_g17s_c40", m5_wins),
+        ("applegpu_g15d_c80", m3_wins),
+    ):
+        for n, k, bits, gs, rows, want_bk, want_sk in specs:
+            for dtype in (mx.bfloat16, mx.float16):
+                face = affine.tile_face(bits, gs, dtype)
+                pol = tuning.lookup(
+                    "dense_tile",
+                    face,
+                    dtype=dtype,
+                    bits=bits,
+                    group=gs,
+                    n=n,
+                    k=k,
+                    rows=rows,
+                    chip=chip,
+                )
+                assert pol is not None, (chip, n, k, rows, dtype)
+                assert pol.backend == want_bk and pol.split_k == want_sk, (
+                    chip,
+                    n,
+                    k,
+                    rows,
+                    dtype,
+                    pol,
+                )
+                assert pol.is_legal(face, k, n, rows, chip, dtype=dtype)
+
+    # FN_k_proj M=128 on M3 Ultra stays mlx (1.0355x over 7 draws).
+    for dtype in (mx.bfloat16, mx.float16):
+        face = affine.tile_face(8, 64, dtype)
+        pol_keep = tuning.lookup(
+            "dense_tile",
+            face,
+            dtype=dtype,
+            bits=8,
+            group=64,
+            n=512,
+            k=2560,
+            rows=128,
+            chip="applegpu_g15d_c80",
+        )
+        assert pol_keep is not None and pol_keep.backend == "mlx"
+
+    # Execute every host winning cell through FormatLinear and check C2 (bf16 & fp16).
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    host_specs = m5_wins if linear._nax_host() else m3_wins
+    for n, k, bits, gs, rows, _, _ in host_specs:
+        for dtype in (mx.bfloat16, mx.float16):
+            quantized, layer = _layer(n, k, bits, gs, dtype)
+            x = _x((1, rows, k), dtype=dtype, seed=rows + n)
+            with testing.fresh_proofs():
+                got = layer(x)
+            want = quantized(x)
+            mx.eval(got, want)
+            _assert_c2(got, want, x, quantized)

@@ -1853,10 +1853,17 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T21:35:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "nax",
+        "bm": 64,
+        "bn": 32,
+        "bk": 128,
+        "wm": 2,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 20
       }
     },
     {
@@ -1872,10 +1879,17 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T21:35:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "nax",
+        "bm": 64,
+        "bn": 32,
+        "bk": 128,
+        "wm": 2,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 20
       }
     },
     {

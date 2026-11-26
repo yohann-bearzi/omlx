@@ -840,6 +840,27 @@ _SKELETON_TEXT = (
 )
 tuning.register_skeleton("dense_tile", _SKELETON_TEXT)
 
+_SPLITK_ACCUM_SOURCE = """
+    using Idx = metal::conditional_t<IDX64, size_t, uint>;
+    const Idx gid = Idx(thread_position_in_grid.x);
+    const Idx stride = Idx(part_strides[0]);
+    float acc = part[gid];
+    int i = 1;
+    #pragma unroll
+    for (; i + 3 < SPLIT_K; i += 4) {
+      const float a0 = part[gid + Idx(i) * stride];
+      const float a1 = part[gid + Idx(i + 1) * stride];
+      const float a2 = part[gid + Idx(i + 2) * stride];
+      const float a3 = part[gid + Idx(i + 3) * stride];
+      acc = (((acc + a0) + a1) + a2) + a3;
+    }
+    #pragma unroll
+    for (; i < SPLIT_K; ++i) {
+      acc += part[gid + Idx(i) * stride];
+    }
+    y[gid] = static_cast<T>(acc);
+"""
+
 
 class _WideBinding(NamedTuple):
     kernel: Any
@@ -909,6 +930,42 @@ def _kernel(face: Tile, policy: DenseTilePolicy):
     """Build (once) the unified steel or NAX dense kernel for ``face``."""
     with _lock:
         return _build(face, policy.backend)
+
+
+@cache
+def _build_splitk_accum():
+    return mx.fast.metal_kernel(
+        name="omlx_dense_splitk_accum",
+        input_names=["part"],
+        output_names=["y"],
+        source=_SPLITK_ACCUM_SOURCE,
+    )
+
+
+def _splitk_accum_kernel():
+    """Build (once) the fused single-pass split-K FP32 reduce + cast kernel."""
+    with _lock:
+        return _build_splitk_accum()
+
+
+def _splitk_accum(
+    part: mx.array, out_shape: tuple[int, ...], dtype: mx.Dtype
+) -> mx.array:
+    """Single-pass FP32 split-K accumulation in ascending partition order."""
+    split_k = part.shape[0]
+    total = part.size // split_k
+    if total == 0:
+        return mx.zeros(out_shape, dtype=dtype)
+    tg = 128 if total <= 32768 else 256
+    idx64 = part.size >= (1 << 32)
+    return _splitk_accum_kernel()(
+        inputs=[part],
+        template=[("T", dtype), ("SPLIT_K", split_k), ("IDX64", idx64)],
+        grid=(total, 1, 1),
+        threadgroup=(min(tg, total), 1, 1),
+        output_shapes=[out_shape],
+        output_dtypes=[dtype],
+    )[0]
 
 
 def source_digest() -> str:
@@ -1446,7 +1503,7 @@ def _launch(mm, policy: DenseTilePolicy, x: mx.array, operands: tuple) -> mx.arr
             output_dtypes=[mx.float32 if split_k > 1 else dtype],
         )[0]
         if split_k > 1:
-            return mx.sum(out, axis=0).astype(dtype).reshape(out_shape)
+            return _splitk_accum(out, out_shape, dtype)
         return out
 
     tgp = wm * wn * 32
@@ -1475,7 +1532,7 @@ def _launch(mm, policy: DenseTilePolicy, x: mx.array, operands: tuple) -> mx.arr
         output_dtypes=[mx.float32 if split_k > 1 else dtype],
     )[0]
     if split_k > 1:
-        return mx.sum(out, axis=0).astype(dtype).reshape(out_shape)
+        return _splitk_accum(out, out_shape, dtype)
     return out
 
 
@@ -1913,6 +1970,35 @@ def warm_specs(
             proofs.setdefault(inst, []).append(
                 (plan.proof, (dtype, plan.k, eff, op_flags))
             )
+            if split_k > 1:
+                accum_k = _splitk_accum_kernel()
+                stand_total = stand_rows * stand_n
+                accum_inst = kernels.planned(
+                    accum_k,
+                    (((split_k, stand_rows, stand_n), mx.float32),),
+                    [dtype],
+                    template=[
+                        ("T", dtype),
+                        ("SPLIT_K", split_k),
+                        ("IDX64", False),
+                    ],
+                )
+                accum_tg = (min(128, stand_total), 1, 1)
+
+                def accum_recipe(
+                    in_shapes=((split_k, stand_rows, stand_n),),
+                    out_shapes=((stand_rows, stand_n),),
+                    grid=(stand_total, 1, 1),
+                    threadgroup=accum_tg,
+                ):
+                    return kernels.StandIn(
+                        input_shapes=in_shapes,
+                        output_shapes=out_shapes,
+                        grid=grid,
+                        threadgroup=threadgroup,
+                    )
+
+                instances.setdefault(accum_inst, accum_recipe)
     return instances, proofs
 
 

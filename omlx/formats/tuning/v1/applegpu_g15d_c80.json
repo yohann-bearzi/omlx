@@ -627,10 +627,20 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 12,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -646,10 +656,20 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 12,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -703,10 +723,20 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 64,
+        "bn": 32,
+        "bk": 32,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 6,
+        "x_nreads": 8,
+        "param_staging": "group_steps",
+        "vec_store": true
       }
     },
     {
@@ -722,10 +752,20 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 64,
+        "bn": 32,
+        "bk": 32,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 6,
+        "x_nreads": 8,
+        "param_staging": "group_steps",
+        "vec_store": true
       }
     },
     {
@@ -1213,10 +1253,20 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 32,
+        "bk": 32,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 20,
+        "x_nreads": 4,
+        "param_staging": "group_steps",
+        "vec_store": true
       }
     },
     {
@@ -1232,10 +1282,20 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 32,
+        "bk": 32,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 20,
+        "x_nreads": 4,
+        "param_staging": "group_steps",
+        "vec_store": true
       }
     },
     {
@@ -1365,10 +1425,19 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 4,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -1384,10 +1453,19 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 4,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -1555,10 +1633,19 @@
       },
       "face_sha256": "48aecdb4a3ee",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 32,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 10,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -1574,10 +1661,19 @@
       },
       "face_sha256": "8d6a646e003a",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 32,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 10,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -1631,10 +1727,20 @@
       },
       "face_sha256": "48aecdb4a3ee",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 64,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 8,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -1650,10 +1756,20 @@
       },
       "face_sha256": "8d6a646e003a",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 64,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 8,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -2331,10 +2447,19 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 16,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 8,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -2350,10 +2475,19 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 16,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 8,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -2407,10 +2541,19 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 16,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 5,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -2426,10 +2569,19 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 16,
+        "bk": 64,
+        "wm": 2,
+        "wn": 2,
+        "align_n": true,
+        "split_k": 5,
+        "x_nreads": 8,
+        "param_staging": "per_step"
       }
     },
     {
@@ -2857,10 +3009,20 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 16,
+        "bk": 128,
+        "wm": 2,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 20,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -2876,10 +3038,20 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 32,
+        "bn": 16,
+        "bk": 128,
+        "wm": 2,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 20,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -2933,10 +3105,20 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 16,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 10,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
@@ -2952,10 +3134,20 @@
       },
       "face_sha256": "2c7c53f3b7ff",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-22T23:35:00Z",
-      "exactness": "bitwise",
+      "measured_at": "2026-11-25T22:20:00Z",
+      "exactness": "rule17_fp32",
       "params": {
-        "backend": "mlx"
+        "backend": "steel",
+        "bm": 16,
+        "bn": 16,
+        "bk": 64,
+        "wm": 1,
+        "wn": 2,
+        "align_n": false,
+        "split_k": 10,
+        "x_nreads": 8,
+        "param_staging": "per_step",
+        "vec_store": true
       }
     },
     {
