@@ -2299,13 +2299,8 @@ class FormatLinear(_FormatLayer):
         signature = (x.shape, x.dtype)
         graph = plan.proof.graphs.get(signature)
         if graph is not None:
-            dot_fast = kept.dot_fast
-            if dot_fast is not None:
-                cur = self.__dict__.get(_FAST)
-                if cur is None or (
-                    cur is not dot_fast and self.__dict__.get(_FAST2) is None
-                ):
-                    self._publish_fast(kept, dot_fast)
+            if "no_dot_fast" not in kept._slots:
+                self._register_dot_fast(kept, plan, signature)
             y = graph(x, *plan.operands)
             return y if bias is None else y + bias
         y = _launch(plan, signature, _linear, _linear_stand_in, x)
@@ -2447,13 +2442,8 @@ class FormatLinear(_FormatLayer):
                     return y if bias is None else y + bias
                 graph = plan.proof.graphs.get((shape, dtype))
                 if graph is not None:
-                    dot_fast = kept.dot_fast
-                    if dot_fast is not None:
-                        cur = self.__dict__.get(_FAST)
-                        if cur is None or (
-                            cur is not dot_fast and self.__dict__.get(_FAST2) is None
-                        ):
-                            self._publish_fast(kept, dot_fast)
+                    if "no_dot_fast" not in kept._slots:
+                        self._register_dot_fast(kept, plan, (shape, dtype))
                     y = graph(x, *plan.operands)
                     return y if bias is None else y + bias
             if not shape or shape[-1] != plan.k:
@@ -2480,13 +2470,8 @@ class FormatLinear(_FormatLayer):
         # A single row is this: its Dot plan's kept graph and the bias.
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
-            dot_fast = kept.dot_fast
-            if dot_fast is not None:
-                cur = self.__dict__.get(_FAST)
-                if cur is None or (
-                    cur is not dot_fast and self.__dict__.get(_FAST2) is None
-                ):
-                    self._publish_fast(kept, dot_fast)
+            if "no_dot_fast" not in kept._slots:
+                self._register_dot_fast(kept, plan, (shape, dtype))
             y = graph(x, *plan.operands)
         else:
             k = self.input_dims

@@ -1045,4 +1045,26 @@ def test_native_fast_refuses_16_or_more_operands_and_recovers_orphaned_dot_fast(
         y2 = fl2(x1)
         mx.eval(y2)
         assert _same_bits(y2, ref)
+        assert fl2._fast is not None
         assert fl2._fast is fl2.__dict__[linear._KEPT].dot_fast
+
+
+def test_shared_proof_dot_hit_registers_dot_fast_on_sibling_layers():
+    """A Dot hit on a shared plan.proof graph must bind native dot_fast on the
+    layer that took the hit (sibling layers and a fresh same-shape layer),
+    not leave them on Python dispatch."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+
+    with testing.fresh_proofs():
+        _, fl1 = _pair(10240, 2560, bits=8, group_size=64, seed=990)
+        _, fl2 = _pair(10240, 2560, bits=8, group_size=64, seed=991)
+        x1 = _x((1, 1, 2560), dtype=mx.bfloat16, seed=992)
+        x3 = _x((3, 1, 2560), dtype=mx.bfloat16, seed=993)
+        mx.eval(fl1(x1), fl2(x1))
+        mx.eval(fl1(x3), fl2(x3))
+        assert fl2._fast is not None and fl2._fast(fl2, x3) is not None
+
+        _, fl3 = _pair(10240, 2560, bits=8, group_size=64, seed=994)
+        mx.eval(fl3(x3))
+        assert fl3._fast is not None and fl3._fast(fl3, x3) is not None
