@@ -61,6 +61,25 @@
         "dtype": "bf16",
         "bits": 8,
         "group": 64,
+        "rows_bucket": "3-3",
+        "n": 16480,
+        "k": 2560
+      },
+      "face_sha256": "5ff31f90a32e",
+      "skeleton_sha256": "9b34afd024e9",
+      "measured_at": "2026-11-26T21:33:11Z",
+      "exactness": "rule17_fp32",
+      "params": {
+        "backend": "dot"
+      }
+    },
+    {
+      "key": {
+        "route": "dense_tile",
+        "face_id": "affine_tile_b8g64_bf16",
+        "dtype": "bf16",
+        "bits": 8,
+        "group": 64,
         "rows_bucket": "33-48",
         "n": 12288,
         "k": 2560

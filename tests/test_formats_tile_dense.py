@@ -684,3 +684,26 @@ def test_policy_for_return_annotation_includes_mma_and_msg():
     assert MmaTilePolicy in args
     assert MsgTilePolicy in args
     assert "rows >= 2" in (tile_dense.__doc__ or "")
+
+
+def test_three_row_stacked_gdn_projection_selects_measured_m5_route():
+    from types import SimpleNamespace
+
+    from omlx.formats import affine
+
+    layer = SimpleNamespace(
+        input_dims=2560, output_dims=16480, bits=8, group_size=64, mode="affine"
+    )
+    dtype = mx.bfloat16
+    schedule = tile_dense._build_schedule(
+        layer,
+        affine.tile_face(8, 64, dtype),
+        dtype,
+        tensor_units=True,
+        chip="applegpu_g17s_c40",
+    )
+    assert [tile_dense._route_for_rows(schedule, n).backend for n in (2, 3, 4)] == [
+        "mlx",
+        "dot",
+        "mlx",
+    ]
