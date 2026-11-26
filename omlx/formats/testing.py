@@ -1033,19 +1033,23 @@ def _wrappers(linear) -> list:
         through ``Proof.graphs`` and are recorded; non-recording threads keep
         their native fast path untouched."""
 
+        def __init__(self, attr: str) -> None:
+            self._attr = attr
+
         def __get__(self, obj, owner=None):
             if obj is None or _RECORDING.thread.blocks:
                 return None
-            return obj.__dict__.get(linear._FAST)
+            return obj.__dict__.get(self._attr)
 
         def __set__(self, obj, value):
-            obj.__dict__[linear._FAST] = value
+            obj.__dict__[self._attr] = value
 
         def __delete__(self, obj):
-            obj.__dict__.pop(linear._FAST, None)
+            obj.__dict__.pop(self._attr, None)
 
     return [
-        (linear.FormatLinear, "_fast", _FastMask()),
+        (linear.FormatLinear, "_fast", _FastMask(linear._FAST)),
+        (linear.FormatLinear, "_fast2", _FastMask(linear._FAST2)),
         (linear.FormatLinear, "__call__", linear_called),
         (linear.FormatSwitchLinear, "__call__", switch_called),
         (kernels.Proof, "graphs", property(replays, doc=graphs.__doc__)),

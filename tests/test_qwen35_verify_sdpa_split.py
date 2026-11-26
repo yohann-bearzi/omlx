@@ -541,3 +541,58 @@ def test_core_sized_long_kv_split_matches_per_row(monkeypatch):
     got = _gqa_causal_sdpa(q, k, v, scale).astype(mx.float32)
     assert got.shape == ref.shape
     assert mx.abs(ref - got).max().item() <= 2e-2
+
+
+def _fp32_attention_reference(q, k, v, scale, prob_dtype=None):
+    """Causal per-row attention with FP32 scores/softmax; ``prob_dtype``
+    rounds each row's probabilities before the P x V product (the bf16-P
+    control the C1.2 test must be able to fail)."""
+    q_len, kv_len = q.shape[2], k.shape[2]
+    prefix = kv_len - q_len
+    outs = []
+    for i in range(q_len):
+        qf = q[:, :, i : i + 1].astype(mx.float32)
+        kf = k[:, :, : prefix + i + 1].astype(mx.float32)
+        vf = v[:, :, : prefix + i + 1].astype(mx.float32)
+        scores = (qf @ kf.transpose(0, 1, 3, 2)) * scale
+        probs = mx.softmax(scores, axis=-1)
+        if prob_dtype is not None:
+            probs = probs.astype(prob_dtype).astype(mx.float32)
+        outs.append(probs @ vf)
+    return mx.concatenate(outs, axis=2)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_wide_causal_sdpa_keeps_probabilities_in_fp32(dtype):
+    """C1.2 (rule 33): P reaches the P x V product in FP32. The fixture has a
+    peak key (V=1) and eight near-equal tail keys whose V alternates +-250
+    (four at +250, four at -250, scores -1.20 vs -1.24), so a bf16 P breaks
+    the cancellation and moves the output by ~1e-1: that control must fail
+    while the kernel matches the FP32 reference."""
+    heads, q_len, prefix, dim = 4, 8, 8, 256
+    kv_len = prefix + q_len
+    scale = 1.0 / 16.0
+    q = mx.zeros((1, heads, q_len, dim), dtype=dtype)
+    q[:, :, :, 0] = 128.0
+    k = mx.zeros((1, heads, kv_len, dim), dtype=dtype)
+    k[:, :, 1:, 0] = -0.15
+    v = mx.zeros((1, heads, kv_len, dim), dtype=dtype)
+    v[:, :, 0, :] = 1.0
+    # Eight near-equal tail keys every row sees, four at +250 and four at
+    # -250; the two groups differ slightly in score (-1.20 vs -1.24), so
+    # FP32 P cancels them closely while a bf16 P leaves a large residual.
+    for j in range(1, prefix + 1):
+        v[:, :, j, :] = 250.0 if j % 2 else -250.0
+        if j % 2 == 0:
+            k[:, :, j, 0] = -0.155
+
+    ref = _fp32_attention_reference(q, k, v, scale)
+    bf16_p = _fp32_attention_reference(q, k, v, scale, prob_dtype=mx.bfloat16)
+    control_error = mx.abs(bf16_p - ref).max().item()
+    assert control_error > 1e-2, control_error
+
+    got = _wide_causal_sdpa(q, k, v, scale).astype(mx.float32)
+    assert got.shape == ref.shape
+    tolerance = 5e-2 if dtype == mx.bfloat16 else 5e-3
+    assert mx.abs(got - ref).max().item() <= tolerance

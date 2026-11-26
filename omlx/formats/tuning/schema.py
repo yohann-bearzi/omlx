@@ -83,7 +83,7 @@ def _elem_bytes(dtype: Any) -> int | None:
 class DenseTilePolicy:
     """A direct dense tile's compile-time geometry (release-3 spec §3.2)."""
 
-    backend: Literal["steel", "nax", "wide", "mlx", "rows"]
+    backend: Literal["steel", "nax", "wide", "mlx", "dot"]
     bm: int = 0
     bn: int = 0
     bk: int = 0
@@ -99,23 +99,36 @@ class DenseTilePolicy:
     sched: Literal["seg", "db"] = "seg"
 
     def is_legal(
-        self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
+        self,
+        face,
+        k: int,
+        n: int,
+        m: int,
+        chip: str,
+        dtype: Any = "bf16",
+        *,
+        tail: bool = False,
     ) -> bool:
-        """Whether this geometry runs on ``face``'s tables, its shape and chip."""
+        """Whether this geometry runs on ``face``'s tables, its shape and chip.
+
+        ``tail`` admits a K the launch passes whole (``K_PART == K``) that
+        the NAX skeleton's ``k_rem`` loop finishes to its 32-deep step: the
+        measured-entry check keeps it off, the unmeasured parity floor
+        (``tile_dense._default_policy``) takes it, as the pre-schedule
+        prefill did. Steel asserts whole BK tiles, and a split or a
+        double-buffered NAX schedule still needs whole BK tiles."""
         if self.backend not in _BACKENDS:
             return False
         if k < 1 or n < 1 or m < 1:
             return False
         if self.backend in _ROUTE_ONLY_BACKENDS:
-            return (
-                self.bm == 0
-                and self.bn == 0
-                and self.bk == 0
-                and self.split_k == 1
-                and self.sched == "seg"
-                and self.pad_bytes == 0
-                and self.gx == 0
-            )
+            if self != DenseTilePolicy(self.backend):
+                return False
+            if self.backend == "wide":
+                return k % 8 == 0 and kernels.table_bytes(face) <= _THREADGROUP_BYTES
+            if self.backend == "dot":
+                return m <= _DOT_MAX_ROWS
+            return True
         if self.backend == "nax":
             match = _CHIP_GEN_RE.match((chip or "").lower())
             if match is None:
@@ -151,7 +164,11 @@ class DenseTilePolicy:
         tgp = self.wm * self.wn * 32
         if tgp > 1024:
             return False
-        if self.split_k < 1 or k % (self.split_k * self.bk):
+        if self.split_k < 1:
+            return False
+        if k % (self.split_k * self.bk) and not (
+            tail and self.backend == "nax" and self.split_k == 1 and k % 32 == 0
+        ):
             return False
         if self.align_n and n % self.bn:
             return False
@@ -258,6 +275,34 @@ def mma_asserts() -> tuple[tuple[str, str], ...]:
 
 
 @dataclass(frozen=True)
+class MsgTilePolicy:
+    """A huge-N verify row route's msg tile: NSG simdgroups a threadgroup and
+    the weight load layout (all four columns, or one column streamed)."""
+
+    nsg: int = 8
+    load_lifetime: LoadLifetime = LoadLifetime.BATCH_COLUMNS
+
+    def is_legal(
+        self, face, k: int, n: int, m: int, chip: str, dtype: Any = "bf16"
+    ) -> bool:
+        """Whether the msg tile takes this face, shape and row count."""
+        if self.nsg < 1 or 32 * self.nsg > 1024:
+            return False
+        if not 1 <= int(m) <= 8 or 4 * int(m) > 32:
+            return False
+        if int(k) < 8 or int(k) % 8:
+            return False
+        if self.load_lifetime not in (
+            LoadLifetime.BATCH_COLUMNS,
+            LoadLifetime.ONE_COL_STREAMING,
+        ):
+            return False
+        if int(n) < 4 * self.nsg or int(n) % (4 * self.nsg):
+            return False
+        return kernels.table_bytes(face) <= 32768
+
+
+@dataclass(frozen=True)
 class RoutedWindowPolicy:
     """One single-stream verify-window gate+up coalescing policy (rule 27/28)."""
 
@@ -308,8 +353,9 @@ class RoutedDownPolicy:
         return n % (2 * self.rps) == 0 and n % 16 == 0
 
 
-_BACKENDS = ("steel", "nax", "wide", "mlx", "rows")
-_ROUTE_ONLY_BACKENDS = ("wide", "mlx", "rows")
+_BACKENDS = ("steel", "nax", "wide", "mlx", "dot")
+_ROUTE_ONLY_BACKENDS = ("wide", "mlx", "dot")
+_DOT_MAX_ROWS = 16
 _ROUTED_WINDOW_COALESCE = ("none", "folded", "unfolded")
 _ROUTED_DOWN_MODES = ("fused", "split")
 _ROUTED_DOWN_RPS = (4, 8)
@@ -331,6 +377,7 @@ _THREADGROUP_BYTES = 32768
 _ROUTES: dict[str, type] = {
     "dense_tile": DenseTilePolicy,
     "mma_tile": MmaTilePolicy,
+    "msg_tile": MsgTilePolicy,
     "routed_window": RoutedWindowPolicy,
     "routed_down": RoutedDownPolicy,
 }
@@ -438,6 +485,15 @@ def params_from_json(route: str, data: Any):
                 f"tuning: {route} param_staging is one of "
                 f"{[item.value for item in ParamStaging]}, not "
                 f"{data['param_staging']!r}"
+            ) from None
+    if "load_lifetime" in data:
+        try:
+            data = {**data, "load_lifetime": LoadLifetime(data["load_lifetime"])}
+        except ValueError:
+            raise ValueError(
+                f"tuning: {route} load_lifetime is one of "
+                f"{[item.value for item in LoadLifetime]}, not "
+                f"{data['load_lifetime']!r}"
             ) from None
     try:
         return cls(**data)

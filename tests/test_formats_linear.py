@@ -59,6 +59,16 @@ def by_hand(monkeypatch):
         yield
 
 
+@pytest.fixture
+def dot_route(monkeypatch):
+    """Name the Dot plan for every row: the route a format face with no
+    legal tile takes. The rows kernel's own tests run on a stock layer,
+    whose unmeasured 2..16-row buckets are MLX's by DATA (lead H4)."""
+    from omlx.formats import tile_dense
+
+    monkeypatch.setattr(tile_dense, "build_plan", lambda layer, **kwargs: None)
+
+
 EXPERTS = 6
 _NAMES = ("weight", "scales", "biases")
 
@@ -125,12 +135,17 @@ def _equal(a, b):
     return a.shape == b.shape and a.dtype == b.dtype and mx.array_equal(a, b).item()
 
 
+def test_linear_docstring_has_no_row_exact_claims():
+    """The module docstring describes the live routes only (Rule 33 deleted
+    the row-exact arms)."""
+    assert "Explicitly row-exact" not in linear.__doc__
+    assert "row-exact verification" not in linear.__doc__
+
+
 def test_the_decode_mlx_route_table_holds_the_measured_losing_cells():
-    """The DATA of the C7 receipts: 5- and 7-row decodes on both chips, plus
-    the four measured M3 Ultra cells (512x2560 and 640x2560 at 1-2 rows,
-    2560x2560 at 1, and 2560x640 at 3-4 and 6-8), are MLX's own qmv for a
-    Qwen-attached stock layer; every other measured bucket stays the format
-    route."""
+    """The DATA of the C7 single-row M3 Ultra receipts (512x2560, 2560x2560,
+    640x2560 at 1 row) keeps MLX's own qmv; rows >= 2 are governed by the
+    per-chip construction-time schedule and native FormatLinearFast."""
     rows = linear._decode_mlx_rows
     for arch in ("applegpu_g17s",):
         for n, k in (
@@ -141,44 +156,21 @@ def test_the_decode_mlx_route_table_holds_the_measured_losing_cells():
             (6144, 2560),
             (2560, 2560),
             (640, 2560),
+            (2560, 640),
         ):
-            assert rows(arch, n, k) == frozenset({5, 7}), (arch, n, k)
-    assert rows("applegpu_g17s", 2560, 640) == frozenset({5, 7})
-    assert rows("applegpu_g15d", 12288, 2560) == frozenset({5, 7})
-    assert rows(None, 2560, 640) == frozenset({5, 7})
-    assert rows("applegpu_g15d", 512, 2560) == frozenset({1, 2, 5, 7})
-    assert rows("applegpu_g15d", 2560, 2560) == frozenset({1, 5, 7})
-    assert rows("applegpu_g15d", 640, 2560) == frozenset({1, 2, 5, 7})
-    assert rows("applegpu_g15d", 2560, 640) == frozenset({3, 4, 5, 6, 7, 8})
+            assert rows(arch, n, k) == frozenset(), (arch, n, k)
+    assert rows("applegpu_g15d", 12288, 2560) == frozenset()
+    assert rows(None, 2560, 640) == frozenset()
+    assert rows("applegpu_g15d", 512, 2560) == frozenset({1})
+    assert rows("applegpu_g15d", 2560, 2560) == frozenset({1})
+    assert rows("applegpu_g15d", 640, 2560) == frozenset({1})
+    assert rows("applegpu_g15d", 2560, 640) == frozenset()
 
 
-def test_a_losing_decode_cell_takes_mlx_qmv(monkeypatch):
-    """A Qwen-attached stock layer's 5-row call (a losing bucket) runs MLX's
-    matmul; its 4-row call on a big shape runs the format route."""
-    _, layer = _pair(2560, 12288, bits=8, seed=75)
-    layer._qwen_row_exact = lambda: False
-    calls = []
-    original = type(layer)._stock_matmul
-
-    def counted(self, x):
-        calls.append(x.shape)
-        return original(self, x)
-
-    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
-    losing = _x((5, 1, 2560), seed=91)
-    mx.eval(layer(losing))
-    assert calls == [(5, 1, 2560)], calls
-    calls.clear()
-    winning = _x((4, 1, 2560), seed=92)
-    mx.eval(layer(winning))
-    assert calls == [], calls
-
-
-def test_the_m3_2560x640_four_row_cell_takes_mlx_qmv(monkeypatch):
-    """The M3 Ultra's down-projection cell at 4 rows is MLX's; another chip
-    keeps the format route there."""
-    _, layer = _pair(640, 2560, bits=8, seed=76)
-    layer._qwen_row_exact = lambda: False
+def test_m3_single_row_losing_decode_cell_takes_mlx_qmv(monkeypatch):
+    """M3 Ultra's single-row C7 cell (512x2560) takes _stock_matmul on 3-D
+    1-row decode; M5 Max keeps the Dot plan."""
+    quantized, layer = _pair(2560, 512, bits=8, bias=True, seed=75)
     calls = []
     original = type(layer)._stock_matmul
 
@@ -189,9 +181,12 @@ def test_the_m3_2560x640_four_row_cell_takes_mlx_qmv(monkeypatch):
     monkeypatch.setattr(type(layer), "_stock_matmul", counted)
     monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
     layer.__dict__.pop(linear._KEPT, None)
-    x = _x((4, 1, 640), seed=93)
-    mx.eval(layer(x))
-    assert calls == [(4, 1, 640)], calls
+    x = _x((1, 1, 2560), seed=91)
+    got = layer(x)
+    want = quantized(x)
+    mx.eval(got, want)
+    assert calls == [(1, 1, 2560)], calls
+    assert _same_bits(got, want)
     calls.clear()
     monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g17s")
     layer.__dict__.pop(linear._KEPT, None)
@@ -199,87 +194,68 @@ def test_the_m3_2560x640_four_row_cell_takes_mlx_qmv(monkeypatch):
     assert calls == [], calls
 
 
-def test_3d_wrong_width_is_refused_before_stock_matmul():
-    """Malformed 3-D widths whose size // k lands in kept.mlx_rows must raise
-    FormatLinear's ValueError instead of reaching MLX's quantized_matmul."""
-    for attach in (False, True):
-        _, layer = _pair(2560, 12288, bits=8, seed=78)
-        if attach:
-            layer._qwen_row_exact = lambda: False
-        for bad_shape in ((5, 2, 1280), (5, 1, 2561)):
-            with pytest.raises(
-                ValueError,
-                match=re.escape(f"x is (..., 2560), not of shape {bad_shape}"),
-            ):
-                layer(_x(bad_shape, seed=95))
+def test_measured_five_and_seven_row_schedule_winners_are_not_blocked(monkeypatch):
+    """A measured 5- or 7-row schedule route (e.g. mma_tile / msg_tile / dense)
+    must serve 3-D verify inputs through FormatLinearFast instead of being
+    shadowed by an uncompiled _stock_matmul shortcut."""
+    from omlx.formats import tile_dense, tuning
+
+    quantized, layer = _pair(2560, 12288, bits=8, seed=76)
+    mma_pol = tuning.MmaTilePolicy(bn=16, bk=32, nsg=8)
+    monkeypatch.setattr(
+        tuning,
+        "lookup",
+        lambda route, *a, **kw: mma_pol if route == "mma_tile" else None,
+    )
+    monkeypatch.setattr(
+        type(layer),
+        "_stock_matmul",
+        lambda self, x: pytest.fail(f"_stock_matmul shadowed schedule for {x.shape}"),
+    )
+    for rows in (5, 7):
+        x = _x((1, rows, 2560), seed=90 + rows)
+        got = layer(x)
+        mx.eval(got)
+        assert got.shape == (1, rows, 12288)
+        kept = vars(layer)[linear._KEPT]
+        assert tile_dense.route_for(kept.dense, rows, x.dtype).backend == "mma"
 
 
-def test_armed_row_exact_and_bias_on_losing_decode_bucket(monkeypatch):
-    """Unarmed losing buckets add bias on _stock_matmul; armed row-exact calls
-    never take _stock_matmul and match row-by-row serial bits."""
-    quantized, layer = _pair(2560, 12288, bits=8, bias=True, seed=77)
+def test_a_scheduled_mlx_decode_cell_adds_bias_and_uses_native_fast(monkeypatch):
+    """A 3-D multi-row call whose schedule resolves to mlx runs compiled
+    mlx_route with bias (bitwise to MLX) and registers FormatLinearFast."""
+    from omlx.custom_kernels.quant_matmul import fast as native
+    from omlx.formats import tile_dense, tuning
+
+    quantized, layer = _pair(2560, 512, bits=8, bias=True, seed=75)
     assert mx.any(quantized["bias"] != 0).item()
-    calls = []
-    original = type(layer)._stock_matmul
-
-    def counted(self, x):
-        calls.append(x.shape)
-        return original(self, x)
-
-    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
-    x = _x((5, 1, 2560), seed=94)
-
-    layer._qwen_row_exact = lambda: False
+    monkeypatch.setattr(tuning, "lookup", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        type(layer),
+        "_stock_matmul",
+        lambda self, x: pytest.fail("multi-row mlx route bypassed compiled schedule"),
+    )
+    x = _x((5, 1, 2560), seed=96)
     got = layer(x)
     want = quantized(x)
     mx.eval(got, want)
-    assert calls == [(5, 1, 2560)], calls
     assert _same_bits(got, want)
-
-    calls.clear()
-    layer._qwen_row_exact = lambda: True
-    armed_got = layer(x)
-    serial = mx.concatenate([quantized(x[i : i + 1]) for i in range(5)], axis=0)
-    mx.eval(armed_got, serial)
-    assert calls == [], calls
-    assert _same_bits(armed_got, serial)
+    kept = vars(layer)[linear._KEPT]
+    assert tile_dense.route_for(kept.dense, 5, x.dtype).backend == "mlx"
+    if native.has_symbol("FormatLinearFast"):
+        assert kept.dense_fast is not None and layer._fast is not None
 
 
-def test_non_qwen_stock_3d_5row_stays_row_exact(monkeypatch):
-    """Non-Qwen stock layers never run tile_wide and stay row-exact on 3-D
-    5-row calls instead of taking _stock_matmul."""
-    quantized, layer = _pair(2560, 12288, bits=8, seed=79)
-    assert layer._qwen_row_exact is None
-    calls = []
-    original = type(layer)._stock_matmul
-
-    def counted(self, x):
-        calls.append(x.shape)
-        return original(self, x)
-
-    monkeypatch.setattr(type(layer), "_stock_matmul", counted)
-    x = _x((5, 1, 2560), seed=96)
-    got = layer(x)
-    serial = mx.concatenate([quantized(x[i : i + 1]) for i in range(5)], axis=0)
-    mx.eval(got, serial)
-    assert calls == [], calls
-    assert _same_bits(got, serial)
-
-
-def test_format_linear_polls_row_exact_once():
-    """FormatLinear.__call__ polls _qwen_row_exact once per cold call across
-    2-D, 3-D winning, 3-D losing, and prefill shapes."""
-    for shape in ((4, 2560), (4, 1, 2560), (5, 1, 2560), (32, 2560)):
-        _, layer = _pair(2560, 2560, bits=8, seed=80)
-        calls = []
-
-        def poll(_calls=calls):
-            _calls.append(1)
-            return False
-
-        layer._qwen_row_exact = poll
-        mx.eval(layer(_x(shape, seed=97)))
-        assert len(calls) == 1, (shape, len(calls))
+def test_3d_wrong_width_is_refused_before_stock_matmul():
+    """Malformed 3-D widths must raise FormatLinear's ValueError instead of
+    reaching MLX's quantized_matmul."""
+    _, layer = _pair(2560, 12288, bits=8, seed=78)
+    for bad_shape in ((5, 2, 1280), (5, 1, 2561)):
+        with pytest.raises(
+            ValueError,
+            match=re.escape(f"x is (..., 2560), not of shape {bad_shape}"),
+        ):
+            layer(_x(bad_shape, seed=95))
 
 
 @pytest.mark.parametrize(
@@ -292,7 +268,9 @@ def test_format_linear_polls_row_exact_once():
         (1024, 16, 8, mx.float16, False),
     ],
 )
-def test_a_row_has_the_bits_of_mlx_s_quantized_linear(caplog, k, n, bits, dtype, bias):
+def test_a_row_has_the_bits_of_mlx_s_quantized_linear(
+    dot_route, caplog, k, n, bits, dtype, bias
+):
     caplog.set_level(logging.INFO, logger=linear.__name__)
     quantized, layer = _pair(k, n, bits, dtype, bias)
     face = formats.dot(layer, k, n)
@@ -336,7 +314,7 @@ def test_rows_go_to_the_shared_launch_in_the_largest_group_of_the_budget():
     assert [linear._group(m, 32, n) for m in (2, 3, 4, 6)] == [1, 1, 1, 1]
 
 
-def test_a_warm_call_does_not_size_its_group_again(monkeypatch):
+def test_a_warm_call_does_not_size_its_group_again(dot_route, monkeypatch):
     """The group (and the GPU's cores under it) is worked out as a call's
     launch is built, once a shape; a call its thread has a graph for
     replays it and asks nothing."""
@@ -535,7 +513,9 @@ def test_a_face_past_the_unrolled_envelope_shares_rolled(monkeypatch):
     assert made[0]["name"] == "omlx_format_linear_rows_toy_envelope8"
 
 
-def test_rows_in_groups_are_one_launch_and_their_stand_in_is_one_group(monkeypatch):
+def test_rows_in_groups_are_one_launch_and_their_stand_in_is_one_group(
+    dot_route, monkeypatch
+):
     """Two to 16 rows that a group of 2 to 4 divides are one launch of the
     shared-rows skeleton, proven on a stand-in of one group of zeros over
     one tile; a compiled function over the layer's state launches it too."""
@@ -584,7 +564,7 @@ def test_more_rows_outside_dense_prefill_are_the_decode_and_mlx_s_matmul():
 
 
 @pytest.mark.parametrize("n", [1, 4, 12, 60])
-def test_an_n_of_part_of_a_tile_runs_in_the_shared_launch(n):
+def test_an_n_of_part_of_a_tile_runs_in_the_shared_launch(dot_route, n):
     """A matrix whose N is not whole tiles of 8: every row count runs in the
     shared-rows launch, the last tile holding the rows that are left (the
     shared expert's gate has one), each row with MLX's bits."""
@@ -814,7 +794,7 @@ def test_a_launch_s_graph_holds_no_array():
             assert value in kernels_ or all(type(n) in (int, bool) for n in numbers)
 
 
-def test_views_of_x_and_of_the_indices_are_read_as_their_rows():
+def test_views_of_x_and_of_the_indices_are_read_as_their_rows(dot_route):
     """MLX hands a kernel a contiguous copy of an input that is a view."""
     quantized, layer = _pair(320, 72)
     switched, switch = _switch_pair(320, 72)
@@ -1042,20 +1022,41 @@ def _want(layer, x, indices=None):
     return want
 
 
+def test_dense_route_docstring_omits_deleted_rows():
+    """Docstrings and comments align with the live schedule routes, and the
+    unreachable multi-row ``mlx_rows`` branch is gone (review LOW-2, NIT-1)."""
+    import inspect
+
+    from omlx.formats import tile_dense
+
+    doc = tile_dense.DenseRoute.__doc__ or ""
+    assert "rows" not in doc, doc
+    assert "unmeasured Dot fallback" in doc, doc
+    mod_doc = linear.__doc__ or ""
+    assert "float16/bfloat16" in mod_doc, mod_doc
+    assert "Dot" in mod_doc, mod_doc
+    resolve_src = inspect.getsource(tile_dense._resolve_cell)
+    assert "the layer's own matmul for a plugin" not in resolve_src
+    assert "affine" in (tile_dense._resolve_cell.__doc__ or "")
+    call_src = inspect.getsource(FormatLinear.__call__)
+    assert "rows in kept.mlx_rows" not in call_src
+
+
 def test_a_3d_decode_call_folds_to_one_projection(monkeypatch):
     """A Qwen-attached layer's unarmed (B, 1, k) call folds to (B, k) and
-    takes the 2-D route once: one launch, one rounding, and no `mx.where`
-    layout selection (rule 28/33)."""
+    takes the schedule's route once: one projection, one rounding, and no
+    `mx.where` layout selection (rule 28/33)."""
+    from omlx.formats import tile_dense
+
     _, layer = _pair(2560, 2560, bits=8, seed=71)
-    layer._qwen_row_exact = lambda: False
     launches = []
-    original = linear._launch
+    original = tile_dense.project
 
-    def counted(*args, **kwargs):
+    def counted(plan, value, **kwargs):
         launches.append(1)
-        return original(*args, **kwargs)
+        return original(plan, value, **kwargs)
 
-    monkeypatch.setattr(linear, "_launch", counted)
+    monkeypatch.setattr(tile_dense, "project", counted)
     monkeypatch.setattr(
         mx, "where", lambda *args, **kwargs: pytest.fail("dual layout route")
     )
@@ -1069,15 +1070,15 @@ def test_a_3d_decode_call_folds_to_one_projection(monkeypatch):
 def test_the_steady_decode_call_is_served_by_the_native_fast_path(monkeypatch):
     """After the first call, the 3-D decode and prefill signatures are
     registered directly with the native warm dispatcher: the next (4, 1, k),
-    (2, 1, k), and (1, 32, k) calls hit it directly on entry, never
-    `_ordinary` or a fresh projection."""
+    (2, 1, k), and (1, 32, k) calls hit it directly on entry, never the
+    schedule's projection."""
     from omlx.custom_kernels.quant_matmul import fast as native
+    from omlx.formats import tile_dense
 
     if not native.has_symbol("FormatLinearFast"):
         pytest.skip("requires the native warm dispatcher")
     monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
     _, layer = _pair(2560, 2560, bits=8, seed=74)
-    layer._qwen_row_exact = lambda: False
     firsts = {}
     for rows in (4, 2):
         x = _x((rows, 1, 2560))
@@ -1097,13 +1098,8 @@ def test_the_steady_decode_call_is_served_by_the_native_fast_path(monkeypatch):
         with monkeypatch.context() as patch:
             layer.__dict__["_fast"] = counting
             patch.setattr(
-                linear.FormatLinear,
-                "_ordinary",
-                lambda *args, **kwargs: pytest.fail("ordinary"),
-            )
-            patch.setattr(
-                linear.FormatLinear,
-                "_project_route",
+                tile_dense,
+                "project",
                 lambda *args, **kwargs: pytest.fail("projected"),
             )
             try:
@@ -1144,7 +1140,6 @@ def test_a_3d_decode_call_meets_the_fp32_reference():
     """A (B, 1, k) call's error stays inside the bar for 1..8 streams
     (rule 33: the route may reorder; the FP32 reference decides)."""
     _, layer = _pair(2560, 2560, bits=8, seed=72)
-    layer._qwen_row_exact = lambda: False
     decoded = mx.dequantize(
         layer["weight"], layer["scales"], layer["biases"], group_size=32, bits=8
     ).astype(mx.float32)
@@ -1162,7 +1157,6 @@ def test_the_second_3d_call_replays_the_kept_graph(monkeypatch):
     """After the first call the kept graph serves the next one: no launch,
     same bits."""
     _, layer = _pair(2560, 2560, bits=8, seed=73)
-    layer._qwen_row_exact = lambda: False
     x = _x((4, 1, 2560))
     first = layer(x)
     mx.eval(first)
@@ -1786,7 +1780,7 @@ def test_whatever_a_launch_s_first_evaluation_raises_is_the_launch_s_failure(
 
 
 def test_a_failure_ahead_of_the_rows_is_raised_and_is_not_their_launch_s(
-    monkeypatch, caplog
+    dot_route, monkeypatch, caplog
 ):
     caplog.set_level(logging.WARNING, logger=linear.__name__)
     quantized, layer = _pair(320, 72)
@@ -2111,6 +2105,7 @@ def _like(arrays, tensors):
 
 
 def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at_all(
+    dot_route,
     monkeypatch,
 ):
     """What a layer evaluates is the stand-in of a Metal that is not proven:
@@ -2260,7 +2255,9 @@ def _sources(monkeypatch, capfd):
     return read
 
 
-def test_a_stand_in_has_the_metal_of_the_launch_it_proves(toy, monkeypatch, capfd):
+def test_a_stand_in_has_the_metal_of_the_launch_it_proves(
+    dot_route, toy, monkeypatch, capfd
+):
     """MLX writes a launch's Metal from the kernel's source, the template's
     values and, input by input, the dtype, whether the input has fewer than
     8 elements and whether it has no axis. A stand-in is the smallest launch
@@ -2368,7 +2365,7 @@ def _built(monkeypatch):
     return built
 
 
-def test_a_launch_is_built_once_and_replayed(monkeypatch):
+def test_a_launch_is_built_once_and_replayed(dot_route, monkeypatch):
     """MLX writes a kernel's source out for every launch that is built. A
     layer builds one for its arrays' shapes and types, and replays it."""
     quantized, layer = _pair(320, 72, bias=True)
@@ -2487,7 +2484,9 @@ def test_a_stack_s_graph_is_not_replayed_for_x_of_another_dtype():
     assert proof.graphs == kept
 
 
-def test_a_proof_keeps_so_many_graphs_then_builds_them_as_called(monkeypatch):
+def test_a_proof_keeps_so_many_graphs_then_builds_them_as_called(
+    dot_route, monkeypatch
+):
     """A prefill's chunks are shapes without end."""
     monkeypatch.setattr(kernels, "MAX_GRAPHS", 2)
     quantized, layer = _pair(320, 72)
@@ -2528,7 +2527,7 @@ def test_a_launch_that_fails_stops_the_launches_that_ran(toy, monkeypatch, caplo
     assert len(_logged(caplog, linear, logging.WARNING)) == 1
 
 
-def test_a_proven_launch_is_built_into_a_function_that_mlx_compiles():
+def test_a_proven_launch_is_built_into_a_function_that_mlx_compiles(dot_route):
     """MLX's compile calls a layer once for the shapes it is given, over
     arrays that cannot be evaluated: a proven launch needs none."""
     quantized, layer = _pair(320, 72, bias=True)
@@ -2755,7 +2754,7 @@ def test_a_face_that_does_not_compile_decodes_in_a_function_compiled_over_the_st
 
 
 def test_a_proven_launch_is_built_over_a_trace_s_tensors_without_a_proof(
-    monkeypatch, caplog
+    dot_route, monkeypatch, caplog
 ):
     """A Metal that is proven needs no stand-in where the layer's tensors
     cannot be evaluated either: its launches are built over them, and
@@ -3957,7 +3956,7 @@ def test_the_affine_decode_is_mlx_s_dequantize():
     assert not _same_bits(several[1, 0], several[0, 0])
 
 
-def test_a_face_with_a_table_runs_the_rows_kernels_to_the_bit(monkeypatch):
+def test_a_face_with_a_table_runs_the_rows_kernels_to_the_bit(dot_route, monkeypatch):
     """A 4-bit affine face that reads its weight values from a table the
     kernel stages: one row, a verify window and a switch's pairs have MLX's
     bits, as the face without a table has."""

@@ -309,7 +309,7 @@ GATED = (
     "imported by engine/vlm.py at module level, gated by model_type or opt-in "
     "(never invoked for a stock qwen4_exp)"
 )
-PENDING = "pending - hc U21 (owner's ruling)"
+PENDING = "pending - hc_prefill_nax DEFERRED 59 (owner's ruling)"
 REFUSE = "declines loudly at load"
 A8FACE = "takes the built-in affine FormatLinear face"
 
@@ -441,7 +441,7 @@ PATH_DECISIONS = {
     ),
     "omlx/patches/qwen35_q4_mlp.py": (
         FACE,
-        "tests/test_qwen35_q4_mlp.py::test_vlm_format_prefill_linear_honours_row_exact_callable",
+        "tests/test_qwen35_q4_mlp.py::test_vlm_format_prefill_linear_routes_affine_language_layers",
     ),
     "omlx/patches/qwen35_verify_qmm.py": (
         FACE,
@@ -509,12 +509,12 @@ PATH_DECISIONS = {
         "the model's own quantized KV caches",
     ),
     "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py": (
-        PENDING,
-        "hc lane U21",
+        FACE,
+        "U21 ported hc_fused to FormatLinear faces and set _nax_projection_eligible=False; DEL3-3 pins them (hc_prefill_nax stays DEFERRED 59)",
     ),
     "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py": (
         PENDING,
-        "hc lane U21",
+        "DEFERRED 59 / U29 (tensor-unit prefill not yet ported to faces)",
     ),
     "installed/models/quantized_verifier.py": (
         "declines a FormatLinear (upstream helper; returns None); the row-invariant design adoption is DEFERRED and the narrow-N >16 route choice is PFX/tilebf under C2",
@@ -528,10 +528,6 @@ PATH_DECISIONS = {
 }
 
 SCOPE_DECISIONS = {
-    ("omlx/formats/linear.py", "FormatLinear._ordinary_serves"): (
-        OWN,
-        "tests/test_formats_stock_dense.py: the stock affine layer's own route choice",
-    ),
     ("omlx/patches/qwen35_oq_a8.py", "_is_q8_linear"): (
         A8FACE,
         "tests/test_qwen35_oq_a8.py::test_q8_stock_affine_format_mtp_head_not_tagged",
@@ -744,14 +740,6 @@ EXPECTED = {
         "read bits",
         "read group_size",
     ),
-    ("omlx/formats/linear.py", "FormatLinear._ordinary"): (
-        "read bits",
-        "read group_size",
-    ),
-    ("omlx/formats/linear.py", "FormatLinear._ordinary_serves"): (
-        "read bits",
-        "read group_size",
-    ),
     ("omlx/formats/linear.py", "FormatLinear._stock_matmul"): (
         "read bits",
         "read group_size",
@@ -765,6 +753,10 @@ EXPECTED = {
         "read group_size",
     ),
     ("omlx/formats/linear.py", "_FormatLayer._stacked_outputs"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/linear.py", "_plan_existing_dense_warm"): (
         "read bits",
         "read group_size",
     ),
@@ -1161,12 +1153,13 @@ EXPECTED = {
     ): ("read " "group_size",),
     (
         "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py",
-        "_check_static_layout",
-    ): ("getattr " "group_size",),
-    (
-        "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py",
-        "_decode_face",
-    ): ("read " "bits", "read " "group_size"),
+        "_affine_tensors_ok",
+    ): (
+        "getattr " "bits",
+        "getattr " "group_size",
+        "getattr " "scales",
+        "read " "scales",
+    ),
     (
         "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py",
         "_nax_prefill",
@@ -1177,14 +1170,8 @@ EXPECTED = {
     ): ("read " "group_size",),
     (
         "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py",
-        "_quantized_ok",
-    ): (
-        "QuantizedLinear",
-        "getattr " "bits",
-        "getattr " "group_size",
-        "getattr " "scales",
-        "read " "scales",
-    ),
+        "_projection_face",
+    ): ("read " "bits", "read " "group_size"),
     (
         "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py",
         "down_silu",
@@ -1432,10 +1419,6 @@ EXPECTED = {
         "QuantizedLinear",
         "type-is " "QuantizedLinear",
     ),
-    ("omlx/patches/qwen35_verify_qmm.py", "_FormatVerifyPlan._build_entry"): (
-        "read bits",
-        "read group_size",
-    ),
     ("omlx/patches/qwen35_verify_qmm.py", "_patch_verify_swiglu._feed_forward"): (
         "read " "bits",
         "read " "group_size",
@@ -1448,10 +1431,6 @@ EXPECTED = {
         "read " "bits",
         "read " "group_size",
         "read " "scales",
-    ),
-    ("omlx/patches/qwen35_verify_qmm.py", "bind_format_verify"): (
-        "read bits",
-        "read group_size",
     ),
     ("omlx/patches/qwen35_verify_qmm.py", "run_route"): (
         "read bits",
@@ -1577,11 +1556,10 @@ def test_every_quantized_layer_reader_is_tabled():
         decision, evidence = _decide(key)
         assert decision and evidence, key
     pending = sorted(key for key in found if _decide(key)[0].startswith("pending"))
-    assert pending, "the HC readers stay listed while hc's U21 is open"
+    assert pending, "hc_prefill_nax stays pending (DEFERRED 59)"
     assert all(
-        path.startswith(
-            "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_"
-        )
+        path
+        == "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py"
         for path, _ in pending
     ), pending
 
@@ -1680,6 +1658,16 @@ def test_audit_module_binding_and_short_alias():
         "s.py", "def p(m):\n    return quantize(m, class_predicate=fn)\n"
     )
     assert "class_predicate" in pred[("s.py", "p")]
+
+
+def test_hc_audit_evidence_names_u21_and_deferred_59():
+    """The evidence text says what happened: U21 ported hc_fused and set the
+    hook False; hc_prefill_nax is DEFERRED 59, not a live U21 item."""
+    hc = "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_fused.py"
+    nax = "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py"
+    assert "DEL3-3 closes" not in PATH_DECISIONS[hc][1]
+    assert "U21 ported hc_fused" in PATH_DECISIONS[hc][1]
+    assert "DEFERRED 59" in PATH_DECISIONS[nax][1]
 
 
 def test_release3_warm_audit_citations_exist():

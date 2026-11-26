@@ -950,14 +950,6 @@ class Proof:
                 self._bindings.add(binding)
         return binding
 
-    def attach(self, binding: ProofBinding) -> bool:
-        """Register ``binding`` so a failure of this proof retires it too."""
-        with _KEEPING:
-            if self.failed:
-                return False
-            self._bindings.add(binding)
-        return True
-
     @property
     def graphs(self) -> dict:
         """The calling thread's graphs, each under its launch's signature."""

@@ -14,7 +14,7 @@ import hashlib
 import json
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cache
 from pathlib import Path
 
@@ -28,6 +28,7 @@ from .schema import (
     FetchGranularity,
     LoadLifetime,
     MmaTilePolicy,
+    MsgTilePolicy,
     ParamStaging,
     RoutedDownPolicy,
     RoutedWindowPolicy,
@@ -44,6 +45,7 @@ __all__ = [
     "FetchGranularity",
     "LoadLifetime",
     "MmaTilePolicy",
+    "MsgTilePolicy",
     "ParamStaging",
     "RoutedDownPolicy",
     "RoutedWindowPolicy",
@@ -54,6 +56,7 @@ __all__ = [
     "current_chip",
     "face_digest",
     "lookup",
+    "match_rank",
     "register_skeleton",
     "register_tuning_path",
     "reset_cache",
@@ -129,6 +132,7 @@ _ROWS_BUCKETS = {
         (513, 1024, "513-1024"),
         (1025, 2048, "1025-2048"),
     ),
+    "msg_tile": ((1, 4, "4"), (5, 6, "6"), (7, 8, "8")),
     "mma_tile": (
         (1, 8, "8"),
         (9, 16, "16"),
@@ -168,6 +172,19 @@ _K_BUCKETS = frozenset({"K<=1024", "K1025-4096", "K>4096"})
 _ROWS_BUCKET_NAMES = {
     route: frozenset({name for _, _, name in buckets})
     | {f"<{buckets[0][0]}", f"{buckets[-1][1] + 1}+"}
+    for route, buckets in _ROWS_BUCKETS.items()
+}
+# Named row buckets carry the same span rank as custom "lo-hi" spans:
+# -(rows covered), with open upper tails at -(1 << 30) so a narrower named
+# bucket always outranks a wider custom span (review MEDIUM-2).
+_NAMED_SPAN_RANK = {
+    route: {
+        **{name: -(hi - lo + 1) for lo, hi, name in buckets},
+        f"<{buckets[0][0]}": (
+            -(buckets[0][0] - 1) if buckets[0][0] > 1 else -(1 << 30)
+        ),
+        f"{buckets[-1][1] + 1}+": -(1 << 30),
+    }
     for route, buckets in _ROWS_BUCKETS.items()
 }
 
@@ -324,6 +341,9 @@ class _Entry:
 @dataclass(frozen=True)
 class ChipTable:
     entries: tuple[_Entry, ...]
+    by_key: dict[tuple[str, str, int, int], tuple[_Entry, ...]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
 
 def _check_key(path: Path, key: dict) -> None:
@@ -463,7 +483,14 @@ def _index_for_chip(chip: str) -> ChipTable:
             path = base if base.is_file() else base / f"{chip}.json"
             if path.is_file() and path.stem == chip:
                 _read_table(path, chips)
-        table = ChipTable(tuple(chips.get(chip, ())))
+        raw_entries = tuple(chips.get(chip, ()))
+        grouped: dict[tuple[str, str, int, int], list[_Entry]] = {}
+        for entry in raw_entries:
+            ek = entry.key
+            grouped.setdefault(
+                (ek["route"], ek["dtype"], ek["bits"], ek["group"]), []
+            ).append(entry)
+        table = ChipTable(raw_entries, {k: tuple(v) for k, v in grouped.items()})
         _CHIPS[chip] = table
         return table
 
@@ -527,7 +554,9 @@ def _matches(entry: _Entry, query: _Query) -> tuple[int, int]:
     else:
         if key.get("rows_bucket") != query.rows_bucket:
             return (0, 0)
-        span_rank = -(1 << 29)
+        span_rank = _NAMED_SPAN_RANK.get(query.route, {}).get(
+            query.rows_bucket, -(1 << 29)
+        )
     face_id = key.get("face_id")
     exact_face = face_id == query.face_key
     if not exact_face and face_id != f"*:{query.profile}":
@@ -560,7 +589,7 @@ def row_bounds(route: str, *, chip: str | None = None) -> tuple[int, ...]:
     return tuple(sorted(cut for cut in cuts if cut >= 1))
 
 
-def lookup(
+def _lookup_best(
     route: str,
     face,
     *,
@@ -571,21 +600,28 @@ def lookup(
     k: int,
     rows: int,
     chip: str | None = None,
-) -> object | None:
-    """The tuned parameters for a face and shape, or None for the parity
-    default.  Resolve once per launch plan, never per call."""
+) -> tuple[object | None, tuple[int, int]]:
+    """Return ``(params, rank)`` for the highest-specificity legal entry."""
     chip_id = current_chip() if chip is None else chip
     table = _index_for_chip(chip_id)
     if not table.entries:
-        return None
+        return None, (0, 0)
     skeleton = skeleton_digest(route)
     if skeleton is None:
-        return None
+        return None, (0, 0)
+    dtype_name = _dtype_name(dtype)
+    candidates = (
+        table.by_key.get((route, dtype_name, bits, group), ())
+        if table.by_key
+        else table.entries
+    )
+    if not candidates:
+        return None, (0, 0)
     query = _Query(
         route=route,
         face_key=face.key,
         profile=table_profile(face),
-        dtype=_dtype_name(dtype),
+        dtype=dtype_name,
         bits=bits,
         group=group,
         n=n,
@@ -598,7 +634,7 @@ def lookup(
     digest: str | None = None
     best_rank = (0, 0)
     best_params = None
-    for entry in table.entries:
+    for entry in candidates:
         rank = _matches(entry, query)
         if rank[0] == 0 or rank <= best_rank:
             continue
@@ -613,7 +649,63 @@ def lookup(
             continue
         best_rank = rank
         best_params = entry.params
-    return best_params
+    return best_params, best_rank
+
+
+def lookup(
+    route: str,
+    face,
+    *,
+    dtype,
+    bits: int,
+    group: int,
+    n: int,
+    k: int,
+    rows: int,
+    chip: str | None = None,
+) -> object | None:
+    """The tuned parameters for a face and shape, or None for the parity
+    default.  Resolve once per launch plan, never per call."""
+    params, _ = _lookup_best(
+        route,
+        face,
+        dtype=dtype,
+        bits=bits,
+        group=group,
+        n=n,
+        k=k,
+        rows=rows,
+        chip=chip,
+    )
+    return params
+
+
+def match_rank(
+    route: str,
+    face,
+    *,
+    dtype,
+    bits: int,
+    group: int,
+    n: int,
+    k: int,
+    rows: int,
+    chip: str | None = None,
+) -> tuple[int, int]:
+    """The specificity ``(face_shape_rank, span_rank)`` of ``lookup``'s winner
+    for ``route``, or ``(0, 0)`` when no table entry matches."""
+    _, rank = _lookup_best(
+        route,
+        face,
+        dtype=dtype,
+        bits=bits,
+        group=group,
+        n=n,
+        k=k,
+        rows=rows,
+        chip=chip,
+    )
+    return rank
 
 
 def stale_entries(dirs=None, faces=None) -> list[str]:

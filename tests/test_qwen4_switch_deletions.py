@@ -28,7 +28,8 @@ def _function_nodes(path, function):
     "path,function,symbol",
     [
         (LANGUAGE, "_fused_plan", "QuantizedLinear"),
-        (Q4 / "hc_fused.py", "_quantized_ok", "QuantizedLinear"),
+        (Q4 / "hc_fused.py", "_projection_face", "QuantizedLinear"),
+        (Q4 / "hc_fused.py", "_nax_projection_eligible", "QuantizedLinear"),
         (LANGUAGE, "_uniform_affine_layout", "QuantizedEmbedding"),
         (ADAPTER, "_ple_reader", "QuantizedEmbedding"),
     ],
@@ -38,6 +39,28 @@ def test_qwen_private_route_releases_its_mlx_class_branch(path, function, symbol
     assert nodes, f"{function} not found"
     assert not any(
         isinstance(node, ast.Attribute) and node.attr == symbol for node in nodes
+    )
+
+
+def test_hc_fused_keeps_no_mlx_quantized_linear_or_inject_hasattr():
+    """U21 ported hc_fused to FormatLinear faces and DEL3-3's hook returns
+    False, so no QuantizedLinear name/attribute and no dead
+    input_inject_weight hasattr remains anywhere in the file (the plan
+    reads the member, not a kind)."""
+    tree = ast.parse((Q4 / "hc_fused.py").read_text())
+    assert not any(
+        (isinstance(node, ast.Attribute) and node.attr == "QuantizedLinear")
+        or (isinstance(node, ast.Name) and node.id == "QuantizedLinear")
+        for node in ast.walk(tree)
+    )
+    assert not any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "hasattr"
+        and len(node.args) >= 2
+        and isinstance(node.args[1], ast.Constant)
+        and node.args[1].value == "input_inject_weight"
+        for node in ast.walk(tree)
     )
 
 
@@ -180,3 +203,16 @@ def test_gdn_prework_releases_the_legacy_quantized_paths():
         and node.attr in ("quantized_matmul", "QuantizedLinear")
         for node in ast.walk(tree)
     )
+
+
+def test_batch_decode_docstring_drops_stock_matmul():
+    tree = ast.parse(GDN.read_text())
+    fn = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_qwen4_batch_decode"
+    )
+    doc = ast.get_docstring(fn)
+    assert doc
+    assert "quantized matmul" not in doc and "stock layer" not in doc
+    assert "format layer's own forward" in doc

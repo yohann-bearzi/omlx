@@ -48,17 +48,18 @@ from omlx.formats.linear import FormatLinear
 from omlx.patches import module_cache, qwen35_gdn_prework, row_exact_qmv
 
 _REFERENCE = Path(__file__).parent / "data" / "parity_row_exact_a13.json"
-_LAUNCH_19_REFERENCE = (
-    Path(__file__).parent / "data" / "parity_row_exact_19_launches.json"
+_LAUNCH_12_REFERENCE = (
+    Path(__file__).parent / "data" / "parity_row_exact_12_launches.json"
 )
 # The combined digest of the 240 pinned specs, captured from release-3
 # eae63b6c's own builders (specs/parity-skeletons-evidence/a13/test_emit.py
 # proved 240/240; the serialization here is the one below).
 A13_DIGEST = "fd884b476cbabb5772730282d87b344412c95c853b007f7ba1ed51d665e02f9d"
-# The combined digest of all 19 served launch captures from release-3 eae63b6c
-# (spec, grid, threadgroup, template, input_shapes, output_shapes, output_dtypes).
-A13_LAUNCH_19_DIGEST = (
-    "6d39e45f0c311672076ceb86711ea67c964431e85c2dafba084d5b104b2d6359"
+# The combined digest of the 12 live served launch captures from release-3
+# eae63b6c (spec, grid, threadgroup, template, input_shapes, output_shapes,
+# output_dtypes); the 7 deleted unrolled qwen4 verify shapes are dropped.
+A13_LAUNCH_12_DIGEST = (
+    "c59d5323c38644ea3e8a89bb7d17b1bbff85401a117fadc30155446cdbcb7e44"
 )
 
 
@@ -665,11 +666,11 @@ def test_row_exact_plan_pre_flattens_operands_and_chooses_index_width_at_build()
     assert "size_t(out_row)" in plan64.spec["header"]
 
 
-def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
-    """All 19 served shapes match eae63b6c byte-for-byte on spec, grid,
+def test_row_exact_launch_plan_matches_live_12_shapes(monkeypatch):
+    """All 12 live served shapes match eae63b6c byte-for-byte on spec, grid,
     threadgroup, template, input shapes and output shapes."""
-    reference = json.loads(_LAUNCH_19_REFERENCE.read_text())
-    assert len(reference) == 19
+    reference = json.loads(_LAUNCH_12_REFERENCE.read_text())
+    assert len(reference) == 12
 
     captured = {}
     cur = [None]
@@ -731,24 +732,10 @@ def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
             64,
             "affine",
             mx.bfloat16,
-            qwen35_gdn_prework._qwen4_verify_out_tile,
+            qwen35_gdn_prework._qwen4_verify_out_geometry,
         )
         cur[0] = "gdn_out_m1"
         p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 6144)))
-        pm = row_exact_qmv.rows_qmv(
-            w,
-            s,
-            b,
-            8,
-            64,
-            "affine",
-            mx.bfloat16,
-            qwen35_gdn_prework._qwen4_verify_out_tile,
-            unrolled=True,
-        )
-        for m in (2, 3, 4, 8):
-            cur[0] = f"gdn_out_m{m}"
-            pm(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 6144)))
 
         w, s, b = mk_w(2560, 16480, 8, 64)
         p1 = row_exact_qmv.rows_qmv(
@@ -759,24 +746,10 @@ def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
             64,
             "affine",
             mx.bfloat16,
-            qwen35_gdn_prework._qwen4_verify_in_tile,
+            qwen35_gdn_prework._qwen4_verify_in_geometry,
         )
         cur[0] = "gdn_in_m1"
         p1(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, 1, 2560)))
-        pm = row_exact_qmv.rows_qmv(
-            w,
-            s,
-            b,
-            8,
-            64,
-            "affine",
-            mx.bfloat16,
-            qwen35_gdn_prework._qwen4_verify_in_tile,
-            unrolled=True,
-        )
-        for m in (2, 3, 4):
-            cur[0] = f"gdn_in_m{m}"
-            pm(mx.broadcast_to(mx.array(0, dtype=mx.bfloat16), (1, m, 2560)))
 
         att_ls = [mk_layer(2560, n, 8, 64) for n in (12288, 512, 512, 640)]
         for m, geom in [(1, (1, 2, False)), (2, (2, 4, True)), (3, (1, 4, True))]:
@@ -835,7 +808,78 @@ def test_row_exact_launch_plan_matches_eae63b6c_all_19_shapes(monkeypatch):
         for k in mismatches[:3]
     ]
     digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()
-    assert digest == A13_LAUNCH_19_DIGEST, digest
+    assert digest == A13_LAUNCH_12_DIGEST, digest
+
+
+_MSG_SOURCE_PINS = {
+    "b8g64_bf16_batch_m4": "f2d16912adac6ece933b6e312dd6dc80461aacf8f07f55c09e7928cf6729318b",
+    "b8g64_bf16_batch_m6": "e8b7a6f2755d38415c173d45df76f3377877ca70c93b0c4bab03ec74ea2b4383",
+    "b8g64_bf16_batch_m8": "788b042fb13a6459fca48480d285ab88e9d502f094171ea877e01404859eb6a2",
+    "b8g64_bf16_column_m4": "858df853cf482c5f34b53376a7d73cb86063f4c105c5046b28967122c2838ee0",
+    "b8g64_bf16_column_m6": "aa45993bf2d632a1db33d1502f5b709fc4f0b962bddba16e153d12b0f7006a27",
+    "b8g64_bf16_column_m8": "147d941f9231223aecd252b25f1a72686285832788b1e966c6129131b788488e",
+    "b8g64_fp16_batch_m4": "a8b00c6306ead292b7d74fafabb99e38cf7ce8123eb1991caf6f1cccc3329cf7",
+    "b8g64_fp16_batch_m6": "d2e0b3b0a66b0a11c77c4359441a7096e24408a4b5d80614e0bf3dfc2e60b338",
+    "b8g64_fp16_batch_m8": "194e11c353e120ac4ff13fcfc34bcfa9e6a1e1fbce0ae1f3ba2a6e53fab65c80",
+    "b8g64_fp16_column_m4": "1c516198c2fbd605c7b1d9a00c0c4f7bfc006bbdcea8775619e35e22ef269111",
+    "b8g64_fp16_column_m6": "ddb7503794b3b69b650d5c80a9e71866b23b0ba88e803aa0ca9522a95f2408c2",
+    "b8g64_fp16_column_m8": "13e34cd328febcaf736226f316d17ad9cf9e6c69b1269ae55545784b84d25c9c",
+    "b4g64_bf16_batch_m4": "40d412ae00636f4c92acbbaee14fb8a2bcaf23c9c0eb35c0483d95a198660116",
+    "b4g64_bf16_batch_m6": "611d2f0f60c6bf89ff997bea977d634f1751a4b841398f5bddbd47bcf8bba2f2",
+    "b4g64_bf16_batch_m8": "9e5f47d94f872c942ff6b256797a004e12c9c58706c09f68189cccd549cf4918",
+    "b4g64_bf16_column_m4": "e730618f66f3927151f5e11158879f2815d8bc20e48bc8edb5123754f96ca2a7",
+    "b4g64_bf16_column_m6": "2c63c311ef7ab394b9cc4ed8afcbcb8424881fab252eb13bcb65a326b83ec438",
+    "b4g64_bf16_column_m8": "05b8526ecf81915a3bbab9c4ac83b61fe99940d6ceb551f359140b5dfd884d25",
+    "b4g64_fp16_batch_m4": "0e5ec3fc70a2ed685e5d9c2b1cad92818ec729c259099c4036024deed9e0b18a",
+    "b4g64_fp16_batch_m6": "17e0febe2c3e945560c6564da9048534318d76b0949f923f58332ab723823f88",
+    "b4g64_fp16_batch_m8": "8f20ebaf36bc97d04b260909fa24fde856f5c37486857f33d4a4076b3ae68ad2",
+    "b4g64_fp16_column_m4": "41c760dbd2745e07cd818a03997a0845345edaf9587a290ac814526b214ebfc3",
+    "b4g64_fp16_column_m6": "6c7228588868484530481d9d9c210a71727a5dc167f09ef6ead3bc6871c711c9",
+    "b4g64_fp16_column_m8": "810d2481d10d94339da5d1824d382fd106590834243da50192505ed63d33d6db",
+}
+
+
+def test_msg_tile_sources_are_generic_per_face_and_lifetime():
+    """The promoted msg skeleton reads every face through its own Runs<K>
+    cursors: the four-column and single-column layouts are a DATA policy, the
+    stock affine 4-bit four-face shortcut is gone, and the affine 8-bit
+    sources match the vk pins byte for byte."""
+    import hashlib
+
+    from omlx.formats import affine, verify_skeleton
+
+    faces = {
+        f"b{bits}g64_{name}": affine.tile_face(bits, 64, dtype)
+        for bits, name, dtype in (
+            (8, "bf16", mx.bfloat16),
+            (8, "fp16", mx.float16),
+            (4, "bf16", mx.bfloat16),
+            (4, "fp16", mx.float16),
+        )
+    }
+    for name, face in faces.items():
+        for lifetime in ("batch", "column"):
+            for rows in (4, 6, 8):
+                source = verify_skeleton.emit_msg_source(
+                    verify_skeleton.msg_tile_ops(face, rows, 8, lifetime)
+                )
+                digest = hashlib.sha256(source.encode()).hexdigest()
+                assert digest == _MSG_SOURCE_PINS[f"{name}_{lifetime}_m{rows}"], (
+                    name,
+                    lifetime,
+                    rows,
+                )
+    four = verify_skeleton.emit_msg_source(
+        verify_skeleton.msg_tile_ops(faces["b4g64_bf16"], 6, 8, "batch")
+    )
+    assert "const F four" not in four
+    assert "r0.c" not in four and "r0.s" not in four and "r0.b" not in four
+    assert "const R r0(w, size_t(n0));" in four
+    column = verify_skeleton.emit_msg_source(
+        verify_skeleton.msg_tile_ops(faces["b8g64_bf16"], 6, 8, "column")
+    )
+    assert "const R rj(w, size_t(n0 + j));" in column
+    assert "const auto p0 = r0.params(gi);" in four
 
 
 class _Bf16PluginFormat(formats.QuantFormat):

@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 import threading
 from functools import cache, partial, wraps
 from typing import NamedTuple
@@ -106,7 +107,6 @@ import numpy as np
 
 from .. import formats
 from ..formats import Dot, kernels, tuning
-from ..formats.affine import AffineFormat
 from ..formats.linear import FormatLinear, FormatSwitchLinear
 from . import qwen35_moe_router as _router
 from .module_cache import cached_per_module
@@ -934,22 +934,18 @@ def _plain(layer, *classes) -> bool:
 
 
 def _window_router_ok(gate, dtype: mx.Dtype) -> bool:
-    """Whether a verify window takes the block's quantized gate through
-    ``row_exact_linear``: exactly a plain quantized linear of an affine
-    layout that tiles (its other layouts fall back to one stock call a
-    row), without a bias, whose scales and biases are the dtype the
-    launches are compiled for (a mixed dtype would promote in
-    ``quantized_matmul`` and every window would decline after its gate
-    work). These are the affine
-    widths and group sizes ``row_exact_qmv`` tiles."""
-    stock = (
-        _plain(gate, nn.QuantizedLinear)
-        or type(gate) is FormatLinear
-        and isinstance(gate.fmt, AffineFormat)
-        and "bias" not in gate
-    )
+    """Whether a verify window takes the block's quantized gate through the
+    fused launch: a plain bias-free ``FormatLinear`` of any format (Rule 25:
+    ``row_exact_linear`` tiles its dot face or runs one-row calls, and the
+    runtime dtype/shape guard below stays fail-closed), or exactly a plain
+    quantized linear of an affine layout that ``row_exact_linear`` tiles,
+    whose scales and biases are the dtype the launches are compiled for (a
+    mixed dtype would promote in ``quantized_matmul`` and every window would
+    decline after its gate work)."""
+    if type(gate) is FormatLinear and "bias" not in gate:
+        return True
     return (
-        stock
+        _plain(gate, nn.QuantizedLinear)
         and "biases" in gate
         and gate.mode == "affine"
         and gate.bits in (4, 5, 6, 8)
@@ -2401,6 +2397,13 @@ def _join_warm_futures(futures, *, exc_in_body: bool = False) -> None:
             raise first_error
 
 
+def _hc_fused_module():
+    """Return the vendored Qwen4 ``hc_fused`` module if already imported."""
+    return sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused") or sys.modules.get(
+        "omlx.patches.mlx_vlm_qwen4_exp_compat.vendor.mlx_vlm.models.qwen4_exp.hc_fused"
+    )
+
+
 def warm_engine_dispatch(
     model,
     stream,
@@ -2414,7 +2417,7 @@ def warm_engine_dispatch(
     if model is None or not mx.metal.is_available():
         return
     from ..formats import linear
-    from . import qwen35_verify_qmm, row_exact_qmv
+    from . import row_exact_qmv
 
     if prefill_lengths is None:
         resolved_lengths: tuple[int, ...] = (
@@ -2428,31 +2431,43 @@ def warm_engine_dispatch(
                 r for r in prefill_lengths if type(r) is int and r > linear.MAX_ROWS
             )
         )
-    # Catch any post-configure_qwen4_decode wide GDN row_exact_qmv Metals
-    # (O(1) no-op for libraries already warmed in warm_moe_model).
-    row_futures = list(row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled) or ())
-    row_futures.extend(
-        qwen35_verify_qmm.warm_model(model, mtp_enabled=mtp_enabled) or ()
-    )
-    if row_futures:
-        _join_warm_futures(row_futures)
-    if stream is not None:
-        with mx.stream(stream):
-            linear.warm_model_dispatch(
-                model,
-                prefill_lengths=resolved_lengths,
-                mtp_enabled=mtp_enabled,
-            )
-            _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
-            row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
-    else:
+    # Catch any post-configure_qwen4_decode wide GDN row_exact_qmv / stacked
+    # FormatLinear or HC Metals (O(1) no-op for libraries already warmed in
+    # warm_moe_model). Join submitted futures even if a later warm raises.
+    extra_futures = []
+    hc_fused = _hc_fused_module()
+    exc_in_body = False
+    try:
+        extra_futures.extend(row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled))
+        if hc_fused is not None:
+            extra_futures.extend(hc_fused.warm_model(model))
+    except BaseException:
+        exc_in_body = True
+        raise
+    finally:
+        if extra_futures:
+            _join_warm_futures(extra_futures, exc_in_body=exc_in_body)
+
+    def _run_dispatch() -> None:
+        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
+        extra_linears = row_exact_qmv._gdn_stacked_linears(
+            model, mtp_enabled=mtp_enabled
+        )
         linear.warm_model_dispatch(
             model,
             prefill_lengths=resolved_lengths,
             mtp_enabled=mtp_enabled,
+            extra_linears=extra_linears,
         )
+        if hc_fused is not None:
+            hc_fused.warm_model_dispatch(model, prefill_lengths=resolved_lengths)
         _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
-        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
+
+    if stream is not None:
+        with mx.stream(stream):
+            _run_dispatch()
+    else:
+        _run_dispatch()
 
 
 def warm_moe_model(
@@ -2704,26 +2719,36 @@ def warm_moe_model(
         row_futures = row_exact_qmv.warm_model(model, mtp_enabled=mtp_enabled)
         if row_futures:
             futures.extend(row_futures)
-        from . import qwen35_verify_qmm
-
-        vq_futures = qwen35_verify_qmm.warm_model(model, mtp_enabled=mtp_enabled)
-        if vq_futures:
-            futures.extend(vq_futures)
+        hc_fused = _hc_fused_module()
+        if hc_fused is not None:
+            hc_futures = hc_fused.warm_model(model)
+            if hc_futures:
+                futures.extend(hc_futures)
     except BaseException:
         exc_in_body = True
         raise
     finally:
         _join_warm_futures(futures, exc_in_body=exc_in_body)
     if warm_dispatch:
+        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
+        extra_linears = row_exact_qmv._gdn_stacked_linears(
+            model, mtp_enabled=mtp_enabled
+        )
         linear.warm_model_dispatch(
             model,
             prefill_lengths=prefill_lengths,
             mtp_enabled=mtp_enabled,
+            extra_linears=extra_linears,
         )
+        hc_fused = _hc_fused_module()
+        if hc_fused is not None:
+            hc_fused.warm_model_dispatch(model, prefill_lengths=prefill_lengths)
         _warm_routed_dispatch(model, mtp_enabled=mtp_enabled)
-        row_exact_qmv.warm_model_dispatch(model, mtp_enabled=mtp_enabled)
     else:
-        linear.prepare_layer_plans(model)
+        extra_linears = row_exact_qmv._gdn_stacked_linears(
+            model, mtp_enabled=mtp_enabled
+        )
+        linear.prepare_layer_plans(model, extra_linears=extra_linears)
 
 
 _ensure_tuning_registered()

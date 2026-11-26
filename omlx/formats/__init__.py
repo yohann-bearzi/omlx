@@ -450,6 +450,7 @@ class Dot(_Face):
             if name == "shared":
                 return text
         return ""
+
     __hash__ = _Face.__hash__
 
 
@@ -490,6 +491,10 @@ class QuantFormat:
     codes_name: str = "weight"  # its packed tensor's name: its codes
     tensors: tuple[str, ...]  # its side parameters beside "bias"
     contract: int  # the revision of the contract it is written for
+    # A format whose faces depend on the layer's training state declares it;
+    # the fused HC plan records the flag only for such faces, so a load's
+    # model.eval() cannot stale an ordinary affine plan.
+    training_sensitive: bool = False
 
     def dot(self, layer, k: int, n: int) -> Dot | None:
         """The mat-vec face of ``layer``'s ``(..., n, k)`` matrix, or None."""
@@ -1128,6 +1133,7 @@ def tile(layer, k: int, n: int) -> Tile | None:
 def codes(layer, k: int, n: int) -> Codes | None:
     """The layer's codes face, with the same checks and fallback as tile()."""
     return _face(layer, k, n, Codes, "codes", "the layer keeps its other kernels")
+
 
 # What a layer has no attribute at, apart from a None it holds there.
 _MISSING = object()

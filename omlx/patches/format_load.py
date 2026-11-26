@@ -1157,11 +1157,7 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
             checkpoint,
         )
     check_families = (
-        (
-            (top,)
-            if inner is None or inner in (top, f"{top}_text")
-            else (top, inner)
-        )
+        ((top,) if inner is None or inner in (top, f"{top}_text") else (top, inner))
         if top is not None
         else (inner,)
     )
@@ -1249,9 +1245,7 @@ def _refuse_family(checkpoint: _Checkpoint, mode: str | None = None) -> None:
             if checkpoint.records(wanted):
                 checkpoint._record(wanted)
             if formats.get(wanted) is None:
-                raise _refused(
-                    _not_installed(wanted, checkpoint), wanted, checkpoint
-                )
+                raise _refused(_not_installed(wanted, checkpoint), wanted, checkpoint)
             family = missing if missing is not None else check_families[0]
             raise _refused(
                 f"the family {family!r} with format {wanted!r} is not "
@@ -1609,10 +1603,14 @@ def _format_layer(layer, layer_cls, signature, arguments):
         # A built-in format builds its layers only in the families the stock
         # switch has ported (a plugin's own record always builds its); every
         # other checkpoint of an MLX mode keeps MLX's layer, as before.
-        if mode in formats._BUILTIN_MODES and not kept_record and (
-            checkpoint is None
-            or getattr(_SHARDED, "entry", None) is not None
-            or not _ported(checkpoint)
+        if (
+            mode in formats._BUILTIN_MODES
+            and not kept_record
+            and (
+                checkpoint is None
+                or getattr(_SHARDED, "entry", None) is not None
+                or not _ported(checkpoint)
+            )
         ):
             # Outside a load, under a distributed loader (a rank shards MLX's
             # own packed layers, DEFERRED 29), or in a family the switch has
@@ -1654,9 +1652,7 @@ def _format_layer(layer, layer_cls, signature, arguments):
     if layer_cls is FormatEmbedding and not formats.stackable(
         fmt, k, n, bits, group_size
     ):
-        raise _refused(
-            "its rows are not independent (not formats.stackable)", mode
-        )
+        raise _refused("its rows are not independent (not formats.stackable)", mode)
     for name, value in arguments.items():
         if name not in _TAKEN and value != signature.parameters[name].default:
             raise _refused(
@@ -1930,6 +1926,18 @@ def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> Non
             # A load joined to an outer one of the checkpoint is checked by
             # that one, when it returns.
             checkpoint.check(loaded)
+            # mlx_vlm/mlx_lm call model.eval() after load_weights; load_weights
+            # builds no HC plans, so build them once here, after the loader's
+            # post-load steps.
+            hc_fused = sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused")
+            if hc_fused is not None:
+                for item in (loaded if isinstance(loaded, tuple) else (loaded,)):
+                    # Only the qwen4_exp family has HC layers; a stock load's
+                    # model is never walked (test_a_stock_load_is_not_walked).
+                    if isinstance(item, nn.Module) and type(item).__module__.startswith(
+                        "mlx_vlm.models.qwen4_exp."
+                    ):
+                        hc_fused.rebuild_plans(item)
         return loaded
 
     _LOADER_CODES.add(loader.__code__)

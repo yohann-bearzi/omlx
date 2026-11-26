@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ _REMOTE_CODE_METADATA_PATTERNS = [
     "*.jsonl",
     "*.jinja",
 ]
+
 
 def ensure_model_code_trusted(
     config: dict[str, Any],
@@ -235,7 +237,12 @@ def expand_per_layer_quant_keys(cfg: dict) -> dict:
                     fg = cand.replace(".hc_ffn_", ".ffn_hc.")
                 elif ".self_attn." in cand:
                     head, tail = cand.split(".self_attn.", 1)
-                    if tail.split(".", 1)[0] in ("f_a_proj", "f_b_proj", "A_log", "dt_bias"):
+                    if tail.split(".", 1)[0] in (
+                        "f_a_proj",
+                        "f_b_proj",
+                        "A_log",
+                        "dt_bias",
+                    ):
                         fg = f"{head}.self_attn.forget_gate.{tail}"
                 if fg and fg not in quant and fg not in extras:
                     extras[fg] = val
@@ -1044,9 +1051,7 @@ def maybe_apply_pre_load_patches(
                 # The checkpoint ships one MTP block per draft depth; cap
                 # the chain at the shipped depth (8 on Inkling Small).
                 mtp_cfg = config.get("mtp_config") or {}
-                set_mtp_depth(
-                    int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3
-                )
+                set_mtp_depth(int(mtp_cfg.get("num_nextn_predict_layers", 0) or 0) or 3)
             elif model_type == "qwen3_5" and _nax_available():
                 # The M5 packed verify kernels keep a 5-row verify close to
                 # a 4-row one on dense Qwen, so depth 4 pays there.
@@ -1703,6 +1708,11 @@ def cast_bf16_params_to_fp16(model: Any) -> int:
     if count:
         # Read by numerics_revision_for_model so bfloat16 KV blocks are not reused.
         model._omlx_fp16_recast = True
+        # The HC plans hold the norm/scales dtypes they were built with; a
+        # recast is a weight change, so rebuild them explicitly.
+        hc_fused = sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused")
+        if hc_fused is not None:
+            hc_fused.rebuild_plans(model)
     return count
 
 

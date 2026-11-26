@@ -25,6 +25,17 @@ from omlx.custom_kernels.attention import fast as _attention_fast
 # The native roll stages this many columns per block; an MTP rollback shifts at most one verify window.
 _NATIVE_ROLL_MAX_SHIFT = 16
 
+_INT_DTYPES = (mx.int32, mx.int64)
+
+
+def _host_int_list(values) -> list[int] | None:
+    """Return a plain ``list[int]`` when ``values`` is a host int sequence."""
+    if isinstance(values, (list, tuple)) and all(
+        isinstance(v, int) and not isinstance(v, bool) for v in values
+    ):
+        return list(values)
+    return None
+
 
 def _native_roll(x, shifts, length: int, axis: int, max_shift: int):
     """Roll the rows of ``x`` in place when the kernel applies, else ``None``."""
@@ -113,6 +124,106 @@ def _logical_kv(cache):
 class _CapacityMethods:
     # Live rows when the bank has spare rows, else None.
     _rows = None
+
+    @property
+    def left_padding(self):
+        if "_left_padding" in self.__dict__:
+            return self._left_padding
+        return self.__dict__.get("left_padding")
+
+    @left_padding.setter
+    def left_padding(self, value):
+        self.__dict__.pop("left_padding", None)
+        self._left_padding = value
+        self._left_padding_host = None
+
+    def _set_left_padding(self, value, host: list[int] | None) -> None:
+        self.__dict__.pop("left_padding", None)
+        self._left_padding = value
+        self._left_padding_host = None if host is None else list(host)
+
+    def _left_padding_host_list(self) -> list[int] | None:
+        """Host shadow when intact and backed by a 1-D integer array, else None."""
+        host = self.__dict__.get("_left_padding_host")
+        lp = self.left_padding
+        if (
+            host is None
+            or not isinstance(lp, mx.array)
+            or lp.ndim != 1
+            or lp.dtype not in _INT_DTYPES
+            or len(host) != int(lp.shape[0])
+        ):
+            return None
+        return host
+
+    def left_padding_list(self) -> list[int]:
+        """Per-row left padding as a fresh ``list[int]`` without GPU sync."""
+        host = self._left_padding_host_list()
+        if host is not None:
+            return list(host)
+        lp = self.left_padding
+        resolved = [int(v) for v in lp.tolist()]
+        if isinstance(lp, mx.array) and lp.ndim == 1 and lp.dtype in _INT_DTYPES:
+            self._left_padding_host = resolved
+            return list(resolved)
+        return resolved
+
+    def _join_left_padding(self, shift: int, other, left: int) -> None:
+        a_host = self._left_padding_host_list()
+        b_host = (
+            other._left_padding_host_list()
+            if hasattr(other, "_left_padding_host_list")
+            else None
+        )
+        if (
+            a_host is not None
+            and b_host is not None
+            and self.left_padding.dtype == other.left_padding.dtype
+        ):
+            joined = [p + shift for p in a_host] + [p + left for p in b_host]
+            self._set_left_padding(
+                mx.array(joined, dtype=self.left_padding.dtype), joined
+            )
+            return
+        a_lp = self.left_padding + shift if shift else self.left_padding
+        b_lp = other.left_padding + left if left else other.left_padding
+        self.left_padding = mx.concatenate([a_lp, b_lp])
+
+    def prepare(self, *, left_padding=None, lengths=None, right_padding=None):
+        del lengths
+        if left_padding is not None:
+            if self.keys is not None:
+                raise ValueError(
+                    "Left padding can only be added to an empty BatchKVCache"
+                )
+            added_host = _host_int_list(left_padding)
+            left_padding_arr = mx.array(left_padding)
+            cur_host = self._left_padding_host_list()
+            if (
+                cur_host is not None
+                and added_host is not None
+                and len(cur_host) == len(added_host)
+                and left_padding_arr.dtype in _INT_DTYPES
+                and self.left_padding.dtype == left_padding_arr.dtype
+            ):
+                new_pads = [a + b for a, b in zip(cur_host, added_host)]
+                self._set_left_padding(
+                    mx.array(new_pads, dtype=self.left_padding.dtype), new_pads
+                )
+            else:
+                self.left_padding = self.left_padding + left_padding_arr
+            self.offset = self.offset - left_padding_arr
+
+        if right_padding is not None:
+            rp_host = _host_int_list(right_padding)
+            if rp_host is not None:
+                if max(rp_host) > 0:
+                    rp_arr = mx.array(rp_host)
+                    self._right_padding = rp_arr
+                    self._right_padding_host = (rp_arr, rp_host)
+            elif max(right_padding) > 0:
+                self._right_padding = mx.array(right_padding)
+                self._right_padding_host = None
 
     @property
     def keys(self):
@@ -273,9 +384,15 @@ class _CapacityMethods:
         if self._right_padding is not None:
             if self.keys is None:
                 self._right_padding = None
+                self._right_padding_host = None
                 return
             padding = self._right_padding
-            max_shift = max(padding.tolist())
+            rp_entry = self.__dict__.get("_right_padding_host")
+            if rp_entry is not None and rp_entry[0] is padding:
+                rp_host = rp_entry[1]
+            else:
+                rp_host = [int(v) for v in padding.tolist()]
+            max_shift = max(rp_host) if rp_host else 0
             self._settle_extracts()
             # Roll only the stock width; the zero tail stays in place.
             # Spare rows roll too, with no shift, so the bank keeps them.
@@ -291,8 +408,21 @@ class _CapacityMethods:
                 self._values, shifts[:, None], width, axis=2, max_shift=max_shift
             )
             self.offset -= padding
-            self.left_padding += padding
+            lp_host = self._left_padding_host_list()
+            if (
+                lp_host is not None
+                and len(lp_host) == len(rp_host)
+                and padding.dtype in _INT_DTYPES
+                and self.left_padding.dtype == padding.dtype
+            ):
+                new_pads = [a + b for a, b in zip(lp_host, rp_host)]
+                self._set_left_padding(
+                    mx.array(new_pads, dtype=self.left_padding.dtype), new_pads
+                )
+            else:
+                self.left_padding = self.left_padding + padding
             self._right_padding = None
+            self._right_padding_host = None
 
     def filter(self, batch_indices):
         """Keep the given rows in place, or copy survivors once into a ladder bank."""
@@ -302,12 +432,28 @@ class _CapacityMethods:
             else list(batch_indices)
         )
         self.offset = self.offset[batch_indices]
-        self.left_padding = self.left_padding[batch_indices]
+        lp_host = self._left_padding_host_list()
+        if lp_host is not None:
+            lp_dtype = self.left_padding.dtype
+            kept_pads = [lp_host[i] for i in kept]
+            self._set_left_padding(mx.array(kept_pads, dtype=lp_dtype), kept_pads)
+            min_left_pad = min(min(kept_pads), self._idx) if kept_pads else 0
+        else:
+            self.left_padding = self.left_padding[batch_indices]
+            min_left_pad = min(self.left_padding.min().item(), self._idx) if kept else 0
+            kept_pads = None
         if self._right_padding is not None and not isinstance(self, LMBatchKVCache):
-            self._right_padding = self._right_padding[batch_indices]
+            old_rp = self._right_padding
+            rp_entry = self.__dict__.get("_right_padding_host")
+            self._right_padding = old_rp[batch_indices]
+            if rp_entry is not None and rp_entry[0] is old_rp:
+                self._right_padding_host = (
+                    self._right_padding,
+                    [rp_entry[1][i] for i in kept],
+                )
+            else:
+                self._right_padding_host = None
 
-        # Shift left to reduce padding
-        min_left_pad = min(self.left_padding.min().item(), self._idx) if kept else 0
         if self._keys is not None:
             if not kept:
                 self._keys = self._keys[batch_indices]
@@ -319,7 +465,11 @@ class _CapacityMethods:
                 self._drop_left_columns(len(kept), min_left_pad)
         if min_left_pad > 0:
             self._idx -= min_left_pad
-            self.left_padding -= min_left_pad
+            if kept_pads is not None:
+                shifted = [p - min_left_pad for p in kept_pads]
+                self._set_left_padding(mx.array(shifted, dtype=lp_dtype), shifted)
+            else:
+                self.left_padding = self.left_padding - min_left_pad
 
     def _move_rows(self, kept, drop: int) -> bool:
         """Refill freed rows in place from rows past ``len(kept)``.
@@ -364,7 +514,7 @@ class _CapacityMethods:
     def extend(self, other):
         """In-place extend this cache with the other cache."""
         if self.keys is None and other.keys is None:
-            self.left_padding = mx.concatenate([self.left_padding, other.left_padding])
+            self._join_left_padding(0, other, 0)
             self.offset = mx.concatenate([self.offset, other.offset])
             return
 
@@ -406,12 +556,12 @@ class _CapacityMethods:
                 pad = [(0, 0), (0, 0), (left, right), (0, 0)]
                 k = mx.pad(k, pad)
                 v = mx.pad(v, pad)
-            left_padding = c.left_padding + left
-            return k, v, c.offset, left_padding
+            return k, v, c.offset
 
-        self.keys, self.values, self.offset, self.left_padding = map(
+        self.keys, self.values, self.offset = map(
             mx.concatenate, zip(*(pad(self), pad(other)))
         )
+        self._join_left_padding(max_idx - self._idx, other, max_idx - other._idx)
         self._width = None
         self._idx = max_idx
 
@@ -451,9 +601,7 @@ class _CapacityMethods:
             bank[rows, :, :max_size] = 0
             bank[rows, :, left : left + length] = part[..., :length, :]
         self.offset = mx.concatenate([self.offset, other.offset])
-        self.left_padding = mx.concatenate(
-            [self.left_padding + shift, other.left_padding + left]
-        )
+        self._join_left_padding(shift, other, left)
         self._idx = max_idx
         self._width = max_size
         self._rows = live + new if live + new < int(self._keys.shape[0]) else None
@@ -522,16 +670,14 @@ class _CapacityMethods:
         keys = mx.zeros((total, k0.shape[1], capacity, k0.shape[3]), k0.dtype)
         values = mx.zeros((total, v0.shape[1], capacity, v0.shape[3]), v0.dtype)
         start = 0
-        left_padding = []
         for c, (k, v), n in zip(sides, banks, rows):
             left = max_idx - c._idx
             length = min(int(k.shape[2]), max_size - left)
             keys[start : start + n, :, left : left + length] = k[..., :length, :]
             values[start : start + n, :, left : left + length] = v[..., :length, :]
-            left_padding.append(c.left_padding + left)
             start += n
         self.offset = mx.concatenate([self.offset, other.offset])
-        self.left_padding = mx.concatenate(left_padding)
+        self._join_left_padding(max_idx - self._idx, other, max_idx - other._idx)
         self._keys, self._values = keys, values
         self._width = max_size
         self._rows = start if start < total else None
@@ -575,7 +721,10 @@ class _CapacityMethods:
         return cache
 
     def extract(self, idx):
-        padding = int(self.left_padding[idx].item())
+        lp_host = self._left_padding_host_list()
+        padding = (
+            lp_host[idx] if lp_host is not None else int(self.left_padding[idx].item())
+        )
         length = self._idx - padding
         # mlx-lm KVCache.state exposes the whole buffer, so its rows keep the
         # exact width.
@@ -666,9 +815,25 @@ def install_capacity_methods(cls) -> None:
     """
     if getattr(cls, "_omlx_capacity_managed", False):
         return
+    orig_init = cls.__init__
+
+    def _init(self, left_padding):
+        orig_init(self, left_padding)
+        host = _host_int_list(left_padding)
+        lp = self.left_padding
+        if (
+            host is not None
+            and isinstance(lp, mx.array)
+            and lp.ndim == 1
+            and lp.dtype in _INT_DTYPES
+            and len(host) == int(lp.shape[0])
+        ):
+            self._left_padding_host = host
+
     for name, member in vars(_CapacityMethods).items():
         if not name.startswith("__"):
             setattr(cls, name, member)
+    cls.__init__ = _init
     if cls is LMBatchKVCache:
         cls.state = property(_lm_state, _set_lm_state)
     cls._omlx_capacity_managed = True

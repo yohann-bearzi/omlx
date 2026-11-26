@@ -4,12 +4,11 @@
 import contextvars
 from collections import Counter
 
-from omlx.formats import testing as format_testing
-
 import mlx.core as mx
 import pytest
 
 from omlx import formats, oq
+from omlx.formats import testing as format_testing
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.patches import format_load
 from omlx.utils.model_loading import maybe_apply_pre_load_patches
@@ -24,8 +23,9 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
     """The write admits two readers, distinct by identity: ``_format_reader``'s
     for the write's dot and tile probes, and the one ``verify_written_format_
     checkpoint``'s reload admits. The write probes both faces of every
-    persisted layer on the first; the reload then probes every layer's dot
-    face once on the second, and no tile face."""
+    persisted layer on the first; the reload's 16-token forward then probes
+    every layer's dot face and every ``FormatLinear``'s tile face (2..16-row
+    schedule) once on the second, and no ``FormatSwitchLinear`` tile face."""
     assert not formats._TESTING.get()
     assert formats._LOADING.get() is None
     # oQ accepts the text source and writes the Qwen3.5 MoE model type that
@@ -38,9 +38,7 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
         "_VERIFIED_EXTRA",
         contextvars.ContextVar(
             "omlx_verified_extra",
-            default=frozenset(
-                (("qwen3_5_moe_text", None), ("qwen3_5_moe", None))
-            ),
+            default=frozenset((("qwen3_5_moe_text", None), ("qwen3_5_moe", None))),
         ),
     )
     monkeypatch.setattr(
@@ -148,13 +146,16 @@ def test_writer_probes_each_persisted_layer_with_its_accepted_reader(
             )
     assert {item[1] for item in expected} == {FormatLinear, FormatSwitchLinear}
     # The write probes both faces of every persisted layer; the
-    # verify-on-finalize reload then probes every layer's dot face once on
-    # the verify reader and never a tile face.
-    dot_faces = [item for item in expected if item[0] == "dot"]
-    assert len(probes) == len(expected) + len(dot_faces)
+    # verify-on-finalize reload's 16-token forward then probes every layer's
+    # dot face and every FormatLinear's tile face (the 2..16-row schedule)
+    # once on the verify reader, and never a FormatSwitchLinear tile face.
+    reload_faces = [
+        item for item in expected if item[0] == "dot" or item[1] is FormatLinear
+    ]
+    assert len(probes) == len(expected) + len(reload_faces)
     assert Counter(probes[: len(expected)]) == Counter(expected)
     assert all(reader is write_reader for reader in probe_readers[: len(expected)])
-    assert Counter(probes[len(expected) :]) == Counter(dot_faces)
+    assert Counter(probes[len(expected) :]) == Counter(reload_faces)
     assert all(reader is verify_reader for reader in probe_readers[len(expected) :])
 
     maybe_apply_pre_load_patches(str(output))

@@ -42,13 +42,11 @@ def test_qwen4_quantization_path_aliases_non_mtp_is_empty():
 
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 @pytest.mark.parametrize("rows", [1, 4])
-def test_planless_stock_affine_row_exact_matches_serial_decode(
-    monkeypatch, dtype, rows
-):
+def test_planless_stock_affine_keeps_mlx_matmul(monkeypatch, dtype, rows):
     """An affine layer whose face declines the matrix (a 128-deep K, or a
-    matrix under one group) keeps MLX's own matmul under a row-exact verify
-    forward, as upstream's row_exact_qmv does: bitwise serial decode, never
-    the decoded float matmul."""
+    matrix under one group) keeps MLX's own matmul, batched at every row
+    count: Rule 33 retired row-exact arming, so an armed flag no longer
+    splits the call into rows, and the decoded float matmul is never used."""
     import mlx.core as mx
     import mlx.nn as nn
 
@@ -74,32 +72,25 @@ def test_planless_stock_affine_row_exact_matches_serial_decode(
                 bias=quantized.get("bias"),
             )
         assert linear._plan(layer) is None
-        object.__setattr__(layer, "_qwen_row_exact", verify.is_row_exact_armed)
-        assert layer._qwen_row_exact()
         x = mx.random.normal((rows, k)).astype(dtype)
-        serial = mx.concatenate(
-            [
-                mx.quantized_matmul(
-                    x[r : r + 1],
-                    quantized["weight"],
-                    quantized["scales"],
-                    quantized.get("biases"),
-                    transpose=True,
-                    group_size=group_size,
-                    bits=bits,
-                )
-                for r in range(rows)
-            ]
+        batched = mx.quantized_matmul(
+            x,
+            quantized["weight"],
+            quantized["scales"],
+            quantized.get("biases"),
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
         )
         got = layer(x)
-        mx.eval(got, serial)
-        assert mx.array_equal(got.view(mx.uint16), serial.view(mx.uint16)).item()
+        mx.eval(got, batched)
+        assert mx.array_equal(got.view(mx.uint16), batched.view(mx.uint16)).item()
         monkeypatch.setattr(
             FormatLinear, "_decoded", lambda self: pytest.fail("decoded the matrix")
         )
         again = layer(x)
         mx.eval(again)
-        assert mx.array_equal(again.view(mx.uint16), serial.view(mx.uint16)).item()
+        assert mx.array_equal(again.view(mx.uint16), batched.view(mx.uint16)).item()
     finally:
         verify.set_verify_qmm_armed(False)
 

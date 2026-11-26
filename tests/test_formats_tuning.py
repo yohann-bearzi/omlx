@@ -314,13 +314,15 @@ def test_lookup_is_thread_safe_and_reads_a_table_once(tmp_path, monkeypatch):
 
 
 def test_every_in_tree_entry_is_current(tmp_path):
-    # Re-register the live dense_tile and routed_window skeletons (fresh_tuner
-    # swaps in a dummy digest) and validate every shipped entry's
-    # skeleton_sha256, face_sha256, and legality against all shipped faces.
-    from omlx.formats import affine, tile_dense
+    # Re-register all live skeletons (fresh_tuner swaps in a dummy digest) and
+    # validate every shipped entry's skeleton_sha256, face_sha256, and legality
+    # against all shipped faces.
+    from omlx.formats import affine, tile_dense, verify_skeleton
     from omlx.patches import qwen35_moe_routed_decode as routed
 
     tuning.register_skeleton("dense_tile", tile_dense._SKELETON_TEXT)
+    tuning.register_skeleton("mma_tile", verify_skeleton._skeleton_material())
+    tuning.register_skeleton("msg_tile", verify_skeleton._msg_skeleton_material())
     routed._ensure_tuning_registered()
     faces = {
         face.key: face
@@ -363,17 +365,12 @@ def test_every_in_tree_entry_is_current(tmp_path):
         for entry in entries:
             fid = entry.key["face_id"]
             face = profile_faces[fid] if fid.startswith("*:") else faces[fid]
-            span = entry.rows_span
-            if entry.key["route"] in ("routed_window", "routed_down"):
-                parsed = tuning._parse_rows_span(entry.key["rows_bucket"])
-                assert parsed is not None and parsed[1] is not None, entry
-                sample_m = parsed[1]
-            else:
-                sample_m = (
-                    span[1]
-                    if (span is not None and span[1] is not None)
-                    else max(4096, (span[0] if span and span[0] else 17))
-                )
+            span = entry.rows_span or tuning._parse_rows_span(entry.key["rows_bucket"])
+            sample_m = (
+                span[1]
+                if (span is not None and span[1] is not None)
+                else max(4096, (span[0] if span and span[0] else 17))
+            )
             assert entry.params.is_legal(
                 face,
                 entry.key["k"],
@@ -1534,15 +1531,16 @@ def test_register_skeleton_refuses_a_route_without_row_buckets():
 
 def test_dense_tile_route_only_backends_and_nax_sched_decode_and_check_legality():
     face = _face()
-    for backend in ("mlx", "wide", "rows"):
+    for backend, sample_m in (("mlx", 48), ("wide", 48), ("dot", 16)):
         pol = schema.params_from_json("dense_tile", {"backend": backend})
         assert pol == schema.DenseTilePolicy(backend)
-        assert pol.is_legal(face, 2560, 2560, 48, "applegpu_g15d_c80")
+        assert pol.is_legal(face, 2560, 2560, sample_m, "applegpu_g15d_c80")
         assert not schema.DenseTilePolicy(backend, bm=32).is_legal(
-            face, 2560, 2560, 48, "applegpu_g15d_c80"
+            face, 2560, 2560, sample_m, "applegpu_g15d_c80"
         )
-        with pytest.raises(ValueError, match="bm|bn|bk"):
-            schema.params_from_json("dense_tile", {"backend": backend, "bm": 32})
+        for dim in ("bm", "bn", "bk"):
+            with pytest.raises(ValueError, match="bm|bn|bk"):
+                schema.params_from_json("dense_tile", {"backend": backend, dim: 32})
     db = schema.params_from_json(
         "dense_tile",
         {
@@ -1622,7 +1620,7 @@ def test_narrow_rows_span_beats_enclosing_bucket_and_exposes_row_bounds(tmp_path
         n=2560,
         k=2560,
         rows_bucket="44-52",
-        params={"backend": "rows"},
+        params={"backend": "wide"},
     )
     # Write broad entries BEFORE narrow to confirm span specificity wins over order.
     _write(tmp_path / "v1", chip, [broad_lo, broad_hi, narrow])
@@ -1636,9 +1634,113 @@ def test_narrow_rows_span_beats_enclosing_bucket_and_exposes_row_bounds(tmp_path
     assert p43 is not None and (p43.backend, p43.bm, p43.bk) == ("steel", 16, 128)
     for r in range(44, 53):
         pr = _lookup(face, n=2560, k=2560, rows=r, chip=chip)
-        assert pr is not None and pr.backend == "rows", r
+        assert pr is not None and pr.backend == "wide", r
     p53 = _lookup(face, n=2560, k=2560, rows=53, chip=chip)
     assert p53 is not None and (p53.backend, p53.bm, p53.bk) == ("steel", 32, 128)
+
+
+def test_narrow_named_bucket_beats_wider_custom_span(tmp_path):
+    """Named row buckets rank by the row count they cover, matching custom
+    ``lo-hi`` spans: ``17-24`` (width 8) beats ``5-24`` (width 20), and
+    ``msg_tile`` ``6`` (width 2) beats ``dense_tile`` ``2-16`` (width 15)
+    (review MEDIUM-2)."""
+    face = _face()
+    wide = _entry(
+        face,
+        n=2560,
+        k=5120,
+        rows_bucket="5-24",
+        params={"backend": "mlx"},
+    )
+    narrow = _entry(
+        face,
+        n=2560,
+        k=5120,
+        rows_bucket="17-24",
+        params={"backend": "wide"},
+    )
+    _write(tmp_path / "v1", CHIP, [wide, narrow])
+    tuning.reset_cache()
+    picked = _lookup(face, rows=20)
+    assert picked is not None and picked.backend == "wide"
+
+    # Control: dropping the named bucket lets the wider custom span answer.
+    _write(tmp_path / "v1", CHIP, [wide])
+    tuning.reset_cache()
+    fallback = _lookup(face, rows=20)
+    assert fallback is not None and fallback.backend == "mlx"
+
+    # Open/low named buckets rank by their covered width too: "<17" (16 rows)
+    # beats "1-20" (20 rows) and loses to "2-16" (15 rows).
+    lt17 = _entry(face, n=2560, k=5120, rows_bucket="<17", params={"backend": "wide"})
+    span20 = _entry(face, n=2560, k=5120, rows_bucket="1-20", params={"backend": "mlx"})
+    _write(tmp_path / "v1", CHIP, [span20, lt17])
+    tuning.reset_cache()
+    assert _lookup(face, rows=10).backend == "wide"
+    span15 = _entry(face, n=2560, k=5120, rows_bucket="2-16", params={"backend": "mlx"})
+    _write(tmp_path / "v1", CHIP, [lt17, span15])
+    tuning.reset_cache()
+    assert _lookup(face, rows=10).backend == "mlx"
+
+    # Cross-route specificity: named msg_tile "6" (width 2) beats dense_tile
+    # custom span "2-16" (width 15).
+    tuning.register_skeleton("msg_tile", "msg-v1")
+    dense = _entry(face, n=2560, k=5120, rows_bucket="2-16", params={"backend": "mlx"})
+    msg = _entry(
+        face,
+        route="msg_tile",
+        n=2560,
+        k=5120,
+        rows_bucket="6",
+        params={"nsg": 8},
+    )
+    msg["skeleton_sha256"] = tuning.skeleton_digest("msg_tile")
+    _write(tmp_path / "v1", CHIP, [dense, msg])
+    tuning.reset_cache()
+    mr_msg = tuning.match_rank(
+        "msg_tile",
+        face,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=2560,
+        k=5120,
+        rows=6,
+        chip=CHIP,
+    )
+    mr_dense = tuning.match_rank(
+        "dense_tile",
+        face,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=2560,
+        k=5120,
+        rows=6,
+        chip=CHIP,
+    )
+    assert mr_msg == (4, -2) and mr_dense == (4, -15)
+    assert mr_msg > mr_dense
+
+
+def test_tail_legality_is_nax_split1_only():
+    """``tail=True`` waives ``K % BK == 0`` only for single-partition NAX
+    launches (its ``k_rem`` loop); ``steel`` asserts whole ``BK`` tiles, and
+    split-K or double-buffered NAX still require whole ``BK`` (review LOW-1)."""
+    from omlx.formats import affine
+
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    steel = schema.DenseTilePolicy("steel", 32, 32, 64, 2, 2)
+    assert not steel.is_legal(face, 96, 64, 32, "applegpu_g15d_c80", tail=True)
+    nax_split = schema.DenseTilePolicy("nax", 32, 64, 64, 2, 2, split_k=2)
+    assert not nax_split.is_legal(face, 96, 64, 32, CHIP, tail=True)
+    nax_db = schema.DenseTilePolicy("nax", 32, 64, 64, 2, 2, sched="db")
+    assert not nax_db.is_legal(face, 96, 64, 32, CHIP, tail=True)
+    nax = schema.DenseTilePolicy("nax", 32, 64, 64, 2, 2)
+    assert not nax.is_legal(face, 96, 64, 32, CHIP, tail=False)
+    assert nax.is_legal(face, 96, 64, 32, CHIP, tail=True)
+    # Zero rows are illegal for msg_tile (kills 1 <= m -> 0 <= m mutant).
+    assert not schema.MsgTilePolicy(nsg=8).is_legal(face, 2560, 512, 0, CHIP)
 
 
 def test_lookup_empty_chip_fails_closed_twice_contract(tmp_path, monkeypatch):
@@ -1851,6 +1953,193 @@ def test_face_digest_caches_per_face(monkeypatch):
     first = tuning.face_digest(face)
     second = tuning.face_digest(face)
     assert first == second and calls == 1
+
+
+@pytest.mark.parametrize(
+    "nsg, lifetime, k, n, m, legal",
+    [
+        (8, schema.LoadLifetime.BATCH_COLUMNS, 2560, 248320, 4, True),
+        (8, schema.LoadLifetime.ONE_COL_STREAMING, 2560, 248320, 8, True),
+        (8, schema.LoadLifetime.BATCH_COLUMNS, 2560, 248320, 9, False),
+        (8, schema.LoadLifetime.BATCH_COLUMNS, 2564, 248320, 4, False),
+        (8, schema.LoadLifetime.BATCH_COLUMNS, 2560, 248324, 4, False),
+        (8, schema.LoadLifetime.BATCH_COLUMNS, 2560, 12, 4, False),
+        (0, schema.LoadLifetime.BATCH_COLUMNS, 2560, 248320, 4, False),
+        (40, schema.LoadLifetime.BATCH_COLUMNS, 2560, 248320, 4, False),
+    ],
+)
+def test_msg_tile_policy_is_legal_fails_closed(nsg, lifetime, k, n, m, legal):
+    face = _face()
+    policy = schema.MsgTilePolicy(nsg=nsg, load_lifetime=lifetime)
+    assert policy.is_legal(face, k, n, m, CHIP) is legal
+
+
+def test_msg_tile_policy_parses_and_refuses_a_bad_load_lifetime():
+    policy = schema.params_from_json("msg_tile", {"nsg": 8, "load_lifetime": "column"})
+    assert policy.load_lifetime is schema.LoadLifetime.ONE_COL_STREAMING
+    with pytest.raises(ValueError, match="load_lifetime"):
+        schema.params_from_json("msg_tile", {"nsg": 8, "load_lifetime": "bogus"})
+
+
+def test_msg_tile_row_buckets_are_the_padded_row_counts():
+    assert tuning.row_bounds("msg_tile") == (4, 6, 8)
+
+
+def test_read_table_accepts_a_single_row_lo_hi_span(tmp_path):
+    """A per-row <17 entry is an explicit lo-hi span ("5-5") and answers only
+    its row; a bare "5" stays a typo (l114), as does a reversed span."""
+    face = _face()
+    entry = _entry(face)
+    entry["key"]["rows_bucket"] = "5-5"
+    _write(tmp_path / "v1", CHIP, [entry])
+    tuning.register_tuning_path(tmp_path / "v1")
+    params = tuning.lookup(
+        "dense_tile",
+        face,
+        dtype=mx.bfloat16,
+        bits=4,
+        group=64,
+        n=2560,
+        k=5120,
+        rows=5,
+        chip=CHIP,
+    )
+    assert params is not None and params.backend == "nax"
+    assert (
+        tuning.lookup(
+            "dense_tile",
+            face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=2560,
+            k=5120,
+            rows=6,
+            chip=CHIP,
+        )
+        is None
+    )
+
+    bare = _entry(face)
+    bare["key"]["rows_bucket"] = "5"
+    _write(tmp_path / "bare", CHIP, [bare])
+    with pytest.raises(ValueError, match="bucket"):
+        tuning.register_tuning_path(tmp_path / "bare")
+
+
+def test_wide_policy_is_legal_checks_k_alignment_and_table_budget():
+    face = _face()
+    wide = schema.DenseTilePolicy("wide")
+    assert wide.is_legal(face, 2560, 2560, 8, CHIP)
+    assert not wide.is_legal(face, 2564, 2560, 8, CHIP)
+    huge = SimpleNamespace(
+        tables=tuple(Table(f"big{i}", mx.uint32, (0,) * 1024) for i in range(9))
+    )
+    assert not wide.is_legal(huge, 2560, 2560, 8, CHIP)
+    assert set(schema._ROUTE_ONLY_BACKENDS) == {"wide", "mlx", "dot"}
+
+
+def test_dot_policy_rejects_rows_above_max_rows_and_non_default_geometry():
+    from typing import get_args, get_type_hints
+
+    face = _face()
+    assert "dot" in get_args(get_type_hints(schema.DenseTilePolicy)["backend"])
+    assert schema.DenseTilePolicy("dot").is_legal(face, 2560, 2560, 16, CHIP)
+    assert not schema.DenseTilePolicy("dot").is_legal(face, 2560, 2560, 17, CHIP)
+    non_defaults = (
+        {"bm": 32},
+        {"bn": 32},
+        {"bk": 32},
+        {"wm": 4},
+        {"wn": 4},
+        {"align_n": False},
+        {"split_k": 2},
+        {"x_nreads": 8},
+        {"param_staging": schema.ParamStaging.PER_STEP},
+        {"vec_store": True},
+        {"pad_bytes": 16},
+        {"gx": 8},
+        {"sched": "db"},
+    )
+    for backend in ("dot", "mlx", "wide"):
+        for kw in non_defaults:
+            assert not schema.DenseTilePolicy(backend, **kw).is_legal(
+                face, 2560, 2560, 8, CHIP
+            ), (backend, kw)
+
+
+def test_match_rank_orders_exact_row_above_coarse_and_wildcard(tmp_path):
+    face = _face()
+    tuning.register_skeleton("mma_tile", "skel-v1")
+    coarse = _entry(face, n=512, k=2560, rows_bucket="<17", params={"backend": "mlx"})
+    exact = _entry(
+        face,
+        route="mma_tile",
+        n=512,
+        k=2560,
+        rows_bucket="8-8",
+        params={"bn": 16, "bk": 32, "nsg": 8},
+    )
+    _write(tmp_path / "v1", CHIP, [coarse, exact])
+    tuning.reset_cache()
+    try:
+        r_coarse = tuning.match_rank(
+            "dense_tile",
+            face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=512,
+            k=2560,
+            rows=8,
+            chip=CHIP,
+        )
+        r_exact = tuning.match_rank(
+            "mma_tile",
+            face,
+            dtype=mx.bfloat16,
+            bits=4,
+            group=64,
+            n=512,
+            k=2560,
+            rows=8,
+            chip=CHIP,
+        )
+        assert r_exact > r_coarse > (0, 0), (r_exact, r_coarse)
+    finally:
+        tuning.reset_cache()
+
+
+def test_msg_tile_policy_rejects_unsupported_load_lifetime():
+    face = _face()
+    assert schema.MsgTilePolicy(8, schema.LoadLifetime.BATCH_COLUMNS).is_legal(
+        face, 2560, 2560, 4, CHIP
+    )
+    assert schema.MsgTilePolicy(8, schema.LoadLifetime.ONE_COL_STREAMING).is_legal(
+        face, 2560, 2560, 8, CHIP
+    )
+    assert not schema.MsgTilePolicy(8, schema.LoadLifetime.GROUP_BASE_REBASE).is_legal(
+        face, 2560, 2560, 4, CHIP
+    )
+
+
+def test_chip_table_by_key_index_matches_unindexed_lookup(tmp_path):
+    face = _face()
+    e1 = _entry(face, rows_bucket="4-4", params={"backend": "mlx"})
+    e2 = _entry(face, dtype="fp16", rows_bucket="4-4", params={"backend": "wide"})
+    _write(tmp_path / "v1", CHIP, [e1, e2])
+    tuning.reset_cache()
+    table = tuning._index_for_chip(CHIP)
+    assert ("dense_tile", "bf16", 4, 64) in table.by_key
+    assert ("dense_tile", "fp16", 4, 64) in table.by_key
+    got_bf16 = _lookup(face, dtype="bf16", rows=4)
+    got_fp16 = _lookup(face, dtype="fp16", rows=4)
+    assert got_bf16 == schema.DenseTilePolicy("mlx")
+    assert got_fp16 == schema.DenseTilePolicy("wide")
+    # Fallback when ChipTable is constructed without by_key.
+    tuning._CHIPS[CHIP] = tuning.ChipTable(table.entries)
+    assert _lookup(face, dtype="bf16", rows=4) == got_bf16
+    assert _lookup(face, dtype="fp16", rows=4) == got_fp16
 
 
 def test_routed_window_policy_schema_and_validation(tmp_path):

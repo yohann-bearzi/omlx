@@ -6,16 +6,14 @@ formats MLX knows.
 A layer holds a matrix's tensors under the names its format gives them, and
 asks the registry how to run them:
 
-- ordinary Qwen dense projections select a single-row dot, a wide mat-vec or
-  the dense prefill below, according to MLX's row count, layout and size
-  rules. The wide kernel decodes weights through the format's tile face.
-  Explicitly row-exact calls use the dot face for each input row;
+- dense layers pin a single row to their dot face and resolve every
+  float16/bfloat16 call above one row through a construction-time per-chip
+  row schedule (the Dot rows kernel up to ``MAX_ROWS``, MLX's matmul, wide
+  mat-vec, verify MMA/MSG tiles, or steel/NAX dense tiles), replaying warm
+  signatures through the native ``FormatLinearFast``;
 - a switch layer's sorted prefill uses its tile face on tensor units or
   through MLX's steel matrix kernels, from 16 rows and four rows per expert
   on average. Below that threshold it uses its decode rows kernel;
-- a matrix above 16 rows with no ordinary route takes its tile face as one
-  expert, on tensor units or through MLX's steel matrix kernels; during
-  row-exact verification its dot face handles up to 16 rows at once;
 - everything else (a layout the face does not cover, activations of a type
   it is not exact for, a format without the face, a face that did not
   compile) is the format's ``decode``, cast to the activations' type, then
@@ -27,10 +25,9 @@ from __future__ import annotations
 
 import logging
 import math
-import sys
 from copy import copy
 from functools import cache
-from threading import Lock, local
+from threading import local
 from typing import Any, NamedTuple
 
 import mlx.core as mx
@@ -38,8 +35,7 @@ import mlx.nn as nn
 
 from .. import formats
 from ..patches.module_cache import cached_per_module
-from . import Dot, Tile, kernels, tile_dense, tile_wide
-from .mlx import traversal
+from . import Dot, Tile, kernels, tile_dense
 
 logger = logging.getLogger(__name__)
 
@@ -54,23 +50,19 @@ def packed_name(layer) -> str:
     return formats.tensor_names(layer)[0]
 
 
-# Maximum number of serial-exact rows in one dense Dot launch. A longer
-# explicitly row-exact Qwen call uses several such groups.
+# Maximum rows in one dense Dot rows launch (the fallback when a format
+# has no legal tile route for 2..16 rows).
 MAX_ROWS = 16
 
-# C7 (2026-11-23) receipts: the decode row buckets where tile_wide's ragged
-# V geometry loses to MLX's own qmv for a Qwen-attached stock layer (5 and 7
-# rows on both chips, plus four M3 Ultra chip-shape cells in
-# c7-attached-m3-clean.json: 512x2560 and 640x2560 at 1-2 rows, 2560x2560 at
-# 1 row, and 2560x640 at 3-4 and 6-8 rows; none on M5). DATA: those buckets
-# take MLX's matmul; the format route serves every other bucket. The kernel
-# gap itself is DEFERRED (tile_wide tiles=(rows+4)//5).
-_DECODE_MLX_ROWS = frozenset({5, 7})
+# C7 (2026-11-23) receipts: single-row decode cells on M3 Ultra where MLX's
+# own qmv beats the Dot face (512x2560, 2560x2560 and 640x2560 at 1 row).
+# Rows >= 2 are governed by the per-chip construction-time schedule and
+# replayed through FormatLinearFast (VFAST Commit 3).
+_DECODE_MLX_ROWS = frozenset()
 _DECODE_MLX_CELLS = {
-    ("applegpu_g15d", 512, 2560): _DECODE_MLX_ROWS | frozenset({1, 2}),
-    ("applegpu_g15d", 2560, 2560): _DECODE_MLX_ROWS | frozenset({1}),
-    ("applegpu_g15d", 640, 2560): _DECODE_MLX_ROWS | frozenset({1, 2}),
-    ("applegpu_g15d", 2560, 640): _DECODE_MLX_ROWS | frozenset({3, 4, 6, 8}),
+    ("applegpu_g15d", 512, 2560): frozenset({1}),
+    ("applegpu_g15d", 2560, 2560): frozenset({1}),
+    ("applegpu_g15d", 640, 2560): frozenset({1}),
 }
 
 
@@ -310,49 +302,11 @@ def _tile(layer) -> _Tile | None:
     return _Tile(face, kernel, operands, proof, said)
 
 
-def _ordinary_tile(layer, k, n, route, build_kernel):
-    face = formats.tile(layer, k, n)
-    if face is None:
-        return None
-    kernel = build_kernel(face)
-    if kernel is None:
-        return None
-    operands = tuple(layer[name] for name in (packed_name(layer), *face.tensors))
-    proof = kernels.proof(
-        f"format_linear_{route}", face, tuple(a.dtype for a in operands), k, n
-    )
-    said = (
-        f"quant format face {face.key}: {route} kernel engaged",
-        f"quant format face {face.key}: {route} kernel failed; rows kernel fallback",
-    )
-    return _Tile(face, kernel, operands, proof, said)
-
-
 @cache
 def _metal_architecture():
     if mx.is_available(mx.gpu):
         return mx.device_info(mx.gpu).get("architecture")
     return None
-
-
-def _loading_qwen():
-    checkpoint = formats._LOADING.get()
-    if checkpoint is None or not checkpoint.active:
-        return False
-    try:
-        config = checkpoint._read_config()
-    except (OSError, ValueError):
-        return False
-    if not isinstance(config, dict):
-        return False
-    from ..oq import _family
-
-    for section in (config, config.get("text_config")):
-        if isinstance(section, dict):
-            name = section.get("model_type")
-            if isinstance(name, str) and _family(name) == "qwen4_exp":
-                return True
-    return False
 
 
 @cache
@@ -626,27 +580,7 @@ def _switch_stand_in(plan: _Plan, metal):
 # float16 when activations are recast. A load builds only its checkpoint's
 # floating dtype when known, falling back to both otherwise.
 _WARM_DTYPES = (mx.bfloat16, mx.float16)
-_FAST_LOCK = Lock()
 _NO_EPILOGUE = object()
-# Mirrors qwen35_verify_qmm._VERIFY_ACTIVE (count of threads with non-row-exact
-# batched verify armed) so FormatLinear.__call__ skips verify.is_armed() in one
-# global check when no thread has verify armed (rule 28).
-_VERIFY_ACTIVE = 0
-_VERIFY_QMM_MOD_NAME = (
-    f"{(__package__ or 'omlx').partition('.')[0]}.patches.qwen35_verify_qmm"
-)
-
-
-def _init_verify_active() -> None:
-    global _VERIFY_ACTIVE
-    qvm = sys.modules.get(_VERIFY_QMM_MOD_NAME)
-    lock = getattr(qvm, "_ROW_EXACT_LOCK", None)
-    if lock is not None:
-        with lock:
-            _VERIFY_ACTIVE = getattr(qvm, "_VERIFY_ACTIVE", 0)
-
-
-_init_verify_active()
 
 
 def _infer_warm_dtypes(tensors, layout, dtypes) -> tuple[mx.Dtype, ...]:
@@ -852,12 +786,16 @@ def _plan_dense_warm(
     instances: dict,
     proofs: dict,
 ) -> None:
-    """Collect rows, shared rows, tile_wide and tile_dense warms for a FormatLinear."""
+    """Collect rows, shared rows, and scheduled dense tile warms for a FormatLinear."""
     n = stand_in.output_dims
     is_stackable = fmt.mode == "affine" or (
         n > 16384 and formats.stackable(fmt, k, n, bits, group_size)
     )
     plan = _plan(stand_in)
+    dot_face = None if plan is None else plan.face
+    dense_plan = tile_dense.build_plan(
+        stand_in, tensor_units=_nax_host(), dot_face=dot_face
+    )
     if plan is not None:
         _, op_specs = tile_dense._stand_in_operands(
             plan.operands, n, min(n, 8), stackable=is_stackable
@@ -891,9 +829,13 @@ def _plan_dense_warm(
                 if n % 8:
                     groups.add(1)
                 for r in range(2, MAX_ROWS + 1):
-                    g = _group(r, plan.face.vpt, n)
-                    if g > 1:
-                        groups.add(g)
+                    if (
+                        dense_plan is None
+                        or tile_dense.route_for(dense_plan, r, dtype).backend == "dot"
+                    ):
+                        g = _group(r, plan.face.vpt, n)
+                        if g > 1:
+                            groups.add(g)
                 for group in sorted(groups):
                     in_shapes = ((group, k), *op_shapes)
                     inst = kernels.planned(
@@ -920,69 +862,18 @@ def _plan_dense_warm(
                     instances.setdefault(inst, shared_recipe)
                     _record_proof(proofs, inst, plan.proof, (dtype, group))
 
-    arch = _metal_architecture()
-    wide_tile = (
-        _ordinary_tile(stand_in, k, n, "wide", tile_wide.kernel) if arch else None
-    )
-    if wide_tile is not None:
-        wide_modes = set()
-        for r in range(2, MAX_ROWS + 1):
-            if traversal(r, n, k, group_size, arch, bits=bits)[0] == "wide":
-                tiles = (r + 4) // 5
-                vectors = (r + tiles - 1) // tiles
-                wide_modes.add((vectors, r % vectors != 0))
-        if wide_modes:
-            _, wide_ops = tile_dense._stand_in_operands(
-                wide_tile.operands, n, min(n, 8), stackable=is_stackable
-            )
-            wide_shapes = tuple(s for s, _ in wide_ops)
-            for dtype in target_dtypes:
-                if not wide_tile.face.exact_for(dtype):
-                    continue
-                for vectors, partial_m in sorted(wide_modes):
-                    rows = 2 * vectors - 1 if partial_m else vectors
-                    tiles = (rows + 4) // 5
-                    inst = kernels.planned(
-                        wide_tile.kernel,
-                        (((rows, k), dtype), *wide_ops),
-                        [dtype],
-                        template=[
-                            ("T", dtype),
-                            ("K", k),
-                            ("N", n),
-                            ("V", vectors),
-                            ("PARTIAL_M", partial_m),
-                        ],
-                    )
-                    in_shapes = ((rows, k), *wide_shapes)
-
-                    def wide_recipe(
-                        in_shapes=in_shapes,
-                        out_shapes=((rows, n),),
-                        grid=(32 * tiles, 2, 1),
-                    ):
-                        return kernels.StandIn(
-                            input_shapes=in_shapes,
-                            output_shapes=out_shapes,
-                            grid=grid,
-                            threadgroup=(32, 2, 1),
-                        )
-
-                    instances.setdefault(inst, wide_recipe)
-                    _record_proof(
-                        proofs,
-                        inst,
-                        wide_tile.proof,
-                        (dtype, k, n, vectors, partial_m),
-                    )
-
-    td_instances, td_proofs = tile_dense.warm_specs(
-        stand_in, target_dtypes, tensor_units=_nax_host(), stackable=is_stackable
-    )
-    for inst, recipe in td_instances.items():
-        instances.setdefault(inst, recipe)
-        for proof_obj, metal in td_proofs.get(inst, ()):
-            _record_proof(proofs, inst, proof_obj, metal)
+    if dense_plan is not None:
+        td_instances, td_proofs = tile_dense.warm_specs(
+            stand_in,
+            target_dtypes,
+            tensor_units=_nax_host(),
+            stackable=is_stackable,
+            plan=dense_plan,
+        )
+        for inst, recipe in td_instances.items():
+            instances.setdefault(inst, recipe)
+            for proof_obj, metal in td_proofs.get(inst, ()):
+                _record_proof(proofs, inst, proof_obj, metal)
 
 
 def warm_layer(
@@ -1171,52 +1062,73 @@ def warm_existing_dense(
     return tuple(kernels.warm(_attach_proofs(instances, proofs)))
 
 
-def prepare_layer_plans(model) -> None:
+def _plan_existing_dense_warm(
+    layer: FormatLinear,
+    dtypes: tuple[mx.Dtype, ...],
+    instances: dict,
+    proofs: dict,
+) -> None:
+    """Collect load-time Metal warms for an already-loaded ``FormatLinear``."""
+    warm_dtypes = tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
+    k, n = layer.input_dims, layer.output_dims
+    if not warm_dtypes or k < 8 or n <= 0:
+        return
+    _plan_dense_warm(
+        layer,
+        layer.fmt,
+        layer.bits,
+        layer.group_size,
+        k,
+        warm_dtypes,
+        instances,
+        proofs,
+    )
+
+
+def _prepare_linear_plan(
+    mod: FormatLinear, tensor_units: bool, schedule_cache: dict
+) -> None:
+    kept = mod.__dict__.get(_KEPT)
+    if kept is None or kept.weight is not mod[packed_name(mod)]:
+        kept = mod._keep()
+    if kept._slots.get("dense", _UNBUILT) is _UNBUILT:
+        if mod.input_dims <= 0 or mod.output_dims <= 0:
+            kept._slots.setdefault("dense", None)
+        else:
+            built = tile_dense.build_plan(
+                mod,
+                tensor_units=tensor_units,
+                dot_face=None if kept.plan is None else kept.plan.face,
+                _schedule_cache=schedule_cache,
+            )
+            kept._slots.setdefault("dense", built)
+
+
+def prepare_layer_plans(model, *, extra_linears: tuple[FormatLinear, ...] = ()) -> None:
     """Resolve construction-time plans for every format layer in ``model``.
 
-    Thread-independent: populates each ``FormatLinear``'s ``_Kept``, dense
-    prefill ``DensePlan`` (deduplicating per-chip schedule lookups across
-    identical layer geometries within this pass) and optional ``wide`` tile,
-    and each ``FormatSwitchLinear``'s ``_Kept`` and sorted ``_Tile``. Fails
-    closed if any layer still holds an unloaded placeholder.
+    Thread-independent: populates each ``FormatLinear``'s ``_Kept`` and dense
+    schedule ``DensePlan`` (deduplicating per-chip schedule lookups across
+    identical layer geometries within this pass), and each
+    ``FormatSwitchLinear``'s ``_Kept`` and sorted ``_Tile``. Fails closed if
+    any layer still holds an unloaded placeholder.
     """
     named_modules = getattr(model, "named_modules", None)
     if not callable(named_modules):
         return
     tensor_units = _nax_host()
-    arch = _metal_architecture()
     schedule_cache: dict = {}
     for _, mod in named_modules():
         if isinstance(mod, FormatLinear):
-            kept = mod.__dict__.get(_KEPT)
-            if kept is None or kept.weight is not mod[packed_name(mod)]:
-                kept = mod._keep()
-            if kept.dense is _UNBUILT:
-                if mod.input_dims % 32 or mod.output_dims <= 0:
-                    kept.dense = None
-                else:
-                    kept.dense = tile_dense.build_plan(
-                        mod,
-                        tensor_units=tensor_units,
-                        _schedule_cache=schedule_cache,
-                    )
-            if (
-                mod._qwen_row_exact is not None
-                and kept.plan is not None
-                and arch
-                and "wide" not in kept.routes
-            ):
-                wide = _ordinary_tile(
-                    mod, kept.plan.k, kept.plan.n, "wide", tile_wide.kernel
-                )
-                kept.routes["wide"] = wide
-                if wide is not None:
-                    kept.wide = wide
+            _prepare_linear_plan(mod, tensor_units, schedule_cache)
         elif isinstance(mod, FormatSwitchLinear):
             kept = mod.__dict__.get(_KEPT)
             if kept is None or kept.weight is not mod[packed_name(mod)]:
                 kept = mod._keep()
             mod._sorted_tile(kept)
+    for mod in extra_linears:
+        if isinstance(mod, FormatLinear):
+            _prepare_linear_plan(mod, tensor_units, schedule_cache)
 
 
 def _infer_model_dtype(model) -> mx.Dtype | None:
@@ -1278,39 +1190,19 @@ def _warm_linear_rows_graph(
     dtype: mx.Dtype,
     *,
     key: tuple,
-) -> None:
+) -> bool:
     """Compile and keep a rows graph on this thread if its Metal is warm."""
     if plan is None or plan.proof.failed or not plan.face.exact_for(dtype):
-        return
+        return False
     if key in plan.proof.graphs:
-        return
+        return True
     x_dummy = mx.zeros(x_shape, dtype)
     metal, graph = _linear(plan, x_dummy)
     if metal not in plan.proof.ran:
-        return
+        return False
     compiled = mx.compile(graph)
     compiled(x_dummy, *plan.operands)
     plan.proof.keep(key, compiled)
-
-
-def _warm_linear_wide_graph(
-    tile: _Tile | None,
-    x_shape: tuple[int, ...],
-    dtype: mx.Dtype,
-) -> bool:
-    """Compile and keep a tile_wide graph on this thread if its Metal is warm."""
-    if tile is None or tile.proof.failed or not tile.face.exact_for(dtype):
-        return False
-    sig = (x_shape, dtype)
-    if sig in tile.proof.graphs:
-        return True
-    x_dummy = mx.zeros(x_shape, dtype)
-    metal, graph = tile_wide.describe(tile, x_dummy)
-    if metal not in tile.proof.ran:
-        return False
-    compiled = mx.compile(graph)
-    compiled(x_dummy, *tile.operands)
-    tile.proof.keep(sig, compiled)
     return True
 
 
@@ -1405,6 +1297,89 @@ def _warm_switch_prefill_graph(
         epi_proof.keep(epi_sig, compiled)
 
 
+def _warm_scheduled_shape(
+    mod: FormatLinear,
+    kept: _Kept,
+    x_shape: tuple[int, ...],
+    rows: int,
+    dtype: mx.Dtype,
+) -> None:
+    """Warm one multi-row (rows > 1) FormatLinear dispatch signature."""
+    dense = kept._slots.get("dense", _UNBUILT)
+    if dense is not None and dense is not _UNBUILT and rows < dense.row_limit:
+        route = tile_dense.route_for(dense, rows, dtype)
+        if route.backend == "dot":
+            if rows <= MAX_ROWS and kept.plan is not None:
+                sig = (x_shape, dtype)
+                if _warm_linear_rows_graph(kept.plan, x_shape, dtype, key=sig):
+                    mod._register_dot_fast(kept, kept.plan, sig)
+            return
+        if tile_dense.warm_graph(dense, x_shape, dtype):
+            mod._register_fast(kept, dense, (x_shape, dtype))
+        return
+    if rows <= MAX_ROWS and kept.plan is not None:
+        sig = (x_shape, dtype)
+        if _warm_linear_rows_graph(kept.plan, x_shape, dtype, key=sig):
+            mod._register_dot_fast(kept, kept.plan, sig)
+
+
+def _warm_format_linear_dispatch(
+    mod: FormatLinear,
+    *,
+    model_dtype: mx.Dtype | None,
+    explicit: tuple[mx.Dtype, ...] | None,
+    fp16_recast: bool,
+    batches: tuple[int, ...],
+    verifies: tuple[int, ...],
+    prefills: tuple[int, ...],
+) -> None:
+    kept = mod.__dict__.get(_KEPT)
+    if kept is None:
+        return
+    k, n = mod.input_dims, mod.output_dims
+    if k < 8 or n <= 0:
+        return
+    layer_dtypes = _layer_warm_dtypes(
+        mod, model_dtype, explicit, fp16_recast=fp16_recast
+    )
+    seq_rows = tuple(
+        dict.fromkeys(
+            (
+                *batches,
+                *verifies,
+                *(b * s for b in batches for s in verifies if b * s <= MAX_ROWS),
+            )
+        )
+    )
+    for dtype in layer_dtypes:
+        # 1. Single-row decode (1, 1, K): M3 C7 single-row mlx_rows bind on
+        #    dense_fast; all other layers bind on dot_fast so warm 1-token
+        #    decode hits native FormatLinearFast directly on entry.
+        sig1 = ((1, 1, k), dtype)
+        if 1 in kept.mlx_rows:
+            dense = kept._slots.get("dense")
+            if dense is not None:
+                mod._bind_one_row_mlx_fast(kept, dense, sig1)
+        elif kept.plan is not None:
+            if _warm_linear_rows_graph(kept.plan, (1, 1, k), dtype, key=sig1):
+                mod._register_dot_fast(kept, kept.plan, sig1)
+        # 2. Multi-row decode (B, 1, K), batched verify (B, S, K), and
+        #    single-stream / GDN-stacked verify (1, S, K) — every FormatLinear
+        #    follows its construction-time schedule and registers on dense_fast
+        #    or dot_fast (published into _fast/_fast2).
+        for b in batches:
+            _warm_scheduled_shape(mod, kept, (b, 1, k), b, dtype)
+            for s in verifies:
+                rows = b * s
+                if rows <= MAX_ROWS:
+                    _warm_scheduled_shape(mod, kept, (b, s, k), rows, dtype)
+        for s in seq_rows:
+            _warm_scheduled_shape(mod, kept, (1, s, k), s, dtype)
+        # 3. Prefill (1, L, K) -> scheduled dense graph + native FormatLinearFast.
+        for length in prefills:
+            _warm_scheduled_shape(mod, kept, (1, length, k), length, dtype)
+
+
 def warm_model_dispatch(
     model,
     *,
@@ -1413,6 +1388,7 @@ def warm_model_dispatch(
     decode_batch_sizes: tuple[int, ...] = (1, 2, 4),
     mtp_enabled: bool = False,
     verify_rows: tuple[int, ...] = (2, 3, 4),
+    extra_linears: tuple[FormatLinear, ...] = (),
 ) -> None:
     """Populate per-layer plans, compiled graphs and native fast dispatch on
     the calling thread so the first served request does none of that work.
@@ -1427,7 +1403,7 @@ def warm_model_dispatch(
     if not callable(named_modules):
         return
 
-    prepare_layer_plans(model)
+    prepare_layer_plans(model, extra_linears=extra_linears)
 
     explicit = (
         tuple(dict.fromkeys(dt for dt in dtypes if dt in _WARM_DTYPES))
@@ -1448,11 +1424,6 @@ def warm_model_dispatch(
             b for b in decode_batch_sizes if type(b) is int and 1 < b <= MAX_ROWS
         )
     )
-    verify_batches = tuple(
-        dict.fromkeys(
-            b for b in decode_batch_sizes if type(b) is int and 1 <= b <= MAX_ROWS
-        )
-    )
     verifies = (
         tuple(
             dict.fromkeys(
@@ -1462,132 +1433,20 @@ def warm_model_dispatch(
         if mtp_enabled
         else ()
     )
-    arch = _metal_architecture()
 
     from ..patches import m5_gather_qmm
 
     for _, mod in named_modules():
         if isinstance(mod, FormatLinear):
-            kept = mod.__dict__.get(_KEPT)
-            if kept is None:
-                continue
-            k, n = mod.input_dims, mod.output_dims
-            if k < 8 or n <= 0:
-                continue
-            layer_dtypes = _layer_warm_dtypes(
-                mod, model_dtype, explicit, fp16_recast=fp16_recast
+            _warm_format_linear_dispatch(
+                mod,
+                model_dtype=model_dtype,
+                explicit=explicit,
+                fp16_recast=fp16_recast,
+                batches=batches,
+                verifies=verifies,
+                prefills=prefills,
             )
-            qwen = mod._qwen_row_exact is not None
-            for dtype in layer_dtypes:
-                # 1. Single-row decode (1, 1, K) -> native dense_fast.
-                sig1 = ((1, 1, k), dtype)
-                if qwen and 1 in kept.mlx_rows:
-                    mod._bind_one_row_mlx_fast(kept, sig1)
-                else:
-                    _warm_linear_rows_graph(kept.plan, (1, 1, k), dtype, key=sig1)
-                    mod._bind_plan_fast(kept, sig1)
-                # 2. Multi-row decode (B, 1, K), armed verify (1, S, K) and
-                #    batched verify (B, S, K).
-                for b in batches:
-                    b_shape = (b, 1, k)
-                    if qwen:
-                        if b in kept.mlx_rows or kept.plan is None or not arch:
-                            continue
-                        choice = traversal(
-                            b, n, k, mod.group_size, arch, bits=mod.bits
-                        )[0]
-                        if choice == "rows":
-                            _warm_linear_rows_graph(
-                                kept.plan,
-                                b_shape,
-                                dtype,
-                                key=("ordinary_rows", b_shape, dtype),
-                            )
-                        elif choice == "wide" and kept.wide is not _UNBUILT:
-                            if _warm_linear_wide_graph(kept.wide, b_shape, dtype):
-                                mod._register_fast(kept, kept.wide, (b_shape, dtype))
-                        elif (
-                            choice in ("qmm", "split_k")
-                            and kept.dense is not None
-                            and tile_dense.warm_graph(kept.dense, b_shape, dtype)
-                        ):
-                            mod._register_fast(
-                                kept,
-                                kept.dense,
-                                (b_shape, dtype),
-                                proof_state=kept.dense.binding.state,
-                            )
-                    else:
-                        _warm_linear_rows_graph(
-                            kept.plan, b_shape, dtype, key=(b_shape, dtype)
-                        )
-                for s in verifies:
-                    s_shape = (1, s, k)
-                    _warm_linear_rows_graph(
-                        kept.plan, s_shape, dtype, key=(s_shape, dtype)
-                    )
-                if mtp_enabled and kept.verify is not None:
-                    for vb in verify_batches:
-                        for vs in verifies:
-                            kept.verify.warm_graph((vb, vs, k), dtype)
-                # 3. Prefill (1, L, K) -> dense graph + native FormatLinearFast.
-                if kept.dense is not None:
-                    for length in prefills:
-                        if length >= kept.dense.row_limit:
-                            continue
-                        policy = tile_dense.policy_for(kept.dense, length, dtype)
-                        if policy is not None and policy.backend == "rows":
-                            if kept.plan is not None and arch:
-                                chunks = (
-                                    (MAX_ROWS, length % MAX_ROWS)
-                                    if length % MAX_ROWS
-                                    else (MAX_ROWS,)
-                                )
-                                for chunk in chunks:
-                                    c_shape = (chunk, k)
-                                    choice = traversal(
-                                        chunk, n, k, mod.group_size, arch, bits=mod.bits
-                                    )[0]
-                                    if choice == "rows":
-                                        _warm_linear_rows_graph(
-                                            kept.plan,
-                                            c_shape,
-                                            dtype,
-                                            key=("ordinary_rows", c_shape, dtype),
-                                        )
-                                    elif choice == "wide":
-                                        if "wide" not in kept.routes:
-                                            wide = _ordinary_tile(
-                                                mod,
-                                                kept.plan.k,
-                                                kept.plan.n,
-                                                "wide",
-                                                tile_wide.kernel,
-                                            )
-                                            kept.routes["wide"] = wide
-                                            if wide is not None:
-                                                kept.wide = wide
-                                        if (
-                                            kept.wide is not _UNBUILT
-                                            and _warm_linear_wide_graph(
-                                                kept.wide, c_shape, dtype
-                                            )
-                                            and qwen
-                                        ):
-                                            mod._register_fast(
-                                                kept, kept.wide, (c_shape, dtype)
-                                            )
-                            continue
-                        p_shape = (1, length, k)
-                        if tile_dense.warm_graph(kept.dense, p_shape, dtype):
-                            mod._register_fast(
-                                kept,
-                                kept.dense,
-                                (p_shape, dtype),
-                                proof_state=kept.dense.binding.state,
-                            )
-                    if kept.dense_fast is not None:
-                        mod.__dict__[_FAST] = kept.dense_fast
             continue
 
         # 4. MoE FormatSwitchLinear sorted prefill (+ M5 NAX mapped SwiGLU).
@@ -1663,6 +1522,20 @@ def warm_model_dispatch(
                             length * top_k,
                             dtype,
                         )
+
+    # Extra runtime-stacked FormatLinear layers (e.g. Qwen4 GDN stacked
+    # in-projections, used for 2..16-row batch decode and MTP verify, never prefill).
+    for mod in extra_linears:
+        if isinstance(mod, FormatLinear):
+            _warm_format_linear_dispatch(
+                mod,
+                model_dtype=model_dtype,
+                explicit=explicit,
+                fp16_recast=fp16_recast,
+                batches=batches,
+                verifies=verifies,
+                prefills=(),
+            )
 
 
 def _launch(plan: _Plan | None, signature: tuple, describe, stand_in, *arrays):
@@ -1847,6 +1720,7 @@ def _swiglu(plan, tile, x, indices, limit, row_map=None):
 # bias.
 _KEPT = "_omlx_format_call"
 _FAST = "_fast"
+_FAST2 = "_fast2"
 _NATIVE_FALLBACK_LOGGED = False
 _UNBUILT = object()
 
@@ -1854,32 +1728,27 @@ _UNBUILT = object()
 class _Kept:
     """What one call of a layer works out, kept until a write retires it.
 
-    Every cached route has its own name: the ordinary routes a Qwen-style
-    dense call selects (``routes``, each entry a tile or its decline, beside
-    the native memo), the warm wide tile of that call (``wide``), the dense
-    prefill's tile (``dense``) and a switch layer's sorted tile
-    (``sorted``). A tile is ``_UNBUILT`` until its route first asks for it
-    and None once that route declined, so a decline is not built again and
-    one route's write can never land in another's slot. ``weight`` is the
-    array the record was worked out over; another array retires it whole,
-    as a write of any tensor or attribute does."""
+    ``plan`` is the Dot route a single row keeps; ``dense`` is the
+    construction-time schedule every call above one row resolves through
+    (``_UNBUILT`` until its first multi-row half/bfloat16 call binds it
+    atomically into ``_slots``, None once the layer's format has no tile
+    face). A layer can run both dense and Dot routes, so each operand group
+    has its own native replay bound atomically into ``_slots``: ``dense_fast``
+    for every scheduled dense route (including mma/msg, which inline
+    ``N_size`` inside their compiled graph) and ``dot_fast`` for the Dot
+    plan's route (single row and scheduled Dot rows). A switch layer keeps its sorted tile in
+    ``sorted``. ``weight`` is the array the record was worked out over;
+    another array retires it whole, as a write of any tensor or attribute
+    does."""
 
     __slots__ = (
         "plan",
         "bias",
         "weight",
         "weight_key",
-        "routes",
-        "wide",
-        "dense",
-        "dense_fast",
-        "dense_fast_sigs",
-        "plan_fast",
-        "plan_fast_sigs",
-        "no_native",
         "sorted",
         "mlx_rows",
-        "verify",
+        "_slots",
     )
 
     def __init__(
@@ -1888,7 +1757,6 @@ class _Kept:
         bias,
         weight,
         mlx_rows=frozenset(),
-        verify=None,
         *,
         weight_key: str = "weight",
     ):
@@ -1896,17 +1764,21 @@ class _Kept:
         self.bias = bias
         self.weight = weight
         self.weight_key = weight_key
-        self.mlx_rows = mlx_rows
-        self.verify = verify
-        self.routes = {}
-        self.wide = _UNBUILT
-        self.dense = _UNBUILT
-        self.dense_fast = None
-        self.dense_fast_sigs = None
-        self.plan_fast = None
-        self.plan_fast_sigs = None
-        self.no_native = False
         self.sorted = _UNBUILT
+        self.mlx_rows = mlx_rows
+        self._slots: dict[str, Any] = {}
+
+    @property
+    def dense(self):
+        return self._slots.get("dense", _UNBUILT)
+
+    @property
+    def dense_fast(self):
+        return self._slots.get("dense_fast")
+
+    @property
+    def dot_fast(self):
+        return self._slots.get("dot_fast")
 
 
 def _log_native_fallback() -> None:
@@ -2083,10 +1955,6 @@ class _FormatLayer(nn.Module):
             ),
             _placeholders=dict.fromkeys(names if placeholders else ()),
         )
-        if not self._STACK and _loading_qwen():
-            from ..patches.qwen35_verify_qmm import is_row_exact_armed
-
-            object.__setattr__(self, "_qwen_row_exact", is_row_exact_armed)
         for name in names:
             self[name] = tensors[name]
         if bias is not None:
@@ -2118,6 +1986,7 @@ class _FormatLayer(nn.Module):
         # hands arrays back outside a load: it changes no tensor's status.
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         held = self.get(key)
         if held is not None and key in self._tensors:
             if value is held:
@@ -2219,23 +2088,23 @@ class _FormatLayer(nn.Module):
         return layer
 
     def _keep(self) -> _Kept:
-        """The layer's plan and bias, worked out and kept."""
-        self.__dict__.pop(_FAST, None)
+        """The layer's plan and bias, bound once into a record and published
+        atomically. Two threads racing on a fresh layer's first call share the
+        winning record (and its dense plan, proof binding, and native replays)
+        with no lock in the hot path."""
+        weight_key = packed_name(self)
+        weight = self[weight_key]
+        existing = self.__dict__.get(_KEPT)
+        if existing is not None and existing.weight is weight:
+            return existing
         bias = self.get("bias")
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        plan = _plan(self)
-        verify = None
-        if self._stock and not self._STACK and self.mode == "affine":
-            from ..patches import qwen35_verify_qmm
-
-            verify = qwen35_verify_qmm.bind_format_verify(self, bias)
-        weight_key = packed_name(self)
-        kept = self.__dict__[_KEPT] = _Kept(
-            plan,
+        built = _Kept(
+            _plan(self),
             bias,
-            self[weight_key],
+            weight,
             (
                 _decode_mlx_rows(
                     _metal_architecture(), self.output_dims, self.input_dims
@@ -2243,42 +2112,62 @@ class _FormatLayer(nn.Module):
                 if self._stock and not self._STACK
                 else frozenset()
             ),
-            verify=verify,
             weight_key=weight_key,
         )
-        return kept
+        if existing is None:
+            kept = self.__dict__.setdefault(_KEPT, built)
+            if kept.weight is weight:
+                return kept
+        self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
+        self.__dict__[_KEPT] = built
+        return built
 
     def _dense_tile(self, kept: _Kept) -> tile_dense.DensePlan | None:
-        """The dense-prefill plan, built once with this chip's schedule; None
-        where the layer's format has no face this GPU's tile skeleton takes.
-        It dies with the record."""
-        kept.dense = tile_dense.build_plan(self, tensor_units=_nax_host())
-        return kept.dense
+        """The dense-prefill plan, built once with this chip's schedule and
+        bound atomically onto ``kept`` (rule 28); None where the layer's
+        format has no face this GPU's tile skeleton takes. Two threads racing
+        on the first multi-row call keep the single winning plan and its proof
+        binding with no lock in the hot path."""
+        dense = kept._slots.get("dense", _UNBUILT)
+        if dense is not _UNBUILT:
+            return dense
+        built = tile_dense.build_plan(
+            self,
+            tensor_units=_nax_host(),
+            dot_face=None if kept.plan is None else kept.plan.face,
+        )
+        return kept._slots.setdefault("dense", built)
 
     def __delitem__(self, key: str) -> None:
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         super().__delitem__(key)
 
     def pop(self, *key_and_default):
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         return super().pop(*key_and_default)
 
     # A dict's own mutators, which do not go through the three above.
     def setdefault(self, key: str, default: Any = None) -> Any:
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         return super().setdefault(key, default)
 
     def popitem(self) -> tuple:
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         return super().popitem()
 
     def clear(self) -> None:
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         super().clear()
 
     def __ior__(self, other):
@@ -2290,6 +2179,7 @@ class _FormatLayer(nn.Module):
     def __delattr__(self, name: str) -> None:
         self.__dict__.pop(_KEPT, None)
         self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
         super().__delattr__(name)
 
     def _decoded(self, indices: mx.array | None = None) -> mx.array:
@@ -2337,54 +2227,13 @@ def keeps_dtype(module, key: str) -> bool:
     return not (module.mode in formats._BUILTIN_MODES and key in module._stored_floats)
 
 
-def _exact_rows(plan, x):
-    """Keep long verify calls in groups of at most MAX_ROWS serial-exact rows."""
-    if plan is None or plan.proof.failed or not plan.face.exact_for(x.dtype):
-        return None
-    proof = plan.proof
-    signature = ("row_exact", x.shape, x.dtype)
-    graph = proof.graphs.get(signature)
-    if graph is not None:
-        return graph(x, *plan.operands)
-
-    k, n = plan.k, plan.n
-    groups, tail = divmod(x.size // k, MAX_ROWS)
-    flat = x.reshape(-1, k)
-
-    def rows_graph(count):
-        key = ((count, k), x.dtype)
-        if key not in proof.graphs:
-            _launch(plan, key, _linear, _linear_stand_in, flat[:count])
-        return proof.graphs.get(key)
-
-    full = rows_graph(MAX_ROWS)
-    last = rows_graph(tail) if tail else None
-    if full is None or (tail and last is None):
-        return None
-
-    def grouped(x, *operands):
-        rows = x.reshape(-1, k)
-        outputs = [
-            full(rows[i * MAX_ROWS : (i + 1) * MAX_ROWS], *operands)
-            for i in range(groups)
-        ]
-        if tail:
-            outputs.append(last(rows[-tail:], *operands))
-        return mx.concatenate(outputs).reshape(*x.shape[:-1], n)
-
-    graph = mx.compile(grouped)
-    result = graph(x, *plan.operands)
-    proof.keep(signature, graph)
-    return result
-
-
 class FormatLinear(_FormatLayer):
     """``x @ W.T + bias`` for a matrix ``W`` kept in format ``mode``:
     ``tensors`` are its codes (``mode``'s format's ``codes_name``) and the
     format's tensors, by name."""
 
-    _qwen_row_exact = None
     _fast = None
+    _fast2 = None
 
     def _stock_matmul(self, x):
         """MLX's own affine matmul over the layer's tensors, for a stock
@@ -2392,7 +2241,7 @@ class FormatLinear(_FormatLayer):
         None for a plugin's format, whose tensors MLX cannot run."""
         if not self._stock or self._STACK:
             return None
-        weight = self[packed_name(self)]
+        weight = self[self._tensors[0]]
         if weight.ndim != 2:
             return None
         # The caller adds the bias, as it does for every route here.
@@ -2407,268 +2256,159 @@ class FormatLinear(_FormatLayer):
             mode=self.mode,
         )
 
-    def _ordinary_serves(self, rows: int, *, chip: str | None = None) -> bool:
-        """Whether the ordinary rows kernel serves this layer at ``rows``:
-        the construction-time check a "rows" table bucket must pass for
-        every chunk size it can issue (rule 28, fail closed)."""
-        architecture = (
-            _metal_architecture() if chip is None else chip.partition("_c")[0]
-        )
-        if not architecture:
-            return False
-        kept = self.__dict__.get(_KEPT)
-        plan = _plan(self) if kept is None else kept.plan
-        if plan is None:
-            return False
-        folded = traversal(
-            rows, plan.n, plan.k, self.group_size, architecture, bits=self.bits
-        )
-        return folded[0] in ("rows", "wide")
-
-    def _ordinary_rows(self, kept, x):
-        """The ordinary rows kernel, chunked to MAX_ROWS rows a call: what
-        prefill ran before the dense tile replaced it."""
-        if kept.plan is None:
-            return None
-        k = self.input_dims
-        n = self.output_dims
-        rows = x.size // k
-        flat = x.reshape(-1, k)
-        pieces = []
-        for start in range(0, rows, MAX_ROWS):
-            part = flat[start : start + MAX_ROWS]
-            y = self._ordinary(kept, part, (part.shape, part.dtype))
-            if y is None:
-                return None
-            pieces.append(y)
-        out = pieces[0] if len(pieces) == 1 else mx.concatenate(pieces, axis=0)
-        return out.reshape(*x.shape[:-1], n)
-
-    def _ordinary(self, kept, x, signature):
-        plan = kept.plan
-        architecture = _metal_architecture()
-        if not architecture:
-            return None
+    def _scheduled(self, kept, plan, x, bias):
+        """The plan's route for this call (with ``bias`` applied once): the
+        native replay of the route's graph once it is built, else the route's
+        own projection, which builds, proves and keeps the graph under this
+        thread's signature. A single row keeps the Dot plan (``dot``)."""
         rows = x.size // plan.k
-        geometry = (plan.n, plan.k, self.group_size, architecture)
-        folded = traversal(rows, *geometry, bits=self.bits)
-        if folded[0] not in ("rows", "wide"):
-            if folded[0] in ("qmm", "split_k") and rows <= MAX_ROWS:
-                return self._prefill(kept, x, rows, armed=False)
+        if rows >= plan.row_limit:
             return None
-        return self._project_route(kept, x, signature, folded)
-
-    def _project_route(self, kept, x, signature, choice):
-        plan, routes = kept.plan, kept.routes
-        route = choice[0]
-        if route == "rows":
-            key = ("ordinary_rows", *signature)
-            graph = plan.proof.graphs.get(key)
-            if graph is not None:
-                return graph(x, *plan.operands)
-            return _launch(plan, key, _linear, _linear_stand_in, x)
-        if route != "wide":
+        route = tile_dense.route_for(plan, rows, x.dtype)
+        if route.backend == "dot":
+            return self._dot_rows(kept, x, bias)
+        if not plan.face.exact_for(x.dtype):
             return None
-        if route not in routes:
-            tile = _ordinary_tile(self, plan.k, plan.n, route, tile_wide.kernel)
-            routes[route] = tile
-            if tile is not None:
-                kept.wide = tile
-        tile = routes[route]
-        if tile is None:
-            return None
-        graph = tile.proof.graphs.get(signature)
-        if graph is not None:
-            if self._qwen_row_exact is not None:
-                tile_fast = kept.routes.get(("native", id(tile)))
-                if tile_fast is not None and signature in kept.routes.get(
-                    ("native_sigs", id(tile)), ()
+        fast = kept._slots.get("dense_fast")
+        if fast is not None:
+            y = fast(self, x)
+            if y is not None:
+                cur = self.__dict__.get(_FAST)
+                if cur is None or (
+                    cur is not fast and self.__dict__.get(_FAST2) is None
                 ):
-                    self.__dict__[_FAST] = tile_fast
-                else:
-                    self._register_fast(kept, tile, signature)
-            return graph(x, *tile.operands)
-        y = _launch(tile, signature, tile_wide.describe, tile_wide.stand_in, x)
-        if y is not None and self._qwen_row_exact is not None:
-            self._register_fast(kept, tile, signature)
-        return y
-
-    def _register_fast(
-        self, kept, tile, signature: tuple, *, proof_state: dict | None = None
-    ) -> None:
-        if proof_state is None:
-            graph = tile.proof.graphs.get(signature)
-            proof_state = vars(tile.proof)
-        else:
-            kept_local = proof_state.get("_kept")
-            graph = None if kept_local is None else kept_local.graphs.get(signature)
-        if graph is None:
-            return
-        # Each plan binds its own operands and live proof. A layer can switch
-        # between a prefill's wide graph, dense graph, and small-row plan graph.
-        # Dense prefill and plan keep their own slots so declining an ordinary
-        # route never allocates kept.routes.
-        is_dense = tile is kept.dense
-        is_plan = tile is kept.plan
-        with _FAST_LOCK:
-            if len(tile.operands) >= 16:
-                kept.no_native = True
-                return
-            if is_dense:
-                fast = kept.dense_fast
-            elif is_plan:
-                fast = kept.plan_fast
-            else:
-                fast = kept.routes.get(("native", id(tile)))
-            if fast is None:
-                try:
-                    from ..custom_kernels.quant_matmul import fast as native
-                except ImportError:
-                    _log_native_fallback()
-                    kept.no_native = True
-                    return
-
-                if not native.has_symbol("FormatLinearFast"):
-                    _log_native_fallback()
-                    kept.no_native = True
-                    return
-                fast = native.format_linear_fast(
-                    kept.weight,
-                    kept.bias,
-                    tile.operands,
-                    proof_state,
-                    kept.weight_key,
-                )
-                if fast is None:
-                    _log_native_fallback()
-                    kept.no_native = True
-                    return
-                if is_dense:
-                    kept.dense_fast = fast
-                elif is_plan:
-                    kept.plan_fast = fast
-                else:
-                    kept.routes[("native", id(tile))] = fast
-            fast.__self__.register(signature)
-            if is_dense:
-                sigs = kept.dense_fast_sigs
-                if sigs is None:
-                    sigs = kept.dense_fast_sigs = set()
-            elif is_plan:
-                sigs = kept.plan_fast_sigs
-                if sigs is None:
-                    sigs = kept.plan_fast_sigs = set()
-            else:
-                sigs = kept.routes.setdefault(("native_sigs", id(tile)), set())
-            if signature not in sigs:
-                if len(sigs) == 64:
-                    sigs.clear()
-                sigs.add(signature)
-            self.__dict__[_FAST] = fast
-
-    def _ensure_dense(self, kept: _Kept) -> tile_dense.DensePlan | None:
-        plan = kept.dense
-        if plan is _UNBUILT:
-            if self.input_dims % 32 or self.output_dims <= 0:
-                kept.dense = None
-                return None
-            plan = self._dense_tile(kept)
-        return plan
-
-    def _bind_one_row_mlx_fast(self, kept: _Kept, sig: tuple) -> None:
-        dense = self._ensure_dense(kept)
-        if dense is None or dense.proof.failed:
-            return
-        if (
-            kept.dense_fast is not None
-            and kept.dense_fast_sigs is not None
-            and sig in kept.dense_fast_sigs
-            and dense.binding.kept is not None
-            and sig in dense.binding.kept.graphs
-        ):
-            self.__dict__[_FAST] = kept.dense_fast
-            return
-        tile_dense._keep_local(
-            dense, sig, tile_dense._make_mlx_route(self.bits, self.group_size)
-        )
-        self._register_fast(kept, dense, sig, proof_state=dense.binding.state)
-
-    def _bind_plan_fast(self, kept: _Kept, sig: tuple) -> None:
-        plan = kept.plan
-        if plan is None or plan.proof.failed:
-            return
-        graph = plan.proof._kept.graphs.get(sig)
-        if graph is None:
-            return
-        shape = sig[0]
-        # Share kept.dense_fast for (1, 1, K) when kept.dense is already built
-        # (by prepare_layer_plans or an earlier prefill) so decode1 and prefill
-        # share one native dispatcher without allocating a tile_dense Proof on
-        # small-row-only layers. Multi-row plan graphs stay on kept.plan_fast so
-        # tile_dense.project never shares bindings with rows > 1 Dot graphs.
-        if len(shape) == 3 and shape[0] == 1 and shape[1] == 1:
-            dense = kept.dense
-            if (
-                dense is not _UNBUILT
-                and dense is not None
-                and not dense.proof.failed
-                and len(dense.operands) == len(plan.operands)
-                and all(a is b for a, b in zip(dense.operands, plan.operands))
-            ):
-                if (
-                    kept.dense_fast is not None
-                    and kept.dense_fast_sigs is not None
-                    and sig in kept.dense_fast_sigs
-                    and dense.binding.kept is not None
-                    and sig in dense.binding.kept.graphs
-                ):
-                    self.__dict__[_FAST] = kept.dense_fast
-                    return
-                if plan.proof.attach(dense.binding):
-                    tile_dense._keep_local(dense, sig, graph)
-                    self._register_fast(
-                        kept, dense, sig, proof_state=dense.binding.state
-                    )
-                    return
-        plan_fast = kept.plan_fast
-        if (
-            plan_fast is not None
-            and kept.plan_fast_sigs is not None
-            and sig in kept.plan_fast_sigs
-        ):
-            self.__dict__[_FAST] = plan_fast
-        else:
-            self._register_fast(kept, plan, sig)
-
-    def _prefill(self, kept, x, rows, *, armed: bool | None = None):
-        """A dense call above MAX_ROWS over the format's tile face via the
-        unified direct dense skeleton; None where the call decodes instead."""
-        if x.dtype not in (mx.float16, mx.bfloat16):
-            return None
-        if armed is None:
-            row_exact = self._qwen_row_exact
-            armed = row_exact is not None and row_exact()
-        if armed:
-            # Armed row-exact exactness: rows go serial, bitwise to decode.
-            return None
-        plan = self._ensure_dense(kept)
-        if plan is None or rows >= plan.row_limit:
-            return None
-        policy = tile_dense.policy_for(plan, rows, x.dtype)
-        if policy is not None and policy.backend == "rows":
-            return self._ordinary_rows(kept, x)
+                    self._publish_fast(kept, fast)
+                return y
         y = tile_dense.project(plan, x)
         if y is not None:
-            sig = (x.shape, x.dtype)
-            if (
-                kept.dense_fast is not None
-                and kept.dense_fast_sigs is not None
-                and sig in kept.dense_fast_sigs
-            ):
-                self.__dict__[_FAST] = kept.dense_fast
-            else:
-                self._register_fast(kept, plan, sig, proof_state=plan.binding.state)
-        return y
+            self._register_fast(kept, plan, (x.shape, x.dtype))
+            return y if bias is None else y + bias
+        return None
+
+    def _dot_rows(self, kept, x, bias):
+        """A call of 2..MAX_ROWS rows whose route is the Dot plan (with
+        ``bias`` applied once): its own native replay once the plan's graph is
+        built, else the plan's rows kernel, which proves and keeps it. A
+        longer call is no rows route (the chunked ordinary rows kernel it
+        replaced is gone)."""
+        plan = kept.plan
+        if plan is None or not plan.face.exact_for(x.dtype):
+            return None
+        if x.size // plan.k > MAX_ROWS:
+            return None
+        fast = kept._slots.get("dot_fast")
+        if fast is not None:
+            y = fast(self, x)
+            if y is not None:
+                cur = self.__dict__.get(_FAST)
+                if cur is None or (
+                    cur is not fast and self.__dict__.get(_FAST2) is None
+                ):
+                    self._publish_fast(kept, fast)
+                return y
+        signature = (x.shape, x.dtype)
+        y = _launch(plan, signature, _linear, _linear_stand_in, x)
+        if y is not None:
+            self._register_dot_fast(kept, plan, signature)
+            return y if bias is None else y + bias
+        return None
+
+    def _native_fast(self, kept, slot, operands, proof_state):
+        """The native replay kept under ``slot``, or one bound over these
+        operands and proof state and published atomically; None when the
+        extension has none."""
+        fast = kept._slots.get(slot)
+        if fast is not None:
+            return fast
+        no_slot = f"no_{slot}"
+        if no_slot in kept._slots:
+            return None
+        if len(operands) >= 16:
+            kept._slots[no_slot] = True
+            return None
+        try:
+            from ..custom_kernels.quant_matmul import fast as native
+        except ImportError:
+            _log_native_fallback()
+            kept._slots[no_slot] = True
+            return None
+        if not native.has_symbol("FormatLinearFast"):
+            _log_native_fallback()
+            kept._slots[no_slot] = True
+            return None
+        fast = native.format_linear_fast(
+            kept.weight, kept.bias, operands, proof_state, kept.weight_key
+        )
+        if fast is None:
+            _log_native_fallback()
+            kept._slots[no_slot] = True
+            return None
+        return kept._slots.setdefault(slot, fast)
+
+    def _publish_fast(self, kept, fast) -> None:
+        """Expose up to two distinct native replays on the layer without a
+        lock: ``_fast`` holds the first route to warm and is never
+        overwritten; ``_fast2`` holds a second route when a layer's schedule
+        alternates between ``dense_fast`` and ``dot_fast``. Ignores and
+        retracts publishes from a ``kept`` retired by concurrent mutation."""
+        if self.__dict__.get(_KEPT) is not kept:
+            return
+        first = self.__dict__.setdefault(_FAST, fast)
+        if first is fast:
+            if self.__dict__.get(_FAST2) is fast:
+                self.__dict__.pop(_FAST2, None)
+        else:
+            self.__dict__.setdefault(_FAST2, fast)
+            if self.__dict__.get(_FAST) is fast and self.__dict__.get(_FAST2) is fast:
+                self.__dict__.pop(_FAST2, None)
+        if self.__dict__.get(_KEPT) is not kept:
+            if self.__dict__.get(_FAST) is fast:
+                self.__dict__.pop(_FAST, None)
+            if self.__dict__.get(_FAST2) is fast:
+                self.__dict__.pop(_FAST2, None)
+
+    def _register_fast(self, kept, plan, signature: tuple):
+        """Have the plan's native replay hold ``signature``: every scheduled
+        dense route (including mma/msg, which inline ``N_size`` inside their
+        compiled graph) shares ``dense_fast``. The replay reads this thread's
+        graphs of the plan's proof binding, which a failed proof retires."""
+        if "no_dense_fast" in kept._slots:
+            return
+        kept_local = plan.binding.state.get("_kept")
+        if kept_local is None or kept_local.graphs.get(signature) is None:
+            return
+        fast = self._native_fast(kept, "dense_fast", plan.operands, plan.binding.state)
+        if fast is None:
+            return
+        fast.__self__.register(signature)
+        self._publish_fast(kept, fast)
+
+    def _register_dot_fast(self, kept, plan, signature: tuple):
+        """Have the Dot plan's native replay hold ``signature``: the plan's
+        proof keeps this thread's graph, which a failed proof retires."""
+        if "no_dot_fast" in kept._slots:
+            return
+        kept_local = plan.proof._kept
+        if kept_local is None or kept_local.graphs.get(signature) is None:
+            return
+        fast = self._native_fast(kept, "dot_fast", plan.operands, vars(plan.proof))
+        if fast is None:
+            return
+        fast.__self__.register(signature)
+        self._publish_fast(kept, fast)
+
+    def _bind_one_row_mlx_fast(
+        self, kept: _Kept, dense: tile_dense.DensePlan, sig: tuple
+    ) -> None:
+        """Bind a single-row M3 C7 ``mlx_rows`` signature onto ``dense_fast``."""
+        if dense.proof.failed:
+            return
+        kept_local = dense.binding.kept
+        if kept_local is None or sig not in kept_local.graphs:
+            tile_dense._keep_local(
+                dense, sig, tile_dense._make_mlx_route(self.bits, self.group_size)
+            )
+        self._register_fast(kept, dense, sig)
 
     def __call__(self, x: mx.array) -> mx.array:
         fast = self._fast
@@ -2676,73 +2416,77 @@ class FormatLinear(_FormatLayer):
             y = fast(self, x)
             if y is not None:
                 return y
+            fast2 = self._fast2
+            if fast2 is not None:
+                y = fast2(self, x)
+                if y is not None:
+                    return y
         shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
-        verify_armed = False
-        if _VERIFY_ACTIVE:
-            verify = kept.verify
-            if verify is not None and verify.is_armed():
-                verify_armed = True
-                y = verify(x)
-                if y is not None:
-                    return y
         plan, bias = kept.plan, kept.bias
-        row_exact = self._qwen_row_exact
-        if row_exact is not None and plan is not None:
-            armed = row_exact()
-            if not armed:
-                if (
-                    x.ndim == 3
-                    and shape[-1] == plan.k
-                    and x.size // plan.k in kept.mlx_rows
-                ):
-                    # DATA (C7 receipts): this bucket is MLX's own qmv's.
+        if plan is not None:
+            # Fast single-row decode path on the already-fetched shape tuple:
+            # avoids C++ x.size/x.ndim calls and integer division on every
+            # 1-token step while still keeping the M3 C7 single-row mlx_rows.
+            if (
+                len(shape) == 2
+                and shape[0] == 1
+                or len(shape) == 3
+                and shape[0] == 1
+                and shape[1] == 1
+            ):
+                if kept.mlx_rows and len(shape) == 3 and shape[-1] == plan.k:
                     y = self._stock_matmul(x)
-                    if (
-                        not verify_armed
-                        and not kept.no_native
-                        and shape[0] == 1
-                        and shape[1] == 1
-                    ):
-                        self._bind_one_row_mlx_fast(kept, (shape, dtype))
+                    if dtype in (mx.float16, mx.bfloat16):
+                        dense = kept._slots.get("dense")
+                        if dense is not None:
+                            self._bind_one_row_mlx_fast(kept, dense, (shape, dtype))
                     return y if bias is None else y + bias
-                if kept.wide is not _UNBUILT and x.size > plan.k:
-                    wide = kept.wide
-                    graph = wide.proof.graphs.get((shape, dtype))
-                    if graph is not None:
-                        if fast is not None:
-                            wide_fast = kept.routes.get(("native", id(wide)))
-                            if wide_fast is not None and (
-                                shape,
-                                dtype,
-                            ) in kept.routes.get(("native_sigs", id(wide)), ()):
-                                self.__dict__[_FAST] = wide_fast
-                            else:
-                                self._register_fast(kept, wide, (shape, dtype))
-                        y = graph(x, *wide.operands)
-                        return y if bias is None else y + bias
+                graph = plan.proof.graphs.get((shape, dtype))
+                if graph is not None:
+                    dot_fast = kept.dot_fast
+                    if dot_fast is not None:
+                        cur = self.__dict__.get(_FAST)
+                        if cur is None or (
+                            cur is not dot_fast and self.__dict__.get(_FAST2) is None
+                        ):
+                            self._publish_fast(kept, dot_fast)
+                    y = graph(x, *plan.operands)
+                    return y if bias is None else y + bias
             if not shape or shape[-1] != plan.k:
                 raise ValueError(f"x is (..., {plan.k}), not of shape {shape}")
-            if x.size > plan.k:
-                if armed:
-                    if x.size > MAX_ROWS * plan.k:
-                        y = _exact_rows(plan, x)
-                        if y is not None:
-                            return y if bias is None else y + bias
-                else:
-                    y = self._ordinary(kept, x, (shape, dtype))
+            rows = x.size // plan.k
+            if rows > 1 and dtype in (mx.float16, mx.bfloat16):
+                dense = kept._slots.get("dense", _UNBUILT)
+                if dense is _UNBUILT:
+                    dense = self._dense_tile(kept)
+                if dense is not None:
+                    y = self._scheduled(kept, dense, x, bias)
                     if y is not None:
-                        return y if bias is None else y + bias
-        else:
-            armed = row_exact is not None and row_exact()
-        # A decode step is this, its kept graph's replay and the bias.
+                        return y
+        elif shape and shape[-1] == self.input_dims:
+            rows = x.size // self.input_dims if self.input_dims else 0
+            if rows > 1 and dtype in (mx.float16, mx.bfloat16):
+                dense = kept._slots.get("dense", _UNBUILT)
+                if dense is _UNBUILT:
+                    dense = self._dense_tile(kept)
+                if dense is not None:
+                    y = self._scheduled(kept, dense, x, bias)
+                    if y is not None:
+                        return y
+        # A single row is this: its Dot plan's kept graph and the bias.
         graph = plan.proof.graphs.get((shape, dtype)) if plan is not None else None
         if graph is not None:
+            dot_fast = kept.dot_fast
+            if dot_fast is not None:
+                cur = self.__dict__.get(_FAST)
+                if cur is None or (
+                    cur is not dot_fast and self.__dict__.get(_FAST2) is None
+                ):
+                    self._publish_fast(kept, dot_fast)
             y = graph(x, *plan.operands)
-            if not armed and not verify_armed and not kept.no_native:
-                self._bind_plan_fast(kept, (shape, dtype))
         else:
             k = self.input_dims
             if not shape or shape[-1] != k:
@@ -2751,51 +2495,19 @@ class FormatLinear(_FormatLayer):
             rows = x.size // k if k else 0
             if plan is not None and 0 < rows <= MAX_ROWS:
                 y = _launch(plan, (shape, dtype), _linear, _linear_stand_in, x)
-                if (
-                    y is not None
-                    and not armed
-                    and not verify_armed
-                    and not kept.no_native
-                ):
-                    self._bind_plan_fast(kept, (shape, dtype))
+                if y is not None:
+                    self._register_dot_fast(kept, plan, (shape, dtype))
             # No row materializes a matrix, stock or plugin.
             if y is None and rows == 0:
                 y = mx.zeros((*shape[:-1], self.output_dims), dtype=dtype)
-            if y is None and rows > 0 and self._stock and (rows <= MAX_ROWS or armed):
+            if y is None and rows > 0 and self._stock and rows <= MAX_ROWS:
                 # A short call whose matrix has no plan (qmv_quad's K 64 or
                 # 128, too few scales for a face) keeps MLX's own matmul, as
-                # it ran before the switch; an armed verification step takes
-                # it a row at a time (at any row count, as row_exact_qmv
-                # does), never the dense tile or decoded fallback. Unarmed
-                # calls above MAX_ROWS go to the format's dense route below.
-                if armed and rows > 1:
-                    flat = x.reshape(rows, k)
-                    first = self._stock_matmul(flat[:1])
-                    if first is not None:
-                        parts = [
-                            first,
-                            *(
-                                self._stock_matmul(flat[r : r + 1])
-                                for r in range(1, rows)
-                            ),
-                        ]
-                        y = mx.concatenate(parts, axis=0).reshape(
-                            *shape[:-1], self.output_dims
-                        )
-                else:
-                    y = self._stock_matmul(x)
-            if y is None and rows > MAX_ROWS and not armed:
-                y = self._prefill(kept, x, rows, armed=False)
+                # it ran before the switch; a longer one with no scheduled
+                # tile route falls to the decode below.
+                y = self._stock_matmul(x)
             if y is None:
-                decoded = self._decoded().astype(dtype).T
-                if armed and rows > 1:
-                    flat = x.reshape(rows, k)
-                    y = mx.concatenate(
-                        [flat[r : r + 1] @ decoded for r in range(rows)],
-                        axis=0,
-                    ).reshape(*shape[:-1], self.output_dims)
-                else:
-                    y = x @ decoded
+                y = x @ self._decoded().astype(dtype).T
         return y if bias is None else y + bias
 
 
@@ -2892,7 +2604,7 @@ class FormatSwitchLinear(_FormatLayer):
 
     @property
     def num_experts(self) -> int:
-        return self[packed_name(self)].shape[0]
+        return self[self._tensors[0]].shape[0]
 
     def _through_decode(self, x, indices, sorted_indices):
         """``x`` times the matrices at ``indices``, decoded: what the rows

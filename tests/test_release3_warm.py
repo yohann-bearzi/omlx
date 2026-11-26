@@ -668,8 +668,12 @@ def test_tile_dense_unbounded_wide_tail(monkeypatch):
 
     real_plan = tile_dense.build_plan(layer, tensor_units=False)
     assert real_plan is not None
-    steel = real_plan.schedule[-1][1]
+    steel = real_plan.schedule[-1].policy
     wide = tile_dense.DenseTilePolicy(backend="wide")
+    custom_sched = (
+        tile_dense.DenseRoute(32, steel.backend, steel),
+        tile_dense.DenseRoute(None, "wide", wide),
+    )
     custom_plan = tile_dense.DensePlan(
         face=real_plan.face,
         operands=real_plan.operands,
@@ -679,8 +683,8 @@ def test_tile_dense_unbounded_wide_tail(monkeypatch):
         n=real_plan.n,
         bits=real_plan.bits,
         group_size=real_plan.group_size,
-        schedule=((32, steel), (None, wide)),
-        schedules={mx.bfloat16: ((32, steel), (None, wide))},
+        schedule=custom_sched,
+        schedules={mx.bfloat16: custom_sched},
         row_limit=real_plan.row_limit,
         binding=real_plan.binding,
     )
@@ -944,7 +948,6 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
             self.proj_b, lay_b = _quantized_format_linear(
                 fmt, 256, hidden, 8, 64, dtype, seed=202
             )
-            self.proj_b._qwen_row_exact = qwen35_verify_qmm.is_row_exact_armed
             self.proj_n1, lay_n1 = _quantized_format_linear(
                 fmt, 1, hidden, 8, 64, dtype, seed=203
             )
@@ -1021,6 +1024,7 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
     orig_build_plan = tile_dense.build_plan
     orig_compile = mx.compile
     orig_register_fast = linear.FormatLinear._register_fast
+    orig_register_dot_fast = linear.FormatLinear._register_dot_fast
 
     def spy_keep(self):
         keep_calls.append(self)
@@ -1038,10 +1042,17 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
         register_fast_calls.append((self, args[1] if len(args) > 1 else None))
         return orig_register_fast(self, *args, **kwargs)
 
+    def spy_register_dot_fast(self, *args, **kwargs):
+        register_fast_calls.append((self, args[1] if len(args) > 1 else None))
+        return orig_register_dot_fast(self, *args, **kwargs)
+
     monkeypatch.setattr(linear._FormatLayer, "_keep", spy_keep)
     monkeypatch.setattr(tile_dense, "build_plan", spy_build_plan)
     monkeypatch.setattr(mx, "compile", spy_compile)
     monkeypatch.setattr(linear.FormatLinear, "_register_fast", spy_register_fast)
+    monkeypatch.setattr(
+        linear.FormatLinear, "_register_dot_fast", spy_register_dot_fast
+    )
 
     before_proofs = kernels.proof_count()
 
@@ -1059,7 +1070,7 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
     mx.eval(x_pre, x_pre2, x_dec, x_b2, x_b4, x_ver, x_sw, idx_sw, x_sw_dn)
 
     # First served prefill (L and L+1) + decode + batched decode (b2/b4 -> prefill)
-    # + armed verify + switch + routed MoE.
+    # + disarmed Qwen verify (proj_b) & non-Qwen verify (proj_a) + switch + routed MoE.
     y_pre_a = model.proj_a(x_pre)
     y_pre_b = model.proj_b(x_pre)
     y_pre2_a = model.proj_a(x_pre2)
@@ -1068,14 +1079,10 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
     y_dec_b = model.proj_b(x_dec)
     y_b2_b = model.proj_b(x_b2)
     y_b4_b = model.proj_b(x_b4)
+    y_ver_b = model.proj_b(x_ver)
     y_pre_b_again = model.proj_b(x_pre)
     y_dec_n1 = model.proj_n1(x_dec)
-
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
-    try:
-        y_ver_a = model.proj_a(x_ver)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=False)
+    y_ver_a = model.proj_a(x_ver)
 
     gu = model.moe.switch_mlp.gate_up_proj
     dn = model.moe.switch_mlp.down_proj
@@ -1103,6 +1110,7 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
         y_dec_b,
         y_b2_b,
         y_b4_b,
+        y_ver_b,
         y_pre_b_again,
         y_dec_n1,
         y_ver_a,
@@ -1131,8 +1139,10 @@ def test_first_served_request_does_no_keep_build_plan_compile_or_register_fast(
     monkeypatch.setattr(kernels, "_PROOFS", {})
     model.proj_a.__dict__.pop("_omlx_format_call", None)
     model.proj_a.__dict__.pop("_fast", None)
+    model.proj_a.__dict__.pop("_fast2", None)
     model.proj_b.__dict__.pop("_omlx_format_call", None)
     model.proj_b.__dict__.pop("_fast", None)
+    model.proj_b.__dict__.pop("_fast2", None)
     y_cold_pre = model.proj_a(x_pre)
     y_cold_dec = model.proj_a(x_dec)
     y_cold_b2 = model.proj_b(x_b2)
@@ -1217,6 +1227,7 @@ def test_warm_engine_dispatch_populates_engine_thread_and_preserves_thread_safet
         orig_build_plan = tile_dense.build_plan
         orig_compile = mx.compile
         orig_register_fast = linear.FormatLinear._register_fast
+        orig_register_dot_fast = linear.FormatLinear._register_dot_fast
 
         def _wrap(name, fn):
             def wrapped(*args, **kwargs):
@@ -1234,6 +1245,11 @@ def test_warm_engine_dispatch_populates_engine_thread_and_preserves_thread_safet
             linear.FormatLinear,
             "_register_fast",
             _wrap("register_fast", orig_register_fast),
+        )
+        monkeypatch.setattr(
+            linear.FormatLinear,
+            "_register_dot_fast",
+            _wrap("register_fast", orig_register_dot_fast),
         )
 
         before = kernels.proof_count()
@@ -1327,8 +1343,8 @@ def test_prepare_layer_plans_fails_closed_on_placeholder_and_never_keeps_unprove
         operands=steel_plan.operands,
         proof=kernels.proof("test_unproven_steel", steel_plan.face),
         said=steel_plan.said,
-        schedule=((None, steel_policy),),
-        schedules={dtype: ((None, steel_policy),)},
+        schedule=(tile_dense.DenseRoute(None, "steel", steel_policy),),
+        schedules={dtype: (tile_dense.DenseRoute(None, "steel", steel_policy),)},
         k=steel_plan.k,
         n=steel_plan.n,
         bits=steel_plan.bits,
@@ -1535,7 +1551,7 @@ def test_c936_comment_review_mutants(monkeypatch):
 def test_tile_dense_schedule_cache_matches_uncached_and_respects_subclasses(
     monkeypatch,
 ):
-    """build_plan(_schedule_cache=...) matches uncached and skips subclasses."""
+    """build_plan(_schedule_cache=...) matches uncached and keys on dot_ok."""
     from omlx.formats import tile_dense, tuning
 
     fmt = affine.AffineFormat()
@@ -1544,25 +1560,8 @@ def test_tile_dense_schedule_cache_matches_uncached_and_respects_subclasses(
         a, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=301)
         b, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=302)
 
-    class _NoOrdinaryRows(FormatLinear):
-        def _ordinary_serves(self, rows: int, *, chip: str | None = None) -> bool:
-            return False
-
-    c = _NoOrdinaryRows.__new__(_NoOrdinaryRows)
-    with testing.verified("qwen4_exp"):
-        c._init_tensors(
-            fmt,
-            8,
-            64,
-            512,
-            {n: a[n] for n in a._tensors},
-            None,
-            layout=fmt.layout(512, 256, 8, 64),
-        )
-
     a._keep()
     b._keep()
-    c._keep()
 
     cache: dict = {}
     p_uncached = tile_dense.build_plan(a, tensor_units=False)
@@ -1579,8 +1578,11 @@ def test_tile_dense_schedule_cache_matches_uncached_and_respects_subclasses(
     p_b = tile_dense.build_plan(b, tensor_units=False, _schedule_cache=cache)
     assert lookups == [], "identical FormatLinear should reuse _schedule_cache"
 
-    p_c = tile_dense.build_plan(c, tensor_units=False, _schedule_cache=cache)
-    assert len(lookups) > 0, "subclass overriding _ordinary_serves must bypass cache"
+    # A planless (dot_face=None) layer has dot_ok=False and must NOT hit a's entry.
+    p_c = tile_dense.build_plan(
+        b, tensor_units=False, dot_face=None, _schedule_cache=cache
+    )
+    assert len(lookups) > 0, "dot_face=None (dot_ok=False) must miss dot_ok=True cache"
     assert (
         p_uncached is not None
         and p_a is not None
@@ -1589,8 +1591,11 @@ def test_tile_dense_schedule_cache_matches_uncached_and_respects_subclasses(
     )
     assert p_a.schedules == p_uncached.schedules
     assert p_b.schedules == p_uncached.schedules
-    assert p_c.schedules == tile_dense.build_plan(c, tensor_units=False).schedules
-    assert len(cache) == len(p_a.schedules)
+    assert (
+        p_c.schedules
+        == tile_dense.build_plan(b, tensor_units=False, dot_face=None).schedules
+    )
+    assert len(cache) == 2 * len(p_a.schedules)
 
 
 def test_warm_row_exact_qmv_zero_compiles_on_first_request():
@@ -1690,7 +1695,7 @@ def make_fl(n, k, seed):
     w, s, b = mx.quantize(w_fp, group_size=64, bits=8)
     mx.eval(w, s, b)
     layout = fmt.layout(k, n, 8, 64)
-    return FormatLinear(
+    layer = FormatLinear(
         fmt,
         8,
         64,
@@ -1700,6 +1705,7 @@ def make_fl(n, k, seed):
         placeholders=False,
         _load_layout=layout,
     )
+    return layer
 
 
 class _FakeIndexer(nn.Module):
@@ -1773,11 +1779,12 @@ x1 = (mx.random.normal((1, 1, 2560)) * 0.2).astype(dtype)
 xo1 = (mx.random.normal((1, 1, 6144)) * 0.2).astype(dtype)
 mx.eval(x1, xo1)
 
-# 1-row GDN in/out + 1-row Attention group4/group1.
+# 1-row GDN in/out + 1-row Attention group4/group1 + GDN batch decode (rows 2,4).
 dec_plan = qwen35_gdn_prework._qwen4_decode_plan(model.gdn)
 assert dec_plan is not None
-y_gdn_in = dec_plan[-2](x1)
-y_gdn_out = dec_plan[-1](xo1)
+y_gdn_in = dec_plan[-3](x1)
+y_gdn_out = dec_plan[-2](xo1)
+stacked_gdn = dec_plan[-1]
 g4_plan = row_exact_qmv._group_plan(
     (
         model.attn.q_proj,
@@ -1795,7 +1802,16 @@ y_g1 = row_exact_qmv.quantized_linears_tiled(
     (model.attn.o_proj,), xo1, *_fused_tile(1)
 )
 assert y_g1 is not None
-mx.eval(y_gdn_in, y_gdn_out, *y_g4, *y_g1)
+# Batch decode (2, 4 rows) uses stacked FormatLinear and out_proj FormatLinear.
+from omlx.formats import kernels as _fmt_kernels
+
+proofs_before = _fmt_kernels.proof_count()
+xb2 = (mx.random.normal((1, 2, 2560)) * 0.2).astype(dtype)
+xob2 = (mx.random.normal((1, 2, 6144)) * 0.2).astype(dtype)
+mx.eval(xb2, xob2)
+yb_in = stacked_gdn(xb2)
+yb_out = model.gdn.out_proj(xob2)
+mx.eval(y_gdn_in, y_gdn_out, *y_g4, *y_g1, yb_in, yb_out)
 
 bitwise_ok = True
 # Verify 1-row bitwise equality vs direct FormatLinear calls.
@@ -1816,12 +1832,16 @@ bitwise_ok &= bool(
 if mtp_enabled:
     ver_plan = qwen35_gdn_prework._qwen4_verify_plan(model.gdn)
     assert ver_plan is not None
+    # 1-row verify uses in_rows/out_rows; >=2 rows uses stacked/out FormatLinear.
+    yv1_in = ver_plan[0](x1)
+    yv1_out = ver_plan[1](xo1)
+    mx.eval(yv1_in, yv1_out)
     for rows in (2, 3, 4):
         xr = (mx.random.normal((1, rows, 2560)) * 0.2).astype(dtype)
         xor = (mx.random.normal((1, rows, 6144)) * 0.2).astype(dtype)
         mx.eval(xr, xor)
-        yv_in = ver_plan[0](xr)
-        yv_out = ver_plan[1](xor)
+        yv_in = ver_plan[2](xr)
+        yv_out = ver_plan[3](xor)
         p4 = row_exact_qmv._group_plan(
             (
                 model.attn.q_proj,
@@ -1839,10 +1859,7 @@ if mtp_enabled:
             (model.attn.o_proj,), xor, *_fused_tile(rows)
         )
         assert yg1 is not None
-        yg3 = row_exact_qmv.quantized_linears(
-            (model.attn.q_proj, model.attn.k_proj, model.attn.v_proj), xr
-        )
-        mx.eval(yv_in, yv_out, *yg4, *yg1, *yg3)
+        mx.eval(yv_in, yv_out, *yg4, *yg1)
         # Bitwise check row 0 against serial 1-row FormatLinear.
         ref_r0 = model.attn.o_proj(xor[:, :1, :])
         mx.eval(ref_r0)
@@ -1851,13 +1868,17 @@ if mtp_enabled:
                 yg1[0][:, :1, :].view(mx.uint16), ref_r0.view(mx.uint16)
             ).item()
         )
-        bitwise_ok &= bool(
-            mx.array_equal(
-                yg3[0].view(mx.uint16), yg4[0].view(mx.uint16)
-            ).item()
-        )
 
-print(json.dumps({"recorded": recorded, "bitwise_ok": bitwise_ok}))
+proofs_delta = _fmt_kernels.proof_count() - proofs_before
+print(
+    json.dumps(
+        {
+            "recorded": recorded,
+            "bitwise_ok": bitwise_ok,
+            "proofs_delta": proofs_delta,
+        }
+    )
+)
 """
     for mtp_flag in (0, 1):
         res = subprocess.run(
@@ -1870,6 +1891,9 @@ print(json.dumps({"recorded": recorded, "bitwise_ok": bitwise_ok}))
         assert res.returncode == 0, f"mtp={mtp_flag} probe failed:\n{res.stderr}"
         data = json.loads(res.stdout.strip().splitlines()[-1])
         assert data["bitwise_ok"] is True
+        assert (
+            data["proofs_delta"] == 0
+        ), f"mtp={mtp_flag}: unexpected cold Proof.prove() count={data['proofs_delta']}"
         req0 = data["recorded"]["request0"]
         load = data["recorded"]["load"]
         assert req0 == [], (
@@ -1877,13 +1901,20 @@ print(json.dumps({"recorded": recorded, "bitwise_ok": bitwise_ok}))
             f"request #0: {req0}"
         )
         assert len(load) >= 4, f"mtp={mtp_flag}: expected >=4 load compiles, got {load}"
+        # Rule 29: Qwen4 disarmed row-exact verify -> never warm dead group3 or
+        # dead GDN multi-row unrolled row_exact_qmv libraries.
+        assert not any(
+            "group3" in name for name in load
+        ), f"mtp={mtp_flag}: disarmed qwen4 must not warm dead group3: {load}"
         if mtp_flag == 0:
             assert not any(
-                "_u__" in name or "group3" in name for name in load
+                "_u__" in name for name in load
             ), f"mtp=0 should not compile verify libraries: {load}"
         else:
-            assert any("group3" in name for name in load), f"missing group3 in {load}"
             assert any("_u__" in name for name in load), f"missing _u verify in {load}"
+            assert all(
+                "group4" in name or "group1" in name for name in load if "_u__" in name
+            ), f"unexpected non-attention unrolled verify warm in {load}"
 
 
 def test_warm_row_exact_qmv_fails_closed_and_verifies_real_weights(monkeypatch):
@@ -2040,7 +2071,10 @@ def test_warm_model_dispatch_uses_model_dtype_over_fixed_format_scale_dtype(
 
 
 def test_register_fast_concurrent_creation_keeps_sigs_in_sync(monkeypatch):
-    """pre-a1-aa9d16b9 MEDIUM 2 & Mutant 3: concurrent _register_fast + 64-entry clear."""
+    """pre-a1-aa9d16b9 MEDIUM 2 & Mutant 3 (adapted to c3 lock-free _slots):
+    concurrent _register_fast shares one winning FormatLinearFast via
+    kept._slots.setdefault with zero lost signatures, and FormatLinearFast
+    clears its 64-entry table on the 65th signature."""
     import concurrent.futures
     import threading
 
@@ -2054,26 +2088,23 @@ def test_register_fast_concurrent_creation_keeps_sigs_in_sync(monkeypatch):
     with testing.verified("qwen4_exp"):
         layer, _ = _quantized_format_linear(fmt, 256, 256, 8, 64, dtype, seed=320)
     kept = layer._keep()
-    kept.dense = layer._dense_tile(kept)
-    assert kept.dense is not None
+    dense = layer._dense_tile(kept)
+    assert dense is not None
 
     x_a = mx.zeros((1, 64, 256), dtype=dtype)
     x_b = mx.zeros((1, 65, 256), dtype=dtype)
     sig_a = (x_a.shape, dtype)
     sig_b = (x_b.shape, dtype)
-    kept.dense.binding.kept.graphs[sig_a] = lambda z, *ops: z
-    kept.dense.binding.kept.graphs[sig_b] = lambda z, *ops: z
+    dense.binding.kept.graphs[sig_a] = lambda z, *ops: z
+    dense.binding.kept.graphs[sig_b] = lambda z, *ops: z
 
-    # 1. Force two threads into _register_fast concurrently; if unlocked, both
-    # call native.format_linear_fast and hit the barrier; if locked, they
-    # serialize and the second reuses kept.dense_fast without calling it again.
+    # 1. Force two threads into _register_fast concurrently; atomic
+    # kept._slots.setdefault picks ONE winning FormatLinearFast and BOTH
+    # threads register their signatures on it.
     orig_ctor = native.format_linear_fast
-    ctor_calls = 0
     ctor_barrier = threading.Barrier(2, timeout=0.5)
 
     def racing_ctor(*args, **kwargs):
-        nonlocal ctor_calls
-        ctor_calls += 1
         with __import__("contextlib").suppress(threading.BrokenBarrierError):
             ctor_barrier.wait()
         return orig_ctor(*args, **kwargs)
@@ -2082,11 +2113,9 @@ def test_register_fast_concurrent_creation_keeps_sigs_in_sync(monkeypatch):
     start_barrier = threading.Barrier(2)
 
     def worker(sig):
-        kept.dense.binding.kept.graphs[sig] = lambda z, *ops: z
+        dense.binding.kept.graphs[sig] = lambda z, *ops: z
         start_barrier.wait()
-        layer._register_fast(
-            kept, kept.dense, sig, proof_state=kept.dense.binding.state
-        )
+        layer._register_fast(kept, dense, sig)
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(worker, sig_a)
@@ -2094,148 +2123,90 @@ def test_register_fast_concurrent_creation_keeps_sigs_in_sync(monkeypatch):
         f1.result()
         f2.result()
 
-    assert (
-        ctor_calls == 1
-    ), f"expected serialized single fast creation, got {ctor_calls}"
-    assert layer._fast is not None
-    # Main thread also has both graphs populated (line 2060 above), so replay
-    # checks both registered signatures on the shared FormatLinearFast.
+    assert layer._fast is kept.dense_fast and layer._fast is not None
     assert layer._fast(layer, x_a) is not None
     assert layer._fast(layer, x_b) is not None
-    assert kept.dense_fast_sigs == {sig_a, sig_b}
 
-    # 2. Mutant 3 (linear.py:2468-2469): len(sigs) == 64 clears on the 65th sig
-    # (mirroring format_dispatch.cpp:42), killing `== 64 -> == 65`.
+    # 2. C++ FormatLinearFast clears its 64-entry table on the 65th signature
+    # (format_dispatch.cpp:41-43).
     monkeypatch.setattr(native, "format_linear_fast", orig_ctor)
-    kept.dense_fast = None
-    kept.dense_fast_sigs = None
+    kept._slots.pop("dense_fast", None)
+    layer.__dict__.pop(linear._FAST, None)
+    layer.__dict__.pop(linear._FAST2, None)
+    x_first = mx.zeros((1, 64, 256), dtype=dtype)
     for i in range(64):
         sig_i = ((1, 64 + i, 256), dtype)
-        kept.dense.binding.kept.graphs[sig_i] = lambda z, *ops: z
-        layer._register_fast(
-            kept, kept.dense, sig_i, proof_state=kept.dense.binding.state
-        )
-    assert len(kept.dense_fast_sigs) == 64
-    sig_64 = ((1, 128, 256), dtype)
-    kept.dense.binding.kept.graphs[sig_64] = lambda z, *ops: z
-    layer._register_fast(kept, kept.dense, sig_64, proof_state=kept.dense.binding.state)
-    assert kept.dense_fast_sigs == {sig_64}
+        dense.binding.kept.graphs[sig_i] = lambda z, *ops: z
+        layer._register_fast(kept, dense, sig_i)
+    assert layer._fast(layer, x_first) is not None
+    x_64 = mx.zeros((1, 128, 256), dtype=dtype)
+    sig_64 = (x_64.shape, dtype)
+    dense.binding.kept.graphs[sig_64] = lambda z, *ops: z
+    layer._register_fast(kept, dense, sig_64)
+    assert layer._fast(layer, x_64) is not None
+    assert layer._fast(layer, x_first) is None
 
 
 def test_warm_model_dispatch_rows_backend_does_not_bind_wide_fast_on_non_qwen(
     monkeypatch,
 ):
-    """pre-a1-aa9d16b9 LOW 3: rows-backend wide warm never binds _fast on non-Qwen."""
-    from omlx.formats import tile_dense, tile_wide
+    """pre-a1-aa9d16b9 LOW 3 (adapted to c3 schedule + _fast/_fast2): warming
+    both a dot route (rows=4 -> dot_fast) and a dense route (prefill ->
+    dense_fast) publishes both into _fast/_fast2 without overwriting _fast."""
+    from omlx.custom_kernels.quant_matmul import fast as native
+    from omlx.formats import tile_dense, tuning
 
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
     monkeypatch.setattr(kernels, "_PROOFS", {})
 
     fmt = affine.AffineFormat()
     dtype = mx.bfloat16
+    dot_pol = tuning.DenseTilePolicy("dot")
+    monkeypatch.setattr(
+        tuning,
+        "lookup",
+        lambda route, *a, rows=1, **kw: (
+            dot_pol if route == "dense_tile" and rows <= 4 else None
+        ),
+    )
+    monkeypatch.setattr(tuning, "row_bounds", lambda route, **kw: (4, 16))
     with testing.verified("qwen4_exp"):
-        non_qwen, _ = _quantized_format_linear(fmt, 256, 256, 4, 64, dtype, seed=330)
-        qwen_layer, _ = _quantized_format_linear(fmt, 256, 256, 4, 64, dtype, seed=331)
-    qwen_layer._qwen_row_exact = lambda: False
+        layer, _ = _quantized_format_linear(fmt, 256, 256, 4, 64, dtype, seed=330)
 
     class _Wrap(nn.Module):
-        def __init__(self, layer):
+        def __init__(self, mod):
             super().__init__()
-            self.layer = layer
+            self.layer = mod
 
-    rows_policy = tile_dense.DenseTilePolicy(
-        "rows",
-        16,
-        16,
-        16,
-        1,
-        1,
-        False,
-        1,
-        1,
-        tile_dense.ParamStaging.PER_STEP,
-        1,
-        0,
-        0,
-        "seg",
-    )
-    steel_policy = tile_dense._default_steel_policy(2048, 256, 256)
-
-    # 1. Non-Qwen layer with backend="rows" at length 48 -> must NOT bind _fast.
-    kept_nq = non_qwen._keep()
-    kept_nq.dense = non_qwen._dense_tile(kept_nq)
-    assert kept_nq.dense is not None
-    kept_nq.dense = tile_dense.DensePlan(
-        face=kept_nq.dense.face,
-        operands=kept_nq.dense.operands,
-        proof=kept_nq.dense.proof,
-        said=kept_nq.dense.said,
-        schedule=((None, rows_policy),),
-        schedules={dtype: ((None, rows_policy),)},
-        k=256,
-        n=256,
-        bits=4,
-        group_size=64,
-        row_limit=kept_nq.dense.row_limit,
-        binding=kept_nq.dense.binding,
-    )
-    wide_nq = linear._ordinary_tile(non_qwen, 256, 256, "wide", tile_wide.kernel)
-    assert wide_nq is not None
-    kept_nq.routes["wide"] = wide_nq
-    kept_nq.wide = wide_nq
-    metal_16, _ = tile_wide.describe(wide_nq, mx.zeros((16, 256), dtype))
-    wide_nq.proof.ran.add(metal_16)
-    monkeypatch.setattr(linear, "traversal", lambda *a, **kw: ("wide", None))
-    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
-
+    wrap = _Wrap(layer)
+    for fut in linear.warm_existing_dense(wrap, dtypes=(dtype,)) or ():
+        fut.result()
     linear.warm_model_dispatch(
-        _Wrap(non_qwen), prefill_lengths=(48,), mtp_enabled=False
+        wrap, decode_batch_sizes=(1, 4), prefill_lengths=(64,), mtp_enabled=False
     )
-    assert non_qwen._fast is None, "non-Qwen rows-backend must not bind wide_fast"
-    assert ((16, 256), dtype) in wide_nq.proof.graphs
+    kept = layer.__dict__[linear._KEPT]
+    assert kept.dot_fast is not None and kept.dense_fast is not None
+    assert {layer._fast, layer._fast2} == {kept.dot_fast, kept.dense_fast}
+    first_fast = layer._fast
 
-    # Direct _project_route on non-Qwen must also not bind _fast.
-    y_nq = non_qwen._project_route(
-        kept_nq, mx.zeros((16, 256), dtype), ((16, 256), dtype), ("wide", None)
+    # Alternating dot (rows=4) and dense (rows=64) hits _fast/_fast2 directly
+    # without overwriting _fast or calling _scheduled/_dot_rows.
+    monkeypatch.setattr(
+        FormatLinear,
+        "_scheduled",
+        lambda *a, **kw: pytest.fail("warm call missed _fast/_fast2"),
     )
-    assert y_nq is not None
-    assert non_qwen._fast is None
-
-    # 2. Qwen layer with prefills=(2048, 48): length 48 must NOT leave _fast on
-    # wide_fast when dense_fast was bound for 2048.
-    kept_q = qwen_layer._keep()
-    kept_q.dense = qwen_layer._dense_tile(kept_q)
-    assert kept_q.dense is not None
-    kept_q.dense = tile_dense.DensePlan(
-        face=kept_q.dense.face,
-        operands=kept_q.dense.operands,
-        proof=kept_q.dense.proof,
-        said=kept_q.dense.said,
-        schedule=((64, rows_policy), (None, steel_policy)),
-        schedules={dtype: ((64, rows_policy), (None, steel_policy))},
-        k=256,
-        n=256,
-        bits=4,
-        group_size=64,
-        row_limit=kept_q.dense.row_limit,
-        binding=kept_q.dense.binding,
+    monkeypatch.setattr(
+        FormatLinear,
+        "_dot_rows",
+        lambda *a, **kw: pytest.fail("warm dot call missed _fast/_fast2"),
     )
-    eff_steel = tile_dense._effective_policy(steel_policy, 256, 256)
-    kept_q.dense.proof.ran.add(
-        tile_dense._metal_key(kept_q.dense, mx.zeros((1, 2048, 256), dtype), eff_steel)
-    )
-    wide_q = linear._ordinary_tile(qwen_layer, 256, 256, "wide", tile_wide.kernel)
-    assert wide_q is not None
-    kept_q.routes["wide"] = wide_q
-    kept_q.wide = wide_q
-    wide_q.proof.ran.add(metal_16)
-
-    linear.warm_model_dispatch(
-        _Wrap(qwen_layer), prefill_lengths=(2048, 48), mtp_enabled=False
-    )
-    assert kept_q.dense_fast is not None
-    assert qwen_layer._fast is kept_q.dense_fast
+    y4 = layer(mx.zeros((4, 1, 256), dtype=dtype))
+    y64 = layer(mx.zeros((1, 64, 256), dtype=dtype))
+    mx.eval(y4, y64)
+    assert layer._fast is first_fast
+    assert tile_dense.route_for(kept.dense, 4, dtype).backend == "dot"
 
 
 def test_engine_prefill_lengths_includes_grid_aligned_steady_step():
@@ -2296,34 +2267,25 @@ def test_aa9d16b9_surviving_mutants(monkeypatch):
     assert warmed_switches == [], "invalid num_experts blocks must be skipped"
     monkeypatch.undo()
 
-    # Mutant 2 (linear.py:2531): 1-row call on Qwen FormatLinear must NOT probe
-    # wide.proof.graphs (guards `x.size > plan.k`).
+    # Mutant 2: 1-row call on FormatLinear stays on the Dot plan and never
+    # invokes _scheduled / tile_dense.route_for.
     with testing.verified("qwen4_exp"):
         q_lin, _ = _quantized_format_linear(fmt, 256, 256, 8, 64, dtype, seed=342)
-    q_lin._qwen_row_exact = lambda: False
-    kept_q = q_lin._keep()
-    wide_probes = []
-
-    class _SpyGraphs(dict):
-        def get(self, key, default=None):
-            wide_probes.append(key)
-            return super().get(key, default)
-
-    kept_q.wide = SimpleNamespace(
-        proof=SimpleNamespace(graphs=_SpyGraphs()), operands=()
+    q_lin._keep()
+    monkeypatch.setattr(
+        FormatLinear,
+        "_scheduled",
+        lambda *a, **kw: pytest.fail("1-row decode must not enter _scheduled"),
     )
     y1 = q_lin(mx.zeros((1, 1, 256), dtype=dtype))
     mx.eval(y1)
-    assert wide_probes == [], "1-row decode must not probe kept.wide.proof.graphs"
+    monkeypatch.undo()
 
-    # Mutant 4 (tile_dense.py:1197): instance attribute `_ordinary_serves` in
-    # layer.__dict__ must bypass `_schedule_cache`.
+    # Mutant 4: distinct dot_ok (dot_face=None vs real dot_face) must not
+    # collide in build_plan's _schedule_cache.
     with testing.verified("qwen4_exp"):
         d_a, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=343)
-        d_inst, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=344)
     d_a._keep()
-    d_inst._keep()
-    d_inst.__dict__["_ordinary_serves"] = lambda rows, *, chip=None: False
     sched_cache: dict = {}
     tile_dense.build_plan(d_a, tensor_units=False, _schedule_cache=sched_cache)
     inst_lookups = []
@@ -2333,26 +2295,26 @@ def test_aa9d16b9_surviving_mutants(monkeypatch):
         "lookup",
         lambda *a, **kw: (inst_lookups.append(a) or orig_lookup(*a, **kw)),
     )
-    tile_dense.build_plan(d_inst, tensor_units=False, _schedule_cache=sched_cache)
-    assert (
-        len(inst_lookups) > 0
-    ), "instance _ordinary_serves must bypass _schedule_cache"
+    tile_dense.build_plan(
+        d_a, tensor_units=False, dot_face=None, _schedule_cache=sched_cache
+    )
+    assert len(inst_lookups) > 0, "dot_face=None must not collide in _schedule_cache"
     monkeypatch.undo()
 
-    # Mutant 5 (linear.py:1452): b in kept.mlx_rows must be skipped by
+    # Mutant 5: 1 in kept.mlx_rows skips 1-row rows-graph warming in
     # warm_model_dispatch.
     with testing.verified("qwen4_exp"):
         mlx_lin, _ = _quantized_format_linear(fmt, 256, 256, 8, 64, dtype, seed=345)
-    mlx_lin._qwen_row_exact = lambda: False
     kept_m = mlx_lin._keep()
-    kept_m.mlx_rows = frozenset({2})
-    traversed_b = []
-    monkeypatch.setattr(linear, "_metal_architecture", lambda: "applegpu_g15d")
-    monkeypatch.setattr(
-        linear,
-        "traversal",
-        lambda b, *a, **kw: (traversed_b.append(b) or ("rows", None)),
-    )
+    kept_m.mlx_rows = frozenset({1})
+    warmed_rows_shapes = []
+    orig_rows_warm = linear._warm_linear_rows_graph
+
+    def spy_rows_warm(plan, x_shape, dt, *, key):
+        warmed_rows_shapes.append(x_shape)
+        return orig_rows_warm(plan, x_shape, dt, key=key)
+
+    monkeypatch.setattr(linear, "_warm_linear_rows_graph", spy_rows_warm)
 
     class _One(nn.Module):
         def __init__(self, m):
@@ -2360,53 +2322,49 @@ def test_aa9d16b9_surviving_mutants(monkeypatch):
             self.m = m
 
     linear.warm_model_dispatch(
-        _One(mlx_lin), decode_batch_sizes=(2, 4), prefill_lengths=(), mtp_enabled=False
+        _One(mlx_lin), decode_batch_sizes=(1,), prefill_lengths=(), mtp_enabled=False
     )
-    assert traversed_b == [4], f"expected b=2 skipped via mlx_rows, got {traversed_b}"
+    assert (
+        1,
+        1,
+        256,
+    ) not in warmed_rows_shapes, (
+        f"expected 1-row skipped via mlx_rows, got {warmed_rows_shapes}"
+    )
     monkeypatch.undo()
 
-    # Mutant 6 (tile_dense.py:1696): unproven wide Metal must NOT be kept by
+    # Mutant 6: unproven wide, mma, and msg Metals must NOT be kept by
     # tile_dense.warm_graph.
     monkeypatch.setattr(kernels, "_PROOFS", {})
     with testing.verified("qwen4_exp"):
-        w_lin, _ = _quantized_format_linear(fmt, 256, 256, 8, 64, dtype, seed=346)
+        w_lin, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=346)
     base_plan = tile_dense.build_plan(w_lin, tensor_units=False)
     assert base_plan is not None
-    wide_policy = tile_dense.DenseTilePolicy(
-        "wide",
-        16,
-        16,
-        16,
-        1,
-        1,
-        False,
-        1,
-        1,
-        tile_dense.ParamStaging.PER_STEP,
-        1,
-        0,
-        0,
-        "seg",
-    )
-    unproven_wide_proof = kernels.proof("test_unproven_wide", base_plan.face)
-    forced_wide = tile_dense.DensePlan(
-        face=base_plan.face,
-        operands=base_plan.operands,
-        proof=unproven_wide_proof,
-        said=base_plan.said,
-        schedule=((None, wide_policy),),
-        schedules={dtype: ((None, wide_policy),)},
-        k=base_plan.k,
-        n=base_plan.n,
-        bits=base_plan.bits,
-        group_size=base_plan.group_size,
-        row_limit=base_plan.row_limit,
-        binding=unproven_wide_proof.bind(),
-    )
     assert tile_wide.kernel(base_plan.face) is not None
-    assert tile_dense.warm_graph(forced_wide, (1, 16, 256), dtype) is False
-    assert forced_wide.proof.graphs == {}
-    assert forced_wide.binding.kept.graphs == {}
+    for backend, pol, rows in (
+        ("wide", tile_dense.DenseTilePolicy("wide"), 16),
+        ("mma", tuning.MmaTilePolicy(16, 32, 8), 8),
+        ("msg", tuning.MsgTilePolicy(4), 4),
+    ):
+        unproven_proof = kernels.proof(f"test_unproven_{backend}", base_plan.face)
+        route_sched = (tile_dense.DenseRoute(None, backend, pol),)
+        forced = tile_dense.DensePlan(
+            face=base_plan.face,
+            operands=base_plan.operands,
+            proof=unproven_proof,
+            said=base_plan.said,
+            schedule=route_sched,
+            schedules={dtype: route_sched},
+            k=base_plan.k,
+            n=base_plan.n,
+            bits=base_plan.bits,
+            group_size=base_plan.group_size,
+            row_limit=base_plan.row_limit,
+            binding=unproven_proof.bind(),
+        )
+        assert tile_dense.warm_graph(forced, (1, rows, 512), dtype) is False
+        assert forced.proof.graphs == {}
+        assert forced.binding.kept.graphs == {}
 
 
 def test_warm_row_exact_qmv_prewarms_all_reference_format_linears(monkeypatch):
@@ -2473,12 +2431,24 @@ def test_warm_row_exact_qmv_prewarms_all_reference_format_linears(monkeypatch):
         s_plan = linear._plan(proj)
         assert s_plan is not None and dtype in s_plan.proof.ran
 
-    # 2. Failed reference proof must fail closed (not silently skipped).
+    # 2. Failed reference proof must fail closed (not silently skipped),
+    #    including when metal is STILL present in Proof.ran (pre-a1-529daae8 LOW 1).
     monkeypatch.setattr(row_exact_qmv, "_UNROLLED_VERDICTS", {})
     q_plan = linear._plan(model.attn.q_proj)
     assert q_plan is not None
     q_plan.proof.ran.clear()
     q_plan.proof.failed = True
+    with pytest.raises(
+        RuntimeError, match="cannot warm a proof that has already failed"
+    ):
+        row_exact_qmv.warm_model(model, mtp_enabled=True)
+
+    # LOW 1: metal still in proof.ran when proof.fail() ran for another metal.
+    monkeypatch.setattr(row_exact_qmv, "_UNROLLED_VERDICTS", {})
+    q_plan.proof.failed = False
+    q_plan.proof.ran.add(dtype)
+    q_plan.proof.fail()
+    assert dtype in q_plan.proof.ran and q_plan.proof.failed
     with pytest.raises(
         RuntimeError, match="cannot warm a proof that has already failed"
     ):
@@ -2566,7 +2536,8 @@ def test_warm_row_exact_qmv_handles_non_int_group_size(monkeypatch):
     assert row_exact_qmv.warm_model(model, mtp_enabled=False) == ()
     assert row_exact_qmv.warm_model(model, mtp_enabled=True) == ()
 
-    # warm_model_dispatch must skip non-Qwen4 attention when has_idx=False & mtp=False.
+    # warm_model and warm_model_dispatch must skip non-indexer attention when
+    # row-exact verify is not enabled (both mtp=False and mtp=True on release/4).
     dtype_calls = []
     orig_attn_dt = row_exact_qmv._attn_warm_dtypes
     monkeypatch.setattr(
@@ -2574,8 +2545,11 @@ def test_warm_row_exact_qmv_handles_non_int_group_size(monkeypatch):
         "_attn_warm_dtypes",
         lambda *a, **kw: (dtype_calls.append(a) or orig_attn_dt(*a, **kw)),
     )
+    row_exact_qmv.warm_model(model, mtp_enabled=False)
+    row_exact_qmv.warm_model(model, mtp_enabled=True)
     row_exact_qmv.warm_model_dispatch(model, mtp_enabled=False)
-    assert dtype_calls == [], "has_idx=False & mtp_enabled=False must skip early"
+    row_exact_qmv.warm_model_dispatch(model, mtp_enabled=True)
+    assert dtype_calls == [], "has_idx=False without row-exact verify must skip early"
 
 
 def test_d090ff51_surviving_mutants(monkeypatch):
@@ -2846,6 +2820,1143 @@ def test_d090ff51_surviving_mutants(monkeypatch):
             self.lin = p2_lin
 
     assert linear._infer_model_dtype(_OnlyFmt()) == mx.float16
+
+
+def test_r4_vfast_c2_gdn_stacked_and_disarmed_verify_warm_and_mutants(monkeypatch):
+    """Release/4 VFAST c2 adaptations + pre-a1-529daae8 surviving mutants:
+    1) GDN stacked FormatLinear (rows >= 2 batch decode & disarmed verify) warms
+       Metals, plans, and dispatch at load with 0 cold proofs/plans/compiles;
+    2) Disarmed Qwen4 verify (1, S, K) warms batched Qwen routes (not serial
+       _linear), while non-Qwen layers keep serial (1, S, K);
+    3) Rule 29: g3 attention warming runs ONLY when _omlx_mtp_row_exact_verify;
+    4) Kills pre-a1-529daae8 surviving mutants 1-3 (GDN dispatch, unaligned-N
+       ref_proof_tasks, pre-populated _UNROLLED_VERDICTS inst.build).
+    """
+    from omlx.formats import tile_dense
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+    from omlx.patches import qwen35_gdn_prework, row_exact_qmv
+
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedDeltaNet,
+        Qwen4ExpRMSNormGated,
+    )
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+
+    def _make_qwen_fl(n, k, seed):
+        layer, _ = _quantized_format_linear(fmt, n, k, 8, 64, dtype, seed=seed)
+        return layer
+
+    # --- 1. GDN stacked FormatLinear + 1-row GDN dispatch (kills mutant 1) ---
+    hk, hv, dk, dv = 16, 48, 128, 128
+    c_dim = 2 * hk * dk + hv * dv
+
+    def _make_gdn():
+        mod = Qwen4ExpGatedDeltaNet.__new__(Qwen4ExpGatedDeltaNet)
+        nn.Module.__init__(mod)
+        mod.num_k_heads, mod.num_v_heads = hk, hv
+        mod.head_k_dim, mod.head_v_dim = dk, dv
+        mod.conv_kernel_size = 4
+        mod.conv1d = nn.Conv1d(c_dim, c_dim, 4, groups=c_dim, bias=False)
+        mod.conv1d.weight = mx.zeros((c_dim, 4, 1), dtype=dtype)
+        mod.norm = Qwen4ExpRMSNormGated(dv, eps=1e-6, activation="sigmoid")
+        mod.norm.weight = mx.ones((dv,), dtype=dtype)
+        mod.A_log = mx.zeros((hv,), dtype=dtype)
+        mod.dt_bias = mx.zeros((hv,), dtype=dtype)
+        mod.in_proj_qkv = _make_qwen_fl(c_dim, 2560, 411)
+        mod.in_proj_z = _make_qwen_fl(hv * dv, 2560, 412)
+        mod.in_proj_b = _make_qwen_fl(hv, 2560, 413)
+        mod.in_proj_a = _make_qwen_fl(hv, 2560, 414)
+        mod.out_proj = _make_qwen_fl(2560, hv * dv, 415)
+        mod.eval()
+        mx.eval(mod.parameters())
+        return mod
+
+    class _GdnModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gdn = _make_gdn()
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    with testing.verified("qwen4_exp"):
+        gdn_model = _GdnModel()
+        for fut in linear.warm_existing_dense(gdn_model, dtypes=(dtype,)) or ():
+            fut.result()
+
+    qwen35_moe_routed_decode.warm_moe_model(
+        gdn_model, mtp_enabled=True, warm_dispatch=False
+    )
+    qwen35_moe_routed_decode.warm_engine_dispatch(
+        gdn_model,
+        mx.default_stream(mx.gpu),
+        prefill_lengths=(),
+        mtp_enabled=True,
+    )
+
+    dec_plan = qwen35_gdn_prework._qwen4_decode_plan(gdn_model.gdn)
+    ver_plan = qwen35_gdn_prework._qwen4_verify_plan(gdn_model.gdn)
+    assert dec_plan is not None and ver_plan is not None
+    in_qmv, out_qmv, stacked = dec_plan[-3], dec_plan[-2], dec_plan[-1]
+    assert isinstance(stacked, FormatLinear)
+    assert linear._KEPT in stacked.__dict__, "stacked FormatLinear plan not prepared"
+
+    # Spy all cold work during first request on GDN (1-row + rows 2,3,4).
+    cold_events: list[str] = []
+    orig_keep = linear._FormatLayer._keep
+    orig_bp = tile_dense.build_plan
+    orig_compile = mx.compile
+    orig_rf = linear.FormatLinear._register_fast
+    orig_rdf = linear.FormatLinear._register_dot_fast
+    monkeypatch.setattr(
+        linear._FormatLayer,
+        "_keep",
+        lambda self: (cold_events.append("keep") or orig_keep(self)),
+    )
+    monkeypatch.setattr(
+        tile_dense,
+        "build_plan",
+        lambda *a, **kw: (cold_events.append("build_plan") or orig_bp(*a, **kw)),
+    )
+    monkeypatch.setattr(
+        mx,
+        "compile",
+        lambda *a, **kw: (cold_events.append("compile") or orig_compile(*a, **kw)),
+    )
+    monkeypatch.setattr(
+        linear.FormatLinear,
+        "_register_fast",
+        lambda self, *a, **kw: (
+            cold_events.append("register_fast") or orig_rf(self, *a, **kw)
+        ),
+    )
+    monkeypatch.setattr(
+        linear.FormatLinear,
+        "_register_dot_fast",
+        lambda self, *a, **kw: (
+            cold_events.append("register_dot_fast") or orig_rdf(self, *a, **kw)
+        ),
+    )
+
+    proofs_before = kernels.proof_count()
+    x1 = mx.zeros((1, 1, 2560), dtype=dtype)
+    xo1 = mx.zeros((1, 1, 6144), dtype=dtype)
+    outs = [in_qmv(x1), out_qmv(xo1), ver_plan[0](x1), ver_plan[1](xo1)]
+    for rows in (2, 3, 4):
+        outs.append(stacked(mx.zeros((1, rows, 2560), dtype=dtype)))
+        outs.append(gdn_model.gdn.out_proj(mx.zeros((1, rows, 6144), dtype=dtype)))
+    mx.eval(*outs)
+    assert kernels.proof_count() == proofs_before
+    assert cold_events == [], f"unexpected cold work on GDN request #0: {cold_events}"
+    monkeypatch.undo()
+
+    # --- 2. Construction-time schedule warms dense_fast (mlx) and dot_fast (dot) ---
+    # Test in separate models/proofs since identical shapes share one Proof.
+    from omlx.formats import tuning
+
+    class _SingleModel(nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.proj = layer
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    with testing.verified("qwen4_exp"):
+        q_lin = _make_qwen_fl(256, 512, 421)
+    q_model = _SingleModel(q_lin)
+    for fut in linear.warm_existing_dense(q_model, dtypes=(dtype,)) or ():
+        fut.result()
+    linear.warm_model_dispatch(
+        q_model, prefill_lengths=(), decode_batch_sizes=(1, 2, 4), mtp_enabled=True
+    )
+    q_kept = q_lin.__dict__[linear._KEPT]
+    assert ((1, 3, 512), dtype) not in q_kept.plan.proof.graphs
+    assert ((1, 3, 512), dtype) in q_kept.dense.binding.kept.graphs
+    # And scheduled verify (1, 3, 512) must run with 0 cold proofs/compiles.
+    q_before = kernels.proof_count()
+    y_qv = q_lin(mx.zeros((1, 3, 512), dtype=dtype))
+    mx.eval(y_qv)
+    assert kernels.proof_count() == q_before
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    dot_pol = tuning.DenseTilePolicy("dot")
+    with monkeypatch.context() as dot_patch:
+        dot_patch.setattr(
+            tuning,
+            "lookup",
+            lambda route, *a, rows=1, **kw: (
+                dot_pol if route == "dense_tile" and rows <= 4 else None
+            ),
+        )
+        dot_patch.setattr(tuning, "row_bounds", lambda route, **kw: (4, 16))
+        with testing.verified("qwen4_exp"):
+            nq_lin, _ = _quantized_format_linear(fmt, 256, 512, 8, 64, dtype, seed=422)
+        nq_model = _SingleModel(nq_lin)
+        for fut in linear.warm_existing_dense(nq_model, dtypes=(dtype,)) or ():
+            fut.result()
+        linear.warm_model_dispatch(
+            nq_model, prefill_lengths=(), decode_batch_sizes=(1, 2, 4), mtp_enabled=True
+        )
+    nq_kept = nq_lin.__dict__[linear._KEPT]
+    assert ((1, 3, 512), dtype) in nq_kept.plan.proof.graphs
+    nq_before = kernels.proof_count()
+    y_nqv = nq_lin(mx.zeros((1, 3, 512), dtype=dtype))
+    mx.eval(y_nqv)
+    assert kernels.proof_count() == nq_before
+
+    # --- 3. Rule 29: g3 warmed ONLY when _omlx_mtp_row_exact_verify is True ---
+    class _FakeIndexer(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.index_qk_proj = _make_qwen_fl(64, 256, 430)
+
+    class _FakeAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = _make_qwen_fl(128, 256, 431)
+            self.k_proj = _make_qwen_fl(64, 256, 432)
+            self.v_proj = _make_qwen_fl(64, 256, 433)
+            self.o_proj = _make_qwen_fl(256, 256, 434)
+            self.indexer = _FakeIndexer()
+
+    class _DisarmedModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.attn = _FakeAttn()
+
+    class _RowExactModel(nn.Module):
+        _omlx_mtp_row_exact_verify = True
+
+        def __init__(self):
+            super().__init__()
+            self.attn = _FakeAttn()
+
+    with testing.verified("qwen4_exp"):
+        disarmed_m = _DisarmedModel()
+        row_exact_m = _RowExactModel()
+
+    for fut in row_exact_qmv.warm_model(disarmed_m, mtp_enabled=True):
+        fut.result()
+    row_exact_qmv.warm_model_dispatch(disarmed_m, mtp_enabled=True)
+    disarmed_keys = list(row_exact_qmv._plans(disarmed_m.attn.q_proj).keys())
+    assert disarmed_keys and all(
+        k[0] != 3 for k in disarmed_keys
+    ), f"disarmed Qwen4 must not plan group3: {disarmed_keys}"
+
+    for fut in row_exact_qmv.warm_model(row_exact_m, mtp_enabled=True):
+        fut.result()
+    row_exact_qmv.warm_model_dispatch(row_exact_m, mtp_enabled=True)
+    row_exact_keys = list(row_exact_qmv._plans(row_exact_m.attn.q_proj).keys())
+    assert any(
+        k[0] == 3 for k in row_exact_keys
+    ), f"row-exact opt-in model must still plan group3: {row_exact_keys}"
+
+    # --- 4. pre-a1-529daae8 Mutant 2 (unaligned N % 8 != 0 ref_proof_tasks) ---
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(row_exact_qmv, "_UNROLLED_VERDICTS", {})
+
+    class _UnalignedAttn(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj, _ = _quantized_format_linear(
+                fmt, 128, 256, 8, 64, dtype, seed=441
+            )
+            self.k_proj, _ = _quantized_format_linear(
+                fmt, 64, 256, 8, 64, dtype, seed=442
+            )
+            self.v_proj, _ = _quantized_format_linear(
+                fmt, 64, 256, 8, 64, dtype, seed=443
+            )
+            # N=68 is divisible by 4 (group1 rps=4 -> 2*rps=8? Use N=72? No,
+            # 2*rps=8 requires N%8==0 for o_proj; unaligned N%8!=0 hits
+            # _plan_warm_target directly with rps=2 / N=68).
+            self.o_proj, _ = _quantized_format_linear(
+                fmt, 68, 256, 8, 64, dtype, seed=444
+            )
+
+    with testing.verified("qwen4_exp"):
+        ua = _UnalignedAttn()
+    insts: dict = {}
+    unrolled: dict = {}
+    refs: dict = {}
+    row_exact_qmv._plan_warm_target(
+        (ua.o_proj,),
+        256,
+        2,
+        dtype,
+        (2, 2, True),
+        grouped=True,
+        instances=insts,
+        unrolled_tasks=unrolled,
+        ref_proof_tasks=refs,
+    )
+    o_plan = linear._plan(ua.o_proj)
+    assert o_plan is not None and o_plan.n % 8 != 0
+    assert (id(o_plan.proof), (dtype, 1)) in refs
+
+    # --- 5. pre-a1-529daae8 Mutant 3 (pre-populated _UNROLLED_VERDICTS[shape]=True
+    #        still builds inst into inst.kernel._built) ---
+    orig_build = row_exact_qmv.row_exact_skeleton.build_plan
+    captured_u: list = []
+
+    def _cap_u(faces, shapes, k, rows, dt, geometry, **kwargs):
+        plan = orig_build(faces, shapes, k, rows, dt, geometry, **kwargs)
+        if plan is not None and geometry[2]:
+            in_specs, _ = row_exact_qmv._plan_stand_in(plan, k, dt)
+            inst = kernels.planned(
+                plan.kernel, in_specs, plan.output_dtypes, template=plan.template
+            )
+            inst.kernel._built.clear()
+            row_exact_qmv._UNROLLED_VERDICTS[plan.shape] = True
+            captured_u.append(inst)
+        return plan
+
+    monkeypatch.setattr(row_exact_qmv.row_exact_skeleton, "build_plan", _cap_u)
+    for fut in row_exact_qmv.warm_model(disarmed_m, mtp_enabled=True):
+        fut.result()
+    assert captured_u, "expected unrolled attention instances"
+    for inst in captured_u:
+        assert (
+            inst in inst.kernel._built
+        ), "pre-verified unrolled tile must still build into kernel._built"
+
+
+def test_warm_hc_fused_zero_compiles_and_mutants(monkeypatch):
+    """Release/4 U21 hc_fused warming:
+    1) Subprocess Metal spy: zero omlx_qwen4_hc_* Metal compiles, zero
+       _VALIDATED misses (mid-forward mx.eval syncs), and zero mx.compile calls
+       on request #0 across prefill (write=False/True, INJ=1 tail_launch &
+       INJ=0 _tail) and decode/batch/verify (rows=1,2,3,4,7,16, write=False/True),
+       bitwise-identical to unwarmed outputs;
+    2) Concurrent warm_model thread safety + O(1) second-call no-op;
+    3) Fail-closed on broken face kernel: raises FaceKernelError and never marks
+       launch recorded or validated;
+    4) Non-Qwen4 model warm never imports mlx_vlm.models.qwen4_exp.hc_fused.
+    """
+    import concurrent.futures
+    import subprocess
+    import sys
+    import threading
+    from pathlib import Path
+
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    repo_root = str(Path(__file__).resolve().parents[1])
+    probe = r"""
+import ctypes as C
+import ctypes.util
+import json
+import re
+import sys
+import threading
+
+import mlx.core as mx
+import mlx.nn as nn
+
+from omlx.formats import affine, linear, testing
+from omlx.formats.linear import FormatLinear
+from omlx.patches import (
+    mlx_vlm_qwen4_exp_compat as compat,
+    qwen35_moe_routed_decode,
+)
+
+compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+from mlx_vlm.models.qwen4_exp import hc_fused
+from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
+
+objc = C.CDLL(ctypes.util.find_library("objc"))
+metal = C.CDLL("/System/Library/Frameworks/Metal.framework/Metal")
+ptr = C.c_void_p
+metal.MTLCreateSystemDefaultDevice.restype = ptr
+objc.object_getClass.argtypes = [ptr]
+objc.object_getClass.restype = ptr
+objc.sel_registerName.argtypes = [C.c_char_p]
+objc.sel_registerName.restype = ptr
+objc.class_getInstanceMethod.argtypes = [ptr, ptr]
+objc.class_getInstanceMethod.restype = ptr
+objc.method_getImplementation.argtypes = [ptr]
+objc.method_getImplementation.restype = ptr
+objc.method_setImplementation.argtypes = [ptr, ptr]
+objc.method_setImplementation.restype = ptr
+
+msg_str = C.CFUNCTYPE(C.c_char_p, ptr, ptr)(("objc_msgSend", objc))
+sel_utf8 = objc.sel_registerName(b"UTF8String")
+
+dev = metal.MTLCreateSystemDefaultDevice()
+cls = objc.object_getClass(dev)
+sel = objc.sel_registerName(b"newLibraryWithSource:options:error:")
+method = objc.class_getInstanceMethod(cls, sel)
+sig = C.CFUNCTYPE(ptr, ptr, ptr, ptr, ptr, ptr)
+old_impl = sig(objc.method_getImplementation(method))
+
+lock = threading.Lock()
+phase = ["init"]
+recorded = {"init": [], "load": [], "request0": []}
+
+
+@sig
+def hooked(self_p, cmd_p, src_p, opts_p, err_p):
+    res = old_impl(self_p, cmd_p, src_p, opts_p, err_p)
+    if src_p:
+        raw = msg_str(src_p, sel_utf8)
+        if raw:
+            text = raw.decode("utf-8", errors="ignore")
+            m = re.search(r"omlx_qwen4_hc_[A-Za-z0-9_]*", text)
+            if m:
+                with lock:
+                    recorded[phase[0]].append(m.group(0))
+    return res
+
+
+objc.method_setImplementation(method, C.cast(hooked, ptr))
+
+HC, HIDDEN, LOWRANK = 4, 512, 128
+WIDTH = HC * HIDDEN
+dtype = mx.bfloat16
+fmt = affine.AffineFormat()
+
+
+def make_fl(k, n, seed):
+    mx.random.seed(seed)
+    w_fp = (mx.random.normal((n, k)) * 0.02).astype(dtype)
+    w, s, b = mx.quantize(w_fp, group_size=64, bits=8)
+    mx.eval(w, s, b)
+    layout = fmt.layout(k, n, 8, 64)
+    return FormatLinear(
+        fmt,
+        8,
+        64,
+        k,
+        {"weight": w, "scales": s, "biases": b},
+        None,
+        placeholders=False,
+        _load_layout=layout,
+    )
+
+
+def make_hc(use_combine, seed):
+    mod = Qwen4ExpGatedResidual.__new__(Qwen4ExpGatedResidual)
+    nn.Module.__init__(mod)
+    mod.hc_count, mod.hidden_size, mod.hc_lowrank = HC, HIDDEN, LOWRANK
+    mod.hc_norm = Qwen4ExpRMSNorm(WIDTH, group_size=HIDDEN, eps=1e-6)
+    mx.random.seed(seed)
+    mod.hc_norm.weight = (mx.random.normal((WIDTH,)) * 0.05).astype(dtype)
+    mod.input_mix_weight_down = make_fl(WIDTH, LOWRANK, seed + 1)
+    mod.input_mix_weight_up = make_fl(LOWRANK, WIDTH, seed + 2)
+    if use_combine:
+        mod.block_inject_weight = make_fl(WIDTH, HC, seed + 3)
+    mod.eval()
+    mx.eval(mod.parameters())
+    return mod
+
+
+class _Model(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.hc_inj0 = make_hc(True, 10)
+        self.hc_inj1 = make_hc(True, 20)
+        self.hc_mix = make_hc(False, 30)
+
+
+with testing.verified("qwen4_exp"):
+    model = _Model()
+    hc_fused.rebuild_plans(model)
+
+    # Compute unwarmed reference outputs on a separate cloned model? Even simpler:
+    # run reference after resetting hc_fused caches or compute eager reference now?
+    # Keep subprocess clean: record bit-exact outputs via warmed vs cleared cache.
+    phase[0] = "load"
+    for fut in linear.warm_existing_dense(model, dtypes=(dtype,)) or ():
+        fut.result()
+    qwen35_moe_routed_decode.warm_moe_model(
+        model, mtp_enabled=True, warm_dispatch=False
+    )
+    qwen35_moe_routed_decode.warm_engine_dispatch(
+        model,
+        mx.default_stream(mx.gpu),
+        prefill_lengths=(32,),
+        mtp_enabled=True,
+    )
+
+# Prepare inputs before switching to request0 phase.
+mx.random.seed(99)
+inputs = {}
+for rows in (1, 2, 3, 4, 7, 16, 32):
+    x = (mx.random.normal((1, rows, WIDTH)) * 0.1).astype(dtype)
+    br = (mx.random.normal((1, rows, HIDDEN)) * 0.1).astype(dtype)
+    gt = (mx.random.normal((1, rows, HC)) * 0.1).astype(dtype)
+    mx.eval(x, br, gt)
+    inputs[rows] = (x, br, gt)
+
+# Spy mid-forward mx.eval syncs (which happen ONLY on _VALIDATED misses) and
+# mx.compile calls during request0.
+mid_evals = []
+compile_calls = []
+orig_eval = mx.eval
+orig_compile = mx.compile
+
+
+def spy_eval(*args, **kwargs):
+    mid_evals.append(len(args))
+    return orig_eval(*args, **kwargs)
+
+
+def spy_compile(*args, **kwargs):
+    compile_calls.append(1)
+    return orig_compile(*args, **kwargs)
+
+
+phase[0] = "request0"
+mx.eval = spy_eval
+mx.compile = spy_compile
+try:
+    warm_outs = []
+    # Prefill (rows=32) on both inject (tail_launch) and mixer (_tail)
+    x32, br32, gt32 = inputs[32]
+    for mod in (model.hc_inj0, model.hc_inj1, model.hc_mix):
+        warm_outs.append(hc_fused.prefill_forward(mod, x32, write=None, nax=False))
+        warm_outs.append(hc_fused.prefill_forward(mod, x32, write=(br32, gt32), nax=False))
+    # Decode / batch / verify (rows=1,2,3,4,7,16) on inject & mixer
+    for rows in (1, 2, 3, 4, 7, 16):
+        xr, brr, gtr = inputs[rows]
+        for mod in (model.hc_inj0, model.hc_inj1, model.hc_mix):
+            warm_outs.append(hc_fused.fused_forward(mod, xr, write=None))
+            warm_outs.append(hc_fused.fused_forward(mod, xr, write=(brr, gtr)))
+finally:
+    mx.eval = orig_eval
+    mx.compile = orig_compile
+
+flat_warm = []
+for item in warm_outs:
+    if isinstance(item, tuple):
+        flat_warm.extend(item)
+    else:
+        flat_warm.append(item)
+mx.eval(*flat_warm)
+
+# Bitwise parity against cold validation path (clear _VALIDATED & recorded).
+hc_fused._VALIDATED.clear()
+cold_outs = []
+x32, br32, gt32 = inputs[32]
+for mod in (model.hc_inj0, model.hc_inj1, model.hc_mix):
+    cold_outs.append(hc_fused.prefill_forward(mod, x32, write=None, nax=False))
+    cold_outs.append(hc_fused.prefill_forward(mod, x32, write=(br32, gt32), nax=False))
+for rows in (1, 2, 3, 4, 7, 16):
+    xr, brr, gtr = inputs[rows]
+    for mod in (model.hc_inj0, model.hc_inj1, model.hc_mix):
+        cold_outs.append(hc_fused.fused_forward(mod, xr, write=None))
+        cold_outs.append(hc_fused.fused_forward(mod, xr, write=(brr, gtr)))
+flat_cold = []
+for item in cold_outs:
+    if isinstance(item, tuple):
+        flat_cold.extend(item)
+    else:
+        flat_cold.append(item)
+mx.eval(*flat_cold)
+
+bitwise_ok = len(flat_warm) == len(flat_cold) and all(
+    mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item()
+    for a, b in zip(flat_warm, flat_cold)
+)
+
+print(
+    json.dumps(
+        {
+            "load_count": len(recorded["load"]),
+            "request0": recorded["request0"],
+            "mid_evals": mid_evals,
+            "compile_calls": compile_calls,
+            "bitwise_ok": bitwise_ok,
+        }
+    )
+)
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert proc.returncode == 0, f"stderr:\n{proc.stderr}\nstdout:\n{proc.stdout}"
+    data = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert data["load_count"] > 0, f"expected hc_fused Metal warms at load: {data}"
+    assert (
+        data["request0"] == []
+    ), f"hc_fused Metal compiled on request #0: {data['request0']}"
+    assert (
+        data["mid_evals"] == []
+    ), f"mid-forward mx.eval syncs on request #0: {data['mid_evals']}"
+    assert (
+        data["compile_calls"] == []
+    ), f"mx.compile calls on request #0: {data['compile_calls']}"
+    assert data["bitwise_ok"] is True
+
+    # Part 2: Thread safety + O(1) second-call no-op + fail-closed on broken build.
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_fused
+    from mlx_vlm.models.qwen4_exp.language import Qwen4ExpGatedResidual, Qwen4ExpRMSNorm
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    hc, hidden, lowrank = 4, 512, 128
+    width = hc * hidden
+
+    def _make_hc(seed):
+        mod = Qwen4ExpGatedResidual.__new__(Qwen4ExpGatedResidual)
+        nn.Module.__init__(mod)
+        mod.hc_count, mod.hidden_size, mod.hc_lowrank = hc, hidden, lowrank
+        mod.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
+        mod.hc_norm.weight = mx.zeros((width,), dtype=dtype)
+        mod.input_mix_weight_down, _ = _quantized_format_linear(
+            fmt, lowrank, width, 8, 64, dtype, seed=seed
+        )
+        mod.input_mix_weight_up, _ = _quantized_format_linear(
+            fmt, width, lowrank, 8, 64, dtype, seed=seed + 1
+        )
+        mod.block_inject_weight, _ = _quantized_format_linear(
+            fmt, hc, width, 8, 64, dtype, seed=seed + 2
+        )
+        mod.eval()
+        mx.eval(mod.parameters())
+        return mod
+
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    monkeypatch.setattr(hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__)
+    with testing.verified("qwen4_exp"):
+        hc_mod = _make_hc(501)
+        hc_fused.rebuild_plans(hc_mod)
+
+    barrier = threading.Barrier(2)
+
+    def _run_concurrent():
+        barrier.wait()
+        futs = hc_fused.warm_model(hc_mod)
+        for fut in futs:
+            fut.result()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(_run_concurrent)
+        f2 = pool.submit(_run_concurrent)
+        f1.result()
+        f2.result()
+
+    assert hc_fused.warm_model(hc_mod) == ()
+    plan = hc_mod.__dict__[hc_fused._PLAN_ATTR]
+    assert plan.prefill_signatures[False] in hc_fused._VALIDATED
+    assert plan.prefill_signatures[True] in hc_fused._VALIDATED
+    for row_launches in plan.decode_launches:
+        assert row_launches[False] in hc_fused._VALIDATED
+        assert row_launches[True] in hc_fused._VALIDATED
+
+    # Part 3: Fail-closed on broken build: raises FaceKernelError and leaves
+    # _VALIDATED untouched.
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    with testing.verified("qwen4_exp"):
+        bad_mod = _make_hc(511)
+        hc_fused.rebuild_plans(bad_mod)
+
+    def _boom(*_a, **_kw):
+        raise RuntimeError("injected metal compile failure")
+
+    monkeypatch.setattr(kernels._Instance, "build", _boom)
+    bad_futs = hc_fused.warm_model(bad_mod)
+    assert bad_futs, "expected unbuilt warm futures"
+    with pytest.raises(
+        hc_fused.FaceKernelError, match="injected metal compile failure"
+    ):
+        for fut in bad_futs:
+            fut.result()
+    assert len(hc_fused._VALIDATED) == 0
+
+    # Part 4: Non-Qwen4 model warm never imports mlx_vlm.models.qwen4_exp.hc_fused.
+    non_qwen = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys, mlx.nn as nn\n"
+                "from omlx.patches import qwen35_moe_routed_decode\n"
+                "class M(nn.Module):\n"
+                "    pass\n"
+                "m = M()\n"
+                "qwen35_moe_routed_decode.warm_moe_model(m, warm_dispatch=True)\n"
+                "qwen35_moe_routed_decode.warm_engine_dispatch(m, None)\n"
+                "assert 'mlx_vlm.models.qwen4_exp.hc_fused' not in sys.modules\n"
+            ),
+        ],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert non_qwen.returncode == 0, non_qwen.stderr
+
+
+def test_warm_engine_dispatch_joins_row_futures_when_hc_warm_raises(monkeypatch):
+    """pre-a1-a69f8379 LOW 1 + all 5 surviving mutants:
+    1) warm_engine_dispatch joins row_exact_qmv futures if hc_fused.warm_model raises;
+    2) linear.py:1476 mutant (mtp_enabled=False still warms Qwen GDN stacked (1, 2, K));
+    3) hc_fused.py:2271 mutant (write_enabled()==False skips write=True warms);
+    4) hc_fused.py:2304/2404 mutant (FP32 HC plan skips prefill norms, _act, _tail);
+    5) hc_fused.py:2399 mutant (prefill_lengths filters out bool and <= MAX_ROWS);
+    6) qwen35_moe_routed_decode.py:1896 mutant (vendor-path sys.modules fallback).
+    """
+    import sys
+    import types
+
+    from omlx.formats import tile_dense
+    from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
+    from omlx.patches import qwen35_gdn_prework, row_exact_qmv
+
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    # --- LOW 1: warm_engine_dispatch joins submitted row_exact_qmv futures ---
+    spy_fut = _Future()
+
+    class _EmptyModel(nn.Module):
+        pass
+
+    monkeypatch.setattr(
+        row_exact_qmv, "warm_model", lambda _m, mtp_enabled=False: (spy_fut,)
+    )
+    fake_hc = types.SimpleNamespace(
+        warm_model=lambda _m: (_ for _ in ()).throw(RuntimeError("hc boom"))
+    )
+    monkeypatch.setattr(qwen35_moe_routed_decode, "_hc_fused_module", lambda: fake_hc)
+    with pytest.raises(RuntimeError, match="hc boom"):
+        qwen35_moe_routed_decode.warm_engine_dispatch(
+            _EmptyModel(), None, mtp_enabled=True
+        )
+    assert spy_fut.awaited == 1
+    monkeypatch.undo()
+
+    # --- Mutant 1: mtp_enabled=False warms Qwen GDN stacked (1, 2, 2560) ---
+    compat.apply_mlx_vlm_qwen4_exp_compat_patch()
+    from mlx_vlm.models.qwen4_exp import hc_fused
+    from mlx_vlm.models.qwen4_exp.language import (
+        Qwen4ExpGatedDeltaNet,
+        Qwen4ExpGatedResidual,
+        Qwen4ExpRMSNorm,
+        Qwen4ExpRMSNormGated,
+    )
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    hk, hv, dk, dv = 16, 48, 128, 128
+    c_dim = 2 * hk * dk + hv * dv
+
+    def _make_qwen_fl(n, k, seed):
+        layer, _ = _quantized_format_linear(fmt, n, k, 8, 64, dtype, seed=seed)
+        return layer
+
+    def _make_gdn_model():
+        mod = Qwen4ExpGatedDeltaNet.__new__(Qwen4ExpGatedDeltaNet)
+        nn.Module.__init__(mod)
+        mod.num_k_heads, mod.num_v_heads = hk, hv
+        mod.head_k_dim, mod.head_v_dim = dk, dv
+        mod.conv_kernel_size = 4
+        mod.conv1d = nn.Conv1d(c_dim, c_dim, 4, groups=c_dim, bias=False)
+        mod.conv1d.weight = mx.zeros((c_dim, 4, 1), dtype=dtype)
+        mod.norm = Qwen4ExpRMSNormGated(dv, eps=1e-6, activation="sigmoid")
+        mod.norm.weight = mx.ones((dv,), dtype=dtype)
+        mod.A_log = mx.zeros((hv,), dtype=dtype)
+        mod.dt_bias = mx.zeros((hv,), dtype=dtype)
+        mod.in_proj_qkv = _make_qwen_fl(c_dim, 2560, 611)
+        mod.in_proj_z = _make_qwen_fl(hv * dv, 2560, 612)
+        mod.in_proj_b = _make_qwen_fl(hv, 2560, 613)
+        mod.in_proj_a = _make_qwen_fl(hv, 2560, 614)
+        mod.out_proj = _make_qwen_fl(2560, hv * dv, 615)
+        mod.eval()
+        mx.eval(mod.parameters())
+
+        class _M(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.gdn = mod
+
+        return _M()
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    with testing.verified("qwen4_exp"):
+        gdn_m = _make_gdn_model()
+        for fut in linear.warm_existing_dense(gdn_m, dtypes=(dtype,)) or ():
+            fut.result()
+    qwen35_moe_routed_decode.warm_moe_model(
+        gdn_m, mtp_enabled=False, warm_dispatch=False
+    )
+    qwen35_moe_routed_decode.warm_engine_dispatch(
+        gdn_m, mx.default_stream(mx.gpu), prefill_lengths=(), mtp_enabled=False
+    )
+    dec_plan = qwen35_gdn_prework._qwen4_decode_plan(gdn_m.gdn)
+    assert dec_plan is not None
+    stacked = dec_plan[-1]
+    cold = []
+    orig_keep = linear._FormatLayer._keep
+    orig_bp = tile_dense.build_plan
+    orig_compile = mx.compile
+    orig_rf = linear.FormatLinear._register_fast
+    orig_rdf = linear.FormatLinear._register_dot_fast
+    monkeypatch.setattr(
+        linear._FormatLayer,
+        "_keep",
+        lambda self: (cold.append("keep") or orig_keep(self)),
+    )
+    monkeypatch.setattr(
+        tile_dense,
+        "build_plan",
+        lambda *a, **kw: (cold.append("bp") or orig_bp(*a, **kw)),
+    )
+    monkeypatch.setattr(
+        mx,
+        "compile",
+        lambda *a, **kw: (cold.append("compile") or orig_compile(*a, **kw)),
+    )
+    monkeypatch.setattr(
+        linear.FormatLinear,
+        "_register_fast",
+        lambda self, *a, **kw: (cold.append("rf") or orig_rf(self, *a, **kw)),
+    )
+    monkeypatch.setattr(
+        linear.FormatLinear,
+        "_register_dot_fast",
+        lambda self, *a, **kw: (cold.append("rdf") or orig_rdf(self, *a, **kw)),
+    )
+    p0 = kernels.proof_count()
+    y_b2 = stacked(mx.zeros((1, 2, 2560), dtype=dtype))
+    mx.eval(y_b2)
+    assert kernels.proof_count() == p0
+    assert (
+        cold == []
+    ), f"GDN stacked (1, 2, 2560) did cold work with mtp_enabled=False: {cold}"
+    monkeypatch.undo()
+
+    # Helper to build a small Qwen4ExpGatedResidual for mutants 2-4.
+    def _make_hc(dt, use_combine, seed):
+        hc, hidden, lowrank = 4, 512, 128
+        width = hc * hidden
+        mod = Qwen4ExpGatedResidual.__new__(Qwen4ExpGatedResidual)
+        nn.Module.__init__(mod)
+        mod.hc_count, mod.hidden_size, mod.hc_lowrank = hc, hidden, lowrank
+        mod.hc_norm = Qwen4ExpRMSNorm(width, group_size=hidden, eps=1e-6)
+        mod.hc_norm.weight = mx.zeros((width,), dtype=dt)
+        mod.input_mix_weight_down, _ = _quantized_format_linear(
+            fmt, lowrank, width, 8, 64, dt, seed=seed
+        )
+        mod.input_mix_weight_up, _ = _quantized_format_linear(
+            fmt, width, lowrank, 8, 64, dt, seed=seed + 1
+        )
+        if use_combine:
+            mod.block_inject_weight, _ = _quantized_format_linear(
+                fmt, hc, width, 8, 64, dt, seed=seed + 2
+            )
+        mod.eval()
+        mx.eval(mod.parameters())
+        return mod
+
+    # --- Mutant 2: write_enabled() == False skips write=True warms ---
+    monkeypatch.setattr(hc_fused, "_WRITE_DISABLED", True)
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    monkeypatch.setattr(hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__)
+    with testing.verified("qwen4_exp"):
+        hc_nowrite = _make_hc(mx.bfloat16, True, 620)
+        hc_fused.rebuild_plans(hc_nowrite)
+    for fut in hc_fused.warm_model(hc_nowrite):
+        fut.result()
+    plan_nw = hc_nowrite.__dict__[hc_fused._PLAN_ATTR]
+    assert plan_nw.prefill_signatures[False] in hc_fused._VALIDATED
+    assert plan_nw.prefill_signatures[True] not in hc_fused._VALIDATED
+    for row_launches in plan_nw.decode_launches:
+        assert row_launches[False] in hc_fused._VALIDATED
+        assert row_launches[True] not in hc_fused._VALIDATED
+    monkeypatch.undo()
+
+    # --- Mutant 3: FP32 HC plan skips prefill norms, _act, _tail ---
+    monkeypatch.setattr(hc_fused, "_VALIDATED", set())
+    monkeypatch.setattr(hc_fused, "_KERNELS", {})
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(kernels, "_RAW_KERNELS", {})
+    monkeypatch.setattr(hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__)
+    with testing.verified("qwen4_exp"):
+        hc_fp32 = _make_hc(mx.float32, False, 630)
+        hc_fused.rebuild_plans(hc_fp32)
+    for fut in hc_fused.warm_model(hc_fp32):
+        fut.result()
+    plan_32 = hc_fp32.__dict__[hc_fused._PLAN_ATTR]
+    assert plan_32.dtype == mx.float32
+    assert plan_32.prefill_signatures[False] not in hc_fused._VALIDATED
+    assert plan_32.prefill_signatures[True] not in hc_fused._VALIDATED
+    assert "omlx_qwen4_hc_prefill_norm" not in hc_fused._KERNELS
+    act_calls = []
+    tail_calls = []
+    monkeypatch.setattr(
+        hc_fused, "_act", lambda hc: (act_calls.append(hc) or (lambda y: y))
+    )
+    monkeypatch.setattr(
+        hc_fused,
+        "_tail",
+        lambda hc, h: (tail_calls.append((hc, h)) or (lambda u, n: u)),
+    )
+    hc_fused.warm_model_dispatch(hc_fp32, prefill_lengths=(32,))
+    assert act_calls == [] and tail_calls == []
+    monkeypatch.undo()
+
+    # --- Mutant 4: prefill_lengths filters out bool and <= MAX_ROWS ---
+    with testing.verified("qwen4_exp"):
+        hc_mix = _make_hc(mx.bfloat16, False, 640)
+        hc_fused.rebuild_plans(hc_mix)
+    seen_tail_shapes = []
+    orig_tail = hc_fused._tail
+
+    def _spy_tail(hc, h):
+        fn = orig_tail(hc, h)
+
+        def _wrapped(u, n):
+            seen_tail_shapes.append(u.shape)
+            return fn(u, n)
+
+        return _wrapped
+
+    class _IntSub(int):
+        pass
+
+    monkeypatch.setattr(hc_fused, "_tail", _spy_tail)
+    hc_fused.warm_model_dispatch(
+        hc_mix, prefill_lengths=(True, _IntSub(33), 1, hc_fused.MAX_ROWS, 32)
+    )
+    assert seen_tail_shapes == [(1, 32, 4 * 512)]
+    monkeypatch.undo()
+
+    # --- Mutant 5: _hc_fused_module falls back to full vendor sys.modules key ---
+    vendor_key = (
+        "omlx.patches.mlx_vlm_qwen4_exp_compat.vendor.mlx_vlm.models.qwen4_exp.hc_fused"
+    )
+    alias_key = "mlx_vlm.models.qwen4_exp.hc_fused"
+    sentinel = object()
+    monkeypatch.delitem(sys.modules, alias_key, raising=False)
+    monkeypatch.setitem(sys.modules, vendor_key, sentinel)
+    assert qwen35_moe_routed_decode._hc_fused_module() is sentinel
+
+
+def test_vfast_c3_schedule_warms_all_routes_and_k_mod_8_zero_cold_work(monkeypatch):
+    """VFAST c3 load-time warm-up: mma, msg, wide, mlx, dot, steel/nax, and
+    k % 32 != 0 (k % 8 == 0) all warm at load with zero cold proofs, plans,
+    compiles, or fast registrations on request #0, and warmed mma/msg graphs
+    hold no DensePlan closure."""
+    import gc
+    import weakref
+
+    from omlx import formats
+    from omlx.formats import tile_dense, tuning
+
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    fmt = affine.AffineFormat()
+    dtype = mx.bfloat16
+    dot_pol = tuning.DenseTilePolicy("dot")
+    msg_pol = tuning.MsgTilePolicy(4)
+    mma_pol = tuning.MmaTilePolicy(16, 32, 8)
+    wide_pol = tuning.DenseTilePolicy("wide")
+    mlx_pol = tuning.DenseTilePolicy("mlx")
+
+    def _sched_lookup(route, *a, rows=1, **kw):
+        if route == "dense_tile" and rows == 2:
+            return dot_pol
+        if route == "msg_tile" and 3 <= rows <= 4:
+            return msg_pol
+        if route == "mma_tile" and 5 <= rows <= 8:
+            return mma_pol
+        if route == "dense_tile" and 9 <= rows <= 12:
+            return wide_pol
+        if route == "dense_tile" and 13 <= rows <= 16:
+            return mlx_pol
+        return None
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(tuning, "lookup", _sched_lookup)
+    monkeypatch.setattr(tuning, "row_bounds", lambda route, **kw: (2, 4, 8, 12, 16))
+
+    class _AllRoutesModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.full, _ = _quantized_format_linear(
+                fmt, 128, 512, 8, 64, dtype, seed=701
+            )
+
+    with testing.verified("qwen4_exp"):
+        model = _AllRoutesModel()
+        for fut in linear.warm_existing_dense(model, dtypes=(dtype,)) or ():
+            fut.result()
+
+    linear.warm_model_dispatch(
+        model,
+        prefill_lengths=(64,),
+        decode_batch_sizes=(1, 2, 4, 8),
+        mtp_enabled=True,
+        verify_rows=(2, 3, 4, 8, 12, 16),
+    )
+
+    kept = model.full.__dict__[linear._KEPT]
+    assert tile_dense.route_for(kept.dense, 2, dtype).backend == "dot"
+    assert tile_dense.route_for(kept.dense, 4, dtype).backend == "msg"
+    assert tile_dense.route_for(kept.dense, 8, dtype).backend == "mma"
+    assert tile_dense.route_for(kept.dense, 12, dtype).backend == "wide"
+    assert tile_dense.route_for(kept.dense, 16, dtype).backend == "mlx"
+    assert kept.dense_fast is not None and kept.dot_fast is not None
+    assert {model.full._fast, model.full._fast2} == {kept.dense_fast, kept.dot_fast}
+
+    # Spy all cold work during request #0 across every route.
+    cold: list[str] = []
+    orig_keep = linear._FormatLayer._keep
+    orig_bp = tile_dense.build_plan
+    orig_compile = mx.compile
+    orig_rf = linear.FormatLinear._register_fast
+    orig_rdf = linear.FormatLinear._register_dot_fast
+    with monkeypatch.context() as spy:
+        spy.setattr(
+            linear._FormatLayer,
+            "_keep",
+            lambda self: (cold.append("keep") or orig_keep(self)),
+        )
+        spy.setattr(
+            tile_dense,
+            "build_plan",
+            lambda *a, **kw: (cold.append("build_plan") or orig_bp(*a, **kw)),
+        )
+        spy.setattr(
+            mx,
+            "compile",
+            lambda *a, **kw: (cold.append("compile") or orig_compile(*a, **kw)),
+        )
+        spy.setattr(
+            linear.FormatLinear,
+            "_register_fast",
+            lambda self, *a, **kw: (
+                cold.append("register_fast") or orig_rf(self, *a, **kw)
+            ),
+        )
+        spy.setattr(
+            linear.FormatLinear,
+            "_register_dot_fast",
+            lambda self, *a, **kw: (
+                cold.append("register_dot_fast") or orig_rdf(self, *a, **kw)
+            ),
+        )
+        p0 = kernels.proof_count()
+        xs = {
+            "1": mx.random.normal((1, 1, 512), dtype=dtype),
+            "b2": mx.random.normal((2, 1, 512), dtype=dtype),
+            "s2": mx.random.normal((1, 2, 512), dtype=dtype),
+            "s4": mx.random.normal((1, 4, 512), dtype=dtype),
+            "s8": mx.random.normal((1, 8, 512), dtype=dtype),
+            "s12": mx.random.normal((1, 12, 512), dtype=dtype),
+            "s16": mx.random.normal((1, 16, 512), dtype=dtype),
+            "p64": mx.random.normal((1, 64, 512), dtype=dtype),
+        }
+        mx.eval(*xs.values())
+        warm_outs = {k: model.full(v) for k, v in xs.items()}
+        mx.eval(*warm_outs.values())
+        assert kernels.proof_count() == p0
+        assert cold == [], f"unexpected cold work on c3 warmed routes: {cold}"
+
+    # Bitwise parity vs cold un-warmed execution.
+    ref_binding = weakref.ref(kept.dense.binding)
+    del kept
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    model.full.__dict__.pop(linear._KEPT, None)
+    model.full.__dict__.pop(linear._FAST, None)
+    model.full.__dict__.pop(linear._FAST2, None)
+    cold_outs = {k: model.full(v) for k, v in xs.items()}
+    mx.eval(*cold_outs.values())
+    for tag in xs:
+        assert mx.array_equal(
+            warm_outs[tag].view(mx.uint16), cold_outs[tag].view(mx.uint16)
+        ).item(), f"warm vs cold mismatch on {tag}"
+
+    # Warmed mma/msg graphs in _PROOFS must not pin DensePlan.binding on unload.
+    del model, warm_outs, cold_outs, xs
+    gc.collect()
+    assert ref_binding() is None, "warmed mma/msg graph pinned DensePlan.binding"
+
+    # Non-multiple-of-32 K (k=40, k % 8 == 0, k % 32 != 0) with a tile face
+    # warms wide at load and runs request #0 with zero cold compiles/plans.
+    from tests.test_formats_tile_dense import _stack, _tile_toy
+
+    monkeypatch.setattr(kernels, "_PROOFS", {})
+    monkeypatch.setattr(
+        tuning,
+        "lookup",
+        lambda route, *a, rows=1, **kw: (
+            wide_pol if route == "dense_tile" and 2 <= rows <= 16 else None
+        ),
+    )
+    monkeypatch.setattr(tuning, "row_bounds", lambda route, **kw: (4, 16))
+    face_k40 = _tile_toy("warm_k40_wide")
+
+    class _K40Format(formats.QuantFormat):
+        mode = "test_warm_k40"
+        codes_name = "codes"
+        tensors = ("group_scales",)
+
+        def layout(self, k, n, bits, group_size):
+            return {"codes": ((n, k), mx.uint8), "group_scales": ((n,), mx.float32)}
+
+        def decode(self, tensors, bits, group_size):
+            return (tensors["codes"].astype(mx.float32) - 128.0) * tensors[
+                "group_scales"
+            ][:, None]
+
+        def tile(self, layer, k, n):
+            return face_k40
+
+    k40_weights = {name: a[0] for name, a in _stack(32, 40, seed=71).items()}
+
+    class _K40Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = FormatLinear(_K40Format(), 8, 1, 40, k40_weights)
+
+    with testing.verified("qwen4_exp"):
+        m40 = _K40Model()
+        for fut in linear.warm_existing_dense(m40, dtypes=(dtype,)) or ():
+            fut.result()
+    linear.warm_model_dispatch(
+        m40, prefill_lengths=(), decode_batch_sizes=(1, 4), mtp_enabled=False
+    )
+    p40 = kernels.proof_count()
+    cold40: list[str] = []
+    with monkeypatch.context() as spy:
+        spy.setattr(
+            tile_dense,
+            "build_plan",
+            lambda *a, **kw: (cold40.append("bp") or orig_bp(*a, **kw)),
+        )
+        spy.setattr(
+            mx,
+            "compile",
+            lambda *a, **kw: (cold40.append("compile") or orig_compile(*a, **kw)),
+        )
+        y40 = m40.proj(mx.zeros((4, 1, 40), dtype=dtype))
+        mx.eval(y40)
+    assert kernels.proof_count() == p40
+    assert cold40 == [], f"k=40 wide route did cold work: {cold40}"
 
 
 def test_warm_moe_model_warms_batched_and_coalesced_verify_zero_proofs(

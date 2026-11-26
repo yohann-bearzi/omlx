@@ -1,12 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Boundaries of the native warm dispatcher and its Qwen family selector."""
+"""Boundaries of the native warm dispatcher."""
 
 import mlx.core as mx
 import pytest
 
 from omlx.custom_kernels.quant_matmul import fast as native
-from omlx.formats import kernels, linear
-from omlx.patches.format_load import loading
+from omlx.formats import kernels
 
 
 def dispatcher(weight, operands, kept):
@@ -27,6 +26,7 @@ def test_native_operand_limit_includes_the_input(count):
         # argument vector, even when run against the off-by-one mutant.
         def unexpected_lookup(signature):
             pytest.fail(f"registered {count} static operands for {signature}")
+
         proof._kept.replay = unexpected_lookup
     else:
         proof.keep(key, lambda *args: args)
@@ -66,9 +66,3 @@ def test_registering_the_65th_shape_restarts_native_signature_lookup():
     for i in (0, 63, 64):
         assert replay(layer, inputs[i]) is None
     assert kept.keys == [keys[-1]]
-
-
-def test_damaged_checkpoint_config_does_not_select_qwen(tmp_path):
-    (tmp_path / "config.json").write_text('{"model_type": "qwen4_exp"')
-    with loading(tmp_path):
-        assert not linear._loading_qwen()

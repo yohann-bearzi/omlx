@@ -667,9 +667,14 @@ def format_rows_qmv(linear, dtype, geometry):
         return plan, proof
 
     def project(x):
+        shape = x.shape
+        if not shape or shape[-1] != k or x.dtype != dtype:
+            raise ValueError(
+                f"row-exact tile: expected [..., {k}] {dtype}, got {shape} {x.dtype}"
+            )
         rows = x.size // k
         plan, proof = tile(rows)
-        signature = (x.shape, x.dtype)
+        signature = (shape, dtype)
         graph = proof.graphs.get(signature)
         if graph is not None:
             return graph(x, *operands)
@@ -768,6 +773,12 @@ class RowsQmv:
 
     def __call__(self, x: mx.array) -> mx.array:
         """``x`` is ``[..., K]`` of the planned dtype, row-contiguous."""
+        shape = x.shape
+        if not shape or shape[-1] != self._k or x.dtype != self._dtype:
+            raise ValueError(
+                f"row-exact tile: expected [..., {self._k}] {self._dtype}, "
+                f"got {shape} {x.dtype}"
+            )
         rows = x.size // self._k
         plan = self._launch.get(rows)
         if plan is None:
@@ -1003,7 +1014,7 @@ def _plan_warm_target(
         if (
             (s_plan.n % 8 and s_plan.shared is None)
             or not s_plan.face.exact_for(dtype)
-            or metal in s_plan.proof.ran
+            or (metal in s_plan.proof.ran and not s_plan.proof.failed)
         ):
             continue
         # Do not skip s_plan.proof.failed so Proof.warm fails closed.
@@ -1100,14 +1111,61 @@ def _attn_warm_dtypes(q_proj, model_dtype, *, fp16_recast: bool) -> tuple:
     return linear_mod._WARM_DTYPES
 
 
-def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
-    """Warm served ``omlx_row_exact_qmv`` Metal libraries on ``kernels._WARM_POOL``.
+def _row_exact_verify_enabled(model) -> bool:
+    """Whether ``model`` opts into row-exact MTP verify (g3 attention path)."""
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        if getattr(candidate, "_omlx_mtp_row_exact_verify", False):
+            return True
+    return False
 
-    Always warms the 1-row Qwen4 GDN (stacked in-proj, out-proj) and fused
-    Attention (group4 Q/K/V/index_qk, group1 o_proj) libraries. When
-    ``mtp_enabled`` is True, also warms and verifies the verify-window GDN
-    (rows 2..4), Attention fused (even/odd unrolled group4/group1), and
-    Attention group3 (Q/K/V) libraries.
+
+def _gdn_stacked_linears(
+    model, *, mtp_enabled: bool = False
+) -> tuple[FormatLinear, ...]:
+    """Return cached Qwen4 GDN stacked ``FormatLinear`` layers for ``model``."""
+    if model is None:
+        return ()
+    named_modules = getattr(model, "named_modules", None)
+    if not callable(named_modules):
+        return ()
+
+    from . import qwen35_gdn_prework
+
+    found: list[FormatLinear] = []
+    seen: set[int] = set()
+    for _, mod in named_modules():
+        if not qwen35_gdn_prework._is_qwen4_gdn(mod):
+            continue
+        dec_plan = qwen35_gdn_prework._qwen4_decode_plan(mod)
+        if dec_plan is not None:
+            stacked = dec_plan[-1]
+            if isinstance(stacked, FormatLinear) and id(stacked) not in seen:
+                seen.add(id(stacked))
+                found.append(stacked)
+        if mtp_enabled:
+            ver_plan = qwen35_gdn_prework._qwen4_verify_plan(mod)
+            if ver_plan is not None:
+                stacked = ver_plan[2]
+                if isinstance(stacked, FormatLinear) and id(stacked) not in seen:
+                    seen.add(id(stacked))
+                    found.append(stacked)
+    return tuple(found)
+
+
+def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
+    """Warm served ``omlx_row_exact_qmv`` and GDN stacked ``FormatLinear``
+    Metal libraries on ``kernels._WARM_POOL``.
+
+    Always warms the 1-row Qwen4 GDN (stacked in-proj, out-proj), the GDN
+    stacked ``FormatLinear`` batched/verify routes (rows 2..MAX_ROWS), and
+    fused Attention (group4 Q/K/V/index_qk, group1 o_proj) libraries. When
+    ``mtp_enabled`` is True, also warms and verifies fused Attention verify
+    (even/odd unrolled group4/group1, live at <2K), plus Attention group3
+    (Q/K/V) only for models opting into ``_omlx_mtp_row_exact_verify``.
 
     Returns futures submitted to ``kernels._WARM_POOL``; callers must await
     them and fail closed on any error.
@@ -1123,15 +1181,18 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
 
     fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
     model_dtype = None if fp16_recast else linear_mod._infer_model_dtype(model)
+    warm_g3 = mtp_enabled and _row_exact_verify_enabled(model)
 
     instances: dict = {}
+    proofs: dict = {}
     unrolled_tasks: dict = {}
     ref_proof_tasks: dict = {}
     seen_attn: set[tuple] = set()
     seen_gdn: set[tuple] = set()
 
     for _, mod in named_modules():
-        # 1. Qwen4 GatedDeltaNet (1-row in/out + verify in/out when mtp_enabled).
+        # 1. Qwen4 GatedDeltaNet: 1-row row_exact_qmv (in/out) + stacked
+        #    FormatLinear Metals (rows >= 2 batch decode and disarmed verify).
         if qwen35_gdn_prework._is_qwen4_gdn(mod):
             projs = tuple(
                 getattr(mod, name, None)
@@ -1162,14 +1223,19 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
                 if gdn_key not in seen_gdn:
                     seen_gdn.add(gdn_key)
                     dec_plan = qwen35_gdn_prework._qwen4_decode_plan(mod)
-                    stacked = (
-                        qwen35_gdn_prework._stacked_format_inputs(mod)
-                        if dec_plan is not None
+                    ver_plan = (
+                        qwen35_gdn_prework._qwen4_verify_plan(mod)
+                        if mtp_enabled and dec_plan is None
                         else None
+                    )
+                    stacked = (
+                        dec_plan[-1]
+                        if dec_plan is not None
+                        else (ver_plan[2] if ver_plan is not None else None)
                     )
                     out_proj = mod.out_proj
                     out_dims = _linear_in_out(out_proj)
-                    if dec_plan is not None:
+                    if dec_plan is not None or ver_plan is not None:
                         if stacked is not None:
                             _plan_warm_target(
                                 (stacked,),
@@ -1182,6 +1248,10 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
                                 unrolled_tasks=unrolled_tasks,
                                 ref_proof_tasks=ref_proof_tasks,
                             )
+                            if isinstance(stacked, FormatLinear):
+                                linear_mod._plan_existing_dense_warm(
+                                    stacked, (dtype,), instances, proofs
+                                )
                         if out_dims is not None:
                             _plan_warm_target(
                                 (out_proj,),
@@ -1194,46 +1264,10 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
                                 unrolled_tasks=unrolled_tasks,
                                 ref_proof_tasks=ref_proof_tasks,
                             )
-                    if (
-                        mtp_enabled
-                        and qwen35_gdn_prework._qwen4_verify_plan(mod) is not None
-                    ):
-                        if stacked is None:
-                            stacked = qwen35_gdn_prework._stacked_format_inputs(mod)
-                        for rows in _VERIFY_WARM_ROWS:
-                            if stacked is not None:
-                                rps, grp = qwen35_gdn_prework._qwen4_verify_in_tile(
-                                    rows
-                                )
-                                _plan_warm_target(
-                                    (stacked,),
-                                    stacked.input_dims,
-                                    rows,
-                                    dtype,
-                                    (grp, rps, True),
-                                    grouped=False,
-                                    instances=instances,
-                                    unrolled_tasks=unrolled_tasks,
-                                    ref_proof_tasks=ref_proof_tasks,
-                                )
-                            if out_dims is not None:
-                                rps, grp = qwen35_gdn_prework._qwen4_verify_out_tile(
-                                    rows
-                                )
-                                _plan_warm_target(
-                                    (out_proj,),
-                                    out_dims[0],
-                                    rows,
-                                    dtype,
-                                    (grp, rps, True),
-                                    grouped=False,
-                                    instances=instances,
-                                    unrolled_tasks=unrolled_tasks,
-                                    ref_proof_tasks=ref_proof_tasks,
-                                )
             continue
 
-        # 2. Qwen4 Attention (group4 + group1 always; even/odd _u + group3 if MTP).
+        # 2. Qwen4 Attention (group4 + group1 always; even/odd _u if MTP;
+        #    group3 only for row-exact-verify models).
         q_proj = getattr(mod, "q_proj", None)
         k_proj = getattr(mod, "k_proj", None)
         v_proj = getattr(mod, "v_proj", None)
@@ -1248,7 +1282,7 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
         indexer = getattr(mod, "indexer", None)
         idx_proj = getattr(indexer, "index_qk_proj", None)
         has_idx = isinstance(idx_proj, _QUANTIZED_TYPES)
-        if not has_idx and not mtp_enabled:
+        if not has_idx and not warm_g3:
             continue
         q_dims = _linear_in_out(q_proj)
         o_dims = _linear_in_out(o_proj)
@@ -1320,7 +1354,7 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
                             unrolled_tasks=unrolled_tasks,
                             ref_proof_tasks=ref_proof_tasks,
                         )
-            if mtp_enabled:
+            if warm_g3:
                 g3 = (q_proj, k_proj, v_proj)
                 for rows in _VERIFY_WARM_ROWS:
                     _plan_warm_target(
@@ -1354,7 +1388,11 @@ def warm_model(model, *, mtp_enabled: bool = False) -> tuple:
         if first_err is not None:
             raise first_err
 
-    futures = list(kernels.warm(instances)) if instances else []
+    futures = (
+        list(kernels.warm(linear_mod._attach_proofs(instances, proofs)))
+        if instances
+        else []
+    )
     for task in unrolled_tasks.values():
         futures.append(kernels._WARM_POOL.submit(task))
     return tuple(futures)
@@ -1374,13 +1412,14 @@ def warm_model_dispatch(model, *, mtp_enabled: bool = False) -> None:
 
     fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False))
     model_dtype = None if fp16_recast else linear_mod._infer_model_dtype(model)
+    warm_g3 = mtp_enabled and _row_exact_verify_enabled(model)
 
     for _, mod in named_modules():
         if qwen35_gdn_prework._is_qwen4_gdn(mod):
             dec_plan = qwen35_gdn_prework._qwen4_decode_plan(mod)
             if dec_plan is not None:
                 dtype = mod.conv1d.weight.dtype
-                in_qmv, out_qmv = dec_plan[-2], dec_plan[-1]
+                in_qmv, out_qmv = dec_plan[-3], dec_plan[-2]
                 if in_qmv is not None:
                     in_qmv(
                         mx.zeros((1, 1, qwen35_gdn_prework._QWEN4_HIDDEN_SIZE), dtype)
@@ -1392,16 +1431,10 @@ def warm_model_dispatch(model, *, mtp_enabled: bool = False) -> None:
                 if ver_plan is not None:
                     dtype = mod.conv1d.weight.dtype
                     in_rows, out_rows = ver_plan[0], ver_plan[1]
-                    for rows in _VERIFY_WARM_ROWS:
-                        in_rows(
-                            mx.zeros(
-                                (1, rows, qwen35_gdn_prework._QWEN4_HIDDEN_SIZE),
-                                dtype,
-                            )
-                        )
-                        out_rows(
-                            mx.zeros((1, rows, mod.num_v_heads * mod.head_v_dim), dtype)
-                        )
+                    in_rows(
+                        mx.zeros((1, 1, qwen35_gdn_prework._QWEN4_HIDDEN_SIZE), dtype)
+                    )
+                    out_rows(mx.zeros((1, 1, mod.num_v_heads * mod.head_v_dim), dtype))
             continue
 
         q_proj = getattr(mod, "q_proj", None)
@@ -1422,7 +1455,7 @@ def warm_model_dispatch(model, *, mtp_enabled: bool = False) -> None:
         indexer = getattr(mod, "indexer", None)
         idx_proj = getattr(indexer, "index_qk_proj", None)
         has_idx = isinstance(idx_proj, _QUANTIZED_TYPES)
-        if not has_idx and not mtp_enabled:
+        if not has_idx and not warm_g3:
             continue
         dtypes = _attn_warm_dtypes(q_proj, model_dtype, fp16_recast=fp16_recast)
         for dtype in dtypes:
@@ -1437,7 +1470,7 @@ def warm_model_dispatch(model, *, mtp_enabled: bool = False) -> None:
                         tile = _fused_attn_tile(rows)
                         _group_plan(g4, x_q, rows, tile)
                         _group_plan((o_proj,), x_o, rows, tile)
-            if mtp_enabled:
+            if warm_g3:
                 g3 = (q_proj, k_proj, v_proj)
                 for rows in _VERIFY_WARM_ROWS:
                     _group_plan(g3, x_q, rows)

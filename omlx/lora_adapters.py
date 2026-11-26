@@ -20,6 +20,7 @@ import json
 import math
 import re
 import struct
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -482,5 +483,9 @@ def apply_adapter(model: nn.Module, path: str | Path) -> int:
         layer.update_modules(tree_unflatten([(name, wrapped)]))
     # oQh fused MLPs call matmul_rotated on their projections, which a wrapper lacks.
     oqh_runtime.release_wrapped(model)
+    # A wrapped HC projection no longer matches the plan built at load.
+    hc_fused = sys.modules.get("mlx_vlm.models.qwen4_exp.hc_fused")
+    if hc_fused is not None:
+        hc_fused.rebuild_plans(model)
     mx.eval([(entry[3], entry[4]) for entry in plan])
     return len(plan)

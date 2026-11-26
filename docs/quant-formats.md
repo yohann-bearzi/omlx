@@ -558,7 +558,7 @@ model.layers.0.mlp.gate_proj.weight: ...`.
 
 A face is a frozen dataclass: a `Dot` for the mat-vec kernels, a `Tile` for the kernels that decode tiles of weights (see [The tile face](#the-tile-face)), and a `Codes` for integer levels with a group scale and bias (see [The codes face](#the-codes-face)). A kernel builder is cached on the faces it is instantiated with, so a format returns equal faces for layers of the same layout (cache them) and a kernel is compiled once per layout.
 
-A format's `dot(layer, k, n)` and `tile(layer, k, n)` may depend on the registered format for the layer's mode, the matrix dimensions `k` and `n`, the layer's training state, its `bits` and `group_size` (both value and type), and its directly held tensors. The tensor names, shapes, dtypes and values can all matter. For example, a checkpoint can supply a tensor of fitted levels for a face's table. To change a tensor used to select or build a face, bind a new array to the layer. An in-place change to the existing array leaves its binding intact and can reuse the previous face.
+A format's `dot(layer, k, n)` and `tile(layer, k, n)` may depend on the registered format for the layer's mode, the matrix dimensions `k` and `n`, the layer's training state, its `bits` and `group_size` (both value and type), and its directly held tensors. The tensor names, shapes, dtypes and values can all matter. For example, a checkpoint can supply a tensor of fitted levels for a face's table. To change a tensor used to select or build a face, bind a new array to the layer. An in-place change to the existing array leaves its binding intact and can reuse the previous face. A format whose faces depend on training state must set `training_sensitive = True` on its `QuantFormat` subclass so fused hyper-connection plans record `_training`.
 
 For each face kind and matrix shape, an `nn.Module` keeps its format's answer, including an ordinary `None`, while those inputs are unchanged. Renaming a tensor, replacing its array, changing a width or training state, or replacing the registered format triggers a new lookup. A format can be called from more than one thread. A defective answer is reported on each lookup that encounters it.
 
@@ -1392,6 +1392,32 @@ inject dot read in whole face lanes over each virtual thread's contiguous run,
 tile the 256 threads (`256 * vpt` does not divide the row's width) or whose
 staged stream, partials and tables do not fit the threadgroup keeps the
 canonical path for the injection.
+
+The hyper-connection kernels take the layers the loader builds,
+`FormatLinear`s. A built-in affine layer keeps the lane faces above when it
+is 4, 5, 6 or 8 bits with groups of 32 or 64 and scales in the norm's dtype;
+2- and 3-bit affine stays canonical. A plugin's own dot face is taken when
+it is exact in that dtype and has lanes, and its codes and side tensors are
+read by the format's own names (D11), so nothing reads a `weight` tensor by
+hand. Each layer's faces, pre-read weight tuples, norm weight, `eps`,
+and prebuilt decode and prefill launches are fixed once as an immutable plan
+tuple by the load patch's post-eval hook after the loader's `model.eval()`
+(`hc_fused.rebuild_plans`, or lazily on first use under `_PLAN_LOCK` for
+directly constructed modules and direct `load_weights` callers); in-tree
+post-load mutators (`cast_bf16_params_to_fp16`, `apply_adapter`) rebuild
+plans automatically (a format declaring `QuantFormat.training_sensitive = True`
+records `_training` in its plan; an ordinary affine plan does not, so it
+survives the flip). A caller that invokes `model.eval()` directly on a format
+declaring `QuantFormat.training_sensitive = True` must build the plan under
+`eval()` (that is, call `eval()` before the first forward or
+`hc_fused.rebuild_plans`), or call `hc_fused.rebuild_plans(model)` afterwards. Any other un-rebuilt post-load mutation to
+recorded layer, projection, norm, or geometry reads fails closed with
+`ValueError` naming `rebuild_plan`. Warm decode invokes the prebuilt native launch directly, both
+`fused_forward` and `prefill_forward` validate input shape, dtype, and row
+count up front with `ValueError`, decode supports same-dtype pending writes
+for BF16, FP16, and FP32 plans, and the tensor-unit prefill declines format
+layers until its port lands (N2), running each `FormatLinear` projection on
+its own route instead.
 
 The routed decode plans its launches for a bf16 or fp16 activation when both the gate+up and down faces are exact for it. A face with an empty `dtypes` accepts all three types in `formats.FLOATS`. The activation dtype selects the top-k kernel and is part of the proof shared between blocks. Its launches take rows in whole groups: a block whose expert width or hidden size is not a multiple of 4 keeps its composed path too (every affine layout is whole groups), and a shared expert whose width is not is left out of the fused launches. A block whose fused gate+up width is odd keeps its composed path: halving it would shift every expert past the first.
 

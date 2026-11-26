@@ -1687,10 +1687,7 @@ def test_batch_gather_eligibility_fails_closed(monkeypatch):
         (batch, language._GATHERED_BATCH_MAX_QUERY + 1, pair.config.hidden_size)
     )
     assert paddings(x=wide, mask=None, verify=True) is None
-    # Row-exact verify keeps its own arms.
-    monkeypatch.setattr(language, "_row_exact_verify_armed", lambda: True)
-    assert paddings(x=narrow, mask=window_mask, verify=True) is None
-    monkeypatch.setattr(language, "_row_exact_verify_armed", lambda: False)
+    # A verify window with a window mask takes the batch gather arms.
     # Singleton caches belong to the batch-one arms.
     assert paddings(x=decode[:1], mask=None, c=language.QSAKVCache()) is None
     # A misaligned indexer bank cannot be sliced per row.

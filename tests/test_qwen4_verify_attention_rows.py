@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Row-exact Lightning MTP verify rows through Qwen4 attention.
+"""Disarmed Lightning MTP verify rows through Qwen4 attention (Rule 33).
 
-Every verify row must get the bits of the serial one-row decode step at its
-position and leave the cache exactly as the serial steps would. Past the QSA
-block budget (rank-three positions, below the gathered crossover) a serial
-step attends through ``_masked_decode``: one-row block scores, the one-launch
-selection kernel and the selected-keys SDPA. Below the budget it runs MLX's
-vector SDPA over its whole prefix, on a kernel plan that depends on its key
-count. Real attention shapes (2560 hidden, 24/2 heads of 256, a 4x128
-indexer, 2048-token budget), synthetic 6-bit weights.
+Every verify window is compared with the serial one-row decode steps at the
+same positions within the C2 rounding bound (a one-row call is decode and
+stays bit-exact), and its cache is left as the serial steps would. Past the
+QSA block budget (rank-three positions, below the gathered crossover) a
+serial step attends through ``_masked_decode``: one-row block scores, the
+one-launch selection kernel and the selected-keys SDPA; a verify window
+makes ONE batched selection for the whole window. Below the budget it takes
+the fused dense gate (decision 5) or MLX's vector SDPA over each prefix; the
+armed ``row_exact_causal_sdpa`` route is never taken. Real attention shapes
+(2560 hidden, 24/2 heads of 256, a 4x128 indexer, 2048-token budget),
+synthetic 6-bit weights.
 """
 
 from __future__ import annotations
@@ -180,7 +183,7 @@ def masked_prefill(_stock_sdpa_helper):
 
 
 def _verify(attn, cache, x):
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
     try:
         out = attn(
             x,
@@ -240,6 +243,19 @@ def _bit_equal(a: mx.array, b: mx.array) -> bool:
     return a.shape == b.shape and a.dtype == b.dtype and mx.array_equal(a, b).item()
 
 
+def _close(want, got, tolerance=2e-2):
+    """Rule 33: a disarmed verify window takes the batched attention route,
+    so it differs from serial decode by rounding (the C2-style relative
+    bound), not bit for bit."""
+    if want.dtype != got.dtype or want.shape != got.shape:
+        return False
+    left = want.astype(mx.float32)
+    right = got.astype(mx.float32)
+    difference = float(mx.sqrt(mx.sum((left - right) ** 2)).item())
+    scale = float(mx.sqrt(mx.sum(left * left)).item())
+    return difference <= tolerance * max(scale, 1e-12)
+
+
 # 2060: the window starts just past the sparse crossover; 16382: its rows
 # straddle MLX's two-pass partition switch at 16384 keys (the multi-row MLX
 # path gave row 0 of a two-row window the 16384-key plan); 24000: the served
@@ -251,35 +267,40 @@ def test_masked_verify_rows_equal_serial_decode_steps(
 ):
     attn, cache = masked_prefill(context)
     selections = _record_selection(monkeypatch)
+    batched = []
+    selection_mask = language.Qwen4ExpQSAIndexer._selection_mask
+
+    def counted(self, *args, **keywords):
+        batched.append(1)
+        return selection_mask(self, *args, **keywords)
+
+    monkeypatch.setattr(language.Qwen4ExpQSAIndexer, "_selection_mask", counted)
     for seed in (11, 12):
         mx.random.seed(seed + rows)
         x = (mx.random.normal((1, rows, _CONFIG.hidden_size)) * 0.5).astype(mx.bfloat16)
 
+        batched.clear()
         verified = _verify(attn, cache, x)
         verified_state = _state(cache)
         verified_selections = selections[:]
         selections.clear()
+        batched_selections = batched[:]
+        batched.clear()
         cache.trim(rows)
 
         serial = _serial(attn, cache, x)
         serial_state = _state(cache)
-        serial_selections = selections[:]
         selections.clear()
         cache.trim(rows)
 
-        assert _bit_equal(verified, serial)
+        assert _close(verified, serial)
         for got, want in zip(verified_state, serial_state):
-            assert _bit_equal(got, want)
-        # Each row's FP32 block scores and selected tokens: the multi-row
-        # scores are a GEMM that rounds differently and can flip a selection
-        # at the cut-off.
-        assert len(verified_selections) == len(serial_selections) == rows
-        for (scores, keys, mask), (want_scores, want_keys, want_mask) in zip(
-            verified_selections, serial_selections
-        ):
-            assert keys == want_keys
-            assert _bit_equal(scores, want_scores)
-            assert _bit_equal(mask, want_mask)
+            assert _close(got, want)
+        # Rule 33: the disarmed window selects once for the batch; the
+        # per-row selection hook (seq_len == 1 only) never runs, and score
+        # parity against serial decode is the C4e KL bar's job.
+        assert verified_selections == []
+        assert len(batched_selections) == 1, batched_selections
 
 
 def test_masked_verify_rollback_then_decode_matches_serial():
@@ -299,10 +320,10 @@ def test_masked_verify_rollback_then_decode_matches_serial():
 
     expected = _serial(attn, reference, window[:, :2])
     expected_resumed = _serial(attn, reference, follow)
-    assert _bit_equal(verified[:, :2], expected)
-    assert _bit_equal(resumed, expected_resumed)
+    assert _close(verified[:, :2], expected)
+    assert _close(resumed, expected_resumed)
     for got, want in zip(_state(cache), _state(reference)):
-        assert _bit_equal(got, want)
+        assert _close(got, want)
 
 
 # Below the block budget: 700 keys stays on MLX's one-pass vector kernel;
@@ -310,7 +331,13 @@ def test_masked_verify_rollback_then_decode_matches_serial():
 # keys, which a shared multi-row call would hide.
 @pytest.mark.parametrize("context", [700, 1020, 1022])
 @pytest.mark.parametrize("rows", [2, 3, 4, 8, 16])
-def test_dense_verify_rows_equal_serial_decode_steps(context, rows):
+def test_dense_verify_rows_equal_serial_decode_steps(context, rows, monkeypatch):
+    import omlx.patches.qwen35_verify_sdpa_split as sdpa_split
+
+    def no_row_exact(*args, **kwargs):
+        pytest.fail("a disarmed verify window ran the row-exact SDPA")
+
+    monkeypatch.setattr(sdpa_split, "row_exact_causal_sdpa", no_row_exact)
     attn = _attention(seed=8)
     cache = _prefill(attn, context, seed=9)
     for seed in (31, 32):
@@ -322,6 +349,6 @@ def test_dense_verify_rows_equal_serial_decode_steps(context, rows):
         serial = _serial(attn, cache, x)
         serial_state = _state(cache)
         cache.trim(rows)
-        assert _bit_equal(verified, serial)
+        assert _close(verified, serial)
         for got, want in zip(verified_state, serial_state):
-            assert _bit_equal(got, want)
+            assert _close(got, want)

@@ -31,8 +31,9 @@ ops are available: one threadgroup per KV head and key split holds the rows
 of all its query heads, so each key block is read once per group. Otherwise
 blocks of four to eight rows use ``_wide_causal_sdpa``: one threadgroup per
 query head and key split holds all rows with simdgroup matrices. Both merge
-the splits in a second launch, and probabilities enter the value product in
-bf16.
+the splits in a second launch. ``_wide_causal_sdpa`` stages its
+probabilities and its value tile in FP32 (C1.2); the tensor-op path keeps
+them in the input dtype.
 
 MTP draft chains attend through ``ChainKVCache``: chain rows stay in a short
 tail next to the head's cache, and ``prefix_tail_attention`` reads both.
@@ -190,7 +191,7 @@ _WIDE_PARTIAL = """
     constexpr int D = 256;
     constexpr int BK = 32;
     constexpr int SS = 36;   // padded partial-S row stride (floats)
-    constexpr int PS = 40;   // padded P row stride (bf16)
+    constexpr int PS = 40;   // padded P row stride (floats: C1.2 P in FP32)
     uint tid = thread_position_in_threadgroup.x;
     uint sg = tid / 32;
     uint lane = tid % 32;
@@ -206,7 +207,7 @@ _WIDE_PARTIAL = """
     int t_end = min(t_begin + chunk, T);
 
     threadgroup float Sp[4 * 8 * SS];
-    threadgroup T_ P[8 * PS];
+    threadgroup float P[8 * PS];
     threadgroup float st_m[8];
     threadgroup float st_l[8];
     threadgroup float st_a[8];
@@ -269,7 +270,7 @@ _WIDE_PARTIAL = """
             for (int e = 0; e < 2; ++e) {
                 float p = m_new == -INFINITY ? 0.0f : exp(sv[e] - m_new);
                 rsum += p;
-                P[r * PS + cp + e] = T_(p);
+                P[r * PS + cp + e] = p;
             }
             for (int off = 1; off < 16; off <<= 1)
                 rsum += simd_shuffle_xor(rsum, ushort(off));
@@ -289,15 +290,22 @@ _WIDE_PARTIAL = """
             o[j].thread_elements()[1] *= alpha;
         }
         for (int kt = 0; kt < 4; ++kt) {
-            simdgroup_matrix<T_, 8, 8> pa;
+            // C1.2: the probabilities reach the P x V product in FP32, and V
+            // is widened to FP32 before it (a bf16 P loses tail mass that a
+            // large V turns into a visible error).
+            simdgroup_matrix<float, 8, 8> pa;
             simdgroup_load(pa, P + kt * 8, PS);
             int ts = min(t0 + kt * 8, T - 8);
             // Issue the tile's value loads before the products that use them.
-            simdgroup_matrix<T_, 8, 8> vb[8];
+            simdgroup_matrix<T_, 8, 8> vt[8];
             for (int j = 0; j < 8; ++j)
-                simdgroup_load(vb[j], vh + ts * vst + j * 8, vst);
-            for (int j = 0; j < 8; ++j)
-                simdgroup_multiply_accumulate(o[j], pa, vb[j], o[j]);
+                simdgroup_load(vt[j], vh + ts * vst + j * 8, vst);
+            for (int j = 0; j < 8; ++j) {
+                simdgroup_matrix<float, 8, 8> vb;
+                vb.thread_elements()[0] = float(vt[j].thread_elements()[0]);
+                vb.thread_elements()[1] = float(vt[j].thread_elements()[1]);
+                simdgroup_multiply_accumulate(o[j], pa, vb, o[j]);
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }

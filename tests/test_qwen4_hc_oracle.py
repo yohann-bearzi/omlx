@@ -9,7 +9,8 @@ GPU classes' geometry, at a hidden size whose K slices end in a partial block
 and at sizes whose do not, and on all-zero rows. FP32 activations run on no
 served path, but there the outputs keep every FP32 rounding of the sums, which
 the 16-bit outputs mostly absorb: they show a change of summation order
-(hc_fused takes FP32 rows in its decode, without a pending write).
+(hc_fused takes FP32 rows in its decode, including same-dtype pending
+writes; the oracle checks below run write-free FP32 rows).
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import pytest
 from omlx.formats import Table, affine, kernels
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 from tests.oracles import hc_fused as oracle
-from tests.test_qwen4_hc_fused import HC, LOWRANK, _module
+from tests.test_qwen4_hc_fused import HC, LOWRANK, _module, _reference_fp32, _rel_l2
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 
@@ -125,6 +126,71 @@ def _assert_bitwise(live, expected, what):
         assert mx.array_equal(a.view(view), b.view(view)).item(), (what, i)
 
 
+def _assert_prefill(live, expected, module, hyper, write, what):
+    """The tail inject and a written stream are bitwise; the mixed path runs
+    the layers' own route (a reordered accumulation), judged by the C2 bar
+    against an FP32 reference (rule 33, class 1)."""
+    live = live if isinstance(live, tuple) else (live,)
+    expected = expected if isinstance(expected, tuple) else (expected,)
+    assert len(live) == len(expected), what
+    mx.eval(live, expected)
+    if len(live) == 3:
+        mixed, middle, injection = live
+        expected_mixed, expected_middle, expected_injection = expected
+        if write is not None:
+            assert mx.array_equal(
+                middle.view(_view(middle.dtype)),
+                expected_middle.view(_view(expected_middle.dtype)),
+            ).item(), what
+            source = middle
+        else:
+            source = hyper
+    elif len(live) == 2:
+        mixed, middle = live
+        mixed_expected, expected_middle = expected
+        if write is not None:
+            assert mx.array_equal(
+                middle.view(_view(middle.dtype)),
+                expected_middle.view(_view(expected_middle.dtype)),
+            ).item(), what
+            source = middle
+        else:
+            source = hyper
+        injection = expected_injection = None
+        expected_mixed = mixed_expected
+    else:
+        (mixed,) = live
+        (expected_mixed,) = expected
+        injection = expected_injection = None
+        source = hyper
+    # Rule 33, class 1: the mixed path (and a fallback injection, which runs
+    # the same dense route) is a reordered accumulation, judged by the C2 bar
+    # against an FP32 reference from the same dequantized weights, not
+    # bitwise against the MLX quantized matmul it replaces. Where the tail
+    # inject's face tiles the width, its injection stays bitwise.
+    reference, reference_injection = _reference_fp32(module, source)
+    rel_new = _rel_l2(mixed, reference)
+    rel_base = _rel_l2(expected_mixed, reference)
+    assert rel_new <= 1.05 * rel_base + 1e-6, (what, rel_new, rel_base)
+    if injection is not None:
+        inject = module.block_inject_weight
+        tiled = (HC * module.hidden_size) % (256 * oracle.pack_factor(inject.bits)) == 0
+        if tiled:
+            assert mx.array_equal(
+                injection.view(_view(injection.dtype)),
+                expected_injection.view(_view(expected_injection.dtype)),
+            ).item(), what
+        else:
+            rel_new = _rel_l2(injection, reference_injection)
+            rel_base = _rel_l2(expected_injection, reference_injection)
+            assert rel_new <= 1.05 * rel_base + 1e-6, (
+                what,
+                "inject",
+                rel_new,
+                rel_base,
+            )
+
+
 def _inputs(rows, hidden, dtype, seed, zero=None, batch=1):
     mx.random.seed(seed)
     shape = (batch, rows, HC * hidden)
@@ -158,9 +224,49 @@ def _decode(monkeypatch, module, hyper, write, gpu_class):
         monkeypatch.setattr(
             hc_fused, "_decode_launch", hc_fused._decode_launch.__wrapped__
         )
+    hc_fused.rebuild_plan(module)
     live = hc_fused.fused_forward(module, hyper, write)
     assert live is not None
     return live, oracle.decode(module, hyper, write, gpu_class=gpu_class)
+
+
+@pytest.mark.parametrize("rows", [2, 7])
+def test_warm_decode_does_not_rerecord_face_kernel(rows, monkeypatch):
+    """OPT-1: warm decode calls prebuilt native launches directly without
+    re-entering _FaceKernel._record on either two-launch or three-launch rows."""
+    live = _live()
+    monkeypatch.setattr(live.kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(live, "_VALIDATED", set())
+    if hasattr(getattr(live, "_decode_launch", None), "__wrapped__"):
+        monkeypatch.setattr(live, "_decode_launch", live._decode_launch.__wrapped__)
+    seen = []
+    real_face_kernel = live.kernels.face_kernel
+
+    def capture(*args, **kwargs):
+        kernel = real_face_kernel(*args, **kwargs)
+        seen.append(kernel)
+        return kernel
+
+    monkeypatch.setattr(live.kernels, "face_kernel", capture)
+    module = _module(8, True, hidden=256)
+    hyper, pending = _inputs(rows, 256, mx.bfloat16, 2570 + rows)
+    first = live.fused_forward(module, hyper, pending)
+    assert first is not None
+    mx.eval(first)
+    assert seen
+    records = []
+    for kernel in seen:
+        real_record = kernel._record
+        monkeypatch.setattr(
+            kernel,
+            "_record",
+            lambda *a, _orig=real_record, **kw: records.append(1) or _orig(*a, **kw),
+        )
+    second = live.fused_forward(module, hyper, pending)
+    assert second is not None
+    mx.eval(second)
+    assert records == [], f"warm decode re-recorded _FaceKernel {len(records)} times"
+    _assert_bitwise(second, first, ("warm decode opt-1", rows))
 
 
 def test_decode_helper_switches_gpu_class_geometry(monkeypatch):
@@ -174,8 +280,10 @@ def test_decode_helper_switches_gpu_class_geometry(monkeypatch):
     original = live._down_rps
 
     def record(rows):
-        seen.append(original(rows))
-        return seen[-1]
+        rps = original(rows)
+        if rows == 4:
+            seen.append(rps)
+        return rps
 
     monkeypatch.setattr(live, "_down_rps", record)
     _decode(monkeypatch, module, hyper, None, "d")
@@ -227,7 +335,8 @@ def test_decode_with_partial_blocks_matches_the_oracle(
     seed = 1600 + hidden + bits + group_size
     modules = _modules(bits, group_size, dtype, hidden=hidden, seed=seed)
     rows = (1, 2, 3, 4, 6, 7, 16)
-    # hc_fused takes no pending write of FP32 rows.
+    # The oracle parity checks write-free FP32 rows; FP32 pending writes are
+    # covered by test_fused_forward_supports_fp32_pending_write.
     writes = dtype != mx.float32
     _assert_decode(monkeypatch, modules, hidden, dtype, rows, gpu_class, seed, writes)
 
@@ -239,7 +348,8 @@ def test_float32_decode_matches_the_oracle(bits, group_size, monkeypatch):
     modules = _modules(bits, group_size, mx.float32, seed=seed)
     rows = range(1, oracle.MAX_ROWS + 1)
     for gpu_class in ("d", "s"):
-        # hc_fused takes no pending write of FP32 rows.
+        # The oracle parity checks write-free FP32 rows; FP32 pending writes
+        # are covered by test_fused_forward_supports_fp32_pending_write.
         _assert_decode(
             monkeypatch, modules, 2560, mx.float32, rows, gpu_class, seed, False
         )
@@ -289,6 +399,12 @@ def test_tail_inject_ok_checks_vpt_and_table_bytes():
     assert not live._tail_inject_ok(10240, -2560, -4, dtype, qmv8)
     assert not live._tail_inject_ok(10240, 2560, 0, dtype, qmv8)
     assert not live._tail_inject_ok(10240, 2560, 4, dtype, None)
+    # width > 0, the width == hc * hidden upper bound, and the dtype's byte
+    # size are each load-bearing (pre-hc-8b9f3528 LOW-1).
+    assert not live._tail_inject_ok(0, 2560, 0, dtype, qmv8)
+    assert not live._tail_inject_ok(-10240, 2560, -4, dtype, qmv8)
+    assert not live._tail_inject_ok(2048, 2560, 4, dtype, qmv8)
+    assert not live._tail_inject_ok(32768, 8192, 4, mx.float32, qmv8)
     assert not live._tail_inject_ok(2560, 2560, 4, dtype, qmv8)
     assert not live._tail_inject_ok(3072, 1024, 3, dtype, qmv8)
     assert not live._tail_inject_ok(4096, 256, 16, dtype, qmv8)
@@ -301,9 +417,9 @@ def test_tail_inject_ok_checks_vpt_and_table_bytes():
     assert not live._tail_inject_ok(64512, 16128, 4, dtype, over)
 
 
-def test_prefill_tail_inject_uses_dot_face_and_finish(monkeypatch):
+def test_prefill_tail_inject_uses_dot_face_and_finish():
     """The tail inject reads the inject face: its finish scales the row's sum."""
-    from tests.test_formats_kernels import _toy
+    from tests.test_qwen4_hc_fused import _hc_toy_format, _plugin_projection
 
     hidden, dtype, rows = 2560, mx.bfloat16, 17
     width = HC * hidden
@@ -314,38 +430,39 @@ def test_prefill_tail_inject_uses_dot_face_and_finish(monkeypatch):
     module.input_mix_weight_up.biases = mx.full(
         module.input_mix_weight_up.biases.shape, -10.0, dtype
     )
-    inject = module.block_inject_weight
+    # A plugin inject: its own codes/name (D11) and a non-identity finish.
+    inject = _plugin_projection(_hc_toy_format(8), width, HC, 90)
+    module.block_inject_weight = inject
     codes = mx.full((HC, width), 128, mx.uint8)
     codes[:, 0] = 129
     codes[:, hidden] = 129
-    inject.weight = codes.view(mx.uint32)
-    inject.scales = mx.zeros_like(inject.scales)
-    inject.biases = mx.zeros_like(inject.biases)
+    inject.qcodes = codes
+    base_gains = mx.array([1.0, 1.5, 2.0, 2.5, 0.0, 0.0, 0.0, 0.0], mx.float32)
     hyper, _ = _inputs(rows, hidden, dtype, 2679)
     live = _live()
-    stock_face = live._decode_face
-    toy = replace(_toy("hc20"), tensors=("hc_gains",))
-    monkeypatch.setattr(
-        live,
-        "_decode_face",
-        lambda projection, is_inject: (
-            toy if projection is inject else stock_face(projection, is_inject)
-        ),
-    )
-    base_gains = mx.array([1.0, 1.5, 2.0, 2.5, 0.0, 0.0, 0.0, 0.0], mx.float32)
 
     def injection_of(gains):
-        inject.hc_gains = gains
+        inject.gains = gains
+        live.rebuild_plan(module)
         out = live.prefill_forward(module, hyper, None, nax=False)
         assert out is not None
         mx.eval(out)
-        return out[2]
+        return out[-1]
 
     base = injection_of(base_gains)
     doubled = injection_of(2.0 * base_gains)
     # The dot's value: each code adds its own stream's normed element.
     flat = hyper.reshape(rows, width)
-    normed = live._kernel_norm(module, flat, rows, HC, hidden, dtype, precise=True)
+    normed = live._kernel_norm(
+        module.hc_norm.weight,
+        live._eps_array(module),
+        flat,
+        rows,
+        HC,
+        hidden,
+        dtype,
+        precise=True,
+    )
     normed = normed.reshape(rows, width)
     total = normed[:, 0].astype(mx.float32) + normed[:, hidden].astype(mx.float32)
     for t in range(HC):
@@ -375,7 +492,7 @@ def test_float32_tail_inject_matches_oracle_bits(bits, group_size):
     face = affine.face(bits, group_size, False, mx.float32)
     launch = live._tail_inject_launch(HC, hidden, mx.float32, face)
     assert launch is not None
-    actual = launch(rows, up, normed, inject)
+    actual = launch(rows, up, normed, (inject.weight, inject.scales, inject.biases))
     expected = oracle._kernel(
         "ti_f32",
         ["up", "xn", "inject_w", "inject_s", "inject_b"],
@@ -403,7 +520,7 @@ def test_float32_tail_inject_matches_oracle_bits(bits, group_size):
 
 
 def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
-    """A swapped layer or a new input dtype rebuilds the plan and its launch."""
+    """A swapped layer or a new dtype rebuilds the immutable plan on rebuild_plan."""
     hidden, dtype, rows = 2560, mx.bfloat16, 17
     mx.random.seed(2810)
     module = _module(8, True, hidden=hidden)
@@ -423,10 +540,10 @@ def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
     assert out is not None
     assert seen and len(seen[-1].instances()) == 1
     _assert_bitwise(out, oracle.prefill(module, hyper, pending), "first plan")
-    first = module.__dict__["_hc_tail_inject"]
+    first = module.__dict__["_omlx_hc_plan"]
     face_calls = []
     records = []
-    real_face = live._decode_face
+    real_face = live._projection_face
     real_record = seen[-1]._record
 
     def counted_face(*args):
@@ -437,20 +554,22 @@ def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
         records.append(1)
         return real_record(*args, **kwargs)
 
-    monkeypatch.setattr(live, "_decode_face", counted_face)
+    monkeypatch.setattr(live, "_projection_face", counted_face)
     monkeypatch.setattr(seen[-1], "_record", counted_record)
     again = live.prefill_forward(module, hyper, pending, nax=False)
     assert again is not None
-    assert module.__dict__["_hc_tail_inject"] is first
+    assert module.__dict__["_omlx_hc_plan"] is first
     assert not face_calls and not records, (len(face_calls), len(records))
     other = _module(8, True, hidden=hidden, group_size=32)
     module.block_inject_weight = other.block_inject_weight
+    live.rebuild_plan(module)
     out = live.prefill_forward(module, hyper, pending, nax=False)
     assert out is not None
-    plan = module.__dict__["_hc_tail_inject"]
-    assert plan[0] is module.block_inject_weight and plan[0] is not first[0]
+    plan = module.__dict__["_omlx_hc_plan"]
+    assert plan.inject is module.block_inject_weight and plan.inject is not first.inject
     _assert_bitwise(out, oracle.prefill(module, hyper, pending), "swapped layer")
     module.set_dtype(mx.float16)
+    live.rebuild_plan(module)
     half = hyper.astype(mx.float16)
     half_pending = (
         pending[0].astype(mx.float16),
@@ -458,8 +577,8 @@ def test_prefill_tail_inject_plan_refreshes_and_records_instance(monkeypatch):
     )
     out = live.prefill_forward(module, half, half_pending, nax=False)
     assert out is not None
-    plan = module.__dict__["_hc_tail_inject"]
-    assert plan[1] == mx.float16
+    plan = module.__dict__["_omlx_hc_plan"]
+    assert plan.dtype == mx.float16
     _assert_bitwise(out, oracle.prefill(module, half, half_pending), "new input dtype")
 
 
@@ -475,12 +594,28 @@ def test_concurrent_prefill_tail_inject_matches_oracle(monkeypatch):
         module = modules[bits]
         hyper, pending = inputs[bits]
         barrier.wait()
+        first = None
         for _ in range(3):
             out = live.prefill_forward(module, hyper, pending, nax=False)
             assert out is not None
-            _assert_bitwise(
-                out, oracle.prefill(module, hyper, pending), ("thread", bits)
-            )
+            mx.eval(out)
+            if first is None:
+                first = out
+                _assert_prefill(
+                    out,
+                    oracle.prefill(module, hyper, pending),
+                    module,
+                    hyper,
+                    pending,
+                    ("thread", bits),
+                )
+            else:
+                # A thread's own repeat must be the same bits: a shared
+                # specialization or record racing would show here.
+                for a, b in zip(out, first):
+                    assert mx.array_equal(
+                        a.view(_view(a.dtype)), b.view(_view(b.dtype))
+                    ).item(), ("thread", bits)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = [pool.submit(run, bits) for bits in modules]
@@ -500,8 +635,13 @@ def test_concurrent_prefill_tail_inject_matches_oracle(monkeypatch):
             cold_barrier.wait()
             out = live.prefill_forward(module, hyper, pending, nax=False)
             assert out is not None
-            _assert_bitwise(
-                out, oracle.prefill(module, hyper, pending), ("cold", index)
+            _assert_prefill(
+                out,
+                oracle.prefill(module, hyper, pending),
+                module,
+                hyper,
+                pending,
+                ("cold", index),
             )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -576,18 +716,21 @@ def test_prefill_validates_distinct_faces_once_across_row_counts(monkeypatch):
     assert (
         prefill_signatures() == first
     ), "a second module with one face must not re-validate"
+    live.prefill_forward(same, hyper33, None, nax=False)
+    assert len(prefill_signatures()) == 2, "a write-free call validates its own"
     other = _module(8, True, hidden=hidden, group_size=32)
     other.hc_norm.weight = mx.zeros((HC * hidden,), dtype)
     hyper65, pending65 = _inputs(65, hidden, dtype, 2674)
     live.prefill_forward(other, hyper65, pending65, nax=False)
-    assert len(prefill_signatures()) == 2, "a distinct face validates its own"
-    assert module.__dict__["_hc_tail_inject"][0] is inject_layer
+    assert len(prefill_signatures()) == 3, "a distinct face validates its own"
+    assert module.__dict__["_omlx_hc_plan"].inject is inject_layer
     fallback = _module(8, True, hidden=1152)
     fallback.hc_norm.weight = mx.zeros((HC * 1152,), dtype)
     fb_hyper, fb_pending = _inputs(17, 1152, dtype, 2675)
     live.prefill_forward(fallback, fb_hyper, fb_pending, nax=False)
-    assert fallback.__dict__["_hc_tail_inject"][2:] == (None, None)
-    assert ("prefill", dtype, HC, 1152, True, None) in prefill_signatures()
+    fb_plan = fallback.__dict__["_omlx_hc_plan"]
+    assert (fb_plan.tail_launch, fb_plan.tail_face) == (None, None)
+    assert ("prefill", dtype, HC, 1152, True, None, ()) in prefill_signatures()
 
 
 def test_tail_inject_ok_mirrors_the_kernel_s_hc_assert():
@@ -627,9 +770,12 @@ def test_prefill_matches_the_oracle(bits, group_size, dtype, hidden):
             for write in (None, pending):
                 live = _live().prefill_forward(module, hyper, write, nax=False)
                 assert live is not None
-                _assert_bitwise(
+                _assert_prefill(
                     live,
                     oracle.prefill(module, hyper, write),
+                    module,
+                    hyper,
+                    write,
                     ("prefill", rows, "block_inject_weight" in module, write is None),
                 )
 
@@ -797,7 +943,14 @@ def test_batched_and_strided_rows_match_the_oracle(bits, monkeypatch):
                     else:
                         live = _live().prefill_forward(m, rows_in, write, nax=False)
                         assert live is not None
-                        _assert_bitwise(live, oracle.prefill(m, rows_in, write), what)
+                        _assert_prefill(
+                            live,
+                            oracle.prefill(m, rows_in, write),
+                            m,
+                            rows_in,
+                            write,
+                            what,
+                        )
     assert oracle._KERNELS
     assert all(name.startswith("omlx_oracle_") for name in oracle._KERNELS)
 
@@ -828,8 +981,13 @@ def test_mixed_projections_match_the_oracle(down, up, inject, monkeypatch):
         for write in (None, pending):
             live = _live().prefill_forward(module, hyper, write, nax=False)
             assert live is not None
-            _assert_bitwise(
-                live, oracle.prefill(module, hyper, write), ("prefill", rows)
+            _assert_prefill(
+                live,
+                oracle.prefill(module, hyper, write),
+                module,
+                hyper,
+                write,
+                ("prefill", rows),
             )
 
 
@@ -846,7 +1004,7 @@ def test_decode_uses_each_projections_dot_face(projection, rows, write, monkeypa
     from tests.test_formats_kernels import _toy
 
     live = _live()
-    stock_face = live._decode_face
+    stock_face = live._projection_face
     toy = replace(_toy("hc"), tensors=("hc_gains",))
     mx.random.seed(2500 + rows)
     hidden = 1152
@@ -875,8 +1033,10 @@ def test_decode_uses_each_projections_dot_face(projection, rows, write, monkeypa
     monkeypatch.setattr(live, "_gpu_class", lambda: "d")
     monkeypatch.setattr(
         live,
-        "_decode_face",
-        lambda p, inject: toy if p is layer else stock_face(p, inject),
+        "_projection_face",
+        lambda p, k, n, dtype, inject: (
+            toy if p is layer else stock_face(p, k, n, dtype, inject)
+        ),
     )
     result = live.fused_forward(module, hyper, operands)
     assert result is not None
@@ -890,7 +1050,7 @@ def test_decode_up_stages_each_chunk_before_adding_it(monkeypatch):
     from omlx.formats import ApplyRead, Dot, DotReads, LoadRead, MaddRead, TypeParam
 
     live = _live()
-    stock_face = live._decode_face
+    stock_face = live._projection_face
     toy = Dot(
         key="hc_fma",
         type="HcFma",
@@ -939,8 +1099,10 @@ struct HcFma {
     up.weight = codes.view(mx.uint32)
     monkeypatch.setattr(
         live,
-        "_decode_face",
-        lambda p, inject: toy if p is up else stock_face(p, inject),
+        "_projection_face",
+        lambda p, k, n, dtype, inject: (
+            toy if p is up else stock_face(p, k, n, dtype, inject)
+        ),
     )
     hyper, _ = _inputs(3, 256, mx.float32, 2561)
     monkeypatch.setattr(live, "_DECODE_V2", True)
@@ -951,6 +1113,7 @@ struct HcFma {
     assert staged is not None
     mx.eval(staged)
     monkeypatch.setattr(live, "_DECODE_V2", False)
+    live.rebuild_plan(module)
     serial = live.fused_forward(module, hyper)
     assert serial is not None
     _assert_bitwise(serial, staged, "up chunk accumulation")
@@ -1015,34 +1178,39 @@ def _kernel_recorder(live, monkeypatch, rows, width, hidden, lowrank, dtype):
 
     def record(**spec):
         name = spec["name"]
-        builds.append((name, spec.get("header", ""), spec.get("source", "")))
-        if "fused_write_norm" in name:
-            return lambda **kwargs: [
-                mx.zeros((rows, width), dtype),
-                mx.zeros((rows, width), dtype),
-            ]
-        if "fused_norm" in name:
-            return lambda **kwargs: [mx.zeros((rows, width), dtype)]
-        if "hc_fused_down" in name:
-            return lambda **kwargs: [
-                mx.zeros((rows, lowrank), dtype),
+        entry = (name, spec.get("header", ""), spec.get("source", ""))
+
+        def invoke(**kwargs):
+            builds.append(entry)
+            if "fused_write_norm" in name:
+                return [
+                    mx.zeros((rows, width), dtype),
+                    mx.zeros((rows, width), dtype),
+                ]
+            if "fused_norm" in name:
+                return [mx.zeros((rows, width), dtype)]
+            if "hc_fused_down" in name:
+                return [
+                    mx.zeros((rows, lowrank), dtype),
+                    mx.zeros((rows, HC), dtype),
+                ]
+            if "decode_write_norm_down" in name:
+                return [
+                    mx.zeros((rows, width), dtype),
+                    mx.zeros((rows, width), dtype),
+                    mx.zeros((rows, HC, lowrank + HC), mx.float32),
+                ]
+            if "decode_norm_down" in name:
+                return [
+                    mx.zeros((rows, width), dtype),
+                    mx.zeros((rows, HC, lowrank + HC), mx.float32),
+                ]
+            return [
+                mx.zeros((rows, hidden), dtype),
                 mx.zeros((rows, HC), dtype),
             ]
-        if "decode_write_norm_down" in name:
-            return lambda **kwargs: [
-                mx.zeros((rows, width), dtype),
-                mx.zeros((rows, width), dtype),
-                mx.zeros((rows, HC, lowrank + HC), mx.float32),
-            ]
-        if "decode_norm_down" in name:
-            return lambda **kwargs: [
-                mx.zeros((rows, width), dtype),
-                mx.zeros((rows, HC, lowrank + HC), mx.float32),
-            ]
-        return lambda **kwargs: [
-            mx.zeros((rows, hidden), dtype),
-            mx.zeros((rows, HC), dtype),
-        ]
+
+        return invoke
 
     monkeypatch.setattr(mx.fast, "metal_kernel", record)
     monkeypatch.setattr(live, "_KERNELS", {})
@@ -1134,14 +1302,17 @@ def test_affine_serial_up_streams_an_equal_face_copy(monkeypatch):
     module.hc_norm.weight = mx.zeros((width,), dtype)
     up = module.input_mix_weight_up
     live = _live()
-    stock_face = live._decode_face
-    copied = replace(stock_face(up, False))
-    assert copied == stock_face(up, False) and copied is not stock_face(up, False)
+    stock_face = live._projection_face
+    copied = replace(stock_face(up, LOWRANK, width, dtype, False))
+    assert copied == stock_face(up, LOWRANK, width, dtype, False)
+    assert copied is not stock_face(up, LOWRANK, width, dtype, False)
     monkeypatch.setattr(
         live,
-        "_decode_face",
-        lambda projection, inject: (
-            copied if projection is up else stock_face(projection, inject)
+        "_projection_face",
+        lambda projection, k, n, face_dtype, inject: (
+            copied
+            if projection is up
+            else stock_face(projection, k, n, face_dtype, inject)
         ),
     )
     monkeypatch.setattr(live, "_gpu_class", lambda: "d")
@@ -1176,30 +1347,31 @@ def test_decode_v2_accounts_for_face_table_bytes(monkeypatch):
 
 def test_decode_launch_accounts_for_face_tables(monkeypatch):
     """A face's staged tables reach the form's bounds through the launch."""
-
     hidden, rows = 16320, 1
     width = HC * hidden
-    module = _module(8, True, hidden=hidden, lowrank=512)
-    module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
-    down = module.input_mix_weight_down
-    inj = module.block_inject_weight
     live = _live()
-    stock_face = live._decode_face
-
+    stock_face = live._projection_face
+    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
     up_table = Table("u", mx.float32, (0.0,) * 5)  # 20 B, outside both bounds
 
-    def with_tables(down_table, inj_table):
-        def attach(projection, inject):
-            face = stock_face(projection, inject)
+    def case(down_table, inj_table, lowrank=512, inject=True):
+        # A fresh module per case resolves the patched faces on its first call.
+        module = _module(8, inject, hidden=hidden, lowrank=lowrank)
+        module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+        down = module.input_mix_weight_down
+        inj = module.block_inject_weight if inject else None
+
+        def attach(projection, k, n, dtype, inject_flag):
+            face = stock_face(projection, k, n, dtype, inject_flag)
             if projection is down:
                 return replace(face, tables=(down_table,))
-            if projection is inj:
+            if inj is not None and projection is inj:
                 return replace(face, tables=(inj_table,))
             return replace(face, tables=(up_table,))
 
-        return attach
+        monkeypatch.setattr(live, "_projection_face", attach)
+        return module
 
-    monkeypatch.setattr(live, "_gpu_class", lambda: "d")
     shared = Table("t", mx.float32, (0.0,) * 24)
     for down_table, inj_table, expected in (
         (
@@ -1214,7 +1386,7 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
         ),  # 48 + 52 overflow; any dropped face sees 52 at most
         (shared, shared, "decode_up"),  # one deduplicated 96-byte table fits
     ):
-        monkeypatch.setattr(live, "_decode_face", with_tables(down_table, inj_table))
+        module = case(down_table, inj_table)
         builds = _kernel_recorder(
             live, monkeypatch, rows, width, hidden, 512, module.hc_norm.weight.dtype
         )
@@ -1225,23 +1397,13 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
         assert expected in _up_builds(builds)[0], (expected, [b[0] for b in builds])
 
     # Without inject rows the down face's own table still counts.
-    plain = copy(module)
-    del plain["block_inject_weight"]
     plain_table = Table("d", mx.float32, (0.0,) * 25)  # 100 B, over the bound
-    monkeypatch.setattr(
-        live,
-        "_decode_face",
-        lambda projection, inject: (
-            replace(stock_face(projection, inject), tables=(plain_table,))
-            if projection is down
-            else stock_face(projection, inject)
-        ),
-    )
+    plain = case(plain_table, None, inject=False)
     builds = _kernel_recorder(
-        live, monkeypatch, rows, width, hidden, 512, module.hc_norm.weight.dtype
+        live, monkeypatch, rows, width, hidden, 512, plain.hc_norm.weight.dtype
     )
     out = live.fused_forward(
-        plain, mx.ones((1, rows, width), module.hc_norm.weight.dtype)
+        plain, mx.ones((1, rows, width), plain.hc_norm.weight.dtype)
     )
     assert out is not None
     assert (
@@ -1250,20 +1412,17 @@ def test_decode_launch_accounts_for_face_tables(monkeypatch):
 
     hidden, lowrank, rows = 256, 3200, 1
     width = HC * hidden
-    module = _module(4, False, hidden=hidden, lowrank=lowrank)
-    module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
-    up = module.input_mix_weight_up
-
-    def with_up_table(values):
-        table = Table("t", mx.float32, (0.0,) * values)
-        return lambda projection, inject: (
-            replace(stock_face(projection, inject), tables=(table,))
-            if projection is up
-            else stock_face(projection, inject)
-        )
-
     for values, expected in ((160, "decode_up"), (161, "fused_up")):
-        monkeypatch.setattr(live, "_decode_face", with_up_table(values))
+        table = Table("t", mx.float32, (0.0,) * values)
+        module = _module(4, False, hidden=hidden, lowrank=lowrank)
+        module.hc_norm.weight = mx.zeros((width,), module.hc_norm.weight.dtype)
+        up = module.input_mix_weight_up
+
+        def attach_up(projection, k, n, dtype, inject, _up=up, _table=table):
+            face = stock_face(projection, k, n, dtype, inject)
+            return replace(face, tables=(_table,)) if projection is _up else face
+
+        monkeypatch.setattr(live, "_projection_face", attach_up)
         builds = _kernel_recorder(
             live, monkeypatch, rows, width, hidden, lowrank, module.hc_norm.weight.dtype
         )
@@ -1284,7 +1443,7 @@ def test_concurrent_decode_reads_each_layers_current_weights(rows, monkeypatch):
     hyper, pending = _inputs(rows, 256, mx.bfloat16, 2671)
     expected = [oracle.decode(layer, hyper, pending, gpu_class="d") for layer in layers]
     for layer in layers:
-        live._eps_array(layer)
+        live.rebuild_plan(layer)
     mx.eval(expected)
     together = Barrier(2, timeout=30)
 

@@ -2,10 +2,11 @@
 """Unified parameterized direct dense prefill skeleton over a format's tile face.
 
 One steel emitter (Apple GPU without tensor units, e.g. M3 Ultra) and one NAX
-emitter (Apple GPU with tensor units, e.g. M5 Max) serve every dense matrix
-above ``linear.MAX_ROWS``. There is no MoE schedule, no expert offsets buffer,
-and no per-call policy lookup: ``build_plan`` resolves the layer's per-chip
-schedule once from ``omlx.formats.tuning`` at construction time.
+emitter (Apple GPU with tensor units, e.g. M5 Max), together with the wide and
+verify MMA/MSG routes, serve every dense matrix for rows >= 2. There is no MoE
+schedule, no expert offsets buffer, and no per-call policy lookup: ``build_plan``
+resolves the layer's per-chip schedule once from ``omlx.formats.tuning`` at
+construction time.
 """
 
 from __future__ import annotations
@@ -13,16 +14,17 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import re
 import threading
-from functools import cache
+from functools import cache, partial
 from typing import Any, NamedTuple
 
 import mlx.core as mx
 
 from .. import formats
 from ..patches.m5_gather_qmm_nax import _read_mlx_headers
-from . import Tile, affine, kernels, tile_wide, tuning
-from .tuning import DenseTilePolicy, ParamStaging
+from . import Tile, affine, kernels, tile_wide, tuning, verify_skeleton
+from .tuning import DenseTilePolicy, MmaTilePolicy, MsgTilePolicy, ParamStaging
 
 logger = logging.getLogger(__name__)
 _lock = threading.Lock()
@@ -844,6 +846,16 @@ class _WideBinding(NamedTuple):
     operands: tuple
 
 
+class DenseRoute(NamedTuple):
+    """One construction-time schedule bucket: every row count up to ``hi``
+    (None = the tail) takes ``backend``'s route with ``policy`` (None for an
+    unmeasured Dot fallback). Backends: dot, mlx, wide, steel, nax, mma, msg."""
+
+    hi: int | None
+    backend: str
+    policy: object
+
+
 class DensePlan(NamedTuple):
     """Construction-time dense prefill plan for one FormatLinear layer."""
 
@@ -851,8 +863,8 @@ class DensePlan(NamedTuple):
     operands: tuple
     proof: kernels.Proof
     said: tuple[str, str]
-    schedule: tuple[tuple[int | None, DenseTilePolicy], ...]
-    schedules: dict[mx.Dtype, tuple[tuple[int | None, DenseTilePolicy], ...]]
+    schedule: tuple[DenseRoute, ...]
+    schedules: dict[mx.Dtype, tuple[DenseRoute, ...]]
     k: int
     n: int
     bits: int
@@ -1068,28 +1080,26 @@ def _default_policy(
     return _default_steel_policy(rows, n, k)
 
 
-def _rows_chunks(lo: int, hi: int | None, max_rows: int = 16) -> tuple[int, ...]:
-    """Distinct chunk sizes ``_ordinary_rows`` can pass to ``_ordinary``
-    for any row count in ``[lo, hi]`` (bounded by 1..max_rows)."""
-    if hi is None or hi - lo + 1 >= max_rows:
-        return tuple(range(1, max_rows + 1))
-    chunks: set[int] = set()
-    for r in range(lo, hi + 1):
-        if r >= max_rows:
-            chunks.add(max_rows)
-        rem = r % max_rows
-        if rem:
-            chunks.add(rem)
-    return tuple(sorted(chunks))
+_CHIP_RE = re.compile(r"^applegpu_g\d+[a-z]?(?:_|$)")
 
 
-def _rows_bucket_ok(layer, lo: int, hi: int | None, *, chip: str | None = None) -> bool:
-    """Whether ``layer``'s ordinary rows route serves every chunk size a
-    ``[lo, hi]`` bucket can issue (rule 28, fail closed)."""
-    serves = getattr(layer, "_ordinary_serves", None)
-    if serves is None:
-        return False
-    return all(serves(chunk, chip=chip) for chunk in _rows_chunks(lo, hi))
+def _chip_recognized(chip: str) -> bool:
+    """Whether the row schedule knows this host's chip family."""
+    return bool(_CHIP_RE.match(chip or ""))
+
+
+def _wide_legal(face: Tile, k: int, chip: str) -> bool:
+    """The wide route's construction-time legality (rule 25: format faces
+    only, no stock-only gate)."""
+    return (
+        _chip_recognized(chip)
+        and k > 0
+        and k % 8 == 0
+        and kernels.table_bytes(face) <= 32768
+    )
+
+
+_UNSET = object()
 
 
 def _resolve_cell(
@@ -1102,8 +1112,18 @@ def _resolve_cell(
     *,
     tensor_units: bool,
     chip: str,
-) -> DenseTilePolicy:
+    dot_ok: bool = True,
+) -> DenseRoute:
+    """One schedule bucket's route, resolved from the DATA once (rule 28).
+
+    Measured entries win across dense_tile, mma_tile, and msg_tile (ranked by
+    tuning.match_rank); an unmeasured bucket below 17 rows takes MLX's own
+    matmul for an affine face, the format-generic wide route for a plugin when
+    legal, else the Dot plan; never the prefill default tiles (review 3 H4).
+    """
     k, n = layer.input_dims, layer.output_dims
+    bound = sample if hi is None else hi
+    candidates: list[tuple[int, str, str, object]] = []
     pol = tuning.lookup(
         "dense_tile",
         face,
@@ -1115,19 +1135,73 @@ def _resolve_cell(
         rows=sample,
         chip=chip,
     )
-    if pol is not None and pol.backend == "nax" and pol.wm * pol.wn * 32 < 2 * pol.bn:
-        # Explicit entries are refused by is_legal; a resolved cell never
-        # loads a refused config (DEFERRED: kLT==BN NAX precision).
-        pol = None
-    if pol is not None and not tensor_units and pol.backend == "nax":
-        pol = None
-    if pol is None:
-        return _default_policy(tensor_units, layer.bits, sample, n, k)
-    if pol.backend == "mlx" and layer.mode != "affine":
-        return _default_policy(tensor_units, layer.bits, sample, n, k)
-    if pol.backend == "rows" and not _rows_bucket_ok(layer, lo, hi, chip=chip):
-        return _default_policy(tensor_units, layer.bits, sample, n, k)
-    return pol
+    if (
+        isinstance(pol, DenseTilePolicy)
+        and not (
+            pol.backend == "nax"
+            and (not tensor_units or pol.wm * pol.wn * 32 < 2 * pol.bn)
+        )
+        and not (pol.backend == "mlx" and layer.mode != "affine")
+        and not (pol.backend == "wide" and not _wide_legal(face, k, chip))
+        and not (
+            pol.backend == "dot" and (not dot_ok or bound > tuning.schema._DOT_MAX_ROWS)
+        )
+    ):
+        candidates.append((2, "dense_tile", pol.backend, pol))
+    for prio, route_name, backend, cls in (
+        (1, "mma_tile", "mma", MmaTilePolicy),
+        (0, "msg_tile", "msg", MsgTilePolicy),
+    ):
+        data = tuning.lookup(
+            route_name,
+            face,
+            dtype=dtype,
+            bits=layer.bits,
+            group=layer.group_size,
+            n=n,
+            k=k,
+            rows=sample,
+            chip=chip,
+        )
+        if isinstance(data, cls) and data.is_legal(face, k, n, bound, chip, dtype):
+            candidates.append((prio, route_name, backend, data))
+    if len(candidates) == 1:
+        _, _, backend, chosen = candidates[0]
+        return DenseRoute(hi, backend, chosen)
+    if candidates:
+        _, _, backend, chosen = max(
+            candidates,
+            key=lambda item: (
+                tuning.match_rank(
+                    item[1],
+                    face,
+                    dtype=dtype,
+                    bits=layer.bits,
+                    group=layer.group_size,
+                    n=n,
+                    k=k,
+                    rows=sample,
+                    chip=chip,
+                ),
+                item[0],
+            ),
+        )
+        return DenseRoute(hi, backend, chosen)
+    if hi is not None and hi <= 16:
+        # Rule 28 / lead H4: unmeasured below-17 rows take MLX's matmul for
+        # an affine face, the format-generic wide route for a plugin when
+        # legal, else the Dot plan; never the prefill default tiles.
+        if layer.mode == "affine":
+            return DenseRoute(hi, "mlx", DenseTilePolicy("mlx"))
+        if _wide_legal(face, k, chip):
+            return DenseRoute(hi, "wide", DenseTilePolicy("wide"))
+        return DenseRoute(hi, "dot", None)
+    default = _default_policy(tensor_units, layer.bits, sample, n, k)
+    if default.is_legal(face, k, n, bound, chip, dtype, tail=True):
+        return DenseRoute(hi, default.backend, default)
+    if layer.mode == "affine":
+        return DenseRoute(hi, "mlx", DenseTilePolicy("mlx"))
+    return DenseRoute(hi, "dot", None)
 
 
 def _build_schedule(
@@ -1137,21 +1211,43 @@ def _build_schedule(
     *,
     tensor_units: bool,
     chip: str,
-) -> tuple[tuple[int | None, DenseTilePolicy], ...]:
-    cuts = tuple(sorted({16, *tuning.row_bounds("dense_tile", chip=chip)}))
-    schedule: list[tuple[int | None, DenseTilePolicy]] = []
-    lo = 1
-    for top in cuts:
-        pol = _resolve_cell(
-            layer, face, dtype, lo, top, top, tensor_units=tensor_units, chip=chip
+    dot_ok: bool = True,
+) -> tuple[DenseRoute, ...]:
+    cuts = tuple(
+        sorted(
+            {
+                1,
+                16,
+                *tuning.row_bounds("dense_tile", chip=chip),
+                *tuning.row_bounds("mma_tile", chip=chip),
+                *tuning.row_bounds("msg_tile", chip=chip),
+            }
         )
-        if schedule and schedule[-1][1] == pol:
-            schedule[-1] = (top, pol)
+    )
+    schedule: list[DenseRoute] = [DenseRoute(1, "dot", None)]
+    lo = 2
+    for top in cuts:
+        if top < 2:
+            continue
+        route = _resolve_cell(
+            layer,
+            face,
+            dtype,
+            lo,
+            top,
+            top,
+            tensor_units=tensor_units,
+            chip=chip,
+            dot_ok=dot_ok,
+        )
+        last = schedule[-1]
+        if last.backend == route.backend and last.policy == route.policy:
+            schedule[-1] = DenseRoute(top, route.backend, route.policy)
         else:
-            schedule.append((top, pol))
+            schedule.append(DenseRoute(top, route.backend, route.policy))
         lo = top + 1
     tail_sample = max(4096, (cuts[-1] + 1) if cuts else 4096)
-    tail_pol = _resolve_cell(
+    tail = _resolve_cell(
         layer,
         face,
         dtype,
@@ -1160,11 +1256,13 @@ def _build_schedule(
         tail_sample,
         tensor_units=tensor_units,
         chip=chip,
+        dot_ok=dot_ok,
     )
-    if schedule and schedule[-1][1] == tail_pol:
-        schedule[-1] = (None, tail_pol)
+    last = schedule[-1]
+    if last.backend == tail.backend and last.policy == tail.policy:
+        schedule[-1] = DenseRoute(None, tail.backend, tail.policy)
     else:
-        schedule.append((None, tail_pol))
+        schedule.append(DenseRoute(None, tail.backend, tail.policy))
     return tuple(schedule)
 
 
@@ -1173,6 +1271,7 @@ def build_plan(
     *,
     tensor_units: bool,
     chip: str | None = None,
+    dot_face: Any = _UNSET,
     _schedule_cache: dict | None = None,
 ) -> DensePlan | None:
     """Build a layer's construction-time dense prefill plan once."""
@@ -1183,23 +1282,17 @@ def build_plan(
     if chip == "":
         raise ValueError("tuning: a dense plan names its chip")
     chip_id = tuning.current_chip() if chip is None else chip
+    if dot_face is _UNSET:
+        dot_face = None if k < 8 else formats.dot(layer, k, n)
+        if dot_face is not None and n % 8 and dot_face.vpt < 1:
+            dot_face = None
     plan_dtypes = tuple(
         dt for dt in (mx.bfloat16, mx.float16) if face.exact_for(dt)
     ) or (mx.bfloat16, mx.float16)
-    kept_rec = layer.__dict__.get("_omlx_format_call")
-    from .linear import FormatLinear
-
-    use_cache = (
-        _schedule_cache is not None
-        and kept_rec is not None
-        and isinstance(layer, FormatLinear)
-        and type(layer)._ordinary_serves is FormatLinear._ordinary_serves
-        and "_ordinary_serves" not in layer.__dict__
-    )
-    if use_cache:
-        plan_ready = kept_rec.plan is not None
+    if _schedule_cache is not None:
         schedules = {}
         for dt in plan_dtypes:
+            dot_ok = dot_face is not None and dot_face.exact_for(dt)
             cache_key = (
                 layer.mode,
                 face,
@@ -1210,19 +1303,29 @@ def build_plan(
                 n,
                 tensor_units,
                 chip_id,
-                plan_ready,
+                dot_ok,
             )
             sched = _schedule_cache.get(cache_key)
             if sched is None:
                 sched = _build_schedule(
-                    layer, face, dt, tensor_units=tensor_units, chip=chip_id
+                    layer,
+                    face,
+                    dt,
+                    tensor_units=tensor_units,
+                    chip=chip_id,
+                    dot_ok=dot_ok,
                 )
                 _schedule_cache[cache_key] = sched
             schedules[dt] = sched
     else:
         schedules = {
             dt: _build_schedule(
-                layer, face, dt, tensor_units=tensor_units, chip=chip_id
+                layer,
+                face,
+                dt,
+                tensor_units=tensor_units,
+                chip=chip_id,
+                dot_ok=dot_face is not None and dot_face.exact_for(dt),
             )
             for dt in plan_dtypes
         }
@@ -1252,25 +1355,30 @@ def build_plan(
     )
 
 
-def _policy_for_rows(
-    schedule: tuple[tuple[int | None, DenseTilePolicy], ...], rows: int
-) -> DenseTilePolicy:
-    for hi, policy in schedule:
-        if hi is None or rows <= hi:
-            return policy
-    return schedule[-1][1]
+def _route_for_rows(schedule: tuple[DenseRoute, ...], rows: int) -> DenseRoute:
+    for route in schedule:
+        if route.hi is None or rows <= route.hi:
+            return route
+    return schedule[-1]
+
+
+def route_for(
+    plan: DensePlan | None, rows: int, dtype: mx.Dtype | None = None
+) -> DenseRoute:
+    """The plan's constructed route for this many rows (rule 28)."""
+    if plan is None:
+        return DenseRoute(None, "dot", None)
+    schedule = (
+        plan.schedules.get(dtype, plan.schedule) if dtype is not None else plan.schedule
+    )
+    return _route_for_rows(schedule, rows)
 
 
 def policy_for(
     plan: DensePlan | None, rows: int, dtype: mx.Dtype | None = None
-) -> DenseTilePolicy | None:
+) -> DenseTilePolicy | MmaTilePolicy | MsgTilePolicy | None:
     """The plan's constructed policy for this many rows (rule 28)."""
-    if plan is None:
-        return None
-    schedule = (
-        plan.schedules.get(dtype, plan.schedule) if dtype is not None else plan.schedule
-    )
-    return _policy_for_rows(schedule, rows)
+    return route_for(plan, rows, dtype).policy
 
 
 def _split_k_geometry(k: int, bk: int, requested: int) -> tuple[int, int]:
@@ -1449,21 +1557,92 @@ def _stand_in_operands(
     return stand_n, tuple(((stand_n, *a.shape[1:]), a.dtype) for a in operands)
 
 
+def _mma_msg_spec(face: Tile, backend: str, k: int, n: int, m: int, pol):
+    """Build the face kernel and launch grid for an mma or msg verify route."""
+    if backend == "mma":
+        ops = verify_skeleton.tile_mma_ops(face, policy=pol)
+        kernel = kernels.face_kernel(
+            f"omlx_fl_mma_rt{m // 8}_k{k}",
+            ("x", "w", "N_size"),
+            {"w": face},
+            ("y",),
+            ops.header,
+            verify_skeleton.emit_mma_source(ops, m // 8, k),
+        )
+        grid = (32 * pol.nsg, n // pol.bn, 1)
+    else:
+        lifetime = getattr(pol, "load_lifetime", None)
+        lifetime = getattr(lifetime, "value", lifetime) or "batch"
+        ops = verify_skeleton.msg_tile_ops(face, m, pol.nsg, lifetime)
+        kernel = verify_skeleton.msg_tile_kernel(ops)
+        cols = 4 * pol.nsg
+        grid = (32 * pol.nsg, (n + cols - 1) // cols, 1)
+    return kernel, grid
+
+
+def _make_mma_msg_graph(
+    m: int,
+    kernel,
+    grid: tuple[int, int, int],
+    k: int,
+    n: int,
+    is_mma: bool,
+    nsg: int,
+):
+    """Compiled graph body for mma/msg: binds only scalars and the face kernel
+    so global _PROOFS never pins a layer's DensePlan or GPU weights."""
+
+    def graph(
+        z,
+        *tensors,
+        _m=m,
+        _kernel=kernel,
+        _grid=grid,
+        _k=k,
+        _n=n,
+        _is_mma=is_mma,
+        _nsg=nsg,
+    ):
+        zz = z.reshape(-1, _k)
+        if zz.shape[0] < _m:
+            pad = mx.zeros((_m - zz.shape[0], _k), dtype=z.dtype)
+            zz = mx.concatenate([zz, pad], axis=0)
+        n_size = mx.array(_n, dtype=mx.uint32)
+        (y,) = _kernel(
+            inputs=[zz, *tensors, n_size],
+            # The mma skeleton bakes K into its source; the msg skeleton
+            # takes it as a template value.
+            template=[("T", z.dtype)] + ([] if _is_mma else [("K", _k)]),
+            grid=_grid,
+            threadgroup=(32 * _nsg, 1, 1),
+            output_shapes=[(_m, _n)],
+            output_dtypes=[z.dtype],
+        )
+        return y[: z.size // _k].reshape(*z.shape[:-1], _n)
+
+    return graph
+
+
 def warm_specs(
     layer,
     dtypes: tuple[mx.Dtype, ...],
     *,
     tensor_units: bool,
     stackable: bool = False,
+    dot_face: Any = _UNSET,
+    plan: DensePlan | None = None,
 ) -> tuple[dict, dict]:
     """Plan load-time ``(instances, proofs)`` for every dense schedule bucket.
 
-    Returns ``({instance: recipe}, {instance: [(proof, metal), ...]})``.
-    Closures capture only plain shapes, dtypes and ints — never ``mx.array``.
+    Covers wide, mma, msg, steel, and NAX routes (dot is warmed by linear's
+    rows/shared planner; mlx needs no custom Metal). Returns
+    ``({instance: recipe}, {instance: [(proof, metal), ...]})``. Closures
+    capture only plain shapes, dtypes and ints — never ``mx.array``.
     """
-    if layer.input_dims % 32 or layer.output_dims <= 0:
+    if layer.input_dims <= 0 or layer.output_dims <= 0:
         return {}, {}
-    plan = build_plan(layer, tensor_units=tensor_units)
+    if plan is None:
+        plan = build_plan(layer, tensor_units=tensor_units, dot_face=dot_face)
     if plan is None:
         return {}, {}
     instances: dict = {}
@@ -1475,10 +1654,13 @@ def warm_specs(
             continue
         schedule = plan.schedules.get(dtype, plan.schedule)
         lo = 1
-        for hi, policy in schedule:
+        for route in schedule:
+            hi, backend, policy = route
             bucket_lo = lo
             lo = (hi + 1) if hi is not None else lo
-            if policy.backend == "wide":
+            if backend in ("dot", "mlx"):
+                continue
+            if backend == "wide":
                 mm_wide = tile_wide.kernel(plan.face)
                 if mm_wide is None:
                     continue
@@ -1529,7 +1711,100 @@ def warm_specs(
                         )
                     )
                 continue
-            if policy.backend not in ("steel", "nax"):
+            if backend == "mma":
+                pol = policy
+                hi_row = hi if hi is not None else max(bucket_lo, 24)
+                m_vals = sorted(
+                    {
+                        ((rows + 7) // 8) * 8
+                        for rows in range(max(2, bucket_lo), hi_row + 1)
+                    }
+                )
+                stand_n, op_specs = _stand_in_operands(
+                    plan.operands,
+                    plan.n,
+                    min(plan.n, pol.bn),
+                    align=pol.bn,
+                    stackable=stackable,
+                )
+                op_shapes = tuple(s for s, _ in op_specs)
+                tg = (32 * pol.nsg, 1, 1)
+                for m in m_vals:
+                    kernel, _ = _mma_msg_spec(plan.face, "mma", plan.k, plan.n, m, pol)
+                    inst = kernels.planned(
+                        kernel,
+                        (((m, plan.k), dtype), *op_specs, ((), mx.uint32)),
+                        [dtype],
+                        template=[("T", dtype)],
+                    )
+                    in_shapes = ((m, plan.k), *op_shapes, ())
+
+                    def mma_recipe(
+                        in_shapes=in_shapes,
+                        out_shapes=((m, stand_n),),
+                        grid=tg,
+                        threadgroup=tg,
+                    ):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=grid,
+                            threadgroup=threadgroup,
+                        )
+
+                    instances.setdefault(inst, mma_recipe)
+                    proofs.setdefault(inst, []).append(
+                        (plan.proof, ("mma", dtype, plan.k, m, pol, op_flags))
+                    )
+                continue
+            if backend == "msg":
+                pol = policy
+                hi_row = min(hi, 8) if hi is not None else 8
+                m_vals = sorted(
+                    {
+                        4 if rows <= 4 else 6 if rows <= 6 else 8
+                        for rows in range(max(2, bucket_lo), hi_row + 1)
+                    }
+                )
+                cols = 4 * pol.nsg
+                stand_n, op_specs = _stand_in_operands(
+                    plan.operands,
+                    plan.n,
+                    min(plan.n, cols),
+                    align=cols,
+                    stackable=stackable,
+                )
+                op_shapes = tuple(s for s, _ in op_specs)
+                tg = (32 * pol.nsg, 1, 1)
+                for m in m_vals:
+                    kernel, _ = _mma_msg_spec(plan.face, "msg", plan.k, plan.n, m, pol)
+                    inst = kernels.planned(
+                        kernel,
+                        (((m, plan.k), dtype), *op_specs, ((), mx.uint32)),
+                        [dtype],
+                        template=[("T", dtype), ("K", plan.k)],
+                    )
+                    in_shapes = ((m, plan.k), *op_shapes, ())
+
+                    def msg_recipe(
+                        in_shapes=in_shapes,
+                        out_shapes=((m, stand_n),),
+                        grid=tg,
+                        threadgroup=tg,
+                    ):
+                        return kernels.StandIn(
+                            input_shapes=in_shapes,
+                            output_shapes=out_shapes,
+                            grid=grid,
+                            threadgroup=threadgroup,
+                        )
+
+                    instances.setdefault(inst, msg_recipe)
+                    proofs.setdefault(inst, []).append(
+                        (plan.proof, ("msg", dtype, plan.k, m, pol, op_flags))
+                    )
+                continue
+            if backend not in ("steel", "nax"):
                 continue
             eff = _effective_policy(policy, plan.k, plan.n)
             mm = _kernel(plan.face, eff)
@@ -1637,18 +1912,17 @@ def warm_specs(
 
 
 def _make_mlx_route(bits: int, gs: int):
-    def mlx_route(
-        z,
-        weight,
-        scales,
-        biases=None,
-        _qmm=mx.quantized_matmul,
-        _gs=gs,
-        _bits=bits,
-    ):
-        return _qmm(z, weight, scales, biases, True, _gs, _bits, "affine")
-
-    return mlx_route
+    # Keep a C-level partial over mx.quantized_matmul directly (no mx.compile
+    # wrapper around a single C++ primitive, which adds ~0.3 us per launch on
+    # short rows), while still replaying natively via FormatLinearFast and
+    # retiring cleanly on Proof.fail().
+    return partial(
+        mx.quantized_matmul,
+        transpose=True,
+        group_size=gs,
+        bits=bits,
+        mode="affine",
+    )
 
 
 def warm_graph(
@@ -1675,10 +1949,51 @@ def warm_graph(
         return False
     if sig in kept.graphs:
         return True
-    policy = _policy_for_rows(plan.schedules.get(dtype, plan.schedule), rows)
+    route = _route_for_rows(plan.schedules.get(dtype, plan.schedule), rows)
+    if route.backend == "dot":
+        return False
+
+    if route.backend in ("mma", "msg"):
+        pol = route.policy
+        if route.backend == "mma":
+            m = ((rows + 7) // 8) * 8
+        else:
+            m = 4 if rows <= 4 else 6 if rows <= 6 else 8
+        shared_key = (route.backend, x_shape, dtype, plan.n, m, pol)
+        graph = plan.proof.graphs.get(shared_key)
+        if graph is not None:
+            _keep_local(plan, sig, graph)
+            return True
+        metal = (
+            route.backend,
+            dtype,
+            plan.k,
+            m,
+            pol,
+            tuple((a.size < 8, a.ndim == 0) for a in plan.operands),
+        )
+        if metal not in plan.proof.ran:
+            return False
+        kernel, grid = _mma_msg_spec(plan.face, route.backend, plan.k, plan.n, m, pol)
+        graph_fn = _make_mma_msg_graph(
+            m, kernel, grid, plan.k, plan.n, route.backend == "mma", pol.nsg
+        )
+        x_dummy = mx.zeros(x_shape, dtype)
+        compiled = mx.compile(graph_fn)
+        compiled(x_dummy, *plan.operands)
+        plan.proof.keep(shared_key, compiled)
+        _keep_local(plan, sig, compiled)
+        return True
+
+    policy = route.policy
 
     if policy.backend == "mlx":
-        _keep_local(plan, sig, _make_mlx_route(plan.bits, plan.group_size))
+        shared_key = ("mlx", plan.bits, plan.group_size)
+        graph = plan.proof.graphs.get(shared_key)
+        if graph is None:
+            graph = _make_mlx_route(plan.bits, plan.group_size)
+            plan.proof.keep(shared_key, graph)
+        _keep_local(plan, sig, graph)
         return True
 
     if policy.backend == "wide":
@@ -1736,21 +2051,67 @@ def _project_cold(
     if not plan.face.exact_for(x.dtype):
         return None
     rows = x.size // plan.k
-    keep_local = rows > 1
-    policy = _policy_for_rows(plan.schedules.get(x.dtype, plan.schedule), rows)
+    route = _route_for_rows(plan.schedules.get(x.dtype, plan.schedule), rows)
+    if route.backend == "dot":
+        return None
+    if route.backend in ("mma", "msg"):
+        pol = route.policy
+        if route.backend == "mma":
+            m = ((rows + 7) // 8) * 8
+        else:
+            m = 4 if rows <= 4 else 6 if rows <= 6 else 8
+        shared_key = (route.backend, x.shape, x.dtype, plan.n, m, pol)
+        graph = plan.proof.graphs.get(shared_key)
+        if graph is not None:
+            _keep_local(plan, sig, graph)
+            return graph(x, *plan.operands)
+        kernel, grid = _mma_msg_spec(plan.face, route.backend, plan.k, plan.n, m, pol)
+        graph = _make_mma_msg_graph(
+            m, kernel, grid, plan.k, plan.n, route.backend == "mma", pol.nsg
+        )
+
+        metal = (
+            route.backend,
+            x.dtype,
+            plan.k,
+            m,
+            pol,
+            tuple((a.size < 8, a.ndim == 0) for a in plan.operands),
+        )
+
+        def stand_in():
+            arrays = kernels.zeros(
+                ((m, plan.k), x.dtype),
+                *((a.shape, a.dtype) for a in plan.operands),
+            )
+            return arrays, graph
+
+        if not plan.proof.prove(metal, stand_in, logger, *plan.said):
+            return None
+        compiled = mx.compile(graph)
+        result = compiled(x, *plan.operands)
+        plan.proof.keep(shared_key, compiled)
+        _keep_local(plan, sig, compiled)
+        return result
+    policy = route.policy
 
     if policy.backend == "mlx":
+        shared_key = ("mlx", plan.bits, plan.group_size)
+        graph = plan.proof.graphs.get(shared_key)
+        if graph is not None:
+            _keep_local(plan, sig, graph)
+            return graph(x, *plan.operands)
         mlx_route = _make_mlx_route(plan.bits, plan.group_size)
-        if keep_local:
-            _keep_local(plan, sig, mlx_route)
-        return mlx_route(x, *plan.operands)
+        result = mlx_route(x, *plan.operands)
+        plan.proof.keep(shared_key, mlx_route)
+        _keep_local(plan, sig, mlx_route)
+        return result
 
     if policy.backend == "wide":
         shared_key = ("wide", x.shape, x.dtype, plan.n)
         graph = plan.proof.graphs.get(shared_key)
         if graph is not None:
-            if keep_local:
-                _keep_local(plan, sig, graph)
+            _keep_local(plan, sig, graph)
             return graph(x, *plan.operands)
         mm = tile_wide.kernel(plan.face)
         if mm is None:
@@ -1767,8 +2128,7 @@ def _project_cold(
         compiled = mx.compile(graph)
         result = compiled(x, *plan.operands)
         plan.proof.keep(shared_key, compiled)
-        if keep_local:
-            _keep_local(plan, sig, compiled)
+        _keep_local(plan, sig, compiled)
         return result
 
     if policy.backend not in ("steel", "nax"):
@@ -1778,8 +2138,7 @@ def _project_cold(
     shared_key = (x.shape, x.dtype, plan.n, eff_policy)
     graph = plan.proof.graphs.get(shared_key)
     if graph is not None:
-        if keep_local:
-            _keep_local(plan, sig, graph)
+        _keep_local(plan, sig, graph)
         return graph(x, *plan.operands)
 
     mm = _kernel(plan.face, eff_policy)
@@ -1799,13 +2158,15 @@ def _project_cold(
     compiled = mx.compile(graph)
     result = compiled(x, *plan.operands)
     plan.proof.keep(shared_key, compiled)
-    if keep_local:
-        _keep_local(plan, sig, compiled)
+    _keep_local(plan, sig, compiled)
     return result
 
 
 def project(plan: DensePlan | None, x: mx.array) -> mx.array | None:
-    """Replay this thread's compiled dense graph, proving once on cold miss."""
+    """Replay this thread's compiled dense graph, proving once on cold miss.
+
+    Every scheduled dense route (including mma/msg, which inline ``N_size``
+    inside their compiled graph) takes ``plan.operands`` alone."""
     if plan is None:
         return None
     sig = (x.shape, x.dtype)

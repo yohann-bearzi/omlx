@@ -27,8 +27,9 @@ decode shapes and prefill keep the stock path. Qwen4 has its separate
 FP16/BF16 decode prework and norm-gate kernels below, and its planned decode runs
 them with the recurrence as one launch between the two projections. Its B1
 speculative verify runs the same step for every row in one launch between
-multi-row projections with one-row arithmetic per row, and emits the conv
-window and per-step recurrent states the speculative cache records.
+the stacked FormatLinear projections (rows 2..16; a one-row step keeps the
+decode's qmv_fast), and emits the conv window and per-step recurrent states
+the speculative cache records.
 """
 
 from __future__ import annotations
@@ -46,7 +47,6 @@ from ..formats import kernels
 from ..formats.linear import FormatLinear
 from . import qwen35_gdn_verify_fused
 from .module_cache import cached_per_module
-from .qwen35_verify_qmm import is_row_exact_armed
 from .row_exact_qmv import format_rows_qmv
 
 logger = logging.getLogger(__name__)
@@ -77,10 +77,9 @@ _QWEN4_DECODE_QMV = True
 # launch for every row's prework, recurrence (with the per-step rollback
 # states) and norm-gate, and the out-projection.
 _QWEN4_VERIFY_FUSED = True
-# Rows of a batched one-token decode per step launch, and the widest batch
-# whose projections run per row (bit-identical to each row decoded alone).
+# Rows of a batched one-token decode per step launch: the widest batch the
+# fused decode plan serves (one stacked projection for every row count).
 _QWEN4_BATCH_DECODE_MAX_ROWS = 16
-_QWEN4_BATCH_ROW_EXACT_ROWS = 3
 # The verify's rollback records skip the per-step recurrent states (S-1 x 3 MB per
 # layer, written on every verify and read only on a partial accept): a commit
 # keeping m of S rows reruns the fused step on the first m rows.
@@ -1592,11 +1591,13 @@ def _build_qwen4_decode_plan(module):
         module.in_proj_a,
     )
     stacked = _stacked_format_inputs(module)
-    in_qmv = (
-        format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
-        if stacked is not None
-        else None
-    )
+    if stacked is None:
+        # Every shipped checkpoint's four GDN in-projections share one
+        # allocation (oQ3e-mtp and oQ4e-fp8ple: 8b g64 affine); a layout that
+        # does not stack takes the generic path rather than a per-projection
+        # fallback here (rules 29/32).
+        return None
+    in_qmv = format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
     out = module.out_proj
     out_qmv = format_rows_qmv(out, dtype, _qwen4_verify_out_geometry)
     return (
@@ -1614,6 +1615,7 @@ def _build_qwen4_decode_plan(module):
         module.head_v_dim,
         in_qmv,
         out_qmv,
+        stacked,
     )
 
 
@@ -1676,60 +1678,32 @@ def _qwen4_decode_state_eligible(inputs, cache, dtype) -> bool:
 
 
 def _qwen4_verify_in_geometry(rows):
-    # (Columns per simdgroup, rows per threadgroup) of the stacked
-    # in-projection: the one-row decode tile, and for verify blocks rows share
-    # each decoded weight tile three or two at a time (fastest over a chain of
-    # 36 layers on M5 Ultra at 2..4 rows; two rows prefer one column).
+    # (Columns per simdgroup, rows per threadgroup) of the one-row verify
+    # in-projection (production verifies use one row here; rows >= 2 take the
+    # stacked FormatLinear instead). The multi-row entries remain the measured
+    # tile geometry the rows kernel serves for direct callers and tests: rows
+    # share each decoded weight tile three or two at a time (fastest over a
+    # chain of 36 layers on M5 Ultra at 2..4 rows; two rows prefer one
+    # column).
     if rows == 2:
         return 1, 2
     return _QWEN4_IN_QMV_RPS, next(d for d in (3, 2, 1) if rows % d == 0)
 
 
 def _qwen4_verify_out_geometry(rows):
-    # The one-row decode tile, and stock qmv_fast's four columns per
-    # simdgroup (one row per threadgroup) for verify blocks.
+    # The one-row verify out-projection (production verifies use one row; rows
+    # >= 2 take the FormatLinear) and stock qmv_fast's four columns per
+    # simdgroup (one row per threadgroup) for direct multi-row callers.
     return (_QWEN4_OUT_QMV_RPS, 1) if rows == 1 else (4, 1)
-
-
-# The same (columns per simdgroup, rows per threadgroup) pairs for the
-# unrolled tile, per block size: the fastest over a chain of 36 layers on M5
-# Ultra (oQ5e: 6-bit in-, 5-bit out-projection), each inside the unrolled
-# tile's register envelope at every bit width the kernel serves (at most 16
-# values per lane). Other block sizes keep the pairs above.
-_QWEN4_VERIFY_IN_TILES = {
-    2: (1, 2),
-    3: (2, 3),
-    4: (4, 2),
-    5: (2, 5),
-    6: (4, 3),
-    7: (8, 1),
-    8: (4, 2),
-}
-_QWEN4_VERIFY_OUT_TILES = {
-    2: (4, 1),
-    3: (4, 3),
-    4: (2, 4),
-    5: (2, 5),
-    6: (4, 3),
-    7: (4, 1),
-    8: (2, 4),
-}
-
-
-def _qwen4_verify_in_tile(rows):
-    return _QWEN4_VERIFY_IN_TILES.get(rows) or _qwen4_verify_in_geometry(rows)
-
-
-def _qwen4_verify_out_tile(rows):
-    return _QWEN4_VERIFY_OUT_TILES.get(rows) or _qwen4_verify_out_geometry(rows)
 
 
 def _build_qwen4_verify_plan(module):
     """Resolved operands of the fused speculative verify, or None when ineligible.
 
     The verify serves every canonical affine layout whose four in-projections
-    share one allocation (its projections run per row with one-row qmv_fast
-    bits, whatever the decode allow-list admits)."""
+    share one allocation (rows 2..16 take one stacked FormatLinear projection;
+    one row keeps the decode's qmv_fast, whatever the decode allow-list
+    admits)."""
     if not _qwen4_gdn_geometry_ok(module):
         return None
     dtype = module.conv1d.weight.dtype
@@ -1752,13 +1726,15 @@ def _build_qwen4_verify_plan(module):
     stacked = _stacked_format_inputs(module)
     if stacked is None:
         return None
-    in_rows = format_rows_qmv(stacked, dtype, _qwen4_verify_in_tile)
-    out_rows = format_rows_qmv(out, dtype, _qwen4_verify_out_tile)
+    in_rows = format_rows_qmv(stacked, dtype, _qwen4_verify_in_geometry)
+    out_rows = format_rows_qmv(out, dtype, _qwen4_verify_out_geometry)
     if in_rows is None or out_rows is None:
         return None
     return (
         in_rows,
         out_rows,
+        stacked,
+        out,
         module.conv1d.weight,
         mx.array(module.head_k_dim**-0.5, dtype=dtype),
         module.A_log,
@@ -1804,13 +1780,16 @@ def _qwen4_verify_state_eligible(inputs, cache, dtype) -> bool:
 
 
 def _qwen4_verify(plan, inputs, cache):
-    """Fused verify rows on a cached plan: bit-identical outputs, next states
-    and committed rollback states (the conv window, and the per-step
-    recurrent states or their deferred recomputation) to the per-op verify
-    path below."""
+    """Fused verify rows on a cached plan: outputs, next states and committed
+    rollback states (the conv window, and the per-step recurrent states or
+    their deferred recomputation) that reproduce a one-row decode step bit
+    for bit and match the per-op verify path below within the numerics
+    contract's tolerance for longer windows."""
     (
         in_rows,
         out_rows,
+        stacked,
+        out,
         conv_w,
         q_scale,
         A_log,
@@ -1822,8 +1801,10 @@ def _qwen4_verify(plan, inputs, cache):
         dk,
         dv,
     ) = plan
-    proj = in_rows(inputs)
-    steps = proj.shape[1]
+    steps = inputs.shape[1]
+    # Verify rows take the batched FormatLinear routes; one row keeps the
+    # one-row qmv_fast arithmetic of a decode step.
+    proj = stacked(inputs) if steps >= 2 else in_rows(inputs)
     conv_start, start = cache[0], cache[1]
     deferred = (
         _QWEN4_VERIFY_DEFERRED_STATES
@@ -1875,7 +1856,7 @@ def _qwen4_verify(plan, inputs, cache):
     else:
         cache.record_speculative_states(1, states, state)
     cache[1] = state
-    return out_rows(gated)
+    return out(gated) if steps >= 2 else out_rows(gated)
 
 
 def _qwen4_state_after(
@@ -1947,14 +1928,12 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
     """A batched one-token decode: the in-projection, one launch of the
     fused decode step for every row, and the out-projection.
 
-    Up to ``_QWEN4_BATCH_ROW_EXACT_ROWS`` rows take the verify plan's per-row
-    projections (one-row qmv bits), so each row is bit-identical to that row
-    decoded alone; wider batches (or a mixed allocation with no verify plan)
-    take one per-call projection each: the format layer's own forward, or a
-    stock layer's quantized matmul, which reads the weights once for all rows
-    (faster from four rows on, M5 Ultra)."""
+    Every row count takes one per-call stacked in-projection:
+    the format layer's own forward, which reads the weights once for all
+    rows; a decode batch of that row count runs the same batched route as
+    a verify window (Rule 33)."""
     (
-        projections,
+        _,
         conv_w,
         q_scale,
         A_log,
@@ -1968,16 +1947,14 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
         dv,
         _,
         _,
+        stacked,
     ) = plan
     rows = inputs.shape[0]
-    verify = _qwen4_verify_plan(module) if rows <= _QWEN4_BATCH_ROW_EXACT_ROWS else None
-    if verify is not None:
-        c_dim = 2 * hk * dk + hv * dv
-        proj = verify[0](inputs.reshape(1, rows, -1)).reshape(rows, 1, -1)
-        split = [c_dim, c_dim + hv * dv, c_dim + hv * dv + hv]
-        mixed_qkv, z, b, a = mx.split(proj, split, axis=-1)
-    else:
-        mixed_qkv, z, b, a = (linear(inputs) for linear in projections)
+    # One per-call projection through the format layer for every row count:
+    # the stacked in-projection reads the weights once for all rows (a layout
+    # that does not stack never reaches this plan; it takes the generic path).
+    proj = stacked(inputs.reshape(1, rows, -1)).reshape(rows, 1, -1)
+    mixed_qkv, z, b, a = mx.split(proj, _QWEN4_GDN_SPLITS, axis=-1)
     conv_state, state, gated = qwen4_batch_decode_step_fused(
         mixed_qkv,
         z,
@@ -1996,10 +1973,9 @@ def _qwen4_batch_decode(module, plan, inputs, cache):
         dk,
         dv,
     )
-    if verify is not None:
-        result = verify[1](gated.reshape(1, rows, -1)).reshape(rows, 1, -1)
-    else:
-        result = out_proj(gated)
+    # The verify window's out-projection layout, (1, rows, hv * dv), so the
+    # two routes share one compiled graph.
+    result = out_proj(gated.reshape(1, rows, -1)).reshape(rows, 1, -1)
     cache[0], cache[1] = conv_state, state
     if hasattr(cache, "advance"):
         from mlx_vlm.models.qwen3_5 import language as q35
@@ -2155,6 +2131,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             dv,
             in_qmv,
             out_qmv,
+            _stacked,
         ) = plan
         if in_qmv is not None and _QWEN4_DECODE_QMV:
             projected = in_qmv(inputs)
@@ -2334,11 +2311,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
                 and sites[1] is not None
                 and getattr(type(layer), "_normalize_qk", None) is sites[1]
             )
-        # Qwen4 B1 rows: the fused verify reproduces the per-op path below bit
-        # for bit. Its projections run one-row qmv_fast arithmetic per row, as
-        # the verifier's do at one row and in the armed row-exact mode. The
-        # plan pins the layer geometry and weights, the state gate the inputs
-        # and both cache states.
+        # Qwen4 B1 rows: the fused verify reproduces the per-op path below
+        # (one row bit for bit; longer windows reorder through the stacked
+        # FormatLinear projection, inside the contract's tolerance). The plan
+        # pins the layer geometry and weights, the state gate the inputs and
+        # both cache states.
         if (
             l2_norm
             and _QWEN4_VERIFY_FUSED
@@ -2347,12 +2324,11 @@ def apply_qwen35_gdn_prework_patch() -> bool:
             and cache.is_speculating
             and cache.lengths is None
             and 1 <= length <= _QWEN4_VERIFY_MAX_ROWS
-            and (length == 1 or is_row_exact_armed())
         ):
             plan = _qwen4_verify_plan(layer)
-            # plan[2] is conv_w, which holds the layer's compute dtype.
+            # plan[4] is conv_w, which holds the layer's compute dtype.
             if plan is not None and _qwen4_verify_state_eligible(
-                inputs, cache, plan[2].dtype
+                inputs, cache, plan[4].dtype
             ):
                 result = _qwen4_verify(plan, inputs, cache)
                 if hasattr(cache, "advance"):

@@ -51,13 +51,31 @@ def _set_verify_qmm_armed(flag: bool, *, row_exact: bool = False) -> None:
         pass
 
 
+def _wide_copy_window(model: Any) -> bool:
+    """Whether the target's context-copy drafter keeps the wide verify window.
+
+    Models opt in with ``_omlx_mtp_wide_copy_window`` (Qwen4-Exp). The window
+    is independent of row-exact arming (Rule 33): a 15-token verbatim copy is
+    verified as a 16-row window whatever arithmetic the rows take.
+    """
+    for candidate in (
+        model,
+        getattr(model, "_language_model", None),
+        getattr(model, "language_model", None),
+    ):
+        if getattr(candidate, "_omlx_mtp_wide_copy_window", False):
+            return True
+    return False
+
+
 def _row_exact_verify(model: Any) -> bool:
     """Whether the target's verify rows must reproduce its one-row decode.
 
-    Models opt in with ``_omlx_mtp_row_exact_verify`` (Qwen4-Exp). Their
-    armed verify forwards then run every multi-row quantized projection,
-    DeltaNet prework and attention row with the arithmetic of a serial
-    decode step, so greedy MTP output equals MTP-off output byte for byte.
+    Models opt in with ``_omlx_mtp_row_exact_verify`` (GLM-5.3 and
+    MiniMax-M3; qwen4_exp was disarmed under Rule 33). Their armed verify
+    forwards then run every multi-row quantized projection, DeltaNet
+    prework and attention row with the arithmetic of a serial decode step,
+    so greedy MTP output equals MTP-off output byte for byte.
     """
     for candidate in (
         model,
@@ -4515,7 +4533,9 @@ def _context_copy_drafts(
         # verify cap (GLM-5.3's indexer pool rolls back at most 8 rows).
         cap = _max_verify_rows(gen_batch.model)
         state.context_copy = _context_copy.ContextCopy(
-            wide_window=_row_exact_verify(gen_batch.model)
+            wide_window=(
+                _row_exact_verify(gen_batch.model) or _wide_copy_window(gen_batch.model)
+            )
             and (cap is None or cap > _context_copy.MAX_COPY)
         )
     copier = state.context_copy

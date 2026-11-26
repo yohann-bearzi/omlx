@@ -3218,3 +3218,15 @@ def test_sharded_embedding_applies_shared_fp8_scale_after_decode():
     mx.eval(out, expected)
     assert out.dtype == mx.bfloat16
     assert mx.array_equal(out, expected).item()
+
+
+def test_qwen4_disarms_row_exact_but_keeps_the_wide_copy_window():
+    """Rule 33: qwen4_exp verify rows take batched routes, so the model no
+    longer opts into row-exact arithmetic; the context-copy drafter keeps its
+    15-token window through its own marker."""
+    from omlx.patches.mlx_lm_mtp import batch_generator as bg
+
+    language, owner = _make_bound_qwen4_language_model(_tiny_config())
+    model = SimpleNamespace(language_model=language, mtp=owner.mtp)
+    assert bg._row_exact_verify(model) is False
+    assert bg._wide_copy_window(model) is True

@@ -17,7 +17,6 @@ using namespace nb::literals;
 namespace omlx::quant_matmul {
 namespace {
 
-thread_local bool row_exact_armed = false;
 
 class FormatLinearFast {
  public:
@@ -69,7 +68,7 @@ class FormatLinearFast {
   }
 
   PyObject* call(PyObject* layer, PyObject* input) {
-    if (row_exact_armed || Py_TYPE(input) != array_type_ ||
+    if (Py_TYPE(input) != array_type_ ||
         !nb::inst_ready(input) ||
         PyDict_GetItem(layer, weight_key_.ptr()) != weight_.ptr()) {
       Py_RETURN_NONE;
@@ -185,7 +184,6 @@ class FormatLinearFast {
 }  // namespace
 
 void register_format_dispatch(nb::module_& m) {
-  m.def("set_row_exact_armed", [](bool armed) { row_exact_armed = armed; });
   nb::class_<FormatLinearFast>(m, "FormatLinearFast")
       .def(nb::init<nb::object, nb::object, std::vector<nb::object>, nb::dict,
                     nb::str>(),

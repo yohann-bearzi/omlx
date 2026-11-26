@@ -59,14 +59,15 @@ def _one_expert(layer, x):
 
 @pytest.mark.parametrize("mode", ("stock", "plugin"))
 @pytest.mark.parametrize("schedule", ((2, 64, 2), (64, 2, 64)))
-def test_one_layer_reuses_wide_and_dense_plans_across_requests(
+def test_one_layer_reuses_its_schedule_routes_across_requests(
     mode, schedule, tmp_path, monkeypatch
 ):
     build = _builder(tmp_path)
 
     def make_layer():
-        # N=1024 takes wide at M=2 and the steel/NAX dense tile at M=64 on both
-        # chips (narrow N=512 8b keeps the MLX policy on short chunks for rule 32).
+        # N=1024 rows 64 take the steel/NAX dense tile on both chips; two
+        # rows take the schedule's route for the mode (MLX for a stock
+        # layer, the format's wide tile for a plugin's), lead H4.
         layer, _, _ = _equivalent_layer(mode, build, 1024, 2560)
         return layer
 
@@ -85,47 +86,41 @@ def test_one_layer_reuses_wide_and_dense_plans_across_requests(
 
     layer = make_layer()
     built = []
-    wide_tile = linear._ordinary_tile
     dense_tile = tile_dense.build_plan
 
-    def wide(*args):
-        built.append("wide")
-        return wide_tile(*args)
-
     def dense(held, **kwargs):
-        built.append("dense")
+        built.append(held is layer)
         return dense_tile(held, **kwargs)
 
     projected = []
     project = tile_dense.project
 
-    def record(tile, z, **kwargs):
-        projected.append((tile, z.shape))
-        return project(tile, z, **kwargs)
+    def record(plan, z, **kwargs):
+        projected.append((plan, z.shape))
+        return project(plan, z, **kwargs)
 
-    monkeypatch.setattr(linear, "_ordinary_tile", wide)
     monkeypatch.setattr(tile_dense, "build_plan", dense)
     monkeypatch.setattr(tile_dense, "project", record)
     for m in schedule:
         actual = np.asarray(layer(x[:m]).view(mx.uint16))
         np.testing.assert_array_equal(actual, expected[m])
 
-    first, second = ("wide", "dense") if schedule[0] == 2 else ("dense", "wide")
-    assert built == [first, second]
-    assert [shape for _, shape in projected] == [(m, 2560) for m in schedule if m > 16]
+    assert built == [True], "the layer built its schedule more than once"
+    signatures = list(dict.fromkeys(schedule))
+    assert [shape for _, shape in projected] == [(m, 2560) for m in signatures]
+    kept = vars(layer)[linear._KEPT]
+    plan = kept.dense
+    assert kept.plan is not None and plan is not None
     for tile, _ in projected:
-        assert tile is not None
+        assert tile is plan
         assert tile.proof is kernels.proof(
             _dense_route(), tile.face, tuple(a.dtype for a in tile.operands)
         )
-    kept = vars(layer)[linear._KEPT]
-    assert kept.routes["wide"] is kept.wide
-    assert kept.dense is not None
     ran = {key[0] for key, proof in kernels._PROOFS.items() if proof.ran}
-    assert _dense_route() in ran and "format_linear_wide" in ran
+    assert _dense_route() in ran
 
-    # A write retires both routes together; each one binds the array it
-    # reads before its next call, so neither replays the old operands.
+    # A write retires the schedule whole; the next calls resolve and build
+    # it again, and neither route replays the old operands.
     before = dict(expected)
     scale = formats.tensor_names(layer)[1]
     layer[scale] = 0.5 * mx.ones_like(layer[scale])
@@ -141,5 +136,5 @@ def test_one_layer_reuses_wide_and_dense_plans_across_requests(
     for m in schedule:
         actual = np.asarray(layer(x[:m]).view(mx.uint16))
         np.testing.assert_array_equal(actual, expected[m])
-    assert sorted(built) == ["dense", "wide"]
-    assert len(projected) == sum(1 for m in schedule if m > 16)
+    assert built == [True]
+    assert len(projected) == len(signatures)

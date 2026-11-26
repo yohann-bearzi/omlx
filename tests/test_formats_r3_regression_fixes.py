@@ -1,6 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression tests for Release-3 freeze fixes A (tuning data), B (FormatLinear
-batched verify route), and C (FormatLinear (1, 1, K) native dense_fast).
+"""Regression tests for Release-3 + Release-4 (VFAST c3) merge invariants:
+- Part A: per-chip tuning table completeness, R3 prefill fixes (short-prefill
+  25-32 occupancy, M3 HC_down long-prefill), and VFAST c3 overlapping-cell
+  resolutions.
+- Part B: VFAST c3 construction-time schedule on batched verify (rows 2..16),
+  qwen35_verify_qmm boundary (FormatLinear stays off verify_qmm), load-time
+  warm_moe_model/warm_model_dispatch coverage, and _ROW_EXACT_ACTIVE locking.
+- Part C: FormatLinear 1-row ((1, 1, K) and (1, K)) native FormatLinearFast
+  dispatch (dot_fast + M3 mlx_rows dense_fast), proof failure retirement,
+  tile_dense.project 1-row isolation, and _FastMask hiding both _fast/_fast2.
+- Part D: Zero per-call host overhead on Python fallback (weight_key, no_{slot}
+  cache), >=16 operand refusal, orphaned dot_fast recovery, and weight mutation.
 """
 
 from __future__ import annotations
@@ -13,10 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
-from omlx.formats.mlx import traversal as mlx_traversal
 
 from omlx.custom_kernels.quant_matmul import fast as native
 from omlx.formats import affine, linear, testing, tile_dense, tuning
+from omlx.formats.mlx import traversal as mlx_traversal
 from omlx.patches import qwen35_moe_routed_decode, qwen35_verify_qmm
 
 # Every 2-D quantized dense FormatLinear shape in Qwen3.8-Flash-Next (P32).
@@ -56,7 +66,6 @@ def _pair(
     group_size: int = 64,
     dtype: mx.Dtype = mx.bfloat16,
     bias: bool = False,
-    qwen: bool = True,
     seed: int = 1,
 ):
     key = mx.random.key(seed)
@@ -87,8 +96,6 @@ def _pair(
             {"weight": wq, "scales": sc, "biases": bi},
             b_arr,
         )
-    if qwen:
-        object.__setattr__(fl, "_qwen_row_exact", qwen35_verify_qmm.is_row_exact_armed)
     return ql, fl
 
 
@@ -110,10 +117,12 @@ def _assert_c2(got: mx.array, want: mx.array, x: mx.array, ql: nn.QuantizedLinea
         group_size=ql.group_size,
         bits=ql.bits,
     )
-    rows = x.size // ql.scales.shape[1] // ql.group_size
     k = x.shape[-1]
+    rows = x.size // k
     n = ql.scales.shape[0]
     ref = x.reshape(rows, k).astype(mx.float32) @ w_f32.T
+    if "bias" in ql:
+        ref = ref + ql.bias.astype(mx.float32)
     mx.eval(ref)
     assert bool(mx.all(mx.isfinite(got)).item())
     denom = float(mx.sqrt(mx.sum(ref * ref)).item())
@@ -126,16 +135,61 @@ def _assert_c2(got: mx.array, want: mx.array, x: mx.array, ql: nn.QuantizedLinea
     assert g_err <= 1.05 * w_err + 1e-6, (g_err, w_err)
 
 
+def _best_route(
+    face,
+    *,
+    dtype: mx.Dtype,
+    bits: int,
+    group: int,
+    n: int,
+    k: int,
+    rows: int,
+    chip: str,
+):
+    best_rank = (0, 0)
+    best = None
+    for route in ("dense_tile", "mma_tile", "msg_tile"):
+        pol = tuning.lookup(
+            route,
+            face,
+            dtype=dtype,
+            bits=bits,
+            group=group,
+            n=n,
+            k=k,
+            rows=rows,
+            chip=chip,
+        )
+        if pol is None:
+            continue
+        rank = tuning.match_rank(
+            route,
+            face,
+            dtype=dtype,
+            bits=bits,
+            group=group,
+            n=n,
+            k=k,
+            rows=rows,
+            chip=chip,
+        )
+        if rank > best_rank:
+            best_rank = rank
+            best = (route, pol)
+    return best
+
+
 # ---------------------------------------------------------------------------
-# Part A: tuning table completeness & short-prefill occupancy floor
+# Part A: tuning table completeness, R3 prefill fixes, and VFAST c3 overlaps
 # ---------------------------------------------------------------------------
 
 
-def test_served_flash_next_shapes_have_explicit_dense_tile_entries_on_both_chips():
+def test_served_flash_next_shapes_have_explicit_policies_on_both_chips():
     """Every served (shape, reachable bucket, dtype) in Qwen3.8-Flash-Next must
     have an explicit legal entry in both applegpu_g15d_c80 and applegpu_g17s_c40
-    so _default_steel_policy / _default_nax_policy can never silently take a
-    served shape."""
+    across the unified dense/mma/msg tables, and overlapping small-row cells
+    must keep the faster VFAST c3 winner while preserving non-overlapping R3
+    <17 entries."""
     tuning.reset_cache()
     assert tuning.stale_entries() == []
 
@@ -144,18 +198,22 @@ def test_served_flash_next_shapes_have_explicit_dense_tile_entries_on_both_chips
     for chip, arch, _tu, _cores in _SERVED_CHIPS:
         for n, k, bits, gs in SERVED_FLASH_NEXT_SHAPES:
             probes = list(_PREFILL_PROBES)
-            # Include <17 rows whenever ordinary traversal delegates to _prefill.
-            for r in (12, 13, 16):
-                if mlx_traversal(r, n, k, gs, arch, bits=bits)[0] in (
-                    "qmm",
-                    "split_k",
-                ):
-                    probes.insert(0, r)
+            if (n, k) == (248320, 2560):
+                # lm_head serves decode/verify batch products {2..8, 12, 16};
+                # unmeasured odd rows (9-11, 13-15) use the c3 min(MLX, Dot)
+                # floor rather than _default_steel_policy / _default_nax_policy.
+                probes = [2, 3, 4, 5, 6, 7, 8, 12, 16, *probes]
+            else:
+                for r in (12, 13, 16):
+                    if mlx_traversal(r, n, k, gs, arch, bits=bits)[0] in (
+                        "qmm",
+                        "split_k",
+                    ):
+                        probes.insert(0, r)
             for dtype in (mx.bfloat16, mx.float16):
                 face = affine.tile_face(bits, gs, dtype)
                 for rows in probes:
-                    pol = tuning.lookup(
-                        "dense_tile",
+                    hit = _best_route(
                         face,
                         dtype=dtype,
                         bits=bits,
@@ -165,17 +223,166 @@ def test_served_flash_next_shapes_have_explicit_dense_tile_entries_on_both_chips
                         rows=rows,
                         chip=chip,
                     )
-                    if pol is None:
+                    if hit is None:
                         bname = tuning.rows_bucket("dense_tile", rows)
                         missing.append(
                             f"{chip} {n}x{k} b{bits}g{gs} {dtype} rows={rows} ({bname})"
                         )
-                    elif not pol.is_legal(face, k, n, rows, chip, dtype=dtype):
-                        illegal.append(
-                            f"{chip} {n}x{k} b{bits}g{gs} {dtype} rows={rows}: {pol}"
+                    else:
+                        route, pol = hit
+                        legal = (
+                            pol.is_legal(face, k, n, rows, chip, dtype=dtype)
+                            if route == "dense_tile"
+                            else pol.is_legal(face, k, n, rows, chip)
                         )
+                        if not legal:
+                            illegal.append(
+                                f"{chip} {n}x{k} b{bits}g{gs} {dtype} rows={rows}: "
+                                f"{route} {pol}"
+                            )
     assert not missing, f"{len(missing)} missing served cells, e.g.: {missing[:12]}"
     assert not illegal, f"illegal served policies: {illegal[:8]}"
+
+    # Pin every overlapping R3-vs-VFAST-c3 resolution (bf16 and fp16).
+    for dtype in (mx.bfloat16, mx.float16):
+        face = affine.tile_face(8, 64, dtype)
+        # M3 Ultra overlaps: VFAST c3 wins rows 2..16; 248320 keeps mma at M=20
+        # alongside R3 dense_tile 17-24 for M=17..19, 21..24.
+        assert _best_route(
+            face,
+            dtype=dtype,
+            bits=8,
+            group=64,
+            n=10240,
+            k=2560,
+            rows=6,
+            chip="applegpu_g15d_c80",
+        ) == ("dense_tile", tuning.DenseTilePolicy("dot"))
+        assert (
+            _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=10240,
+                k=2560,
+                rows=16,
+                chip="applegpu_g15d_c80",
+            )[0]
+            == "mma_tile"
+        )
+        m3_12288_16 = _best_route(
+            face,
+            dtype=dtype,
+            bits=8,
+            group=64,
+            n=12288,
+            k=2560,
+            rows=16,
+            chip="applegpu_g15d_c80",
+        )
+        assert m3_12288_16[0] == "mma_tile" and m3_12288_16[1].nsg == 16
+        assert (
+            _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=248320,
+                k=2560,
+                rows=16,
+                chip="applegpu_g15d_c80",
+            )[0]
+            == "mma_tile"
+        )
+        assert (
+            _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=248320,
+                k=2560,
+                rows=20,
+                chip="applegpu_g15d_c80",
+            )[0]
+            == "mma_tile"
+        )
+        m3_248320_24 = _best_route(
+            face,
+            dtype=dtype,
+            bits=8,
+            group=64,
+            n=248320,
+            k=2560,
+            rows=24,
+            chip="applegpu_g15d_c80",
+        )
+        assert m3_248320_24[0] == "dense_tile" and m3_248320_24[1].backend == "steel"
+
+        # M5 Max overlaps: VFAST c3 wins rows 2..16; 248320 17-24 serves M=20..24.
+        for n in (10240, 12288, 248320):
+            m5_16 = _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=n,
+                k=2560,
+                rows=16,
+                chip="applegpu_g17s_c40",
+            )
+            assert m5_16[0] == "dense_tile"
+            assert (m5_16[1].backend, m5_16[1].bm, m5_16[1].bn, m5_16[1].bk) == (
+                "nax",
+                32,
+                64,
+                64,
+            )
+            assert m5_16[1].sched == "db"
+        m5_248320_20 = _best_route(
+            face,
+            dtype=dtype,
+            bits=8,
+            group=64,
+            n=248320,
+            k=2560,
+            rows=20,
+            chip="applegpu_g17s_c40",
+        )
+        assert m5_248320_20[0] == "dense_tile" and m5_248320_20[1].backend == "nax"
+
+        # Non-overlapping R3 <17 entries preserved on both chips.
+        for chip, want_backend in (
+            ("applegpu_g15d_c80", "steel"),
+            ("applegpu_g17s_c40", "nax"),
+        ):
+            r3_4x10240 = _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=4,
+                k=10240,
+                rows=16,
+                chip=chip,
+            )
+            assert r3_4x10240 is not None and r3_4x10240[1].backend == want_backend
+        for chip, want_backend in (
+            ("applegpu_g15d_c80", "mlx"),
+            ("applegpu_g17s_c40", "nax"),
+        ):
+            r3_10240x320 = _best_route(
+                face,
+                dtype=dtype,
+                bits=8,
+                group=64,
+                n=10240,
+                k=320,
+                rows=16,
+                chip=chip,
+            )
+            assert r3_10240x320 is not None and r3_10240x320[1].backend == want_backend
 
 
 def test_m3_short_prefill_25_32_never_hits_low_occupancy_split_k_1():
@@ -296,20 +503,19 @@ def test_m3_hc_down_long_prefill_avoids_unaligned_m_tail_cliff():
 
 
 # ---------------------------------------------------------------------------
-# Part B: FormatLinear batched verify route (vk_qmm_mma / verify_qmm)
+# Part B: VFAST c3 construction-time schedule on batched verify + warm-up
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("shape_nk", [(6144, 2560), (10240, 2560), (12288, 2560)])
 @pytest.mark.parametrize("bl", [(4, 2), (4, 3), (4, 4), (2, 4)])
 @pytest.mark.parametrize("with_bias", [False, True])
-def test_format_linear_batched_verify_matches_r2_quantized_linear_bitwise(
+def test_format_linear_batched_verify_keeps_vfast_schedule_and_passes_c2(
     shape_nk, bl, with_bias, monkeypatch
 ):
-    """Armed non-row-exact 3-D batched verify (rows 8, 12, 16) through
-    FormatLinear must take the verify qmm route (vk_qmm_mma on M3, mma/skinny
-    on M5), bitwise equal to release 2's patched nn.QuantizedLinear, with
-    construction-time route binding (0 hot-path _verify_route calls)."""
+    """Armed verify (non-row-exact and row-exact) must NOT hijack FormatLinear
+    away from VFAST c3's construction-time schedule + FormatLinearFast, while
+    unported nn.QuantizedLinear keeps its verify_qmm route intact."""
     if not mx.metal.is_available():
         pytest.skip("requires Metal")
     assert qwen35_verify_qmm.apply_verify_qmm_patch()
@@ -319,644 +525,389 @@ def test_format_linear_batched_verify_matches_r2_quantized_linear_bitwise(
     ql, fl = _pair(n, k, bits=8, group_size=64, bias=with_bias, seed=n + rows)
     x = _x((b, length, k), dtype=mx.bfloat16, seed=n + b * 17 + length)
 
+    unarmed = fl(x)
+    want = ql(x)
+    mx.eval(unarmed, want)
+    _assert_c2(unarmed, want, x, ql)
+
     qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
     try:
-        assert qwen35_verify_qmm.takes_verify_route(fl, rows, x.dtype)
-        want = ql(x)
-        mx.eval(want)
-
-        # Must not hit tile_wide or tile_dense during armed batched verify.
+        assert not qwen35_verify_qmm.takes_verify_route(fl, rows, x.dtype)
+        assert qwen35_verify_qmm.takes_verify_route(ql, rows, x.dtype)
         with monkeypatch.context() as patch:
             patch.setattr(
+                mx,
+                "compile",
+                lambda *a, **kw: pytest.fail("cold mx.compile on armed FormatLinear"),
+            )
+            patch.setattr(
                 linear.FormatLinear,
-                "_ordinary",
-                lambda *a, **kw: pytest.fail("armed verify fell into _ordinary"),
+                "_scheduled",
+                lambda *a, **kw: pytest.fail("armed verify missed FormatLinearFast"),
+            )
+            armed = fl(x)
+            mx.eval(armed)
+        assert _same_bits(armed, unarmed), (n, k, bl, with_bias)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+
+
+def test_warm_moe_model_warms_batched_verify_and_one_row_dispatch(monkeypatch):
+    """warm_moe_model(..., mtp_enabled=True) must pre-warm (1, 1, K), multi-row
+    decode (B, 1, K), batched verify (B, S, K), GDN-stacked (1, B*S, K), and
+    prefill onto native FormatLinearFast so request #0 runs 0 compiles and 0
+    Python fallbacks."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+    assert qwen35_verify_qmm.apply_verify_qmm_patch()
+
+    ql_proj, fl_proj = _pair(6144, 2560, bits=8, group_size=64, seed=601)
+    ql_mtp, fl_mtp = _pair(2560, 2560, bits=8, group_size=64, seed=602)
+
+    class _Model(nn.Module):
+        def __init__(self, proj, mtp):
+            super().__init__()
+            self.proj = proj
+            self.mtp = mtp
+
+    model = _Model(fl_proj, fl_mtp)
+    for fut in linear.warm_existing_dense(model, dtypes=(mx.bfloat16,)) or ():
+        fut.result()
+    qwen35_moe_routed_decode.warm_moe_model(
+        model, mtp_enabled=True, prefill_lengths=(64,)
+    )
+
+    # Both layers must already hold native fast dispatchers before request #0.
+    assert fl_proj._fast is not None
+    assert fl_mtp._fast is not None
+
+    shapes = (
+        (1, 1, 2560),
+        (2, 1, 2560),
+        (4, 1, 2560),
+        (2, 2, 2560),
+        (2, 3, 2560),
+        (2, 4, 2560),
+        (4, 2, 2560),
+        (4, 3, 2560),
+        (4, 4, 2560),
+        (1, 6, 2560),
+        (1, 8, 2560),
+        (1, 12, 2560),
+        (1, 16, 2560),
+        (1, 64, 2560),
+    )
+
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                mx,
+                "compile",
+                lambda *a, **kw: pytest.fail("cold mx.compile after warm_moe_model"),
+            )
+            patch.setattr(
+                linear,
+                "_launch",
+                lambda *a, **kw: pytest.fail("Python _launch after warm_moe_model"),
             )
             patch.setattr(
                 tile_dense,
                 "project",
-                lambda *a, **kw: pytest.fail("armed verify fell into tile_dense"),
-            )
-            first = fl(x)
-            mx.eval(first)
-            assert _same_bits(
-                first, want
-            ), f"FormatLinear verify != R2 QuantizedLinear for {n}x{k} {(b, length)}"
-
-            # Construction-time binding: steady-state call makes 0 _verify_route
-            # lookups and 0 mx.compile calls.
-            patch.setattr(
-                qwen35_verify_qmm,
-                "_verify_route",
-                lambda *a, **kw: pytest.fail("hot-path _verify_route called"),
+                lambda *a, **kw: pytest.fail("Python project after warm_moe_model"),
             )
             patch.setattr(
-                mx,
-                "compile",
-                lambda *a, **kw: pytest.fail("hot-path mx.compile called"),
+                linear.FormatLinear,
+                "_scheduled",
+                lambda *a, **kw: pytest.fail("Python _scheduled after warm_moe_model"),
             )
-            second = fl(x)
-            mx.eval(second)
-            assert _same_bits(second, want)
+            for ql, fl in ((ql_proj, fl_proj), (ql_mtp, fl_mtp)):
+                for shape in shapes:
+                    x = _x(shape, dtype=mx.bfloat16, seed=610 + sum(shape))
+                    got = fl(x)
+                    want = ql(x)
+                    mx.eval(got, want)
+                    if shape == (1, 1, 2560):
+                        assert _same_bits(got, want), (fl.output_dims, shape)
+                    else:
+                        _assert_c2(got, want, x, ql)
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False)
 
 
-def test_format_linear_verify_route_bypasses_unarmed_fast_dispatch_both_directions():
-    """Unarmed FormatLinearFast (wide_fast / dense_fast) must never shadow
-    armed batched verify, and armed batched verify must never poison unarmed
-    FormatLinearFast on the exact same 3-D shape."""
-    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
-        pytest.skip("requires Metal and FormatLinearFast native")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    n, k = 6144, 2560
-    ql, fl = _pair(n, k, bits=8, group_size=64, seed=412)
+def test_row_exact_active_counter_transitions_and_threads():
+    """_ROW_EXACT_ACTIVE tracks armed row-exact threads cleanly across
+    idempotent calls, verify <-> row_exact transitions, and concurrent threads."""
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
 
-    for shape in ((4, 2, k), (4, 4, k), (1, 12, k)):
-        x = _x(shape, dtype=mx.bfloat16, seed=sum(shape))
-        # 1. Unarmed call populates FormatLinearFast.
-        unarmed_ref = fl(x)
-        mx.eval(unarmed_ref)
-        assert fl._fast is not None
-        assert fl._fast(fl, x) is not None
-
-        # 2. Arm batched verify: C++ _fast must return None so verify route runs.
+    qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
+    try:
+        assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+        assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 1
+        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+        assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 1
         qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-        try:
-            assert fl._fast(fl, x) is None
-            armed_want = ql(x)
-            armed_got = fl(x)
-            mx.eval(armed_want, armed_got)
-            assert _same_bits(armed_got, armed_want), shape
-        finally:
-            qwen35_verify_qmm.set_verify_qmm_armed(False)
+        assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False)
+    assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
 
-        # 3. Disarm: FormatLinearFast replays unarmed output again (unpoisoned).
-        replay = fl._fast(fl, x)
-        assert replay is not None
-        mx.eval(replay)
-        assert _same_bits(replay, unarmed_ref), shape
+    barrier = threading.Barrier(2)
+    observed: list[int] = []
 
-        # 4. Arm row-exact verify: must take serial row-exact Dot, not vk_qmm_mma.
+    def arm_worker():
         qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
         try:
-            assert fl._fast(fl, x) is None
-            re_got = fl(x)
-            re_single = mx.concatenate(
-                [fl(x.reshape(-1, k)[i : i + 1]) for i in range(x.size // k)], axis=0
-            ).reshape(x.shape[0], x.shape[1], n)
-            mx.eval(re_got, re_single)
-            assert _same_bits(re_got, re_single), shape
+            barrier.wait(timeout=5.0)
+            observed.append(qwen35_verify_qmm._ROW_EXACT_ACTIVE)
+            barrier.wait(timeout=5.0)
         finally:
             qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-def test_format_linear_verify_route_guards_mutations_and_threads():
-    """Verify route guards: non-eligible N gets no verify plan, 2-D and (1,1,K)
-    stay off verify route, wrong width raises ValueError, weight/bias mutation
-    invalidates the bound verify plan, and concurrent threads stay isolated."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    # Non-eligible N=512 (8-bit): kept.verify must be None at construction.
-    _, small = _pair(512, 2560, bits=8, group_size=64, seed=501)
-    kept_small = small._keep()
-    assert kept_small.verify is None
-
-    # Eligible N=4096 (8-bit): kept.verify bound at construction.
-    ql, fl = _pair(4096, 2560, bits=8, group_size=64, seed=502)
-    kept = fl._keep()
-    assert kept.verify is not None
-
-    # Non-affine layer must get kept.verify is None even if tensors match affine shapes.
-    non_affine = type(
-        "_Stub",
-        (),
-        {
-            "_stock": True,
-            "_STACK": 0,
-            "mode": "oqel",
-            "input_dims": 2560,
-            "output_dims": 4096,
-            "bits": 8,
-            "group_size": 64,
-            "get": lambda self, key: fl.get(key),
-        },
-    )()
-    assert qwen35_verify_qmm.bind_format_verify(non_affine, None) is None
-
-    x_bad = _x((4, 2, 128), dtype=mx.bfloat16, seed=503)
-    x_2d = _x((8, 2560), dtype=mx.bfloat16, seed=504)
-    x_3d = _x((4, 2, 2560), dtype=mx.bfloat16, seed=505)
-
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        with pytest.raises(ValueError):
-            kept.verify(x_bad)
-        with pytest.raises(ValueError):
-            fl(x_bad)
-        # 2-D does not enter batched verify route (matches R2 x.ndim != 3).
-        assert kept.verify(x_2d) is None
-        y_2d = fl(x_2d)
-        mx.eval(y_2d)
-        assert y_2d.shape == (8, 4096)
-        before = fl(x_3d)
-        mx.eval(before)
-        # Mutate scales: must retire old verify plan and compute with new scales.
-        new_scales = fl["scales"] * mx.array(2.0, dtype=mx.bfloat16)
-        mx.eval(new_scales)
-        fl["scales"] = new_scales
-        ql.scales = new_scales
-        after_got = fl(x_3d)
-        after_want = ql(x_3d)
-        mx.eval(after_got, after_want)
-        assert not _same_bits(before, after_got)
-        assert _same_bits(after_got, after_want)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-    # Multi-thread isolation (Rule 14): armed thread vs unarmed thread concurrently.
-    unarmed_ref = fl(x_3d)
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        armed_ref = ql(x_3d)
-        mx.eval(unarmed_ref, armed_ref)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-    def run_armed():
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-        try:
-            outs = [fl(x_3d) for _ in range(4)]
-            mx.eval(*outs)
-            return all(_same_bits(o, armed_ref) for o in outs)
-        finally:
-            qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-    def run_unarmed():
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-        outs = [fl(x_3d) for _ in range(4)]
-        mx.eval(*outs)
-        return all(_same_bits(o, unarmed_ref) for o in outs)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        f_arm = pool.submit(run_armed)
-        f_unarm = pool.submit(run_unarmed)
-        assert f_arm.result()
-        assert f_unarm.result()
-
-
-def test_warm_moe_model_warms_verify_qmm_and_dispatch(monkeypatch):
-    """warm_moe_model(..., mtp_enabled=True) must warm verify_qmm MMA Metals and
-    pre-compile 4-stream verify graphs so the first armed call does 0 compiles."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    ql, fl = _pair(4096, 2560, bits=8, group_size=64, seed=601)
-
-    class _Model(nn.Module):
-        def __init__(self, layer):
-            super().__init__()
-            self.proj = layer
-
-    model = _Model(fl)
-    qwen35_moe_routed_decode.warm_moe_model(
-        model, mtp_enabled=True, prefill_lengths=(64,)
-    )
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                mx,
-                "compile",
-                lambda *a, **kw: pytest.fail("cold mx.compile on warmed verify"),
-            )
-            for bl in ((4, 2), (4, 3), (4, 4)):
-                x = _x((*bl, 2560), dtype=mx.bfloat16, seed=610 + bl[1])
-                got = fl(x)
-                want = ql(x)
-                mx.eval(got, want)
-                assert _same_bits(got, want), bl
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-def test_format_linear_verify_routes_vk_sg8_and_unpatched_guard(monkeypatch):
-    """Verify routes beyond mma (vk ksplit, vk msg, sg8) match R2 bitwise and
-    is_armed() stays False while the verify qmm patch is not applied."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    # Unpatched guard: when _QL_PATCHED is False, FormatLinear verify is disarmed.
-    _, fl_guard = _pair(4096, 2560, bits=8, group_size=64, seed=650)
-    kept_guard = fl_guard._keep()
-    assert kept_guard.verify is not None
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        assert kept_guard.verify.is_armed() is True
-        with monkeypatch.context() as patch:
-            patch.setattr(qwen35_verify_qmm, "_QL_PATCHED", False)
-            assert kept_guard.verify.is_armed() is False
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-    # vk ksplit (N=16384, rows=4), vk msg (N=100000, rows=4), sg8 (bits=4, rows=8).
-    cases = [
-        (16384, 2560, 8, (2, 2)),
-        (100000, 2560, 8, (2, 2)),
-        (4096, 2560, 4, (4, 2)),
-    ]
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        for n, k, bits, bl in cases:
-            ql, fl = _pair(n, k, bits=bits, group_size=64, seed=660 + n + bits)
-            x = _x((*bl, k), dtype=mx.bfloat16, seed=670 + n)
-            want = ql(x)
-            got = fl(x)
-            mx.eval(want, got)
-            assert _same_bits(got, want), (n, k, bits, bl)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_format_linear_verify_group_sums_only_passed_to_sg8(with_bias):
-    """Registered group sums must be passed ONLY to sg8 (group_size==64) verify
-    routes; non-sg8 routes (mma/skinny/vk) and group_size!=64 sg8 on the same
-    or another 4-bit layer must never receive group sums and must match R2's
-    nn.QuantizedLinear bitwise."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    ql, fl = _pair(4096, 2560, bits=4, group_size=64, bias=with_bias, seed=680)
-    ql_vk, fl_vk = _pair(16384, 2560, bits=4, group_size=64, bias=with_bias, seed=681)
-    x8 = _x((4, 2, 2560), dtype=mx.bfloat16, seed=682)
-    x12 = _x((4, 3, 2560), dtype=mx.bfloat16, seed=683)
-    x3 = _x((1, 3, 2560), dtype=mx.bfloat16, seed=684)
-
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        kept = fl._keep()
-        kept_vk = fl_vk._keep()
-        assert kept.verify is not None and kept_vk.verify is not None
-        assert kept.verify.routes.get((8, mx.bfloat16)) == "sg8"
-        assert kept.verify.routes.get((12, mx.bfloat16)) in ("mma", "skinny")
-        assert kept_vk.verify.routes.get((8, mx.bfloat16)) == "sg8"
-        assert kept_vk.verify.routes.get((3, mx.bfloat16)) == "vk"
-
-        qwen35_verify_qmm.register_group_sums(x8, qwen35_verify_qmm.group_sums(x8))
-        qwen35_verify_qmm.register_group_sums(x12, qwen35_verify_qmm.group_sums(x12))
-        qwen35_verify_qmm.register_group_sums(x3, qwen35_verify_qmm.group_sums(x3))
-
-        got8, want8 = fl(x8), ql(x8)
-        got12, want12 = fl(x12), ql(x12)
-        got3, want3 = fl_vk(x3), ql_vk(x3)
-        mx.eval(got8, want8, got12, want12, got3, want3)
-
-        assert _same_bits(got8, want8)
-        assert _same_bits(got12, want12)
-        assert _same_bits(got3, want3)
-
-        # sg8 (g=64) must take the summed graph; non-sg8 (mma/skinny/vk) must not.
-        graphs = kept.verify._graphs()
-        assert ((4, 2, 2560), mx.bfloat16, True) in graphs
-        assert ((4, 2, 2560), mx.bfloat16, False) not in graphs
-        assert ((4, 3, 2560), mx.bfloat16, False) in graphs
-        assert ((4, 3, 2560), mx.bfloat16, True) not in graphs
-        graphs_vk = kept_vk.verify._graphs()
-        assert ((1, 3, 2560), mx.bfloat16, False) in graphs_vk
-        assert ((1, 3, 2560), mx.bfloat16, True) not in graphs_vk
-
-        # group_size=32 sg8 must never take summed graphs even when sums are registered.
-        if not with_bias:
-            ql32, fl32 = _pair(4096, 2560, bits=4, group_size=32, seed=685)
-            kept32 = fl32._keep()
-            assert kept32.verify is not None
-            assert kept32.verify.routes.get((8, mx.bfloat16)) == "sg8"
-            assert kept32.verify.sg8_keys == frozenset()
-            got32, want32 = fl32(x8), ql32(x8)
-            mx.eval(got32, want32)
-            assert _same_bits(got32, want32)
-            graphs32 = kept32.verify._graphs()
-            assert ((4, 2, 2560), mx.bfloat16, False) in graphs32
-            assert ((4, 2, 2560), mx.bfloat16, True) not in graphs32
-    finally:
-        qwen35_verify_qmm.clear_group_sums()
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_warm_verify_graph_precompiles_summed_sg8(with_bias, monkeypatch):
-    """After load-time warm_model_dispatch (and direct warm_graph, even if the
-    unsummed graph was already cached), the first armed summed-sg8 verify call
-    must trigger zero mx.compile calls and match R2 bitwise."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    ql, fl = _pair(4096, 2560, bits=4, group_size=64, bias=with_bias, seed=690)
-    _, fl_late = _pair(4096, 2560, bits=4, group_size=64, bias=with_bias, seed=691)
-
-    class _Model(nn.Module):
-        def __init__(self, layer):
-            super().__init__()
-            self.proj = layer
-
-    model = _Model(fl)
-    linear.warm_model_dispatch(model, mtp_enabled=True, prefill_lengths=())
-
-    x8 = _x((4, 2, 2560), dtype=mx.bfloat16, seed=692)
-    x8_plain = _x((4, 2, 2560), dtype=mx.bfloat16, seed=693)
-
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        # Pre-populate only the unsummed graph on fl_late, then warm_graph must
-        # still trace and cache the summed sg8 entry.
-        mx.eval(fl_late(x8_plain))
-        kept_late = fl_late.__dict__[linear._KEPT]
-        assert kept_late.verify is not None
-        assert ((4, 2, 2560), mx.bfloat16, False) in kept_late.verify._graphs()
-        assert ((4, 2, 2560), mx.bfloat16, True) not in kept_late.verify._graphs()
-        assert kept_late.verify.warm_graph((4, 2, 2560), mx.bfloat16) is True
-        assert ((4, 2, 2560), mx.bfloat16, True) in kept_late.verify._graphs()
-
-        qwen35_verify_qmm.register_group_sums(x8, qwen35_verify_qmm.group_sums(x8))
-        want = ql(x8)
-        want_plain = ql(x8_plain)
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                mx,
-                "compile",
-                lambda *a, **kw: pytest.fail("cold mx.compile on summed sg8 verify"),
-            )
-            got = fl(x8)
-            got_plain = fl(x8_plain)
-            got_late = fl_late(x8)
-            mx.eval(got, want, got_plain, want_plain, got_late)
-            assert _same_bits(got, want)
-            assert _same_bits(got_plain, want_plain)
-    finally:
-        qwen35_verify_qmm.clear_group_sums()
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-def test_warm_model_dispatch_warms_single_stream_verify_graph(monkeypatch):
-    """warm_model_dispatch must warm vb=1 single-stream verify shapes ((1, 3, K)
-    and (1, 4, K)) so the first armed single-stream MTP verify does 0 compiles."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    ql, fl = _pair(16384, 2560, bits=8, group_size=64, seed=695)
-
-    class _Model(nn.Module):
-        def __init__(self, layer):
-            super().__init__()
-            self.lm_head = layer
-
-    model = _Model(fl)
-    linear.warm_model_dispatch(model, mtp_enabled=True, prefill_lengths=())
-
-    kept = fl.__dict__[linear._KEPT]
-    assert kept.verify is not None
-    assert ((1, 3, 2560), mx.bfloat16, False) in kept.verify._graphs()
-    assert ((1, 4, 2560), mx.bfloat16, False) in kept.verify._graphs()
-
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(
-                mx,
-                "compile",
-                lambda *a, **kw: pytest.fail("cold mx.compile on single-stream verify"),
-            )
-            for vs in (3, 4):
-                x = _x((1, vs, 2560), dtype=mx.bfloat16, seed=696 + vs)
-                got = fl(x)
-                want = ql(x)
-                mx.eval(got, want)
-                assert _same_bits(got, want), vs
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-
-def test_warm_engine_dispatch_and_msg_metal_warming(monkeypatch):
-    """warm_engine_dispatch must invoke qwen35_verify_qmm.warm_model, and
-    warm_model must submit msg_tasks for N >= 100000 layers."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-
-    _, fl = _pair(4096, 2560, bits=8, group_size=64, seed=698)
-    with testing.verified("qwen4_exp"):
-        fl_msg = linear.FormatLinear(
-            "affine",
-            8,
-            64,
-            2560,
-            {
-                "weight": mx.zeros((100000, 2560 * 8 // 32), dtype=mx.uint32),
-                "scales": mx.zeros((100000, 2560 // 64), dtype=mx.bfloat16),
-                "biases": mx.zeros((100000, 2560 // 64), dtype=mx.bfloat16),
-            },
-            None,
-        )
-
-    class _Model(nn.Module):
-        def __init__(self, proj, head):
-            super().__init__()
-            self.proj = proj
-            self.head = head
-
-    model = _Model(fl, fl_msg)
-    warm_calls: list[bool] = []
-    msg_ms: list[int] = []
-    real_warm = qwen35_verify_qmm.warm_model
-    real_msg = qwen35_verify_qmm._warm_msg_metal
-
-    def spy_warm(m, *, mtp_enabled=False):
-        warm_calls.append(mtp_enabled)
-        return real_warm(m, mtp_enabled=mtp_enabled)
-
-    def spy_msg(m, *args):
-        msg_ms.append(m)
-        return real_msg(m, *args)
-
-    with monkeypatch.context() as patch:
-        patch.setattr(qwen35_verify_qmm, "warm_model", spy_warm)
-        patch.setattr(qwen35_verify_qmm, "_warm_msg_metal", spy_msg)
-        qwen35_moe_routed_decode.warm_engine_dispatch(
-            model, stream=None, prefill_lengths=(), mtp_enabled=True
-        )
-    assert warm_calls == [True]
-    assert sorted(msg_ms) == [4, 6]
+        f1 = pool.submit(arm_worker)
+        f2 = pool.submit(arm_worker)
+        f1.result()
+        f2.result()
+    assert observed == [2, 2]
+    assert qwen35_verify_qmm._ROW_EXACT_ACTIVE == 0
 
 
 # ---------------------------------------------------------------------------
-# Part C: FormatLinear (1, 1, K) native dense_fast dispatch
+# Part C: FormatLinear 1-row native FormatLinearFast dispatch & safety
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "shape_nk,qwen,with_bias",
+    "shape_nk,with_bias",
     [
-        ((4096, 2560), True, False),  # 1 not in mlx_rows (Dot -> dense_fast)
-        ((4096, 2560), True, True),  # with bias
-        ((2560, 2560), True, False),  # 1 in mlx_rows on M3 (MTP fc_embedding/fc_hidden)
-        ((256, 256), False, False),  # non-Qwen layer
+        ((4096, 2560), False),  # 1 not in mlx_rows -> dot_fast
+        ((4096, 2560), True),  # with bias -> dot_fast
+        ((2560, 2560), False),  # 1 in mlx_rows on M3 -> dense_fast when dense built
+        ((256, 256), False),  # small layer -> dot_fast
     ],
 )
-def test_format_linear_one_row_uses_native_dense_fast_dispatch(
-    shape_nk, qwen, with_bias, monkeypatch
+def test_format_linear_one_row_uses_native_fast_dispatch(
+    shape_nk, with_bias, monkeypatch
 ):
-    """FormatLinear (1, 1, K) must be served by native kept.dense_fast with
-    zero Python dispatch, sharing the same FormatLinearFast dispatcher with
-    prefill (1, L, K), bitwise identical to the reference route."""
+    """FormatLinear (1, 1, K) and (1, K) must be served by native
+    FormatLinearFast (dot_fast, or dense_fast for M3 mlx_rows) and coexist
+    lock-free with prefill (1, 32, K) across _fast/_fast2 with zero Python
+    dispatch, bitwise identical to stock QuantizedLinear."""
     if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
         pytest.skip("requires Metal and FormatLinearFast native")
     n, k = shape_nk
-    ql, fl = _pair(n, k, bits=8, group_size=64, bias=with_bias, qwen=qwen, seed=701 + n)
-    x1 = _x((1, 1, k), dtype=mx.bfloat16, seed=710)
-    xp = _x((1, 32, k), dtype=mx.bfloat16, seed=711)
+    ql, fl = _pair(n, k, bits=8, group_size=64, bias=with_bias, seed=701 + n)
+    linear.prepare_layer_plans(fl)
+    x1_3d = _x((1, 1, k), dtype=mx.bfloat16, seed=710)
+    x1_2d = _x((1, k), dtype=mx.bfloat16, seed=711)
+    xp = _x((1, 32, k), dtype=mx.bfloat16, seed=712)
 
-    first1 = fl(x1)
-    assert fl._fast is not None, "cold (1,1,K) must bind native fast on first call"
+    first1 = fl(x1_3d)
+    first1_2d = fl(x1_2d)
     firstp = fl(xp)
-    # After prefill builds kept.dense, the next (1, 1, K) shares kept.dense_fast.
-    upgrade1 = fl(x1)
-    mx.eval(first1, firstp, upgrade1)
-    assert _same_bits(first1, upgrade1)
+    mx.eval(first1, first1_2d, firstp)
+
     kept = fl.__dict__[linear._KEPT]
-    assert kept.dense_fast is not None
-    assert fl._fast is kept.dense_fast
+    if 1 in kept.mlx_rows:
+        assert kept.dense_fast is not None
+    else:
+        assert kept.dot_fast is not None
+    assert fl._fast is not None
 
-    fast = kept.dense_fast
     served: list[bool] = []
+    orig_fast = fl.__dict__.get(linear._FAST)
+    orig_fast2 = fl.__dict__.get(linear._FAST2)
 
-    def counting(module, value, _fast=fast):
-        y = _fast(module, value)
-        served.append(y is not None)
-        return y
+    def wrap(fn):
+        if fn is None:
+            return None
+
+        def counting(module, value, _fn=fn):
+            y = _fn(module, value)
+            if y is not None:
+                served.append(True)
+            return y
+
+        return counting
 
     with monkeypatch.context() as patch:
-        fl.__dict__[linear._FAST] = counting
+        fl.__dict__[linear._FAST] = wrap(orig_fast)
+        if orig_fast2 is not None:
+            fl.__dict__[linear._FAST2] = wrap(orig_fast2)
         patch.setattr(
             linear.FormatLinear,
             "_keep",
-            lambda *a, **kw: pytest.fail("Python _keep on warm (1,1,K)"),
+            lambda *a, **kw: pytest.fail("Python _keep on warm 1-row/prefill"),
         )
         patch.setattr(
             linear.FormatLinear,
-            "_ordinary",
-            lambda *a, **kw: pytest.fail("Python _ordinary on warm (1,1,K)"),
+            "_scheduled",
+            lambda *a, **kw: pytest.fail("Python _scheduled on warm 1-row/prefill"),
         )
         patch.setattr(
             linear,
             "_launch",
-            lambda *a, **kw: pytest.fail("Python _launch on warm (1,1,K)"),
+            lambda *a, **kw: pytest.fail("Python _launch on warm 1-row/prefill"),
         )
         try:
-            again1 = fl(x1)
+            again1 = fl(x1_3d)
             againp = fl(xp)
-            again1_b = fl(x1)
-            mx.eval(again1, againp, again1_b)
+            again1_2d = fl(x1_2d)
+            again1_b = fl(x1_3d)
+            mx.eval(again1, againp, again1_2d, again1_b)
         finally:
-            fl.__dict__[linear._FAST] = fast
+            fl.__dict__[linear._FAST] = orig_fast
+            if orig_fast2 is not None:
+                fl.__dict__[linear._FAST2] = orig_fast2
 
-    assert served == [
-        True,
-        True,
-        True,
-    ], f"(1,1,K) or prefill missed dense_fast: {served}"
+    assert served == [True, True, True, True], f"missed native fast: {served}"
     assert _same_bits(first1, again1)
     assert _same_bits(first1, again1_b)
+    assert _same_bits(first1_2d, again1_2d)
     assert _same_bits(firstp, againp)
-    ref1 = ql(x1)
-    mx.eval(ref1)
+    ref1 = ql(x1_3d)
+    ref1_2d = ql(x1_2d)
+    mx.eval(ref1, ref1_2d)
     assert _same_bits(again1, ref1)
-
-    # Row-exact armed call on (1, 1, K) must bypass _fast and not corrupt dense_fast.
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
-    try:
-        assert fl._fast(fl, x1) is None
-        re1 = fl(x1)
-        mx.eval(re1)
-        assert _same_bits(re1, ref1)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-    post = fl._fast(fl, x1)
-    assert post is not None
-    mx.eval(post)
-    assert _same_bits(post, first1)
+    assert _same_bits(again1_2d, ref1_2d)
 
 
-def test_one_row_dense_fast_safety_proof_fail_tile_dense_project_and_threads(
-    monkeypatch,
-):
-    """Safety invariants for (1, 1, K) on dense_fast:
-    1. plan.proof.fail() immediately retires (1, 1, K) from dense_fast.
-    2. tile_dense.project(kept.dense, x_1x1) calls _project_cold rather than
-       replaying the Dot graph stored for FormatLinearFast.
+def test_one_row_fast_safety_proof_fail_tile_dense_project_and_threads(monkeypatch):
+    """Safety invariants for 1-row native fast dispatch:
+    1. plan.proof.fail() immediately retires dot_fast on (1, 1, K) and (1, K)
+       and falls back bitwise to _stock_matmul.
+    2. After _bind_one_row_mlx_fast caches a 1-row graph in dense.binding.kept,
+       direct tile_dense.project(kept.dense, x1) still enters _project_cold
+       (returning None) and never replays or overwrites the bound graph.
     3. Multi-thread (1, 1, K) calls stay bitwise exact."""
     if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
         pytest.skip("requires Metal and FormatLinearFast native")
 
-    ql, fl = _pair(256, 256, bits=8, group_size=64, qwen=False, seed=801)
-    linear.prepare_layer_plans(fl)
-    x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=802)
-    ref = ql(x1)
-    y = fl(x1)
-    mx.eval(ref, y)
-    assert _same_bits(y, ref)
-    kept = fl.__dict__[linear._KEPT]
-    assert fl._fast is kept.dense_fast
-    assert fl._fast(fl, x1) is not None
+    with testing.fresh_proofs():
+        ql, fl = _pair(256, 256, bits=8, group_size=64, seed=801)
+        linear.prepare_layer_plans(fl)
+        x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=802)
+        x1_2d = _x((1, 256), dtype=mx.bfloat16, seed=803)
+        ref = ql(x1)
+        ref_2d = ql(x1_2d)
+        y = fl(x1)
+        y_2d = fl(x1_2d)
+        mx.eval(ref, ref_2d, y, y_2d)
+        assert _same_bits(y, ref)
+        assert _same_bits(y_2d, ref_2d)
+        kept = fl.__dict__[linear._KEPT]
+        assert kept.dot_fast is not None
+        assert fl._fast is kept.dot_fast
+        assert kept.dot_fast(fl, x1) is not None
+        assert kept.dot_fast(fl, x1_2d) is not None
 
-    # Direct tile_dense.project on (1, 1, 256) must go through _project_cold
-    # (never replay the Dot graph placed in kept.dense.binding for dense_fast)
-    # and must never overwrite the bound Dot graph in dense.binding.kept.
-    sig1 = (x1.shape, x1.dtype)
-    bound_before = kept.dense.binding.kept.graphs[sig1]
-    cold_calls = []
-    real_cold = tile_dense._project_cold
+        # Multi-thread (1, 1, K) calls on dot_fast.
+        def worker():
+            out = fl(x1)
+            mx.eval(out)
+            return _same_bits(out, ref)
 
-    def spy_cold(plan, x, sig):
-        cold_calls.append(sig)
-        return real_cold(plan, x, sig)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f1 = pool.submit(worker)
+            f2 = pool.submit(worker)
+            assert f1.result() and f2.result()
 
-    with monkeypatch.context() as patch:
-        patch.setattr(tile_dense, "_project_cold", spy_cold)
-        td_y = tile_dense.project(kept.dense, x1)
-    assert td_y is not None
-    assert cold_calls == [sig1]
-    assert kept.dense.binding.kept.graphs[sig1] is bound_before
-    mx.eval(td_y)
-    assert td_y.shape == (1, 1, 256)
+        # Failing kept.plan.proof must immediately retire dot_fast replay.
+        kept.plan.proof.fail()
+        assert kept.dot_fast(fl, x1) is None
+        assert kept.dot_fast(fl, x1_2d) is None
+        fb1 = fl(x1)
+        fb2 = fl(x1_2d)
+        mx.eval(fb1, fb2)
+        assert _same_bits(fb1, ref)
+        assert _same_bits(fb2, ref_2d)
 
-    # Multi-thread (1, 1, K) calls.
-    def worker():
-        out = fl(x1)
-        mx.eval(out)
-        return _same_bits(out, ref)
+        # _bind_one_row_mlx_fast isolation: tile_dense.project(dense, x1) must
+        # go through _project_cold (returning None) and never replay/clobber
+        # the 1-row MLX graph bound for dense_fast.
+        ql_m, fl_m = _pair(256, 256, bits=8, group_size=64, seed=805)
+        linear.prepare_layer_plans(fl_m)
+        kept_m = fl_m.__dict__[linear._KEPT]
+        sig1 = (x1.shape, x1.dtype)
+        fl_m._bind_one_row_mlx_fast(kept_m, kept_m.dense, sig1)
+        assert kept_m.dense_fast is not None
+        replay_m = kept_m.dense_fast(fl_m, x1)
+        assert replay_m is not None
+        ref_m = ql_m(x1)
+        mx.eval(replay_m, ref_m)
+        assert _same_bits(replay_m, ref_m)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(worker)
-        f2 = pool.submit(worker)
-        assert f1.result() and f2.result()
+        bound_before = kept_m.dense.binding.kept.graphs[sig1]
+        cold_calls: list[tuple] = []
+        real_cold = tile_dense._project_cold
 
-    # Failing kept.plan.proof must immediately retire dense_fast replay!
-    kept.plan.proof.fail()
-    assert fl._fast(fl, x1) is None
-    fallback = fl(x1)
-    mx.eval(fallback)
-    assert _same_bits(fallback, ref)
+        def spy_cold(plan, x, sig):
+            cold_calls.append(sig)
+            return real_cold(plan, x, sig)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(tile_dense, "_project_cold", spy_cold)
+            td_y = tile_dense.project(kept_m.dense, x1)
+        assert td_y is None
+        assert cold_calls == [sig1]
+        assert kept_m.dense.binding.kept.graphs[sig1] is bound_before
+
+
+def test_fast_mask_hides_both_fast_and_fast2_only_on_recording_thread():
+    """testing.layer_calls() must mask BOTH _fast and _fast2 on the recording
+    thread (recording warm calls and keeping raw Proof._kept graphs) while
+    leaving concurrent non-recording threads on native fast."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+
+    with testing.fresh_proofs():
+        _, fl = _pair(256, 256, bits=8, group_size=64, seed=970)
+        linear.prepare_layer_plans(fl)
+        x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=971)
+        xp = _x((1, 32, 256), dtype=mx.bfloat16, seed=972)
+
+        # Populate BOTH _fast (dot_fast) and _fast2 (dense_fast).
+        mx.eval(fl(x1), fl(xp))
+        assert fl._fast is not None and fl._fast2 is not None
+        kept = fl.__dict__[linear._KEPT]
+
+        other_saw: list[tuple[bool, bool]] = []
+        entered = threading.Event()
+        release = threading.Event()
+
+        def observer():
+            entered.wait(timeout=5.0)
+            other_saw.append((fl._fast is not None, fl._fast2 is not None))
+            release.set()
+
+        t = threading.Thread(target=observer)
+        t.start()
+        try:
+            with testing.layer_calls() as calls:
+                assert fl._fast is None and fl._fast2 is None
+                entered.set()
+                release.wait(timeout=5.0)
+                mx.eval(fl(x1))
+                mx.eval(fl(xp))
+        finally:
+            t.join(timeout=5.0)
+
+        assert other_saw == [(True, True)], other_saw
+        assert len(calls) >= 1
+        assert fl._fast is not None and fl._fast2 is not None
+        # Raw graph kept in plan.proof._kept (not the recorder wrapper).
+        raw = kept.plan.proof._kept.graphs[(x1.shape, x1.dtype)]
+        assert raw is not None
+        assert getattr(raw, "__name__", "") != "recorded"
 
 
 # ---------------------------------------------------------------------------
-# Part D: Zero per-call host overhead on FormatLinear small rows (Rule 28)
+# Part D: Zero per-call host overhead & native-fast boundary guards
 # ---------------------------------------------------------------------------
 
 
@@ -969,31 +920,28 @@ def test_format_linear_small_rows_python_fallback_zero_extra_calls(
     bits, shape, monkeypatch
 ):
     """On the Python warm path (native disabled), small-row FormatLinear calls
-    must make zero calls to verify.is_armed(), _is_armed(), packed_name(),
-    builtins.len(), or _register_fast() while verify is disarmed."""
+    must make zero calls to packed_name() and zero repeat native.has_symbol()
+    calls."""
     if not mx.metal.is_available():
         pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    qwen35_verify_qmm.set_verify_qmm_armed(False)
 
-    _, fl = _pair(4096, 2048, bits=bits, group_size=64, qwen=False, seed=901 + bits)
+    _, fl = _pair(4096, 2048, bits=bits, group_size=64, seed=901 + bits)
     x = _x(shape, dtype=mx.bfloat16, seed=910 + sum(shape))
 
     with monkeypatch.context() as patch:
-        patch.setattr(native, "has_symbol", lambda _name: False)
-        # Warm the plan graph and establish no_native on the cold call.
+        has_symbol_calls = 0
+
+        def spy_has_symbol(_name):
+            nonlocal has_symbol_calls
+            has_symbol_calls += 1
+            return False
+
+        patch.setattr(native, "has_symbol", spy_has_symbol)
+        # Warm the graph and establish no_dot_fast / no_dense_fast on cold call.
         warm0 = fl(x)
         mx.eval(warm0)
         assert fl._fast is None
-        assert fl.__dict__[linear._KEPT].verify is not None
-
-        is_armed_calls = 0
-        orig_is_armed = qwen35_verify_qmm._FormatVerifyPlan.is_armed
-
-        def spy_is_armed(self):
-            nonlocal is_armed_calls
-            is_armed_calls += 1
-            return orig_is_armed(self)
+        has_symbol_calls = 0
 
         packed_calls = 0
         orig_packed = linear.packed_name
@@ -1003,17 +951,7 @@ def test_format_linear_small_rows_python_fallback_zero_extra_calls(
             packed_calls += 1
             return orig_packed(layer)
 
-        reg_calls = 0
-        orig_reg = linear.FormatLinear._register_fast
-
-        def spy_reg(self, *a, **kw):
-            nonlocal reg_calls
-            reg_calls += 1
-            return orig_reg(self, *a, **kw)
-
-        patch.setattr(qwen35_verify_qmm._FormatVerifyPlan, "is_armed", spy_is_armed)
         patch.setattr(linear, "packed_name", spy_packed)
-        patch.setattr(linear.FormatLinear, "_register_fast", spy_reg)
 
         pr = cProfile.Profile()
         pr.enable()
@@ -1023,329 +961,59 @@ def test_format_linear_small_rows_python_fallback_zero_extra_calls(
         pr.disable()
         mx.eval(y)
 
-    assert is_armed_calls == 0, f"verify.is_armed() called {is_armed_calls} times"
     assert packed_calls == 0, f"packed_name() called {packed_calls} times"
-    assert reg_calls == 0, f"_register_fast() called {reg_calls} times"
+    assert has_symbol_calls == 0, f"has_symbol() called {has_symbol_calls} times"
     callee_names = {fn[2] for fn in pstats.Stats(pr).stats if fn[2] != "disable"}
-    assert "len" not in callee_names, f"per-call len() on warm path: {callee_names}"
-    assert (
-        "_is_armed" not in callee_names
-    ), f"per-call _is_armed() on warm path: {callee_names}"
+    assert "packed_name" not in callee_names, callee_names
 
 
-def test_bind_plan_fast_in_layer_calls_keeps_raw_graph():
-    """A (1,1,K) bind inside testing.layer_calls() caches the raw graph, not
-    the recorder wrapper (no leak through native dense_fast afterwards)."""
+def test_native_fast_refuses_16_or_more_operands_and_recovers_orphaned_dot_fast():
+    """_native_fast refuses operands of length >= 16 before caching; orphaned
+    _fast/_fast2 is re-published on a warm Dot hit; weight mutation retires
+    both _fast and _fast2 and rebinds cleanly."""
     if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
         pytest.skip("requires Metal and FormatLinearFast native")
-    with testing.fresh_proofs():
-        _, fl = _pair(256, 256, bits=8, group_size=64, qwen=False, seed=970)
-        linear.prepare_layer_plans(fl)
-        x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=971)
-        with testing.layer_calls() as calls:
-            mx.eval(fl(x1))
-        assert len(calls) == 1
-        kept = fl.__dict__[linear._KEPT]
-        raw = kept.plan.proof._kept.graphs[(x1.shape, x1.dtype)]
-        assert kept.dense.binding.kept.graphs[(x1.shape, x1.dtype)] is raw
-
-
-def test_init_verify_active_partial_and_armed_module(monkeypatch):
-    """A partially imported verify module (no lock yet) and an armed stub both
-    leave the counter consistent; a concurrent import cannot raise."""
-    import sys
-    import types
-
-    stub = types.ModuleType(linear._VERIFY_QMM_MOD_NAME)
-    monkeypatch.setitem(sys.modules, linear._VERIFY_QMM_MOD_NAME, stub)
-    linear._init_verify_active()
-    assert linear._VERIFY_ACTIVE == 0
-    stub._ROW_EXACT_LOCK = threading.Lock()
-    stub._VERIFY_ACTIVE = 2
-    try:
-        linear._init_verify_active()
-        assert linear._VERIFY_ACTIVE == 2
-    finally:
-        linear._VERIFY_ACTIVE = 0
-
-
-@pytest.mark.parametrize("bits", [4, 8])
-@pytest.mark.parametrize("with_bias", [False, True])
-def test_format_linear_small_rows_bind_native_plan_fast_and_stay_bitwise(
-    bits, with_bias, monkeypatch
-):
-    """Small-row 2-D and 3-D bare FormatLinear calls bind native plan_fast
-    (including after prefill binds dense_fast), stay bitwise identical to the
-    Python route, keep kept.routes empty, isolate tile_dense.project, and
-    respect proof failure, weight mutation, and armed verify."""
-    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
-        pytest.skip("requires Metal and FormatLinearFast native")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    qwen35_verify_qmm.set_verify_qmm_armed(False)
 
     with testing.fresh_proofs():
-        _check_small_rows_bind_native_plan_fast(bits, with_bias, monkeypatch)
+        ql, fl = _pair(256, 256, bits=8, group_size=64, bias=True, seed=955)
+        kept = fl._keep()
+        sig = ((1, 256), mx.bfloat16)
+        kept.plan.proof.keep(sig, lambda x, *ops: x)
 
-
-def _check_small_rows_bind_native_plan_fast(bits, with_bias, monkeypatch):
-
-    k = 2048
-    _, fl = _pair(
-        k, k, bits=bits, group_size=64, bias=with_bias, qwen=False, seed=920 + bits
-    )
-    _, fl_py = _pair(
-        k, k, bits=bits, group_size=64, bias=with_bias, qwen=False, seed=920 + bits
-    )
-
-    shapes = ((1, k), (2, k), (4, k), (8, k), (2, 1, k), (4, 1, k), (1, 4, k))
-    inputs = {s: _x(s, dtype=mx.bfloat16, seed=930 + sum(s)) for s in shapes}
-
-    # Reference outputs with native disabled (pure Python Dot route).
-    refs = {}
-    with monkeypatch.context() as patch:
-        patch.setattr(native, "has_symbol", lambda _name: False)
-        for s, x in inputs.items():
-            refs[s] = fl_py(x)
-        mx.eval(*refs.values())
-
-    # 1. Small 2-D rows bind plan_fast without allocating kept.routes.
-    for s in ((1, k), (2, k), (4, k), (8, k)):
-        x = inputs[s]
-        first = fl(x)
-        mx.eval(first)
-        assert _same_bits(first, refs[s]), s
-        kept = fl.__dict__[linear._KEPT]
-        assert kept.plan_fast is not None
-        assert fl._fast is kept.plan_fast
-        assert kept.routes == {}
-        replay = fl._fast(fl, x)
-        assert replay is not None, s
-        mx.eval(replay)
-        assert _same_bits(replay, refs[s]), s
-
-    # 2. Prefill binds dense_fast; subsequent 3-D 2/4-stream calls switch back
-    #    to plan_fast and serve directly from C++ (0 Python fallback hits).
-    xp = _x((33, k), dtype=mx.bfloat16, seed=950)
-    mx.eval(fl(xp))
-    kept = fl.__dict__[linear._KEPT]
-    assert kept.dense_fast is not None
-    assert fl._fast is kept.dense_fast
-
-    for s in ((2, 1, k), (4, 1, k), (1, 4, k)):
-        x = inputs[s]
-        first = fl(x)
-        mx.eval(first)
-        assert _same_bits(first, refs[s]), s
-        assert fl._fast is kept.plan_fast
-        served: list[bool] = []
-        fast = kept.plan_fast
-
-        def counting(module, value, _fast=fast, _served=served):
-            y = _fast(module, value)
-            _served.append(y is not None)
-            return y
-
-        with monkeypatch.context() as patch:
-            fl.__dict__[linear._FAST] = counting
-            patch.setattr(
-                linear.FormatLinear,
-                "_keep",
-                lambda *a, **kw: pytest.fail("Python _keep on warm small-row"),
-            )
-            patch.setattr(
-                qwen35_verify_qmm._FormatVerifyPlan,
-                "is_armed",
-                lambda *a, **kw: pytest.fail("verify.is_armed on warm small-row"),
-            )
-            try:
-                again = fl(x)
-                mx.eval(again)
-            finally:
-                fl.__dict__[linear._FAST] = fast
-        assert served == [True], s
-        assert _same_bits(again, refs[s]), s
-
-    # 3. Direct tile_dense.project on 4 rows must never see a Dot graph from plan_fast.
-    assert kept.dense is not None
-    assert ((4, k), mx.bfloat16) not in (
-        kept.dense.binding.kept.graphs if kept.dense.binding.kept is not None else {}
-    )
-    assert ((1, 4, k), mx.bfloat16) not in (
-        kept.dense.binding.kept.graphs if kept.dense.binding.kept is not None else {}
-    )
-    td_out = tile_dense.project(kept.dense, inputs[(4, k)])
-    assert td_out is not None
-    mx.eval(td_out)
-    assert td_out.shape == (4, k)
-
-    # 3b. A tile of at least 16 operands refuses native before caching.
-    class _Wide:
-        failed = False
-        operands = tuple(range(16))
-
-    saved = (kept.plan, kept.dense, kept.plan_fast, kept.dense_fast, kept.no_native)
-    try:
-        kept.plan = _Wide()
-        kept.dense = _Wide()
-        kept.plan_fast = None
-        kept.dense_fast = None
-        kept.no_native = False
-        graph = object()
-        from types import SimpleNamespace
-
-        state = {"_kept": SimpleNamespace(graphs={((1, k), mx.bfloat16): graph})}
-        fl._register_fast(kept, kept.plan, ((1, k), mx.bfloat16), proof_state=state)
-        assert kept.plan_fast is None
-        assert kept.dense_fast is None
-        assert kept.no_native is True
-        kept.no_native = False
-        fl._register_fast(kept, kept.dense, ((1, k), mx.bfloat16), proof_state=state)
-        assert kept.plan_fast is None
-        assert kept.dense_fast is None
-        assert kept.no_native is True
-    finally:
-        (
-            kept.plan,
-            kept.dense,
-            kept.plan_fast,
-            kept.dense_fast,
-            kept.no_native,
-        ) = saved
-
-    # 4. Multi-threaded warm plan_fast stays bitwise identical.
-    x2 = inputs[(2, 1, k)]
-
-    def worker():
-        out = fl(x2)
-        mx.eval(out)
-        return _same_bits(out, refs[(2, 1, k)])
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(worker)
-        f2 = pool.submit(worker)
-        assert f1.result() and f2.result()
-
-    # 5. Armed verify bypasses plan_fast; disarming restores unpoisoned replay.
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        assert fl._fast(fl, x2) is None
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-    post = fl._fast(fl, x2)
-    assert post is not None
-    mx.eval(post)
-    assert _same_bits(post, refs[(2, 1, k)])
-
-    # 5b. Armed row-exact calls (cold and warm) never bind plan_fast; >=16
-    #     operands marks kept.no_native without setting _fast.
-    if not with_bias:
-        _, fl_re = _pair(k, k, bits=bits, group_size=64, qwen=True, seed=955 + bits)
-        x1 = inputs[(1, k)]
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
-        try:
-            mx.eval(fl_re(x1))
-            assert fl_re._fast is None
-            mx.eval(fl_re(x1))
-            assert fl_re._fast is None
-        finally:
-            qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-        _, fl_wide_ops = _pair(
-            256, 256, bits=bits, group_size=64, qwen=False, seed=956 + bits
-        )
-        kept_ops = fl_wide_ops._keep()
-        sig_ops = ((1, 256), mx.bfloat16)
-        kept_ops.plan.proof.keep(sig_ops, lambda x, *ops: x)
-        fake_tile = type(
+        fake_wide = type(
             "_BigTile",
             (),
-            {"operands": (kept_ops.weight,) * 16, "proof": kept_ops.plan.proof},
+            {"operands": (kept.weight,) * 16, "proof": kept.plan.proof},
         )()
-        fl_wide_ops._register_fast(kept_ops, fake_tile, sig_ops)
-        assert kept_ops.no_native is True
-        assert fl_wide_ops._fast is None
+        assert fl._native_fast(kept, "dot_fast", fake_wide.operands, {}) is None
+        assert kept.dot_fast is None
+        assert kept._slots.get("no_dot_fast") is True
+        assert fl._native_fast(kept, "dense_fast", fake_wide.operands, {}) is None
+        assert kept.dense_fast is None
+        assert kept._slots.get("no_dense_fast") is True
 
-    # 6. Weight mutation retires plan_fast cleanly; plan.proof.fail() retires
-    #    plan_fast immediately and falls back bitwise on 1-row stock matmul.
-    if with_bias:
-        fl["weight"] = mx.array(fl["weight"])
-        assert fl._fast is None
-        rebound = fl(x2)
-        mx.eval(rebound)
-        assert _same_bits(rebound, refs[(2, 1, k)])
-        assert fl._fast is fl.__dict__[linear._KEPT].plan_fast
-    else:
-        kept.plan.proof.fail()
-        x1_2d = inputs[(1, k)]
-        assert fl._fast(fl, x2) is None
-        assert fl._fast(fl, x1_2d) is None
-        fb = fl(x1_2d)
-        mx.eval(fb)
-        assert _same_bits(fb, refs[(1, k)])
+        # Clean layer: warm (1, 1, 256), orphan _fast, verify warm hit recovers.
+        ql2, fl2 = _pair(256, 256, bits=8, group_size=64, bias=True, seed=956)
+        x1 = _x((1, 1, 256), dtype=mx.bfloat16, seed=957)
+        ref = ql2(x1)
+        y0 = fl2(x1)
+        mx.eval(ref, y0)
+        assert _same_bits(y0, ref)
+        kept2 = fl2.__dict__[linear._KEPT]
+        assert fl2._fast is kept2.dot_fast
 
+        fl2.__dict__.pop(linear._FAST, None)
+        fl2.__dict__.pop(linear._FAST2, None)
+        assert fl2._fast is None
+        y1 = fl2(x1)
+        mx.eval(y1)
+        assert _same_bits(y1, ref)
+        assert fl2._fast is kept2.dot_fast
 
-def test_verify_active_counter_transitions_threads_and_unpatched_guard(monkeypatch):
-    """linear._VERIFY_ACTIVE tracks armed non-row-exact verify threads cleanly
-    across idempotent calls, row_exact transitions, concurrent threads, and
-    _QL_PATCHED=False guards."""
-    if not mx.metal.is_available():
-        pytest.skip("requires Metal")
-    assert qwen35_verify_qmm.apply_verify_qmm_patch()
-    qwen35_verify_qmm.set_verify_qmm_armed(False)
-    assert linear._VERIFY_ACTIVE == 0
-
-    # Idempotent disarm and arm on one thread.
-    qwen35_verify_qmm.set_verify_qmm_armed(False)
-    assert linear._VERIFY_ACTIVE == 0
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        assert linear._VERIFY_ACTIVE == 1
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-        assert linear._VERIFY_ACTIVE == 1
-        # Transition verify -> row_exact clears _VERIFY_ACTIVE.
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
-        assert linear._VERIFY_ACTIVE == 0
-        # Transition row_exact -> verify restores _VERIFY_ACTIVE.
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-        assert linear._VERIFY_ACTIVE == 1
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-    assert linear._VERIFY_ACTIVE == 0
-
-    # Concurrent threads: 2 armed threads give _VERIFY_ACTIVE == 2, then 0.
-    barrier = threading.Barrier(2)
-    observed: list[int] = []
-
-    def arm_worker():
-        qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-        try:
-            barrier.wait(timeout=5.0)
-            observed.append(linear._VERIFY_ACTIVE)
-            barrier.wait(timeout=5.0)
-        finally:
-            qwen35_verify_qmm.set_verify_qmm_armed(False)
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        f1 = pool.submit(arm_worker)
-        f2 = pool.submit(arm_worker)
-        f1.result()
-        f2.result()
-    assert observed == [2, 2]
-    assert linear._VERIFY_ACTIVE == 0
-
-    # Unpatched guard while _VERIFY_ACTIVE > 0 must still skip verify route.
-    _, fl = _pair(4096, 2560, bits=8, group_size=64, qwen=False, seed=960)
-    x_ver = _x((4, 2, 2560), dtype=mx.bfloat16, seed=961)
-    unarmed_ref = fl(x_ver)
-    mx.eval(unarmed_ref)
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=False)
-    try:
-        assert linear._VERIFY_ACTIVE == 1
-        with monkeypatch.context() as patch:
-            patch.setattr(qwen35_verify_qmm, "_QL_PATCHED", False)
-            got = fl(x_ver)
-            mx.eval(got)
-            assert _same_bits(got, unarmed_ref)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False)
-    assert linear._VERIFY_ACTIVE == 0
+        # Weight mutation retires both _fast and _fast2 cleanly and rebinds.
+        fl2["weight"] = mx.array(fl2["weight"])
+        assert fl2._fast is None and fl2._fast2 is None
+        y2 = fl2(x1)
+        mx.eval(y2)
+        assert _same_bits(y2, ref)
+        assert fl2._fast is fl2.__dict__[linear._KEPT].dot_fast

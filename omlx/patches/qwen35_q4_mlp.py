@@ -505,9 +505,6 @@ class _VLMFormatPrefillLinear(FormatLinear):
     def __call__(self, x):
         if x.ndim != 3 or x.shape[-2] <= 1:
             return super().__call__(x)
-        row_exact = self._qwen_row_exact
-        if row_exact is not None and row_exact():
-            return super().__call__(x)
         if x.shape[
             -2
         ] >= _VLMQuantizedPrefillLinear._route_min_tokens or _q8_backend_candidate(

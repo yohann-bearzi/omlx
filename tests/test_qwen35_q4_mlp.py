@@ -1073,111 +1073,6 @@ def test_stock_affine_format_projection_takes_the_prefill_backend():
     assert type(block.q_proj) is q4_mlp._VLMFormatPrefillLinear
 
 
-def test_vlm_format_prefill_linear_honours_row_exact_callable(monkeypatch, tmp_path):
-    """A qwen4_exp FormatLinear carries ``_qwen_row_exact`` as a callable;
-    unarmed prefill must call the registered backend, armed row-exact must skip
-    it, Q8 must reach it below the 2048-row floor (and call it once when it
-    declines above 2048), non-affine FormatLinear must not be reclassed, and
-    vision modules must not be reclassed."""
-    import json
-
-    import mlx.nn as nn
-
-    from omlx.formats import testing as fmt_testing
-    from omlx.formats.linear import FormatLinear
-    from omlx.patches import qwen35_q4_mlp as q4_mlp
-    from omlx.patches.format_load import loading
-
-    (tmp_path / "config.json").write_text(
-        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
-    )
-
-    def _make_layer(bits):
-        mx.random.seed(29 + bits)
-        weight = (mx.random.normal((128, 256)) * 0.1).astype(mx.float16)
-        arrays = dict(
-            zip(("weight", "scales", "biases"), mx.quantize(weight, bits=bits))
-        )
-        with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
-            return FormatLinear("affine", bits, 64, 256, arrays)
-
-    q4_layer = _make_layer(4)
-    q8_layer = _make_layer(8)
-    non_affine = _make_layer(4)
-    object.__setattr__(non_affine, "fmt", object())
-    vision_layer = _make_layer(4)
-    assert callable(q4_layer._qwen_row_exact)
-
-    class LangBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.q_proj = q4_layer
-            self.o_proj = q8_layer
-            self.v_proj = non_affine
-
-    class VisionBlock(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.out_proj = vision_layer
-
-    class Model(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lang = LangBlock()
-            self.vis = VisionBlock()
-
-    LangBlock.__module__ = "mlx_vlm.models.qwen4_exp.language"
-    VisionBlock.__module__ = "mlx_vlm.models.qwen4_exp.vision"
-    Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
-
-    model = Model()
-    monkeypatch.setattr(q4_mlp, "_has_native_qmm", lambda: True)
-    assert q4_mlp.apply_qwen35_q4_prefill_linear_patch(model)
-    assert type(model.lang.q_proj) is q4_mlp._VLMFormatPrefillLinear
-    assert type(model.lang.o_proj) is q4_mlp._VLMFormatPrefillLinear
-    assert type(model.lang.v_proj) is FormatLinear
-    assert type(model.vis.out_proj) is FormatLinear
-
-    sentinel = mx.ones((1, 2, 128), dtype=mx.float16)
-    calls = []
-    decline = False
-
-    def stub_backend(linear, x):
-        calls.append((linear, x.shape))
-        return None if decline else sentinel
-
-    monkeypatch.setattr(q4_mlp, "_PREFILL_LINEAR_BACKEND", stub_backend)
-
-    # Unarmed Q4 below 2048 rows -> backend skipped (kills >= -> <).
-    x_64 = mx.zeros((1, 64, 256), dtype=mx.float16)
-    short_out = model.lang.q_proj(x_64)
-    assert short_out is not sentinel
-    assert len(calls) == 0
-
-    # Unarmed Q4 at 2048 rows -> backend runs once and returns sentinel.
-    x_2048 = mx.zeros((1, 2048, 256), dtype=mx.float16)
-    out = model.lang.q_proj(x_2048)
-    assert out is sentinel
-    assert len(calls) == 1
-
-    # Armed row-exact callable -> backend skipped.
-    object.__setattr__(model.lang.q_proj, "_qwen_row_exact", lambda: True)
-    armed_out = model.lang.q_proj(x_2048)
-    assert armed_out is not sentinel
-    assert len(calls) == 1
-
-    # Unarmed Q8 below 2048 rows (64 rows) -> backend runs once.
-    q8_out = model.lang.o_proj(x_64)
-    assert q8_out is sentinel
-    assert len(calls) == 2
-
-    # Unarmed Q8 at 2048 rows when backend declines -> backend asked only once.
-    decline = True
-    fallback_out = model.lang.o_proj(x_2048)
-    assert fallback_out is not sentinel
-    assert len(calls) == 3
-
-
 def test_qwen35_q4_prefill_linear_patch_keeps_the_qwen4_exp_trunk(monkeypatch):
     """An oQh qwen4_exp trunk keeps affine nn.QuantizedLinear projections
     (format_load leaves _ported off); the q4 prefill tile still admits them."""
@@ -1225,3 +1120,99 @@ def test_vlm_format_prefill_linear_early_returns(tmp_path, monkeypatch):
     assert calls == []
     layer(mx.zeros((1, 2, 256)))
     assert calls == [(1, 2, 256)]
+
+
+def test_vlm_format_prefill_linear_routes_affine_language_layers(monkeypatch, tmp_path):
+    """The prefill backend runs at the 2048-row floor, Q8 reaches it below
+    the floor (once when it declines above), non-affine FormatLinear must not
+    be reclassed, and vision modules must not be reclassed."""
+    import json
+
+    import mlx.nn as nn
+
+    from omlx.formats import testing as fmt_testing
+    from omlx.formats.linear import FormatLinear
+    from omlx.patches import qwen35_q4_mlp as q4_mlp
+    from omlx.patches.format_load import loading
+
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "qwen4_exp", "omlx_quant_formats": {"affine": {}}})
+    )
+
+    def _make_layer(bits):
+        mx.random.seed(29 + bits)
+        weight = (mx.random.normal((128, 256)) * 0.1).astype(mx.float16)
+        arrays = dict(
+            zip(("weight", "scales", "biases"), mx.quantize(weight, bits=bits))
+        )
+        with fmt_testing.verified("qwen4_exp"), loading(tmp_path):
+            return FormatLinear("affine", bits, 64, 256, arrays)
+
+    q4_layer = _make_layer(4)
+    q8_layer = _make_layer(8)
+    non_affine = _make_layer(4)
+    object.__setattr__(non_affine, "fmt", object())
+    vision_layer = _make_layer(4)
+
+    class LangBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.q_proj = q4_layer
+            self.o_proj = q8_layer
+            self.v_proj = non_affine
+
+    class VisionBlock(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.out_proj = vision_layer
+
+    class Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lang = LangBlock()
+            self.vis = VisionBlock()
+
+    LangBlock.__module__ = "mlx_vlm.models.qwen4_exp.language"
+    VisionBlock.__module__ = "mlx_vlm.models.qwen4_exp.vision"
+    Model.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+
+    model = Model()
+    monkeypatch.setattr(q4_mlp, "_has_native_qmm", lambda: True)
+    assert q4_mlp.apply_qwen35_q4_prefill_linear_patch(model)
+    assert type(model.lang.q_proj) is q4_mlp._VLMFormatPrefillLinear
+    assert type(model.lang.o_proj) is q4_mlp._VLMFormatPrefillLinear
+    assert type(model.lang.v_proj) is FormatLinear
+    assert type(model.vis.out_proj) is FormatLinear
+
+    sentinel = mx.ones((1, 2, 128), dtype=mx.float16)
+    calls = []
+    decline = False
+
+    def stub_backend(linear, x):
+        calls.append((linear, x.shape))
+        return None if decline else sentinel
+
+    monkeypatch.setattr(q4_mlp, "_PREFILL_LINEAR_BACKEND", stub_backend)
+
+    # Q4 below 2048 rows -> backend skipped (kills >= -> <).
+    x_64 = mx.zeros((1, 64, 256), dtype=mx.float16)
+    short_out = model.lang.q_proj(x_64)
+    assert short_out is not sentinel
+    assert len(calls) == 0
+
+    # Q4 at 2048 rows -> backend runs once and returns sentinel.
+    x_2048 = mx.zeros((1, 2048, 256), dtype=mx.float16)
+    out = model.lang.q_proj(x_2048)
+    assert out is sentinel
+    assert len(calls) == 1
+
+    # Q8 below 2048 rows (64 rows) -> backend runs once.
+    q8_out = model.lang.o_proj(x_64)
+    assert q8_out is sentinel
+    assert len(calls) == 2
+
+    # Q8 at 2048 rows when backend declines -> backend asked only once.
+    decline = True
+    fallback_out = model.lang.o_proj(x_2048)
+    assert fallback_out is not sentinel
+    assert len(calls) == 3

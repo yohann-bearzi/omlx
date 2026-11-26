@@ -942,6 +942,9 @@ def _ensure_vlm_verify_patch() -> None:
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
+    from ..formats.linear import FormatLinear
+    from .row_exact_qmv import quantized_linear as row_exact_linear
+
     original = Qwen3_5BatchInvariantForward._feed_forward
     if getattr(original, "_omlx_router_fused", False):
         return
@@ -954,7 +957,16 @@ def _ensure_vlm_verify_patch() -> None:
             and router_eligible(x, feed_forward.num_experts)
         ):
             return original(self, feed_forward, x)
-        gates = mx.softmax(self._linear(feed_forward.gate, x), axis=-1, precise=True)
+        gate = feed_forward.gate
+        # A FormatLinear router feeds discrete top-k selection: keep its
+        # one-row arithmetic per row so composed verify matches both decode
+        # and routed_verify_window (rule 25, numerics contract).
+        logits = (
+            row_exact_linear(gate, x)
+            if type(gate) is FormatLinear
+            else self._linear(gate, x)
+        )
+        gates = mx.softmax(logits, axis=-1, precise=True)
         indices, scores = fused_router_topk(gates, feed_forward.top_k)
         shared = self._feed_forward(feed_forward.shared_expert, x)
         shared = mx.sigmoid(self._linear(feed_forward.shared_expert_gate, x)) * shared

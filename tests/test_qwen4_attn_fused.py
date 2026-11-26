@@ -250,8 +250,8 @@ def test_dense_rows_equal_mlx_path(monkeypatch, context, rows):
     attn = _attention(seed=3)
     cache = _prefill(attn, context, seed=4)
     prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (11, 12))
-    # Windows whose rows share an SDPA plan take the kernels (a 16-row window
-    # at 2043 already passes the indexer's dense budget).
+    # The fused dense gate is the measured-faster route at <2K (decision 5)
+    # and serves decode and verify windows alike.
     dense = context + rows <= 2043 + 8
     if dense and attn_fused.row_plan(context + 1, context + rows) is not None:
         assert prologues == [rows, rows]
@@ -267,7 +267,9 @@ def test_masked_rows_equal_mlx_path(monkeypatch, context):
     cache = _prefill_chunked(attn, context, seed=8)
     for rows in (1, 2, 4, 8, 16):
         prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,))
-        assert prologues == [rows]
+        # Rule 33: the fused prologue serves one-row decode only; verify
+        # windows take the batched attention route (still equal to MLX's).
+        assert prologues == ([rows] if rows == 1 else [])
 
 
 @requires_kernels
@@ -287,7 +289,8 @@ def test_yarn_masked_rows_equal_mlx_path(monkeypatch):
     attn = _attention(seed=7, config=_YARN_CONFIG)
     cache = _prefill_chunked(attn, 2060, seed=8)
     for rows in (1, 4, 16):
-        assert _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,)) == [rows]
+        prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (13,))
+        assert prologues == ([rows] if rows == 1 else [])
 
 
 def test_fused_verify_rollback_then_decode_matches_mlx(monkeypatch):
@@ -509,7 +512,8 @@ def test_format_attention_projections_fuse_and_match_the_generic_path(
 
     monkeypatch.setattr(language.row_exact_qmv, "quantized_linears_tiled", record)
     cache = _prefill(attn, 0, seed=2)
-    assert _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (19,)) == [rows]
+    prologues = _assert_fused_equals_mlx(monkeypatch, attn, cache, rows, (19,))
+    assert prologues == [rows]
     # The four projections take the grouped plan's launch (no tiled call);
     # o_proj keeps its single-plan tiled call.
     assert observed == [(id(attn.o_proj),)]

@@ -38,8 +38,7 @@ _MTP_QUANT_PREFIXES = (
     "language_model.model.mtp.",
 )
 _RMSNORM_CENTER_ANCHOR_RE = re.compile(
-    r"^language_model\.model\.layers\.\d+"
-    r"\.attn_hyper_connection\.hc_norm\.weight$"
+    r"^language_model\.model\.layers\.\d+" r"\.attn_hyper_connection\.hc_norm\.weight$"
 )
 _RMSNORM_CENTER_MIN_ANCHORS = 8
 _RMSNORM_ONES_CENTERED_VOTE = 0.9
@@ -180,10 +179,7 @@ class Model(Qwen3_5Model):
             # add the raw-HF default as a second key: sanitize_key() maps both
             # spellings to runtime_scale_key, and the default would otherwise
             # overwrite a real shared FP8 PLE scale during normalization.
-            if (
-                source_scale_key not in weights
-                and runtime_scale_key not in weights
-            ):
+            if source_scale_key not in weights and runtime_scale_key not in weights:
                 weights[source_scale_key] = mx.ones((1,), dtype=mx.bfloat16)
         mtp_enabled = get_mtp_runtime().enabled
 

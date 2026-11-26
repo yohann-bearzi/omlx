@@ -206,15 +206,15 @@ def _verify(block, x, window, row_exact=True):
 
 
 def _check(block, x, engaged, row_exact=True):
-    """Window rows == one-token rows == the row-exact composed verifier's
-    rows (the latter only up to the shared router cap: past it the composed
-    verifier runs stock argpartition routing, not the one-token arithmetic)."""
+    """Window rows == one-token rows: the router's logits are its one-row
+    arithmetic per row (``row_exact_linear`` over a quantized or FormatLinear
+    gate), and the window-off rows agree with them."""
     count = len(engaged)
     new = _verify(block, x, window=True, row_exact=row_exact)
     ref = _serial(block, x)
     mx.eval(ref)
-    assert engaged[count:] == [True]
     assert _same_bits(new, ref)
+    assert engaged[count:] == [True]
     if row_exact and x.size // x.shape[-1] <= router._MAX_ROWS:
         assert _same_bits(new, _verify(block, x, window=False))
 
@@ -960,7 +960,69 @@ def test_stock_affine_format_router_takes_the_fused_window(row_exact, engaged):
     _check(block, x, engaged, row_exact=row_exact)
 
 
-def test_biased_or_non_affine_format_router_declines_fused_window():
+@pytest.mark.parametrize("row_exact", [True, False], ids=["row_exact", "verify"])
+def test_format_router_window_row_exact_under_msg_tile(row_exact, engaged, monkeypatch):
+    """A FormatLinear MoE router feeds discrete top-k selection, so verify
+    windows must run its one-row arithmetic per row (``row_exact_linear``)
+    even when the dense schedule picks ``msg_tile`` for 4 rows (HIGH-1)."""
+    from omlx.formats import linear, tile_dense, tuning
+    from omlx.formats.tuning import MsgTilePolicy
+    from omlx.patches.row_exact_qmv import quantized_linear as row_exact_linear
+
+    hidden = 2560
+    block = _block(
+        7,
+        bits=4,
+        hidden=hidden,
+        inter=512,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    # Mirror both halves of the 8-bit router weights and feed cancelling
+    # [half, -half] rows: every expert's true logit sits near 0 while its
+    # half-sums are large, so msg_tile's different FP32 accumulation order
+    # flips the discrete top-k expert set relative to 1-row Dot.
+    w_half = (
+        mx.random.normal((block.num_experts, hidden // 2), key=mx.random.key(71))
+        * 512.0
+    ).astype(mx.bfloat16)
+    w_full = mx.concatenate([w_half, w_half], axis=-1)
+    q_w, q_s, q_b = mx.quantize(w_full, group_size=64, bits=8)
+    block.gate["weight"], block.gate["scales"], block.gate["biases"] = q_w, q_s, q_b
+    block.gate = _stock_affine_format_layer(block.gate)
+    block.eval()
+    mx.eval(block.parameters())
+
+    def lookup(route, *args, **kwargs):
+        if route == "msg_tile" and kwargs.get("rows") == 4:
+            return MsgTilePolicy(nsg=8)
+        return None
+
+    monkeypatch.setattr(tuning, "lookup", lookup)
+    half = mx.random.normal((1, 4, hidden // 2), key=mx.random.key(77)).astype(
+        mx.bfloat16
+    )
+    x = mx.concatenate([half, -half], axis=-1)
+    # Control: calling gate directly at 4 rows takes msg_tile and differs in
+    # bits from one-row Dot arithmetic (proving the window cannot bypass
+    # row_exact_linear).
+    flat = x.reshape(4, hidden)
+    direct = block.gate(flat)
+    exact = row_exact_linear(block.gate, flat)
+    mx.eval(direct, exact)
+    kept = vars(block.gate)[linear._KEPT]
+    assert tile_dense.route_for(kept.dense, 4, x.dtype).backend == "msg"
+    assert not _same_bits(direct, exact), "control: msg_tile must differ from 1-row Dot"
+    # Cold build and warm graph replay must both keep exact one-row router logits.
+    _check(block, x, engaged, row_exact=row_exact)
+    _check(block, x, engaged, row_exact=row_exact)
+
+
+def test_biased_format_router_declines_and_a_plugin_one_is_accepted():
+    """Rule 25/D11: a plain bias-free FormatLinear router is taken whatever
+    its format; a bias makes it decline."""
     from omlx.patches.qwen35_moe_routed_decode import _window_router_ok
 
     block = _block(
@@ -979,9 +1041,82 @@ def test_biased_or_non_affine_format_router_declines_fused_window():
     gate["bias"] = mx.zeros((6,), dtype=mx.bfloat16)
     assert not _window_router_ok(gate, mx.bfloat16)
 
-    non_affine = _stock_affine_format_layer(block.gate)
-    object.__setattr__(non_affine, "fmt", object())
-    assert not _window_router_ok(non_affine, mx.bfloat16)
+    plugin = _stock_affine_format_layer(block.gate)
+    object.__setattr__(plugin, "fmt", object())
+    assert _window_router_ok(plugin, mx.bfloat16)
+
+
+def test_vlm_verify_router_respects_format_linear_subclass(monkeypatch):
+    """pre-kit-82917ced LOW 3: a FormatLinear subclass overriding __call__
+    must route through self._linear (preserving its override), never bypass
+    into row_exact_linear."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from omlx.formats.linear import FormatLinear
+
+    sub_calls = []
+
+    class _OffsetFormatLinear(FormatLinear):
+        def __call__(self, x):
+            sub_calls.append(x.shape)
+            return super().__call__(x) + mx.array(1.0, dtype=x.dtype)
+
+    hidden = 256
+    block = _block(
+        8,
+        bits=4,
+        hidden=hidden,
+        inter=128,
+        top_k=4,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    base_gate = _stock_affine_format_layer(block.gate)
+    sub_gate = _OffsetFormatLinear.__new__(_OffsetFormatLinear)
+    sub_gate._init_tensors(
+        base_gate.fmt,
+        base_gate.bits,
+        base_gate.group_size,
+        base_gate.input_dims,
+        {name: base_gate[name] for name in base_gate._tensors},
+        None,
+        layout=base_gate.fmt.layout(
+            base_gate.input_dims,
+            base_gate.output_dims,
+            base_gate.bits,
+            base_gate.group_size,
+        ),
+    )
+    block.gate = sub_gate
+    block.eval()
+    mx.eval(block.parameters())
+
+    router._ensure_vlm_verify_patch()
+    x = _inputs(2, 0, hidden=hidden)
+
+    linear_calls = []
+    orig_linear = Qwen3_5BatchInvariantForward._linear
+
+    def spy_linear(self, layer, inp):
+        linear_calls.append(layer)
+        return orig_linear(self, layer, inp)
+
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "_linear", spy_linear)
+    monkeypatch.setattr(routed, "routed_verify_window", lambda b, inp: None)
+
+    out = Qwen3_5BatchInvariantForward()._feed_forward(block, x)
+    mx.eval(out)
+    assert any(layer is sub_gate for layer in linear_calls)
+    assert len(sub_calls) >= 1
+
+    # Negative control: plain FormatLinear still routes through row_exact_linear
+    # (never via self._linear).
+    linear_calls.clear()
+    block.gate = base_gate
+    out_plain = Qwen3_5BatchInvariantForward()._feed_forward(block, x)
+    mx.eval(out_plain)
+    assert not any(layer is base_gate for layer in linear_calls)
 
 
 def _write_routed_window_table(v1_dir, chip, modes_by_row, *, bits=4, group=64):

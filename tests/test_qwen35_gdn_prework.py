@@ -862,51 +862,15 @@ def test_the_sharded_metal_test_skips_without_metal():
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_batch_decode_mixed_allocation_uses_the_per_call_projections(
-    patched_decode,
-):
-    """A mixed allocation has no verify plan; a >1-row batch then takes one
-    per-call projection (the format forward), the batched step and the out
-    projection, bit-identical to the explicit chain."""
-    from mlx_vlm.models.cache import ArraysCache
-
+def test_qwen4_mixed_allocation_declines_the_fused_batch_plan(patched_decode):
+    """A layout whose four GDN in-projections do not share one allocation
+    gets no decode plan, so the fused batch path declines and the generic
+    path serves it. No shipped checkpoint has such a layout (oQ3e-mtp and
+    oQ4e-fp8ple both use 8-bit/64 affine for all four), so there is no
+    per-projection fallback inside the fused path (rules 29/32)."""
     module = _real_qwen4_decode_module(((4, 64), (5, 128), (5, 128), (5, 128)), 17)
+    assert prework_mod._qwen4_decode_plan(module) is None
     assert prework_mod._qwen4_verify_plan(module) is None
-    rows = 2
-    mx.random.seed(61)
-    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
-    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
-    recurrent = mx.random.normal((rows, HV, DV, DK)) * 0.05
-    batch = ArraysCache(size=2)
-    batch[0], batch[1] = conv_state, recurrent
-    got = module(inputs, cache=batch)
-    mx.eval(got, batch[0], batch[1])
-    projections = (
-        module.in_proj_qkv,
-        module.in_proj_z,
-        module.in_proj_b,
-        module.in_proj_a,
-    )
-    mixed = [projection(inputs) for projection in projections]
-    want_conv, want_state, gated = prework_mod.qwen4_batch_decode_step_fused(
-        *mixed,
-        conv_state,
-        module.conv1d.weight,
-        mx.array(module.head_k_dim**-0.5, dtype=mx.bfloat16),
-        module.A_log,
-        module.dt_bias,
-        recurrent,
-        module.norm.weight,
-        mx.array(module.norm.eps, mx.float32),
-        HK,
-        HV,
-        DK,
-        DV,
-    )
-    want = module.out_proj(gated)
-    mx.eval(want, want_conv, want_state)
-    assert _same(want, got)
-    assert _same(want_conv, batch[0]) and _same(want_state, batch[1])
 
 
 def test_qwen4_decode_route_commits_both_states_and_advances_once(monkeypatch):
@@ -1383,7 +1347,6 @@ def patched_decode(monkeypatch):
     "signatures",
     [
         ((6, 64), (6, 64), (6, 64), (6, 64)),  # one fused in-projection launch
-        ((4, 64), (5, 128), (5, 128), (5, 128)),  # four projection launches
         ((8, 64), (8, 64), (8, 64), (8, 64)),  # re-quantized oQ4e
     ],
 )
@@ -1432,8 +1395,11 @@ def test_qwen4_decode_plan_follows_replaced_weights_and_modules(
 ):
     module = _real_qwen4_decode_module(((6, 64),) * 4, 5)
     _assert_planned_decode_matches_per_call_path(monkeypatch, module, 1, 5)
-    # A projection with another allocation turns the fused in-projection into four.
+    # A projection with another allocation cannot stack: the fused plan
+    # declines and the generic path serves it (no per-projection fallback).
     module.in_proj_z = _random_projection(2560, HV * DV, 5, 128)
+    assert prework_mod._qwen4_decode_plan(module) is None
+    module.in_proj_z = _random_projection(2560, HV * DV, 6, 64)
     _assert_planned_decode_matches_per_call_path(monkeypatch, module, 1, 6)
     # New tensors on the same modules.
     module.in_proj_qkv.weight = mx.random.randint(
@@ -1474,7 +1440,8 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, HV, DV, DK)),
     )
     assert fallbacks == [(1, 1, 2560)]
-    # ...until the model opts in to wide projections.
+    # A wide opt-in widens the allow-list, but the four projections still do
+    # not stack (8b/g128 against 6b/64), so the fused plan stays declined.
     prework_mod.configure_qwen4_decode(
         SimpleNamespace(modules=lambda: [module]), wide_projections=True
     )
@@ -1484,7 +1451,33 @@ def test_qwen4_decode_plan_turns_ineligible_on_replacement(monkeypatch):
         mx.zeros((1, 3, C), dtype=mx.bfloat16),
         mx.zeros((1, HV, DV, DK)),
     )
-    assert fallbacks == [(1, 1, 2560)]
+    assert fallbacks == [(1, 1, 2560), (1, 1, 2560)]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_stacked_gdn_projection_uses_batched_tile_schedule_not_dot(monkeypatch):
+    """Commit 3: a runtime-stacked GDN FormatLinear takes the construction-time
+    row schedule (batched Tile / MLX route via FormatLinearFast), never the
+    Dot rows path, at rows >= 2."""
+    from omlx.formats import linear, tile_dense
+
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 5)
+    stacked = prework_mod._stacked_format_inputs(module)
+    assert stacked is not None
+    monkeypatch.setattr(
+        linear,
+        "_launch",
+        lambda *a, **kw: pytest.fail("GDN rows >= 2 fell back to the Dot plan"),
+    )
+    x = mx.zeros((1, 5, 2560), mx.bfloat16)
+    y = stacked(x)
+    mx.eval(y)
+    assert y.shape == (1, 5, stacked.output_dims)
+    kept = vars(stacked)[linear._KEPT]
+    assert kept.dense is not None
+    assert tile_dense.route_for(kept.dense, 5, mx.bfloat16).backend != "dot"
+    assert stacked._fast is not None
+    assert stacked._fast(stacked, x) is not None
 
 
 # --- Fused Qwen4 speculative verify ------------------------------------------
@@ -1544,6 +1537,21 @@ def _same(want, got):
     )
 
 
+def _close(want, got, tolerance):
+    """Rule 33: a batched projection and a one-row decode differ by rounding
+    (reordered accumulation); the C2-style bound is relative (a bf16 ULP grows
+    with the value, so a max-abs bound would depend on the fixture's scale)."""
+    if want.dtype != got.dtype or want.shape != got.shape:
+        return False
+    if not bool(mx.all(mx.isfinite(got))):
+        return False
+    left = want.astype(mx.float32)
+    right = got.astype(mx.float32)
+    difference = float(mx.sqrt(mx.sum((left - right) ** 2)).item())
+    scale = float(mx.sqrt(mx.sum(left * left)).item())
+    return difference <= tolerance * max(scale, 1e-12)
+
+
 def _verify_inputs(rows, seed, dtype=mx.bfloat16):
     mx.random.seed(seed)
     return (
@@ -1559,6 +1567,41 @@ def _verify_inputs(rows, seed, dtype=mx.bfloat16):
 _PARAVIRTUAL_GPU = mx.metal.is_available() and not str(
     mx.device_info().get("architecture", "")
 ).startswith("applegpu")
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [1, 2, 3, 16])
+def test_qwen4_verify_takes_the_stacked_projection_for_multi_row_windows(
+    qwen4_verify, monkeypatch, rows
+):
+    """Rule 33: a multi-row verify window projects through the stacked
+    FormatLinear and the out-projection, once each; a one-row window keeps the
+    one-row qmv pair."""
+    from omlx.formats.linear import FormatLinear
+
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 19)
+    plan = prework_mod._qwen4_verify_plan(module)
+    assert plan is not None
+    stacked, out = plan[2], plan[3]
+    inputs, conv, recurrent = _verify_inputs(rows, 43)
+    seen = []
+    call = FormatLinear.__call__
+
+    def recording(self, x):
+        if self is stacked or self is out:
+            seen.append(("stacked" if self is stacked else "out", tuple(x.shape)))
+        return call(self, x)
+
+    monkeypatch.setattr(FormatLinear, "__call__", recording)
+    got, _, transaction = _verify_block(
+        module, inputs, conv, recurrent, row_exact=False
+    )
+    mx.eval(got)
+    transaction.abort()
+    if rows == 1:
+        assert seen == [], seen
+    else:
+        assert seen == [("stacked", (1, rows, 2560)), ("out", (1, rows, HV * DV))]
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -1593,14 +1636,22 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
     got, got_cache, got_tx = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == [rows]
 
-    assert _same(want, got)
+    # Rule 33: one-row blocks stay bitwise; rows >= 2 route their
+    # projections through one batched FormatLinear, so outputs and states
+    # differ from the per-op path only by rounding (C2 bound).
+    close = rows == 1
+    out_cmp = (lambda a, b: _same(a, b)) if close else (lambda a, b: _close(a, b, 2e-2))
+    state_cmp = (
+        (lambda a, b: _same(a, b)) if close else (lambda a, b: _close(a, b, 2e-2))
+    )
+    assert out_cmp(want, got)
     for index in (0, 1):
-        assert _same(want_cache[index], got_cache[index])
+        assert out_cmp(want_cache[index], got_cache[index])
     want_records = want_cache._speculation["records"]
     got_records = got_cache._speculation["records"]
     (kind, want_window, width), got_window = want_records[0], got_records[0]
     assert got_window[0] == kind == "window" and got_window[2] == width == 3
-    assert _same(want_window, got_window[1])
+    assert out_cmp(want_window, got_window[1])
     (kind, want_history, want_final), got_states = want_records[1], got_records[1]
     assert kind == "states"
     if rows == 1:
@@ -1610,11 +1661,11 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
         # No per-step states are written; each is recomputed on demand.
         assert got_states[0] == "deferred" and got_states[3] == rows
         for kept in range(1, rows):
-            assert _same(want_history[:, kept - 1], got_states[4](kept)), kept
+            assert state_cmp(want_history[:, kept - 1], got_states[4](kept)), kept
     else:
         assert got_states[0] == "states"
-        assert _same(want_history, got_states[1])
-    assert _same(want_final, got_states[2])
+        assert state_cmp(want_history, got_states[1])
+    assert state_cmp(want_final, got_states[2])
     for keep in range(rows + 1):
         want_kept, want_keep_tx = copy.deepcopy((want_cache, want_tx))
         got_kept, got_keep_tx = copy.deepcopy((got_cache, got_tx))
@@ -1623,7 +1674,7 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
         for (_, a), (_, b) in zip(
             tree_flatten(want_kept.state), tree_flatten(got_kept.state), strict=True
         ):
-            assert _same(a, b), keep
+            assert state_cmp(a, b), keep
     want_tx.abort()
     got_tx.abort()
 
@@ -1664,21 +1715,31 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 
     got, cache, transaction = _verify_block(module, inputs, conv_state, recurrent_state)
     assert qwen4_verify == [rows]
+    # Rule 33: rows >= 2 project through one batched FormatLinear, so the
+    # verify rows match serial decode within C2 rounding, not bit for bit.
+    out_cmp = (
+        (lambda a, b: _same(a, b)) if rows == 1 else (lambda a, b: _close(a, b, 2e-2))
+    )
+    state_cmp = (
+        (lambda a, b: _same(a, b)) if rows == 1 else (lambda a, b: _close(a, b, 2e-2))
+    )
     for t in range(rows):
-        assert _same(outputs[t][:, 0], got[:, t]), t
+        assert out_cmp(outputs[t][:, 0], got[:, t]), t
     window = cache._speculation["records"][0][1]
     kind, _, final, _, state_after = cache._speculation["records"][1]
     assert kind == "deferred"
     for t in range(rows + 1):
-        assert _same(convs[t], window[:, t : t + 3]), t
+        assert state_cmp(convs[t], window[:, t : t + 3]), t
     for t in range(rows - 1):
-        assert _same(states[t + 1], state_after(t + 1)), t
-    assert _same(states[rows], final)
-    assert _same(convs[rows], cache[0]) and _same(states[rows], cache[1])
+        assert state_cmp(states[t + 1], state_after(t + 1)), t
+    assert state_cmp(states[rows], final)
+    assert state_cmp(convs[rows], cache[0]) and state_cmp(states[rows], cache[1])
     for keep in range(rows + 1):
         kept, keep_tx = copy.deepcopy((cache, transaction))
         keep_tx.commit([keep])
-        assert _same(convs[keep], kept[0]) and _same(states[keep], kept[1]), keep
+        assert state_cmp(convs[keep], kept[0]) and state_cmp(
+            states[keep], kept[1]
+        ), keep
     transaction.abort()
 
 
@@ -1689,12 +1750,12 @@ def test_qwen4_fused_verify_rows_equal_serial_decode_steps(
 def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     monkeypatch, qwen4_verify, dtype, signatures, rows
 ):
-    """Up to the per-row projection limit, every row of a batched one-token
-    decode, and its next conv and recurrent states, equal that row decoded
-    alone (B1) bit for bit."""
+    """Every row of a batched one-token decode, and its next conv and
+    recurrent states, matches that row decoded alone (B1) within the C2
+    rounding bound: the batch takes one stacked projection for all rows
+    (Rule 33), not one-row arithmetic per row."""
     from mlx_vlm.models.cache import ArraysCache
 
-    assert rows <= prework_mod._QWEN4_BATCH_ROW_EXACT_ROWS
     module = _real_qwen4_decode_module(signatures, 17, dtype)
     mx.random.seed(rows)
     inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(dtype)
@@ -1712,15 +1773,46 @@ def test_qwen4_batched_decode_rows_equal_their_one_row_decode(
     monkeypatch.setattr(prework_mod, "qwen4_batch_decode_step_fused", counted)
     got = module(inputs, cache=batch)
     mx.eval(got, batch[0], batch[1])
+    # One stacked call, reshaped to the step kernel's (rows, 1, K) layout.
     assert engaged == [rows]
     for r in range(rows):
         alone = ArraysCache(size=2)
         alone[0], alone[1] = conv_state[r : r + 1], recurrent_state[r : r + 1]
         want = module(inputs[r : r + 1], cache=alone)
         mx.eval(want, alone[0], alone[1])
-        assert _same(want, got[r : r + 1]), r
-        assert _same(alone[0], batch[0][r : r + 1]), r
-        assert _same(alone[1], batch[1][r : r + 1]), r
+        assert _close(want, got[r : r + 1], 2e-2), r
+        assert _close(alone[0], batch[0][r : r + 1], 2e-2), r
+        assert _close(alone[1], batch[1][r : r + 1], 1e-3), r
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 16])
+def test_qwen4_batch_decode_uses_verify_out_proj_shape(qwen4_verify, monkeypatch, rows):
+    """The batched decode's out-projection takes the verify window's
+    (1, rows, hv * dv) layout, so both routes share one compiled graph."""
+    from mlx_vlm.models.cache import ArraysCache
+
+    from omlx.formats.linear import FormatLinear
+
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 17)
+    inputs = (mx.random.normal((rows, 1, 2560)) * 0.5).astype(mx.bfloat16)
+    conv_state = (mx.random.normal((rows, 3, C)) * 0.5).astype(mx.bfloat16)
+    recurrent_state = mx.random.normal((rows, HV, DV, DK)) * 0.05
+    cache = ArraysCache(size=2)
+    cache[0], cache[1] = conv_state, recurrent_state
+    seen = []
+    call = FormatLinear.__call__
+    out_proj = module.out_proj
+
+    def recording(self, x):
+        if self is out_proj:
+            seen.append(tuple(x.shape))
+        return call(self, x)
+
+    monkeypatch.setattr(FormatLinear, "__call__", recording)
+    got = module(inputs, cache=cache)
+    mx.eval(got)
+    assert seen == [(1, rows, HV * DV)], seen
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -1836,9 +1928,9 @@ def test_qwen4_verify_step_kernel_equals_chained_decode_step_kernels(dtype, rows
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
-def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify):
-    """Unarmed multi-row verify projections run other kernels, so their rows
-    keep the per-op path; a one-row block takes one-row arithmetic either way."""
+def test_qwen4_fused_verify_engages_without_row_exact_arming(qwen4_verify):
+    """Rule 33: the fused verify no longer waits for row-exact arming; every
+    multi-row block takes it (its projections are batched FormatLinear)."""
     module = _real_qwen4_decode_module(((6, 64),) * 4, 13)
     for rows in (3, 1):
         inputs, conv_state, recurrent_state = _verify_inputs(rows, 13)
@@ -1846,7 +1938,7 @@ def test_qwen4_fused_verify_multi_row_blocks_need_row_exact_arming(qwen4_verify)
             module, inputs, conv_state, recurrent_state, row_exact=False
         )
         transaction.abort()
-    assert qwen4_verify == [1]
+    assert qwen4_verify == [3, 1]
 
 
 @pytest.fixture
@@ -1904,11 +1996,22 @@ def test_gdn_format_plan_uses_the_decode_recipe_and_the_verify_geometry(
     if bits == 4:
         assert decode is None
     else:
-        assert decode is not None and all(callable(f) for f in decode[-2:])
+        assert decode is not None and all(callable(f) for f in decode[-3:-1])
         assert prework_mod._qwen4_decode_plan(module) is decode
     verify = prework_mod._qwen4_verify_plan(module)
     assert verify is not None and all(callable(f) for f in verify[:2])
     assert prework_mod._qwen4_verify_plan(module) is verify
+    # Literal geometry pins: a mutant in either return must move these (the
+    # tile test above derives its expectation from the same functions).
+    assert prework_mod._qwen4_verify_in_geometry(1) == (2, 1)
+    assert prework_mod._qwen4_verify_in_geometry(2) == (1, 2)
+    assert prework_mod._qwen4_verify_in_geometry(3) == (2, 3)
+    assert prework_mod._qwen4_verify_in_geometry(4) == (2, 2)
+    assert prework_mod._qwen4_verify_in_geometry(6) == (2, 3)
+    assert prework_mod._qwen4_verify_in_geometry(16) == (2, 2)
+    assert prework_mod._qwen4_verify_out_geometry(1) == (1, 1)
+    assert prework_mod._qwen4_verify_out_geometry(2) == (4, 1)
+    assert prework_mod._qwen4_verify_out_geometry(16) == (4, 1)
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -1924,7 +2027,7 @@ def test_gdn_format_projections_match_independent_serial_calls(
         else prework_mod._qwen4_verify_plan(module)
     )
     assert plan is not None
-    run_in, run_out = plan[-2:] if rows == 1 else plan[:2]
+    run_in, run_out = plan[-3:-1] if rows == 1 else plan[:2]
     parts = (module.in_proj_qkv, module.in_proj_z, module.in_proj_b, module.in_proj_a)
     for run, linears, k in (
         (run_in, parts, 2560),
@@ -1953,7 +2056,7 @@ def test_warm_gdn_format_projection_replays_without_a_python_launch(
 
     module = format_gdn(8, mx.bfloat16)
     if rows == 1:
-        run_in, run_out = prework_mod._qwen4_decode_plan(module)[-2:]
+        run_in, run_out = prework_mod._qwen4_decode_plan(module)[-3:-1]
     else:
         run_in, run_out = prework_mod._qwen4_verify_plan(module)[:2]
     if projection == "input":
@@ -2052,12 +2155,15 @@ def test_gdn_format_tiles_bind_the_served_projection_geometry(format_gdn, monkey
     verify = prework_mod._qwen4_verify_plan(module)
     assert decode is not None and verify is not None
     for rows in range(1, 17):
-        pair = decode[-2:] if rows == 1 else verify[:2]
+        pair = decode[-3:-1] if rows == 1 else verify[:2]
         for run, size, width, tile in zip(
             pair,
             (16480, 2560),
             (2560, 6144),
-            (prework_mod._qwen4_verify_in_tile, prework_mod._qwen4_verify_out_tile),
+            (
+                prework_mod._qwen4_verify_in_geometry,
+                prework_mod._qwen4_verify_out_geometry,
+            ),
         ):
             rps, group = tile(rows)
             y = run(mx.zeros((1, rows, width), mx.bfloat16))
@@ -2120,8 +2226,7 @@ def test_gdn_checks_the_layout_of_the_unequal_input_stack(format_gdn, monkeypatc
         return shape
 
     monkeypatch.setattr(fmt, "layout", padded)
-    decode = prework_mod._qwen4_decode_plan(module)
-    assert decode is not None and decode[-2] is None and decode[-1] is not None
+    assert prework_mod._qwen4_decode_plan(module) is None
     assert prework_mod._qwen4_verify_plan(module) is None
 
 
@@ -2201,8 +2306,7 @@ def test_gdn_keeps_input_projections_of_two_checkpoint_readers_apart(format_gdn)
         source.input_dims,
         {name: source[name] for name in (other.codes_name, *other.tensors)},
     )
-    decode = prework_mod._qwen4_decode_plan(module)
-    assert decode is not None and decode[-2] is None and decode[-1] is not None
+    assert prework_mod._qwen4_decode_plan(module) is None
     assert prework_mod._qwen4_verify_plan(module) is None
 
 
@@ -2286,7 +2390,7 @@ def test_gdn_stock_affine_plan_matches_serial_calls(monkeypatch, rows):
             else prework_mod._qwen4_verify_plan(module)
         )
         assert plan is not None
-        run = plan[-2] if rows == 1 else plan[0]
+        run = plan[-3] if rows == 1 else plan[0]
         parts = (
             module.in_proj_qkv,
             module.in_proj_z,

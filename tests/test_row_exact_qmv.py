@@ -233,6 +233,50 @@ def test_rows_qmv_declines_unsupported_layouts(k, n):
     )
 
 
+def test_rows_qmv_rejects_mismatched_k_or_dtype():
+    qmv = row_exact_qmv.rows_qmv(
+        *_quantized(2560, 64, 8, 64, mx.bfloat16, 1),
+        8,
+        64,
+        "affine",
+        mx.bfloat16,
+        lambda _: (1, 1),
+    )
+    assert qmv is not None
+    with pytest.raises(ValueError, match="row-exact tile"):
+        qmv(mx.zeros((2, 1280), mx.bfloat16))
+    with pytest.raises(ValueError, match="row-exact tile"):
+        qmv(mx.zeros((1, 2560), mx.float16))
+    with pytest.raises(ValueError, match="row-exact tile"):
+        qmv(mx.zeros((), mx.bfloat16))
+    with pytest.raises(ValueError, match="row-exact tile"):
+        qmv(mx.zeros((1, 5120), mx.bfloat16))
+    assert qmv(mx.zeros((2560,), mx.bfloat16)).shape == (64,)
+
+
+def test_format_rows_qmv_rejects_mismatched_k_dtype_or_scalar():
+    weight, scales, biases = _quantized(2560, 64, 8, 64, mx.bfloat16, 1)
+    with testing.verified("qwen4_exp"):
+        layer = row_exact_qmv.FormatLinear(
+            "affine",
+            8,
+            64,
+            2560,
+            {"weight": weight, "scales": scales, "biases": biases},
+        )
+    project = row_exact_qmv.format_rows_qmv(layer, mx.bfloat16, lambda _: (1, 1))
+    assert project is not None
+    for bad in (
+        mx.zeros((2, 1280), mx.bfloat16),
+        mx.zeros((1, 2560), mx.float16),
+        mx.zeros((), mx.bfloat16),
+        mx.zeros((1, 5120), mx.bfloat16),
+    ):
+        with pytest.raises(ValueError, match="row-exact tile"):
+            project(bad)
+    assert project(mx.zeros((2560,), mx.bfloat16)).shape == (64,)
+
+
 def test_rows_qmv_rejects_an_n_the_tile_does_not_divide():
     weight, scales, biases = _quantized(2560, 40, 8, 64, mx.bfloat16, 1)
     qmv = row_exact_qmv.RowsQmv(
