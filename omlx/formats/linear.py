@@ -2296,17 +2296,18 @@ class FormatLinear(_FormatLayer):
             return None
         if x.size // plan.k > MAX_ROWS:
             return None
-        fast = kept._slots.get("dot_fast")
-        if fast is not None:
-            y = fast(self, x)
-            if y is not None:
+        signature = (x.shape, x.dtype)
+        graph = plan.proof.graphs.get(signature)
+        if graph is not None:
+            dot_fast = kept.dot_fast
+            if dot_fast is not None:
                 cur = self.__dict__.get(_FAST)
                 if cur is None or (
-                    cur is not fast and self.__dict__.get(_FAST2) is None
+                    cur is not dot_fast and self.__dict__.get(_FAST2) is None
                 ):
-                    self._publish_fast(kept, fast)
-                return y
-        signature = (x.shape, x.dtype)
+                    self._publish_fast(kept, dot_fast)
+            y = graph(x, *plan.operands)
+            return y if bias is None else y + bias
         y = _launch(plan, signature, _linear, _linear_stand_in, x)
         if y is not None:
             self._register_dot_fast(kept, plan, signature)

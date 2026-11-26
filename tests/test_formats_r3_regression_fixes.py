@@ -23,10 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 import mlx.core as mx
 import mlx.nn as nn
 import pytest
+from omlx.formats.mlx import traversal as mlx_traversal
 
 from omlx.custom_kernels.quant_matmul import fast as native
 from omlx.formats import affine, linear, testing, tile_dense, tuning
-from omlx.formats.mlx import traversal as mlx_traversal
 from omlx.patches import qwen35_moe_routed_decode, qwen35_verify_qmm
 
 # Every 2-D quantized dense FormatLinear shape in Qwen3.8-Flash-Next (P32).
@@ -904,6 +904,35 @@ def test_fast_mask_hides_both_fast_and_fast2_only_on_recording_thread():
         raw = kept.plan.proof._kept.graphs[(x1.shape, x1.dtype)]
         assert raw is not None
         assert getattr(raw, "__name__", "") != "recorded"
+
+
+def test_dot_rows_records_under_layer_calls_and_reuses_graph_on_fallback(monkeypatch):
+    """A warm multi-row Dot-scheduled call must record under
+    testing.layer_calls() (the masked Proof graphs, not the raw slot) and must
+    reuse its kept graph when no native dot_fast is bound instead of
+    re-launching (mx.compile) every warm call."""
+    if not mx.metal.is_available() or not native.has_symbol("FormatLinearFast"):
+        pytest.skip("requires Metal and FormatLinearFast native")
+
+    with testing.fresh_proofs():
+        _, fl = _pair(10240, 2560, bits=8, group_size=64, seed=980)
+        x3 = _x((3, 1, 2560), dtype=mx.bfloat16, seed=981)
+        mx.eval(fl(x3))
+        with testing.layer_calls() as calls:
+            mx.eval(fl(x3))
+        assert [c.layer for c in calls] == [fl]
+
+        _, fl2 = _pair(10240, 2560, bits=8, group_size=64, seed=982)
+        monkeypatch.setattr(native, "has_symbol", lambda _n: False)
+        mx.eval(fl2(x3))
+
+        def boom(*a, **kw):
+            raise AssertionError("warm Dot fallback re-launched")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(linear, "_launch", boom)
+            patch.setattr(mx, "compile", boom)
+            mx.eval(fl2(x3))
 
 
 # ---------------------------------------------------------------------------
