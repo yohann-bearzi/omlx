@@ -20,6 +20,7 @@ import mlx.core as mx
 
 from .. import formats
 from ..formats import transforms
+from ..formats.linear import _TransformedFormatSwitchLinear
 from . import m5_gather_qmm as _m5
 from .m5_gather_qmm import fused_gate_up_activation
 from .m5_gather_qmm_a8 import try_routed_a8
@@ -100,24 +101,14 @@ def _weighted_sum_transforms(switch_mlp):
     return gu, _bind_with_key(getattr(switch_mlp, "down_proj", None))
 
 
-def _native_switch_weighted_sum(
+def _native_switch_weighted_sum_tx(
     switch_mlp: Any,
+    gate_up: Any,
     x: mx.array,
     inds: mx.array,
     scores: mx.array,
     weighted_sum: Callable[..., mx.array],
 ) -> mx.array:
-    # oQh experts read the rotated token rows, with gate | up fused.
-    oqh_experts = getattr(switch_mlp, "oqh_experts", None)
-    if oqh_experts is not None:
-        x = switch_mlp.oqh_rotated_input(x)
-        x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
-        return weighted_sum(
-            mx.contiguous(oqh_experts(x_tok[row_map], idx, sorted_indices=True)),
-            mx.contiguous(inv_order.astype(mx.uint32)),
-            mx.contiguous(scores.astype(mx.float32)),
-        )
-    gate_up = getattr(switch_mlp, "gate_up_proj", None)
     pair = cached_per_module(
         switch_mlp,
         "_omlx_weighted_sum_transforms",
@@ -132,8 +123,6 @@ def _native_switch_weighted_sum(
     # computed when the gate/up kernel reads the token rows in place.
     x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
     if not switch_mlp.training and gu is None and dn is None:
-        # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up on
-        # INT8 operands and the A16 Down; None keeps the A16 path below.
         routed = try_routed_a8(
             switch_mlp, (x_tok, row_map), idx, seq_len=int(x.shape[-2])
         )
@@ -151,10 +140,6 @@ def _native_switch_weighted_sum(
     rotated = False
     if gate_up is not None:
         if not switch_mlp.training:
-            # M5: the activation in the [gate; up] matmul's epilogue, rows
-            # read through the row map (bit-identical; None keeps the split
-            # + activation below). When ``prepared`` is true the rows are
-            # already rotated.
             x_act = fused_gate_up_activation(
                 gate_up,
                 x_sorted,
@@ -163,8 +148,6 @@ def _native_switch_weighted_sum(
                 token_rows=(x_tok, row_map),
                 **({"prepared": True} if prepared else {}),
             )
-            # The epilogue's activation is in the plain basis: the down
-            # projection applies its own transform when it is called.
         if x_act is None:
             x_gate_up = (
                 gate_up._call_prepared(x_sorted, idx, sorted_indices=True)
@@ -203,6 +186,87 @@ def _native_switch_weighted_sum(
         switch_mlp.down_proj._call_prepared(x_act, idx, sorted_indices=True)
         if rotated
         else switch_mlp.down_proj(x_act, idx, sorted_indices=True)
+    )
+    return weighted_sum(
+        mx.contiguous(x_sorted),
+        mx.contiguous(inv_order.astype(mx.uint32)),
+        mx.contiguous(scores.astype(mx.float32)),
+    )
+
+
+def _native_switch_weighted_sum(
+    switch_mlp: Any,
+    x: mx.array,
+    inds: mx.array,
+    scores: mx.array,
+    weighted_sum: Callable[..., mx.array],
+) -> mx.array:
+    # oQh experts read the rotated token rows, with gate | up fused.
+    oqh_experts = getattr(switch_mlp, "oqh_experts", None)
+    if oqh_experts is not None:
+        x = switch_mlp.oqh_rotated_input(x)
+        x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+        return weighted_sum(
+            mx.contiguous(oqh_experts(x_tok[row_map], idx, sorted_indices=True)),
+            mx.contiguous(inv_order.astype(mx.uint32)),
+            mx.contiguous(scores.astype(mx.float32)),
+        )
+    gate_up = getattr(switch_mlp, "gate_up_proj", None)
+    if type(switch_mlp.down_proj) is _TransformedFormatSwitchLinear or (
+        type(gate_up) is _TransformedFormatSwitchLinear
+        if gate_up is not None
+        else (
+            type(switch_mlp.gate_proj) is _TransformedFormatSwitchLinear
+            or type(switch_mlp.up_proj) is _TransformedFormatSwitchLinear
+        )
+    ):
+        return _native_switch_weighted_sum_tx(
+            switch_mlp, gate_up, x, inds, scores, weighted_sum
+        )
+    # mlx-lm's _gather_sort; the replicated rows stay lazy and are never
+    # computed when the gate/up kernel reads the token rows in place.
+    x_tok, row_map, idx, inv_order = sort_routes(mx.expand_dims(x, (-2, -3)), inds)
+    if not switch_mlp.training:
+        # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up on
+        # INT8 operands and the A16 Down; None keeps the A16 path below.
+        routed = try_routed_a8(
+            switch_mlp, (x_tok, row_map), idx, seq_len=int(x.shape[-2])
+        )
+        if routed is not None:
+            return weighted_sum(
+                mx.contiguous(routed),
+                mx.contiguous(inv_order.astype(mx.uint32)),
+                mx.contiguous(scores.astype(mx.float32)),
+            )
+    x_sorted = x_tok[row_map]
+    if switch_mlp.training:
+        idx = mx.stop_gradient(idx)
+
+    x_act = None
+    if gate_up is not None:
+        if not switch_mlp.training:
+            # M5: the activation in the [gate; up] matmul's epilogue, rows
+            # read through the row map (bit-identical; None keeps the split
+            # + activation below).
+            x_act = fused_gate_up_activation(
+                gate_up,
+                x_sorted,
+                idx,
+                switch_mlp.activation,
+                token_rows=(x_tok, row_map),
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x_sorted, idx, sorted_indices=True)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+    else:
+        x_up = switch_mlp.up_proj(x_sorted, idx, sorted_indices=True)
+        x_gate = switch_mlp.gate_proj(x_sorted, idx, sorted_indices=True)
+    if x_act is None:
+        x_act = switch_mlp.activation(x_up, x_gate)
+    x_sorted = switch_mlp.down_proj(
+        x_act,
+        idx,
+        sorted_indices=True,
     )
     return weighted_sum(
         mx.contiguous(x_sorted),

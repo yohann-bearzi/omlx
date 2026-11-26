@@ -107,7 +107,12 @@ import numpy as np
 
 from .. import formats
 from ..formats import Dot, kernels, transforms, tuning
-from ..formats.linear import FormatLinear, FormatSwitchLinear
+from ..formats.linear import (
+    _LINEAR_CLASSES,
+    _SWITCH_CLASSES,
+    FormatLinear,
+    FormatSwitchLinear,
+)
 from . import qwen35_moe_router as _router
 from .module_cache import cached_per_module
 from .qwen35_moe_router import (
@@ -1272,7 +1277,7 @@ def _window_router_ok(gate, dtype: mx.Dtype) -> bool:
     whose scales and biases are the dtype the launches are compiled for (a
     mixed dtype would promote in ``quantized_matmul`` and every window would
     decline after its gate work)."""
-    if type(gate) is FormatLinear and "bias" not in gate:
+    if type(gate) in _LINEAR_CLASSES and "bias" not in gate:
         return True
     return (
         _plain(gate, nn.QuantizedLinear)
@@ -1369,12 +1374,16 @@ class _Plan(NamedTuple):
     # expert's gate+up with its gate and its down (none unless folded).
     operands: tuple
     experts: int  # the router's width: the experts it scores, the block's own
-    outside: bool  # the block computes a router or shared expert outside them
+    outside: bool  # the block computes a router, shared expert or transform outside
     proof: kernels.Proof  # one token's launches; failed: nothing of the plan runs
     window: kernels.Proof | None = None  # theirs; failed: one token still runs
     quantized_router: bool = False  # a verify window's routing is the gate's rows
     gu_tx: tuple | None = None  # (tx, tensors, key) for gate+up
     d_tx: tuple | None = None  # (tx, tensors, key) for down
+    window_outside: bool = False  # True when window hit needs qrouter or tx
+    decode: object = None  # _decode_tx when transformed, else None (uses _decode)
+    window_hit: object = None  # bound once when window_outside is True
+    window_miss: object = None  # bound once at _build_plan: plain / tx
 
 
 def _bind_with_key(layer):
@@ -1428,7 +1437,7 @@ def _shared_formats(
         shared.get("down_proj"),
         gate,
     )
-    if not all(_plain(layer, nn.QuantizedLinear, FormatLinear) for layer in layers):
+    if not all(_plain(layer, nn.QuantizedLinear, *_LINEAR_CLASSES) for layer in layers):
         return None
     gate_proj, up_proj, down_proj, _ = layers
     if (
@@ -1654,8 +1663,8 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
     gate_up = switch_mlp.get("gate_up_proj")
     down = switch_mlp.get("down_proj")
     if not (
-        _plain(gate_up, QuantizedSwitchLinear, FormatSwitchLinear)
-        and _plain(down, QuantizedSwitchLinear, FormatSwitchLinear)
+        _plain(gate_up, QuantizedSwitchLinear, *_SWITCH_CLASSES)
+        and _plain(down, QuantizedSwitchLinear, *_SWITCH_CLASSES)
     ):
         return None
     hidden = down[formats.tensor_names(down)[0]].shape[1]
@@ -1785,6 +1794,7 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
             proof=proof,
             gu_tx=gu_tx,
             d_tx=d_tx,
+            decode=_decode_tx if transformed else None,
         )
     width, sgu_fmt, sd_fmt, g_fmt, shared_gate_up, shared_down, shared_uses_rx = shared
     can_coalesce = gu_fmt.vpt >= 1 and sgu_fmt.vpt >= 1
@@ -1914,11 +1924,12 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         d_tx_apply=d_tx_apply,
         inter=inter,
     )
+    window_outside = quantized_router or transformed
     return _Plan(
         launches=launches,
         operands=(weight, gate_up_operands, down_operands, shared_gate_up, shared_down),
         experts=experts,
-        outside=router is None,
+        outside=(router is None) or transformed,
         proof=proof,
         window=kernels.proof(
             "routed_window",
@@ -1930,6 +1941,14 @@ def _build_plan(block, dtype: mx.Dtype = mx.bfloat16) -> _Plan | None:
         quantized_router=quantized_router,
         gu_tx=gu_tx,
         d_tx=d_tx,
+        window_outside=window_outside,
+        decode=_decode_tx if transformed else None,
+        window_hit=(
+            (_window_hit_tx_qrouter if quantized_router else _window_hit_tx)
+            if transformed
+            else _window_hit_qrouter if quantized_router else None
+        ),
+        window_miss=_window_miss_tx if transformed else _window_miss_plain,
     )
 
 
@@ -1946,15 +1965,22 @@ def _routes(plan: _Plan, x) -> bool:
     )
 
 
-def _gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up, *, rx=None):
+def _gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
     """The one-token gate+up/SwiGLU launch on the routing ``indices``."""
-    inputs = (
-        [x, rx, *gate_up, indices, *shared_gate_up]
-        if rx is not None
-        else [x, *gate_up, indices, *shared_gate_up]
-    )
     return launches.gate_up_kernel(
-        inputs=inputs,
+        inputs=[x, *gate_up, indices, *shared_gate_up],
+        template=launches.gate_up_template,
+        grid=launches.gate_up_grid,
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[launches.gate_up_output],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _gate_up_rx(launches: _Launches, x, rx, indices, gate_up, shared_gate_up):
+    """One-token gate+up/SwiGLU launch taking separate plain ``x`` and rotated ``rx``."""
+    return launches.gate_up_kernel(
+        inputs=[x, rx, *gate_up, indices, *shared_gate_up],
         template=launches.gate_up_template,
         grid=launches.gate_up_grid,
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
@@ -2029,18 +2055,28 @@ def _topk_folds(launches: _Launches, logits) -> bool:
     )
 
 
-def _gate_up_topk(launches: _Launches, x, logits, gate_up, shared_gate_up, *, rx=None):
+def _gate_up_topk(launches: _Launches, x, logits, gate_up, shared_gate_up):
     """Gate+up output, indices and scores of every row of ``x`` from its
     router ``logits`` (the rows' softmax + top-k run inside the launch)."""
     rows = x.size // launches.hidden
     top_k, width = launches.top_k, launches.topk_width
-    inputs = (
-        [x, rx, *gate_up, logits, *shared_gate_up]
-        if rx is not None
-        else [x, *gate_up, logits, *shared_gate_up]
-    )
     return launches.topk_kernel(
-        inputs=inputs,
+        inputs=[x, *gate_up, logits, *shared_gate_up],
+        template=launches.gate_up_template
+        + [("NE", logits.shape[-1]), ("M", rows), ("YW", width)],
+        grid=(32, _GATE_UP_SIMDGROUPS * launches.topk_blocks * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
+        output_dtypes=[launches.dtype, mx.uint32, launches.dtype],
+    )
+
+
+def _gate_up_topk_rx(launches: _Launches, x, rx, logits, gate_up, shared_gate_up):
+    """Folded top-k gate+up/SwiGLU launch taking separate ``x`` and rotated ``rx``."""
+    rows = x.size // launches.hidden
+    top_k, width = launches.top_k, launches.topk_width
+    return launches.topk_kernel(
+        inputs=[x, rx, *gate_up, logits, *shared_gate_up],
         template=launches.gate_up_template
         + [("NE", logits.shape[-1]), ("M", rows), ("YW", width)],
         grid=(32, _GATE_UP_SIMDGROUPS * launches.topk_blocks * rows, 1),
@@ -2086,17 +2122,22 @@ def _routing(logits, top_k: int):
     return routing
 
 
-def _window_gate_up(
-    launches: _Launches, x, indices, gate_up, shared_gate_up, *, rx=None
-):
+def _window_gate_up(launches: _Launches, x, indices, gate_up, shared_gate_up):
     rows = x.shape[0]
-    inputs = (
-        [x, rx, *gate_up, indices, *shared_gate_up]
-        if rx is not None
-        else [x, *gate_up, indices, *shared_gate_up]
-    )
     return launches.window_gate_up_kernel(
-        inputs=inputs,
+        inputs=[x, *gate_up, indices, *shared_gate_up],
+        template=launches.gate_up_template + [("M", rows)],
+        grid=(32, launches.gate_up_grid[1] * rows, 1),
+        threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
+        output_shapes=[(rows, *launches.gate_up_output)],
+        output_dtypes=[launches.dtype],
+    )[0]
+
+
+def _window_gate_up_rx(launches: _Launches, x, rx, indices, gate_up, shared_gate_up):
+    rows = x.shape[0]
+    return launches.window_gate_up_kernel(
+        inputs=[x, rx, *gate_up, indices, *shared_gate_up],
         template=launches.gate_up_template + [("M", rows)],
         grid=(32, launches.gate_up_grid[1] * rows, 1),
         threadgroup=(32, _GATE_UP_SIMDGROUPS, 1),
@@ -2340,8 +2381,6 @@ def _experts(
     folded: bool,
     *beside,
     single_stream: bool = False,
-    rx=None,
-    d_tensors=(),
 ):
     """``(switch_mlp(x, indices) * scores[..., None]).sum(axis=-2)
     + mx.sigmoid(shared_expert_gate(x)) * shared_expert(x)`` for each row
@@ -2355,51 +2394,13 @@ def _experts(
     _, gate_up, down, shared_gate_up, shared_down = operands
     one_token = x.size == launches.hidden
     if one_token:
-        if launches.fold:
-            if folded:
-                if launches.split_out:
-                    yr, ys, indices, scores = _gate_up_topk_tx(
-                        launches, x, rx, logits, gate_up, shared_gate_up
-                    )
-                else:
-                    h, indices, scores = (
-                        _gate_up_topk(
-                            launches, x, logits, gate_up, shared_gate_up, rx=rx
-                        )
-                        if rx is not None
-                        else _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
-                    )
-            else:
-                indices, scores = _routing(logits, launches.top_k)
-                if launches.split_out:
-                    yr, ys = _gate_up_tx(
-                        launches, x, rx, indices, gate_up, shared_gate_up
-                    )
-                else:
-                    h = (
-                        _gate_up(launches, x, indices, gate_up, shared_gate_up, rx=rx)
-                        if rx is not None
-                        else _gate_up(launches, x, indices, gate_up, shared_gate_up)
-                    )
-            if launches.split_out:
-                yr = _apply_down_tx(launches, yr, d_tensors)
-                return _down_tx(
-                    launches, yr, ys, indices, scores, x.shape, down, shared_down
-                )
-            return _down(
-                launches, h, indices, scores, x.shape, down, shared_down, *beside
-            )
-        gu_in = rx if launches.routed_x else x
         if folded:
             h, indices, scores = _gate_up_topk(
-                launches, gu_in, logits, gate_up, shared_gate_up
+                launches, x, logits, gate_up, shared_gate_up
             )
         else:
             indices, scores = _routing(logits, launches.top_k)
-            h = _gate_up(launches, gu_in, indices, gate_up, shared_gate_up)
-        if launches.d_tx_apply is not None:
-            h = mx.reshape(h, (launches.top_k, launches.inter), stream=mx.gpu)
-            h = _apply_down_tx(launches, h, d_tensors)
+            h = _gate_up(launches, x, indices, gate_up, shared_gate_up)
         return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
     rows = x.shape[0]
     mode = _coalesce_mode(launches, rows, folded, single_stream)
@@ -2424,13 +2425,82 @@ def _experts(
             launches, x, logits, gate_up, shared_gate_up
         )
     elif folded:
+        h, indices, scores = _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+    else:
+        indices, scores = _routing(logits, launches.top_k)
+        h = _window_gate_up(launches, x, indices, gate_up, shared_gate_up)
+    return _window_down(launches, h, indices, scores, down, shared_down)
+
+
+def _experts_tx(
+    launches: _Launches,
+    x,
+    logits,
+    operands,
+    folded: bool,
+    *beside,
+    rx=None,
+    d_tensors=(),
+):
+    """Transformed counterpart of ``_experts`` for plans carrying an
+    ``InputTransform`` on gate+up and/or down."""
+    _, gate_up, down, shared_gate_up, shared_down = operands
+    one_token = x.size == launches.hidden
+    if one_token:
+        if launches.fold:
+            if folded:
+                if launches.split_out:
+                    yr, ys, indices, scores = _gate_up_topk_tx(
+                        launches, x, rx, logits, gate_up, shared_gate_up
+                    )
+                else:
+                    h, indices, scores = (
+                        _gate_up_topk_rx(
+                            launches, x, rx, logits, gate_up, shared_gate_up
+                        )
+                        if rx is not None
+                        else _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
+                    )
+            else:
+                indices, scores = _routing(logits, launches.top_k)
+                if launches.split_out:
+                    yr, ys = _gate_up_tx(
+                        launches, x, rx, indices, gate_up, shared_gate_up
+                    )
+                else:
+                    h = (
+                        _gate_up_rx(launches, x, rx, indices, gate_up, shared_gate_up)
+                        if rx is not None
+                        else _gate_up(launches, x, indices, gate_up, shared_gate_up)
+                    )
+            if launches.split_out:
+                yr = _apply_down_tx(launches, yr, d_tensors)
+                return _down_tx(
+                    launches, yr, ys, indices, scores, x.shape, down, shared_down
+                )
+            return _down(
+                launches, h, indices, scores, x.shape, down, shared_down, *beside
+            )
+        gu_in = rx if launches.routed_x else x
+        if folded:
+            h, indices, scores = _gate_up_topk(
+                launches, gu_in, logits, gate_up, shared_gate_up
+            )
+        else:
+            indices, scores = _routing(logits, launches.top_k)
+            h = _gate_up(launches, gu_in, indices, gate_up, shared_gate_up)
+        if launches.d_tx_apply is not None:
+            h = mx.reshape(h, (launches.top_k, launches.inter), stream=mx.gpu)
+            h = _apply_down_tx(launches, h, d_tensors)
+        return _down(launches, h, indices, scores, x.shape, down, shared_down, *beside)
+    if folded:
         if launches.split_out:
             yr, ys, indices, scores = _gate_up_topk_tx(
                 launches, x, rx, logits, gate_up, shared_gate_up
             )
         else:
             h, indices, scores = (
-                _gate_up_topk(launches, x, logits, gate_up, shared_gate_up, rx=rx)
+                _gate_up_topk_rx(launches, x, rx, logits, gate_up, shared_gate_up)
                 if rx is not None
                 else _gate_up_topk(launches, x, logits, gate_up, shared_gate_up)
             )
@@ -2442,7 +2512,7 @@ def _experts(
             )
         else:
             h = (
-                _window_gate_up(launches, x, indices, gate_up, shared_gate_up, rx=rx)
+                _window_gate_up_rx(launches, x, rx, indices, gate_up, shared_gate_up)
                 if rx is not None
                 else _window_gate_up(launches, x, indices, gate_up, shared_gate_up)
             )
@@ -2465,7 +2535,7 @@ def _token(launches: _Launches, folded: bool):
                 logits, *outside = outside
             else:
                 logits = launches.router(x, *operands[0])
-            return _experts(
+            return _experts_tx(
                 launches,
                 x,
                 logits,
@@ -2544,14 +2614,13 @@ def _stand_in(
         rx = x if launches.routed_x else None
         if launches.routed_x or launches.d_tx_apply is not None:
             launched = [
-                _experts(
+                _experts_tx(
                     launches,
                     x,
                     logits,
                     stand_ins,
                     folded,
                     *outside,
-                    single_stream=single_stream,
                     rx=rx,
                     d_tensors=stand_in_d,
                 )
@@ -2633,16 +2702,34 @@ def _decode(block, plan: _Plan, x, graph):
     launches = plan.launches
     if graph is None and not _routes(plan, x):
         return None
-    transformed = plan.gu_tx is not None or plan.d_tx is not None
+    outside = _outside(block, plan, x)
+    if outside is None:
+        return None
+    if graph is not None:
+        return graph(x, outside, plan.operands)
+    logits = _ranked(1, plan.experts, launches.dtype)
+    folded = _topk_folds(launches, logits)
+    stand_in = partial(_stand_in, launches, logits, folded, outside, plan.operands)
+    if not plan.proof.prove((plan.experts, folded), stand_in, logger, *_SAID):
+        return None
+    graph = mx.compile(_token(launches, folded))
+    y = graph(x, outside, plan.operands)
+    plan.proof.keep((x.shape, x.dtype, plan.experts), graph)
+    return y
+
+
+def _decode_tx(block, plan: _Plan, x, graph):
+    """One token's block output through a transformed plan's launches."""
+    launches = plan.launches
+    if graph is None and not _routes(plan, x):
+        return None
     rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
     d_tensors = () if plan.d_tx is None else plan.d_tx[1]
     outside = _outside(block, plan, x)
     if outside is None:
         return None
     if graph is not None:
-        if transformed:
-            return graph(x, outside, plan.operands, rx, d_tensors)
-        return graph(x, outside, plan.operands)
+        return graph(x, outside, plan.operands, rx, d_tensors)
     logits = _ranked(1, plan.experts, launches.dtype)
     folded = _topk_folds(launches, logits)
     stand_in = partial(
@@ -2651,10 +2738,7 @@ def _decode(block, plan: _Plan, x, graph):
     if not plan.proof.prove((plan.experts, folded), stand_in, logger, *_SAID):
         return None
     graph = mx.compile(_token(launches, folded))
-    if transformed:
-        y = graph(x, outside, plan.operands, rx, d_tensors)
-    else:
-        y = graph(x, outside, plan.operands)
+    y = graph(x, outside, plan.operands, rx, d_tensors)
     plan.proof.keep((x.shape, x.dtype, plan.experts), graph)
     return y
 
@@ -2674,7 +2758,7 @@ def _window(launches: _Launches, folded: bool, *, single_stream: bool = False):
                 else None
             )
             logits = launches.router(x, *operands[0])
-            return _experts(
+            return _experts_tx(
                 launches, x, logits, operands, folded, rx=rx_2d, d_tensors=d_tensors
             )
 
@@ -2704,7 +2788,7 @@ def _window_logits(launches: _Launches, folded: bool, *, single_stream: bool = F
                 if launches.routed_x
                 else None
             )
-            return _experts(
+            return _experts_tx(
                 launches, x, logits, operands, folded, rx=rx_2d, d_tensors=d_tensors
             )
 
@@ -2751,6 +2835,123 @@ def _cached_plan(block, dtype: mx.Dtype) -> _Plan | None:
     )
 
 
+def _window_hit_qrouter(block, plan: _Plan, x, shape, graph):
+    rows = x.size // shape[-1]
+    launches = plan.launches
+    logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+    if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+        return None
+    return graph(x, logits, plan.operands)
+
+
+def _window_hit_tx(block, plan: _Plan, x, shape, graph):
+    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
+    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
+    return graph(x, plan.operands, rx, d_tensors)
+
+
+def _window_hit_tx_qrouter(block, plan: _Plan, x, shape, graph):
+    rows = x.size // shape[-1]
+    launches = plan.launches
+    logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+    if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+        return None
+    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
+    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
+    return graph(x, logits, plan.operands, rx, d_tensors)
+
+
+def _window_miss_plain(block, plan: _Plan, x, shape, window_signature):
+    rows = x.size // shape[-1]
+    launches = plan.launches
+    if plan.window.failed or not _windows(plan, x):
+        return None
+    logits = None
+    if plan.quantized_router:
+        logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+        if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+            return None
+    ranked = _ranked(rows, plan.experts, launches.dtype)
+    folded = _topk_folds(launches, ranked)
+    single_stream = shape[0] == 1 and shape[1] > 1
+    mode = _coalesce_mode(launches, rows, folded, single_stream)
+    outside = () if logits is None else (ranked,)
+    stand_in = partial(
+        _stand_in,
+        launches,
+        ranked,
+        folded,
+        outside,
+        plan.operands,
+        single_stream=single_stream,
+    )
+    said = (
+        f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
+        "fused verify-window experts failed; verifier fallback",
+    )
+    if not plan.window.prove(
+        _window_metal(rows, plan.experts, folded, mode), stand_in, logger, *said
+    ):
+        return None
+    if logits is None:
+        graph = mx.compile(_window(launches, folded, single_stream=single_stream))
+        y = graph(x, plan.operands)
+    else:
+        graph = mx.compile(
+            _window_logits(launches, folded, single_stream=single_stream)
+        )
+        y = graph(x, logits, plan.operands)
+    plan.window.keep(window_signature, graph)
+    return y
+
+
+def _window_miss_tx(block, plan: _Plan, x, shape, window_signature):
+    rows = x.size // shape[-1]
+    launches = plan.launches
+    if plan.window.failed or not _windows(plan, x):
+        return None
+    logits = None
+    if plan.quantized_router:
+        logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
+        if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
+            return None
+    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
+    ranked = _ranked(rows, plan.experts, launches.dtype)
+    folded = _topk_folds(launches, ranked)
+    single_stream = shape[0] == 1 and shape[1] > 1
+    mode = _coalesce_mode(launches, rows, folded, single_stream)
+    outside = () if logits is None else (ranked,)
+    stand_in = partial(
+        _stand_in,
+        launches,
+        ranked,
+        folded,
+        outside,
+        plan.operands,
+        d_tensors,
+        single_stream=single_stream,
+    )
+    said = (
+        f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
+        "fused verify-window experts failed; verifier fallback",
+    )
+    if not plan.window.prove(
+        _window_metal(rows, plan.experts, folded, mode), stand_in, logger, *said
+    ):
+        return None
+    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
+    if logits is None:
+        graph = mx.compile(_window(launches, folded, single_stream=single_stream))
+        y = graph(x, plan.operands, rx, d_tensors)
+    else:
+        graph = mx.compile(
+            _window_logits(launches, folded, single_stream=single_stream)
+        )
+        y = graph(x, logits, plan.operands, rx, d_tensors)
+    plan.window.keep(window_signature, graph)
+    return y
+
+
 def routed_verify_window(block, x):
     """The block's output for a verify window ``x`` ([B, L, hidden],
     1..``WINDOW_MAX_ROWS`` rows), each row bit-identical to the fused
@@ -2779,7 +2980,12 @@ def routed_verify_window(block, x):
     if x.size == shape[-1]:
         # One row runs the one-token launches: their proof and graph.
         signature = (shape, dtype, plan.experts)
-        y = _decode(block, plan, x, plan.proof.graphs.get(signature))
+        graph = plan.proof.graphs.get(signature)
+        y = (
+            _decode(block, plan, x, graph)
+            if plan.decode is None
+            else plan.decode(block, plan, x, graph)
+        )
         return None if y is None else mx.reshape(y, (1, -1), stream=mx.gpu)
     # The window's graph is the plan's variant: the fused router's two-argument
     # call or a quantized gate's external logits. Plans of both can share the
@@ -2790,76 +2996,10 @@ def routed_verify_window(block, x):
     # reads nothing else.
     graph = plan.window.graphs.get(window_signature)
     if graph is not None:
-        transformed = plan.gu_tx is not None or plan.d_tx is not None
-        rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
-        d_tensors = () if plan.d_tx is None else plan.d_tx[1]
-        if plan.quantized_router:
-            rows = x.size // shape[-1]
-            launches = plan.launches
-            logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
-            if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
-                return None
-            if transformed:
-                return graph(x, logits, plan.operands, rx, d_tensors)
-            return graph(x, logits, plan.operands)
-        if transformed:
-            return graph(x, plan.operands, rx, d_tensors)
+        if plan.window_outside:
+            return plan.window_hit(block, plan, x, shape, graph)
         return graph(x, plan.operands)
-    rows = x.size // shape[-1]
-    launches = plan.launches
-    if plan.window.failed or not _windows(plan, x):
-        return None
-    # A quantized gate's logits are its own one-row arithmetic per row
-    # (``row_exact_linear``), computed outside the window's graph.
-    logits = None
-    if plan.quantized_router:
-        logits = row_exact_linear(block["gate"], x.reshape(rows, launches.hidden))
-        if logits.dtype != launches.dtype or logits.shape != (rows, plan.experts):
-            return None
-    transformed = plan.gu_tx is not None or plan.d_tx is not None
-    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
-    ranked = _ranked(rows, plan.experts, launches.dtype)
-    folded = _topk_folds(launches, ranked)
-    single_stream = shape[0] == 1 and shape[1] > 1
-    mode = _coalesce_mode(launches, rows, folded, single_stream)
-    outside = () if logits is None else (ranked,)
-    stand_in = partial(
-        _stand_in,
-        launches,
-        ranked,
-        folded,
-        outside,
-        plan.operands,
-        d_tensors,
-        single_stream=single_stream,
-    )
-    said = (
-        f"Qwen MoE fused verify-window experts engaged ({rows} rows)",
-        "fused verify-window experts failed; verifier fallback",
-    )
-    if not plan.window.prove(
-        _window_metal(rows, plan.experts, folded, mode), stand_in, logger, *said
-    ):
-        return None
-    rx = () if plan.gu_tx is None else transforms.prepare_bound(plan.gu_tx, x)
-    if logits is None:
-        graph = mx.compile(_window(launches, folded, single_stream=single_stream))
-        y = (
-            graph(x, plan.operands, rx, d_tensors)
-            if transformed
-            else graph(x, plan.operands)
-        )
-    else:
-        graph = mx.compile(
-            _window_logits(launches, folded, single_stream=single_stream)
-        )
-        y = (
-            graph(x, logits, plan.operands, rx, d_tensors)
-            if transformed
-            else graph(x, logits, plan.operands)
-        )
-    plan.window.keep(window_signature, graph)
-    return y
+    return plan.window_miss(block, plan, x, shape, window_signature)
 
 
 def _ensure_verify_window_patch(cls) -> None:
@@ -2922,16 +3062,12 @@ def apply_qwen35_moe_routed_decode_patch() -> bool:
                 # A decode step is the replay of the graph its thread kept.
                 graph = plan.proof.graphs.get((shape, x.dtype, plan.experts))
                 if graph is not None and not plan.outside:
-                    if plan.gu_tx is None and plan.d_tx is None:
-                        return graph(x, (), plan.operands)
-                    rx = (
-                        ()
-                        if plan.gu_tx is None
-                        else transforms.prepare_bound(plan.gu_tx, x)
-                    )
-                    d_tensors = () if plan.d_tx is None else plan.d_tx[1]
-                    return graph(x, (), plan.operands, rx, d_tensors)
-                y = _decode(self, plan, x, graph)
+                    return graph(x, (), plan.operands)
+                y = (
+                    _decode(self, plan, x, graph)
+                    if plan.decode is None
+                    else plan.decode(self, plan, x, graph)
+                )
                 if y is not None:
                     return y
         elif x.ndim == 3 and shape[1] == 1:

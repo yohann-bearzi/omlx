@@ -3861,7 +3861,10 @@ class ShardedEmbedding(nn.Module):
         shards = list(self.shards)
         if not shards:
             return False
-        if all(type(shard).__name__ == "FormatEmbedding" for shard in shards):
+        if all(
+            type(shard).__name__ in ("FormatEmbedding", "_TransformedFormatEmbedding")
+            for shard in shards
+        ):
             return self._fuse_format_shards(shards, load_sources=load_sources)
         return False
 

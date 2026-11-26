@@ -1159,6 +1159,16 @@ def _stackable_layout(fmt: QuantFormat, k: int, n: int, bits: int, group_size: i
     return None
 
 
+def _declares_input_transform(fmt: QuantFormat) -> bool:
+    """Whether ``fmt`` overrides ``QuantFormat.input_transform`` (on its class
+    or on this instance). Formats that do not can never carry an input
+    transform, so their layers bind the plain call path at construction."""
+    return (
+        type(fmt).input_transform is not QuantFormat.input_transform
+        or "input_transform" in fmt.__dict__
+    )
+
+
 def input_transform(layer, *, refuse: bool = True) -> tuple | None:
     """``(tx, tensors)`` of ``layer``'s format's input transform, or None:
     the descriptor and this layer's arrays of its ``shared_tensors``, bound
@@ -1176,10 +1186,7 @@ def input_transform(layer, *, refuse: bool = True) -> tuple | None:
         check = getattr(layer, "refuse_placeholders", None)
         if check is not None:
             check()
-    if (
-        type(fmt).input_transform is QuantFormat.input_transform
-        and "input_transform" not in fmt.__dict__
-    ):
+    if not _declares_input_transform(fmt):
         return None
     if not isinstance(layer, nn.Module):
         return _bound_transform(fmt, layer, transforms)

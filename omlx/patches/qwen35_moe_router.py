@@ -942,7 +942,7 @@ def _ensure_vlm_verify_patch() -> None:
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
     from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeSparseMoeBlock
 
-    from ..formats.linear import FormatLinear
+    from ..formats.linear import _LINEAR_CLASSES
     from .row_exact_qmv import quantized_linear as row_exact_linear
 
     original = Qwen3_5BatchInvariantForward._feed_forward
@@ -963,7 +963,7 @@ def _ensure_vlm_verify_patch() -> None:
         # and routed_verify_window (rule 25, numerics contract).
         logits = (
             row_exact_linear(gate, x)
-            if type(gate) is FormatLinear
+            if type(gate) in _LINEAR_CLASSES
             else self._linear(gate, x)
         )
         gates = mx.softmax(logits, axis=-1, precise=True)

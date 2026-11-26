@@ -674,16 +674,16 @@ def _bind_gated_norm(norm, out_proj) -> bool:
 def _install_dense_mlp(mlp) -> tuple[bool, list]:
     """Fuse a dense FormatLinear MLP's SwiGLU into down_proj's InputTransform;
     returns ``(installed, gate_up_readers)``. Leaves SwitchGLU untouched."""
-    from .linear import FormatLinear
+    from .linear import _LINEAR_CLASSES
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     readers = [m for m in (gate, up) if m is not None and bind(m) is not None]
     if not (
-        type(gate) is FormatLinear
-        and type(up) is FormatLinear
-        and type(down) is FormatLinear
+        type(gate) in _LINEAR_CLASSES
+        and type(up) in _LINEAR_CLASSES
+        and type(down) in _LINEAR_CLASSES
     ):
         return False, readers
     act = getattr(mlp, "activation", None)
@@ -776,17 +776,18 @@ def release_producers(model: nn.Module, *, wrapped_only: bool = False) -> int:
 
     With ``wrapped_only=True`` (used when a LoRA adapter wraps a projection),
     only fused MLPs or gated norms whose projections are no longer bare
-    ``FormatLinear`` instances are restored; ``_DualNorm`` stays installed so
-    wrapped layers keep hitting the rotation memo.
+    ``FormatLinear`` / ``_TransformedFormatLinear`` instances are restored;
+    ``_DualNorm`` stays installed so wrapped layers keep hitting the rotation
+    memo.
     """
-    from .linear import FormatLinear
+    from .linear import _LINEAR_CLASSES
 
     count = 0
     for _, module in model.named_modules():
         cls = type(module)
         if wrapped_only:
             if issubclass(cls, _FusedMLP) and not all(
-                type(getattr(module, n, None)) is FormatLinear
+                type(getattr(module, n, None)) in _LINEAR_CLASSES
                 for n in ("gate_proj", "up_proj", "down_proj")
             ):
                 module.__class__ = cls.__bases__[1]
@@ -794,7 +795,7 @@ def release_producers(model: nn.Module, *, wrapped_only: bool = False) -> int:
             norm = getattr(module, "norm", None)
             if isinstance(norm, _DualGatedNorm):
                 out_proj = getattr(module, "out_proj", None)
-                if type(out_proj) is not FormatLinear or out_proj is not getattr(
+                if type(out_proj) not in _LINEAR_CLASSES or out_proj is not getattr(
                     norm, "_omlx_tx_reader", None
                 ):
                     norm.__class__ = type(norm).__bases__[1]

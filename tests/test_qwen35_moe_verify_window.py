@@ -1687,3 +1687,66 @@ def test_routed_down_split_declines_when_shared_face_has_no_vpt(monkeypatch, tmp
         assert plan.launches.window_down_shared_kernel is None
     finally:
         tuning.reset_cache()
+
+
+def test_transformed_format_router_uses_row_exact_and_verify_window(
+    monkeypatch, engaged
+):
+    """pre-oqh-2c708f788 MEDIUM #1: a transformed FormatLinear router
+    (_TransformedFormatLinear) must be accepted by _window_router_ok, engage
+    routed_verify_window bit-identically to 1-row decode, and route through
+    row_exact_linear (not self._linear) on composed verify."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from omlx.formats import oqh, testing
+    from omlx.formats.linear import FormatLinear, _TransformedFormatLinear
+    from omlx.patches.qwen35_moe_routed_decode import _window_router_ok
+    from tests.test_formats_oqh import _group_case
+
+    hidden, experts = 512, 64
+    block = _block(
+        91,
+        bits=4,
+        experts=experts,
+        hidden=hidden,
+        inter=256,
+        top_k=8,
+        shared_bits=4,
+        shared_group=64,
+        router_bits=8,
+    )
+    tensors, _ = _group_case(hidden, experts, 4, 128, seed=91)
+    with testing.verified("example"):
+        gate = FormatLinear(oqh.OQH_AFFINE, 4, 128, hidden, tensors)
+    assert type(gate) is _TransformedFormatLinear
+    block.gate = gate
+    block.eval()
+    mx.eval(block.parameters())
+
+    ok = _window_router_ok(block.gate, mx.bfloat16)
+
+    x = _inputs(4, 0, hidden=hidden)
+    linear_calls = []
+    orig_linear = Qwen3_5BatchInvariantForward._linear
+
+    def spy_linear(self, layer, inp):
+        linear_calls.append(layer)
+        return orig_linear(self, layer, inp)
+
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "_linear", spy_linear)
+    out = _verify(block, x, window=False, row_exact=True)
+    mx.eval(out)
+    gate_via_linear = any(layer is block.gate for layer in linear_calls)
+    assert (
+        ok and not gate_via_linear
+    ), f"window_router_ok={ok}, gate_via_linear={gate_via_linear}"
+
+    monkeypatch.setattr(Qwen3_5BatchInvariantForward, "_linear", orig_linear)
+    # Fused verify window engages and matches 1-row serial decode and composed
+    # verify bit-for-bit.
+    _check(block, x, engaged, row_exact=True)
+
+    # Biased transformed router still declines _window_router_ok.
+    block.gate["bias"] = mx.zeros((experts,), dtype=mx.bfloat16)
+    assert not _window_router_ok(block.gate, mx.bfloat16)
+    _BLOCKS.clear()

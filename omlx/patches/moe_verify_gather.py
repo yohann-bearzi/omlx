@@ -203,6 +203,9 @@ class Projection(NamedTuple):
     n: int
 
 
+_NO_PLAIN_RAN: frozenset = frozenset()
+
+
 class _Plan(NamedTuple):
     gate_up: Projection
     down: Projection
@@ -211,6 +214,8 @@ class _Plan(NamedTuple):
     few_pairs: int  # blocks of this many pairs or fewer keep the composed path
     gu_tx: Any = None  # bound (tx, tensors, key) for gate_up, or None
     dn_tx: Any = None  # bound (tx, tensors, key) for down, or None
+    plain_ran: Any = _NO_PLAIN_RAN  # proof.ran when untransformed, else empty
+    tx_call: Any = None  # _fused_switch_tx when transformed, else None
 
 
 def projection(linear, k: int) -> Projection | None:
@@ -277,7 +282,19 @@ def _build_plan(switch_mlp, width: int, top_k: int) -> _Plan | None:
     dn_b = formats.input_transform(layers[1], refuse=False)
     gu_tx = None if gu_b is None else (*gu_b, transforms.key(*gu_b))
     dn_tx = None if dn_b is None else (*dn_b, transforms.key(*dn_b))
-    return _Plan(gate_up, down, proof, width, few_pairs, gu_tx, dn_tx)
+    if gu_tx is None and dn_tx is None:
+        return _Plan(gate_up, down, proof, width, few_pairs, None, None, proof.ran)
+    return _Plan(
+        gate_up,
+        down,
+        proof,
+        width,
+        few_pairs,
+        gu_tx,
+        dn_tx,
+        _NO_PLAIN_RAN,
+        _fused_switch_tx,
+    )
 
 
 _FAILED = "expert-ordered verify gather failed; composed fallback"
@@ -386,6 +403,49 @@ def _experts(projection: Projection) -> int:
     return max(-(-8 * a.shape[0] // a.size) for a in projection.operands)
 
 
+def _fused_switch_tx(
+    plan: _Plan,
+    switch_mlp,
+    x: mx.array,
+    indices: mx.array,
+    batch: int,
+    length: int,
+    rows: int,
+    width: int,
+    top_k: int,
+    pair_count: int,
+    metal: tuple,
+):
+    if metal not in plan.proof.ran and (
+        not plan.few_pairs < pair_count <= _MAX_PAIRS
+        or not plan.gate_up.face.exact_for(x.dtype)
+        or not plan.down.face.exact_for(x.dtype)
+        or rows * width < 8
+        or not mx.issubdtype(indices.dtype, mx.integer)
+        or not plan.proof.prove(
+            metal,
+            lambda: _stand_in(plan, metal),
+            logger,
+            f"MoE expert-ordered verify gather engaged ({rows} rows)",
+            _FAILED,
+        )
+    ):
+        return None
+    if plan.gu_tx is not None:
+        x = transforms.prepare_bound(plan.gu_tx, x)
+    pairs = indices.reshape(pair_count)
+    order = _order(pairs) if pair_count >= ORDERED_PAIRS else None
+    gate_up = _gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
+    gate, up = mx.split(gate_up, 2, axis=-1)
+    hidden = switch_mlp.activation(up, gate)
+    if hidden.dtype != x.dtype or hidden.shape != up.shape:
+        return None
+    if plan.dn_tx is not None:
+        hidden = transforms.prepare_bound(plan.dn_tx, hidden)
+    down = _gather_qmv(plan.down, hidden, pairs, 1, order)
+    return down.reshape(batch, length, top_k, -1)
+
+
 def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     """Fused gate/up then down routed projections for 2..MAX_ROWS rows.
 
@@ -425,26 +485,39 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
     # pays for neither, nor for the stand-in and the log line it would build.
     pair_count = rows * top_k
     metal = (rows, top_k, x.dtype, indices.dtype)
-    if metal not in plan.proof.ran and (
-        # MLX binds an input of fewer than 8 values as constants, and the
-        # kernel reads x from device memory; like gather_qmm, it takes float
-        # activations of the GPU and integer indices only.
-        not plan.few_pairs < pair_count <= _MAX_PAIRS
-        or not plan.gate_up.face.exact_for(x.dtype)
-        or not plan.down.face.exact_for(x.dtype)
-        or rows * width < 8
-        or not mx.issubdtype(indices.dtype, mx.integer)
-        or not plan.proof.prove(
-            metal,
-            lambda: _stand_in(plan, metal),
-            logger,
-            f"MoE expert-ordered verify gather engaged ({rows} rows)",
-            _FAILED,
-        )
-    ):
-        return None
-    if plan.gu_tx is not None:
-        x = transforms.prepare_bound(plan.gu_tx, x)
+    if metal not in plan.plain_ran:
+        if plan.tx_call is not None:
+            return plan.tx_call(
+                plan,
+                switch_mlp,
+                x,
+                indices,
+                batch,
+                length,
+                rows,
+                width,
+                top_k,
+                pair_count,
+                metal,
+            )
+        if (
+            # MLX binds an input of fewer than 8 values as constants, and the
+            # kernel reads x from device memory; like gather_qmm, it takes float
+            # activations of the GPU and integer indices only.
+            not plan.few_pairs < pair_count <= _MAX_PAIRS
+            or not plan.gate_up.face.exact_for(x.dtype)
+            or not plan.down.face.exact_for(x.dtype)
+            or rows * width < 8
+            or not mx.issubdtype(indices.dtype, mx.integer)
+            or not plan.proof.prove(
+                metal,
+                lambda: _stand_in(plan, metal),
+                logger,
+                f"MoE expert-ordered verify gather engaged ({rows} rows)",
+                _FAILED,
+            )
+        ):
+            return None
     pairs = indices.reshape(pair_count)
     order = _order(pairs) if pair_count >= ORDERED_PAIRS else None
     gate_up = _gather_qmv(plan.gate_up, x.reshape(rows, width), pairs, top_k, order)
@@ -454,8 +527,6 @@ def fused_switch(switch_mlp, x: mx.array, indices: mx.array):
         # Not the rows that the down launch is planned and proven for.
         # Nothing is kept of it: the next block asks its activation again.
         return None
-    if plan.dn_tx is not None:
-        hidden = transforms.prepare_bound(plan.dn_tx, hidden)
     down = _gather_qmv(plan.down, hidden, pairs, 1, order)
     return down.reshape(batch, length, top_k, -1)
 

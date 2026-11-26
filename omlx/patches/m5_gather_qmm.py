@@ -50,7 +50,7 @@ import logging
 import mlx.core as mx
 
 from omlx.custom_kernels.nax import is_nax_available
-from omlx.formats.linear import FormatSwitchLinear
+from omlx.formats.linear import FormatSwitchLinear, _TransformedFormatSwitchLinear
 
 from . import m5_gather_qmm_nax as _nax
 from .moe_routes import sort_routes
@@ -292,7 +292,11 @@ def fused_gate_up_activation(
     if not isinstance(x, mx.array) or not isinstance(indices, mx.array):
         return None
     if isinstance(proj, FormatSwitchLinear):
-        return proj._sorted_swiglu(x, indices, limit, token_rows, prepared=prepared)
+        if not prepared:
+            return proj._sorted_swiglu(x, indices, limit, token_rows)
+        if type(proj) is _TransformedFormatSwitchLinear:
+            return proj._sorted_swiglu(x, indices, limit, token_rows, prepared=True)
+        return None
     if prepared:
         # Only a format's transform reads a prepared input; the stock kernels
         # would apply their weights to a rotated activation.

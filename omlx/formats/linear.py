@@ -1960,9 +1960,14 @@ class _FormatLayer(nn.Module):
         # of its own, and those that still hold a load's placeholders, each
         # with the shape and dtype last offered in its place (None: none
         # was). Kept beside the parameters, not among them.
+        has_transform = formats._declares_input_transform(fmt)
         self.__dict__.update(
             _tensors=names,
-            _stock=mode in formats._BUILTIN_MODES and formats._mlx_runs(mode),
+            _stock=(
+                mode in formats._BUILTIN_MODES
+                and formats._mlx_runs(mode)
+                and not has_transform
+            ),
             _stored_floats=tuple(
                 name for name, (_, dtype) in (layout or {}).items() if dtype is None
             ),
@@ -1974,6 +1979,14 @@ class _FormatLayer(nn.Module):
         if bias is not None:
             self["bias"] = bias
         self.freeze()
+        if has_transform:
+            transformed = _TRANSFORMED_LAYER_CLASS.get(type(self))
+            if transformed is not None:
+                self.__class__ = transformed
+            elif type(self) not in _TRANSFORMED_LAYER_CLASSES:
+                raise TypeError(
+                    f"{type(self).__name__} does not support transformed format {mode!r}"
+                )
 
     def _load_dtype(self, name: str, expected):
         """The dtype ``name`` loads as: ``expected``, or None for a stored
@@ -2129,13 +2142,8 @@ class _FormatLayer(nn.Module):
         if "bias" in self and not isinstance(bias, mx.array):
             # MLX's quantized layers raise as they add it.
             raise TypeError(f"the bias is an array, not {type(bias).__name__}")
-        plan = _plan(self)
-        # _plan refused a placeholder already; bind without a second check
-        # and attach tx before publishing so no concurrent thread or retry
-        # after an error can observe kept with tx=None.
-        bound = formats.input_transform(self, refuse=False)
         built = _Kept(
-            plan,
+            _plan(self),
             bias,
             weight,
             (
@@ -2147,8 +2155,6 @@ class _FormatLayer(nn.Module):
             ),
             weight_key=weight_key,
         )
-        if bound is not None:
-            built.tx = (*bound, transforms.key(bound[0], bound[1]))
         if existing is None:
             kept = self.__dict__.setdefault(_KEPT, built)
             if kept.weight is weight:
@@ -2157,11 +2163,6 @@ class _FormatLayer(nn.Module):
         self.__dict__.pop(_FAST2, None)
         self.__dict__[_KEPT] = built
         return built
-
-    def _prepare_input(self, x: mx.array, kept: _Kept) -> mx.array:
-        """``x`` in the basis the layer's weights are kept in: the format's
-        rotation once (a producer's or a sibling's copy when one is there)."""
-        return x if kept.tx is None else transforms.prepare_bound(kept.tx, x)
 
     def _dense_tile(self, kept: _Kept) -> tile_dense.DensePlan | None:
         """The dense-prefill plan, built once with this chip's schedule and
@@ -2469,26 +2470,10 @@ class FormatLinear(_FormatLayer):
                 y = fast2(self, x)
                 if y is not None:
                     return y
+        shape, dtype = x.shape, x.dtype
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
-        if kept.tx is not None:
-            k = self.input_dims
-            if not x.shape or x.shape[-1] != k:
-                raise ValueError(f"x is (..., {k}), not of shape {x.shape}")
-            if x.size > 0:
-                x = self._prepare_input(x, kept)
-        return self._call_prepared(x, kept)
-
-    def _call_prepared(self, x: mx.array, kept: _Kept | None = None) -> mx.array:
-        """The dense call with ``x`` already in the layer's basis (or with no
-        transform to apply): a fused producer hands rotated activations here
-        without double-rotating."""
-        if kept is None:
-            kept = self.__dict__.get(_KEPT)
-            if kept is None or kept.weight is not self[kept.weight_key]:
-                kept = self._keep()
-        shape, dtype = x.shape, x.dtype
         plan, bias = kept.plan, kept.bias
         if plan is not None:
             # Fast single-row decode path on the already-fetched shape tuple:
@@ -2564,6 +2549,8 @@ class FormatLinear(_FormatLayer):
                 y = x @ self._decoded().astype(dtype).T
         return y if bias is None else y + bias
 
+    _call_prepared = __call__
+
 
 class FormatEmbedding(_FormatLayer):
     """A token embedding whose matrix is a format's, looked up by row.
@@ -2632,9 +2619,6 @@ class FormatEmbedding(_FormatLayer):
 
     def __call__(self, ids: mx.array) -> mx.array:
         rows = self._decoded(ids.reshape(-1))
-        bound = formats.input_transform(self, refuse=False)
-        if bound is not None and rows.size:
-            rows = transforms.inverse_weight(rows, *bound).astype(rows.dtype)
         return rows.reshape(*ids.shape, self.dims)
 
     def as_linear(self, x: mx.array) -> mx.array:
@@ -2752,12 +2736,8 @@ class FormatSwitchLinear(_FormatLayer):
             kept.sorted = _tile(self)
         return kept.sorted
 
-    def _sorted_swiglu(self, x, indices, limit, token_rows, prepared=False):
-        """The sorted NAX activation of a fused stack, optionally reading token rows.
-
-        With ``prepared`` the caller already rotated the rows; otherwise this
-        layer's transform runs once, on the token rows when there are some
-        and never on the sorted rows."""
+    def _sorted_swiglu(self, x, indices, limit, token_rows):
+        """The sorted NAX activation of a fused stack, optionally reading token rows."""
         if not _nax_host():
             return None
         from ..patches import m5_gather_qmm_nax as nax
@@ -2797,12 +2777,10 @@ class FormatSwitchLinear(_FormatLayer):
                 and row_map.dtype == mx.uint32
                 and int(tokens.shape[0]) * plan.k < 2**32
             ):
-                rot_tokens = tokens if prepared else self._prepare_input(tokens, kept)
-                y = _swiglu(plan, tile, rot_tokens, indices, limit, row_map)
+                y = _swiglu(plan, tile, tokens, indices, limit, row_map)
                 if y is not None:
                     return y
-        rot_x = x if prepared else self._prepare_input(x, kept)
-        return _swiglu(plan, tile, rot_x, indices, limit)
+        return _swiglu(plan, tile, x, indices, limit)
 
     def __call__(
         self, x: mx.array, indices: mx.array, sorted_indices: bool = False
@@ -2812,35 +2790,11 @@ class FormatSwitchLinear(_FormatLayer):
         # before (its graphs are its proof's alone: an unsorted call never
         # replays one); the rows kernel runs every pair as one mat-vec, in
         # any order; the decode passes the hint on to MLX's gather_mm.
+        shape, dtype = x.shape, x.dtype
+        signature = (shape, dtype, indices.shape, indices.dtype)
         kept = self.__dict__.get(_KEPT)
         if kept is None or kept.weight is not self[kept.weight_key]:
             kept = self._keep()
-        if kept.tx is not None:
-            k = self.input_dims
-            if x.ndim < 2 or x.shape[-1] != k:
-                raise ValueError(f"x is (..., M, {k}), not of shape {x.shape}")
-            if not mx.issubdtype(indices.dtype, mx.integer):
-                raise ValueError(f"indices are integers, not {indices.dtype}")
-            if x.size > 0 and indices.size > 0:
-                x = self._prepare_input(x, kept)
-        return self._call_prepared(x, indices, sorted_indices, kept)
-
-    def _call_prepared(
-        self,
-        x: mx.array,
-        indices: mx.array,
-        sorted_indices: bool = False,
-        kept: _Kept | None = None,
-    ) -> mx.array:
-        """The call with ``x`` already in the layer's basis (or with no
-        transform to apply): a caller that rotates before sorting routes
-        hands the same rotation here instead of rotating twice."""
-        shape, dtype = x.shape, x.dtype
-        signature = (shape, dtype, indices.shape, indices.dtype)
-        if kept is None:
-            kept = self.__dict__.get(_KEPT)
-            if kept is None or kept.weight is not self[kept.weight_key]:
-                kept = self._keep()
         plan, bias = kept.plan, kept.bias
         y = None
         if sorted_indices and plan is not None and _sorts(plan, x, indices):
@@ -2869,3 +2823,157 @@ class FormatSwitchLinear(_FormatLayer):
         if bias is not None:
             y = y + mx.expand_dims(bias[indices], -2)
         return y
+
+    _call_prepared = __call__
+
+
+class _TransformedMixin:
+    """Construction-time mixin for format layers whose format overrides
+    ``QuantFormat.input_transform`` (rule 28). Layers of plain formats stay
+    on the base class and pay zero per-call transform overhead."""
+
+    def _keep(self) -> _Kept:
+        weight_key = packed_name(self)
+        weight = self[weight_key]
+        existing = self.__dict__.get(_KEPT)
+        if existing is not None and existing.weight is weight:
+            return existing
+        bias = self.get("bias")
+        if "bias" in self and not isinstance(bias, mx.array):
+            raise TypeError(f"the bias is an array, not {type(bias).__name__}")
+        plan = _plan(self)
+        # _plan refused a placeholder already; bind without a second check
+        # and attach tx before publishing so no concurrent thread or retry
+        # after an error can observe kept with tx=None.
+        bound = formats.input_transform(self, refuse=False)
+        built = _Kept(
+            plan,
+            bias,
+            weight,
+            frozenset(),
+            weight_key=weight_key,
+        )
+        if bound is not None:
+            built.tx = (*bound, transforms.key(bound[0], bound[1]))
+        if existing is None:
+            kept = self.__dict__.setdefault(_KEPT, built)
+            if kept.weight is weight:
+                return kept
+        self.__dict__.pop(_FAST, None)
+        self.__dict__.pop(_FAST2, None)
+        self.__dict__[_KEPT] = built
+        return built
+
+    def _prepare_input(self, x: mx.array, kept: _Kept) -> mx.array:
+        return x if kept.tx is None else transforms.prepare_bound(kept.tx, x)
+
+
+class _TransformedFormatLinear(_TransformedMixin, FormatLinear):
+    """``FormatLinear`` bound at construction for formats declaring an input
+    transform."""
+
+    def __call__(self, x: mx.array) -> mx.array:
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept.weight is not self[packed_name(self)]:
+            kept = self._keep()
+        if kept.tx is not None:
+            k = self.input_dims
+            if not x.shape or x.shape[-1] != k:
+                raise ValueError(f"x is (..., {k}), not of shape {x.shape}")
+            if x.size > 0:
+                x = transforms.prepare_bound(kept.tx, x)
+        return FormatLinear.__call__(self, x)
+
+
+class _TransformedFormatEmbedding(FormatEmbedding):
+    """``FormatEmbedding`` bound at construction for formats declaring an
+    input transform."""
+
+    def __call__(self, ids: mx.array) -> mx.array:
+        rows = self._decoded(ids.reshape(-1))
+        bound = formats.input_transform(self, refuse=False)
+        if bound is not None and rows.size:
+            rows = transforms.inverse_weight(rows, *bound).astype(rows.dtype)
+        return rows.reshape(*ids.shape, self.dims)
+
+
+class _TransformedFormatSwitchLinear(_TransformedMixin, FormatSwitchLinear):
+    """``FormatSwitchLinear`` bound at construction for formats declaring an
+    input transform."""
+
+    def _sorted_swiglu(self, x, indices, limit, token_rows, prepared=False):
+        if prepared:
+            return FormatSwitchLinear._sorted_swiglu(
+                self, x, indices, limit, token_rows
+            )
+        if not _nax_host():
+            return None
+        from ..patches import m5_gather_qmm_nax as nax
+
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept.weight is not self[packed_name(self)]:
+            kept = self._keep()
+        plan = kept.plan
+        if plan is None or kept.bias is not None:
+            return None
+        experts, rows = plan.operands[0].shape[0], indices.size
+        if (
+            plan.n % 64
+            or rows < 16
+            or rows < 4 * experts
+            or not x.ndim
+            or x.shape[-1] != plan.k
+            or not nax.geometry(x, indices, experts, plan.n)
+        ):
+            return None
+        if limit is not None and not math.isfinite(limit):
+            return None
+        tile = self._sorted_tile(kept)
+        if tile is None or not tile.face.exact_for(x.dtype):
+            return None
+        if token_rows is not None:
+            tokens, row_map = token_rows
+            if (
+                isinstance(tokens, mx.array)
+                and isinstance(row_map, mx.array)
+                and tokens.ndim == 3
+                and tokens.shape[0] > 0
+                and tokens.shape[1:] == (1, plan.k)
+                and tokens.dtype == x.dtype
+                and row_map.ndim == 1
+                and row_map.shape[0] == rows
+                and row_map.dtype == mx.uint32
+                and int(tokens.shape[0]) * plan.k < 2**32
+            ):
+                rot_tokens = self._prepare_input(tokens, kept)
+                y = _swiglu(plan, tile, rot_tokens, indices, limit, row_map)
+                if y is not None:
+                    return y
+        rot_x = self._prepare_input(x, kept)
+        return _swiglu(plan, tile, rot_x, indices, limit)
+
+    def __call__(
+        self, x: mx.array, indices: mx.array, sorted_indices: bool = False
+    ) -> mx.array:
+        kept = self.__dict__.get(_KEPT)
+        if kept is None or kept.weight is not self[packed_name(self)]:
+            kept = self._keep()
+        if kept.tx is not None:
+            k = self.input_dims
+            if x.ndim < 2 or x.shape[-1] != k:
+                raise ValueError(f"x is (..., M, {k}), not of shape {x.shape}")
+            if not mx.issubdtype(indices.dtype, mx.integer):
+                raise ValueError(f"indices are integers, not {indices.dtype}")
+            if x.size > 0 and indices.size > 0:
+                x = transforms.prepare_bound(kept.tx, x)
+        return FormatSwitchLinear.__call__(self, x, indices, sorted_indices)
+
+
+_TRANSFORMED_LAYER_CLASS = {
+    FormatLinear: _TransformedFormatLinear,
+    FormatSwitchLinear: _TransformedFormatSwitchLinear,
+    FormatEmbedding: _TransformedFormatEmbedding,
+}
+_TRANSFORMED_LAYER_CLASSES = frozenset(_TRANSFORMED_LAYER_CLASS.values())
+_LINEAR_CLASSES = (FormatLinear, _TransformedFormatLinear)
+_SWITCH_CLASSES = (FormatSwitchLinear, _TransformedFormatSwitchLinear)

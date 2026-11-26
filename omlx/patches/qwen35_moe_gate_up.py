@@ -25,6 +25,7 @@ from __future__ import annotations
 import copy
 import logging
 import math
+import threading
 from functools import wraps
 from typing import Any
 
@@ -50,7 +51,11 @@ from mlx_vlm.models.switch_layers import (
 
 from .. import formats
 from ..formats import transforms
-from ..formats.linear import FormatSwitchLinear
+from ..formats.linear import (
+    _SWITCH_CLASSES,
+    FormatSwitchLinear,
+    _TransformedFormatSwitchLinear,
+)
 from ..scheduler import _sync_and_clear_cache
 from . import m5_gather_qmm as _m5
 from . import moe_verify_gather
@@ -204,6 +209,40 @@ def _fuse_one(switch_mlp: Any) -> None:
     if not keep_views:
         del switch_mlp.gate_proj
         del switch_mlp.up_proj
+    if (
+        type(gate_up) is _TransformedFormatSwitchLinear
+        or type(switch_mlp.down_proj) is _TransformedFormatSwitchLinear
+    ):
+        _bind_transformed_switch(switch_mlp)
+
+
+_TRANSFORMED_SWITCH_LOCK = threading.Lock()
+_TRANSFORMED_SWITCH_CLS: dict[type, type] = {}
+
+
+def _bind_transformed_switch(switch_mlp: Any) -> None:
+    """Bind the transformed SwitchGLU call path once at fusion time so plain
+    SwitchGLU instances run the pre-oQh call with zero transform checks."""
+    base_cls = type(switch_mlp)
+    if getattr(base_cls, "_omlx_transformed_switch", False):
+        return
+    if base_cls.__call__ not in (SwitchGLU.__call__, VLMSwitchGLU.__call__):
+        return
+    with _TRANSFORMED_SWITCH_LOCK:
+        sub = _TRANSFORMED_SWITCH_CLS.get(base_cls)
+        if sub is None:
+            orig = getattr(base_cls, "_omlx_gate_up_original_call", base_cls.__call__)
+            if issubclass(base_cls, VLMSwitchGLU):
+                call_fn = _make_vlm_patched_call(orig, _make_transformed_patched_call)
+            else:
+                call_fn = _make_transformed_patched_call(orig)
+            sub = type(
+                f"_Transformed{base_cls.__name__}",
+                (base_cls,),
+                {"__call__": call_fn, "_omlx_transformed_switch": True},
+            )
+            _TRANSFORMED_SWITCH_CLS[base_cls] = sub
+    switch_mlp.__class__ = sub
 
 
 def _bind_with_key(layer):
@@ -220,6 +259,60 @@ def _stack_transforms(switch_mlp):
 
 
 def _make_patched_call(orig_call):
+    def patched(self, x: mx.array, indices: mx.array) -> mx.array:
+        gate_up = getattr(self, "gate_up_proj", None)
+        if gate_up is None:
+            return orig_call(self, x, indices)
+
+        x = mx.expand_dims(x, (-2, -3))
+        do_sort = indices.size >= 64
+        idx = indices
+        inv_order = None
+        token_rows = None
+        if do_sort:
+            # mlx-lm's _gather_sort with the replicated rows left lazy.
+            x_tok, row_map, idx, inv_order = sort_routes(x, indices)
+            x = x_tok[row_map]
+            token_rows = (x_tok, row_map)
+        if self.training:
+            idx = mx.stop_gradient(idx)
+        x_act = None
+        if do_sort and not self.training:
+            # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
+            # on INT8 operands and the A16 Down; None keeps the A16 path.
+            routed = try_routed_a8(
+                self,
+                token_rows,
+                idx,
+                # [B, L, k] routes: the sequence length, not B * L
+                seq_len=int(indices.shape[-2]) if indices.ndim >= 3 else None,
+            )
+            if routed is not None:
+                x = _scatter_unsort(routed, inv_order, indices.shape)
+                return x.squeeze(-2)
+            # Sorted prefill on M5: the activation in the [gate; up]
+            # matmul's epilogue, token rows read in place (bit-identical;
+            # None keeps this path).
+            x_act = fused_gate_up_activation(
+                gate_up, x, idx, self.activation, token_rows=token_rows
+            )
+        if x_act is None:
+            x_gate_up = gate_up(x, idx, sorted_indices=do_sort)
+            x_gate, x_up = mx.split(x_gate_up, 2, axis=-1)
+            x_act = self.activation(x_up, x_gate)
+        x = self.down_proj(
+            x_act,
+            idx,
+            sorted_indices=do_sort,
+        )
+        if do_sort:
+            x = _scatter_unsort(x, inv_order, indices.shape)
+        return x.squeeze(-2)
+
+    return patched
+
+
+def _make_transformed_patched_call(orig_call):
     def patched(self, x: mx.array, indices: mx.array) -> mx.array:
         gate_up = getattr(self, "gate_up_proj", None)
         if gate_up is None:
@@ -247,23 +340,16 @@ def _make_patched_call(orig_call):
         x_act = None
         rotated = False
         if do_sort and not self.training and gu is None and dn is None:
-            # Routed A8 (opt-in per model, see m5_gather_qmm_a8): the Gate+Up
-            # on INT8 operands and the A16 Down; None keeps the A16 path.
             routed = try_routed_a8(
                 self,
                 token_rows,
                 idx,
-                # [B, L, k] routes: the sequence length, not B * L
                 seq_len=int(indices.shape[-2]) if indices.ndim >= 3 else None,
             )
             if routed is not None:
                 x = _scatter_unsort(routed, inv_order, indices.shape)
                 return x.squeeze(-2)
         if do_sort and not self.training:
-            # Sorted prefill on M5: the activation in the [gate; up]
-            # matmul's epilogue, token rows read in place (bit-identical;
-            # None keeps this path). When ``prepared`` is true the rows are
-            # already rotated.
             x_act = fused_gate_up_activation(
                 gate_up,
                 x,
@@ -272,8 +358,6 @@ def _make_patched_call(orig_call):
                 token_rows=token_rows,
                 **({"prepared": True} if prepared else {}),
             )
-            # The epilogue's activation is in the plain basis: the down
-            # projection applies its own transform when it is called.
         if x_act is None:
             x_gate_up = (
                 gate_up._call_prepared(x, idx, sorted_indices=do_sort)
@@ -375,8 +459,8 @@ def _unsorted_switch(plan, x, indices):
     return x.squeeze(-2)
 
 
-def _make_vlm_patched_call(original):
-    fused_call = _make_patched_call(original)
+def _make_vlm_patched_call(original, fused_call_factory=_make_patched_call):
+    fused_call = fused_call_factory(original)
 
     def patched(self, x, indices, weights=None, shared=None, residual=None):
         if getattr(self, "gate_up_proj", None) is None:
@@ -384,7 +468,7 @@ def _make_vlm_patched_call(original):
         if not self.training and x.ndim == 3 and 1 < x.shape[1] <= DECODE_BLOCK_SIZE:
             # original() runs the gate and up views, which a format stack's
             # rows kernel would copy whole at every launch.
-            fused_format = type(self.gate_up_proj) is FormatSwitchLinear
+            fused_format = type(self.gate_up_proj) in _SWITCH_CLASSES
             if x.shape[0] * indices.shape[-1] >= 64 and not fused_format:
                 return original(self, x, indices, weights, shared, residual)
             # The upstream kernel would copy the strided gate/up views.
