@@ -508,8 +508,8 @@ def _linear_stand_in(plan: _Plan, metal):
         return kernels.zeros(((group, k), dtype), *operands), launch
 
     def launch(x, *tensors):
-        # Its first tile of outputs.
-        return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (plan.n,), None, 1, 1)
+        # Its first tile of outputs: the only ones its grid writes.
+        return _rows(plan.kernel, plan.k, plan.n, x, tensors, 1, (8,), None, 1, 1)
 
     return kernels.zeros(((plan.k,), metal), *operands), launch
 

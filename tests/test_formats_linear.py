@@ -2102,12 +2102,16 @@ def _launched(monkeypatch, tiles=None):
 
     def recorded(kernel, k, n, x, operands, pairs, shape, *launch):
         rhs, per_row = (*launch, None, 1)[:2]
-        assert x.size // k * per_row == pairs == math.prod(shape) // n
+        assert x.size // k * per_row == pairs
         assert rhs is None or rhs.size == pairs
         launched.append((x, list(operands), rhs))
 
         def gridded(grid, **named):
             assert grid[:2] == (32, 2 * pairs) and 0 < grid[2] <= n // 8
+            # The output holds the tiles its grid writes of every pair, and
+            # no more than a row of N for each: a stand-in may declare only
+            # its first tile of 8.
+            assert pairs * grid[2] * 8 <= math.prod(shape) <= pairs * n
             if tiles is not None:
                 tiles.append(grid[2])
             return kernel(grid=grid, **named)
@@ -2151,8 +2155,8 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     evaluated = _evaluations(monkeypatch)
     y = layer(x)
     zeros, (proving,) = evaluated
-    assert proving is not y and proving.shape == (72,)
-    assert proving.dtype == mx.bfloat16 and _zeros(proving[..., :8]) and not _zeros(y)
+    assert proving is not y and proving.shape == (8,)
+    assert proving.dtype == mx.bfloat16 and _zeros(proving) and not _zeros(y)
     # The stand-in's launch, then the call's. A matrix's stand-in is one
     # vector over the whole of each tensor: what follows the rows in a
     # tensor is the format's own.
@@ -2161,9 +2165,9 @@ def test_an_unproven_launch_is_evaluated_on_its_stand_in_and_a_proven_one_not_at
     assert _like(tensors, [layer[name] for name in _NAMES])
     assert called.shape == (7, 320)
     assert _same([vector, *tensors], zeros)
-    # The stand-in computes the first tile of 8 outputs (the rest of its
-    # result is never written): the grid is no part of the Metal. The call,
-    # all 9 of them.
+    # A matrix's stand-in computes and declares one tile of 8 outputs (the
+    # rest of a row is never written): the grid is no part of the Metal. The
+    # call, all 9 of them.
     assert tiles == [1, 9]
     del evaluated[:], launched[:], tiles[:]
     layer(x), layer(more)
