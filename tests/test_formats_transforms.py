@@ -7,6 +7,10 @@ rotation cannot pass.
 from __future__ import annotations
 
 import gc
+import importlib
+import sys
+import threading
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -1033,6 +1037,7 @@ def test_warm_model_skips_negative_and_invalid_switch_swiglu_limit(monkeypatch):
 
 def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch):
     seen_dtypes = []
+    seen_signs = []
     cast_calls = []
     orig_cast = transforms._cast_tensors
     monkeypatch.setattr(
@@ -1045,6 +1050,7 @@ def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch)
         assert signs.dtype == weight.dtype
         assert x.dtype == weight.dtype
         seen_dtypes.append((weight.dtype, signs.dtype))
+        seen_signs.append(signs)
         return x, x
 
     spec = transforms.ProducerSpec(
@@ -1076,6 +1082,11 @@ def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch)
         def input_transform(self, layer):
             return stub_tx
 
+    # Include 1e-10 (representable in bfloat16, underflows to 0.0 in float16)
+    # so repeated bf16 -> fp16 -> bf16 recasts must cast from raw tensors.
+    raw_signs = mx.array([1.0, 1e-10] * 128, mx.bfloat16).reshape(2, 128)
+    mx.eval(raw_signs)
+
     class _Block(nn.Module):
         def __init__(self):
             super().__init__()
@@ -1090,7 +1101,7 @@ def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch)
                     256,
                     {
                         "codes": mx.zeros((64, 256), mx.bfloat16),
-                        "signs": mx.ones((2, 128), mx.bfloat16),
+                        "signs": raw_signs,
                     },
                 )
 
@@ -1102,6 +1113,8 @@ def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch)
     assert not hasattr(norm, "_omlx_tx_weight_dtype")
     assert not hasattr(norm, "_omlx_tx_cast_tensors")
     assert cast_calls == [mx.bfloat16]
+    # Matching dtype skips no-op astype and reuses the raw tensor directly.
+    assert norm._omlx_tx_cast[1][0] is raw_signs
 
     transforms.clear()
     norm(mx.ones((1, 256), mx.bfloat16))
@@ -1112,11 +1125,233 @@ def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch)
     norm(mx.ones((1, 256), mx.float16))
     norm(mx.ones((1, 256), mx.float16))
     assert cast_calls == [mx.bfloat16, mx.float16]
+    # Recasting back to bfloat16 must recover full precision from raw tensors.
+    norm["weight"] = norm["weight"].astype(mx.bfloat16)
+    norm(mx.ones((1, 256), mx.bfloat16))
+    assert cast_calls == [mx.bfloat16, mx.float16, mx.bfloat16]
+    assert norm._omlx_tx_cast[1][0] is raw_signs
+    mx.eval(seen_signs[-1], raw_signs)
+    assert mx.array_equal(seen_signs[-1], raw_signs).item()
     assert seen_dtypes == [
         (mx.bfloat16, mx.bfloat16),
         (mx.bfloat16, mx.bfloat16),
         (mx.float16, mx.float16),
         (mx.float16, mx.float16),
+        (mx.bfloat16, mx.bfloat16),
     ]
-    assert norm._omlx_tx_cast[0] == mx.float16
+    assert norm._omlx_tx_cast[0] == mx.bfloat16
     transforms.clear()
+
+
+def _make_dual_norm_thread_block(weight_dtype: mx.Dtype):
+    def _stub_rmsnorm(x, weight, signs, *, eps):
+        out = x * signs.reshape(-1)
+        return out, out
+
+    spec = transforms.ProducerSpec(
+        rmsnorm=_stub_rmsnorm, rmsnorm_block=128, rmsnorm_max_width=8192
+    )
+    stub_tx = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        producer_spec=lambda layer=None: spec,
+    )
+
+    class _StubFmt(formats.QuantFormat):
+        mode = "toy_dual_norm_thread_cast"
+        contract = formats.CONTRACT
+        codes_name = "codes"
+        tensors = ()
+        shared_tensors = ("signs",)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "codes": ((n, k), mx.bfloat16),
+                "signs": ((k // 128, 128), mx.bfloat16),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return tensors["codes"]
+
+        def input_transform(self, layer):
+            return stub_tx
+
+    signs = mx.ones((2, 128), mx.bfloat16)
+    codes = mx.zeros((64, 256), mx.bfloat16)
+    weight = mx.ones((256,), weight_dtype)
+    mx.eval(signs, codes, weight)
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.RMSNorm(256)
+            self.input_layernorm.weight = weight
+            self.self_attn = nn.Module()
+            with testing.verified("example"):
+                self.self_attn.q_proj = FormatLinear(
+                    _StubFmt(),
+                    8,
+                    1,
+                    256,
+                    {"codes": codes, "signs": signs},
+                )
+
+    return _Block()
+
+
+def test_dual_norm_cast_cache_is_evaluated_across_threads():
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    blk = _make_dual_norm_thread_block(mx.bfloat16)
+    assert transforms.install_producers(blk) == 1
+    norm = blk.input_layernorm
+    assert isinstance(norm, transforms._DualNorm)
+    norm["weight"] = norm["weight"].astype(mx.float16)
+    mx.eval(norm["weight"])
+
+    errors: list[BaseException] = []
+    out_holder: list[mx.array] = []
+
+    def _t1():
+        try:
+            # Casts and publishes _omlx_tx_cast without evaluating the return value.
+            norm(mx.ones((1, 256), mx.float16))
+        except BaseException as exc:
+            errors.append(exc)
+
+    def _t2():
+        try:
+            out = norm(mx.ones((1, 256), mx.float16))
+            mx.eval(out)
+            out_holder.append(out)
+        except BaseException as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_t1)
+    t1.start()
+    t1.join()
+    assert not errors, f"T1 failed: {errors!r}"
+
+    t2 = threading.Thread(target=_t2)
+    t2.start()
+    t2.join()
+    assert not errors, f"T2 failed: {errors!r}"
+    assert len(out_holder) == 1
+    assert out_holder[0].dtype == mx.float16
+    assert out_holder[0].shape == (1, 256)
+    transforms.clear()
+
+
+def test_dual_norm_initial_bind_mismatched_dtype_is_evaluated_across_threads():
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    blk = _make_dual_norm_thread_block(mx.float16)
+    errors: list[BaseException] = []
+    out_holder: list[mx.array] = []
+
+    def _loader():
+        try:
+            assert transforms.install_producers(blk) == 1
+        except BaseException as exc:
+            errors.append(exc)
+
+    def _engine():
+        try:
+            out = blk.input_layernorm(mx.ones((1, 256), mx.float16))
+            mx.eval(out)
+            out_holder.append(out)
+        except BaseException as exc:
+            errors.append(exc)
+
+    t_load = threading.Thread(target=_loader)
+    t_load.start()
+    t_load.join()
+    assert not errors, f"loader thread failed: {errors!r}"
+
+    t_eng = threading.Thread(target=_engine)
+    t_eng.start()
+    t_eng.join()
+    assert not errors, f"engine thread failed: {errors!r}"
+    assert len(out_holder) == 1
+    assert out_holder[0].dtype == mx.float16
+    assert out_holder[0].shape == (1, 256)
+    transforms.clear()
+
+
+def test_install_producers_resolves_fusable_mlp_types_once(monkeypatch):
+    calls: list[int] = []
+    orig = transforms._fusable_mlp_types
+
+    def _counted():
+        calls.append(1)
+        return orig()
+
+    monkeypatch.setattr(transforms, "_fusable_mlp_types", _counted)
+
+    class _DummyMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gate_proj = nn.Linear(16, 16, bias=False)
+            self.up_proj = nn.Linear(16, 16, bias=False)
+            self.down_proj = nn.Linear(16, 16, bias=False)
+
+    class _TwoLayerModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.l0 = nn.Module()
+            self.l0.mlp = _DummyMLP()
+            self.l1 = nn.Module()
+            self.l1.mlp = _DummyMLP()
+
+    model = _TwoLayerModel()
+    assert transforms.install_producers(model) == 0
+    assert len(calls) == 1
+
+
+def test_fusable_mlp_types_reads_sys_modules_without_importing_and_ignores_non_types(
+    monkeypatch,
+):
+    for mod_name, _ in transforms._FUSABLE_MLP_SPECS:
+        monkeypatch.delitem(sys.modules, mod_name, raising=False)
+
+    def _forbid_import(name, *args, **kwargs):
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(importlib, "import_module", _forbid_import)
+    assert transforms._fusable_mlp_types() == frozenset()
+    for mod_name, _ in transforms._FUSABLE_MLP_SPECS:
+        assert mod_name not in sys.modules
+
+    # Non-type attributes (including unhashable values) must be ignored safely.
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.models.qwen3_5.language",
+        SimpleNamespace(Qwen3_5MLP=["not", "a", "type"]),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.qwen3_next",
+        SimpleNamespace(Qwen3NextMLP="not_a_type"),
+    )
+    assert transforms._fusable_mlp_types() == frozenset()
+
+    class _FakeA:
+        pass
+
+    class _FakeB:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_vlm.models.qwen3_5.language",
+        SimpleNamespace(Qwen3_5MLP=_FakeA),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "mlx_lm.models.qwen3_next",
+        SimpleNamespace(Qwen3NextMLP=_FakeB),
+    )
+    assert transforms._fusable_mlp_types() == frozenset({_FakeA, _FakeB})

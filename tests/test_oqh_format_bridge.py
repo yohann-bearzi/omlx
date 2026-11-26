@@ -41,7 +41,7 @@ from omlx.formats import affine, kernels, linear, oqh, testing, transforms
 from omlx.formats.linear import FormatLinear, FormatSwitchLinear
 from omlx.oqh import loading as oqh_loading
 from omlx.oqh.loading import _verified_format_family, install_load_hook
-from omlx.oqh.modules import OQH_MODULES
+from omlx.oqh.modules import OQH_MODULES, OqhAffineLinear
 from omlx.patches import (
     format_load,
     qwen35_moe_gate_up,
@@ -1377,8 +1377,43 @@ def test_dual_norms_skip_empty_and_clear_stale_handoff_on_fallback():
         assert transforms.take(key, plain.reshape(1, 2, 256)) is None
 
     transforms.clear()
+    # Value-equal but distinct tuple object must still clear stale handoff (==, not is).
+    equal_key = tuple(list(key))
+    assert equal_key == key and equal_key is not key
+    transforms.hand_off(equal_key, mx.ones((1, 2, 256), mx.bfloat16))
+    gnorm(h, None)
+    assert transforms.take(key, mx.zeros((1, 2, 256), mx.bfloat16)) is None
+
+    transforms.clear()
     other_key = ("unrelated_handoff",)
     transforms.hand_off(other_key, mx.ones((1, 2, 256), mx.bfloat16))
     gnorm(h, None)
     assert transforms.take(other_key, mx.zeros((1, 2, 256), mx.bfloat16)) is not None
     transforms.clear()
+
+
+def test_stock_oqh_unverified_qwen35_keeps_upstream_modules(tmp_path):
+    """LOW-1 contract pin: stock oQh qwen3_5/qwen3_5_moe stay on upstream OqhAffineLinear
+    while absent from oq._QUANT_FORMAT_VERIFIED."""
+    tensors, _ = _group_case(256, 64, 4, 128, seed=17)
+    weights = [(f"proj.{k}", v) for k, v in tensors.items()]
+
+    class _StockSingle(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.proj = nn.Linear(256, 64, bias=False)
+
+    install_load_hook()
+    for family in ("qwen3_5", "qwen3_5_moe"):
+        ckpt_dir = tmp_path / f"stock_{family}"
+        ckpt_dir.mkdir()
+        cfg = {"model_type": family, "omlx_oqh": {"version": 1}}
+        (ckpt_dir / "config.json").write_text(json.dumps(cfg))
+        assert _verified_format_family(cfg) is True
+        assert oq._unverified_family(cfg) is not None
+
+        model = _StockSingle()
+        with format_load.loading(ckpt_dir):
+            model.load_weights(weights, strict=True)
+        assert isinstance(model.proj, OqhAffineLinear)
+        assert not isinstance(model.proj, FormatLinear)

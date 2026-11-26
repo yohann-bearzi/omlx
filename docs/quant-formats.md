@@ -332,7 +332,8 @@ The built-in formats `oqh` (one `rscale` per row) and `oqh_affine`
 `CONTRACT = 1`. Both declare `shared_tensors = ("oqh_signs",)` and
 `SignedWhtTransform`; `oqh_affine` reuses affine's `Dot`/`Tile`/`Codes` faces
 (including 5-bit tiles) and per-chip dense tuning cells. Stock oQh checkpoints
-for D10-verified ported families (`qwen4_exp`, `qwen3_5`, `qwen3_5_moe`) bridge
+in the bridge family list (`qwen4_exp`, `qwen3_5`, `qwen3_5_moe`) that are
+D10-verified in `oq._QUANT_FORMAT_VERIFIED` (currently `qwen4_exp`) bridge
 onto `FormatSwitchLinear` and `FormatLinear` at load while
 non-verified/TP/sharded families keep upstream oQh modules.
 

@@ -504,14 +504,22 @@ def _producer_spec(tx: InputTransform, layer) -> ProducerSpec | None:
 
 
 def _cast_tensors(tensors: tuple, dtype: mx.Dtype) -> tuple:
-    return tuple(
-        (
-            t.astype(dtype)
-            if isinstance(t, mx.array) and mx.issubdtype(t.dtype, mx.floating)
-            else t
-        )
-        for t in tensors
-    )
+    out = []
+    cast = []
+    for t in tensors:
+        if (
+            isinstance(t, mx.array)
+            and mx.issubdtype(t.dtype, mx.floating)
+            and t.dtype != dtype
+        ):
+            c = t.astype(dtype)
+            out.append(c)
+            cast.append(c)
+        else:
+            out.append(t)
+    if cast:
+        mx.eval(*cast)
+    return tuple(out)
 
 
 class _DualNorm:
@@ -698,7 +706,7 @@ def _fusable_mlp_types() -> frozenset[type]:
     return frozenset(resolved)
 
 
-def _install_dense_mlp(mlp) -> tuple[bool, list]:
+def _install_dense_mlp(mlp, fusable: frozenset[type]) -> tuple[bool, list]:
     """Fuse an allowlisted dense SwiGLU MLP into down_proj's InputTransform;
     returns ``(installed, gate_up_readers)``. Leaves SwitchGLU and every
     non-allowlisted MLP on the unfused FormatLinear path."""
@@ -708,7 +716,7 @@ def _install_dense_mlp(mlp) -> tuple[bool, list]:
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     readers = [m for m in (gate, up) if m is not None and bind(m) is not None]
-    if type(mlp) not in _fusable_mlp_types():
+    if type(mlp) not in fusable:
         return False, readers
     if not (
         type(gate) in _LINEAR_CLASSES
@@ -746,6 +754,7 @@ def install_producers(model: nn.Module) -> int:
     provides a fused producer kernel. Leaves SwitchGLU to the MoE patches."""
     from .linear import FormatLinear, FormatSwitchLinear
 
+    fusable = _fusable_mlp_types()
     count = 0
     for _, module in model.named_modules():
         if getattr(module, "_omlx_tx_producers_installed", False):
@@ -773,11 +782,11 @@ def install_producers(model: nn.Module) -> int:
                 )
                 shared = getattr(mlp, "shared_expert", None)
                 if shared is not None:
-                    ok, shared_readers = _install_dense_mlp(shared)
+                    ok, shared_readers = _install_dense_mlp(shared, fusable)
                     installed_here += int(ok)
                     readers += shared_readers
             else:
-                ok, readers = _install_dense_mlp(mlp)
+                ok, readers = _install_dense_mlp(mlp, fusable)
                 installed_here += int(ok)
             post_norm = getattr(module, "post_attention_layernorm", None)
             if post_norm is not None and _bind_dual_norm(post_norm, readers):
@@ -789,7 +798,7 @@ def install_producers(model: nn.Module) -> int:
             and hasattr(module, "down_proj")
             and not isinstance(module, _FusedMLP)
         ):
-            ok, _ = _install_dense_mlp(module)
+            ok, _ = _install_dense_mlp(module, fusable)
             installed_here += int(ok)
         if installed_here:
             _set(module, "_omlx_tx_producers_installed", True)
