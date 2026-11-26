@@ -364,8 +364,9 @@ def _said(key: str) -> tuple[str, str]:
 def _rows(
     kernel, k: int, n: int, x, operands, pairs, shape, rhs=None, per_row=1, tiles=None
 ):
-    """One mat-vec per pair, ``pairs`` of them, as ``shape`` (which ends
-    with N). Pair ``p`` is row ``p // per_row`` of ``x``, rows of K in any
+    """One mat-vec per pair, ``pairs`` of them, as ``shape`` (ending with
+    N, or ``(8,)`` for a one-pair, one-tile stand-in). Pair ``p`` is row
+    ``p // per_row`` of ``x``, rows of K in any
     shape, with the matrix (``operands``), or with matrix ``rhs[p]`` of the
     stack. No reshape is put in the graph for the kernel's sake. A pair's
     outputs are ``tiles`` tiles of 8 from the first, or all of them: the

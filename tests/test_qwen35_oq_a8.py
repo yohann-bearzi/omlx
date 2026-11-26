@@ -1935,7 +1935,9 @@ def test_refuse_unclassified_real_switch_namespace(tmp_path):
         Experts(switch(Plugin()), switch("affine")),
     )
     visited = [id(module) for _, module in model.named_modules()]
-    assert visited.index(id(model.mtp)) < visited.index(id(model.live))
+    head = [visited.index(id(module)) for module in model.mtp.modules()]
+    live = [visited.index(id(module)) for module in model.live.modules()]
+    assert max(head) < min(live)
     with pytest.raises(ValueError, match="gate_up_proj.*plugin_sw_test"):
         dispatch._refuse_unclassified(model)
 

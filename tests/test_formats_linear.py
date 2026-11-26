@@ -2108,10 +2108,12 @@ def _launched(monkeypatch, tiles=None):
 
         def gridded(grid, **named):
             assert grid[:2] == (32, 2 * pairs) and 0 < grid[2] <= n // 8
-            # The output holds the tiles its grid writes of every pair, and
-            # no more than a row of N for each: a stand-in may declare only
-            # its first tile of 8.
-            assert pairs * grid[2] * 8 <= math.prod(shape) <= pairs * n
+            # The output holds this grid's last tile of every pair and no
+            # more than a row of N for each. Pairs stride by N, so from the
+            # second pair on they reach N: a stand-in may declare only its
+            # first tile of 8 only when it is one pair.
+            written = (pairs - 1) * n + grid[2] * 8 if pairs else 0
+            assert written <= math.prod(shape) <= pairs * n
             if tiles is not None:
                 tiles.append(grid[2])
             return kernel(grid=grid, **named)
@@ -2120,6 +2122,27 @@ def _launched(monkeypatch, tiles=None):
 
     monkeypatch.setattr(linear, "_rows", recorded)
     return launched
+
+
+def test_launched_rejects_multi_pair_stand_in_shorter_than_last_pair_tile(
+    monkeypatch,
+):
+    """Each pair strides the output by N: eight pairs declaring one tile of 8
+    each have pairs 1 to 7 write past it (review of 86b168bf0)."""
+    _launched(monkeypatch)
+    with pytest.raises(AssertionError):
+        linear._rows(
+            lambda **_: [mx.zeros((8, 8))],
+            320,
+            72,
+            mx.zeros((8, 320)),
+            (),
+            8,
+            (8, 8),
+            mx.zeros((8,), mx.uint32),
+            1,
+            1,
+        )
 
 
 def _same(arrays, others):
