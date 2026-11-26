@@ -24,6 +24,7 @@ fails closed.
 from __future__ import annotations
 
 import math
+import sys
 import threading
 import weakref
 from collections.abc import Callable
@@ -518,13 +519,16 @@ class _DualNorm:
 
     def __call__(self, x):
         weight = self["weight"]
-        if x.dtype not in (mx.bfloat16, mx.float16) or x.dtype != weight.dtype:
+        if (
+            x.size == 0
+            or x.dtype not in (mx.bfloat16, mx.float16)
+            or x.dtype != weight.dtype
+        ):
             return super().__call__(x)
-        tensors = self._omlx_tx_cast_tensors
-        if self._omlx_tx_weight_dtype != weight.dtype:
+        cached_dtype, tensors = self._omlx_tx_cast
+        if cached_dtype != weight.dtype:
             tensors = _cast_tensors(self._omlx_tx_raw_tensors, weight.dtype)
-            _set(self, "_omlx_tx_cast_tensors", tensors)
-            _set(self, "_omlx_tx_weight_dtype", weight.dtype)
+            _set(self, "_omlx_tx_cast", (weight.dtype, tensors))
         rot, plain = self._omlx_tx_rmsnorm(x, weight, *tensors, eps=self.eps)
         for k, orig in self._omlx_tx_entries:
             remember(plain, rot, k, orig)
@@ -538,6 +542,7 @@ class _DualGatedNorm:
         out_proj = self._omlx_tx_reader
         if (
             gate is None
+            or x.size == 0
             or x.ndim < 2
             or x.shape != gate.shape
             or x.shape[-1] != self._omlx_tx_head_dim
@@ -545,6 +550,11 @@ class _DualGatedNorm:
             or gate.dtype not in (mx.bfloat16, mx.float16)
             or x.dtype not in (gate.dtype, mx.float32)
         ):
+            if (
+                _MEMO.handed is not None
+                and _MEMO.handed[0] == self._omlx_tx_handoff_key
+            ):
+                _MEMO.handed = None
             return super().__call__(x, gate)
         rot, plain = self._omlx_tx_gated_norm(
             x, gate, self["weight"], *self._omlx_tx_tensors, eps=self.eps
@@ -570,18 +580,8 @@ class _FusedMLP:
             and g_out.dtype in (mx.bfloat16, mx.float16)
             and u_out.dtype == g_out.dtype
         ):
-            act = self._omlx_tx_act_pair(
-                g_out, u_out, *self._omlx_tx_down_tensors, limit=self._omlx_tx_limit
-            )
+            act = self._omlx_tx_act_pair(g_out, u_out, *self._omlx_tx_down_tensors)
             return down._call_prepared(act)
-        limit = self._omlx_tx_limit
-        if limit is not None:
-            g_out = mx.minimum(g_out, mx.array(limit, g_out.dtype))
-            u_out = mx.clip(
-                u_out,
-                -mx.array(limit, u_out.dtype),
-                mx.array(limit, u_out.dtype),
-            )
         return down(nn.silu(g_out) * u_out)
 
 
@@ -631,8 +631,7 @@ def _bind_dual_norm(norm, readers: list) -> bool:
             entries.append((k, bound[1]))
     _set(self := norm, "_omlx_tx_rmsnorm", spec.rmsnorm)
     _set(self, "_omlx_tx_raw_tensors", tensors)
-    _set(self, "_omlx_tx_cast_tensors", _cast_tensors(tensors, weight.dtype))
-    _set(self, "_omlx_tx_weight_dtype", weight.dtype)
+    _set(self, "_omlx_tx_cast", (weight.dtype, _cast_tensors(tensors, weight.dtype)))
     _set(self, "_omlx_tx_entries", tuple(entries))
     _rebase(norm, _DualNorm)
     return True
@@ -671,23 +670,51 @@ def _bind_gated_norm(norm, out_proj) -> bool:
     return True
 
 
+# Concrete dense SwiGLU MLP classes safe to rebase to _FusedMLP, scoped to the
+# model families oQh ships for today (qwen4_exp, qwen3_5, qwen3_5_moe):
+# - mlx_vlm.models.qwen3_5.language.Qwen3_5MLP (dense MLP in qwen3_5 /
+#   qwen3_5_text and shared_expert in qwen3_5_moe / qwen3_5_moe_text /
+#   qwen4_exp Flash-Next);
+# - mlx_lm.models.qwen3_next.Qwen3NextMLP (dense MLP and shared_expert in
+#   mlx_lm qwen3_5 / qwen3_5_moe).
+# Neither class carries a SwiGLU clamp limit, direct mx.array parameters, or
+# extra forward arguments. Resolved from already-loaded sys.modules entries so
+# importing transforms never pulls in mlx_vlm/torch while matching exact class
+# objects (no subclasses, no attribute sniffing, no name spoofing).
+_FUSABLE_MLP_SPECS: tuple[tuple[str, str], ...] = (
+    ("mlx_vlm.models.qwen3_5.language", "Qwen3_5MLP"),
+    ("mlx_lm.models.qwen3_next", "Qwen3NextMLP"),
+)
+
+
+def _fusable_mlp_types() -> frozenset[type]:
+    """Exact concrete dense MLP classes currently loaded and allowed to fuse."""
+    resolved = []
+    for mod_name, attr in _FUSABLE_MLP_SPECS:
+        mod = sys.modules.get(mod_name)
+        cls = getattr(mod, attr, None) if mod is not None else None
+        if isinstance(cls, type):
+            resolved.append(cls)
+    return frozenset(resolved)
+
+
 def _install_dense_mlp(mlp) -> tuple[bool, list]:
-    """Fuse a dense FormatLinear MLP's SwiGLU into down_proj's InputTransform;
-    returns ``(installed, gate_up_readers)``. Leaves SwitchGLU untouched."""
+    """Fuse an allowlisted dense SwiGLU MLP into down_proj's InputTransform;
+    returns ``(installed, gate_up_readers)``. Leaves SwitchGLU and every
+    non-allowlisted MLP on the unfused FormatLinear path."""
     from .linear import _LINEAR_CLASSES
 
     gate = getattr(mlp, "gate_proj", None)
     up = getattr(mlp, "up_proj", None)
     down = getattr(mlp, "down_proj", None)
     readers = [m for m in (gate, up) if m is not None and bind(m) is not None]
+    if type(mlp) not in _fusable_mlp_types():
+        return False, readers
     if not (
         type(gate) in _LINEAR_CLASSES
         and type(up) in _LINEAR_CLASSES
         and type(down) in _LINEAR_CLASSES
     ):
-        return False, readers
-    act = getattr(mlp, "activation", None)
-    if act is not None and act is not nn.silu and type(act).__name__ != "SwiGLU":
         return False, readers
     down_bound = bind(down)
     if down_bound is None:
@@ -709,7 +736,6 @@ def _install_dense_mlp(mlp) -> tuple[bool, list]:
     _set(mlp, "_omlx_tx_gu", gu_entry)
     _set(mlp, "_omlx_tx_act_pair", spec.act_pair)
     _set(mlp, "_omlx_tx_down_tensors", d_tensors)
-    _set(mlp, "_omlx_tx_limit", getattr(act, "limit", None))
     _rebase(mlp, _FusedMLP)
     return True, readers
 
@@ -850,8 +876,8 @@ def warm_model(model, *, dtypes=None) -> tuple:
     Submits deduplicated tasks on ``kernels._warm_stream()`` capturing only
     shape/dtype tuples (never live ``mx.array`` weights) for:
     - ``tx.apply`` on each distinct transformed format layer;
-    - ``dn_tx.apply_split_swiglu`` (with finite ``_swiglu_limit``) on each
-      transformed ``switch_mlp``;
+    - ``dn_tx.apply_split_swiglu`` (with non-negative finite ``_swiglu_limit``)
+      on each transformed ``switch_mlp``;
     - ``_omlx_tx_rmsnorm``, ``_omlx_tx_gated_norm`` (both activation-dtype and
       float32 inputs) and ``_omlx_tx_act_pair`` on installed producer mixins.
 
@@ -937,6 +963,7 @@ def warm_model(model, *, dtypes=None) -> tuple:
                             isinstance(lim, (int, float))
                             and not isinstance(lim, bool)
                             and math.isfinite(lim)
+                            and lim >= 0
                         )
                     )
                     and all(isinstance(a, mx.array) for a in dn_tensors)
@@ -1064,7 +1091,6 @@ def warm_model(model, *, dtypes=None) -> tuple:
                 and all(isinstance(a, mx.array) for a in d_tensors)
             ):
                 t_specs = _tensor_specs(d_tensors)
-                lim = getattr(mod, "_omlx_tx_limit", None)
                 act_fn = mod._omlx_tx_act_pair
                 mlp_dtypes = (
                     linear._layer_warm_dtypes(
@@ -1077,11 +1103,9 @@ def warm_model(model, *, dtypes=None) -> tuple:
                     _submit_warm(
                         futures,
                         seen,
-                        ("act_pair", act_fn, inter, dt, t_specs, lim),
+                        ("act_pair", act_fn, inter, dt, t_specs),
                         (((1, inter), dt), ((1, inter), dt), *t_specs),
-                        lambda a, b, *ts, fn=act_fn, limit=lim: fn(
-                            a, b, *ts, limit=limit
-                        ),
+                        act_fn,
                         "producer.act_pair",
                     )
 

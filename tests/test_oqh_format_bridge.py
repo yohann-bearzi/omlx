@@ -308,15 +308,14 @@ def test_generalized_producer_fusion_norm_gated_norm_and_dense_mlp(monkeypatch):
             self.norm = _GatedNorm(128)
             self.out_proj = _oqh_linear(256, 256, block=128, seed=3)
 
-    class _DenseMLP(nn.Module):
-        def __init__(self, signs_mlp):
-            super().__init__()
-            self.gate_proj = _oqh_linear(256, 128, block=256, seed=4, signs=signs_mlp)
-            self.up_proj = _oqh_linear(256, 128, block=256, seed=5, signs=signs_mlp)
-            self.down_proj = _oqh_linear(128, 256, block=128, seed=6)
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
 
-        def __call__(self, x):
-            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+    def _make_qwen_mlp(signs_mlp):
+        mlp = Qwen3_5MLP(256, 128)
+        mlp.gate_proj = _oqh_linear(256, 128, block=256, seed=4, signs=signs_mlp)
+        mlp.up_proj = _oqh_linear(256, 128, block=256, seed=5, signs=signs_mlp)
+        mlp.down_proj = _oqh_linear(128, 256, block=128, seed=6)
+        return mlp
 
     class _Layer(nn.Module):
         def __init__(self):
@@ -330,7 +329,7 @@ def test_generalized_producer_fusion_norm_gated_norm_and_dense_mlp(monkeypatch):
             self.linear_attn = _LinearAttn(signs_in)
             self.post_attention_layernorm = nn.RMSNorm(256)
             self.post_attention_layernorm.weight = mx.ones((256,), mx.bfloat16)
-            self.mlp = _DenseMLP(signs_mlp)
+            self.mlp = _make_qwen_mlp(signs_mlp)
 
     class _Model(nn.Module):
         def __init__(self):
@@ -498,51 +497,77 @@ def test_dual_gated_norm_skips_sigmoid_and_mismatched_dtypes():
     assert got_64.shape == (1, 2, 4, 64)
 
 
-def test_fused_mlp_preserves_limit_on_fp32_fallback_and_empty_input():
-    class SwiGLU:
-        def __init__(self, limit: float):
-            self.limit = limit
+def test_fused_mlp_allowlists_qwen3_5_and_qwen3_next_mlps(monkeypatch):
+    from mlx_lm.models import qwen3_5 as qwen3_5_lm
+    from mlx_lm.models.qwen3_next import Qwen3NextMLP
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+    from mlx_vlm.models.qwen3_5_moe.language import Qwen3_5MoeMLP
 
-        def __call__(self, x, gate):
-            g = mx.minimum(gate, mx.array(self.limit, gate.dtype))
-            u = mx.clip(
-                x, -mx.array(self.limit, x.dtype), mx.array(self.limit, x.dtype)
+    assert Qwen3_5MoeMLP is Qwen3_5MLP
+    assert qwen3_5_lm.MLP is Qwen3NextMLP
+
+    for idx, mlp_cls in enumerate((Qwen3_5MLP, Qwen3NextMLP)):
+        signs = _group_case(256, 128, 4, 128, seed=31 + idx, block=256)[0]["oqh_signs"]
+        mlp = mlp_cls(256, 128)
+        mlp.gate_proj = _oqh_linear(256, 128, block=256, seed=32 + idx, signs=signs)
+        mlp.up_proj = _oqh_linear(256, 128, block=256, seed=33 + idx, signs=signs)
+        mlp.down_proj = _oqh_linear(128, 256, block=128, seed=34 + idx)
+        mx.eval(mlp.parameters())
+        mx.random.seed(55 + idx)
+        x_bf = (mx.random.normal((1, 2, 256)) * 0.5).astype(mx.bfloat16)
+        x_f32 = x_bf.astype(mx.float32)
+        ref_bf = mlp(x_bf)
+        ref_f32 = mlp(x_f32)
+        mx.eval(ref_bf, ref_f32)
+
+        assert transforms.install_producers(mlp) == 1
+        assert isinstance(mlp, transforms._FusedMLP)
+
+        # Standalone MLP (no preceding _DualNorm): gate and up share one
+        # block-256 rotation while down_proj fuses into act_pair_had (0
+        # block-128 rotate calls).
+        rotate_calls = []
+        orig_rotate = fast.rotate
+        monkeypatch.setattr(
+            fast,
+            "rotate",
+            lambda *a, _c=rotate_calls, _fn=orig_rotate, **kw: _c.append(a)
+            or _fn(*a, **kw),
+        )
+        transforms.clear()
+        got_bf = mlp(x_bf)
+        mx.eval(got_bf)
+        assert len(rotate_calls) == 1 and rotate_calls[0][2] == 256
+        monkeypatch.undo()
+
+        got_f32 = mlp(x_f32)
+        mx.eval(got_f32)
+        for got, ref in ((got_bf, ref_bf), (got_f32, ref_f32)):
+            err = float(
+                mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item()
             )
-            return nn.silu(g) * u
+            scale = max(float(mx.abs(ref.astype(mx.float32)).max().item()), 1e-6)
+            assert err / scale < 5e-2
 
-    class _ClampedMLP(nn.Module):
-        def __init__(self):
-            super().__init__()
-            signs = _group_case(256, 128, 4, 128, seed=31, block=256)[0]["oqh_signs"]
-            self.gate_proj = _oqh_linear(256, 128, block=256, seed=32, signs=signs)
-            self.up_proj = _oqh_linear(256, 128, block=256, seed=33, signs=signs)
-            self.down_proj = _oqh_linear(128, 256, block=128, seed=34)
-            self.activation = SwiGLU(limit=2.0)
+        # Empty activation guard returns cleanly without calling _omlx_tx_act_pair.
+        act_calls = []
+        orig_act = mlp._omlx_tx_act_pair
+        object.__setattr__(
+            mlp,
+            "_omlx_tx_act_pair",
+            lambda *a, _c=act_calls, _fn=orig_act, **kw: _c.append(a) or _fn(*a, **kw),
+        )
+        empty = mx.zeros((0, 256), mx.bfloat16)
+        out_empty = mlp(empty)
+        mx.eval(out_empty)
+        assert out_empty.shape == (0, 256)
+        assert not act_calls
 
-        def __call__(self, x):
-            return self.down_proj(self.activation(self.up_proj(x), self.gate_proj(x)))
-
-    mlp = _ClampedMLP()
-    mx.eval(mlp.parameters())
-    mx.random.seed(55)
-    # Large scale so gate/up exceed limit=2.0 and clamp makes a big difference.
-    x_f32 = (mx.random.normal((1, 2, 256)) * 5.0).astype(mx.float32)
-    ref = mlp(x_f32)
-    mx.eval(ref)
-
-    assert transforms.install_producers(mlp) == 1
-    assert isinstance(mlp, transforms._FusedMLP)
-    got = mlp(x_f32)
-    mx.eval(got)
-    err = float(mx.abs(got - ref).max().item())
-    scale = max(float(mx.abs(ref).max().item()), 1e-6)
-    assert err / scale < 1e-4
-
-    # Empty activation guard returns cleanly without calling fast.act_pair_had.
-    empty = mx.zeros((0, 256), mx.bfloat16)
-    out_empty = mlp(empty)
-    mx.eval(out_empty)
-    assert out_empty.shape == (0, 256)
+        # Release restores the exact concrete class so re-install succeeds.
+        assert transforms.release_producers(mlp) == 1
+        assert type(mlp) is mlp_cls
+        assert transforms.install_producers(mlp) == 1
+        assert isinstance(mlp, transforms._FusedMLP)
 
 
 def test_dual_norm_skips_custom_rmsnorm_subclass():
@@ -862,3 +887,498 @@ def test_stock_oqh_bridge_survives_benign_model_config_override(tmp_path):
         assert not cp.verified
         assert cp.verified_modes == frozenset()
         assert not format_load._ported(cp)
+
+
+def _assert_close_to_ref(got: mx.array, ref: mx.array, tol: float = 5e-2) -> None:
+    mx.eval(got, ref)
+    err = float(mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item())
+    scale = max(float(mx.abs(ref.astype(mx.float32)).max().item()), 1e-6)
+    assert err / scale < tol
+
+
+def test_install_dense_mlp_skips_direct_array_param_mlp():
+    """Review MEDIUM-1: single-arg MLP with direct mx.array param stays unfused."""
+
+    class _ScaledDenseMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=61, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=62, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=63, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=64)
+            self.global_scale = mx.full((1,), 0.5, mx.bfloat16)
+
+        def __call__(self, x):
+            return (
+                self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+                * self.global_scale
+            )
+
+    mlp = _ScaledDenseMLP()
+    mx.eval(mlp.parameters())
+    assert transforms.install_producers(mlp) == 0
+    assert not isinstance(mlp, transforms._FusedMLP)
+
+    mx.random.seed(65)
+    x_bf = (mx.random.normal((1, 2, 256)) * 0.5).astype(mx.bfloat16)
+    got = mlp(x_bf)
+    ref = (
+        transforms.transform_reference(
+            mlp.down_proj,
+            nn.silu(transforms.transform_reference(mlp.gate_proj, x_bf))
+            * transforms.transform_reference(mlp.up_proj, x_bf),
+        )
+        * mlp.global_scale
+    )
+    _assert_close_to_ref(got, ref)
+
+
+def test_install_dense_mlp_skips_bailing_omlx_swiglu_limit():
+    """Review MEDIUM-2: bailing_hybrid _omlx_swiglu_limit MLP stays unfused."""
+
+    def clamped_swiglu(gate, up, limit):
+        return mx.minimum(nn.silu(gate), limit) * mx.clip(up, -limit, limit)
+
+    class _BailingMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=66, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=67, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=68, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=69)
+            self._omlx_swiglu_limit = 5.0
+
+        def __call__(self, x):
+            return self.down_proj(
+                clamped_swiglu(
+                    self.gate_proj(x), self.up_proj(x), self._omlx_swiglu_limit
+                )
+            )
+
+    mlp = _BailingMLP()
+    mx.eval(mlp.parameters())
+    assert transforms.install_producers(mlp) == 0
+    assert not isinstance(mlp, transforms._FusedMLP)
+
+    mx.random.seed(70)
+    x_bf = (mx.random.normal((1, 2, 256)) * 5.0).astype(mx.bfloat16)
+    got = mlp(x_bf)
+    ref = transforms.transform_reference(
+        mlp.down_proj,
+        clamped_swiglu(
+            transforms.transform_reference(mlp.gate_proj, x_bf),
+            transforms.transform_reference(mlp.up_proj, x_bf),
+            mlp._omlx_swiglu_limit,
+        ),
+    )
+    _assert_close_to_ref(got, ref)
+
+
+def test_install_dense_mlp_skips_negative_and_clamped_limits():
+    """Review LOW-1 & allowlist ruling: negative, invalid, and clamped MLPs stay unfused."""
+
+    class SwiGLU:
+        def __init__(self, limit):
+            self.limit = limit
+
+        def __call__(self, x, gate):
+            g = mx.minimum(gate, mx.array(self.limit, gate.dtype))
+            u = mx.clip(
+                x, -mx.array(self.limit, x.dtype), mx.array(self.limit, x.dtype)
+            )
+            return nn.silu(g) * u
+
+    class _Glm5NextMLP(nn.Module):
+        def __init__(self, limit):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=61, block=256)[0]["oqh_signs"]
+            self.limit = limit
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=62, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=63, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=64)
+
+        def __call__(self, x):
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self.limit is not None:
+                lim = mx.array(self.limit, gate.dtype)
+                gate = mx.minimum(gate, lim)
+                up = mx.clip(up, -lim, lim)
+            return self.down_proj(nn.silu(gate) * up)
+
+    for bad_limit in (
+        -1.0,
+        True,
+        False,
+        float("nan"),
+        float("inf"),
+        -float("inf"),
+        "1",
+    ):
+        bad_mlp = _Glm5NextMLP(bad_limit)
+        assert transforms.install_producers(bad_mlp) == 0
+        assert not isinstance(bad_mlp, transforms._FusedMLP)
+        bad_act_mlp = _Glm5NextMLP(None)
+        bad_act_mlp.activation = SwiGLU(bad_limit)
+        assert transforms.install_producers(bad_act_mlp) == 0
+        assert not isinstance(bad_act_mlp, transforms._FusedMLP)
+
+    # Even valid positive limit on non-allowlisted Glm5NextMLP stays unfused and exact.
+    glm = _Glm5NextMLP(1.0)
+    mx.eval(glm.parameters())
+    assert transforms.install_producers(glm) == 0
+    assert not isinstance(glm, transforms._FusedMLP)
+
+    mx.random.seed(77)
+    x_bf = (mx.random.normal((1, 2, 256)) * 5.0).astype(mx.bfloat16)
+    g_ref = transforms.transform_reference(glm.gate_proj, x_bf)
+    u_ref = transforms.transform_reference(glm.up_proj, x_bf)
+    lim = mx.array(1.0, g_ref.dtype)
+    ref_bf = transforms.transform_reference(
+        glm.down_proj, nn.silu(mx.minimum(g_ref, lim)) * mx.clip(u_ref, -lim, lim)
+    )
+    _assert_close_to_ref(glm(x_bf), ref_bf)
+
+
+def test_install_dense_mlp_skips_zero_and_nonzero_swiglu_limit():
+    """Review LOW-2: swiglu_limit == 0.0 (falsy) and non-zero stay unfused."""
+
+    class _VisionLikeMLP(nn.Module):
+        def __init__(self, swiglu_limit):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=71, block=256)[0]["oqh_signs"]
+            self.swiglu_limit = swiglu_limit
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=72, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=73, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=74)
+
+        def __call__(self, x):
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self.swiglu_limit is not None:
+                lim = mx.array(self.swiglu_limit, up.dtype)
+                up = mx.clip(up, -lim, lim)
+            return self.down_proj(nn.silu(gate) * up)
+
+    for limit in (0.0, 7.0):
+        vision_like = _VisionLikeMLP(limit)
+        assert transforms.install_producers(vision_like) == 0
+        assert not isinstance(vision_like, transforms._FusedMLP)
+
+
+def test_install_dense_mlp_skips_subclasses_and_spoofed_names():
+    """Lead ruling: exact type match only; subclasses and name-spoofed classes stay unfused."""
+    from mlx_lm.models.qwen3_next import Qwen3NextMLP
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    def _wire(mlp, seed):
+        signs = _group_case(256, 128, 4, 128, seed=seed, block=256)[0]["oqh_signs"]
+        mlp.gate_proj = _oqh_linear(256, 128, block=256, seed=seed + 1, signs=signs)
+        mlp.up_proj = _oqh_linear(256, 128, block=256, seed=seed + 2, signs=signs)
+        mlp.down_proj = _oqh_linear(128, 256, block=128, seed=seed + 3)
+        return mlp
+
+    class _SubQwen35MLP(Qwen3_5MLP):
+        pass
+
+    class _ScaledSubQwen35MLP(Qwen3_5MLP):
+        def __init__(self, dim, hidden_dim):
+            super().__init__(dim, hidden_dim)
+            self.global_scale = mx.full((1,), 0.25, mx.bfloat16)
+
+        def __call__(self, x):
+            return super().__call__(x) * self.global_scale
+
+    class _SubQwen3NextMLP(Qwen3NextMLP):
+        pass
+
+    class _SpoofedMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            _wire(self, 120)
+
+        def __call__(self, x):
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    _SpoofedMLP.__module__ = Qwen3_5MLP.__module__
+    _SpoofedMLP.__qualname__ = Qwen3_5MLP.__qualname__
+
+    for sub in (
+        _wire(_SubQwen35MLP(256, 128), 110),
+        _wire(_SubQwen3NextMLP(256, 128), 115),
+        _SpoofedMLP(),
+    ):
+        assert transforms.install_producers(sub) == 0
+        assert not isinstance(sub, transforms._FusedMLP)
+
+    scaled_sub = _wire(_ScaledSubQwen35MLP(256, 128), 125)
+    mx.eval(scaled_sub.parameters())
+    assert transforms.install_producers(scaled_sub) == 0
+    assert not isinstance(scaled_sub, transforms._FusedMLP)
+
+    mx.random.seed(129)
+    x_bf = (mx.random.normal((1, 2, 256)) * 0.5).astype(mx.bfloat16)
+    ref_scaled = (
+        transforms.transform_reference(
+            scaled_sub.down_proj,
+            nn.silu(transforms.transform_reference(scaled_sub.gate_proj, x_bf))
+            * transforms.transform_reference(scaled_sub.up_proj, x_bf),
+        )
+        * scaled_sub.global_scale
+    )
+    _assert_close_to_ref(scaled_sub(x_bf), ref_scaled)
+
+
+def test_install_dense_mlp_drops_attribute_heuristics_and_dead_act_fn():
+    """Review NIT & allowlist ruling: dead act_fn heuristic removed; custom act_fn stays unfused."""
+    assert not hasattr(transforms, "_DENSE_MLP_CHILDREN")
+    assert not hasattr(transforms, "_is_single_arg_swiglu_mlp")
+
+    class _ActFnMLP(nn.Module):
+        def __init__(self, act_fn):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=81, block=256)[0]["oqh_signs"]
+            self.act_fn = act_fn
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=82, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=83, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=84)
+
+        def __call__(self, x):
+            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+    silu_attr = _ActFnMLP(nn.silu)
+    mx.eval(silu_attr.parameters())
+    assert transforms.install_producers(silu_attr) == 0
+    assert not isinstance(silu_attr, transforms._FusedMLP)
+
+    mx.random.seed(85)
+    x_bf = (mx.random.normal((1, 2, 256)) * 0.5).astype(mx.bfloat16)
+    ref_silu = transforms.transform_reference(
+        silu_attr.down_proj,
+        nn.silu(transforms.transform_reference(silu_attr.gate_proj, x_bf))
+        * transforms.transform_reference(silu_attr.up_proj, x_bf),
+    )
+    _assert_close_to_ref(silu_attr(x_bf), ref_silu)
+
+
+def test_install_dense_mlp_skips_multi_arg_merger_bare_and_gelu():
+    """Non-allowlisted multi-arg, merger, bare, and GELU MLPs stay unfused and exact."""
+
+    class _InklingSharedExpertsDense(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=71, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=72, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=73, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=74)
+
+        def __call__(self, x, gamma):
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x) * gamma)
+
+    class _ActFnMLP(nn.Module):
+        def __init__(self, act_fn):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=81, block=256)[0]["oqh_signs"]
+            self.act_fn = act_fn
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=82, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=83, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=84)
+
+        def __call__(self, x):
+            return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+    class _HardcodedGeluMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=85, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=86, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=87, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=88)
+
+        def __call__(self, x):
+            return self.down_proj(nn.gelu(self.gate_proj(x)) * self.up_proj(x))
+
+    class _DefaultExtraArgMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=89, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=90, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=91, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=92)
+
+        def __call__(self, x, mask=None):
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    class _VarArgsMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=93, block=256)[0]["oqh_signs"]
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=94, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=95, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=96)
+
+        def __call__(self, *args):
+            x = args[0]
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    class _MergerMLP(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 128, 4, 128, seed=97, block=256)[0]["oqh_signs"]
+            self.proj = nn.Linear(256, 256, bias=False)
+            self.gate_proj = _oqh_linear(256, 128, block=256, seed=98, signs=signs)
+            self.up_proj = _oqh_linear(256, 128, block=256, seed=99, signs=signs)
+            self.down_proj = _oqh_linear(128, 256, block=128, seed=100)
+
+        def __call__(self, x):
+            x = self.proj(x)
+            return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+
+    mx.random.seed(77)
+    x_bf = (mx.random.normal((1, 2, 256)) * 5.0).astype(mx.bfloat16)
+
+    # Multi-arg InklingSharedExpertsDense stays unfused while preserving norm readers.
+    class _BlockWithInkling(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.post_attention_layernorm = nn.RMSNorm(256)
+            self.post_attention_layernorm.weight = mx.ones((256,), mx.bfloat16)
+            self.mlp = _InklingSharedExpertsDense()
+
+    blk = _BlockWithInkling()
+    mx.eval(blk.parameters())
+    assert transforms.install_producers(blk) == 1
+    assert isinstance(blk.post_attention_layernorm, transforms._DualNorm)
+    assert not isinstance(blk.mlp, transforms._FusedMLP)
+    gamma = mx.full((1, 2, 128), 0.5, mx.bfloat16)
+    y_ink = blk.mlp(x_bf, gamma)
+    ref_ink = transforms.transform_reference(
+        blk.mlp.down_proj,
+        nn.silu(transforms.transform_reference(blk.mlp.gate_proj, x_bf))
+        * transforms.transform_reference(blk.mlp.up_proj, x_bf)
+        * gamma,
+    )
+    assert y_ink.shape == (1, 2, 256)
+    _assert_close_to_ref(y_ink, ref_ink)
+
+    for skipped in (_DefaultExtraArgMLP(), _VarArgsMLP()):
+        assert transforms.install_producers(skipped) == 0
+        assert not isinstance(skipped, transforms._FusedMLP)
+
+    merger = _MergerMLP()
+    mx.eval(merger.parameters())
+    assert transforms.install_producers(merger) == 0
+    assert not isinstance(merger, transforms._FusedMLP)
+    x_proj = merger.proj(x_bf)
+    ref_merger = transforms.transform_reference(
+        merger.down_proj,
+        nn.silu(transforms.transform_reference(merger.gate_proj, x_proj))
+        * transforms.transform_reference(merger.up_proj, x_proj),
+    )
+    _assert_close_to_ref(merger(x_bf), ref_merger)
+
+    bare = nn.Module()
+    signs = _group_case(256, 128, 4, 128, seed=101, block=256)[0]["oqh_signs"]
+    bare.gate_proj = _oqh_linear(256, 128, block=256, seed=102, signs=signs)
+    bare.up_proj = _oqh_linear(256, 128, block=256, seed=103, signs=signs)
+    bare.down_proj = _oqh_linear(128, 256, block=128, seed=104)
+    assert transforms.install_producers(bare) == 0
+    assert not isinstance(bare, transforms._FusedMLP)
+
+    for gelu_mlp in (_ActFnMLP(nn.gelu), _HardcodedGeluMLP()):
+        mx.eval(gelu_mlp.parameters())
+        assert transforms.install_producers(gelu_mlp) == 0
+        assert not isinstance(gelu_mlp, transforms._FusedMLP)
+        ref_gelu = transforms.transform_reference(
+            gelu_mlp.down_proj,
+            nn.gelu(transforms.transform_reference(gelu_mlp.gate_proj, x_bf))
+            * transforms.transform_reference(gelu_mlp.up_proj, x_bf),
+        )
+        _assert_close_to_ref(gelu_mlp(x_bf), ref_gelu)
+
+
+def test_dual_norms_skip_empty_and_clear_stale_handoff_on_fallback():
+    class _GatedNorm(nn.Module):
+        def __init__(self, dim=128):
+            super().__init__()
+            self.weight = mx.ones((dim,), mx.bfloat16)
+            self.eps = 1e-6
+
+        def __call__(self, x, gate=None):
+            y = mx.fast.rms_norm(x, self.weight, self.eps)
+            return y if gate is None else y * nn.silu(gate)
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            signs = _group_case(256, 64, 4, 128, seed=111, block=256)[0]["oqh_signs"]
+            self.input_layernorm = nn.RMSNorm(256)
+            self.input_layernorm.weight = mx.ones((256,), mx.bfloat16)
+            self.linear_attn = nn.Module()
+            self.linear_attn.in_proj_qkv = _oqh_linear(
+                256, 64, block=256, seed=112, signs=signs
+            )
+            self.linear_attn.norm = _GatedNorm(128)
+            self.linear_attn.out_proj = _oqh_linear(256, 256, block=128, seed=113)
+
+    blk = _Block()
+    mx.eval(blk.parameters())
+    assert transforms.install_producers(blk) == 2
+    norm = blk.input_layernorm
+    gnorm = blk.linear_attn.norm
+    assert isinstance(norm, transforms._DualNorm)
+    assert isinstance(gnorm, transforms._DualGatedNorm)
+
+    # _DualNorm skips empty inputs without calling _omlx_tx_rmsnorm.
+    rms_calls = []
+    orig_rms = norm._omlx_tx_rmsnorm
+    object.__setattr__(
+        norm,
+        "_omlx_tx_rmsnorm",
+        lambda *a, **kw: rms_calls.append(a) or orig_rms(*a, **kw),
+    )
+    empty_norm = norm(mx.zeros((0, 256), mx.bfloat16))
+    mx.eval(empty_norm)
+    assert empty_norm.shape == (0, 256)
+    assert not rms_calls
+
+    # _DualGatedNorm skips empty inputs without calling _omlx_tx_gated_norm.
+    gnorm_calls = []
+    orig_gnorm = gnorm._omlx_tx_gated_norm
+    object.__setattr__(
+        gnorm,
+        "_omlx_tx_gated_norm",
+        lambda *a, **kw: gnorm_calls.append(a) or orig_gnorm(*a, **kw),
+    )
+    empty_x = mx.zeros((0, 1, 2, 128), mx.bfloat16)
+    empty_g = mx.zeros((0, 1, 2, 128), mx.bfloat16)
+    empty_out = gnorm(empty_x, empty_g)
+    mx.eval(empty_out)
+    assert empty_out.shape == (0, 1, 2, 128)
+    assert not gnorm_calls
+
+    # Stale matching handoff is cleared on fallback (gate=None, mismatched dtype,
+    # and empty input), while an unrelated handoff key stays intact.
+    mx.random.seed(114)
+    h = (mx.random.normal((1, 2, 2, 128)) * 0.5).astype(mx.bfloat16)
+    g = (mx.random.normal((1, 2, 2, 128)) * 0.5).astype(mx.bfloat16)
+    key = gnorm._omlx_tx_handoff_key
+
+    for fallback_call in (
+        lambda: gnorm(h, None),
+        lambda: gnorm(h, g.astype(mx.float32)),
+        lambda: gnorm(empty_x, empty_g),
+    ):
+        transforms.clear()
+        plain = gnorm(h, g)
+        mx.eval(plain)
+        fallback_out = fallback_call()
+        mx.eval(fallback_out)
+        assert transforms.take(key, plain.reshape(1, 2, 256)) is None
+
+    transforms.clear()
+    other_key = ("unrelated_handoff",)
+    transforms.hand_off(other_key, mx.ones((1, 2, 256), mx.bfloat16))
+    gnorm(h, None)
+    assert transforms.take(other_key, mx.zeros((1, 2, 256), mx.bfloat16)) is not None
+    transforms.clear()

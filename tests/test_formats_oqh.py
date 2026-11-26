@@ -399,3 +399,20 @@ def test_row_tile_and_codes_keep_rscale_read_out_of_constructor():
     assert "const device S* r;" in codes_src
     assert "m.rscale[row]" not in codes_src
     assert codes_src.count("r[0]") == 1
+
+
+def test_row_dot_selects_fast_and_slow_keys_by_k_block():
+    for bits in _BITS:
+        fast_k = 512 if bits in (2, 3, 4, 5) else 256
+        slow_k = fast_k // 2
+        fast_tensors, _ = _row_case(fast_k, 16, bits, seed=bits)
+        fast_layer = _layer(oqh.OQH, bits, 0, fast_k, fast_tensors)
+        fast_face = oqh.OQH.dot(fast_layer, fast_k, 16)
+        assert fast_face is not None
+        assert fast_face.key == f"oqh_b{bits}f"
+
+        slow_tensors, _ = _row_case(slow_k, 16, bits, seed=bits + 10)
+        slow_layer = _layer(oqh.OQH, bits, 0, slow_k, slow_tensors)
+        slow_face = oqh.OQH.dot(slow_layer, slow_k, 16)
+        assert slow_face is not None
+        assert slow_face.key == f"oqh_b{bits}s"

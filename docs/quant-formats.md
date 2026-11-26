@@ -295,8 +295,10 @@ Generalized producer fusion (`transforms.install_producers(model)` and
 `transforms.release_producers(model, wrapped_only=False)`) rewrites eligible
 `RMSNorm` (`_DualNorm` via `rmsnorm` + thread-local `transforms.remember`),
 GDN gated norm (`_DualGatedNorm` via `gated_norm` + thread-local
-`transforms.hand_off`), and dense `MLP` (`_FusedMLP` via `act_pair` +
-`FormatLinear._call_prepared`), leaving `SwitchGLU` to the MoE patches. LoRA
+`transforms.hand_off`), and allowlisted dense SwiGLU `MLP` classes
+(`Qwen3_5MLP`, `Qwen3NextMLP`, matched by exact type; `_FusedMLP` via
+`act_pair` + `FormatLinear._call_prepared`), leaving every other MLP on the
+unfused `FormatLinear` path and `SwitchGLU` to the MoE patches. LoRA
 adapter wrapping calls `release_producers(model, wrapped_only=True)`.
 
 A checkpoint written in a transformed format stores its transform record as
@@ -330,9 +332,9 @@ The built-in formats `oqh` (one `rscale` per row) and `oqh_affine`
 `CONTRACT = 1`. Both declare `shared_tensors = ("oqh_signs",)` and
 `SignedWhtTransform`; `oqh_affine` reuses affine's `Dot`/`Tile`/`Codes` faces
 (including 5-bit tiles) and per-chip dense tuning cells. Stock oQh checkpoints
-for D10-verified ported families (`qwen4_exp`) bridge onto `FormatSwitchLinear`
-and `FormatLinear` at load while non-verified/TP/sharded families keep upstream
-oQh modules.
+for D10-verified ported families (`qwen4_exp`, `qwen3_5`, `qwen3_5_moe`) bridge
+onto `FormatSwitchLinear` and `FormatLinear` at load while
+non-verified/TP/sharded families keep upstream oQh modules.
 
 ### Future `CONTRACT >= 2` sketch (fused on-the-fly dot transform)
 

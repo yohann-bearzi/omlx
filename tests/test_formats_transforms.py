@@ -610,33 +610,33 @@ def test_warm_model_warms_apply_split_swiglu_and_producers(monkeypatch):
         def __call__(self, x, gate=None):
             return x
 
-    class _DenseMLP(nn.Module):
-        def __init__(self, fmt, signs_256, signs_128):
-            super().__init__()
-            self.activation = SwiGLU()
-            self.activation.limit = 7.0
-            with testing.verified("example"):
-                self.gate_proj = FormatLinear(
-                    fmt,
-                    8,
-                    1,
-                    256,
-                    {"codes": mx.zeros((128, 256), mx.bfloat16), "signs": signs_256},
-                )
-                self.up_proj = FormatLinear(
-                    fmt,
-                    8,
-                    1,
-                    256,
-                    {"codes": mx.zeros((128, 256), mx.bfloat16), "signs": signs_256},
-                )
-                self.down_proj = FormatLinear(
-                    fmt,
-                    8,
-                    1,
-                    128,
-                    {"codes": mx.zeros((256, 128), mx.bfloat16), "signs": signs_128},
-                )
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    def _make_qwen_mlp(fmt, signs_256, signs_128):
+        mlp = Qwen3_5MLP(256, 128)
+        with testing.verified("example"):
+            mlp.gate_proj = FormatLinear(
+                fmt,
+                8,
+                1,
+                256,
+                {"codes": mx.zeros((128, 256), mx.bfloat16), "signs": signs_256},
+            )
+            mlp.up_proj = FormatLinear(
+                fmt,
+                8,
+                1,
+                256,
+                {"codes": mx.zeros((128, 256), mx.bfloat16), "signs": signs_256},
+            )
+            mlp.down_proj = FormatLinear(
+                fmt,
+                8,
+                1,
+                128,
+                {"codes": mx.zeros((256, 128), mx.bfloat16), "signs": signs_128},
+            )
+        return mlp
 
     class _SwitchMLP(nn.Module):
         def __init__(self, fmt, signs_256, signs_128):
@@ -699,7 +699,7 @@ def test_warm_model_warms_apply_split_swiglu_and_producers(monkeypatch):
                     256,
                     {"codes": mx.zeros((64, 256), mx.bfloat16), "signs": signs_256},
                 )
-            self.mlp = _DenseMLP(fmt, signs_256, signs_128)
+            self.mlp = _make_qwen_mlp(fmt, signs_256, signs_128)
             self.switch_holder = nn.Module()
             self.switch_holder.switch_mlp = _SwitchMLP(fmt, signs_256, signs_128)
 
@@ -772,7 +772,7 @@ def test_warm_model_warms_apply_split_swiglu_and_producers(monkeypatch):
         ],
         key=lambda item: str(item[1]),
     )
-    assert counts["act_pair"] == [((1, 128), mx.bfloat16, 7.0)]
+    assert counts["act_pair"] == [((1, 128), mx.bfloat16, None)]
 
     # Fail closed: a transform warm error aborts warm_moe_model.
     broken_tx = transforms.InputTransform(
@@ -851,6 +851,15 @@ def test_warm_model_runs_real_signed_wht_native_kernels():
         def __call__(self, x, gate=None):
             return x
 
+    from mlx_vlm.models.qwen3_5.language import Qwen3_5MLP
+
+    def _make_real_mlp():
+        mlp = Qwen3_5MLP(256, 128)
+        mlp.gate_proj = _oqh_lin(256, 128, 256, seed=3)
+        mlp.up_proj = _oqh_lin(256, 128, 256, seed=4, signs=mlp.gate_proj["oqh_signs"])
+        mlp.down_proj = _oqh_lin(128, 256, 128, seed=5)
+        return mlp
+
     class _RealOqhModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -863,13 +872,7 @@ def test_warm_model_runs_real_signed_wht_native_kernels():
             self.gdn_layer.linear_attn = nn.Module()
             self.gdn_layer.linear_attn.norm = _GatedNorm(128)
             self.gdn_layer.linear_attn.out_proj = _oqh_lin(256, 64, 128, seed=2)
-            self.mlp = nn.Module()
-            self.mlp.activation = SwiGLU()
-            self.mlp.gate_proj = _oqh_lin(256, 128, 256, seed=3)
-            self.mlp.up_proj = _oqh_lin(
-                256, 128, 256, seed=4, signs=self.mlp.gate_proj["oqh_signs"]
-            )
-            self.mlp.down_proj = _oqh_lin(128, 256, 128, seed=5)
+            self.mlp = _make_real_mlp()
             self.switch_holder = nn.Module()
             self.switch_holder.switch_mlp = nn.Module()
             self.switch_holder.switch_mlp.activation = SwiGLU()
@@ -907,3 +910,213 @@ def test_plain_format_input_transform_short_circuits_cache():
         )
     assert formats.input_transform(override_layer, refuse=False) is None
     assert called == [override_layer]
+
+
+def test_same_passes_receiver_layer_first_to_other_same_as():
+    class _Stub:
+        def __init__(self, signs):
+            self.signs = signs
+
+        def __getitem__(self, name):
+            return self.signs
+
+    signs = mx.ones((2, 128), mx.bfloat16)
+    la, lb = _Stub(signs), _Stub(signs)
+    b_calls = []
+    tx_a = transforms.InputTransform(
+        block=128, tensors=("signs",), apply=lambda x, s: x, same_as=None
+    )
+    tx_b = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        same_as=lambda other, first, second: (
+            b_calls.append((other, first, second)) or (first is lb and second is la)
+        ),
+    )
+    assert tx_a.same(tx_b, la, lb) is True
+    assert b_calls == [(tx_a, lb, la)]
+
+    a_calls, b_calls2 = [], []
+    tx_a2 = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        same_as=lambda other, first, second: (
+            a_calls.append((other, first, second)) or (first is la and second is lb)
+        ),
+    )
+    tx_b2 = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        same_as=lambda other, first, second: (
+            b_calls2.append((other, first, second)) or (first is lb and second is la)
+        ),
+    )
+    assert tx_a2.same(tx_b2, la, lb) is True
+    assert a_calls == [(tx_b2, la, lb)]
+    assert b_calls2 == [(tx_a2, lb, la)]
+
+
+def test_warm_model_skips_negative_and_invalid_switch_swiglu_limit(monkeypatch):
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+
+    from omlx.formats.linear import FormatSwitchLinear
+    from omlx.patches import m5_gather_qmm
+
+    seen_limits: list = []
+
+    def _split_swiglu(y, signs, *, limit=None):
+        seen_limits.append(limit)
+        return y[..., : signs.size]
+
+    tx = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        apply_split_swiglu=_split_swiglu,
+    )
+
+    class _Fmt(formats.QuantFormat):
+        mode = "toy_switch_limit_warm"
+        contract = formats.CONTRACT
+        codes_name = "codes"
+        tensors = ()
+        shared_tensors = ("signs",)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "codes": ((n, k), mx.bfloat16),
+                "signs": ((k // 128, 128), mx.bfloat16),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return tensors["codes"]
+
+        def input_transform(self, layer):
+            return tx
+
+    class _SwitchHolder(nn.Module):
+        def __init__(self, act):
+            super().__init__()
+            self.activation = act
+            with testing.verified("example"):
+                self.down_proj = FormatSwitchLinear(
+                    _Fmt(),
+                    8,
+                    1,
+                    128,
+                    {
+                        "codes": mx.zeros((4, 256, 128), mx.bfloat16),
+                        "signs": mx.ones((1, 128), mx.bfloat16),
+                    },
+                )
+
+    for bad in (-1.0, float("nan"), float("inf"), -float("inf"), True):
+        seen_limits.clear()
+        monkeypatch.setattr(m5_gather_qmm, "_swiglu_limit", lambda _act, b=bad: b)
+        futs = transforms.warm_model(_SwitchHolder(object()), dtypes=(mx.bfloat16,))
+        for f in futs:
+            f.result()
+        assert seen_limits == [], f"warmed invalid limit {bad!r}: {seen_limits}"
+
+    for good in (0.0, 7.0):
+        seen_limits.clear()
+        monkeypatch.setattr(m5_gather_qmm, "_swiglu_limit", lambda _act, g=good: g)
+        futs = transforms.warm_model(_SwitchHolder(object()), dtypes=(mx.bfloat16,))
+        for f in futs:
+            f.result()
+        assert seen_limits == [good]
+
+
+def test_dual_norm_inplace_weight_recast_recasts_tensors_atomically(monkeypatch):
+    seen_dtypes = []
+    cast_calls = []
+    orig_cast = transforms._cast_tensors
+    monkeypatch.setattr(
+        transforms,
+        "_cast_tensors",
+        lambda tensors, dtype: cast_calls.append(dtype) or orig_cast(tensors, dtype),
+    )
+
+    def _stub_rmsnorm(x, weight, signs, *, eps):
+        assert signs.dtype == weight.dtype
+        assert x.dtype == weight.dtype
+        seen_dtypes.append((weight.dtype, signs.dtype))
+        return x, x
+
+    spec = transforms.ProducerSpec(
+        rmsnorm=_stub_rmsnorm, rmsnorm_block=128, rmsnorm_max_width=8192
+    )
+    stub_tx = transforms.InputTransform(
+        block=128,
+        tensors=("signs",),
+        apply=lambda x, s: x,
+        producer_spec=lambda layer=None: spec,
+    )
+
+    class _StubFmt(formats.QuantFormat):
+        mode = "toy_dual_norm_cast"
+        contract = formats.CONTRACT
+        codes_name = "codes"
+        tensors = ()
+        shared_tensors = ("signs",)
+
+        def layout(self, k, n, bits, group_size):
+            return {
+                "codes": ((n, k), mx.bfloat16),
+                "signs": ((k // 128, 128), mx.bfloat16),
+            }
+
+        def decode(self, tensors, bits, group_size):
+            return tensors["codes"]
+
+        def input_transform(self, layer):
+            return stub_tx
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.input_layernorm = nn.RMSNorm(256)
+            self.input_layernorm.weight = mx.ones((256,), mx.bfloat16)
+            self.self_attn = nn.Module()
+            with testing.verified("example"):
+                self.self_attn.q_proj = FormatLinear(
+                    _StubFmt(),
+                    8,
+                    1,
+                    256,
+                    {
+                        "codes": mx.zeros((64, 256), mx.bfloat16),
+                        "signs": mx.ones((2, 128), mx.bfloat16),
+                    },
+                )
+
+    blk = _Block()
+    assert transforms.install_producers(blk) == 1
+    norm = blk.input_layernorm
+    assert isinstance(norm, transforms._DualNorm)
+    assert hasattr(norm, "_omlx_tx_cast")
+    assert not hasattr(norm, "_omlx_tx_weight_dtype")
+    assert not hasattr(norm, "_omlx_tx_cast_tensors")
+    assert cast_calls == [mx.bfloat16]
+
+    transforms.clear()
+    norm(mx.ones((1, 256), mx.bfloat16))
+    norm(mx.ones((1, 256), mx.bfloat16))
+    # Cache hits must not recast tensors.
+    assert cast_calls == [mx.bfloat16]
+    norm["weight"] = norm["weight"].astype(mx.float16)
+    norm(mx.ones((1, 256), mx.float16))
+    norm(mx.ones((1, 256), mx.float16))
+    assert cast_calls == [mx.bfloat16, mx.float16]
+    assert seen_dtypes == [
+        (mx.bfloat16, mx.bfloat16),
+        (mx.bfloat16, mx.bfloat16),
+        (mx.float16, mx.float16),
+        (mx.float16, mx.float16),
+    ]
+    assert norm._omlx_tx_cast[0] == mx.float16
+    transforms.clear()
