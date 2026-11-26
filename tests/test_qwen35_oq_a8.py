@@ -1916,6 +1916,29 @@ def test_refuse_unclassified_real_switch_namespace(tmp_path):
     MtpModel.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
     dispatch._refuse_unclassified(MtpModel(Experts(switch(Plugin()), switch("affine"))))
 
+    # The MTP head is skipped, not the rest of the scan: a live stack after
+    # it must still refuse (a `break` in place of the skip loads it silently).
+    class MtpThenLiveModel(nn.Module):
+        def __init__(self, mtp, live):
+            super().__init__()
+            # MLX's named_modules walks a module's children last-in first-out:
+            # registering live before mtp visits the whole MTP head first.
+            self.live = live
+            self.mtp = mtp
+
+        def get_mtp_module(self):
+            return self.mtp
+
+    MtpThenLiveModel.__module__ = "mlx_vlm.models.qwen4_exp.qwen4_exp"
+    model = MtpThenLiveModel(
+        Experts(switch(Plugin()), switch("affine")),
+        Experts(switch(Plugin()), switch("affine")),
+    )
+    visited = [id(module) for _, module in model.named_modules()]
+    assert visited.index(id(model.mtp)) < visited.index(id(model.live))
+    with pytest.raises(ValueError, match="gate_up_proj.*plugin_sw_test"):
+        dispatch._refuse_unclassified(model)
+
 
 def test_refuse_unclassified_unfused_switch_namespace(tmp_path):
     import json
@@ -1992,7 +2015,7 @@ def test_refuse_unclassified_unfused_switch_namespace(tmp_path):
     dispatch._refuse_unclassified(Model(Experts(affine, affine, affine)))
 
 
-def test_refuse_unclassified_rejects_affine_subclass_plugin(tmp_path, monkeypatch):
+def test_refuse_unclassified_rejects_affine_subclass_plugin(tmp_path):
     import json
 
     import mlx.nn as nn
