@@ -336,6 +336,7 @@ PATH_DECISIONS = {
     ),
     "omlx/formats/__init__.py": (OWN, "the format face builder itself"),
     "omlx/formats/affine.py": (OWN, "the affine format's own implementation"),
+    "omlx/formats/audit.py": (OWN, "the format-reader AST audit scanner itself"),
     "omlx/formats/debug.py": (
         OWN,
         "tests/test_formats_debug.py: the debug tool reads layers' own tensors "
@@ -740,6 +741,11 @@ EXPECTED = {
     ("omlx/formats/affine.py", "AffineFormat.codes"): ("read bits", "read group_size"),
     ("omlx/formats/affine.py", "AffineFormat.dot"): ("read bits", "read group_size"),
     ("omlx/formats/affine.py", "AffineFormat.tile"): ("read bits", "read group_size"),
+    ("omlx/formats/audit.py", "<module>"): (
+        "QuantizedEmbedding",
+        "QuantizedLinear",
+        "QuantizedSwitchLinear",
+    ),
     ("omlx/formats/debug.py", "_TargetTables.add"): ("read bits",),
     ("omlx/formats/debug.py", "_baseline_weight_bytes"): ("QuantizedLinear",),
     ("omlx/formats/debug.py", "_diagnose_builtin_face_decline"): (
