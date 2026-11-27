@@ -635,7 +635,6 @@ def _extract_facts(
                 v_pos, _ = _extract_facts(val, info, cur)
                 for name in _named_expr_targets(val):
                     pos.invalidate(name)
-                    v_pos.invalidate(name)
                     cur.invalidate(name)
                 pos = pos.merge(v_pos)
                 cur = cur.apply(v_pos)
@@ -647,7 +646,6 @@ def _extract_facts(
                 _, v_neg = _extract_facts(val, info, cur)
                 for name in _named_expr_targets(val):
                     neg.invalidate(name)
-                    v_neg.invalidate(name)
                     cur.invalidate(name)
                 neg = neg.merge(v_neg)
                 cur = cur.apply(v_neg)
@@ -1862,20 +1860,20 @@ class _AuditVisitor:
         if isinstance(expr, ast.BoolOp):
             if isinstance(expr.op, ast.And):
                 cur = env.copy()
-                for val in expr.values:
+                for idx, val in enumerate(expr.values):
                     self._visit_expr(val, cur)
                     for name in _named_expr_targets(val):
-                        env.invalidate(name, keep_taint=True)
+                        env.invalidate(name, keep_taint=idx > 0)
                     env.merge_taint_from(cur)
                     pos, _ = _extract_facts(val, self.info, cur)
                     cur = cur.apply(pos)
                 return
             if isinstance(expr.op, ast.Or):
                 cur = env.copy()
-                for val in expr.values:
+                for idx, val in enumerate(expr.values):
                     self._visit_expr(val, cur)
                     for name in _named_expr_targets(val):
-                        env.invalidate(name, keep_taint=True)
+                        env.invalidate(name, keep_taint=idx > 0)
                     env.merge_taint_from(cur)
                     _, neg = _extract_facts(val, self.info, cur)
                     cur = cur.apply(neg)
@@ -1956,7 +1954,6 @@ class _AuditVisitor:
         elts: Sequence[ast.expr],
         env: _GuardEnv,
     ) -> None:
-        cur = env.copy()
         body_walrus: set[str] = set()
         for idx, gen in enumerate(generators):
             if idx > 0:
@@ -1965,44 +1962,65 @@ class _AuditVisitor:
                 body_walrus |= _named_expr_targets(if_clause)
         for elt in elts:
             body_walrus |= _named_expr_targets(elt)
-        for idx, gen in enumerate(generators):
-            self._visit_expr(gen.iter, cur)
-            iter_reads_attr = _node_reads_module_attr(
-                gen.iter, cur.var_reads_module_attr
-            )
-            iter_reads_unguarded = _node_reads_unguarded_attr(gen.iter, cur)
-            iter_key = _expr_key(gen.iter)
-            elem_facts: set[str] | None = None
-            if iter_key is not None:
-                facts = cur.seq_guards.get(iter_key)
-                if facts is None and iter_key in cur.seq_aliases:
-                    facts = cur.seq_guards.get(cur.seq_aliases[iter_key])
-                if facts:
-                    elem_facts = set(facts)
-            if idx == 0:
-                for name in body_walrus:
-                    cur.invalidate(name, keep_taint=True)
-            self._bind_one_target(
-                gen.target,
-                cur,
-                rhs_reads_attr=iter_reads_attr,
-                rhs_reads_unguarded_attr=iter_reads_unguarded,
-                layout_promise=None,
-                elem_facts=elem_facts,
-                rhs_key=None,
-            )
-            for if_clause in gen.ifs:
-                self._visit_expr(if_clause, cur)
-                pos, _ = _extract_facts(if_clause, self.info, cur)
-                cur = cur.apply(pos)
-        for elt in elts:
-            self._visit_expr(elt, cur)
+        seed = _GuardEnv.empty()
+        while True:
+            mark = len(self.raw_findings)
+            before = _taint_snapshot(seed)
+            cur = env.copy()
+            for idx, gen in enumerate(generators):
+                self._visit_expr(gen.iter, cur)
+                iter_reads_attr = _node_reads_module_attr(
+                    gen.iter, cur.var_reads_module_attr
+                )
+                iter_reads_unguarded = _node_reads_unguarded_attr(gen.iter, cur)
+                iter_key = _expr_key(gen.iter)
+                elem_facts: set[str] | None = None
+                if iter_key is not None:
+                    facts = cur.seq_guards.get(iter_key)
+                    if facts is None and iter_key in cur.seq_aliases:
+                        facts = cur.seq_guards.get(cur.seq_aliases[iter_key])
+                    if facts:
+                        elem_facts = set(facts)
+                if idx == 0:
+                    for name in body_walrus:
+                        cur.invalidate(name, keep_taint=True)
+                    cur.merge_taint_from(seed)
+                self._bind_one_target(
+                    gen.target,
+                    cur,
+                    rhs_reads_attr=iter_reads_attr,
+                    rhs_reads_unguarded_attr=iter_reads_unguarded,
+                    layout_promise=None,
+                    elem_facts=elem_facts,
+                    rhs_key=None,
+                )
+                for if_clause in gen.ifs:
+                    self._visit_expr(if_clause, cur)
+                    pos, _ = _extract_facts(if_clause, self.info, cur)
+                    cur = cur.apply(pos)
+                    for name in body_walrus:
+                        if cur.var_unguarded_attr.get(name):
+                            seed.var_unguarded_attr[name] = True
+                        if cur.var_reads_module_attr.get(name):
+                            seed.var_reads_module_attr[name] = True
+            for elt in elts:
+                self._visit_expr(elt, cur)
+            for name in body_walrus:
+                if cur.var_unguarded_attr.get(name):
+                    seed.var_unguarded_attr[name] = True
+                if cur.var_reads_module_attr.get(name):
+                    seed.var_reads_module_attr[name] = True
+            if _taint_snapshot(seed) == before:
+                break
+            del self.raw_findings[mark:]
         # PEP 572: walrus targets inside a comprehension bind in the enclosing scope.
         for name in _named_expr_targets(comp_node):
             env.invalidate(name, keep_taint=True)
-            if cur.var_unguarded_attr.get(name):
+            if cur.var_unguarded_attr.get(name) or seed.var_unguarded_attr.get(name):
                 env.var_unguarded_attr[name] = True
-            if cur.var_reads_module_attr.get(name):
+            if cur.var_reads_module_attr.get(name) or seed.var_reads_module_attr.get(
+                name
+            ):
                 env.var_reads_module_attr[name] = True
 
     def _check_attr_read(self, node: ast.Attribute, env: _GuardEnv) -> None:

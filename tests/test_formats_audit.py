@@ -1607,6 +1607,216 @@ if isinstance(a, nn.QuantizedLinear):
 """
     assert "unguarded-dequantize" in _rules(taint_src)
 
+    # LOW-2: module-level `from q import *` invalidates `seq_guards`.
+    seq_src = """
+def _is_aff(s):
+    return getattr(s, "mode", None) == "affine"
+
+if all(_is_aff(s) for s in shards):
+    from q import *
+    first = shards[0]
+    _ = first.weight
+"""
+    assert "unguarded-weight" in _rules(seq_src)
+
+
+def test_comprehension_backedge_walrus_taint():
+    # MEDIUM-1: taint created by a walrus in elt or an if-clause must flow
+    # across comprehension iterations via the seed taint fixpoint.
+    snippets = {
+        "elt_before_walrus": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [
+            (mx.quantized_matmul(x, w, s, bi), (w := getattr(b, "weight", None)))
+            for _ in xs
+        ]
+    return x
+""",
+        "if_before_elt_walrus": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [
+            (w := getattr(b, "weight", None))
+            for _ in xs
+            if mx.quantized_matmul(x, w, s, bi) is not None
+        ]
+    return x
+""",
+        "if_walrus_overwritten_by_elt": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi, cond):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [
+            (w := 0)
+            for _ in xs
+            if (mx.quantized_matmul(x, w, s, bi) or (w := getattr(b, "weight", None)))
+            if cond
+        ]
+    return x
+""",
+        "post_comp_failing_filter_qmm": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi, cond):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [(w := 0) for _ in xs if (w := getattr(b, "weight", None)) if cond]
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+    }
+    for name, src in snippets.items():
+        assert "unguarded-quantized-matmul" in _rules(
+            src
+        ), f"{name} missed unguarded-quantized-matmul"
+
+    post_comp_deq = """
+import mlx.core as mx
+def f(b, xs, s, bi, cond):
+    w = 0
+    _ = [(w := 0) for _ in xs if (w := getattr(b, "weight", None)) if cond]
+    return mx.dequantize(w, s, bi, mode="affine")
+"""
+    assert "unguarded-dequantize" in _rules(post_comp_deq)
+
+    # Multi-pass fixpoint must discard intermediate findings (no duplicates).
+    dedup_src = """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [
+            (b.weight, mx.quantized_matmul(x, w, s, bi), (w := getattr(b, "weight", None)))
+            for _ in xs
+        ]
+    return x
+"""
+    dedup_findings = scan_source(dedup_src).findings
+    assert [f.rule for f in dedup_findings] == [
+        "unguarded-weight",
+        "unguarded-quantized-matmul",
+    ]
+
+    # Safe counterpart: untainted walrus rebind stays clean.
+    clean_src = """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        _ = [(mx.quantized_matmul(x, w, s, bi), (w := 0)) for _ in xs]
+    return x
+"""
+    assert scan_source(clean_src).findings == ()
+
+
+def test_boolop_first_operand_walrus_clears_taint():
+    # LOW-1: the first operand of `and` / `or` runs unconditionally, so a
+    # top-level walrus clearing `w` there clears stale taint (no false positive).
+    clean_snippets = {
+        "and_first_operand": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        if (w := 0) and cond:
+            pass
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "or_first_operand": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        if (w := 0) or cond:
+            pass
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "straight_line_clear": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        w = 0
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+    }
+    for name, src in clean_snippets.items():
+        assert "unguarded-quantized-matmul" not in _rules(
+            src
+        ), f"{name} falsely reported unguarded-quantized-matmul"
+
+    # Nested conditional walrus inside values[0] must still preserve taint.
+    nested_cond_src = """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond1, cond2, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        if (cond1 and (w := 0)) and cond2:
+            pass
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+"""
+    assert "unguarded-quantized-matmul" in _rules(nested_cond_src)
+
+
+def test_nested_walrus_then_guard_is_clean():
+    # NIT-1 (Option A): facts established after a walrus inside a nested BoolOp
+    # must survive into the outer BoolOp.
+    clean_and = """
+import mlx.nn as nn
+def f(cond, other):
+    if cond and ((m := other) and isinstance(m, nn.QuantizedLinear)):
+        return m.weight
+    return None
+"""
+    assert scan_source(clean_and).findings == ()
+
+    clean_or = """
+from omlx.formats.linear import FormatLinear
+def f(cond, other):
+    if cond or ((m := other) or isinstance(m, FormatLinear)):
+        return None
+    return m.weight
+"""
+    assert scan_source(clean_or).findings == ()
+
+    # Guard-then-walrus inside a nested BoolOp must still be invalidated.
+    unsafe_and = """
+import mlx.nn as nn
+def f(cond, m, other):
+    if cond and (isinstance(m, nn.QuantizedLinear) and (m := other)):
+        return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(unsafe_and)
+
+    unsafe_or = """
+from omlx.formats.linear import FormatLinear
+def f(cond, m, other):
+    if cond or (isinstance(m, FormatLinear) or (m := other)):
+        return None
+    return m.weight
+"""
+    assert "unguarded-weight" in _rules(unsafe_or)
+
 
 def test_pragmas_allow_and_fail_closed(tmp_path):
     # Same-line pragma suppresses matching rule only; non-matching rule stays reported.
