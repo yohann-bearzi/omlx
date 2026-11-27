@@ -79,7 +79,7 @@ def _dot(array: mx.array) -> str:
     return buf.getvalue()
 
 
-_DENSE_DIGEST = "48 da633342e9652f26f704405bce666bf2ac84512898a0ddc1890eea6bb05473e7"
+_DENSE_DIGEST = "49 da633342e9652f26f704405bce666bf2ac84512898a0ddc1890eea6bb05473e7"
 
 
 def test_dense_skeleton_source_digest_is_pinned():
@@ -1197,13 +1197,13 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     assert tile_dense.policy_for(p1_m3, 512, mx.bfloat16).split_k == 20
     _, o_proj = _layer(2560, 6144, 8, 64)
     p_o = tile_dense.build_plan(o_proj, tensor_units=False, chip="applegpu_g15d_c80")
-    for r in (17, 24):
+    for r in (17, 20, 24):
         assert tile_dense.policy_for(p_o, r, mx.bfloat16).backend == "mlx"
     _, o_proj_fp16 = _layer(2560, 6144, 8, 64, mx.float16)
     p_o16 = tile_dense.build_plan(
         o_proj_fp16, tensor_units=False, chip="applegpu_g15d_c80"
     )
-    for r in (17, 24):
+    for r in (17, 20, 24):
         assert tile_dense.policy_for(p_o16, r, mx.float16).backend == "steel"
         assert tile_dense.policy_for(p_o16, r, mx.float16).split_k == 12
     p48_m5 = tile_dense.build_plan(in_proj, tensor_units=True, chip="applegpu_g17s_c40")

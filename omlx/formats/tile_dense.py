@@ -970,7 +970,8 @@ def _splitk_accum(
 
 def source_digest() -> str:
     """CPU-only SHA-256 digest of the unified steel and NAX dense Metal text
-    over every table-free affine tile face (owner rule 20)."""
+    over every table-free affine tile face plus the fused split-K accumulate
+    (owner rule 20)."""
     digest = hashlib.sha256()
     count = 0
     for backend, body_hdr, body_src in (
@@ -991,6 +992,7 @@ def source_digest() -> str:
                         digest.update(part.encode() + b"\0")
                     count += 1
     digest.update(b"splitk_accum\0" + _SPLITK_ACCUM_SOURCE.encode() + b"\0")
+    count += 1
     return f"{count} {digest.hexdigest()}"
 
 
