@@ -16,6 +16,7 @@ import re
 import statistics
 import time
 from collections.abc import Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -3651,4 +3652,423 @@ def format_bench(result: BenchResult, *, as_json: bool = False) -> str:
         f"peak_working={result.peak_memory_layer_bytes} B "
         f"(delta={result.peak_memory_delta_bytes} B)"
     )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Commit 4 — warm_report pipeline dedup & compile timing reporter
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class WarmPipelineInfo:
+    kind: str
+    kernel_name: str
+    template: tuple[tuple[str, str | int | bool], ...]
+    requested_count: int
+    already_built: bool
+    compiled_now: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class WarmReport:
+    chip: str
+    tensor_units: bool
+    compile_executed: bool
+    layers_scanned: int
+    dense_layers: int
+    switch_layers: int
+    total_requested: int
+    unique_pipelines: int
+    deduped_count: int
+    dedup_ratio: float
+    already_built: int
+    compiled_now: int
+    plan_ms: float
+    compile_ms: float
+    dispatch_warm_ms: float
+    total_ms: float
+    runtime_proof_count_before: int
+    runtime_proof_count_after: int
+    runtime_proof_delta: int
+    pipelines: tuple[WarmPipelineInfo, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+def _resolve_warm_kernel_name(inst: Any, raw_name_map: dict[int, str]) -> str:
+    """Resolve an ``_Instance``'s kernel name without reading ``.native.name``."""
+    raw_name = raw_name_map.get(id(inst.kernel.native))
+    if raw_name is not None:
+        return raw_name
+    for fk_key, fk_obj in tuple(kernels._FACE_KERNELS.items()):
+        if fk_obj is inst.kernel:
+            base_name, fk_inputs, fk_mats_frozen, *_ = fk_key
+            fk_mats = dict(fk_mats_frozen)
+            return "_".join(
+                (
+                    base_name,
+                    *(fk_mats[name].key for name in fk_inputs if name in fk_mats),
+                )
+            )
+    return "omlx_unknown_kernel"
+
+
+def _register_raw_names_for_layer(
+    layer: FormatLinear | FormatSwitchLinear,
+    *,
+    tensor_units: bool,
+    raw_name_map: dict[int, str],
+) -> None:
+    k, n = layer.input_dims, layer.output_dims
+    is_switch = isinstance(layer, FormatSwitchLinear)
+    dot_face = formats.dot(layer, k, n) if k >= 8 else None
+    if dot_face is not None:
+        if is_switch:
+            if n % 8 == 0:
+                raw_name_map[id(linear._kernel(dot_face, True))] = (
+                    f"omlx_format_switch_linear_{dot_face.key}"
+                )
+        else:
+            if n % 8 == 0:
+                raw_name_map[id(linear._kernel(dot_face, False))] = (
+                    f"omlx_format_linear_{dot_face.key}"
+                )
+            if dot_face.vpt >= 1:
+                raw_name_map[id(linear._shared_kernel(dot_face))] = (
+                    f"omlx_format_linear_rows_{dot_face.key}"
+                )
+    if not is_switch:
+        tile_face = formats.tile(layer, k, n)
+        if tile_face is not None:
+            backend = "nax" if tensor_units else "steel"
+            mm = tile_dense._build(tile_face, backend)
+            if mm is not None:
+                raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
+
+
+def _format_proof_task_template(metal: Any) -> tuple[tuple[str, str | int | bool], ...]:
+    if isinstance(metal, tuple):
+        out: list[tuple[str, str | int | bool]] = []
+        for idx, item in enumerate(metal):
+            if isinstance(item, mx.Dtype):
+                out.append((f"arg{idx}", _metal_type(item)))
+            elif isinstance(item, bool):
+                out.append((f"arg{idx}", item))
+            elif isinstance(item, int):
+                out.append((f"arg{idx}", int(item)))
+            else:
+                out.append((f"arg{idx}", repr(item)))
+        return tuple(out)
+    return (("metal", repr(metal)),)
+
+
+def warm_report(
+    target: nn.Module | Sequence[FormatLinear | FormatSwitchLinear],
+    *,
+    dtypes: Sequence[str | mx.Dtype] | None = None,
+    compile: bool = True,
+    warm_dispatch: bool = False,
+    per_rows: Sequence[int] = (1,),
+    prefill_lengths: Sequence[int] = (2047, 2048),
+    decode_batch_sizes: Sequence[int] = (1, 2, 4),
+    mtp_enabled: bool = False,
+    verify_rows: Sequence[int] = (2, 3, 4),
+    isolated_proofs: bool = False,
+) -> WarmReport:
+    """Plan, deduplicate, and optionally compile warm-up Metal pipelines."""
+    if not isinstance(compile, bool):
+        raise TypeError(f"compile must be a bool, not {type(compile).__name__}")
+    if not isinstance(warm_dispatch, bool):
+        raise TypeError(
+            f"warm_dispatch must be a bool, not {type(warm_dispatch).__name__}"
+        )
+    if not isinstance(mtp_enabled, bool):
+        raise TypeError(f"mtp_enabled must be a bool, not {type(mtp_enabled).__name__}")
+    if not isinstance(isolated_proofs, bool):
+        raise TypeError(
+            f"isolated_proofs must be a bool, not {type(isolated_proofs).__name__}"
+        )
+
+    per_rows_tuple = tuple(per_rows)
+    if not per_rows_tuple:
+        raise ValueError("per_rows must be a non-empty sequence of positive integers")
+    for pr in per_rows_tuple:
+        _check_positive_int("per_rows entry", pr)
+
+    explicit_dtypes: tuple[mx.Dtype, ...] | None = None
+    if dtypes is not None:
+        parsed = tuple(dict.fromkeys(parse_dtype(dt) for dt in dtypes))
+        if not parsed or any(dt not in linear._WARM_DTYPES for dt in parsed):
+            raise ValueError(
+                "warm_report dtypes must be non-empty and contain only bf16/fp16"
+            )
+        explicit_dtypes = parsed
+
+    if compile and not mx.metal.is_available():
+        raise RuntimeError(
+            "debug.warm_report(compile=True) requires an available Metal GPU"
+        )
+
+    # Scan target for FormatLinear / FormatSwitchLinear layers.
+    model: nn.Module | None = None
+    layers: list[FormatLinear | FormatSwitchLinear] = []
+    seen_ids: set[int] = set()
+    if isinstance(target, (FormatLinear, FormatSwitchLinear)):
+        layers.append(target)
+    elif isinstance(target, nn.Module):
+        model = target
+        for _, mod in target.named_modules():
+            if isinstance(mod, (FormatLinear, FormatSwitchLinear)) and (
+                id(mod) not in seen_ids
+            ):
+                seen_ids.add(id(mod))
+                layers.append(mod)
+    elif isinstance(target, Sequence) and not isinstance(target, (str, bytes)):
+        for idx, item in enumerate(target):
+            if not isinstance(item, (FormatLinear, FormatSwitchLinear)):
+                raise TypeError(
+                    f"target[{idx}] must be FormatLinear or FormatSwitchLinear, "
+                    f"not {type(item).__name__}"
+                )
+            layers.append(item)
+    else:
+        raise TypeError(
+            "warm_report target must be an nn.Module, format layer, or sequence "
+            f"of format layers, not {type(target).__name__}"
+        )
+
+    if not layers:
+        raise ValueError(
+            "warm_report target contains no FormatLinear or FormatSwitchLinear layers"
+        )
+    for layer in layers:
+        layer.refuse_placeholders()
+
+    chip_id = tuning.current_chip()
+    tensor_units = linear._nax_host()
+    dense_count = sum(1 for item in layers if isinstance(item, FormatLinear))
+    switch_count = sum(1 for item in layers if isinstance(item, FormatSwitchLinear))
+
+    fp16_recast = bool(getattr(model, "_omlx_fp16_recast", False)) if model else False
+    model_dtype = (
+        None
+        if explicit_dtypes is not None or fp16_recast or model is None
+        else linear._infer_model_dtype(model)
+    )
+
+    t_total0 = time.perf_counter()
+    proof_before = kernels.proof_count()
+    ctx = testing.fresh_proofs() if isolated_proofs else nullcontext()
+
+    with ctx:
+        t_plan0 = time.perf_counter()
+        raw_name_map: dict[int, str] = {}
+        instances: dict[Any, Any] = {}
+        proofs: dict[Any, list[tuple[Any, Any]]] = {}
+        inst_counts: dict[Any, int] = {}
+
+        unique_tasks: dict[tuple[int, Any], tuple[Any, Any, Any, str]] = {}
+        task_counts: dict[tuple[int, Any], int] = {}
+        total_requested = 0
+
+        for layer in layers:
+            k, n = layer.input_dims, layer.output_dims
+            if k < 8 or n <= 0:
+                continue
+            target_dtypes = linear._layer_warm_dtypes(
+                layer, model_dtype, explicit_dtypes, fp16_recast=fp16_recast
+            )
+            if not target_dtypes:
+                continue
+            _register_raw_names_for_layer(
+                layer, tensor_units=tensor_units, raw_name_map=raw_name_map
+            )
+            layer_inst: dict[Any, Any] = {}
+            layer_proofs: dict[Any, list[tuple[Any, Any]]] = {}
+            layer_tasks: list[tuple[Any, Any, Any]] = []
+            if isinstance(layer, FormatSwitchLinear):
+                tile_face = formats.tile(layer, k, n)
+                task_kname = (
+                    (
+                        f"omlx_gqmm_{tile_face.key}"
+                        if tensor_units
+                        else f"omlx_steel_gather_{tile_face.key}"
+                    )
+                    if tile_face is not None
+                    else "omlx_switch_tile"
+                )
+                linear._plan_switch_warm(
+                    layer,
+                    k,
+                    target_dtypes,
+                    per_rows_tuple,
+                    linear._NO_EPILOGUE,
+                    layer_inst,
+                    layer_proofs,
+                    layer_tasks,
+                )
+            else:
+                task_kname = "omlx_dense_tile"
+                linear._plan_dense_warm(
+                    layer,
+                    layer.fmt,
+                    layer.bits,
+                    layer.group_size,
+                    k,
+                    target_dtypes,
+                    layer_inst,
+                    layer_proofs,
+                )
+
+            for inst, recipe in layer_inst.items():
+                total_requested += 1
+                inst_counts[inst] = inst_counts.get(inst, 0) + 1
+                instances.setdefault(inst, recipe)
+                for proof_obj, metal in layer_proofs.get(inst, ()):
+                    linear._record_proof(proofs, inst, proof_obj, metal)
+
+            for proof_obj, metal, build in layer_tasks:
+                total_requested += 1
+                task_key = (id(proof_obj), metal)
+                task_counts[task_key] = task_counts.get(task_key, 0) + 1
+                unique_tasks.setdefault(task_key, (proof_obj, metal, build, task_kname))
+
+        # Snapshot already_built BEFORE submitting any warm futures.
+        inst_built_before = {inst: (inst in inst.kernel._built) for inst in instances}
+        task_built_before = {
+            task_key: (metal in proof_obj.ran)
+            for task_key, (proof_obj, metal, _b, _kn) in unique_tasks.items()
+        }
+        plan_ms = (time.perf_counter() - t_plan0) * 1000.0
+
+        compile_ms = 0.0
+        dispatch_warm_ms = 0.0
+        if compile:
+            t_comp0 = time.perf_counter()
+            futures: list[Any] = []
+            if instances:
+                futures.extend(kernels.warm(linear._attach_proofs(instances, proofs)))
+            if unique_tasks:
+                futures.extend(
+                    kernels.warm_proofs(
+                        [(p, m, b) for p, m, b, _ in unique_tasks.values()]
+                    )
+                )
+            # Await EVERY future before re-raising the first build error (Rule 14).
+            first_err: BaseException | None = None
+            for fut in futures:
+                try:
+                    fut.result()
+                except BaseException as exc:  # noqa: BLE001
+                    if first_err is None:
+                        first_err = exc
+            if first_err is not None:
+                raise first_err
+            compile_ms = (time.perf_counter() - t_comp0) * 1000.0
+
+            if warm_dispatch and model is not None:
+                t_disp0 = time.perf_counter()
+                linear.warm_model_dispatch(
+                    model,
+                    dtypes=explicit_dtypes,
+                    prefill_lengths=tuple(prefill_lengths),
+                    decode_batch_sizes=tuple(decode_batch_sizes),
+                    mtp_enabled=mtp_enabled,
+                    verify_rows=tuple(verify_rows),
+                )
+                dispatch_warm_ms = (time.perf_counter() - t_disp0) * 1000.0
+
+        proof_after = kernels.proof_count()
+
+    total_ms = (time.perf_counter() - t_total0) * 1000.0
+
+    pipelines: list[WarmPipelineInfo] = []
+    for inst in instances:
+        was_built = inst_built_before[inst]
+        tmpl = tuple(
+            (name, _template_record_value(val)) for name, _kind, val in inst.template
+        )
+        pipelines.append(
+            WarmPipelineInfo(
+                kind="instance",
+                kernel_name=_resolve_warm_kernel_name(inst, raw_name_map),
+                template=tmpl,
+                requested_count=inst_counts[inst],
+                already_built=was_built,
+                compiled_now=bool(compile and not was_built),
+            )
+        )
+    for task_key, (_p, metal, _b, task_kname) in unique_tasks.items():
+        was_built = task_built_before[task_key]
+        pipelines.append(
+            WarmPipelineInfo(
+                kind="proof_task",
+                kernel_name=task_kname,
+                template=_format_proof_task_template(metal),
+                requested_count=task_counts[task_key],
+                already_built=was_built,
+                compiled_now=bool(compile and not was_built),
+            )
+        )
+
+    unique_count = len(pipelines)
+    deduped = total_requested - unique_count
+    dedup_ratio = (deduped / total_requested) if total_requested > 0 else 0.0
+    already_built_total = sum(1 for p in pipelines if p.already_built)
+    compiled_now_total = sum(1 for p in pipelines if p.compiled_now)
+
+    return WarmReport(
+        chip=chip_id,
+        tensor_units=tensor_units,
+        compile_executed=compile,
+        layers_scanned=len(layers),
+        dense_layers=dense_count,
+        switch_layers=switch_count,
+        total_requested=total_requested,
+        unique_pipelines=unique_count,
+        deduped_count=deduped,
+        dedup_ratio=dedup_ratio,
+        already_built=already_built_total,
+        compiled_now=compiled_now_total,
+        plan_ms=plan_ms,
+        compile_ms=compile_ms,
+        dispatch_warm_ms=dispatch_warm_ms,
+        total_ms=total_ms,
+        runtime_proof_count_before=proof_before,
+        runtime_proof_count_after=proof_after,
+        runtime_proof_delta=proof_after - proof_before,
+        pipelines=tuple(pipelines),
+    )
+
+
+def format_warm_report(report: WarmReport, *, as_json: bool = False) -> str:
+    """Format a ``WarmReport`` as human-readable text or JSON."""
+    if as_json:
+        return json.dumps(report.to_dict(), indent=2, sort_keys=True)
+    lines = [
+        f"WarmReport: chip={report.chip} tensor_units={report.tensor_units} "
+        f"compile_executed={report.compile_executed}",
+        f"Layers: scanned={report.layers_scanned} dense={report.dense_layers} "
+        f"switch={report.switch_layers}",
+        f"Pipelines: total_requested={report.total_requested} "
+        f"unique={report.unique_pipelines} deduped={report.deduped_count} "
+        f"({report.dedup_ratio * 100:.1f}%) "
+        f"already_built={report.already_built} compiled_now={report.compiled_now}",
+        f"Timing: plan={report.plan_ms:.2f} ms compile={report.compile_ms:.2f} ms "
+        f"dispatch={report.dispatch_warm_ms:.2f} ms total={report.total_ms:.2f} ms",
+        f"Runtime proofs: before={report.runtime_proof_count_before} "
+        f"after={report.runtime_proof_count_after} "
+        f"delta={report.runtime_proof_delta}",
+    ]
+    for p in report.pipelines:
+        lines.append(
+            f"  - [{p.kind}] {p.kernel_name} req={p.requested_count} "
+            f"built={p.already_built} compiled_now={p.compiled_now} "
+            f"tmpl={list(p.template)}"
+        )
     return "\n".join(lines)

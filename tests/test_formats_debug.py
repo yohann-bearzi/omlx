@@ -13,6 +13,7 @@ import types
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
 
 from omlx import formats
@@ -1148,3 +1149,167 @@ def test_bench_gpu_oqh_transform_and_non_mlx_group_size():
     assert res_g16.baseline_available is True
     assert res_g16.baseline_group_size == 64
     assert res_g16.baseline_note is not None and "64" in res_g16.baseline_note
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Commit 4 — warm_report tests
+# ---------------------------------------------------------------------------
+
+
+class _SmallWarmModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.l0 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        self.l1 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        self.l2 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        self.l3 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=512)
+        self.sw0 = debug.make_layer(
+            "affine", bits=4, group_size=64, k=256, n=256, experts=4
+        )
+        self.sw1 = debug.make_layer(
+            "affine", bits=4, group_size=64, k=256, n=256, experts=4
+        )
+
+
+def test_warm_report_dry_run_dedup_dense_and_switch_model():
+    model = _SmallWarmModel()
+    rep = debug.warm_report(model, dtypes=(mx.bfloat16,), compile=False)
+    assert rep.compile_executed is False
+    assert rep.compile_ms == 0.0
+    assert rep.compiled_now == 0
+    assert rep.layers_scanned == 6
+    assert rep.dense_layers == 4
+    assert rep.switch_layers == 2
+    assert rep.unique_pipelines > 0
+    assert rep.total_requested > rep.unique_pipelines
+    assert rep.deduped_count == rep.total_requested - rep.unique_pipelines
+    assert rep.deduped_count > 0
+    assert rep.dedup_ratio > 0.0
+    for pipe in rep.pipelines:
+        assert pipe.kernel_name.startswith("omlx_"), pipe
+
+    # Verify proof_tasks deduplication across two identical switch layers.
+    sw_model = nn.Module()
+    sw_model.s0 = model.sw0
+    sw_model.s1 = model.sw1
+    sw_rep = debug.warm_report(sw_model, dtypes=(mx.bfloat16,), compile=False)
+    proof_pipes = [p for p in sw_rep.pipelines if p.kind == "proof_task"]
+    assert proof_pipes, sw_rep.pipelines
+    assert all(p.requested_count == 2 for p in proof_pipes), proof_pipes
+    assert sw_rep.deduped_count >= len(proof_pipes)
+
+    # Formatting text & JSON.
+    txt = debug.format_warm_report(rep, as_json=False)
+    assert "unique_pipelines" in txt or "Pipelines" in txt
+    parsed = json.loads(debug.format_warm_report(rep, as_json=True))
+    assert parsed["layers_scanned"] == 6
+    assert parsed["deduped_count"] == rep.deduped_count
+
+
+def test_warm_report_compile_failure_awaits_all_futures(monkeypatch):
+    awaited: list[str] = []
+
+    class _TrackingFuture:
+        def __init__(self, label: str, fail: bool = False):
+            self.label = label
+            self.fail = fail
+
+        def result(self, timeout=None):
+            awaited.append(self.label)
+            if self.fail:
+                raise RuntimeError(f"synthetic build error on {self.label}")
+            return None
+
+    def fake_warm(instances):
+        return (
+            _TrackingFuture("first", fail=True),
+            _TrackingFuture("second", fail=False),
+        )
+
+    monkeypatch.setattr(kernels, "warm", fake_warm)
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    with pytest.raises(RuntimeError, match="synthetic build error on first"):
+        debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=True)
+    assert awaited == ["first", "second"]
+
+
+def test_warm_report_fail_closed(monkeypatch):
+    with pytest.raises(ValueError, match="no FormatLinear"):
+        debug.warm_report([], compile=False)
+
+    plain_model = nn.Module()
+    plain_model.fc = nn.Linear(64, 64)
+    with pytest.raises(ValueError, match="no FormatLinear"):
+        debug.warm_report(plain_model, compile=False)
+
+    with testing.verified("qwen4_exp"):
+        ph = FormatLinear(
+            "affine",
+            4,
+            64,
+            256,
+            {
+                "weight": mx.zeros((64, 32), dtype=mx.uint32),
+                "scales": mx.zeros((64, 4), dtype=mx.bfloat16),
+                "biases": mx.zeros((64, 4), dtype=mx.bfloat16),
+            },
+            placeholders=True,
+        )
+    with pytest.raises(ValueError, match="placeholder"):
+        debug.warm_report(ph, compile=False)
+
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    with pytest.raises(ValueError):
+        debug.warm_report(layer, dtypes=("fp32",), compile=False)
+    with pytest.raises(ValueError):
+        debug.warm_report(layer, per_rows=(0,), compile=False)
+
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="Metal"):
+        debug.warm_report(layer, compile=True)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal GPU")
+def test_warm_report_gpu_compiles_once_and_zero_runtime_proofs():
+    # Use a distinct shape (k=384, n=384) to exercise real Metal compilation.
+    layers = [
+        debug.make_layer("affine", bits=4, group_size=64, k=384, n=384, seed=i)
+        for i in range(2)
+    ]
+
+    # 1. isolated_proofs=True isolates global kernels._PROOFS while warming Metal.
+    proofs_before = dict(kernels._PROOFS)
+    rep_iso = debug.warm_report(
+        layers, dtypes=(mx.bfloat16,), compile=True, isolated_proofs=True
+    )
+    assert dict(kernels._PROOFS) == proofs_before
+    assert rep_iso.compile_executed is True
+    assert rep_iso.unique_pipelines > 0
+    assert rep_iso.compile_ms >= 0.0
+    assert rep_iso.runtime_proof_delta == 0
+
+    rep_iso2 = debug.warm_report(
+        layers, dtypes=(mx.bfloat16,), compile=True, isolated_proofs=True
+    )
+    assert rep_iso2.already_built == rep_iso2.unique_pipelines
+    assert rep_iso2.compiled_now == 0
+
+    # 2. Within fresh_proofs, warm_report populates Proof.ran so forward has 0 proofs.
+    with testing.fresh_proofs():
+        rep1 = debug.warm_report(
+            layers, dtypes=(mx.bfloat16,), compile=True, isolated_proofs=False
+        )
+        assert rep1.unique_pipelines > 0
+        assert rep1.runtime_proof_delta == 0
+        rep2 = debug.warm_report(
+            layers, dtypes=(mx.bfloat16,), compile=True, isolated_proofs=False
+        )
+        assert rep2.already_built == rep2.unique_pipelines
+        assert rep2.compiled_now == 0
+
+        cnt_before = kernels.proof_count()
+        x = mx.zeros((1, 1, 384), dtype=mx.bfloat16)
+        y = layers[0](x)
+        mx.eval(y)
+        assert kernels.proof_count() == cnt_before
