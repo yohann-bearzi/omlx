@@ -6,6 +6,8 @@ from __future__ import annotations
 import importlib
 import json
 import mmap
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -201,6 +203,59 @@ def test_qwen4_exp_model_file_checkpoints_resolve_to_vendored_module(tmp_path):
 
     assert model_type == "qwen4_exp"
     assert module is qwen4_exp
+
+
+def _composed_trust_script(tmp_path, trust_first: bool) -> str:
+    path = repr(str(tmp_path))
+    steps = [
+        "import sys",
+        "",
+        'assert "omlx.utils.model_loading" not in sys.modules, "already imported"',
+        "import mlx_vlm.utils as utils",
+        "from omlx.patches.mlx_vlm_qwen4_exp_compat import (",
+        "    apply_mlx_vlm_qwen4_exp_compat_patch,",
+        ")",
+    ]
+    if trust_first:
+        steps.append("import omlx.utils.model_loading  # noqa: F401")
+    steps.append("apply_mlx_vlm_qwen4_exp_compat_patch()")
+    if not trust_first:
+        steps.append("import omlx.utils.model_loading  # noqa: F401")
+    steps += [
+        "assert (",
+        "    getattr(utils.get_model_and_args, \"_omlx_qwen4_exp_bypass\", False)",
+        "    is " + str(trust_first) + "), \"unexpected wrapper order\"",
+        "",
+        "module, model_type = utils.get_model_and_args(",
+        '    {"model_type": "qwen4_exp", "model_file": "qwen4_exp.py"},',
+        f"    model_path={path},",
+        ")",
+        'assert model_type == "qwen4_exp", model_type',
+        'assert module.__name__ == "mlx_vlm.models.qwen4_exp", module.__name__',
+        "",
+        "try:",
+        "    utils.get_model_and_args(",
+        '        {"model_type": "custom", "model_file": "model.py"},',
+        f"        model_path={path},",
+        "    )",
+        "except ValueError as error:",
+        '    assert "Trust Remote Code" in str(error), error',
+        "else:",
+        '    raise AssertionError("a custom model_file was not refused")',
+    ]
+    return "\n".join(steps)
+
+
+@pytest.mark.parametrize("trust_first", [False, True])
+def test_model_file_trust_composes_with_the_qwen4_bypass_in_either_order(
+    tmp_path, trust_first
+):
+    """In a shard that applies the qwen4 compat first, the trust check must
+    still see that the bypass drops ``model_file`` before the registry
+    lookup; a load that trusts the model first must behave the same, and
+    other custom files stay refused in both orders."""
+    code = _composed_trust_script(tmp_path, trust_first)
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 @pytest.mark.parametrize("quantized", [False, True])

@@ -1430,6 +1430,32 @@ def test_split_swiglu_oai_unsupported_calls_return_none():
     assert call(scales=(ones, mx.ones((M,)))) is None
 
 
+@needs_nax
+@pytest.mark.parametrize("bits", [3, 4])
+def test_split_affine_swiglu_bit_identical(bits):
+    """Separate affine gate/up with mapped rows and a clamp: 3-bit codes
+    cross 32-bit word boundaries, 4-bit codes do not, and both widths must
+    fuse and match the unfused gather bit for bit."""
+    experts, out_dim, k_len, gs, limit = 8, 64, 256, 64, 7.0
+    dtype = mx.bfloat16
+    gate = _quantized(experts, out_dim, k_len, "affine", bits, gs, dtype, seed=0)[:3]
+    up = _quantized(experts, out_dim, k_len, "affine", bits, gs, dtype, seed=3)[:3]
+    x, idx = _rows([16] * experts, k_len, dtype)
+    row_map = mx.arange(int(idx.shape[0]) - 1, -1, -1, dtype=mx.uint32)
+    nax._verified.pop(("split_affine", dtype, limit, bits, gs), None)
+    out = nax.split_affine_swiglu(
+        x, gate, up, idx, row_map, limit, bits=bits, group_size=gs
+    )
+    assert out is not None
+    rows = x[row_map]
+    want = nax.reference_activation(
+        _stock_sorted(rows, *up, idx, "affine", bits, gs),
+        _stock_sorted(rows, *gate, idx, "affine", bits, gs),
+        limit,
+    )
+    assert nax._bits_equal(out, want)
+
+
 # ---------------------------------------------------------------------------
 # Model forwards: epilogue and row map vs the unfused path
 # ---------------------------------------------------------------------------

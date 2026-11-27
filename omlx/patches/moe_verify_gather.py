@@ -162,6 +162,9 @@ def _order(rhs: mx.array) -> mx.array:
     )[0]
 
 
+pair_order = _order
+
+
 @cache
 def _ordered_kernel(face: Dot, small_offsets: bool = False):
     matrices = kernels.Matrices()

@@ -49,6 +49,7 @@ try:
     from omlx.patches.inkling2 import apply_inkling2_patch
     from omlx.patches.inkling2 import oq_layout as inkling2_layout
     from omlx.patches.mlx_vlm_minimax_m3_compat import virtual_nvfp4 as minimax_nvfp4
+    from omlx.utils.model_loading import _nextn_weight_prefixes_from_config
 
     HAS_MLX = True
 except ImportError:
@@ -93,6 +94,21 @@ _OQ_DEFAULT_GROUP_SIZE = 64
 _GLM_INDEXER_Q8 = {"bits": 8, "group_size": 64, "mode": "affine"}
 _GLM_INDEXER_PROJECTIONS = ("wq_b", "wk", "weights_proj")
 _MINIMAX_INDEXER_PROJECTIONS = ("index_q_proj", "index_k_proj")
+_HY_V4_MODEL_TYPES = ("hy_v4_vl", "hy_v4_flash")
+_HY_V4_INDEXER_PROJECTIONS = (
+    ".self_attn.indexer.wq_b",
+    ".self_attn.indexer.wk",
+    ".self_attn.indexer.weights_proj",
+    ".self_attn.compressed_indexer.query_projection",
+    ".self_attn.compressed_indexer.head_weight_projection",
+    ".self_attn.compressed_indexer.token_key_projection",
+)
+# Hy4-flash pools its compressed-indexer keys with these weights in fp32.
+_HY_V4_FP32_PROJECTIONS = (
+    ".self_attn.compressed_indexer.key_value_projection",
+    ".self_attn.compressed_indexer.key_gate_projection",
+)
+_HY_V4_ENGRAM_TABLE = ".engram_layer.multi_head_embedding.embedding"
 
 _QWEN4_EXP_NGRAM_GROUP_SIZE = 32
 _QWEN4_EXP_NGRAM_SHARD_RE = re.compile(
@@ -656,10 +672,38 @@ def _minimax_indexer_q8_override(path: str, config: dict) -> dict | None:
     return dict(_GLM_INDEXER_Q8)
 
 
+def _is_hy_v4_config(config: dict) -> bool:
+    return str(config.get("model_type", "")) in _HY_V4_MODEL_TYPES
+
+
+def _hy_v4_indexer_q8_override(path: str, config: dict) -> dict | None:
+    """Q8 for the projections Hy4's indexers select key slots with.
+
+    As for GLM and MiniMax, quantization error here changes the selection
+    itself, and the projections are a small part of the model.
+    """
+    if not _is_hy_v4_config(config):
+        return None
+    if not _normalize_quant_path(path).endswith(_HY_V4_INDEXER_PROJECTIONS):
+        return None
+    return dict(_GLM_INDEXER_Q8)
+
+
 def _indexer_q8_override(path: str, config: dict) -> dict | None:
-    return _glm_indexer_q8_override(path, config) or _minimax_indexer_q8_override(
-        path, config
+    return (
+        _glm_indexer_q8_override(path, config)
+        or _minimax_indexer_q8_override(path, config)
+        or _hy_v4_indexer_q8_override(path, config)
     )
+
+
+def _is_hy_v4_engram_table(path: str, config: dict) -> bool:
+    """Hy4-flash's hashed n-gram tables (about 31.7 GB each in BF16).
+
+    Rows are gathered by id, 96 wide, so they take the offload-table policy:
+    group 32 and no share of the resident bit budget.
+    """
+    return _is_hy_v4_config(config) and _HY_V4_ENGRAM_TABLE in path
 
 
 def _is_qwen4_exp_ngram_embedding_tensor(path: str, config: dict) -> bool:
@@ -733,6 +777,8 @@ def universal_quant_predicate(
     indexer_override = _indexer_q8_override(path, config)
     if indexer_override is not None:
         return indexer_override
+    if _is_hy_v4_config(config) and path.endswith(_HY_V4_FP32_PROJECTIONS):
+        return False
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1110,6 +1156,7 @@ def _budgeted_shapes(named_shapes: dict[str, tuple], config: dict) -> dict[str, 
         path: shape
         for path, shape in named_shapes.items()
         if not _is_qwen4_exp_ngram_embedding_tensor(path, config)
+        and not _is_hy_v4_engram_table(path, config)
         and not _is_vision_tensor(path)
         and not _is_audio_tensor(path)
         and not _is_lfm3_speech_module(path, config)
@@ -3185,6 +3232,15 @@ _FP8_WEIGHT_DTYPES = frozenset(("F8_E4M3", "F8_E5M2", "I8"))
 
 def _block_dequant_fp8(weight_raw, scale_raw, w_dtype, s_dtype):
     """Block-scaled dequant of a single FP8/I8 weight+scale pair to BF16."""
+    if weight_raw.ndim == 3 and scale_raw.ndim == 3:
+        # Fused expert stacks (Hy4-flash experts.gate_up_proj) carry one scale
+        # grid per expert; dequantize one expert at a time.
+        return mx.stack(
+            [
+                _block_dequant_fp8(weight_raw[e], scale_raw[e], w_dtype, s_dtype)
+                for e in range(weight_raw.shape[0])
+            ]
+        )
     # MXFP8 checkpoints (e.g. MiniMax-M3) save the e8m0 shared exponents
     # with safetensors dtype U8: fp8 weight, one scale byte per 32 columns.
     # Those bytes are exponents, not linear scales. Float-typed scales
@@ -4025,6 +4081,9 @@ def validate_quantizable(config: dict) -> bool:
             # Muse Spark NVFP4 experts pass through; the rest is BF16.
             if _is_muse_spark_modelopt_nvfp4(config):
                 return True
+            # Inkling 2 releases declare their native experts as ModelOpt NVFP4.
+            if inkling2_layout.is_inkling2(config) and quant_method == "modelopt":
+                return True
         return False
     return True
 
@@ -4058,12 +4117,34 @@ def make_predicate(config: dict, oq_level: int = 4) -> Callable:
     return predicate
 
 
+def _estimate_mtp_donor_bytes(source: Path, config: dict, donor: Path) -> int:
+    donor_config = json.loads((donor / "config.json").read_text())
+    assistant = donor_config.get("model_type") in GEMMA4_ASSISTANT_TYPES.values()
+    if assistant:
+        validate_gemma4_assistant_pair(config, donor_config)
+    else:
+        validate_mtp_donor_pair(source, donor)
+    mapping = _shard_key_map(donor)
+    if not assistant:
+        mapping = {
+            key: shard for key, shard in mapping.items() if _strip_mtp_key_prefix(key)
+        }
+    if not mapping:
+        raise ValueError(f"No MTP tensors found in donor model: {donor}")
+    index = _LazyTensorIndex({donor / shard for shard in mapping.values()})._index
+    return sum(index[key][3] - index[key][2] for key in mapping)
+
+
 def estimate_bpw_and_size(
     model_path: str,
     oq_level: int,
     group_size: int = 64,
     preserve_mtp: bool = False,
     preserve_ngram_table: bool = False,
+    *,
+    text_only: bool = False,
+    dtype: str = "bfloat16",
+    mtp_assistant_model_path: str = "",
 ) -> dict:
     """Calculate precise effective bpw and output size by scanning actual tensors.
 
@@ -4079,6 +4160,10 @@ def estimate_bpw_and_size(
             source bytes, as ``quantize_oq_streaming`` stores them.
         oq_level: Target oQ level (base bits).
         group_size: Quantization group size.
+        text_only: Omit vision and audio tensors from the output.
+        dtype: Output dtype used by the streaming exporter.
+        mtp_assistant_model_path: Add the donor head's stored bytes to the
+            output size. Effective bpw describes the weights priced by oQ.
 
     Returns:
         Dict with effective_bpw, output_size_bytes, output_size_formatted.
@@ -4087,6 +4172,12 @@ def estimate_bpw_and_size(
     config_path = source / "config.json"
     with open(config_path) as f:
         config = json.load(f)
+
+    if dtype not in OQ_DTYPES:
+        raise ValueError(f"Invalid dtype {dtype!r}. Must be one of {OQ_DTYPES}")
+    _validate_oq_dtype_for_model(config, dtype)
+    if text_only and decision_kind(source, config) == "d3":
+        raise ValueError("Decision 3.0 requires its vision encoder")
 
     weight_files = _source_weight_files(source)
     if not weight_files:
@@ -4102,10 +4193,22 @@ def estimate_bpw_and_size(
         if not _checkpoint_has_mtp_weights(source):
             preserve_mtp = False
 
+    donor_bytes = 0
+    if mtp_assistant_model_path:
+        if preserve_mtp:
+            raise ValueError(
+                "Preserving MTP and combining an MTP head are mutually exclusive"
+            )
+        donor_bytes = _estimate_mtp_donor_bytes(
+            source, config, Path(mtp_assistant_model_path)
+        )
+
     if config.get("model_type") == "deepseek_v41":
         from .patches.deepseek_v41.oq import source_budget
 
-        _validate_v41_oq_settings(oq_level, group_size=group_size)
+        _validate_v41_oq_settings(oq_level, dtype, group_size)
+        if text_only:
+            raise ValueError("V4.1 oQ export currently preserves the vision encoder")
         if "omlx_deepseek_v41" in config:
             raise ValueError("V4.1 quantization requires the original checkpoint")
         mapping = json.loads((source / "model.safetensors.index.json").read_text())[
@@ -4167,13 +4270,16 @@ def estimate_bpw_and_size(
     # model as fp16 passthrough (15.8 bpw for a 4-bit run). Falls back to
     # the raw header names when discovery is unavailable.
     plan_view = None
+    cast_predicate = None
     try:
         _sanitize_fn = _build_model_sanitizer(
             config,
+            text_only=text_only,
             model_path=source,
             preserve_mtp=preserve_mtp,
         )
         if _sanitize_fn is not None:
+            cast_predicate = getattr(_sanitize_fn, "_omlx_cast_predicate", None)
             _plan = _discover_sanitize_plan(_sanitize_fn, idx)
             if _plan:
                 plan_view = _DiscoveredPlan(_plan, idx)
@@ -4186,13 +4292,13 @@ def estimate_bpw_and_size(
             if info.get("transform") == "literal":
                 continue
             shape = tuple(info.get("shape") or ())
-            dtype = info.get("dtype")
+            tensor_dtype = info.get("dtype")
             sources = info.get("sources") or []
-            if dtype is None and len(sources) == 1:
+            if tensor_dtype is None and len(sources) == 1:
                 src_meta = logical.get(sources[0])
                 if src_meta is not None:
-                    dtype = src_meta[1]
-            planned_logical[out_name] = (shape, dtype)
+                    tensor_dtype = src_meta[1]
+            planned_logical[out_name] = (shape, tensor_dtype)
         if planned_logical:
             logical = planned_logical
 
@@ -4200,6 +4306,14 @@ def estimate_bpw_and_size(
         if plan_view is not None:
             return plan_view.source_quant_info(name)
         return idx.source_quant_info(name)
+
+    nextn_prefixes = _nextn_weight_prefixes_from_config(config)
+    logical = {
+        name: meta
+        for name, meta in logical.items()
+        if not _should_skip_tensor(name, preserve_mtp, text_only=text_only)
+        and (preserve_mtp or not name.startswith(nextn_prefixes))
+    }
 
     named_shapes = {}
     for name, (shape, _dtype) in logical.items():
@@ -4267,24 +4381,12 @@ def estimate_bpw_and_size(
         for d in shape:
             n_elements *= d
 
-        if _should_skip_tensor(name, preserve_mtp=preserve_mtp):
-            continue
-
-        if not _should_quantize_tensor(name, shape):
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
-        bits, gs, _mode = _get_predicate_bits(name, config, oq_level, group_size)
-        if bits is None:
-            total_params += n_elements
-            total_weighted_bits += n_elements * 16
-            total_output_bytes += n_elements * 2
-            continue
-
         total_params += n_elements
-        src_info = _source_quant_info(name)
+        bits, gs, mode = (None, None, None)
+        if _should_quantize_tensor(name, shape):
+            bits, gs, mode = _get_predicate_bits(name, config, oq_level, group_size)
+
+        src_info = _source_quant_info(name) if bits is not None else None
         if src_info is not None and bits >= src_info["bits"]:
             # Passthrough: packed weight at source bits plus one e8m0
             # uint8 scale byte per group.
@@ -4292,25 +4394,28 @@ def estimate_bpw_and_size(
             n_groups = shape[-1] // src_info["group_size"]
             tensor_bytes = (n_elements * src_info["bits"] + 7) // 8
             tensor_bytes += rows * n_groups
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
-        elif len(shape) >= 2:
-            n_groups = (shape[-1] + gs - 1) // gs
+        elif bits is not None and shape[-1] % gs == 0:
+            n_groups = shape[-1] // gs
             rows = n_elements // max(shape[-1], 1)
             weight_bytes = (n_elements * bits + 7) // 8
-            if _mode == "mxfp4":
+            if mode == "mxfp4":
                 bytes_per_group = 1
-            elif _mode == "mxfp8":
+            elif mode == "mxfp8":
                 bytes_per_group = 2
             else:
                 bytes_per_group = 4
             overhead_bytes = rows * n_groups * bytes_per_group
             tensor_bytes = weight_bytes + overhead_bytes
-            total_output_bytes += tensor_bytes
-            total_weighted_bits += tensor_bytes * 8
         else:
-            total_output_bytes += n_elements * 2
-            total_weighted_bits += n_elements * 16
+            cast = cast_predicate is None or cast_predicate(name)
+            fp32 = (
+                _oq_media_output_is_fp32(name, dtype == "float16")
+                if cast
+                else _dtype is not None and _dtype in ("F32", mx.float32)
+            )
+            tensor_bytes = n_elements * (4 if fp32 else 2)
+        total_output_bytes += tensor_bytes
+        total_weighted_bits += tensor_bytes * 8
 
     for k in ("_oq_use_budget_plan", "_oq_boost_map", "_oq_sensitivity_map"):
         config.pop(k, None)
@@ -4333,6 +4438,7 @@ def estimate_bpw_and_size(
             effective_bpw += 0.3 * _down_boost
             total_output_bytes = int(effective_bpw * total_params / 8)
 
+    total_output_bytes += donor_bytes
     source_total = sum(sf.stat().st_size for sf in _source_weight_files(source))
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
@@ -4674,22 +4780,26 @@ _SKIP_QUANT_PATTERNS = (
 )
 
 
-def _should_skip_tensor(name: str, preserve_mtp: bool = False) -> bool:
-    """Check if a tensor should be completely excluded from output.
-
-    By default mtp.* tensors are stripped because mlx-lm's stock sanitize()
-    removes them when the model has no MTP head. When ``preserve_mtp`` is
-    True the caller has stashed mtp.* tensors around the sanitize call and
-    re-merged them, so we must keep them in the output shards.
-    """
-    if ".mtp." in name or name.startswith("mtp."):
-        return not preserve_mtp
-    return False
+def _should_skip_tensor(
+    name: str, preserve_mtp: bool = False, *, text_only: bool = False
+) -> bool:
+    return (not preserve_mtp and _is_mtp_tensor(name)) or (
+        text_only and (_is_vision_tensor(name) or _is_audio_tensor(name))
+    )
 
 
 def _is_mtp_tensor(name: str) -> bool:
-    """Return True iff the tensor key belongs to an MTP head."""
-    return name.startswith("mtp.") or ".mtp." in name
+    """Return True iff the tensor key belongs to an MTP head.
+
+    Hy4's DFly2 drafter is ``model.dfly_layers.*`` in the checkpoint and
+    ``language_model.dfly.*`` after sanitize.
+    """
+    return (
+        name.startswith("mtp.")
+        or ".mtp." in name
+        or ".dfly." in name
+        or ".dfly_layers." in name
+    )
 
 
 def _source_has_nextn_tensors(keys, config: dict) -> bool:
@@ -4716,7 +4826,11 @@ def _normalize_mtp_in_config(config: dict) -> None:
     while the actual mtp.* tensors are stripped, producing the
     "Missing N parameters" load error we hit on Qwen3.5-27B.
     """
-    for key in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
+    for key in (
+        "mtp_num_hidden_layers",
+        "num_nextn_predict_layers",
+        "dfly_num_hidden_layers",
+    ):
         if key in config and config[key]:
             config[key] = 0
     text_cfg = config.get("text_config")
@@ -4788,14 +4902,16 @@ def _should_quantize_tensor(name: str, shape: tuple) -> bool:
     return True
 
 
+def _oq_media_output_is_fp32(name: str, fp16: bool) -> bool:
+    return fp16 and (_is_vision_tensor(name) or _is_audio_tensor(name))
+
+
 def _cast_passthrough_tensor(tensor_name: str, w_mx, target_dtype):
     """Cast an unquantized output tensor to its storage dtype."""
     if not mx.issubdtype(w_mx.dtype, mx.floating):
         return w_mx
 
-    if target_dtype == mx.float16 and (
-        _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
-    ):
+    if _oq_media_output_is_fp32(tensor_name, target_dtype == mx.float16):
         if w_mx.dtype != mx.float32:
             return w_mx.astype(mx.float32)
         return w_mx
@@ -4862,7 +4978,10 @@ def _build_model_sanitizer(
         any("ForConditionalGeneration" in a for a in architectures)
         or _has_vision_subconfig(config)
         or model_type in VLM_NATIVE_TEXT_MODEL_TYPES
-    ) and not (mlx_lm_text_only or (text_only and model_type != "glm5_next"))
+    ) and not (
+        mlx_lm_text_only
+        or (text_only and model_type not in ("glm5_next", *_HY_V4_MODEL_TYPES))
+    )
 
     # Serving normally registers oMLX's vendored Qwen4 implementation before
     # mlx-vlm class lookup. Quantization does not pass through that loader.
@@ -4915,6 +5034,10 @@ def _build_model_sanitizer(
                     )
 
                     apply_mlx_vlm_muse_glimmer_compat_patch()
+                if model_type in _HY_V4_MODEL_TYPES:
+                    from omlx.patches.hy_v4 import apply_patch as apply_hy_v4_patch
+
+                    apply_hy_v4_patch()
                 if model_type == "glm5_next":
                     from omlx.patches.mlx_vlm_glm5_next_compat import (
                         apply_mlx_vlm_glm5_next_compat_patch,
@@ -5103,6 +5226,8 @@ def _build_model_sanitizer(
                 )
 
                 _vlm_sanitize._omlx_cast_predicate = glm5_next_cast_predicate
+            if model_type in _HY_V4_MODEL_TYPES:
+                _vlm_sanitize._omlx_cast_predicate = model_module.cast_predicate
             if model_type in ("minimax_m3", "minimax_m3_vl"):
                 # Take the predicate from the language module the config
                 # resolved to. Importing it by name could load upstream
@@ -5460,7 +5585,7 @@ def _is_mtp_protected_tensor(name: str) -> bool:
     full precision; the MTP block's internal decoder block (attn/ffn)
     gets the same quantization as the backbone's other layers.
     """
-    if not (name.startswith("mtp.") or ".mtp." in name):
+    if not _is_mtp_tensor(name):
         return False
     # Qwen3.5/3.6 fusion projection
     if name.endswith("mtp.fc.weight") or ".mtp.fc.weight" in name:
@@ -5508,8 +5633,13 @@ def _get_predicate_bits(
     # and use the group-32 layout published by existing Qwen4-Exp
     # quantizations. Embeddings have no input-channel imatrix entry; the
     # streaming loop deliberately applies ordinary affine quantization.
-    if _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config) or (
-        config.get("model_type") == "deepseek_v41" and ".engram.embed" in tensor_name
+    if (
+        _is_qwen4_exp_ngram_embedding_tensor(tensor_name, config)
+        or (
+            config.get("model_type") == "deepseek_v41"
+            and ".engram.embed" in tensor_name
+        )
+        or _is_hy_v4_engram_table(tensor_name, config)
     ):
         return _offload_table_bits(oq_level), _QWEN4_EXP_NGRAM_GROUP_SIZE, "affine"
 
@@ -9977,8 +10107,8 @@ def _find_model_layers(model):
     if getattr(model, "model_type", None) == "muse_spark":
         # mlx-lm's Muse Spark normalizes its token embeddings.
         return model.model.language_model.embed, model.layers
-    if getattr(model, "model_type", None) == inkling2_layout.MODEL_TYPE:
-        return inkling2_layout.embed_fn(model), model.layers
+    if inkling2_layout.is_inkling2_model(model):
+        return inkling2_layout.embed_fn(model), inkling2_layout.walk_layers(model)
     if getattr(model, "model_type", None) == "spark2_5":
         # afm7 also uses ``embedding`` but keeps kv-reuse blocks outside model.layers.
         return model.model.embedding, model.model.layers
@@ -10282,8 +10412,71 @@ def _forward_gemma4_layer_result(block, inputs, mask, state, layer_idx: int):
     return result[0], (result[1], result[2])
 
 
+_HY_V4_LAYER_STATE_KIND = "hy_v4"
+
+
+def _hy_v4_layer_inputs(args, media_token_ids, calib_data, inputs):
+    """Hy4 layer inputs as its own forward builds them.
+
+    Layers run on hc_mult identical streams, take the mask of their attention
+    kind, the top-k of the previous sparse layer (shared indexer layers reuse
+    it) and, on Hy4-flash, the prompt's Engram n-grams.
+    """
+    from omlx.patches.hy_v4.language import engram_inputs
+
+    b, length, d = inputs.shape
+    streams = mx.contiguous(
+        mx.broadcast_to(inputs[:, :, None, :], (b, length, args.hc_mult, d))
+    )
+    by_kind = {
+        "sparse": create_attention_mask(inputs, None, return_array=True),
+        "sliding": create_attention_mask(
+            inputs, None, window_size=args.sliding_window, return_array=True
+        ),
+    }
+    masks = [by_kind[kind] for kind in args.attention_kinds]
+    engram = None
+    if args.engram_layer_ids:
+        engram = engram_inputs(calib_data, args, media_token_ids)
+    state = {
+        "kind": _HY_V4_LAYER_STATE_KIND,
+        "kinds": tuple(args.attention_kinds),
+        "engram": engram,
+        "prev_topk": None,
+    }
+    return streams, masks, state
+
+
+def _prepare_hy_v4_layer_inputs(model, calib_data, inputs):
+    language_model = model.language_model
+    return _hy_v4_layer_inputs(
+        language_model.config, language_model.media_token_ids, calib_data, inputs
+    )
+
+
+def _streamed_hy_v4_state(config: dict, calib_data, embedded):
+    """Streamed counterpart of _prepare_hy_v4_layer_inputs."""
+    from omlx.patches.hy_v4.config import ModelConfig
+
+    model_config = ModelConfig.from_dict(config)
+    media = (model_config.image_token_id, model_config.video_token_id)
+    return _hy_v4_layer_inputs(model_config.text_config, media, calib_data, embedded)
+
+
+def _hy_v4_slot_state(state: dict, lo: int, hi: int) -> dict:
+    """The forward state of draw rows [lo, hi) of a streamed round."""
+    engram = state["engram"]
+    if engram is not None:
+        engram = tuple(part[lo:hi] for part in engram)
+    return {**state, "engram": engram}
+
+
 def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None:
     if not isinstance(state, dict):
+        return
+    if state.get("kind") == _HY_V4_LAYER_STATE_KIND:
+        if state["kinds"][layer_idx] == "sparse":
+            state["prev_topk"] = aux
         return
     if state.get("kind") == _GEMMA4_LAYER_STATE_KIND:
         if not isinstance(aux, tuple) or len(aux) != 2:
@@ -10295,12 +10488,37 @@ def _commit_layer_forward_aux(state, layer_idx: int, aux, fallback=None) -> None
             state["intermediates"][layer_idx] = aux
     elif state.get("kind") == "glm_moe_dsa":
         state["prev_topk_indices"] = aux if aux is not None else fallback
-    elif state.get("kind") in (_KIMI_K3_LAYER_STATE_KIND, _INKLING2_LAYER_STATE_KIND):
+    elif state.get("kind") == _KIMI_K3_LAYER_STATE_KIND:
         state["blocks"] = aux
+    elif state.get("kind") == _INKLING2_LAYER_STATE_KIND:
+        state.update(aux)
+
+
+def _walk_layer_index(position_ids, step: int) -> int:
+    """The decoder layer that calibration walk step ``step`` runs."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
+    ):
+        # A looped Inkling 2 layer runs once per pass.
+        return inkling2_layout.walk_layer_index(position_ids, step)
+    return step
 
 
 def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
     """Forward pass through a transformer layer, returning output and aux."""
+    if (
+        isinstance(position_ids, dict)
+        and position_ids.get("kind") == _HY_V4_LAYER_STATE_KIND
+    ):
+        try:
+            return block(
+                inputs, mask, None, position_ids["prev_topk"], position_ids["engram"]
+            )
+        except (TypeError, ValueError, RuntimeError, AttributeError) as e:
+            raise RuntimeError(
+                f"Hy4 calibration forward failed at layer {layer_idx}: {e}"
+            ) from e
     if (
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _FLINT_LAYER_STATE_KIND
@@ -10388,11 +10606,8 @@ def _forward_layer_result(block, inputs, mask, position_ids, layer_idx=None):
         isinstance(position_ids, dict)
         and position_ids.get("kind") == _INKLING2_LAYER_STATE_KIND
     ):
-        # A copy per call: a layer appends its completed block in place, and the
-        # sensitivity walk runs each block twice on the same inputs.
-        blocks = list(position_ids["blocks"])
         try:
-            return block(inputs, blocks, cache=None), blocks
+            return inkling2_layout.walk_step(block, position_ids, layer_idx, inputs)
         except (TypeError, ValueError, RuntimeError, AttributeError) as e:
             raise RuntimeError(
                 f"Inkling 2 calibration forward failed at layer {layer_idx}: {e}"
@@ -10711,10 +10926,13 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     )
     if model_type == "flint":
         return inputs, [None] * len(layers), {"kind": _FLINT_LAYER_STATE_KIND}
-    if model_type == inkling2_layout.MODEL_TYPE:
+    if inkling2_layout.is_inkling2_model(model):
         # Layers mix the completed attention-residual blocks of earlier layers,
         # build their own masks and take no cache.
-        state = {"kind": _INKLING2_LAYER_STATE_KIND, "blocks": []}
+        state = {
+            "kind": _INKLING2_LAYER_STATE_KIND,
+            **inkling2_layout.walk_state(model),
+        }
         return inputs, [None] * len(layers), state
     gemma4_inputs = _prepare_gemma4_layer_inputs(model, layers, calib_data, inputs)
     if gemma4_inputs is not None:
@@ -10729,6 +10947,8 @@ def _prepare_layer_inputs(model, layers, calib_data, inputs, *, noncausal=False)
     )
     if embedding_gemma2_inputs is not None:
         return embedding_gemma2_inputs
+    if model_type in _HY_V4_MODEL_TYPES:
+        return _prepare_hy_v4_layer_inputs(model, calib_data, inputs)
     if model_type == "glm5_next":
         language_model = getattr(model, "language_model", None)
         args = getattr(language_model, "args", None)
@@ -11122,10 +11342,14 @@ def _collect_untied_lm_head_imatrix(core, hidden, collector, name) -> bool:
 
 
 def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
-    if str(getattr(model, "model_type", "")) not in ("glm5_next", "flint"):
+    model_type = str(getattr(model, "model_type", ""))
+    if model_type not in ("glm5_next", "flint", *_HY_V4_MODEL_TYPES):
         return False
     language_model = getattr(model, "language_model", None)
     core = getattr(language_model, "model", None)
+    if model_type in _HY_V4_MODEL_TYPES and core is not None:
+        # Hy4 collapses its streams with a learned head before the norm.
+        hidden = core.hc_head(hidden)
     return _collect_untied_lm_head_imatrix(
         core, hidden, collector, "language_model.lm_head"
     )
@@ -11133,7 +11357,7 @@ def _collect_language_model_lm_head_imatrix(model, hidden, collector) -> bool:
 
 def _collect_inkling2_lm_head_imatrix(model, hidden, state, collector) -> bool:
     """Capture the head input: the last layer's mixture of all blocks, normed."""
-    if str(getattr(model, "model_type", "")) != inkling2_layout.MODEL_TYPE:
+    if not inkling2_layout.is_inkling2_model(model):
         return False
     module = collector._original_modules.get("lm_head")
     if module is None or not isinstance(state, dict):
@@ -11621,6 +11845,7 @@ _QWEN3_5_STREAM_MODEL_TYPES = frozenset(
 _STREAM_CALIBRATION_SUPPORTED_MODEL_TYPES = frozenset(
     {"minimax_m3_vl", "qwen4_exp", "glm5_next", "muse_spark", "flint"}
     | _QWEN3_5_STREAM_MODEL_TYPES
+    | set(_HY_V4_MODEL_TYPES)
 )
 
 
@@ -11649,6 +11874,11 @@ def _streamed_text_args(model_path, config, *, trust_remote_code: bool = False):
         from mlx_vlm.models.flint.language import DecoderLayer
 
         return ModelConfig.from_dict(config), DecoderLayer
+    if _is_hy_v4_config(config):
+        from omlx.patches.hy_v4.config import ModelConfig
+        from omlx.patches.hy_v4.language import DecoderLayer
+
+        return ModelConfig.from_dict(config).text_config, DecoderLayer
     if _stream_source_model_type(config) == "qwen4_exp":
         from mlx_vlm.models.qwen4_exp.config import TextConfig
         from mlx_vlm.models.qwen4_exp.language import Qwen4ExpDecoderLayer
@@ -12062,6 +12292,18 @@ def _streamed_sensitivity_state(
             "position_ids": {"kind": _FLINT_LAYER_STATE_KIND},
             "scores": {},
         }
+    if _is_hy_v4_config(config):
+        inputs, layer_masks, position_ids = _streamed_hy_v4_state(
+            config, calib_data, inputs
+        )
+        mx.eval(inputs)
+        return {
+            "inputs": inputs,
+            "mask": None,
+            "layer_masks": layer_masks,
+            "position_ids": position_ids,
+            "scores": {},
+        }
     if _stream_source_model_type(config) == "glm5_next":
         inputs, attention_mask = _streamed_glm5_next_state(config, inputs)
         mx.eval(inputs)
@@ -12201,6 +12443,22 @@ def _collect_streamed_qwen4_mtp(source, config, collector, calib_data, working, 
     return installed
 
 
+def _streamed_hy_v4_hc_head(plan, config: dict):
+    """Hy4's stream-collapsing head, sourced from the checkpoint."""
+    from omlx.patches.hy_v4.config import ModelConfig
+    from omlx.patches.hy_v4.layers import HyperHead
+
+    head = HyperHead(ModelConfig.from_dict(config).text_config)
+    prefix = "language_model.model.hc_head."
+    head.load_weights(
+        [(k[len(prefix) :], plan.pop(k)) for k in list(plan) if k.startswith(prefix)],
+        strict=True,
+    )
+    head.eval()
+    mx.eval(head.parameters())
+    return head
+
+
 def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     """Streamed counterpart of _collect_untied_lm_head_imatrix."""
     plan = _streamed_source_plan(source, config)
@@ -12208,6 +12466,9 @@ def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     head_key = "language_model.lm_head.weight"
     if head_key not in plan or norm_key not in plan:
         return 0
+    collapse = None
+    if _is_hy_v4_config(config):
+        collapse = _streamed_hy_v4_hc_head(plan, config)
     head_weight = plan.pop(head_key)
     norm_weight = plan.pop(norm_key)
     text_config = config.get("text_config") or config
@@ -12221,9 +12482,14 @@ def _collect_streamed_untied_lm_head(source, config, collector, working) -> int:
     mx.eval(norm.parameters(), head.parameters())
     before = len(collector.entries)
     for hidden in working:
-        h = hidden.mean(axis=2) if getattr(hidden, "ndim", 0) == 4 else hidden
+        if collapse is not None:
+            h = collapse(hidden)
+        elif getattr(hidden, "ndim", 0) == 4:
+            h = hidden.mean(axis=2)
+        else:
+            h = hidden
         collector.collect_dense("language_model.lm_head", head, norm(h))
-    del norm, head, head_weight, norm_weight
+    del norm, head, head_weight, norm_weight, collapse
     mx.clear_cache()
     return 1 if len(collector.entries) > before else 0
 
@@ -12422,6 +12688,8 @@ def _collect_imatrix_streaming(
         # AFTER the pre-load patches that could re-install the module.
         _qwen4_exp_apply_compat_patch()
 
+    is_hy_v4 = _is_hy_v4_config(config)
+
     def embed_rows(weight, lo: int, hi: int):
         """Layer-0 inputs for draw rows [lo, hi)."""
         rows = _streamed_embed(weight, calib_data[lo:hi], config)
@@ -12429,6 +12697,8 @@ def _collect_imatrix_streaming(
             rows, _, _ = _streamed_qwen4_exp_state(config, calib_data[lo:hi], rows)
         elif is_glm5_next:
             rows, _ = _streamed_glm5_next_state(config, rows)
+        elif is_hy_v4:
+            rows, _, _ = _streamed_hy_v4_state(config, calib_data[lo:hi], rows)
         mx.eval(rows)
         return rows
 
@@ -12471,6 +12741,14 @@ def _collect_imatrix_streaming(
         _, glm5_attention_mask = _streamed_glm5_next_state(config, embedded)
         mask = glm5_attention_mask
         position_ids = {"kind": _GLM5_NEXT_LAYER_STATE_KIND}
+    elif is_hy_v4:
+        # Masks from one row serve every micro-batch; the Engram n-grams are
+        # sliced per micro-batch below.
+        _, hy_layer_masks, hy_state = _streamed_hy_v4_state(
+            config, calib_data, embedded
+        )
+        mask = None
+        position_ids = None
     elif _stream_source_model_type(config) == "flint":
         mask = None
         position_ids = {"kind": _FLINT_LAYER_STATE_KIND}
@@ -12531,6 +12809,8 @@ def _collect_imatrix_streaming(
                 _streamed_qwen4_exp_slot_state(calib_data, q4_position_ids, lo, hi)
                 for lo, hi in ranges
             ]
+        elif is_hy_v4:
+            slot_states = [_hy_v4_slot_state(hy_state, lo, hi) for lo, hi in ranges]
         elif isinstance(position_ids, mx.array):
             slot_states = [position_ids[lo:hi] for lo, hi in ranges]
         else:
@@ -12561,6 +12841,8 @@ def _collect_imatrix_streaming(
                     )
             if is_qwen4_exp:
                 layer_mask = q4_layer_masks[layer_idx]
+            elif is_hy_v4:
+                layer_mask = hy_layer_masks[layer_idx]
             elif is_glm5_next:
                 layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
             elif _is_recurrent_layer(block):
@@ -12647,7 +12929,7 @@ def _collect_imatrix_streaming(
                 },
             )
 
-        if is_glm5_next or _stream_source_model_type(config) == "flint":
+        if is_glm5_next or is_hy_v4 or _stream_source_model_type(config) == "flint":
             head_entries = _collect_streamed_untied_lm_head(
                 source, config, collector, working
             )
@@ -13494,10 +13776,14 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
     del embed_weight
     mx.eval(embedded)
     q4_masks = q4_position_ids = None
+    hy_masks = hy_state = None
     if is_qwen4_exp:
         embedded, q4_masks, q4_position_ids = _streamed_qwen4_exp_state(
             config, calib, embedded
         )
+        mask = position_ids = None
+    elif _is_hy_v4_config(config):
+        embedded, hy_masks, hy_state = _streamed_hy_v4_state(config, calib, embedded)
         mask = position_ids = None
     elif is_glm5_next:
         embedded, mask = _streamed_glm5_next_state(config, embedded)
@@ -13522,14 +13808,14 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
         0, int(calib.shape[0]), max(1, int(plan["micro_batch_size"]))
     )
     working = [embedded[lo:hi] for lo, hi in ranges]
-    slot_states = (
-        [
+    slot_states = None
+    if is_qwen4_exp:
+        slot_states = [
             _streamed_qwen4_exp_slot_state(calib, q4_position_ids, lo, hi)
             for lo, hi in ranges
         ]
-        if is_qwen4_exp
-        else None
-    )
+    elif hy_state is not None:
+        slot_states = [_hy_v4_slot_state(hy_state, lo, hi) for lo, hi in ranges]
     text_config = config.get("text_config") or config
     total_layers = int(text_config.get("num_hidden_layers") or 0)
     for layer_idx, block, _is_moe in _iter_streamed_layer_blocks(
@@ -13537,6 +13823,8 @@ def _refine_oqe_streamed(source, config, writer, stats, *, trust_remote_code, pr
     ):
         if is_qwen4_exp:
             layer_mask = q4_masks[layer_idx]
+        elif hy_masks is not None:
+            layer_mask = hy_masks[layer_idx]
         elif is_glm5_next:
             layer_mask = None if bool(getattr(block, "is_linear", False)) else mask
         elif _is_recurrent_layer(block):
@@ -14197,6 +14485,10 @@ def _oqe_cache_missing_mtp_entries(
     """True when the model declares MTP heads but the cache predates the
     MTP-head collection pass (no ``mtp.*`` entries) — force a recollect so
     the head gets calibrated quantization instead of landing in "missing"."""
+    if _is_hy_v4_config(config):
+        # DFly2 drafts from target caches; no calibration pass runs it, so
+        # its linears quantize without imatrix entries.
+        return False
     collection = cache.metadata.get("collection")
     if (
         config.get("model_type") == "deepseek_v41"
@@ -14442,8 +14734,9 @@ def _measure_sensitivity_from_model(
         if out_float is None:
             continue
 
+        layer = _walk_layer_index(position_ids, layer_idx)
         saved = _temporary_quantize_block(
-            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer_idx
+            block, config, oq_level, _OQ_DEFAULT_GROUP_SIZE, layer_idx=layer
         )
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = prev_aux
@@ -14459,7 +14752,11 @@ def _measure_sensitivity_from_model(
             out_magnitude = (out_float**2).mean()
             mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            value = mse_val.item()
+            # A layer that runs more than once keeps its worst run.
+            if layer in sensitivity:
+                value = max(sensitivity[layer], value)
+            sensitivity[layer] = value
 
         _restore_saved_weights(block, saved)
 
@@ -15233,7 +15530,12 @@ def _measure_sensitivity_from_quantized_model(
             out_mag = (ob32**2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            layer = _walk_layer_index(position_ids, layer_idx)
+            value = mse_val.item()
+            # A layer that runs more than once keeps its worst run.
+            if layer in sensitivity:
+                value = max(sensitivity[layer], value)
+            sensitivity[layer] = value
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux

@@ -20,7 +20,6 @@ _VLM_CONTEXTS = (
     "_strip_audio_config_if_orphaned",
     "_strip_vision_config_if_orphaned",
     "_drop_gemma4_mlx_shared_kv_extras_on_load",
-    "_derive_gemma4_global_kv_on_load",
     "_preserve_gemma4_unified_image_processor_on_load",
     "_force_minimax_m3_moe_sanitize_on_load",
     "_force_qwen4_exp_sanitize_on_load",

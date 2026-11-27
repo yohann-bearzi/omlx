@@ -1446,11 +1446,121 @@ def _act_source(q_type: str, q_init: str, mapped: bool, oai: bool = False) -> st
     )
 
 
+# AffineQ is kept out of _MM_HEADER so tile-face kernels compile unchanged Metal.
+_AFFINE_SPLIT_HEADER = r"""
+namespace omlx_gqmm {
+template <typename T, int GS, int BITS>
+struct AffineQ {
+  using WT = T;
+  STEEL_CONST int kBits = BITS;
+  STEEL_CONST int kGroup = GS;
+  const device T* scales;
+  const device T* biases;
+
+  struct P {
+    float s;
+    float b;
+  };
+
+  METAL_FUNC void advance(const size_t n) thread {
+    scales += n;
+    biases += n;
+  }
+  METAL_FUNC P params(const int g) const thread {
+    return P{float(scales[g]), float(biases[g])};
+  }
+  METAL_FUNC static WT dq(thread const P& p, const uint32_t q) {
+    return static_cast<WT>(p.s * float(q) + p.b);
+  }
+};
+
+// 3-bit packed weights cross 32-bit word boundaries. Metal rejects derived
+// structs, so this loader holds the generic one and replaces its store. Only
+// the split family's source carries it, keeping _MM_HEADER unchanged for the
+// tile-face kernels.
+template <typename T, int GS, typename G, bool PAIR>
+struct Affine3TileLoader {
+  using Base = TileLoader<AffineQ<T, GS, 3>, G, PAIR>;
+
+  Base base;
+  const short row;
+
+  METAL_FUNC Affine3TileLoader(
+      const device uint8_t* w_tile,
+      const int K,
+      thread const AffineQ<T, GS, 3>& q_,
+      const uint lid,
+      const int half_n = 0) thread
+      : base(w_tile, K, q_, lid, half_n), row(base.row) {}
+
+  METAL_FUNC void fetch(const int kb) thread { base.fetch(kb); }
+
+  METAL_FUNC void fetch_tail(const int kb, const int k_valid) thread {
+    base.fetch_tail(kb, k_valid);
+  }
+
+  METAL_FUNC void zero(threadgroup T* Ws) const thread { base.zero(Ws); }
+
+  METAL_FUNC void store_words(threadgroup T* Ws, const int k_valid) const
+      thread {
+    threadgroup T* dst = Ws + base.row * Base::kBKP + base.col;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < Base::kVPT; ++i) {
+      if (base.col + i < k_valid) {
+        const short bit = i * 3;
+        const short word = bit / 32;
+        const short shift = bit % 32;
+        uint32_t code = base.raw[word] >> shift;
+        if (shift > 29 && word + 1 < Base::kWords) {
+          code |= base.raw[word + 1] << (32 - shift);
+        }
+        dst[i] = AffineQ<T, GS, 3>::dq(base.p[i / Base::kGV], code & Base::kMask);
+      }
+    }
+  }
+
+  METAL_FUNC void store(threadgroup T* Ws) const thread {
+    store_words(Ws, G::kBK);
+  }
+};
+
+template <typename G, bool PAIR, typename T, int GS>
+METAL_FUNC Affine3TileLoader<T, GS, G, PAIR> make_loader(
+    const device uint8_t* w,
+    thread AffineQ<T, GS, 3>& q,
+    const size_t w_row,
+    const int K,
+    const uint lid,
+    const int half_n) {
+  q.advance(w_row * size_t(K / GS));
+  return Affine3TileLoader<T, GS, G, PAIR>(
+      w + w_row * size_t(K * 3 / 8), K, q, lid, half_n);
+}
+} // namespace omlx_gqmm
+"""
+
+_AFFINE_Q = (
+    "using Q = omlx_gqmm::AffineQ<T, GS, BITS>;",
+    "Q q{scales, biases};",
+)
 _FP_Q = ("using Q = omlx_gqmm::Fp4Q<GS>;", "Q q{scales};")
 _FP_ACT_SOURCE = _act_source(*_FP_Q, mapped=False)
 _FP_ACT_MAP_SOURCE = _act_source(*_FP_Q, mapped=True)
 _FP_OAI_SOURCE = _act_source(*_FP_Q, mapped=False, oai=True)
 _FP_OAI_MAP_SOURCE = _act_source(*_FP_Q, mapped=True, oai=True)
+
+_AFFINE_SPLIT_ACT = _ACT_SOURCE_TMPL.format(
+    q_type=_AFFINE_Q[0],
+    q_init="""const bool up_row = omlx_gqmm::loads_up<G>(
+        simdgroup_index_in_threadgroup * 32 + thread_index_in_simdgroup);
+    Q q{up_row ? su : scales, up_row ? bu : biases};
+    const device uint8_t* w_sel = (const device uint8_t*)(up_row ? wu : w);""",
+    args="lim[0]",
+    mapped="true",
+    split="true",
+    rmap="rmap",
+    w="w_sel",
+)
 
 # Epilogue kinds (the kernel's EPI): silu(gate) * up, and the clamped form.
 # _EPI_OAI is the scaled SwiGLU-OAI of split gate/up operands.
@@ -1518,11 +1628,19 @@ def _get_act_kernel(kind: str):
                 Path(mx.__file__).parent / "include",
             )
             return None
-        header = mlx_src + _MM_HEADER + _ACT_HEADER
         mapped = kind.endswith("_map")
         family = kind.removesuffix("_map")
+        header = (
+            mlx_src
+            + _MM_HEADER
+            + (_AFFINE_SPLIT_HEADER if family == "affine_split_act" else "")
+            + _ACT_HEADER
+        )
         inputs = ["x", "w", "scales"]
-        inputs += {"fp_oai": ["wu", "su"]}.get(family, [])
+        inputs += {
+            "affine_split_act": ["biases", "wu", "su", "bu"],
+            "fp_oai": ["wu", "su"],
+        }.get(family, [])
         inputs += ["tiles", "tile_count", "params"]
         inputs += ["oai", "gsc", "usc"] if family == "fp_oai" else ["lim"]
         if mapped:
@@ -1530,10 +1648,12 @@ def _get_act_kernel(kind: str):
         source = {
             "fp_act": _FP_ACT_SOURCE,
             "fp_oai": _FP_OAI_SOURCE,
+            "affine_split_act_map": _AFFINE_SPLIT_ACT,
             "fp_act_map": _FP_ACT_MAP_SOURCE,
             "fp_oai_map": _FP_OAI_MAP_SOURCE,
         }[kind]
         name = {
+            "affine_split_act": "omlx_gqmm_affine_split_swiglu",
             "fp_act": "omlx_gqmm_mxfp4_swiglu",
             "fp_oai": "omlx_gqmm_fp4_swiglu_oai",
         }[family]
@@ -1705,6 +1825,8 @@ def supports(
     bits: int,
     mode: str,
     row_map: Optional[mx.array] = None,
+    *,
+    allow_low_bit_affine: bool = False,
 ) -> bool:
     """True when ``sorted_gather_qmm`` handles this call (layout/dtypes).
 
@@ -1718,7 +1840,11 @@ def supports(
         return False
     k = int(x.shape[2])
     if mode == "affine":
-        if bits not in (4, 8) or group_size not in (32, 64, 128):
+        if bits not in (4, 8) and not (allow_low_bit_affine and bits in (2, 3)):
+            return False
+        if group_size not in (32, 64, 128):
+            return False
+        if bits in (2, 3) and (group_size != 64 or k % 64):
             return False
         if biases is None or k % group_size:
             return False
@@ -1811,7 +1937,7 @@ def _launch(
     kernel over the affine tile face (``_launch_face``)."""
     if row_map is not None and not epi:
         return None
-    if mode == "affine":
+    if mode == "affine" and up is None:
         kind = "plain" if not epi else ("act" if row_map is None else "act_map")
         mm = _affine_kernel(bits, group_size, scales.dtype, kind)
         return _launch_face(
@@ -1820,7 +1946,10 @@ def _launch(
     scan = _get_kernel("scan")
     kind = "fp"
     if epi:
-        kind += "_oai" if epi == _EPI_OAI else "_act"
+        if mode == "affine" and up is not None:
+            kind = "affine_split_act"
+        else:
+            kind += "_oai" if epi == _EPI_OAI else "_act"
         if row_map is not None:
             kind += "_map"
     mm = _get_kernel(kind)
@@ -1835,6 +1964,9 @@ def _launch(
     tiles, tile_count, max_tiles = _tiles(scan, indices, E, bm, kw)
     inputs = [x, w, scales]
     template = [("T", x.dtype), ("GS", group_size)]
+    if mode == "affine":
+        inputs.append(biases)
+        template.append(("BITS", bits))
     if up is not None:
         inputs += up
     inputs += [tiles, tile_count, mx.array([N, K], dtype=mx.int32)]
@@ -2434,4 +2566,111 @@ def sorted_gather_qmm_swiglu_oai(
         row_map=row_map,
         up=(wu, su),
         expert_scales=expert_scales,
+    )
+
+
+_SPLIT_AFFINE_PLAN = Plan(_SCHED_SEG, 64, 64, 0, 0)
+# Retain the existing gather for affine 4-bit g128, which regressed on short runs.
+_SPLIT_AFFINE_GROUPS = {2: (64,), 3: (64,), 4: (32, 64), 8: (32, 64, 128)}
+
+
+def _check_split_affine(key):
+    _, dtype, limit, bits, group_size = key
+    count = sum(_CANARY_COUNTS)
+    row_scale = mx.power(10.0, mx.linspace(-1.0, 1.2, count)).reshape(count, 1, 1)
+    w, scales, biases, _, x, idx = _canary_problem(
+        dtype, "affine", bits, group_size, 128, 256, x_scale=row_scale
+    )
+    gate = (w[:, :64], scales[:, :64], biases[:, :64])
+    up = (w[:, 64:], scales[:, 64:], biases[:, 64:])
+    mapping = mx.arange(count - 1, -1, -1, dtype=mx.uint32)
+    expanded = x[mapping]
+    stock = _stock_gather_qmm()
+
+    def project(gather, packed):
+        return gather(
+            expanded,
+            *packed,
+            rhs_indices=idx,
+            group_size=group_size,
+            bits=bits,
+            sorted_indices=True,
+        )
+
+    actual = _launch(
+        x,
+        *gate,
+        idx,
+        group_size,
+        bits,
+        "affine",
+        _SPLIT_AFFINE_PLAN,
+        None,
+        epi=_EPI_CLAMPED,
+        limit=limit,
+        row_map=mapping,
+        up=up,
+    )
+    if actual is None:
+        return False
+    # Also match the active oMLX gather when it overrides the stock MLX path.
+    return all(
+        _bits_equal(
+            reference_activation(project(gather, up), project(gather, gate), limit),
+            actual,
+        )
+        for gather in (stock, mx.gather_qmm)
+    )
+
+
+def split_affine_swiglu(x, gate, up, indices, row_map, limit, *, bits, group_size):
+    """Fuse sorted, separate affine gate/up with mapped rows and a clamp."""
+    w, _, _ = gate
+    min_rows_per_expert = 4 if bits == 3 else 16
+    if (
+        group_size not in _SPLIT_AFFINE_GROUPS.get(bits, ())
+        or limit is None
+        or not math.isfinite(limit)
+        or w.ndim != 3
+        or indices.size // max(w.shape[0], 1) < min_rows_per_expert
+        or x.shape[-1] % 64
+        or up[0].shape != w.shape
+    ):
+        return None
+    if not all(
+        supports(
+            x,
+            *weights,
+            indices,
+            group_size,
+            bits,
+            "affine",
+            row_map,
+            allow_low_bit_affine=True,
+        )
+        for weights in (gate, up)
+    ):
+        return None
+    key = ("split_affine", x.dtype, float(limit), bits, group_size)
+    try:
+        supported = _checked(key, _check_split_affine)
+    except (RuntimeError, TypeError, ValueError) as error:
+        logger.warning("Split affine gate/up canary failed: %s", error)
+        _verified[key] = False
+        return None
+    if not supported:
+        return None
+    return _launch(
+        x,
+        *gate,
+        indices,
+        group_size,
+        bits,
+        "affine",
+        _SPLIT_AFFINE_PLAN,
+        None,
+        epi=_EPI_CLAMPED,
+        limit=limit,
+        row_map=row_map,
+        up=up,
     )

@@ -486,8 +486,16 @@ PATH_DECISIONS = {
     "omlx/patches/glm_moe_dsa/deepseek_v32.py": (UNSERVED, "family not ported"),
     "omlx/patches/glm_moe_dsa/sparse_mla.py": (UNSERVED, "family not ported"),
     "omlx/patches/glm_moe_dsa/switch_layers.py": (UNSERVED, "family not ported"),
+    "omlx/patches/hy_v4/engram_ssd.py": (GATED, "Hy4 family not ported"),
+    "omlx/patches/hy_v4/exact.py": (GATED, "Hy4 family not ported"),
+    "omlx/patches/hy_v4/language.py": (GATED, "Hy4 family not ported"),
+    "omlx/patches/hy_v4/model.py": (GATED, "Hy4 family not ported"),
+    "omlx/patches/hy_v4/verify_moe.py": (GATED, "Hy4 family not ported"),
     "omlx/patches/inkling2/dspark.py": (UNSERVED, "family not ported"),
+    "omlx/patches/inkling2/expert_mma.py": (GATED, "Inkling2 family not ported"),
+    "omlx/patches/inkling2/loader.py": (GATED, "Inkling2 family not ported"),
     "omlx/patches/inkling2/model.py": (GATED, "Inkling2 family not ported"),
+    "omlx/patches/inkling2/verify_experts.py": (GATED, "Inkling2 family not ported"),
     "omlx/patches/k2_horizon/ane_prefill.py": (UNSERVED, "family not ported"),
     "omlx/patches/laguna/laguna_model.py": (UNSERVED, "family not ported"),
     "omlx/patches/mimo_v2/decode_fast.py": (UNSERVED, "family not ported"),
@@ -522,6 +530,10 @@ PATH_DECISIONS = {
     "omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py": (
         PENDING,
         "DEFERRED 59 / U29 (tensor-unit prefill not yet ported to faces)",
+    ),
+    "installed/models/linear.py": (
+        "declines a FormatLinear (upstream helper; strict type check on nn.Linear / ScaledQuantizedLinear)",
+        "the audit pins every installed reader the compat layer reaches",
     ),
     "installed/models/quantized_verifier.py": (
         "declines a FormatLinear (upstream helper; returns None); the row-invariant design adoption is DEFERRED and the narrow-N >16 route choice is PFX/tilebf under C2",
@@ -619,6 +631,12 @@ SCOPE_DECISIONS = {
 
 
 EXPECTED = {
+    ("installed/models/linear.py", "native_block_linear"): (
+        "read bits",
+        "read group_size",
+        "read scales",
+    ),
+    ("installed/models/quantized_verifier.py", "<module>"): ("QuantizedLinear",),
     ("installed/models/quantized_verifier.py", "_can_optimized_affine_linear"): (
         "read " "bits",
         "read " "scales",
@@ -698,7 +716,6 @@ EXPECTED = {
     ("installed/models/quantized_verifier.py", "supports_quantization"): (
         "QuantizedLinear",
         "QuantizedSwitchLinear",
-        "isinstance " "QuantizedLinear",
         "isinstance " "QuantizedSwitchLinear",
         "read bits",
         "read " "group_size",
@@ -1516,6 +1533,56 @@ EXPECTED = {
         "read group_size",
         "read scales",
     ),
+    ("omlx/patches/hy_v4/engram_ssd.py", "open_embedding"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/patches/hy_v4/exact.py", "_mxfp8_rows"): (
+        "read bits",
+        "read group_size",
+        "read scales",
+    ),
+    ("omlx/patches/hy_v4/language.py", "DecoderLayer._can_compile_moe"): (
+        "QuantizedSwitchLinear",
+        "read bits",
+        "read group_size",
+        "type-is QuantizedSwitchLinear",
+    ),
+    ("omlx/patches/hy_v4/model.py", "_sanitize_experts"): ("quantize-call quantize",),
+    ("omlx/patches/hy_v4/verify_moe.py", "_gate_up"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/patches/hy_v4/verify_moe.py", "routed_experts"): (
+        "QuantizedSwitchLinear",
+        "read bits",
+        "read group_size",
+        "type-is QuantizedSwitchLinear",
+    ),
+    ("omlx/patches/inkling2/expert_mma.py", "gather"): ("read scales",),
+    ("omlx/patches/inkling2/expert_mma.py", "supported"): (
+        "read bits",
+        "read group_size",
+        "read scales",
+    ),
+    ("omlx/patches/inkling2/loader.py", "_fuse_rows"): ("quantize-call quantize",),
+    ("omlx/patches/inkling2/model.py", "Inkling2Attention.project"): (
+        "QuantizedLinear",
+    ),
+    ("omlx/patches/inkling2/model.py", "Model._omlx_mtp_row_exact_verify"): (
+        "QuantizedLinear",
+    ),
+    ("omlx/patches/inkling2/model.py", "_project_slice"): (
+        "QuantizedLinear",
+        "type-is QuantizedLinear",
+    ),
+    ("omlx/patches/inkling2/model.py", "_row_slice"): (
+        "QuantizedLinear",
+        "read bits",
+        "read group_size",
+        "read scales",
+    ),
+    ("omlx/patches/inkling2/verify_experts.py", "gather"): ("read scales",),
     ("omlx/patches/qwen35_verify_sdpa_split.py", "_eligible"): ("hasattr bits",),
     ("omlx/patches/qwen38_modelopt_mixed.py", "ScaledQuantizedLinear.__call__"): (
         "read " "bits",

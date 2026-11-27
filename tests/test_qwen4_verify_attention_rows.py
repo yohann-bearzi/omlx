@@ -20,8 +20,10 @@ import importlib
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
+from omlx.custom_kernels.nax import is_nax_available
 from omlx.patches import mlx_vlm_qwen4_exp_compat as compat
 
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
@@ -165,7 +167,7 @@ def _copy_cache(cache):
 
 
 @pytest.fixture(scope="module")
-def masked_prefill(_stock_sdpa_helper):
+def shared_prefill(_stock_sdpa_helper):
     """``(attn, cache)`` for a context: one prefill per context, a copy per case.
 
     Trimming a verify window restores the offsets, not the position rank or
@@ -256,6 +258,32 @@ def _close(want, got, tolerance=2e-2):
     return difference <= tolerance * max(scale, 1e-12)
 
 
+def _check_selection_masks(
+    batched_mask, serial_selections, rows, selected_tokens, nax_available
+):
+    """A batched window's mask must match each serial row's on that row's
+    columns and select nothing past them (a causal leak). The one accepted
+    difference is MLX 0.32.5's NAX ``qmm_t_nax`` at ``rows >= 7``: a BF16 ULP
+    on ``index_qk_proj`` can flip a few boundary blocks at the top-k cutoff."""
+    mismatched = 0
+    padded_serial = []
+    key_len = int(batched_mask.shape[-1])
+    for row_idx, (_, _, serial_mask) in enumerate(serial_selections):
+        width = int(serial_mask.shape[-1])
+        leaked = int(mx.sum(batched_mask[0, 0, row_idx, width:]).item())
+        assert leaked == 0, (row_idx, width, key_len, leaked)
+        mismatched += int(
+            mx.sum(batched_mask[0, 0, row_idx, :width] != serial_mask[0, 0, 0, :]).item()
+        )
+        padded_serial.append(
+            mx.pad(serial_mask, [(0, 0), (0, 0), (0, 0), (0, key_len - width)])
+        )
+    if mismatched:
+        assert nax_available and rows >= 7, (rows, mismatched)
+        assert mismatched <= 0.04 * selected_tokens, (mismatched, selected_tokens)
+    return mismatched, padded_serial
+
+
 # 2060: the window starts just past the sparse crossover; 16382: its rows
 # straddle MLX's two-pass partition switch at 16384 keys (the multi-row MLX
 # path gave row 0 of a two-row window the 16384-key plan); 24000: the served
@@ -263,16 +291,18 @@ def _close(want, got, tolerance=2e-2):
 @pytest.mark.parametrize("context", [2060, 16382, 24000])
 @pytest.mark.parametrize("rows", [2, 3, 8, 16])
 def test_masked_verify_rows_equal_serial_decode_steps(
-    masked_prefill, monkeypatch, context, rows
+    shared_prefill, monkeypatch, context, rows
 ):
-    attn, cache = masked_prefill(context)
+    attn, cache = shared_prefill(context)
     selections = _record_selection(monkeypatch)
     batched = []
     selection_mask = language.Qwen4ExpQSAIndexer._selection_mask
 
     def counted(self, *args, **keywords):
-        batched.append(1)
-        return selection_mask(self, *args, **keywords)
+        mask = selection_mask(self, *args, **keywords)
+        mx.eval(mask)
+        batched.append(mx.array(mask))
+        return mask
 
     monkeypatch.setattr(language.Qwen4ExpQSAIndexer, "_selection_mask", counted)
     for seed in (11, 12):
@@ -290,10 +320,10 @@ def test_masked_verify_rows_equal_serial_decode_steps(
 
         serial = _serial(attn, cache, x)
         serial_state = _state(cache)
+        serial_selections = selections[:]
         selections.clear()
         cache.trim(rows)
 
-        assert _close(verified, serial)
         for got, want in zip(verified_state, serial_state):
             assert _close(got, want)
         # Rule 33: the disarmed window selects once for the batch; the
@@ -301,6 +331,61 @@ def test_masked_verify_rows_equal_serial_decode_steps(
         # parity against serial decode is the C4e KL bar's job.
         assert verified_selections == []
         assert len(batched_selections) == 1, batched_selections
+
+        mismatched, padded_serial = _check_selection_masks(
+            batched_selections[0],
+            serial_selections,
+            rows,
+            rows * attn.indexer.block_topk * attn.indexer.compress_ratio,
+            is_nax_available(),
+        )
+        if mismatched == 0:
+            assert _close(verified, serial)
+        else:
+            # >=98% block overlap, and the attention path within 2e-2 under
+            # identical selection masks.
+            stacked = mx.concatenate(padded_serial, axis=2)
+            with monkeypatch.context() as fixed:
+                fixed.setattr(
+                    language.Qwen4ExpQSAIndexer,
+                    "_selection_mask",
+                    lambda self, *a, _stacked=stacked, **kw: _stacked,
+                )
+                same_mask = _verify(attn, cache, x)
+                cache.trim(rows)
+            assert _close(same_mask, serial)
+
+
+def _selection_mask_of(rows, key_len, selected):
+    mask = np.zeros((1, 1, rows, key_len), dtype=bool)
+    for row, columns in enumerate(selected):
+        mask[0, 0, row, columns] = True
+    return mx.array(mask)
+
+
+def test_selection_mask_check_rejects_short_row_mismatch_and_future_leak():
+    """The NAX rows>=7 tolerance covers only the NAX route's boundary flips:
+    an exact route's mismatch or a bit past a row's own width must fail."""
+    serial = [
+        (None, None, _selection_mask_of(1, 2, [[0, 1]])),
+        (None, None, _selection_mask_of(1, 4, [[0, 2, 3]])),
+    ]
+    exact = _selection_mask_of(2, 5, [[0, 1], [0, 2, 3]])
+    assert _check_selection_masks(exact, serial, 2, 100, True)[0] == 0
+    assert _check_selection_masks(exact, serial, 8, 100, True)[0] == 0
+
+    flipped = _selection_mask_of(2, 5, [[1], [0, 2, 3]])
+    with pytest.raises(AssertionError):
+        _check_selection_masks(flipped, serial, 2, 100, False)
+    with pytest.raises(AssertionError):
+        _check_selection_masks(flipped, serial, 2, 100, True)
+    with pytest.raises(AssertionError):
+        _check_selection_masks(flipped, serial, 8, 100, False)
+    assert _check_selection_masks(flipped, serial, 8, 100, True)[0] == 1
+
+    leaky = _selection_mask_of(2, 5, [[0, 1, 2], [0, 2, 3]])
+    with pytest.raises(AssertionError):
+        _check_selection_masks(leaky, serial, 8, 100, True)
 
 
 def test_masked_verify_rollback_then_decode_matches_serial():

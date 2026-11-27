@@ -44,7 +44,7 @@ except ImportError:
 
 _REQUIRES_METAL = pytest.mark.skipif(not _HAS_METAL, reason="requires Metal")
 
-UPSTREAM = "e1a402cf7b8e36599a3c1689b9d12cec5da79ade"
+UPSTREAM = "633d6cf62971262149c2b2477361487958da3915"
 _REPO = Path(__file__).resolve().parents[1]
 
 # The build both trees run: the calibration tokens replace the corpus (the

@@ -472,7 +472,6 @@ def verify_written_format_checkpoint(
                         import mlx_vlm.utils as vlm_utils
 
                         from .engine.vlm import (
-                            _derive_gemma4_global_kv_on_load,
                             _drop_gemma4_mlx_shared_kv_extras_on_load,
                             _force_minimax_m3_moe_sanitize_on_load,
                             _force_qwen4_exp_sanitize_on_load,
@@ -488,7 +487,6 @@ def verify_written_format_checkpoint(
                             _strip_audio_config_if_orphaned(output),
                             _strip_vision_config_if_orphaned(output),
                             _drop_gemma4_mlx_shared_kv_extras_on_load(output),
-                            _derive_gemma4_global_kv_on_load(output),
                             _preserve_gemma4_unified_image_processor_on_load(output),
                             _force_minimax_m3_moe_sanitize_on_load(output),
                             _force_qwen4_exp_sanitize_on_load(output),

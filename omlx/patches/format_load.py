@@ -1841,7 +1841,14 @@ def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> Non
     load_model``) calls the patch's loader too, and the loader runs a copy
     of it. A closure's code cannot be swapped (a family's loader put over
     the library's before the patch): the module's name for it is."""
-    load = getattr(module, name)
+    _wrap_loader_target(
+        module, name, getattr(module, name), drafter_source=drafter_source
+    )
+
+
+def _wrap_loader_target(
+    module, name: str, load, *, drafter_source: str | None = None
+) -> None:
     if not isinstance(load, types.FunctionType):
         raise LoadHookError(
             f"{module.__name__}.{name} is a {type(load).__name__}, not a Python "
@@ -1968,6 +1975,18 @@ def _wrap_loader(module, name: str, *, drafter_source: str | None = None) -> Non
 
     _LOADER_CODES.add(loader.__code__)
     if not in_place:
+        # A pre-installed closure wrapper (e.g. model_loading's trust wrapper)
+        # hides the original function from early `from <lib> import <name>`
+        # callers. Patch the unwrapped function in place too so those callers
+        # enter the checkpoint load context.
+        base = inspect.unwrap(load)
+        if (
+            base is not load
+            and isinstance(base, types.FunctionType)
+            and base.__closure__ is None
+            and not _wrapped_already(base)
+        ):
+            _wrap_loader_target(module, name, base, drafter_source=drafter_source)
         update_wrapper(loader, load)
         loader._omlx_format_load = True
         setattr(module, name, loader)

@@ -7,7 +7,9 @@ import sys
 import types
 from unittest.mock import MagicMock
 
+import mlx.core as mx
 import mlx_lm.utils as mlx_lm_utils
+import mlx_vlm.utils as mlx_vlm_utils
 import pytest
 
 from omlx.utils import model_loading
@@ -62,6 +64,61 @@ class TestRemoteCodePreflight:
                 model_path=tmp_path,
                 trust_remote_code=False,
             )
+
+    @pytest.mark.parametrize(
+        "marker, model_type, refused",
+        [
+            (False, "qwen4_exp", True),
+            (True, "qwen4_exp", False),
+            (True, "Qwen4_EXP", False),
+            (True, "custom", True),
+        ],
+    )
+    def test_qwen4_exp_trust_skip_needs_the_bypass_below(
+        self, tmp_path, monkeypatch, marker, model_type, refused
+    ):
+        """The skip belongs to the compat bypass's own model type: without
+        the bypass below the trust wrapper, a qwen4_exp model_file is a
+        custom module and must be refused."""
+        calls = []
+
+        def resolver(config, model_path=None):
+            calls.append(config)
+            return object(), config["model_type"]
+
+        if marker:
+            resolver._omlx_qwen4_exp_bypass = True
+        monkeypatch.setattr(mlx_vlm_utils, "get_model_and_args", resolver)
+        monkeypatch.setattr(mlx_vlm_utils, "load_model", mlx_vlm_utils.load_model)
+        model_loading._patch_mlx_vlm_model_file_trust()
+        config = {"model_type": model_type, "model_file": "model.py"}
+        if refused:
+            with pytest.raises(ValueError, match="Enable Trust Remote Code"):
+                mlx_vlm_utils.get_model_and_args(config, model_path=tmp_path)
+            assert calls == []
+        else:
+            module, resolved = mlx_vlm_utils.get_model_and_args(
+                config, model_path=tmp_path
+            )
+            assert resolved == model_type
+            assert calls == [config]
+
+    @pytest.mark.parametrize(
+        "trusted, error", [(False, ValueError), (True, AttributeError)]
+    )
+    def test_vlm_load_runs_the_model_file_only_when_trusted(
+        self, tmp_path, trusted, error
+    ):
+        (tmp_path / "config.json").write_text(
+            '{"model_type": "custom_vlm", "model_file": "arch.py", "vision_config": {}}'
+        )
+        (tmp_path / "arch.py").write_text(
+            "import pathlib\npathlib.Path(__file__).with_name('ran').touch()\n"
+        )
+        mx.save_safetensors(str(tmp_path / "model.safetensors"), {"w": mx.zeros(1)})
+        with pytest.raises(error):
+            mlx_vlm_utils.load_model(tmp_path, trust_remote_code=trusted)
+        assert (tmp_path / "ran").exists() is trusted
 
     def test_tokenizer_trust_failure_happens_before_mlx_lm_load(
         self, tmp_path, monkeypatch
@@ -610,6 +667,27 @@ class TestVlmMtpPreLoadDispatch:
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
             '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_mtp_index(tmp_path, has_mtp=True)
+        settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        stub = sys.modules["omlx.patches.mlx_lm_mtp"]
+        stub.set_mtp_depth.assert_called_once_with(expected)
+
+    @pytest.mark.parametrize(("depth", "expected"), [(None, 5), (3, 3)])
+    def test_deepseek_v41_default_depth_is_the_dspark_block(
+        self, tmp_path, monkeypatch, depth, expected
+    ):
+        self._stub_patches(monkeypatch)
+        monkeypatch.setitem(
+            sys.modules, "omlx.patches.deepseek_v41", MagicMock(apply_patch=MagicMock())
+        )
+        text = {"num_nextn_predict_layers": 3, "dspark_block_size": 5}
+        path = _write_config(
+            tmp_path,
+            json.dumps({"model_type": "deepseek_v41", "vision_config": {}, "text_config": text}),
         )
         _write_mtp_index(tmp_path, has_mtp=True)
         settings = types.SimpleNamespace(mtp_enabled=True, mtp_adaptive_max_depth=depth)

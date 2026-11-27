@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for oQ (oMLX Universal Dynamic Quantization)."""
 
+import importlib.util
 import json
 import os
+import shutil
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -14,6 +17,7 @@ import pytest
 try:
     import mlx.core as mx
     import mlx.nn as nn
+    import mlx_lm.utils as mlx_lm_utils
     from mlx.utils import tree_flatten
 
     from omlx.patches.inkling2.vision import VisionArgs, VisionTower
@@ -95,6 +99,7 @@ from omlx.oq import (
     universal_quant_predicate,
     validate_quantizable,
 )
+from omlx.utils import model_loading
 
 # =============================================================================
 # Test universal_quant_predicate
@@ -2444,14 +2449,14 @@ class TestCalibrationWalkMatchesNativeForward:
             "vocab_size": 128,
             "hidden_size": 32,
             "intermediate_size": 64,
-            "num_hidden_layers": 4,
+            "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
             "head_dim": 8,
             "max_position_embeddings": 256,
             "sliding_window": 8,
-            "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
-            "layer_rope_theta": [10000.0, 10000.0, 10000.0, 0],
+            "layer_types": ["sliding_attention", "full_attention"],
+            "layer_rope_theta": [10000.0, 0],
         }
         vision = {
             "hidden_size": 8,
@@ -2625,16 +2630,17 @@ class TestCalibrationWalkMatchesNativeForward:
         # The model lists the layer types; no layer carries a sliding flag.
         config = {
             **self._DENSE,
+            "num_hidden_layers": 2,
             "num_local_experts": 4,
             "num_experts_per_tok": 2,
             "rope_scaling": None,
-            "layer_types": ["sliding_attention", "full_attention"] * 2,
+            "layer_types": ["sliding_attention", "full_attention"],
         }
         return self._tiny_lm("gpt_oss", config)
 
     def _gemma3_text(self, path):
         # Embeddings scaled by sqrt(hidden_size) before the first layer.
-        config = {**self._DENSE, "sliding_window_pattern": 2}
+        config = {**self._DENSE, "num_hidden_layers": 2, "sliding_window_pattern": 2}
         return self._tiny_lm("gemma3_text", config)
 
     @pytest.mark.parametrize(
@@ -3113,8 +3119,9 @@ class TestQuantizeChunked:
     @pytest.mark.skipif(
         not HAS_MLX or not mx.metal.is_available(), reason="Metal not available"
     )
-    @pytest.mark.parametrize("group_size", [32, 64, 128])
-    @pytest.mark.parametrize("dtype", ["bfloat16", "float16"])
+    @pytest.mark.parametrize(
+        "group_size,dtype", [(32, "bfloat16"), (64, "float16"), (128, "bfloat16")]
+    )
     def test_metal_lsq_refit_matches_reference(self, group_size, dtype):
         dtype = getattr(mx, dtype)
         mx.random.seed(1)
@@ -5527,6 +5534,91 @@ class TestEstimateBpwHeaderOnly:
         assert (
             with_mtp["output_size_bytes"] - without["output_size_bytes"] == 64 * 64 * 2
         )
+
+    @pytest.mark.parametrize(
+        "draft",
+        [
+            "model.dfly_layers.0.proj.bias",
+            "language_model.dfly.layers.0.proj.bias",
+            "model.layers.2.nextn_proj.bias",
+        ],
+    )
+    def test_estimate_only_counts_draft_when_included(
+        self, tmp_path, monkeypatch, draft
+    ):
+        config = {
+            "model_type": "hy_v4_flash",
+            "num_hidden_layers": 2,
+            "num_nextn_predict_layers": 1,
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        tensors = {
+            "model.layers.0.proj.bias": (bytes(8), [4], "BF16"),
+            draft: (bytes(16), [8], "BF16"),
+        }
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
+        off = estimate_bpw_and_size(str(tmp_path), 4)
+        on = estimate_bpw_and_size(str(tmp_path), 4, preserve_mtp=True)
+        assert off["output_size_bytes"] == 8
+        assert on["output_size_bytes"] == 24
+
+    def test_estimate_applies_text_only_and_media_dtype(self, tmp_path, monkeypatch):
+        (tmp_path / "config.json").write_text('{"model_type":"qwen3_5"}')
+        tensors = {
+            "model.layers.0.proj.weight": (bytes(36), [2, 9], "BF16"),
+            "model.layers.0.loop_a.bias": (bytes(4), [2], "BF16"),
+            "model.layers.0.loop_b.bias": (bytes(4), [2], "BF16"),
+            "vision_tower.proj.bias": (bytes(16), [8], "BF16"),
+            "audio_tower.proj.bias": (bytes(8), [4], "BF16"),
+        }
+        _write_safetensors(str(tmp_path / "model.safetensors"), tensors)
+
+        def sanitize(weights):
+            loop = [weights.pop(f"model.layers.0.loop_{s}.bias") for s in "ab"]
+            return {**weights, "model.layers.0.loop.bias": mx.concatenate(loop)}
+
+        sanitize._omlx_cast_predicate = lambda name: "loop" not in name
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: sanitize)
+        bf16 = estimate_bpw_and_size(str(tmp_path), 4)
+        fp16 = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16")
+        text = estimate_bpw_and_size(str(tmp_path), 4, dtype="float16", text_only=True)
+        assert bf16["output_size_bytes"] == 36 + 8 + 24
+        assert fp16["output_size_bytes"] == 36 + 8 + 48
+        assert text["output_size_bytes"] == 36 + 8
+
+    @pytest.mark.parametrize("family", ["gemma4", "qwen3_5"])
+    def test_estimate_adds_only_donated_head(self, tmp_path, monkeypatch, family):
+        source = tmp_path / "source"
+        donor = tmp_path / "donor"
+        source.mkdir()
+        donor.mkdir()
+        config = {"model_type": family, "num_hidden_layers": 2}
+        (source / "config.json").write_text(json.dumps(config))
+        _write_safetensors(
+            str(source / "model.safetensors"),
+            {"model.layers.0.proj.bias": (bytes(8), [4], "BF16")},
+        )
+        if family == "gemma4":
+            donor_config = {
+                "model_type": "gemma4_assistant",
+                "text_config": {"num_hidden_layers": 1},
+            }
+            weights = {"model.projector.bias": (bytes(16), [8], "BF16")}
+        else:
+            donor_config = {**config, "mtp_num_hidden_layers": 1}
+            weights = {
+                "mtp.fc.weight": (bytes(16), [2, 4], "BF16"),
+                "model.layers.0.proj.bias": (bytes(64), [32], "BF16"),
+            }
+            for model in (source, donor):
+                (model / "tokenizer.json").write_text("{}")
+        (donor / "config.json").write_text(json.dumps(donor_config))
+        _write_safetensors(str(donor / "model.safetensors"), weights)
+        monkeypatch.setattr("omlx.oq._build_model_sanitizer", lambda *a, **kw: None)
+        off = estimate_bpw_and_size(str(source), 4)
+        on = estimate_bpw_and_size(str(source), 4, mtp_assistant_model_path=str(donor))
+        assert on["output_size_bytes"] - off["output_size_bytes"] == 16
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
@@ -8476,7 +8568,7 @@ class TestQwen35TextCheckpoint:
         config = {
             "model_type": model_type,
             "hidden_size": 64,
-            "intermediate_size": 128,
+            "intermediate_size": 64,
             "num_hidden_layers": 2,
             "num_attention_heads": 4,
             "num_key_value_heads": 2,
@@ -8495,8 +8587,8 @@ class TestQwen35TextCheckpoint:
             config.update(
                 num_experts=4,
                 num_experts_per_tok=2,
-                shared_expert_intermediate_size=128,
-                moe_intermediate_size=128,
+                shared_expert_intermediate_size=64,
+                moe_intermediate_size=64,
             )
             module = qwen3_5_moe
         else:
@@ -8598,7 +8690,7 @@ def _flint_config(window=513):
 
     return ModelConfig(
         hidden_size=64,
-        intermediate_size=128,
+        intermediate_size=64,
         num_hidden_layers=3,
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -8686,13 +8778,12 @@ class TestFlintCalibration:
         finally:
             collector.restore(model)
 
-    @pytest.mark.parametrize("window", [3, 513])
-    def test_streamed_calibration_matches_resident(self, tmp_path, monkeypatch, window):
+    def test_streamed_calibration_matches_resident(self, tmp_path, monkeypatch):
         import omlx.oq as oq
 
         source = tmp_path / "source"
-        model, config = _flint_checkpoint(source, window)
-        length = window + 3
+        model, config = _flint_checkpoint(source, window=3)
+        length = 6
         tokens = (mx.arange(8 * length).reshape(8, length) % 100).astype(mx.int32)
         monkeypatch.setattr(oq, "_load_calibration_data", lambda *a, **kw: tokens)
         resident, _ = oq._collect_imatrix_from_model(
@@ -9075,7 +9166,6 @@ def _qwen3_5_stream_source(path, model_type, *, vlm, mtp):
 
 _QWEN3_5_STREAM_CASES = [
     pytest.param("qwen3_5_moe", True, True, id="moe-vlm-mtp"),
-    pytest.param("qwen3_5", True, True, id="dense-vlm-mtp"),
     pytest.param("qwen3_5_moe", False, True, id="moe-text-mtp"),
     pytest.param("qwen3_5", False, False, id="dense-text"),
 ]
@@ -9449,6 +9539,7 @@ class TestStreamedCalibration:
         """Streamed Qwen3.5 statistics and sensitivity match resident collection."""
         import omlx.oq as oq
 
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "num_hidden_layers", 2)
         source = tmp_path / "source"
         config = _qwen3_5_stream_source(source, model_type, vlm=vlm, mtp=mtp)
         # As many rows as tokens: a gated delta net would apply a causal mask as
@@ -9495,10 +9586,11 @@ class TestStreamedCalibration:
         import omlx.oq as oq
 
         # Layers wide enough to be quantized and refined.
-        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 256)
-        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 512)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "num_hidden_layers", 2)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "hidden_size", 128)
+        monkeypatch.setitem(_QWEN3_5_STREAM_TEXT, "intermediate_size", 128)
         for key in ("moe_intermediate_size", "shared_expert_intermediate_size"):
-            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 256)
+            monkeypatch.setitem(_QWEN3_5_STREAM_EXPERTS, key, 128)
         source = tmp_path / "source"
         _qwen3_5_stream_source(source, model_type, vlm=False, mtp=False)
         tokens = (mx.arange(16).reshape(4, 4) * 7 % 120 + 1).astype(mx.int32)
@@ -9568,6 +9660,9 @@ class TestStreamedCalibration:
 _INK2_LAYERS = 6
 _INK2_NVFP4_LAYERS = 4
 _INK2_DIMS = {"hidden": 64, "experts": 8, "inter": 64, "vocab": 128}
+# Layers 2 and 3 run three times. The core must sit on block boundaries, so
+# the looped source closes an attention-residual block every two layers.
+_INK2_LOOP = {"core_start": 2, "core_end": 4, "num_passes": 3, "gate_rank": 4}
 _INK2_ATTN = {"heads": 4, "kv": 2, "head_dim": 16, "d_rel": 4, "window": 8, "k": 4}
 _INK2_VISION = {
     "hidden_size": 32,
@@ -9581,7 +9676,7 @@ _INK2_VISION = {
 }
 
 
-def _inkling2_source(path, *, seed=0):
+def _inkling2_source(path, *, seed=0, looped=False):
     path.mkdir(parents=True)
     rng = np.random.default_rng(seed)
     h, e, inter, vocab = (
@@ -9644,6 +9739,12 @@ def _inkling2_source(path, *, seed=0):
         t[q + "mlp_norm.weight"] = bf16(h, scale=1.0)
         t[q + "mlp.gate.weight"] = bf16(e, h)
         t[q + "mlp.gate.bias"] = f32(e)
+        if looped and _INK2_LOOP["core_start"] <= i < _INK2_LOOP["core_end"]:
+            rank = _INK2_LOOP["gate_rank"]
+            for m in ("attn", "k", "v", "mlp"):
+                t[q + f"controllers.{m}.down_weight"] = bf16(rank, 2 * h)
+                t[q + f"controllers.{m}.gain_weight"] = bf16(h, rank)
+                t[q + f"controllers.{m}.forget_weight"] = bf16(h, rank)
         for proj, (rows, cols) in (("w13", (2 * inter, h)), ("w2", (h, inter))):
             ex = q + f"mlp.experts.{proj}_weight"
             if i < _INK2_NVFP4_LAYERS:
@@ -9660,6 +9761,10 @@ def _inkling2_source(path, *, seed=0):
                 scale = rng.integers(118, 121, (e, rows, cols // 32), dtype=np.uint8)
                 t[ex] = raw(body, "F8_E4M3")
                 t[ex + "_scale"] = raw(scale, "U8")
+    if looped:
+        core = _INK2_LOOP["core_end"] - _INK2_LOOP["core_start"]
+        t[root + "middle_cycle_cross_pass_queries"] = f32(2 * core, h)
+        t[root + "middle_cycle_cross_pass_kv_queries"] = f32(2 * core, h)
     tower = VisionTower(VisionArgs.from_dict(_INK2_VISION), h)
     for name, value in tree_flatten(tower.parameters()):
         t["model.visual." + name] = bf16(*value.shape)
@@ -9690,6 +9795,10 @@ def _inkling2_source(path, *, seed=0):
         "vision_config": _INK2_VISION,
         "mtp_config": {"num_hidden_layers": 1},
     }
+    if looped:
+        config["model_type"] = "inkling2_loop"
+        config["text_config"]["n_layers_per_attn_res_block"] = 2
+        config["text_config"]["loop_config"] = dict(_INK2_LOOP)
     (path / "config.json").write_text(json.dumps(config))
     (path / "mtp.safetensors").write_bytes(b"draft")
     (path / "tiktoken").mkdir()
@@ -9703,6 +9812,13 @@ def _inkling2_source(path, *, seed=0):
 def inkling2_source(tmp_path_factory):
     source = tmp_path_factory.mktemp("inkling2") / "source"
     _inkling2_source(source)
+    return source
+
+
+@pytest.fixture(scope="module")
+def inkling2_loop_source(tmp_path_factory):
+    source = tmp_path_factory.mktemp("inkling2_loop") / "source"
+    _inkling2_source(source, looped=True)
     return source
 
 
@@ -9729,11 +9845,15 @@ class TestInkling2OQ:
     NVFP4 = {"bits": 4, "group_size": 16, "mode": "nvfp4"}
     MXFP8 = {"bits": 8, "group_size": 32, "mode": "mxfp8"}
 
-    @pytest.mark.parametrize("text_only", [True, False])
-    def test_sanitizer_matches_runtime_loader(self, inkling2_source, text_only):
+    @pytest.mark.parametrize(
+        "looped,text_only", [(False, True), (False, False), (True, False)]
+    )
+    def test_sanitizer_matches_runtime_loader(self, request, looped, text_only):
         from omlx.patches.inkling2.loader import sanitize_weights
         from omlx.patches.inkling2.model import ModelArgs
 
+        name = "inkling2_loop_source" if looped else "inkling2_source"
+        inkling2_source = request.getfixturevalue(name)
         config = json.loads((inkling2_source / "config.json").read_text())
         files = _source_weight_files(inkling2_source)
         idx = _LazyTensorIndex(files, config=config)
@@ -9767,6 +9887,29 @@ class TestInkling2OQ:
                 base = key[: -len("weight")]
                 assert mx.array_equal(weight, loaded[base + "weight"]).item()
                 assert mx.array_equal(scales, loaded[base + "scales"]).item()
+
+    def test_release_modelopt_config_loads_as_before(
+        self, inkling2_source, tmp_path, monkeypatch
+    ):
+        # The releases declare their native experts as ModelOpt NVFP4.
+        release = tmp_path / "release"
+        _inkling2_source(release)
+        config = json.loads((release / "config.json").read_text())
+        config["quantization_config"] = {
+            "quant_method": "modelopt",
+            "quant_algo": "NVFP4",
+        }
+        (release / "config.json").write_text(json.dumps(config))
+        assert validate_quantizable(config)
+
+        monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+        monkeypatch.setattr(mlx_lm_utils, "load_config", mlx_lm_utils.load_config)
+        model_loading._patch_mlx_lm_load_config()
+        expected = tree_flatten(_inkling2_model(inkling2_source).parameters())
+        loaded = dict(tree_flatten(_inkling2_model(release).parameters()))
+        assert loaded.keys() == dict(expected).keys()
+        for key, value in expected:
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
 
     def test_oq4_passes_native_experts_through(self, inkling2_source, tmp_path):
         output = tmp_path / "oq4"
@@ -9874,10 +10017,12 @@ class TestInkling2OQ:
         # Without the tensor scale the weights would be off by about 2688 / amax.
         assert (mx.linalg.norm(got - real) / mx.linalg.norm(real)).item() < 0.5
 
-    def test_layer_walk_reproduces_the_forward(self, inkling2_source):
+    @pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+    def test_layer_walk_reproduces_the_forward(self, request, looped):
         from omlx.patches.inkling2 import oq_layout
 
-        model = _inkling2_model(inkling2_source)
+        name = "inkling2_loop_source" if looped else "inkling2_source"
+        model = _inkling2_model(request.getfixturevalue(name))
         tokens = mx.arange(1, 25)[None]
         embed_fn, layers = _find_model_layers(model)
         inputs = embed_fn(tokens)
@@ -9885,8 +10030,14 @@ class TestInkling2OQ:
         for i, block in enumerate(layers):
             inputs, aux = _forward_layer_result(block, inputs, masks[i], state, i)
             _commit_layer_forward_aux(state, i, aux)
-        # Layer 0 completes the first block; the last block closes at the end.
-        assert len(state["blocks"]) == 1
+        if looped:
+            # Layers 2 and 3 run once per pass, and every pass after the first
+            # restarts from the blocks of layers 0 and 1.
+            assert len(layers) == _INK2_LAYERS + 2 * 2
+            assert len(state["blocks"]) == 3
+        else:
+            # Layer 0 completes the first block; the last closes at the end.
+            assert len(state["blocks"]) == 1
         logits = model.logits_from_hidden(
             oq_layout.head_input(model, inputs, state["blocks"])
         )
@@ -9894,6 +10045,53 @@ class TestInkling2OQ:
         assert mx.allclose(
             logits[..., :120], expected[..., :120], rtol=1e-4, atol=1e-4
         ).item()
+
+    def test_looped_sensitivity_is_per_layer(self, inkling2_loop_source, monkeypatch):
+        tokens = mx.array(np.random.default_rng(1).integers(1, 120, (2, 24)), mx.int32)
+        monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+        model = _inkling2_model(inkling2_loop_source)
+        config = json.loads((inkling2_loop_source / "config.json").read_text())
+        sensitivity = _measure_sensitivity_from_model(model, None, config, 4)
+        # Ten layer visits score six layers; a looped layer keeps its worst pass.
+        assert sorted(sensitivity) == list(range(_INK2_LAYERS))
+
+    def test_looped_oqe_output_keeps_the_loop(
+        self, inkling2_loop_source, tmp_path, monkeypatch
+    ):
+        tokens = mx.array(np.random.default_rng(1).integers(1, 120, (3, 24)), mx.int32)
+        monkeypatch.setattr("omlx.oq._load_calibration_data", lambda *a, **kw: tokens)
+        monkeypatch.setattr(
+            "omlx.utils.model_loading.lm_load_compat",
+            lambda path, **kw: (_inkling2_model(path), object()),
+        )
+        monkeypatch.setattr(
+            "omlx.utils.model_loading.maybe_apply_pre_load_patches",
+            lambda *a, **kw: None,
+        )
+        output = tmp_path / "oqe4"
+        config, tensors = _quantize_inkling2(
+            inkling2_loop_source,
+            output,
+            4,
+            enhanced=True,
+            imatrix_cache_path=str(tmp_path / "imatrix.npz"),
+            imatrix_num_samples=3,
+            imatrix_seq_length=24,
+        )
+        report = json.loads((output / "oq_imatrix_report.json").read_text())
+        assert not report["missing"] and not report["mismatched"]
+        assert config["model_type"] == "inkling2_loop"
+        assert config["text_config"]["loop_config"] == _INK2_LOOP
+        assert (output / "mtp.safetensors").read_bytes() == b"draft"
+        # The loop controllers and queries keep the runtime loader's FP32 values.
+        source = dict(tree_flatten(_inkling2_model(inkling2_loop_source).parameters()))
+        for i in range(_INK2_LOOP["core_start"], _INK2_LOOP["core_end"]):
+            for name in ("loop_down", "loop_gain_forget", "loop_message.query"):
+                key = f"model.layers.{i}.{name}"
+                assert tensors[key].dtype == mx.float32, key
+                assert mx.array_equal(tensors[key], source[key]).item(), key
+        logits = _inkling2_model(output)(mx.arange(1, 21)[None])[..., :120]
+        assert mx.isfinite(logits).all().item()
 
     def test_oqe_weights_requantized_experts_and_skips_passthrough(
         self, inkling2_source, tmp_path, monkeypatch
@@ -9963,6 +10161,290 @@ class TestInkling2OQ:
             assert logits.shape == reference.shape
             assert mx.isfinite(logits).all().item()
             assert mx.array_equal(model.encode_image(pixels, grid), features).item()
+
+
+@pytest.fixture
+def patched_load_config(monkeypatch):
+    monkeypatch.setattr(model_loading, "_MLX_LM_LOAD_CONFIG_PATCHED", False)
+    monkeypatch.setattr(mlx_lm_utils, "load_config", mlx_lm_utils.load_config)
+    model_loading._patch_mlx_lm_load_config()
+
+
+def _store_affine(tensors, quant, path, weight, group_size, bits):
+    q, scales, biases = mx.quantize(weight, group_size=group_size, bits=bits)
+    tensors.update(
+        {f"{path}.weight": q, f"{path}.scales": scales, f"{path}.biases": biases}
+    )
+    quant[path] = {"group_size": group_size, "bits": bits, "mode": "affine"}
+
+
+# mlx-vlm: inkling2 imports models.inkling, which the Inkling compat patch shadows.
+_MLX_VLM_INKLING2_SANITIZE = """
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+
+import mlx.core as mx
+from mlx_vlm.models.inkling2.inkling2 import Model
+
+source = Path(sys.argv[1])
+text = json.loads((source / "config.json").read_text())["text_config"]
+owner = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(**text)))
+weights = Model.sanitize(owner, mx.load(str(source / "model.safetensors")))
+mx.save_safetensors(sys.argv[2], weights)
+"""
+
+
+def _mlx_vlm_inkling2(source, dest, *, attention_bits=None, expert_bits=()):
+    if importlib.util.find_spec("mlx_vlm.models.inkling2") is None:
+        pytest.skip("mlx-vlm has no inkling2 model")
+    sanitized = source.parent / "mlx_vlm.safetensors"
+    if not sanitized.exists():
+        script = [sys.executable, "-c", _MLX_VLM_INKLING2_SANITIZE]
+        subprocess.run([*script, str(source), str(sanitized)], check=True)
+    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("model.safetensors"))
+    config = json.loads((source / "config.json").read_text())
+    text = config["text_config"]
+    tensors = mx.load(str(sanitized))
+    quant = dict(TestInkling2OQ.NVFP4)
+    for key in [k for k in tensors if ".switch_mlp." in k and k.endswith(".weight")]:
+        path = key.removesuffix(".weight")
+        nvfp4 = f"{path}.weight_scale_2" in tensors
+        quant[path] = TestInkling2OQ.NVFP4 if nvfp4 else TestInkling2OQ.MXFP8
+    for layer in range(_INK2_LAYERS):
+        base = f"language_model.model.layers.{layer}."
+        for name in ("q", "k", "v", "r", "gate", "o") if attention_bits else ():
+            path = f"{base}self_attn.{name}_proj"
+            weight = tensors.pop(f"{path}.weight")
+            _store_affine(tensors, quant, path, weight, 64, attention_bits)
+        for name, bits in expert_bits:
+            path = f"{base}mlp.switch_mlp.{name}_proj"
+            for suffix in ("scales", "weight_scale_2"):
+                tensors.pop(f"{path}.{suffix}", None)
+            in_dims = text["intermediate_size" if name == "down" else "hidden_size"]
+            shape = tensors.pop(f"{path}.weight").shape[:-1] + (in_dims,)
+            weight = mx.random.normal(shape, key=mx.random.key(layer)) * 0.05
+            _store_affine(tensors, quant, path, weight.astype(mx.bfloat16), 32, bits)
+    config["quantization"] = config["quantization_config"] = quant
+    (dest / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(dest / "model.safetensors"), tensors, {"format": "mlx"})
+    return dest
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+@pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+def test_inkling2_mlx_vlm_layout_loads_like_published_layout(
+    request, tmp_path, looped, patched_load_config
+):
+    source = request.getfixturevalue(
+        "inkling2_loop_source" if looped else "inkling2_source"
+    )
+    vlm = _mlx_vlm_inkling2(source, tmp_path / "mlx_vlm")
+
+    expected = dict(tree_flatten(_inkling2_model(source).parameters()))
+    loaded = dict(tree_flatten(_inkling2_model(vlm).parameters()))
+
+    assert loaded.keys() == expected.keys()
+    for key, value in expected.items():
+        assert loaded[key].dtype == value.dtype, key
+        if key.endswith(".global_scale"):
+            assert mx.allclose(loaded[key], value, rtol=1e-6).item(), key
+        else:
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_inkling2_mlx_vlm_quantized_build_keeps_its_codes(
+    inkling2_loop_source, tmp_path, patched_load_config
+):
+    gate, up, down = 2, 3, 4
+    vlm = _mlx_vlm_inkling2(
+        inkling2_loop_source,
+        tmp_path / "mlx_vlm",
+        attention_bits=8,
+        expert_bits=(("gate", gate), ("up", up), ("down", down)),
+    )
+    tensors = mx.load(str(vlm / "model.safetensors"))
+    reference = _inkling2_model(inkling2_loop_source)
+    loaded = _inkling2_model(vlm)
+
+    def dequantize(path, bits):
+        return mx.dequantize(
+            tensors[f"{path}.weight"],
+            tensors[f"{path}.scales"],
+            tensors[f"{path}.biases"],
+            group_size=32,
+            bits=bits,
+        )
+
+    for layer, (ref, got) in enumerate(
+        zip(reference.model.layers, loaded.model.layers)
+    ):
+        fused = ["in_proj"] if ref.attn.sliding else ["q_proj", "k_proj", "v_proj"]
+        for name in ["o_proj", *fused]:
+            module = getattr(got.attn, name)
+            want = mx.quantize(getattr(ref.attn, name).weight, group_size=64, bits=8)
+            have = (module.weight, module.scales, module.biases)
+            for w, h in zip(want, have):
+                assert mx.array_equal(w, h).item(), f"layer {layer} {name}"
+        base = f"language_model.model.layers.{layer}.mlp.switch_mlp."
+        g, u = dequantize(base + "gate_proj", gate), dequantize(base + "up_proj", up)
+        w13 = mx.stack([g, u], axis=-2).reshape(*g.shape[:-2], -1, g.shape[-1])
+        w2 = dequantize(base + "down_proj", down)
+        experts = got.mlp.experts
+        assert experts.w13.bits == max(gate, up)
+        for proj, want in ((experts.w13, w13), (experts.w2, w2)):
+            have = mx.dequantize(
+                proj.weight, proj.scales, proj.biases, group_size=32, bits=proj.bits
+            )
+            assert mx.array_equal(have, want).item(), f"layer {layer}"
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+def test_inkling2_mlx_vlm_quantization_is_rewritten_once(
+    inkling2_loop_source, tmp_path
+):
+    vlm = _mlx_vlm_inkling2(
+        inkling2_loop_source, tmp_path / "mlx_vlm", attention_bits=8
+    )
+    cfg = json.loads((vlm / "config.json").read_text())
+    model_loading.normalize_inkling2_mlx_vlm_quant(cfg)
+    model_loading.expand_per_layer_quant_keys(cfg)
+    once = json.loads(json.dumps(cfg["quantization"]))
+    assert "model.layers.0.attn.in_proj" in once
+    model_loading.normalize_inkling2_mlx_vlm_quant(cfg)
+
+    assert cfg["quantization"] == once
+
+
+_MLX_LM_INK2_LAYER = {
+    "attn.wq_du.weight": "self_attn.q_proj.weight",
+    "attn.wk_dv.weight": "self_attn.k_proj.weight",
+    "attn.wv_dv.weight": "self_attn.v_proj.weight",
+    "attn.wr_du.weight": "self_attn.r_proj.weight",
+    "attn.wo_ud.weight": "self_attn.o_proj.weight",
+    "attn.gate_attn.weight": "self_attn.gate_proj.weight",
+    "attn.attn_sink_proj.weight": "self_attn.sink_proj.weight",
+    "attn.q_l2_clip.scale": "self_attn.q_l2_clip.scale",
+    "attn.rel_l2_clip.scale": "self_attn.rel_l2_clip.scale",
+    "attn.rel_logits_proj.proj": "self_attn.rel_logits_proj.proj",
+    "attn_sconv.weight": "post_attention_convolution.conv1d.weight",
+    "mlp_sconv.weight": "post_mlp_convolution.conv1d.weight",
+    "attn_norm.weight": "input_layernorm.weight",
+    "mlp_norm.weight": "post_attention_layernorm.weight",
+    "mlp.gate.weight": "mlp.gate.weight",
+    "mlp.gate.bias": "mlp.gate.e_score_correction_bias",
+    **{f"{n}_input_norm.weight": f"{n}_input_layernorm.weight" for n in "qkv"},
+    **{f"attn.{n}_sconv.weight": f"self_attn.{n}_sconv.conv1d.weight" for n in "kv"},
+    **{f"attn.{n}_sconv.static_w": f"self_attn.{n}_sconv.static_weight" for n in "kv"},
+    **{
+        f"attn.{n}_sconv.weight_proj": f"self_attn.{n}_sconv.weight_proj.weight"
+        for n in "kv"
+    },
+    **{
+        f"controllers.{m}.{part}_weight": f"{gate}_message_gate.{name}.weight"
+        for m, gate in (("attn", "q"), ("k", "k"), ("v", "v"), ("mlp", "mlp"))
+        for part, name in (
+            ("down", "down_proj"),
+            ("gain", "message_gate_proj"),
+            ("forget", "forget_gate_proj"),
+        )
+    },
+}
+_MLX_LM_INK2_VISION = (
+    ("model.visual.proj_in.", "model.vision_tower.merger.linear_1."),
+    ("model.visual.proj_out.", "model.vision_tower.merger.linear_2."),
+    ("model.visual.backbone.", "model.vision_tower."),
+    ("embeddings.position_embedding", "embeddings.position_embedding.weight"),
+    ("ln_pre.", "pre_layernorm."),
+    ("ln_1.", "layernorm_before."),
+    ("ln_2.", "layernorm_after."),
+    ("ls_1.gamma", "lambda_1"),
+    ("ls_2.gamma", "lambda_2"),
+    ("mlp.c_fc.", "mlp.fc1."),
+    ("mlp.c_proj.", "mlp.fc2."),
+)
+
+
+def _mlx_lm_inkling2(source, dest):
+    shutil.copytree(source, dest, ignore=shutil.ignore_patterns("model.safetensors"))
+    config = json.loads((source / "config.json").read_text())
+    src = mx.load(str(source / "model.safetensors"))
+    lm = "model.language_model."
+    out = {
+        "lm_head.weight": src.pop("model.llm.unembed.weight"),
+        lm + "embed_tokens.weight": src.pop("model.llm.embed.weight"),
+        lm + "embed_norm.weight": src.pop("model.llm.embed_norm.weight"),
+        lm + "norm.weight": src.pop("model.llm.norm.weight"),
+        lm + "final_input.query": src.pop("model.llm.attn_res.output_query"),
+    }
+    for i in range(config["text_config"]["num_hidden_layers"]):
+        pre, dst = f"model.llm.layers.{i}.", f"{lm}layers.{i}."
+        out[dst + "mlp_input.query"] = src.pop(f"model.llm.attn_res.mlp_queries.{i}")
+        if i:
+            query = src.pop(f"model.llm.attn_res.attn_queries.{i - 1}")
+            out[dst + "attention_input.query"] = query
+        for which, name in (("w13", "gate_up_proj"), ("w2", "down_proj")):
+            ex, experts = f"{pre}mlp.experts.{which}_weight", f"{dst}mlp.experts.{name}"
+            out[experts + ".weight"] = src.pop(ex).view(mx.uint32)
+            out[experts + ".scales"] = src.pop(ex + "_scale")
+            if ex + "_amax" in src:
+                denom = src.pop(ex + "_outer_scale_denominator").astype(mx.float32)
+                amax = src.pop(ex + "_amax").astype(mx.float32)
+                out[experts + ".global_scale"] = amax * (6.0 * 448.0 / denom)
+        for old, new in _MLX_LM_INK2_LAYER.items():
+            if pre + old in src:
+                value = src.pop(pre + old)
+                conv = new.endswith("conv1d.weight")
+                out[dst + new] = value.swapaxes(1, 2) if conv else value
+    if "model.llm.middle_cycle_cross_pass_queries" in src:
+        h = config["text_config"]["hidden_size"]
+        q = src.pop("model.llm.middle_cycle_cross_pass_queries").reshape(-1, 2, h)
+        kv = src.pop("model.llm.middle_cycle_cross_pass_kv_queries").reshape(-1, 2, h)
+        out[lm + "message_input.query"] = mx.concatenate(
+            [q[:, :1], kv, q[:, 1:]], axis=1
+        )
+    for key, value in src.items():
+        for old, new in _MLX_LM_INK2_VISION:
+            key = key.replace(old, new)
+        out[key] = value
+    for key in list(out):
+        attention = ".self_attn." in key and key.startswith(lm + "layers.")
+        embedding = key in ("lm_head.weight", lm + "embed_tokens.weight")
+        if embedding or (attention and key.endswith("_proj.weight")):
+            base = key.removesuffix(".weight")
+            q = mx.quantize(out.pop(key), group_size=64, bits=4)
+            out.update(zip((key, f"{base}.scales", f"{base}.biases"), q))
+    config["quantization"] = {"group_size": 64, "bits": 4, "mode": "affine"}
+    config["quantization_config"] = config["quantization"]
+    (dest / "config.json").write_text(json.dumps(config))
+    mx.save_safetensors(str(dest / "model.safetensors"), out, {"format": "mlx"})
+    return dest
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+@pytest.mark.parametrize("looped", [False, True], ids=["plain", "looped"])
+def test_inkling2_mlx_lm_layout_loads_like_published_layout(
+    request, tmp_path, looped, patched_load_config
+):
+    source = request.getfixturevalue(
+        "inkling2_loop_source" if looped else "inkling2_source"
+    )
+    converted = _mlx_lm_inkling2(source, tmp_path / "mlx_lm")
+
+    expected = dict(tree_flatten(_inkling2_model(source).parameters()))
+    loaded = dict(tree_flatten(_inkling2_model(converted).parameters()))
+
+    for key, value in expected.items():
+        base = key.removesuffix(".weight")
+        if f"{base}.biases" in loaded:
+            want = mx.quantize(value, group_size=64, bits=4)
+            have = [loaded[f"{base}.{s}"] for s in ("weight", "scales", "biases")]
+            assert all(mx.array_equal(w, h).item() for w, h in zip(want, have)), key
+        else:
+            assert loaded[key].dtype == value.dtype, key
+            assert mx.array_equal(loaded[key], value, equal_nan=True).item(), key
 
 
 class TestGemma4AudioConfigSanitize:

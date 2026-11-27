@@ -77,7 +77,7 @@ Run `python -m pytest -q tests/test_vision_feature_cache.py tests/test_paged_ssd
 
 # Cache-preserving engine teardown tests
 
-Run `python -m pytest -q tests/test_engine_teardown.py tests/test_engine_core.py tests/test_scheduler.py tests/test_paged_ssd_cache.py tests/test_hot_cache.py tests/test_engine_pool.py tests/test_batched_engine.py tests/test_vlm_engine.py` to check the 60-second teardown budget and one progress-gated extension to 120 seconds. Clock tests cover the deadlines; short-budget subprocesses exercise fatal exits. Real writer-thread cases verify primary/draft flushes and in-flight prefix stores survive a saturated queue and can be reused after reload. Async cases cover event-loop responsiveness, cancellation, and leases during another model's unload.
+Run `python -m pytest -q tests/test_engine_teardown.py tests/test_engine_core.py tests/test_scheduler.py tests/test_paged_ssd_cache.py tests/test_hot_cache.py tests/test_engine_pool.py tests/test_batched_engine.py tests/test_vlm_engine.py` to check the 60-second teardown budget and one progress-gated extension to 120 seconds. Clock tests cover the deadlines; a short-budget subprocess exercises the fatal exit. Real writer-thread cases verify primary/draft flushes and in-flight prefix stores survive a saturated queue and can be reused after reload. Async cases cover event-loop responsiveness, cancellation, and leases during another model's unload.
 
 # Claude launcher tests
 
@@ -109,7 +109,7 @@ Related regression suites are `test_qwen4_qsa_incremental_cache.py`, `test_qwen4
 
 # Qwen4 verify attention row tests
 
-Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check that row-exact Lightning MTP verify windows through Qwen4 attention give every row the bits of the serial one-row decode step and leave the same KV and QSA indexer state. The tests build one attention layer at the real Flash-Next shapes with synthetic 6-bit weights. Masked-arm windows (past the 2,048-token QSA budget, rank-three positions) cover 2 to 8 rows at 2,060, 16,382 and 24,000 cached tokens and compare each row's FP32 block scores and token mask; a rollback case accepts one draft and decodes on. Dense windows below the budget include rows on both sides of MLX's one-pass/two-pass vector SDPA switch at 1,024 keys.
+Run `python -m pytest -q tests/test_qwen4_verify_attention_rows.py` to check that row-exact Lightning MTP verify windows through Qwen4 attention give every row the bits of the serial one-row decode step and leave the same KV and QSA indexer state. The tests build one attention layer at the real Flash-Next shapes with synthetic 6-bit weights. Masked-arm windows (past the 2,048-token QSA budget, rank-three positions) cover 2 to 16 rows at 2,060 and 16,382 cached tokens and compare each row's FP32 block scores and token mask; a rollback case accepts one draft and decodes on. Dense windows below the budget include rows on both sides of MLX's one-pass/two-pass vector SDPA switch at 1,024 keys.
 
 `test_mlx_vlm_qwen4_exp_compat.py::test_qwen4_mtp_one_row_step_is_the_serial_decode_step` checks that a one-row Lightning MTP window (the activation step and depth-0 cycles) runs the serial decode step: equal logits and cache state, no speculative transaction, and a following verify window that rolls back as usual.
 
@@ -138,6 +138,12 @@ Run `python -m pytest -q tests/test_vlm_batch_kv_capacity.py` after changing `om
 Run `python -m pytest -q tests/test_cluster_pairing_session.py tests/test_cluster_pairing.py tests/test_cluster_ui_integration.py apps/omlx-web/tests/ui/test_cluster_wizard.py` to check joining, cancellation, and approval. Session tests recreate a manager with the same base path to verify that the original code and cancellation proof survive a restart. They also cover offline cancellation, switching peers while cleanup is pending, rejected requests versus lost responses, and storage failures. Wizard tests check that delayed responses cannot restore a cancelled join and that pending cleanup leaves new pairing controls available.
 
 For a two-Mac smoke test, start isolated servers with separate base paths. Request a join, restart only the joining server, then cancel and retry; the coordinator must remove the original pending request. Repeat with the coordinator offline: cancellation must return `state: idle` with `cleanup_pending: true`, and joining a different reachable Mac must work. Restore the coordinator and poll the join endpoint to verify cleanup. Keep existing approval/cancel race and token-ownership tests in the run; never relax the coordinator's token check to make a stale request disappear.
+
+# Hy4 offline tests
+
+Run `python -m pytest -q tests/test_hy_v4.py` for Hy4 and Hy4-flash. Tiny random models with no checkpoint download check incremental decode against the full forward, left-padded batch rows against single runs, the FP8 sanitize path, the tool parser and the thinking switches. DFly2 cases roll every cache back to the accepted prefix, reproduce greedy decoding with MTP on, and draft for two concurrent requests. Exact verify cases compare each verify row bit for bit with one-row decode, for plain and one-row batch caches and after a partial accept. Calibration cases check that the oQ layer walk and the streamed walk match the native forward. The vision cases compare the tower, the projector and the image processor with recorded transformers outputs, and follow image placeholders through M-RoPE positions, chunked prefill, decode and the DFly2 anchor. The NAX case runs only on an M5 GPU and compares the NAX sparse MLA, indexer and attention paths with their references.
+
+`tests/test_oqh.py::test_hy_v4_experts_round_trip` checks oQh exports of both models against their dequantized twins.
 
 # DeepSeek V4.1 offline tests
 

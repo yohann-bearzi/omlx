@@ -1948,14 +1948,23 @@ print(
         assert not any(
             "group3" in name for name in load
         ), f"mtp={mtp_flag}: disarmed qwen4 must not warm dead group3: {load}"
+
+        # MLX 0.32.4 mangled template args with "__" (_u__), 0.32.5 uses "_" (_u_).
+        def _is_unrolled(name: str) -> bool:
+            return "_u__" in name or "_u_bfloat16" in name or "_u_half" in name
+
         if mtp_flag == 0:
             assert not any(
-                "_u__" in name for name in load
+                _is_unrolled(name) for name in load
             ), f"mtp=0 should not compile verify libraries: {load}"
         else:
-            assert any("_u__" in name for name in load), f"missing _u verify in {load}"
+            assert any(
+                _is_unrolled(name) for name in load
+            ), f"missing _u verify in {load}"
             assert all(
-                "group4" in name or "group1" in name for name in load if "_u__" in name
+                "group4" in name or "group1" in name
+                for name in load
+                if _is_unrolled(name)
             ), f"unexpected non-attention unrolled verify warm in {load}"
 
 

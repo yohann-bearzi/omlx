@@ -107,6 +107,25 @@ def _compare(layer, packed, x, monkeypatch, *, expected=None, mlx_route=False):
     return got
 
 
+def _serial_stock(x, packed, bits):
+    """Per-row stock qmv oracle for msg_tile C2 comparisons on MLX 0.32.5 NAX."""
+    rows = x.shape[0]
+    return mx.concatenate(
+        [_stock(x[r : r + 1], packed, bits) for r in range(rows)],
+        axis=0,
+    )
+
+
+def _mlx0325_nax_replaces_qmv_wide(rows: int, bits: int) -> bool:
+    """MLX 0.32.5 routes M>=4 (4-bit) and M>=6 (3/8-bit) on NAX to qmm_t_nax
+    instead of qmv_wide, changing the K-reduction order of mx.quantized_matmul."""
+    from omlx.custom_kernels.nax import is_nax_available
+
+    if not is_nax_available():
+        return False
+    return (bits == 4 and rows >= 4) or (bits in (3, 8) and rows >= 6)
+
+
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bits", [2, 3, 4, 8])
 @pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7])
@@ -115,9 +134,9 @@ def test_wide_rows_match_the_stock_oracle_on_a_plugin_face(
 ):
     # A stock layer's 2..16 rows take MLX by DATA (lead H4); the format's
     # wide route serves an unmeasured plugin face over the same matrix and
-    # bits, and is bitwise to the stock oracle. Clear lookup so _AffinePlugin's
-    # reused affine face_id tests the unmeasured plugin wide fallback rather
-    # than a measured stock msg_tile entry.
+    # bits, and is bitwise to MLX's qmv_wide oracle. Clear lookup so
+    # _AffinePlugin's reused affine face_id tests the unmeasured plugin wide
+    # fallback rather than a measured stock msg_tile entry.
     from omlx.formats import tuning
 
     monkeypatch.setattr(tuning, "lookup", lambda *a, **kw: None)
@@ -125,6 +144,29 @@ def test_wide_rows_match_the_stock_oracle_on_a_plugin_face(
     layer, packed, key = _projection(
         build_layer, n, k, bits, dtype, paired_halves=True, stock=False
     )
+    if _mlx0325_nax_replaces_qmv_wide(rows, bits):
+        # MLX 0.32.5 runs qmm_t_nax here rather than qmv_wide; verify the
+        # wide route runs without MLX fallbacks and meets the C2 FP32 bound.
+        x = mx.random.normal((rows, k), key=key).astype(dtype)
+        want = _stock(x, packed, bits)
+        mx.eval(want)
+        calls = []
+        with monkeypatch.context() as patch:
+            for name in ("quantized_matmul", "gather_qmm", "dequantize"):
+                orig = getattr(mx, name)
+                patch.setattr(
+                    mx,
+                    name,
+                    lambda *a, _n=name, _f=orig, **kw: (calls.append(_n), _f(*a, **kw))[
+                        1
+                    ],
+                )
+            got = layer(x)
+            mx.eval(got)
+        assert not calls, f"dense format layer used {calls}"
+        assert got.shape == want.shape and got.dtype == want.dtype
+        _c2_ok(got, _serial_stock(x, packed, bits), x, packed, bits)
+        return
     # Equal weight halves with opposite inputs expose differences in the
     # reduction order even when low-precision outputs usually round alike.
     half = mx.random.normal((rows, k // 2), key=key).astype(dtype)
@@ -1805,8 +1847,8 @@ def test_mma_and_msg_shared_proof_isolate_distinct_output_widths(
         tile_dense.route_for(vars(m_wide)[linear._KEPT].dense, 6, x6.dtype).backend
         == "msg"
     )
-    _c2_ok(ym_small, _stock(x6, mp_small, 8), x6, mp_small, 8)
-    _c2_ok(ym_wide, _stock(x6, mp_wide, 8), x6, mp_wide, 8)
+    _c2_ok(ym_small, _serial_stock(x6, mp_small, 8), x6, mp_small, 8)
+    _c2_ok(ym_wide, _serial_stock(x6, mp_wide, 8), x6, mp_wide, 8)
 
 
 def test_mma_and_msg_stand_in_never_reads_live_layer_tensors(build_layer, monkeypatch):

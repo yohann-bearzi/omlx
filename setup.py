@@ -138,7 +138,6 @@ def _custom_kernel_build_kwargs() -> dict:
                 sources=[
                     f"{quant}/bindings.cpp",
                     f"{quant}/affine_qmm.cpp",
-                    f"{quant}/command_buffer_caps.cpp",
                     f"{quant}/command_queue.cpp",
                     f"{quant}/format_dispatch.cpp",
                     f"{quant}/gather_qmm.cpp",

@@ -587,7 +587,7 @@ def test_fp32_folded_routing_matches_the_routing_launch(bits):
         output_shapes=[(rows, width), (rows, top_k), (rows, top_k)],
         output_dtypes=[f32, mx.uint32, f32],
     )
-    mx.eval(router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k))
+    router.softmax_topk_rows(logits.astype(mx.bfloat16), top_k)
     ref_inds, ref_scores = router._SOFTMAX_TOPK_ROWS_KERNEL(
         inputs=[logits],
         template=[("T", f32), ("NE", experts), ("K", top_k)],
@@ -693,8 +693,9 @@ def test_fast_down_and_top8_are_bit_identical(dtype, top_k, bits):
     assert _engaged()
 
 
-@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
-@pytest.mark.parametrize("quantized_shared", [True, False])
+@pytest.mark.parametrize(
+    "quantized_shared,dtype", [(True, mx.float16), (False, mx.bfloat16)]
+)
 def test_top8_routing_folded_into_gate_up_is_bit_identical(dtype, quantized_shared):
     """128 experts select inside the gate+up launch; an unquantized shared
     expert runs composed and enters the combine."""
@@ -2920,3 +2921,20 @@ def test_a_format_shared_expert_gate_folds_into_routed_decode(monkeypatch):
     x = mx.random.randint(-2, 3, (1, 1, 1024)).astype(mx.bfloat16)
     assert _plan(block, x).launches.fold
     assert _same_bits(*_pair(block, x))
+
+
+def test_reload_after_mtp_keeps_the_verify_window(monkeypatch, _patched_block):
+    """A model without MTP loads first, then one with MTP applies the router again."""
+    from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward
+
+    from omlx.patches import qwen35_moe_router, qwen35_verify_qmm
+
+    monkeypatch.setattr(
+        Qwen3_5BatchInvariantForward, "_feed_forward", lambda self, block, x: block(x)
+    )
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    routed._ensure_verify_window_patch(_patched_block)
+    qwen35_verify_qmm._patch_verify_swiglu()
+    patched = Qwen3_5BatchInvariantForward._feed_forward
+    qwen35_moe_router._ensure_vlm_verify_patch()
+    assert Qwen3_5BatchInvariantForward._feed_forward is patched

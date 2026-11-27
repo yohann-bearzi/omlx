@@ -3150,8 +3150,7 @@ def test_a_drafter_or_draft_refused_is_never_skipped():
 
     for file, expected in (
         ("engine_pool.py", 4),
-        ("engine/batched.py", 1),
-        ("engine/vlm.py", 1),
+        ("specprefill/draft.py", 1),
     ):
         tree = ast.parse((root / file).read_text())
         blocks = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
@@ -3184,14 +3183,27 @@ def test_a_drafter_or_draft_refused_is_never_skipped():
                 seen += 1
                 assert any(
                     rethrows_refusal(h)
-                    and (
-                        block in guarded
-                        if file == "engine_pool.py"
-                        else awaits(h, "stop")
-                    )
+                    and (block in guarded if file == "engine_pool.py" else True)
                     for h in block.handlers[:index]
                 ), (file, block.lineno)
         assert seen == expected, file
+
+    # Both engines await attach_specprefill_draft inside a try that stops the
+    # started engine before re-raising a format or load-hook refusal.
+    for file in ("engine/batched.py", "engine/vlm.py"):
+        tree = ast.parse((root / file).read_text())
+        blocks = [node for node in ast.walk(tree) if isinstance(node, ast.Try)]
+        matched = [
+            block
+            for block in blocks
+            if any(
+                isinstance(n, ast.Name) and n.id == "attach_specprefill_draft"
+                for stmt in block.body
+                for n in ast.walk(stmt)
+            )
+            and any(rethrows_refusal(h) and awaits(h, "stop") for h in block.handlers)
+        ]
+        assert len(matched) == 1, file
 
 
 def test_each_of_omlx_s_own_loads_checks_what_it_loaded():
@@ -3613,12 +3625,14 @@ def test_a_model_directory_under_home_loads_with_its_record(
 def test_the_vlm_engine_reads_its_record(levels, tmp_path):
     from mlx_vlm.utils import load_model as vlm_load_model
 
-    from omlx.engine.vlm import _load_cohere2_moe_text_model
+    from omlx.engine.vlm import _load_text_model_with_tokenizer_fallback
 
     model = vlm_load_model(_tiny(tmp_path / "vlm", [6.0]), lazy=True)
     assert _gate_proj(model).fmt.levels == (6.0,)
-    # The engine's text-only load of Cohere2 MoE goes through it too.
-    model, _ = _load_cohere2_moe_text_model(str(_tiny(tmp_path / "cohere", [7.0])))
+    # The engine's text-only VLM fallback loader goes through it too.
+    model, _ = _load_text_model_with_tokenizer_fallback(
+        str(_tiny(tmp_path / "cohere", [7.0]))
+    )
     assert _gate_proj(model).fmt.levels == (7.0,)
 
 
