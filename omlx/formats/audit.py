@@ -7,13 +7,16 @@ on any host, including CPU-only CI and MLX-free hosts.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import collections
 import fnmatch
 import io
+import json
 import os
 import pathlib
 import re
+import sys
 import tokenize
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1562,9 +1565,12 @@ class _AuditVisitor:
             # zero module tensor attr reads in args or their defining RHS.
             if not has_mod_attr and _call_has_literal_affine_mode(node):
                 return
-        elif op in {"quantized_matmul", "gather_qmm"}:
-            if not has_mod_attr and _call_references_kv_cache(node):
-                return
+        elif (
+            op in {"quantized_matmul", "gather_qmm"}
+            and not has_mod_attr
+            and _call_references_kv_cache(node)
+        ):
+            return
         self._emit(
             node,
             _MLX_OP_TO_RULE[op],
@@ -1899,3 +1905,141 @@ def assert_no_unguarded_readers(
     if not report.ok or (check_unused_pragmas and report.unused_pragmas):
         raise AuditError(report)
     return report
+
+
+def format_report(report: AuditReport, *, fmt: str = "text") -> str:
+    """Render ``report`` as human-readable text or deterministic JSON."""
+    if fmt == "text":
+        lines: list[str] = []
+        for f in report.findings:
+            lines.append(
+                f"{f.path}:{f.line}:{f.col}: [{f.rule}] ({f.scope}) {f.message}"
+            )
+        for path, err in report.unparsable:
+            lines.append(f"{path}: unparsable: {err}")
+        for path, line, raw in report.unused_pragmas:
+            lines.append(f"{path}:{line}: unused pragma: {raw.strip()}")
+        lines.append(
+            f"{len(report.files_scanned)} file(s) scanned, "
+            f"{len(report.findings)} finding(s), {report.suppressed} suppressed, "
+            f"{len(report.unparsable)} unparsable, "
+            f"{len(report.unused_pragmas)} unused pragma(s)"
+        )
+        return "\n".join(lines)
+    if fmt == "json":
+        payload = {
+            "files_scanned": list(report.files_scanned),
+            "findings": [
+                {
+                    "path": f.path,
+                    "line": f.line,
+                    "col": f.col,
+                    "rule": f.rule,
+                    "scope": f.scope,
+                    "symbol": f.symbol,
+                    "message": f.message,
+                }
+                for f in report.findings
+            ],
+            "suppressed": report.suppressed,
+            "unparsable": [
+                {"path": path, "error": err} for path, err in report.unparsable
+            ],
+            "unused_pragmas": [
+                {"path": path, "line": line, "pragma": raw}
+                for path, line, raw in report.unused_pragmas
+            ],
+            "ok": report.ok,
+        }
+        return json.dumps(payload, sort_keys=True, indent=2)
+    raise ValueError(f"unsupported report format {fmt!r}; expected 'text' or 'json'")
+
+
+def _parse_allow_arg(spec: str) -> AllowEntry:
+    """Parse ``PATH[:SCOPE][=RULE]::REASON`` into an :class:`AllowEntry`."""
+    if not isinstance(spec, str) or "::" not in spec:
+        raise ValueError(f"--allow expects PATH[:SCOPE][=RULE]::REASON, not {spec!r}")
+    head, reason = spec.split("::", 1)
+    rule = "*"
+    if "=" in head:
+        head, rule = head.rsplit("=", 1)
+        rule = rule.strip() or "*"
+    scope = "*"
+    if ":" in head:
+        head, scope = head.rsplit(":", 1)
+        scope = scope.strip() or "*"
+    try:
+        return AllowEntry(
+            path=head.strip(), rule=rule, scope=scope, reason=reason.strip()
+        )
+    except ValueError as exc:
+        raise ValueError(f"invalid --allow {spec!r}: {exc}") from exc
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Scan paths from the command line; return a process exit code."""
+    parser = argparse.ArgumentParser(
+        prog="python -m omlx.formats.audit",
+        description=(
+            "Scan Python sources for unguarded quant-format layer reads "
+            "(.weight/.scales/.biases, quantized matmul, dequantize, gather_qmm, "
+            "exact type checks)."
+        ),
+    )
+    parser.add_argument(
+        "paths", nargs="+", metavar="PATH", help="file or directory to scan"
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="GLOB",
+        help="skip paths matching GLOB (repeatable)",
+    )
+    parser.add_argument(
+        "--allow",
+        action="append",
+        default=[],
+        metavar="SPEC",
+        help="suppress findings: PATH[:SCOPE][=RULE]::REASON (repeatable)",
+    )
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="report format (default: text)",
+    )
+    parser.add_argument(
+        "--check-unused-pragmas",
+        action="store_true",
+        help="fail when an omlx-audit pragma suppresses nothing",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        allowlist = tuple(_parse_allow_arg(spec) for spec in args.allow)
+    except ValueError as exc:
+        print(f"omlx.formats.audit: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        report = scan_paths(
+            args.paths,
+            exclude=args.exclude,
+            allowlist=allowlist,
+            check_unused_pragmas=args.check_unused_pragmas,
+        )
+    except (FileNotFoundError, OSError) as exc:
+        print(f"omlx.formats.audit: {exc}", file=sys.stderr)
+        return 2
+
+    print(format_report(report, fmt=args.format))
+    if not report.ok:
+        return 1
+    if args.check_unused_pragmas and report.unused_pragmas:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

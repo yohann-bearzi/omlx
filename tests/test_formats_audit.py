@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import pathlib
+import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +18,8 @@ from omlx.formats.audit import (
     AllowEntry,
     AuditError,
     assert_no_unguarded_readers,
+    format_report,
+    main,
     scan_paths,
     scan_source,
 )
@@ -430,3 +435,161 @@ def test_audit_module_has_zero_mlx_imports():
                 "environ",
                 "getenv",
             }, f"Rule 30: forbidden os.{node.attr} in audit.py"
+
+
+def _run_module_cli(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, "-m", "omlx.formats.audit", *args],
+        cwd=str(REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_cli_clean_file_exits_0_text_and_json(tmp_path, capsys):
+    clean = tmp_path / "clean.py"
+    clean.write_text(
+        "import mlx.core as mx\n"
+        "import mlx.nn as nn\n"
+        "\n"
+        "def f(m, x):\n"
+        "    if isinstance(m, nn.QuantizedLinear):\n"
+        "        return mx.quantized_matmul(x, m.weight, m.scales, m.biases)\n"
+        "    return x\n"
+    )
+
+    assert main([str(clean)]) == 0
+    text_out = capsys.readouterr().out
+    assert "1 file(s) scanned, 0 finding(s)" in text_out
+    assert "[unguarded" not in text_out
+
+    assert main([str(clean), "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is True
+    assert payload["findings"] == []
+    assert payload["files_scanned"] == [clean.as_posix()]
+    assert payload["suppressed"] == 0
+    assert payload["unparsable"] == []
+    assert payload["unused_pragmas"] == []
+
+    with pytest.raises(ValueError):
+        format_report(scan_paths([clean]), fmt="yaml")
+
+    proc = _run_module_cli([str(clean)])
+    assert proc.returncode == 0, proc.stderr
+    assert "0 finding(s)" in proc.stdout
+
+    proc_json = _run_module_cli([str(clean), "--format", "json"])
+    assert proc_json.returncode == 0, proc_json.stderr
+    assert json.loads(proc_json.stdout)["ok"] is True
+
+
+def test_cli_finding_exits_1_with_structured_json(tmp_path, capsys):
+    bad = tmp_path / "bad.py"
+    bad.write_text("def f(layer):\n    return layer.weight\n")
+
+    assert main([str(bad), "--format", "json"]) == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] is False
+    assert len(payload["findings"]) == 1
+    finding = payload["findings"][0]
+    assert finding["rule"] == "unguarded-weight"
+    assert finding["line"] == 2
+    assert finding["col"] == 11
+    assert finding["scope"] == "f"
+    assert finding["path"] == bad.as_posix()
+    assert "weight" in finding["message"]
+
+    assert main([str(bad)]) == 1
+    text_out = capsys.readouterr().out
+    assert f"{bad.as_posix()}:2:11: [unguarded-weight] (f)" in text_out
+    assert "1 finding(s)" in text_out
+
+    proc = _run_module_cli([str(bad), "--format", "json"])
+    assert proc.returncode == 1, proc.stderr
+    assert json.loads(proc.stdout)["findings"][0]["rule"] == "unguarded-weight"
+
+
+def test_cli_allow_and_exclude_flags_suppress_cleanly(capsys):
+    allow_spec = "vendor/mlx_vlm/models/qwen4_exp/hc_prefill_nax.py::DEFERRED 59 / U29"
+
+    assert main([str(QWEN4_COMPAT_DIR), "--allow", allow_spec]) == 0
+    text_out = capsys.readouterr().out
+    assert "0 finding(s)" in text_out
+
+    assert main([str(QWEN4_COMPAT_DIR)]) == 1
+    assert "unguarded-" in capsys.readouterr().out
+
+    assert main([str(QWEN4_COMPAT_DIR), "--exclude", "hc_prefill_nax.py"]) == 0
+    assert "0 finding(s)" in capsys.readouterr().out
+
+    proc = _run_module_cli([str(QWEN4_COMPAT_DIR), "--allow", allow_spec])
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_cli_missing_path_and_bad_allow_exit_2(tmp_path, capsys):
+    assert main([str(tmp_path / "does_not_exist.py")]) == 2
+    assert "does not exist" in capsys.readouterr().err
+
+    (tmp_path / "clean.py").write_text("x = 1\n")
+
+    assert main([str(tmp_path), "--allow", "foo.py"]) == 2
+    assert "--allow" in capsys.readouterr().err
+
+    assert main([str(tmp_path), "--allow", "foo.py::"]) == 2
+    assert "--allow" in capsys.readouterr().err
+
+    assert main([str(tmp_path), "--allow", "foo.py=bogus-rule::reason"]) == 2
+    assert "--allow" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as exc_info:
+        main([str(tmp_path), "--format", "yaml"])
+    assert exc_info.value.code == 2
+
+
+def test_cli_syntax_error_and_unused_pragma_exit_1(tmp_path, capsys):
+    broken = tmp_path / "broken.py"
+    broken.write_text("def broken(:\n    pass\n")
+    assert main([str(broken)]) == 1
+    assert "unparsable" in capsys.readouterr().out
+
+    unused = tmp_path / "unused.py"
+    unused.write_text(
+        "def f(x):\n"
+        "    # omlx-audit: allow[unguarded-weight] -- never fires\n"
+        "    return x\n"
+    )
+    assert main([str(unused)]) == 0
+    capsys.readouterr()
+    assert main([str(unused), "--check-unused-pragmas"]) == 1
+    out = capsys.readouterr().out
+    assert "unused pragma" in out
+    assert "1 unused pragma(s)" in out
+
+
+def test_cli_standalone_script_invocation(tmp_path):
+    script = REPO_ROOT / "omlx/formats/audit.py"
+    clean = tmp_path / "clean.py"
+    clean.write_text("x = 1\n")
+    proc = subprocess.run(
+        [sys.executable, str(script), str(clean)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "1 file(s) scanned, 0 finding(s)" in proc.stdout
+
+    bad = tmp_path / "bad.py"
+    bad.write_text("def f(layer):\n    return layer.weight\n")
+    proc_bad = subprocess.run(
+        [sys.executable, str(script), str(bad)],
+        cwd=str(tmp_path),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc_bad.returncode == 1, proc_bad.stderr
+    assert f"{bad.as_posix()}:2:11: [unguarded-weight] (f)" in proc_bad.stdout
