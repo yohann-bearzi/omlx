@@ -1841,13 +1841,18 @@ def test_warm_report_dispatch_runs_for_single_layer_and_sequence(monkeypatch):
     monkeypatch.setattr(linear, "warm_model_dispatch", fake_warm_dispatch)
 
     layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    layer2 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
     debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=True, warm_dispatch=True)
-    debug.warm_report([layer], dtypes=(mx.bfloat16,), compile=True, warm_dispatch=True)
+    debug.warm_report(
+        [layer, layer2], dtypes=(mx.bfloat16,), compile=True, warm_dispatch=True
+    )
 
     assert len(dispatched) == 2
     assert dispatched[0] is layer
     assert isinstance(dispatched[1], nn.Module)
-    assert any(mod is layer for _, mod in dispatched[1].named_modules())
+    seq_mods = [mod for _, mod in dispatched[1].named_modules()]
+    assert any(mod is layer for mod in seq_mods)
+    assert any(mod is layer2 for mod in seq_mods)
 
 
 class _AllDtypesTileToyFormat(_TabledToyFormat):
@@ -1947,3 +1952,478 @@ def test_warm_report_attributes_steel_on_nax_host(tmp_path, monkeypatch):
         assert all(name != "omlx_unknown_kernel" for name in names), names
     finally:
         tuning.reset_cache()
+
+
+# ---------------------------------------------------------------------------
+# Pre-land review follow-ups (pre-fmtdebug-50a60c722)
+# ---------------------------------------------------------------------------
+
+
+def test_dump_metal_forced_route_uses_tuned_policy_when_auto_differs(
+    tmp_path, monkeypatch
+):
+    chip = "applegpu_g15d_c80"
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    face_sha = tuning.face_digest(face)
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-24",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 4,
+                "param_staging": "group_steps",
+                "vec_store": True,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "mma_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {"bn": 8, "bk": 32, "nsg": 8},
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "mma_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-24",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {"bn": 8, "bk": 32, "nsg": 8},
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "4-4",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 4,
+                "param_staging": "group_steps",
+                "vec_store": True,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "msg_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "4",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("msg_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {"nsg": 4, "load_lifetime": "column"},
+            "exactness": "bitwise",
+        },
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    # Also write an M5 table where dense_tile is NAX so forcing steel must NOT
+    # adopt a NAX policy.
+    chip_m5 = "applegpu_g17s_c40"
+    m5_entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-24",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "db",
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "mma_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": tuning.skeleton_digest("mma_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {"bn": 8, "bk": 32, "nsg": 8},
+            "exactness": "bitwise",
+        },
+    ]
+    (v1 / f"{chip_m5}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip_m5, "entries": m5_entries})
+    )
+
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        # 1. Auto selects mma_tile (20-20); forced route="steel" must pick tuned
+        # dense_tile (17-24, bk=64, vec_store=True), not default (bk=32, False).
+        auto_20 = debug.dump_metal(layer, rows=20, chip=chip)
+        assert auto_20.route == "mma"
+        assert "bn=8" in (auto_20.policy_repr or "")
+
+        forced_steel = debug.dump_metal(layer, rows=20, route="steel", chip=chip)
+        assert "bk=64" in (forced_steel.policy_repr or ""), forced_steel.policy_repr
+        assert "vec_store=True" in (forced_steel.policy_repr or "")
+        tmpl_steel = dict(forced_steel.launch.template)
+        assert tmpl_steel["BK"] == 64
+        assert tmpl_steel["VEC_STORE"] is True
+
+        # 1b. oqh_affine maps to affine table_face during forced-route lookup.
+        oqh_aff = debug.make_layer("oqh_affine", bits=4, group_size=64, k=256, n=256)
+        forced_oqh_steel = debug.dump_metal(oqh_aff, rows=20, route="steel", chip=chip)
+        assert "bk=64" in (forced_oqh_steel.policy_repr or "")
+        assert "vec_store=True" in (forced_oqh_steel.policy_repr or "")
+
+        # 2. Auto selects steel (17-24, prio 2 > mma_tile prio 1 at rows=18);
+        # forced route="mma" must pick tuned mma_tile (bn=8), not default bn=16.
+        auto_18 = debug.dump_metal(layer, rows=18, chip=chip)
+        assert auto_18.route == "steel"
+        forced_mma = debug.dump_metal(layer, rows=18, route="mma", chip=chip)
+        assert "bn=8" in (forced_mma.policy_repr or ""), forced_mma.policy_repr
+        assert forced_mma.launch.grid == (32 * 8, 256 // 8, 1)
+
+        # 3. Auto selects steel (4-4 outranks msg_tile "4"); forced route="msg"
+        # must pick tuned msg_tile (nsg=4, ONE_COL_STREAMING), not default nsg=8.
+        auto_4 = debug.dump_metal(layer, rows=4, chip=chip)
+        assert auto_4.route == "steel"
+        forced_msg = debug.dump_metal(layer, rows=4, route="msg", chip=chip)
+        assert "nsg=4" in (forced_msg.policy_repr or ""), forced_msg.policy_repr
+        assert "ONE_COL_STREAMING" in (forced_msg.policy_repr or "")
+        assert forced_msg.launch.threadgroup == (32 * 4, 1, 1)
+
+        # 4. On M5 where auto is mma (20-20) and dense_tile (17-24) is nax:
+        # forcing nax uses tuned nax; forcing steel ignores nax entry and uses
+        # default steel policy (bk=32, vec_store=False).
+        forced_nax = debug.dump_metal(layer, rows=20, route="nax", chip=chip_m5)
+        assert "backend='nax'" in (forced_nax.policy_repr or "")
+        assert "sched='db'" in (forced_nax.policy_repr or "")
+        forced_m5_steel = debug.dump_metal(layer, rows=20, route="steel", chip=chip_m5)
+        assert "backend='steel'" in (forced_m5_steel.policy_repr or "")
+        assert "bk=32" in (forced_m5_steel.policy_repr or "")
+    finally:
+        tuning.reset_cache()
+
+
+def test_warm_report_registers_dense_names_under_tile_dense_lock(monkeypatch):
+    class _TrackingLock:
+        def __init__(self) -> None:
+            self.enters = 0
+            self.exits = 0
+            self.depth = 0
+
+        def __enter__(self) -> _TrackingLock:
+            self.enters += 1
+            self.depth += 1
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            self.depth -= 1
+            self.exits += 1
+
+    tracker = _TrackingLock()
+    real_build = tile_dense._build
+    build_calls: list[tuple[str, bool]] = []
+
+    def spy_build(face, backend):
+        build_calls.append((backend, tracker.depth > 0))
+        return real_build(face, backend)
+
+    monkeypatch.setattr(tile_dense, "_lock", tracker)
+    monkeypatch.setattr(tile_dense, "_build", spy_build)
+
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    raw_map: dict[int, str] = {}
+    debug._register_raw_names_for_layer(layer, tensor_units=True, raw_name_map=raw_map)
+    assert [b for b, _ in build_calls] == ["nax", "steel"]
+    assert all(held for _, held in build_calls), build_calls
+    assert tracker.enters == 2 and tracker.exits == 2 and tracker.depth == 0
+
+    build_calls.clear()
+    debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
+    assert len(build_calls) >= 1
+    assert all(held for _, held in build_calls), build_calls
+    assert tracker.depth == 0
+
+
+def test_assemble_standalone_metal_scalar_guard_and_strides_binding():
+    launch = debug.LaunchGeometry(
+        grid=(32, 1, 1),
+        threadgroup=(32, 1, 1),
+        threadgroups=(1, 1, 1),
+        template=(("T", "bfloat16_t"),),
+        input_names=("x", "s"),
+        output_names=("y",),
+        input_specs=(
+            ("x", "bfloat16_t", (4, 64), "device"),
+            ("s", "uint32_t", (), "scalar"),
+        ),
+        output_specs=(("y", "bfloat16_t", (4, 64)),),
+        staged_table_bytes=0,
+        split_k=None,
+        k_part=None,
+    )
+    raw_source = (
+        "// uses x_shape x_strides x_ndim and mentions s_shape s_strides s_ndim\n"
+        "y[0] = x[0];\n"
+    )
+    metal, _ = debug._assemble_standalone_metal(
+        kernel_name="omlx_test_bindings",
+        route="steel",
+        mode="affine",
+        bits=4,
+        group_size=64,
+        k=64,
+        n=64,
+        rows=4,
+        chip="applegpu_g15d_c80",
+        table_mode="selects",
+        policy_repr=None,
+        raw_digest="0" * 64,
+        raw_source=raw_source,
+        mlx_route_headers="",
+        face_header="",
+        skeleton_header="",
+        matrix_declarations="",
+        skeleton_body=raw_source,
+        template=[("T", mx.bfloat16)],
+        launch=launch,
+        include_mlx_preamble=False,
+    )
+    sig_start = metal.index("[[kernel]] void omlx_test_bindings_tmpl(")
+    sig_end = metal.index(") {", sig_start)
+    sig = metal[sig_start:sig_end]
+    expected_bindings = [
+        "const device bfloat16_t* x [[buffer(0)]]",
+        "const constant int* x_shape [[buffer(1)]]",
+        "const constant int64_t* x_strides [[buffer(2)]]",
+        "const constant int& x_ndim [[buffer(3)]]",
+        "const constant uint32_t& s [[buffer(4)]]",
+        "device bfloat16_t* y [[buffer(5)]]",
+    ]
+    positions = [sig.find(b) for b in expected_bindings]
+    assert all(p != -1 for p in positions), sig
+    assert positions == sorted(positions), sig
+    assert "s_shape" not in sig
+    assert "s_strides" not in sig
+    assert "s_ndim" not in sig
+
+
+def test_dump_metal_fp32_skips_tile_dense_schedule(tmp_path, monkeypatch):
+    chip = "applegpu_g15d_c80"
+    # 1. oqh_affine at fp32 must skip _build_schedule (which would fail inside
+    # affine.tile_face(..., fp32)) and raise ValueError on inexact dtype.
+    oqh_aff = debug.make_layer("oqh_affine", bits=4, group_size=64, k=256, n=256)
+    with pytest.raises(ValueError, match="exact for fp32"):
+        debug.dump_metal(oqh_aff, rows=32, dtype=mx.float32, route="steel", chip=chip)
+
+    # 2. A Tile with dtypes=() is exact for fp32, yet dump_metal must not query
+    # tile_dense._build_schedule or tuning tables for fp32.
+    all_dt_layer = debug.make_layer(
+        _AllDtypesTileToyFormat(),
+        bits=4,
+        group_size=64,
+        k=256,
+        n=256,
+        dtype=mx.bfloat16,
+    )
+    tile_face = formats._checked_face(
+        all_dt_layer.fmt, all_dt_layer, 256, 256, Tile, "tile"
+    )
+    assert tile_face is not None
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": tile_face.key,
+                "dtype": "fp32",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "25-32",
+            },
+            "face_sha256": tuning.face_digest(tile_face),
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 4,
+                "param_staging": "group_steps",
+                "vec_store": True,
+            },
+            "exactness": "bitwise",
+        }
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    sched_calls: list[object] = []
+    real_build_schedule = tile_dense._build_schedule
+
+    def spy_build_schedule(*args, **kwargs):
+        sched_calls.append(args)
+        return real_build_schedule(*args, **kwargs)
+
+    monkeypatch.setattr(tile_dense, "_build_schedule", spy_build_schedule)
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        dumped = debug.dump_metal(
+            all_dt_layer, rows=32, dtype=mx.float32, route="steel", chip=chip
+        )
+        assert sched_calls == []
+        assert "bk=32" in (dumped.policy_repr or ""), dumped.policy_repr
+        assert "vec_store=False" in (dumped.policy_repr or "")
+    finally:
+        tuning.reset_cache()
+
+
+class _SignFlipWithInverseFormat(_SignFlipNoInverseFormat):
+    """Same mode as _SignFlipNoInverseFormat, but provides inverse_weight."""
+
+    def input_transform(self, layer):
+        return transforms.InputTransform(
+            version=transforms.TRANSFORM_VERSION,
+            kind="sign_flip",
+            tensors=("qsigns",),
+            block=64,
+            apply=lambda x, s: x * s.astype(x.dtype),
+            inverse_weight=lambda w, s: w * s.astype(w.dtype),
+        )
+
+
+def test_resolve_baselines_mixed_transform_sequence_and_no_redundant_decode(
+    monkeypatch,
+):
+    layer_inv = debug.make_layer(
+        _SignFlipWithInverseFormat(),
+        bits=4,
+        group_size=64,
+        k=128,
+        n=128,
+        seed=1,
+        realistic_weights=True,
+    )
+    layer_no_inv = debug.make_layer(
+        _SignFlipNoInverseFormat(),
+        bits=4,
+        group_size=64,
+        k=128,
+        n=128,
+        seed=2,
+        realistic_weights=True,
+    )
+
+    # Mixed sequence where layers[0] has inverse_weight but layers[1] lacks it
+    # must cleanly skip the baseline instead of raising inside _make_mlx_baseline.
+    bases, base_bits, base_gs, note = debug._resolve_baselines(
+        (layer_inv, layer_no_inv), None, mx.bfloat16
+    )
+    assert (bases, base_bits, base_gs) == (None, None, None)
+    assert note is not None and "inverse_weight" in note
+
+    # Resolving baselines for an invertible layer must not decode layer[0] twice.
+    decode_calls: list[int] = []
+    real_plain = debug._plain_weight_fp32
+
+    def spy_plain(layer):
+        decode_calls.append(id(layer))
+        return real_plain(layer)
+
+    monkeypatch.setattr(debug, "_plain_weight_fp32", spy_plain)
+    bases_ok, bits_ok, gs_ok, _ = debug._resolve_baselines(
+        (layer_inv,), None, mx.bfloat16
+    )
+    assert bases_ok is not None and len(bases_ok) == 1
+    assert (bits_ok, gs_ok) == (4, 64)
+    assert decode_calls == [id(layer_inv)]

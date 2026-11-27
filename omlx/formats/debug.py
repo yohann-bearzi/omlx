@@ -2481,6 +2481,7 @@ def dump_metal(
     tile_face: Tile | None = face_objs["tile"]
 
     # Recover the exact scheduled policy on dense layers (auto or forced route).
+    forced_table_face: Tile | None = None
     if not is_switch and tile_face is not None and dt in (mx.float16, mx.bfloat16):
         dot_ok = (
             dot_face is not None
@@ -2497,6 +2498,11 @@ def dump_metal(
             dot_ok=dot_ok,
         )
         scheduled_policy = tile_dense._route_for_rows(sched, rows).policy
+        forced_table_face = (
+            affine.tile_face(layer.bits, layer.group_size, dt)
+            if layer.mode == "oqh_affine"
+            else tile_face
+        )
 
     x_shape = (
         (rows, 1, k) if is_switch else ((1, rows, k) if input_ndim == 3 else (rows, k))
@@ -2587,10 +2593,32 @@ def dump_metal(
             and scheduled_policy.backend == chosen_route
         ):
             pol = scheduled_policy
-        elif chosen_route == "nax":
-            pol = tile_dense._default_nax_policy(layer.bits, rows, n, k)
         else:
-            pol = tile_dense._default_steel_policy(rows, n, k)
+            cand = (
+                tuning.lookup(
+                    "dense_tile",
+                    forced_table_face,
+                    dtype=dt,
+                    bits=layer.bits,
+                    group=layer.group_size,
+                    n=n,
+                    k=k,
+                    rows=rows,
+                    chip=chip_id,
+                )
+                if forced_table_face is not None
+                else None
+            )
+            if (
+                isinstance(cand, DenseTilePolicy)
+                and cand.backend == chosen_route
+                and cand.is_legal(face, k, n, rows, chip_id, dt, tail=True)
+            ):
+                pol = cand
+            elif chosen_route == "nax":
+                pol = tile_dense._default_nax_policy(layer.bits, rows, n, k)
+            else:
+                pol = tile_dense._default_steel_policy(rows, n, k)
         if not pol.is_legal(face, k, n, rows, chip_id, dt, tail=True):
             raise ValueError(
                 f"route {chosen_route!r} policy {pol!r} is illegal for "
@@ -2728,11 +2756,30 @@ def dump_metal(
         face = tile_face
         backend = "mma"
         m_pad = ((rows + 7) // 8) * 8
-        pol = (
-            scheduled_policy
-            if isinstance(scheduled_policy, MmaTilePolicy)
-            else MmaTilePolicy()
-        )
+        if isinstance(scheduled_policy, MmaTilePolicy):
+            pol = scheduled_policy
+        else:
+            cand = (
+                tuning.lookup(
+                    "mma_tile",
+                    forced_table_face,
+                    dtype=dt,
+                    bits=layer.bits,
+                    group=layer.group_size,
+                    n=n,
+                    k=k,
+                    rows=rows,
+                    chip=chip_id,
+                )
+                if forced_table_face is not None
+                else None
+            )
+            pol = (
+                cand
+                if isinstance(cand, MmaTilePolicy)
+                and cand.is_legal(face, k, n, m_pad, chip_id, dt)
+                else MmaTilePolicy()
+            )
         if not pol.is_legal(face, k, n, m_pad, chip_id, dt):
             raise ValueError(
                 f"route 'mma' policy {pol!r} is illegal for "
@@ -2765,11 +2812,30 @@ def dump_metal(
         face = tile_face
         backend = "msg"
         m_pad = 4 if rows <= 4 else 6 if rows <= 6 else 8
-        pol = (
-            scheduled_policy
-            if isinstance(scheduled_policy, MsgTilePolicy)
-            else MsgTilePolicy()
-        )
+        if isinstance(scheduled_policy, MsgTilePolicy):
+            pol = scheduled_policy
+        else:
+            cand = (
+                tuning.lookup(
+                    "msg_tile",
+                    forced_table_face,
+                    dtype=dt,
+                    bits=layer.bits,
+                    group=layer.group_size,
+                    n=n,
+                    k=k,
+                    rows=rows,
+                    chip=chip_id,
+                )
+                if forced_table_face is not None
+                else None
+            )
+            pol = (
+                cand
+                if isinstance(cand, MsgTilePolicy)
+                and cand.is_legal(face, k, n, m_pad, chip_id, dt)
+                else MsgTilePolicy()
+            )
         if not pol.is_legal(face, k, n, m_pad, chip_id, dt):
             raise ValueError(
                 f"route 'msg' policy {pol!r} is illegal for "
@@ -3193,6 +3259,13 @@ def _plain_weight_fp32(layer: FormatLinear) -> tuple[mx.array | None, Any]:
     return w, None
 
 
+def _lacks_inverse_weight(layer: FormatLinear) -> bool:
+    if not formats._declares_input_transform(layer.fmt):
+        return False
+    bound = formats._bound_transform(layer.fmt, layer, transforms)
+    return bound is not None and bound[0].inverse_weight is None
+
+
 def _fp32_reference(layer: FormatLinear, x: mx.array) -> mx.array:
     w_plain, fallback = _plain_weight_fp32(layer)
     x32 = x.astype(mx.float32)
@@ -3339,7 +3412,7 @@ def _resolve_baselines(
             f"no legal MLX affine group_size in (64, 32, 128) divides k={k}",
         )
 
-    if _plain_weight_fp32(first)[0] is None:
+    if any(_lacks_inverse_weight(layer) for layer in layers):
         return (
             None,
             None,
@@ -3749,7 +3822,8 @@ def _register_raw_names_for_layer(
         tile_face = formats.tile(layer, k, n)
         if tile_face is not None:
             for backend in ("nax", "steel") if tensor_units else ("steel",):
-                mm = tile_dense._build(tile_face, backend)
+                with tile_dense._lock:
+                    mm = tile_dense._build(tile_face, backend)
                 if mm is not None:
                     raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
 
