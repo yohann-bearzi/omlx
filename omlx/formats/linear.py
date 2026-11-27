@@ -1883,6 +1883,8 @@ class _FormatLayer(nn.Module):
             raise formats.FormatRefusedError(
                 "the write did not admit this layer", mode="unknown"
             )
+        else:
+            formats.require_metal_backend(fmt if isinstance(fmt, str) else fmt.mode)
         if isinstance(fmt, str):
             # A layer built by hand, of a registered mode: its format.
             mode, fmt = fmt, formats.get(fmt)

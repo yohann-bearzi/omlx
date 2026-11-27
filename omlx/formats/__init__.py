@@ -24,6 +24,7 @@ is written for.
 
 from __future__ import annotations
 
+import contextvars
 import copy
 import gc
 import logging
@@ -31,7 +32,6 @@ import math
 import numbers
 import struct
 import sys
-import contextvars
 import threading
 import types
 import weakref
@@ -108,6 +108,7 @@ BUILTIN: tuple[str, ...] = (
 # oMLX implements, and the oldest one whose formats it still runs.
 CONTRACT = 1
 OLDEST_CONTRACT = 1
+CONTRACT_STABILITY = "experimental"
 
 
 def _identifier(name) -> bool:
@@ -858,6 +859,128 @@ def _check_reader_isolation(registered: QuantFormat, reader, *, stage: str) -> N
 _FORMATS: dict[str, QuantFormat] = {}
 
 
+def _detected_backend() -> str:
+    """Best-effort name of the active non-Metal MLX backend for error messages."""
+    try:
+        cuda = getattr(mx, "cuda", None)
+        cuda_avail = getattr(cuda, "is_available", None)
+        if callable(cuda_avail) and bool(cuda_avail()):
+            return "cuda"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        is_avail = getattr(mx, "is_available", None)
+        if callable(is_avail):
+            if bool(is_avail(mx.gpu)):
+                device_info = getattr(mx, "device_info", None)
+                if callable(device_info):
+                    try:
+                        info = device_info(mx.gpu)
+                    except TypeError:
+                        info = device_info()
+                    if isinstance(info, dict):
+                        name = info.get("architecture") or info.get("device_name")
+                        if isinstance(name, str) and name.strip():
+                            return f"non-Metal GPU ({name.strip()})"
+                return "non-Metal GPU"
+            return "cpu"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        default = mx.default_device()
+        text = str(default)
+        if "cpu" in text.lower():
+            return "cpu"
+        return text
+    except Exception:  # noqa: BLE001
+        return "cpu"
+
+
+def _metal_refusal_reason() -> str | None:
+    """Return None when Apple Metal GPU kernels are available, else a refusal."""
+    try:
+        metal = getattr(mx, "metal", None)
+        metal_avail = getattr(metal, "is_available", None)
+        has_metal = callable(metal_avail) and bool(metal_avail())
+    except Exception:  # noqa: BLE001
+        has_metal = False
+    if not has_metal:
+        return (
+            "quant-format layers require the Apple Silicon Metal backend "
+            f"(detected backend: {_detected_backend()}); non-Metal MLX backends "
+            "(CPU-only, CUDA, ROCm, Vulkan) are not supported yet"
+        )
+    try:
+        is_avail = getattr(mx, "is_available", None)
+        has_gpu = callable(is_avail) and bool(is_avail(mx.gpu))
+    except Exception:  # noqa: BLE001
+        has_gpu = False
+    if not has_gpu:
+        return (
+            "quant-format layers require an active Metal GPU device "
+            "(mx.metal.is_available() is True, but mx.is_available(mx.gpu) is False)"
+        )
+    try:
+        has_kernel = callable(getattr(getattr(mx, "fast", None), "metal_kernel", None))
+    except Exception:  # noqa: BLE001
+        has_kernel = False
+    if not has_kernel:
+        return (
+            "quant-format layers require mx.fast.metal_kernel, which is unavailable "
+            "in this MLX build"
+        )
+    return None
+
+
+def metal_backend_available() -> bool:
+    """Whether the active MLX runtime provides a usable Apple Metal GPU backend."""
+    try:
+        metal = getattr(mx, "metal", None)
+        metal_avail = getattr(metal, "is_available", None)
+        if not (callable(metal_avail) and bool(metal_avail())):
+            return False
+        is_avail = getattr(mx, "is_available", None)
+        if not (callable(is_avail) and bool(is_avail(mx.gpu))):
+            return False
+        return callable(getattr(getattr(mx, "fast", None), "metal_kernel", None))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _installed_label(mode: str) -> str:
+    """Describe what is currently registered for ``mode`` without calling load()."""
+    if not isinstance(mode, str):
+        return "none"
+    installed = _ORIGINS.get(mode)
+    if installed is not None:
+        return installed
+    if mode in _BUILTIN_MODES:
+        return "built-in"
+    if mode in _FORMATS:
+        return "a format registered by hand"
+    return "none"
+
+
+def require_metal_backend(
+    mode: str = "unknown",
+    *,
+    path=None,
+    written: str | None = None,
+    installed: str | None = None,
+) -> None:
+    """Fail closed with FormatRefusedError when Metal is unavailable."""
+    reason = _metal_refusal_reason()
+    if reason is not None:
+        norm_mode = mode if isinstance(mode, str) and mode else "unknown"
+        raise FormatRefusedError(
+            reason,
+            mode=norm_mode,
+            path=path,
+            written=written,
+            installed=installed,
+        )
+
+
 def _may_build(mode) -> None:
     """Refuse a layer of ``mode``'s format built anywhere but in the load of
     a checkpoint that passed the family gate (``format_load``), or in a block
@@ -871,8 +994,19 @@ def _may_build(mode) -> None:
         and checkpoint.verified
         and mode in checkpoint.verified_modes
     ):
+        reason = _metal_refusal_reason()
+        if reason is not None:
+            norm_mode = mode if isinstance(mode, str) and mode else "unknown"
+            raise FormatRefusedError(
+                reason,
+                mode=norm_mode,
+                path=checkpoint.shown,
+                written=checkpoint.writer(norm_mode),
+                installed=_installed_label(norm_mode),
+            )
         return
     if _TESTING.get() and checkpoint is None:
+        require_metal_backend(mode)
         return
     raise FormatRefusedError(
         "a format's layer is built only while oMLX loads a checkpoint of a "
