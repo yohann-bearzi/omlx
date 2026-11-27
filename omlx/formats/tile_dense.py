@@ -990,6 +990,7 @@ def source_digest() -> str:
                     ):
                         digest.update(part.encode() + b"\0")
                     count += 1
+    digest.update(b"splitk_accum\0" + _SPLITK_ACCUM_SOURCE.encode() + b"\0")
     return f"{count} {digest.hexdigest()}"
 
 

@@ -79,7 +79,7 @@ def _dot(array: mx.array) -> str:
     return buf.getvalue()
 
 
-_DENSE_DIGEST = "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
+_DENSE_DIGEST = "48 da633342e9652f26f704405bce666bf2ac84512898a0ddc1890eea6bb05473e7"
 
 
 def test_dense_skeleton_source_digest_is_pinned():
@@ -1195,6 +1195,10 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     assert tile_dense.policy_for(p1_m3, 18, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p1_m3, 64, mx.bfloat16).split_k == 40
     assert tile_dense.policy_for(p1_m3, 512, mx.bfloat16).split_k == 20
+    _, o_proj = _layer(2560, 6144, 8, 64)
+    p_o = tile_dense.build_plan(o_proj, tensor_units=False, chip="applegpu_g15d_c80")
+    for r in (17, 24):
+        assert tile_dense.policy_for(p_o, r, mx.bfloat16).backend == "mlx"
     p48_m5 = tile_dense.build_plan(in_proj, tensor_units=True, chip="applegpu_g17s_c40")
     assert tile_dense.policy_for(p48_m5, 32, mx.bfloat16).backend == "wide"
     assert tile_dense.policy_for(p48_m5, 128, mx.bfloat16).split_k == 40
@@ -1768,6 +1772,13 @@ def test_dense_splitk_accum_warmed_in_warm_specs(monkeypatch):
     stand_in = accum_matches[0][1]()
     assert stand_in.input_shapes == ((10, 16, 48),)
     assert stand_in.output_shapes == ((16, 48),)
+    want = kernels.planned(
+        accum_k,
+        (((10, 16, 48), mx.float32),),
+        [mx.bfloat16],
+        template=[("T", mx.bfloat16), ("SPLIT_K", 10), ("IDX64", False)],
+    )
+    assert want in inst_sk
     assert stand_in.grid == (16 * 48, 1, 1)
 
     pol_1 = (
@@ -1890,8 +1901,8 @@ def test_deferred79_fused_splitk_winning_cells_routed_and_pass_c2(monkeypatch):
 @pytest.mark.skipif(
     tuning.current_chip() != "applegpu_g15d_c80", reason="needs the M3 Ultra table"
 )
-def test_m3_flash_next_output_projection_prose_prefill(monkeypatch):
-    """The oQh gate prefills 24 rows before comparing serial and window logits."""
+def test_m3_output_projection_17_24_bf16_mlx_fp16_steel(monkeypatch):
+    """BF16 17-24 2560x6144 stays MLX (stock bits); FP16 keeps Steel sk=12 (C2)."""
     monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
     for dtype in (mx.bfloat16, mx.float16):
         quantized, layer = _layer(2560, 6144, 8, 64, dtype)
