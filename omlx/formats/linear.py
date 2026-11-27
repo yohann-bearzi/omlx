@@ -1361,9 +1361,10 @@ def _warm_format_linear_dispatch(
             dense = kept._slots.get("dense")
             if dense is not None:
                 mod._bind_one_row_mlx_fast(kept, dense, sig1)
-        elif kept.plan is not None:
-            if _warm_linear_rows_graph(kept.plan, (1, 1, k), dtype, key=sig1):
-                mod._register_dot_fast(kept, kept.plan, sig1)
+        elif kept.plan is not None and _warm_linear_rows_graph(
+            kept.plan, (1, 1, k), dtype, key=sig1
+        ):
+            mod._register_dot_fast(kept, kept.plan, sig1)
         # 2. Multi-row decode (B, 1, K), batched verify (B, S, K), and
         #    single-stream / GDN-stacked verify (1, S, K) — every FormatLinear
         #    follows its construction-time schedule and registers on dense_fast
