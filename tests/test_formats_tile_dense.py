@@ -767,12 +767,13 @@ def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows(monkeypat
     real_dot_rows = FormatLinear._dot_rows
 
     def spy(self, kept, x, bias):
-        dot_rows.append(x.shape)
-        return real_dot_rows(self, kept, x, bias)
+        y = real_dot_rows(self, kept, x, bias)
+        dot_rows.append((x.shape, y is not None))
+        return y
 
     monkeypatch.setattr(FormatLinear, "_dot_rows", spy)
     got = layer(x3)
-    assert dot_rows == [x3.shape]
+    assert dot_rows == [(x3.shape, True)]
     per_row = mx.concatenate([layer(x3[i : i + 1]) for i in range(3)], axis=0)
     mx.eval(got, per_row)
 

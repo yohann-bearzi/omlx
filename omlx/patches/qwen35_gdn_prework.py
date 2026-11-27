@@ -82,7 +82,7 @@ _QWEN4_VERIFY_FUSED = True
 _QWEN4_BATCH_DECODE_MAX_ROWS = 16
 # The verify's rollback records skip the per-step recurrent states (S-1 x 3 MB per
 # layer, written on every verify and read only on a partial accept): a commit
-# keeping m of S rows reparses the first m rows, on a 2/3-row block through the
+# keeping m of S rows recomputes the first m rows, on a 2/3-row block through the
 # prefix-state kernel (bitwise equal to the fused step), else the fused step.
 _QWEN4_VERIFY_DEFERRED_STATES = True
 _QWEN4_VERIFY_STEP_KERNELS: dict = {}
@@ -2000,11 +2000,12 @@ def _qwen4_state_after(
     dv,
     keep,
 ):
-    """The recurrent state after the first ``keep`` rows of a verify block:
-    the fused step on those rows when they were recorded, else the prefix
-    replay (``_qwen4_prefix_state``) on a 2/3-row block, which reproduces
-    the fused step's state after row ``keep - 1`` bit for bit (row t's
-    arithmetic does not depend on the block length)."""
+    """The recurrent state after the first ``keep`` rows of a verify block
+    whose per-step states were not recorded. On a 2/3-row block,
+    ``_qwen4_prefix_state`` replays the prefix, reproducing the fused step's
+    state after row ``keep - 1`` bit for bit. A longer block reruns the fused
+    step on those rows (row t's arithmetic does not depend on the block
+    length)."""
     if proj.shape[1] in (2, 3) and 0 < keep < proj.shape[1]:
         return _qwen4_prefix_state(
             proj, conv_state, conv_w, A_log, dt_bias, state, hk, keep

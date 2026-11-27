@@ -640,7 +640,19 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     from omlx.patches import qwen35_verify_sdpa_split as vs
 
     # Re-apply the split patch so the seam under test is its wrapper (the
-    # module remembers a prior application from other tests).
+    # module remembers a prior application from other tests), and let
+    # monkeypatch put the seam back afterwards so later tests see one wrapper.
+    monkeypatch.setattr(
+        q35_lang,
+        "_qwen3_5_left_padded_attention",
+        q35_lang._qwen3_5_left_padded_attention,
+    )
+    monkeypatch.setattr(
+        q35_lang,
+        "_omlx_verify_attention",
+        getattr(q35_lang, "_omlx_verify_attention", False),
+        raising=False,
+    )
     monkeypatch.setattr(vs, "_PATCHED", False)
     if not vs.apply_qwen35_verify_sdpa_split_patch():
         pytest.skip("verify-split patch unavailable")
@@ -683,3 +695,13 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     finally:
         qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=True)
     assert out is not None and calls == [] and len(row_exact) == 1
+
+
+def test_short_verify_route_restores_seam():
+    """The seam test re-applies the split patch under a monkeypatch context;
+    afterwards the seam must be the one installed before the test."""
+    q35_lang = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
+    before = q35_lang._qwen3_5_left_padded_attention
+    with pytest.MonkeyPatch.context() as mp:
+        test_short_verify_routes_three_rows_to_short_causal_kernel(mp)
+    assert q35_lang._qwen3_5_left_padded_attention is before
