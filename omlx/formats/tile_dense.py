@@ -817,6 +817,15 @@ METAL_FUNC void dense_nax(
   }
 }
 
+// Contiguous MLX views may begin at any element offset. A vector-pointer
+// cast promises vector alignment to Metal, even when the buffer is a view.
+template <typename T, ushort N>
+METAL_FUNC vec<T, N> load_activation(const device T* p) {
+  vec<T, N> value;
+  __builtin_memcpy(&value, p, sizeof(value));
+  return value;
+}
+
 // An eight-code run fills one lane of a 16 x BN x 32 cooperative operation.
 // All lanes apply the same K permutation to both operands. Eight SIMD groups
 // cover disjoint K blocks and reduce FP32 fragments before the output cast.
@@ -864,7 +873,7 @@ METAL_FUNC void register_tile(
       for (short h = 0; h < 2; ++h) {
         const int row = 8 * h + sc.y;
         const vec<T, 8> xv = (8 * h < BM && row < live)
-            ? *(const device vec<T, 8>*)(x + size_t(row0 + row) * K + k + run * 8)
+            ? load_activation<T, 8>(x + size_t(row0 + row) * K + k + run * 8)
             : vec<T, 8>(0);
         STEEL_PRAGMA_UNROLL
         for (short i = 0; i < 8; ++i) {
@@ -943,7 +952,7 @@ METAL_FUNC void prefetch_tile(
     for (short f = 0; f < fragments; ++f) {
       STEEL_PRAGMA_UNROLL
       for (short h = 0; h < 2; ++h)
-        current[f][h] = *(const device vec<T, 4>*)(xp[h] + 16 * f);
+        current[f][h] = load_activation<T, 4>(xp[h] + 16 * f);
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -957,7 +966,7 @@ METAL_FUNC void prefetch_tile(
       for (short f = 0; f < fragments; ++f) {
         STEEL_PRAGMA_UNROLL
         for (short h = 0; h < 2; ++h)
-          next[f][h] = *(const device vec<T, 4>*)(xp[h] + next_k + 16 * f);
+          next[f][h] = load_activation<T, 4>(xp[h] + next_k + 16 * f);
       }
       const threadgroup T* weights = ws + (step & 1) * tile_size + sc.y * STRIDE + sc.x;
       STEEL_PRAGMA_UNROLL

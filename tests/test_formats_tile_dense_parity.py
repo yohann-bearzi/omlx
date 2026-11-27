@@ -79,7 +79,7 @@ def _dot(array: mx.array) -> str:
     return buf.getvalue()
 
 
-_DENSE_DIGEST = "49 e7a95a88fb60ed5685a812e25fb58c7bb4c43c883d030c68b1cc64a6e9109401"
+_DENSE_DIGEST = "49 ca2bba46333e5a1689ec7640a9936d2f4a9b9610c753f5f124b204a5c7d9a16d"
 
 
 def test_dense_skeleton_source_digest_is_pinned():
@@ -1940,5 +1940,21 @@ def test_m5_square_q4_registered_and_prefill_tiles(width):
         kernel = tile_dense._kernel(plan.face, policy)
         for offset in (0, 1):
             x = _x((rows * width + offset,))[offset:].reshape(rows, width)
+            out = tile_dense._launch(kernel, policy, x, plan.operands)
+            _assert_c2(out, stock(x), x, stock)
+
+
+@needs_nax
+def test_m5_register_tile_accepts_unaligned_float16_activations():
+    width = 2048
+    stock, layer = _layer(width, width, 4, 64, dtype=mx.float16)
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    for rows in (4, 8, 16):
+        policy = tile_dense._default_nax_policy(4, rows, width, width)
+        kernel = tile_dense._kernel(plan.face, policy)
+        for offset in (1, 2, 3, 4, 7):
+            x = _x((rows * width + offset,), dtype=mx.float16)[offset:].reshape(
+                rows, width
+            )
             out = tile_dense._launch(kernel, policy, x, plan.operands)
             _assert_c2(out, stock(x), x, stock)
