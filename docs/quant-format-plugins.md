@@ -54,6 +54,7 @@ A format that cannot be shown right is refused, or its layers fall back to a slo
 
 - **Registration**: one format per mode. Built-ins register first and cannot be replaced. MLX's own modes (`affine`, `mxfp4`, `mxfp8`, `nvfp4`, ...) are reserved for built-ins. A plugin's tensors may not be named `weight`, `scales`, `biases` or `bias`, so code that reads MLX's tensors by hand fails loudly. A plugin that fails to import is logged and skipped, and the server starts ([Register a format](quant-formats.md#register-a-format)).
 - **Contract**: a format states its revision in `contract`, each face in `CONTRACT`. A revision outside `OLDEST_CONTRACT..CONTRACT` is refused at registration. A face of another revision fails one `static_assert`. A new revision is an addition, and earlier formats run as before, to the bit ([Versions](quant-formats.md#versions)).
+- **Stability**: `omlx.formats.CONTRACT_STABILITY` is `"experimental"` while the interface is unreleased. It sits beside `CONTRACT = 1` and `OLDEST_CONTRACT = 1`; before upstream freezes the contract there are no backward-compatibility shims, and the value becomes `"stable"` when it does.
 - **Load**: every refusal is one `FormatRefusedError` naming the mode, the checkpoint, the plugin that wrote it and the one installed. Refused: a format not installed, a record `accept` rejects, a layer filled in part, a checkpoint not recorded as verified, a family outside the verified allowlist in `omlx/oq.py` (which oQ applies too). A layer never computes on a placeholder ([Load a checkpoint](quant-formats.md#load-a-checkpoint)).
 - **Runtime**: a `dot()` or `tile()` that raises or returns an invalid face counts as `None`, logged once. Each kernel proves its Metal on a zero stand-in before its first real launch. A face that fails to compile is logged, and its layers keep the composed path or `decode` ([Kernels over faces](quant-formats.md#kernels-over-faces)).
 - **Compile time**: face sources are C++17 Metal without derived classes. Skeleton `static_assert`s name the broken rule. A face source with a static-storage array is refused: tables are `Table` data, because per-lane reads from `constant` or `device` memory varied 2 to 7% in speed between processes on an M3 Ultra ([Compile-time rules](quant-formats.md#compile-time-rules), [Tables](quant-formats.md#tables)).
@@ -131,6 +132,29 @@ Not yet:
 - Dense prefill: a dense format linear's calls above 16 rows that no tile or row-exact route takes run `decode`, then MLX's matmul. Correct, and slow.
 - Distributed serving (cluster, tensor and pipeline parallel), custom `model_file` models, external drafters, and embedding, reranking and audio readers refuse format checkpoints. MoE expert offload keeps every expert resident.
 - Formats whose product is not row by row over blocks of inputs need a new kind of face ([Add to the contract](quant-formats.md#add-to-the-contract)).
+
+## Developer tooling: audit and debug CLIs
+
+`python -m omlx.formats.audit <paths...>` statically scans Python sources for hand-written reads that bypass the format interface: `.weight`, `.scales` and `.biases` on a layer, `mx.quantized_matmul`, `mx.dequantize`, `mx.gather_qmm`, and exact `type(x) is QuantizedLinear` comparisons. A hit is a place where a family's code would misread a format layer; the scan is the check a family port runs before it is declared supported. The scanner is pure Python (it imports no `mlx`), so it also runs on an MLX-free host as `python omlx/formats/audit.py <paths...>`.
+
+- Rules: `unguarded-weight`, `unguarded-scales`, `unguarded-biases`, `unguarded-quantized-matmul`, `unguarded-dequantize`, `unguarded-gather-qmm` and `exact-type-check`.
+- Flags: `--exclude GLOB` (repeatable), `--allow SPEC` (repeatable, `PATH[:SCOPE][=RULE]::REASON`), `--format text|json`, and `--check-unused-pragmas`.
+- Exit codes: `0` clean; `1` findings, unparsable files, or (with `--check-unused-pragmas`) an unused pragma; `2` a usage error, a missing path or a bad `--allow`.
+
+A hit can be allowed inline, on the finding's line, the line above it, or the closing line of a multi-line call; `allow-file` in the leading header covers the whole file. The pragma is parsed from the comment, and malformed syntax, an unknown rule or a missing reason fails closed with an `invalid-pragma` finding that no pragma or allowlist entry can suppress:
+
+    # omlx-audit: allow[unguarded-weight, unguarded-scales] -- reason
+    # omlx-audit: allow -- reason          (every rule)
+    # omlx-audit: allow-file[rule, ...] -- reason
+    # omlx-audit: allow-file -- reason
+
+For pytest, `omlx.formats.audit.assert_no_unguarded_readers(paths, *, exclude=(), allowlist=(), check_unused_pragmas=False)` raises `AuditError` carrying the report; each `AllowEntry(path, rule="*", scope="*", reason=...)` needs a non-empty reason. `scan_paths` and `scan_source` return the same `AuditReport` without raising, and `format_report(report, fmt=...)` renders it as text or JSON.
+
+## Backend requirements and non-Metal extension hook
+
+Format layers are Metal: every face and skeleton compiles to a Metal kernel, so a format layer constructs only where the runtime provides Apple Metal. `omlx.formats.metal_backend_available()` reports whether it does, and `require_metal_backend(mode, ...)` raises one `FormatRefusedError` naming the mode, the checkpoint and the installed plugin when it does not. The check runs once, in `_may_build` at the start of a verified checkpoint load and in the constructor of every format layer; the forward path is unchanged, so there is no per-call cost. On a CPU-only, CUDA, ROCm or Vulkan MLX build, or one without `mx.fast.metal_kernel`, construction fails closed instead of falling back to a slow or wrong path. Registration, `Dot`/`Tile`/`Codes`/`Table` descriptors and `omlx.formats.audit` stay usable without Metal.
+
+**Future `CONTRACT >= 2`: a non-Metal backend emitter (sketch).** Serving CUDA, ROCm, Vulkan or the CPU means compiling a face for that backend instead of for Metal. The planned hook is a `BackendEmitter` per backend: `backend`, `is_available()`, `emit_reads(reads)` over the same `reads.py` descriptors a face already declares, `emit_tables(tables)` over its `Table`s, and `build_skeleton(...)` for the kernel around them. Faces gain a backend key beside their contract revision, `require_supported_backend(fmt, mode)` replaces the Metal-only check at construction, and tuning tables are keyed by `(backend, chip)`. This is a sketch, not a contract: it is written down so backend-independent face descriptors stay the interface.
 
 ## Where to read next
 

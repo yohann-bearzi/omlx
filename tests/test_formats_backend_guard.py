@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import pathlib
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
@@ -405,3 +406,18 @@ def test_require_metal_backend_normalizes_invalid_mode_and_unadmitted_still_refu
     with pytest.raises(FormatRefusedError) as unadmitted:
         FormatLinear("affine", 4, 32, 128, tensors)
     assert "built outside" in str(unadmitted.value)
+
+
+def test_plugin_overview_docs_cover_stability_and_backend_guard():
+    page = (
+        pathlib.Path(__file__).resolve().parents[1] / "docs/quant-format-plugins.md"
+    ).read_text(encoding="utf-8")
+    for token in (
+        "CONTRACT_STABILITY",
+        "experimental",
+        "metal_backend_available",
+        "require_metal_backend",
+        "BackendEmitter",
+        "CONTRACT >= 2",
+    ):
+        assert token in page, f"missing {token!r} in docs/quant-format-plugins.md"

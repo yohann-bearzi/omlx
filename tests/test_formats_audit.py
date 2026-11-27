@@ -593,3 +593,16 @@ def test_cli_standalone_script_invocation(tmp_path):
     )
     assert proc_bad.returncode == 1, proc_bad.stderr
     assert f"{bad.as_posix()}:2:11: [unguarded-weight] (f)" in proc_bad.stdout
+
+
+def test_plugin_overview_docs_cover_audit_cli_and_pragmas():
+    page = (REPO_ROOT / "docs/quant-format-plugins.md").read_text(encoding="utf-8")
+    for token in (
+        "python -m omlx.formats.audit",
+        "assert_no_unguarded_readers",
+        "omlx-audit: allow",
+        "--check-unused-pragmas",
+        "AuditReport",
+        "AllowEntry",
+    ):
+        assert token in page, f"missing {token!r} in docs/quant-format-plugins.md"
