@@ -505,10 +505,33 @@ class _GuardEnv:
         for key in list(self.seq_guards):
             if key == var_name or key.startswith(prefix):
                 del self.seq_guards[key]
-        self.layout_vars.pop(var_name, None)
-        self.seq_aliases.pop(var_name, None)
+        for key, (seq_attr, _) in list(self.layout_vars.items()):
+            seq_key = f"self.{seq_attr}"
+            if (
+                key == var_name
+                or key.startswith(prefix)
+                or seq_key == var_name
+                or seq_key.startswith(prefix)
+            ):
+                del self.layout_vars[key]
+        for key, target in list(self.seq_aliases.items()):
+            if (
+                key == var_name
+                or key.startswith(prefix)
+                or target == var_name
+                or target.startswith(prefix)
+            ):
+                del self.seq_aliases[key]
         self.var_reads_module_attr.pop(var_name, None)
         self.var_unguarded_attr.pop(var_name, None)
+
+    def merge_taint_from(self, other: _GuardEnv) -> None:
+        for var_name, flag in other.var_unguarded_attr.items():
+            if flag:
+                self.var_unguarded_attr[var_name] = True
+        for var_name, flag in other.var_reads_module_attr.items():
+            if flag:
+                self.var_reads_module_attr[var_name] = True
 
     def has_attr_guard(self, recv_key: str, attr: str) -> bool:
         facts = self.recv_facts.get(recv_key)
@@ -532,6 +555,33 @@ class _GuardEnv:
 
 def _is_none_const(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and node.value is None
+
+
+def _is_none_or_falsy_var_test(test: ast.expr, var_name: str) -> bool:
+    if (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and isinstance(test.operand, ast.Name)
+        and test.operand.id == var_name
+    ):
+        return True
+    if (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.ops[0], (ast.Is, ast.Eq))
+    ):
+        left, right = test.left, test.comparators[0]
+        for a, b in ((left, right), (right, left)):
+            if isinstance(a, ast.Name) and a.id == var_name and _is_none_const(b):
+                return True
+    return False
+
+
+def _taint_snapshot(env: _GuardEnv) -> tuple[frozenset[str], frozenset[str]]:
+    return (
+        frozenset(k for k, v in env.var_unguarded_attr.items() if v),
+        frozenset(k for k, v in env.var_reads_module_attr.items() if v),
+    )
 
 
 def _is_str_const(node: ast.AST, value: str) -> bool:
@@ -811,6 +861,12 @@ def _analyze_predicate_fn(
     body = fn.body
     start = 1 if body and _is_docstring_stmt(body[0]) else 0
     for stmt in body[start:]:
+        assigned = _assigned_names([stmt])
+        if any(
+            name in param_set or any(name.startswith(f"{p}.") for p in param_set)
+            for name in assigned
+        ):
+            return None
         if isinstance(stmt, ast.Return):
             if _is_falsy_return(stmt) or stmt.value is None:
                 return None
@@ -830,8 +886,10 @@ def _analyze_predicate_fn(
             _, neg = _extract_facts(stmt.test, base_info, env)
             env = env.apply(neg)
             continue
-        if _has_non_falsy_return(stmt) or (_assigned_names([stmt]) & param_set):
+        if _has_non_falsy_return(stmt):
             return None
+        for name in assigned:
+            env.invalidate(name)
     return None
 
 
@@ -846,11 +904,15 @@ def _analyze_layout_method(
     params = [a.arg for a in fn.args.posonlyargs] + [a.arg for a in fn.args.args]
     if not params or params[0] != "self":
         return None
+    param_set = set(params)
     env = _GuardEnv.empty()
     body = fn.body
     start = 1 if body and _is_docstring_stmt(body[0]) else 0
     saw_truthy_return = False
     for stmt in body[start:]:
+        assigned = _assigned_names([stmt])
+        if assigned & param_set:
+            return None
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
             t = stmt.targets[0]
             if (
@@ -862,7 +924,7 @@ def _analyze_layout_method(
                 env.invalidate(t.id)
                 env.seq_aliases[t.id] = f"self.{stmt.value.attr}"
             else:
-                for name in _assigned_names([stmt]):
+                for name in assigned:
                     env.invalidate(name)
         elif (
             isinstance(stmt, ast.If)
@@ -870,6 +932,8 @@ def _analyze_layout_method(
             and not stmt.orelse
             and not _has_non_falsy_return(stmt)
         ):
+            for name in _named_expr_targets(stmt.test):
+                env.invalidate(name)
             _, neg = _extract_facts(stmt.test, info, env)
             env = env.apply(neg)
         elif isinstance(stmt, ast.Return):
@@ -877,10 +941,13 @@ def _analyze_layout_method(
                 if _qualifying_seq(env) is None:
                     return None
                 saw_truthy_return = True
-        elif _has_non_falsy_return(stmt):
-            if _qualifying_seq(env) is None:
-                return None
-            saw_truthy_return = True
+        else:
+            for name in assigned:
+                env.invalidate(name)
+            if _has_non_falsy_return(stmt):
+                if _qualifying_seq(env) is None:
+                    return None
+                saw_truthy_return = True
     if not saw_truthy_return:
         return None
     return _qualifying_seq(env)
@@ -1098,6 +1165,7 @@ class _AuditVisitor:
         self.scope_stack: list[str] = []
         self.class_stack: list[str] = []
         self.raw_findings: list[_RawFinding] = []
+        self._taint_sinks: list[_GuardEnv] = []
 
     def _scope(self) -> str:
         return ".".join(self.scope_stack) if self.scope_stack else "<module>"
@@ -1134,9 +1202,42 @@ class _AuditVisitor:
     ) -> _GuardEnv:
         start = 1 if skip_docstring and stmts and _is_docstring_stmt(stmts[0]) else 0
         cur = env
+        for sink in self._taint_sinks:
+            sink.merge_taint_from(cur)
         for stmt in stmts[start:]:
             cur = self._visit_stmt(stmt, cur)
+            for sink in self._taint_sinks:
+                sink.merge_taint_from(cur)
         return cur
+
+    def _layout_promise(
+        self, value: ast.AST | None
+    ) -> tuple[str, frozenset[str]] | None:
+        if (
+            value is not None
+            and self.class_stack
+            and isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id == "self"
+        ):
+            return self.info.class_layout_guards.get(
+                (self.class_stack[-1], value.func.attr)
+            )
+        return None
+
+    def _subscript_elem_facts(
+        self, value: ast.AST | None, env: _GuardEnv
+    ) -> set[str] | None:
+        if value is not None and isinstance(value, ast.Subscript):
+            seq_key = _expr_key(value.value)
+            if seq_key is not None:
+                facts = env.seq_guards.get(seq_key)
+                if facts is None and seq_key in env.seq_aliases:
+                    facts = env.seq_guards.get(env.seq_aliases[seq_key])
+                if facts:
+                    return set(facts)
+        return None
 
     def _bind_targets(
         self,
@@ -1153,30 +1254,8 @@ class _AuditVisitor:
         rhs_reads_unguarded_attr = (
             _node_reads_unguarded_attr(value, out) if value is not None else False
         )
-        # Check if RHS is a layout guard call `self.<method>(...)`.
-        layout_promise: tuple[str, frozenset[str]] | None = None
-        if (
-            value is not None
-            and self.class_stack
-            and isinstance(value, ast.Call)
-            and isinstance(value.func, ast.Attribute)
-            and isinstance(value.func.value, ast.Name)
-            and value.func.value.id == "self"
-        ):
-            layout_promise = self.info.class_layout_guards.get(
-                (self.class_stack[-1], value.func.attr)
-            )
-        # Check if RHS is indexing a guarded sequence `seq[i]`.
-        elem_facts: set[str] | None = None
-        if value is not None and isinstance(value, ast.Subscript):
-            seq_key = _expr_key(value.value)
-            if seq_key is not None:
-                facts = out.seq_guards.get(seq_key)
-                if facts is None and seq_key in out.seq_aliases:
-                    facts = out.seq_guards.get(out.seq_aliases[seq_key])
-                if facts:
-                    elem_facts = set(facts)
-        # Check if RHS aliases a sequence (`shards = self.shards`).
+        layout_promise = self._layout_promise(value)
+        elem_facts = self._subscript_elem_facts(value, out)
         rhs_key = _expr_key(value) if value is not None else None
 
         for target in targets:
@@ -1263,87 +1342,149 @@ class _AuditVisitor:
 
     def _visit_stmt(self, stmt: ast.stmt, env: _GuardEnv) -> _GuardEnv:
         if isinstance(stmt, ast.ClassDef):
+            cur = env.copy()
             for dec in stmt.decorator_list:
-                self._visit_expr(dec, env)
+                self._visit_expr(dec, cur)
             for base in stmt.bases:
-                self._visit_expr(base, env)
+                self._visit_expr(base, cur)
             for kw in stmt.keywords:
-                self._visit_expr(kw.value, env)
+                self._visit_expr(kw.value, cur)
+            saved_sinks = self._taint_sinks
+            self._taint_sinks = []
             self.scope_stack.append(stmt.name)
             self.class_stack.append(stmt.name)
-            self._visit_block(stmt.body, _GuardEnv.empty(), skip_docstring=True)
-            self.class_stack.pop()
-            self.scope_stack.pop()
-            return env
+            try:
+                self._visit_block(stmt.body, _GuardEnv.empty(), skip_docstring=True)
+            finally:
+                self.class_stack.pop()
+                self.scope_stack.pop()
+                self._taint_sinks = saved_sinks
+            cur.invalidate(stmt.name)
+            return cur
 
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            cur = env.copy()
             for dec in stmt.decorator_list:
-                self._visit_expr(dec, env)
+                self._visit_expr(dec, cur)
             for default in stmt.args.defaults:
-                self._visit_expr(default, env)
+                self._visit_expr(default, cur)
             for kw_default in stmt.args.kw_defaults:
                 if kw_default is not None:
-                    self._visit_expr(kw_default, env)
+                    self._visit_expr(kw_default, cur)
+            saved_sinks = self._taint_sinks
+            self._taint_sinks = []
             self.scope_stack.append(stmt.name)
             # Soundness: entering a nested def resets local variable guards.
-            self._visit_block(stmt.body, _GuardEnv.empty(), skip_docstring=True)
-            self.scope_stack.pop()
-            return env
+            try:
+                self._visit_block(stmt.body, _GuardEnv.empty(), skip_docstring=True)
+            finally:
+                self.scope_stack.pop()
+                self._taint_sinks = saved_sinks
+            cur.invalidate(stmt.name)
+            return cur
+
+        if isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            out = env.copy()
+            for alias in stmt.names:
+                if alias.asname:
+                    out.invalidate(alias.asname)
+                elif alias.name != "*":
+                    out.invalidate(alias.name.split(".", 1)[0])
+            return out
 
         if isinstance(stmt, ast.Assign):
-            self._visit_expr(stmt.value, env)
-            return self._bind_targets(stmt.targets, stmt.value, env)
+            cur = env.copy()
+            self._visit_expr(stmt.value, cur)
+            return self._bind_targets(stmt.targets, stmt.value, cur)
 
         if isinstance(stmt, ast.AnnAssign):
             if stmt.value is not None:
-                self._visit_expr(stmt.value, env)
-                return self._bind_targets((stmt.target,), stmt.value, env)
+                cur = env.copy()
+                self._visit_expr(stmt.value, cur)
+                return self._bind_targets((stmt.target,), stmt.value, cur)
             return env
 
         if isinstance(stmt, ast.AugAssign):
-            self._visit_expr(stmt.value, env)
-            self._visit_expr(stmt.target, env)
+            cur = env.copy()
+            self._visit_expr(stmt.value, cur)
+            if (
+                isinstance(stmt.target, ast.Attribute)
+                and stmt.target.attr in _TENSOR_ATTR_TO_RULE
+            ):
+                self._check_attr_read(stmt.target, cur)
+            elif isinstance(stmt.target, ast.Subscript):
+                self._check_subscript_read(stmt.target, cur)
+            self._visit_expr(stmt.target, cur)
+            reads_attr = _node_reads_module_attr(
+                stmt.value, cur.var_reads_module_attr
+            ) or _node_reads_module_attr(stmt.target, cur.var_reads_module_attr)
+            reads_unguarded = _node_reads_unguarded_attr(
+                stmt.value, cur
+            ) or _node_reads_unguarded_attr(stmt.target, cur)
             key = _expr_key(stmt.target)
             if key is not None:
-                out = env.copy()
-                out.invalidate(key)
-                return out
-            return env
+                cur.invalidate(key)
+                if isinstance(stmt.target, ast.Name):
+                    if reads_attr:
+                        cur.var_reads_module_attr[stmt.target.id] = True
+                    if reads_unguarded:
+                        cur.var_unguarded_attr[stmt.target.id] = True
+            return cur
 
         if isinstance(stmt, ast.Assert):
-            self._visit_expr(stmt.test, env)
+            cur = env.copy()
+            self._visit_expr(stmt.test, cur)
             if stmt.msg is not None:
-                self._visit_expr(stmt.msg, env)
-            pos, _ = _extract_facts(stmt.test, self.info, env)
-            return env.apply(pos)
+                self._visit_expr(stmt.msg, cur.copy())
+            pos, _ = _extract_facts(stmt.test, self.info, cur)
+            return cur.apply(pos)
 
         if isinstance(stmt, ast.If):
-            self._visit_expr(stmt.test, env)
-            pos, neg = _extract_facts(stmt.test, self.info, env)
-            then_env = self._visit_block(stmt.body, env.apply(pos))
-            else_env = self._visit_block(stmt.orelse, env.apply(neg))
+            test_env = env.copy()
+            self._visit_expr(stmt.test, test_env)
+            pos, neg = _extract_facts(stmt.test, self.info, test_env)
+            then_env = self._visit_block(stmt.body, test_env.apply(pos))
+            else_env = self._visit_block(stmt.orelse, test_env.apply(neg))
             then_exits = _always_exits(stmt.body)
             else_exits = _always_exits(stmt.orelse)
             if then_exits and not stmt.orelse:
-                return env.apply(neg)
+                return test_env.apply(neg)
             if then_exits and not else_exits:
                 return else_env
             if else_exits and not then_exits:
                 return then_env
             # Neither side guaranteed to exit: conservatively invalidate vars
-            # reassigned inside either branch.
-            merged = env.copy()
+            # reassigned inside either branch while preserving taint.
+            merged = test_env.copy()
             for name in _assigned_names(stmt.body) | _assigned_names(stmt.orelse):
                 merged.invalidate(name)
-            # Preserve layout_vars newly initialized in an `if layout is None:` block.
+            merged.merge_taint_from(test_env)
+            merged.merge_taint_from(then_env)
+            merged.merge_taint_from(else_env)
+            # Preserve layout_vars newly initialized in an `if layout is None:`
+            # block (or established identically on both branches).
             for var_name, promise in then_env.layout_vars.items():
-                if var_name not in env.layout_vars:
+                if var_name not in test_env.layout_vars and (
+                    (
+                        var_name in else_env.layout_vars
+                        and else_env.layout_vars[var_name] == promise
+                    )
+                    or (
+                        not stmt.orelse
+                        and _is_none_or_falsy_var_test(stmt.test, var_name)
+                    )
+                ):
                     merged.layout_vars[var_name] = promise
             return merged
 
         if isinstance(stmt, (ast.For, ast.AsyncFor)):
-            self._visit_expr(stmt.iter, env)
-            loop_env = env.copy()
+            iter_env = env.copy()
+            self._visit_expr(stmt.iter, iter_env)
+            iter_reads_attr = _node_reads_module_attr(
+                stmt.iter, iter_env.var_reads_module_attr
+            )
+            iter_reads_unguarded = _node_reads_unguarded_attr(stmt.iter, iter_env)
+            loop_env = iter_env.copy()
             iter_key = _expr_key(stmt.iter)
             elem_facts: set[str] | None = None
             if iter_key is not None:
@@ -1352,37 +1493,95 @@ class _AuditVisitor:
                     facts = loop_env.seq_guards.get(loop_env.seq_aliases[iter_key])
                 if facts:
                     elem_facts = set(facts)
-            for name in _assigned_names(stmt.body):
+            body_assigned = _assigned_names(stmt.body)
+            for name in body_assigned:
                 loop_env.invalidate(name)
+            loop_env.merge_taint_from(iter_env)
             self._bind_one_target(
                 stmt.target,
                 loop_env,
-                rhs_reads_attr=False,
-                rhs_reads_unguarded_attr=False,
+                rhs_reads_attr=iter_reads_attr,
+                rhs_reads_unguarded_attr=iter_reads_unguarded,
                 layout_promise=None,
                 elem_facts=elem_facts,
                 rhs_key=None,
             )
-            self._visit_block(stmt.body, loop_env)
-            out = env.copy()
+            while True:
+                mark = len(self.raw_findings)
+                before_taint = _taint_snapshot(loop_env)
+                body_taint = _GuardEnv.empty()
+                self._taint_sinks.append(body_taint)
+                try:
+                    body_env = self._visit_block(stmt.body, loop_env.copy())
+                finally:
+                    self._taint_sinks.pop()
+                body_taint.merge_taint_from(body_env)
+                loop_env.merge_taint_from(body_taint)
+                if _taint_snapshot(loop_env) == before_taint:
+                    break
+                del self.raw_findings[mark:]
+            orelse_base = iter_env.copy()
+            for name in body_assigned | _node_assigned_names(stmt.target):
+                orelse_base.invalidate(name)
+            orelse_base.merge_taint_from(iter_env)
+            orelse_base.merge_taint_from(loop_env)
+            orelse_base.merge_taint_from(body_taint)
+            orelse_env: _GuardEnv | None = None
+            if stmt.orelse:
+                orelse_env = self._visit_block(stmt.orelse, orelse_base)
+            out = iter_env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
-            if stmt.orelse:
-                self._visit_block(stmt.orelse, out.copy())
+            out.merge_taint_from(iter_env)
+            out.merge_taint_from(loop_env)
+            out.merge_taint_from(body_taint)
+            if orelse_env is not None:
+                out.merge_taint_from(orelse_env)
             return out
 
         if isinstance(stmt, ast.While):
             while_env = env.copy()
-            for name in _assigned_names(stmt.body):
+            body_and_test_assigned = _assigned_names(stmt.body) | _node_assigned_names(
+                stmt.test
+            )
+            for name in body_and_test_assigned:
                 while_env.invalidate(name)
-            self._visit_expr(stmt.test, while_env)
-            pos, _ = _extract_facts(stmt.test, self.info, while_env)
-            self._visit_block(stmt.body, while_env.apply(pos))
+            while_env.merge_taint_from(env)
+            while True:
+                mark = len(self.raw_findings)
+                before_taint = _taint_snapshot(while_env)
+                test_env = while_env.copy()
+                self._visit_expr(stmt.test, test_env)
+                pos, _ = _extract_facts(stmt.test, self.info, test_env)
+                body_taint = _GuardEnv.empty()
+                body_taint.merge_taint_from(test_env)
+                self._taint_sinks.append(body_taint)
+                try:
+                    body_env = self._visit_block(stmt.body, test_env.apply(pos))
+                finally:
+                    self._taint_sinks.pop()
+                body_taint.merge_taint_from(body_env)
+                while_env.merge_taint_from(body_taint)
+                if _taint_snapshot(while_env) == before_taint:
+                    break
+                del self.raw_findings[mark:]
+            orelse_base = env.copy()
+            for name in body_and_test_assigned:
+                orelse_base.invalidate(name)
+            orelse_base.merge_taint_from(env)
+            orelse_base.merge_taint_from(while_env)
+            orelse_base.merge_taint_from(body_taint)
+            orelse_env: _GuardEnv | None = None
+            if stmt.orelse:
+                orelse_env = self._visit_block(stmt.orelse, orelse_base)
             out = env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
-            if stmt.orelse:
-                self._visit_block(stmt.orelse, out.copy())
+            out.merge_taint_from(env)
+            out.merge_taint_from(while_env)
+            out.merge_taint_from(body_taint)
+            if orelse_env is not None:
+                out.merge_taint_from(orelse_env)
             return out
 
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
@@ -1393,47 +1592,139 @@ class _AuditVisitor:
                     self._bind_one_target(
                         item.optional_vars,
                         with_env,
-                        rhs_reads_attr=False,
-                        rhs_reads_unguarded_attr=False,
+                        rhs_reads_attr=_node_reads_module_attr(
+                            item.context_expr, with_env.var_reads_module_attr
+                        ),
+                        rhs_reads_unguarded_attr=_node_reads_unguarded_attr(
+                            item.context_expr, with_env
+                        ),
                         layout_promise=None,
                         elem_facts=None,
                         rhs_key=None,
                     )
-            return self._visit_block(stmt.body, with_env)
-
-        if isinstance(stmt, (ast.Try, ast.TryStar)):
-            self._visit_block(stmt.body, env.copy())
-            for handler in stmt.handlers:
-                if handler.type is not None:
-                    self._visit_expr(handler.type, env)
-                h_env = env.copy()
-                if handler.name:
-                    h_env.invalidate(handler.name)
-                self._visit_block(handler.body, h_env)
-            if stmt.orelse:
-                self._visit_block(stmt.orelse, env.copy())
-            if stmt.finalbody:
-                self._visit_block(stmt.finalbody, env.copy())
+            body_taint = _GuardEnv.empty()
+            self._taint_sinks.append(body_taint)
+            try:
+                body_env = self._visit_block(stmt.body, with_env)
+            finally:
+                self._taint_sinks.pop()
+            body_taint.merge_taint_from(body_env)
+            # Context managers may suppress exceptions raised mid-body, so guards
+            # established inside `with` cannot be trusted after exit and taint
+            # from any point in the block must survive.
             out = env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
+            out.merge_taint_from(env)
+            out.merge_taint_from(with_env)
+            out.merge_taint_from(body_taint)
+            return out
+
+        if isinstance(stmt, (ast.Try, ast.TryStar)):
+            body_taint = _GuardEnv.empty()
+            self._taint_sinks.append(body_taint)
+            try:
+                body_env = self._visit_block(stmt.body, env.copy())
+            finally:
+                self._taint_sinks.pop()
+            body_taint.merge_taint_from(body_env)
+            body_assigned = _assigned_names(stmt.body)
+
+            handler_base = env.copy()
+            for name in body_assigned:
+                handler_base.invalidate(name)
+            handler_base.merge_taint_from(env)
+            handler_base.merge_taint_from(body_taint)
+
+            h_taints: list[_GuardEnv] = []
+            h_assigned: set[str] = set()
+            is_trystar = isinstance(stmt, ast.TryStar)
+            for handler in stmt.handlers:
+                if handler.type is not None:
+                    self._visit_expr(handler.type, handler_base)
+                    h_assigned |= _node_assigned_names(handler.type)
+                h_env = handler_base.copy()
+                if handler.name:
+                    h_env.invalidate(handler.name)
+                    h_assigned.add(handler.name)
+                h_body_assigned = _assigned_names(handler.body)
+                h_assigned |= h_body_assigned
+                h_taint = _GuardEnv.empty()
+                self._taint_sinks.append(h_taint)
+                try:
+                    h_out = self._visit_block(handler.body, h_env)
+                finally:
+                    self._taint_sinks.pop()
+                h_taint.merge_taint_from(h_out)
+                h_taints.append(h_taint)
+                if is_trystar:
+                    # PEP 654: multiple except* handlers may run in sequence.
+                    if handler.name:
+                        handler_base.invalidate(handler.name)
+                    for name in h_body_assigned:
+                        handler_base.invalidate(name)
+                    handler_base.merge_taint_from(h_taint)
+
+            orelse_taint: _GuardEnv | None = None
+            if stmt.orelse:
+                orelse_taint = _GuardEnv.empty()
+                self._taint_sinks.append(orelse_taint)
+                try:
+                    orelse_env = self._visit_block(stmt.orelse, body_env.copy())
+                finally:
+                    self._taint_sinks.pop()
+                orelse_taint.merge_taint_from(orelse_env)
+
+            final_taint: _GuardEnv | None = None
+            if stmt.finalbody:
+                final_base = env.copy()
+                for name in body_assigned | h_assigned | _assigned_names(stmt.orelse):
+                    final_base.invalidate(name)
+                final_base.merge_taint_from(env)
+                final_base.merge_taint_from(body_taint)
+                for h_t in h_taints:
+                    final_base.merge_taint_from(h_t)
+                if orelse_taint is not None:
+                    final_base.merge_taint_from(orelse_taint)
+                final_taint = _GuardEnv.empty()
+                self._taint_sinks.append(final_taint)
+                try:
+                    final_out = self._visit_block(stmt.finalbody, final_base)
+                finally:
+                    self._taint_sinks.pop()
+                final_taint.merge_taint_from(final_out)
+
+            out = env.copy()
+            for name in _assigned_names([stmt]):
+                out.invalidate(name)
+            out.merge_taint_from(env)
+            out.merge_taint_from(body_taint)
+            for h_t in h_taints:
+                out.merge_taint_from(h_t)
+            if orelse_taint is not None:
+                out.merge_taint_from(orelse_taint)
+            if final_taint is not None:
+                out.merge_taint_from(final_taint)
             return out
 
         if isinstance(stmt, ast.Return):
+            cur = env.copy()
             if stmt.value is not None:
-                self._visit_expr(stmt.value, env)
-            return env
+                self._visit_expr(stmt.value, cur)
+            return cur
 
         if isinstance(stmt, ast.Expr):
-            self._visit_expr(stmt.value, env)
-            return env
+            cur = env.copy()
+            self._visit_expr(stmt.value, cur)
+            return cur
 
         if isinstance(stmt, ast.Raise):
+            cur = env.copy()
             if stmt.exc is not None:
-                self._visit_expr(stmt.exc, env)
+                self._visit_expr(stmt.exc, cur)
             if stmt.cause is not None:
-                self._visit_expr(stmt.cause, env)
-            return env
+                self._visit_expr(stmt.cause, cur)
+            return cur
 
         if isinstance(stmt, ast.Delete):
             out = env.copy()
@@ -1446,42 +1737,104 @@ class _AuditVisitor:
             return out
 
         if isinstance(stmt, ast.Match):
-            self._visit_expr(stmt.subject, env)
+            subj_env = env.copy()
+            self._visit_expr(stmt.subject, subj_env)
+            subj_reads_attr = _node_reads_module_attr(
+                stmt.subject, subj_env.var_reads_module_attr
+            )
+            subj_reads_unguarded = _node_reads_unguarded_attr(stmt.subject, subj_env)
+            running_env = subj_env.copy()
+            case_outs: list[_GuardEnv] = []
             for case in stmt.cases:
-                c_env = env.copy()
+                # PEP 634: evaluate pattern sub-expressions before binding names.
+                for pnode in ast.walk(case.pattern):
+                    if isinstance(pnode, ast.MatchValue):
+                        self._visit_expr(pnode.value, running_env)
+                    elif isinstance(pnode, ast.MatchClass):
+                        self._visit_expr(pnode.cls, running_env)
+                    elif isinstance(pnode, ast.MatchMapping):
+                        for key in pnode.keys:
+                            self._visit_expr(key, running_env)
+                bound: set[str] = set()
                 for pnode in ast.walk(case.pattern):
                     if isinstance(pnode, (ast.MatchAs, ast.MatchStar)) and pnode.name:
-                        c_env.invalidate(pnode.name)
+                        bound.add(pnode.name)
                     elif isinstance(pnode, ast.MatchMapping) and pnode.rest:
-                        c_env.invalidate(pnode.rest)
+                        bound.add(pnode.rest)
+                c_env = running_env.copy()
+                for name in bound:
+                    c_env.invalidate(name)
+                    if subj_reads_attr:
+                        c_env.var_reads_module_attr[name] = True
+                    if subj_reads_unguarded:
+                        c_env.var_unguarded_attr[name] = True
                 if case.guard is not None:
+                    # PEP 634 commits pattern bindings before evaluating the guard,
+                    # so a failing guard still leaves those names rebound for later cases.
+                    for name in bound:
+                        running_env.invalidate(name)
+                        if subj_reads_attr:
+                            running_env.var_reads_module_attr[name] = True
+                        if subj_reads_unguarded:
+                            running_env.var_unguarded_attr[name] = True
                     self._visit_expr(case.guard, c_env)
+                    for name in _node_assigned_names(case.guard):
+                        running_env.invalidate(name)
+                    running_env.merge_taint_from(c_env)
                     pos, _ = _extract_facts(case.guard, self.info, c_env)
                     c_env = c_env.apply(pos)
-                self._visit_block(case.body, c_env)
-            out = env.copy()
+                case_outs.append(self._visit_block(case.body, c_env))
+            out = subj_env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
+            out.merge_taint_from(subj_env)
+            out.merge_taint_from(running_env)
+            for c_out in case_outs:
+                out.merge_taint_from(c_out)
             return out
 
+        cur = env.copy()
         for child in ast.iter_child_nodes(stmt):
             if isinstance(child, ast.expr):
-                self._visit_expr(child, env)
-        return env
+                self._visit_expr(child, cur)
+        return cur
 
     def _visit_expr(self, expr: ast.expr, env: _GuardEnv) -> None:
+        if isinstance(expr, ast.NamedExpr):
+            self._visit_expr(expr.value, env)
+            rhs_reads_attr = _node_reads_module_attr(
+                expr.value, env.var_reads_module_attr
+            )
+            rhs_reads_unguarded_attr = _node_reads_unguarded_attr(expr.value, env)
+            self._bind_one_target(
+                expr.target,
+                env,
+                rhs_reads_attr=rhs_reads_attr,
+                rhs_reads_unguarded_attr=rhs_reads_unguarded_attr,
+                layout_promise=self._layout_promise(expr.value),
+                elem_facts=self._subscript_elem_facts(expr.value, env),
+                rhs_key=_expr_key(expr.value),
+            )
+            return
+
         if isinstance(expr, ast.BoolOp):
             if isinstance(expr.op, ast.And):
-                cur = env
+                cur = env.copy()
                 for val in expr.values:
                     self._visit_expr(val, cur)
+                    for name in _named_expr_targets(val):
+                        env.invalidate(name)
+                    env.merge_taint_from(cur)
                     pos, _ = _extract_facts(val, self.info, cur)
                     cur = cur.apply(pos)
                 return
             if isinstance(expr.op, ast.Or):
-                cur = env
+                cur = env.copy()
                 for val in expr.values:
                     self._visit_expr(val, cur)
+                    for name in _named_expr_targets(val):
+                        env.invalidate(name)
+                    env.merge_taint_from(cur)
                     _, neg = _extract_facts(val, self.info, cur)
                     cur = cur.apply(neg)
                 return
@@ -1489,8 +1842,16 @@ class _AuditVisitor:
         if isinstance(expr, ast.IfExp):
             self._visit_expr(expr.test, env)
             pos, neg = _extract_facts(expr.test, self.info, env)
-            self._visit_expr(expr.body, env.apply(pos))
-            self._visit_expr(expr.orelse, env.apply(neg))
+            body_env = env.apply(pos)
+            self._visit_expr(expr.body, body_env)
+            else_env = env.apply(neg)
+            self._visit_expr(expr.orelse, else_env)
+            for name in _named_expr_targets(expr.body) | _named_expr_targets(
+                expr.orelse
+            ):
+                env.invalidate(name)
+            env.merge_taint_from(body_env)
+            env.merge_taint_from(else_env)
             return
 
         if isinstance(expr, ast.Lambda):
@@ -1504,11 +1865,13 @@ class _AuditVisitor:
             return
 
         if isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
-            self._visit_comprehension(expr.generators, (expr.elt,), env)
+            self._visit_comprehension(expr, expr.generators, (expr.elt,), env)
             return
 
         if isinstance(expr, ast.DictComp):
-            self._visit_comprehension(expr.generators, (expr.key, expr.value), env)
+            self._visit_comprehension(
+                expr, expr.generators, (expr.key, expr.value), env
+            )
             return
 
         if isinstance(expr, ast.Compare):
@@ -1546,6 +1909,7 @@ class _AuditVisitor:
 
     def _visit_comprehension(
         self,
+        comp_node: ast.AST,
         generators: Sequence[ast.comprehension],
         elts: Sequence[ast.expr],
         env: _GuardEnv,
@@ -1553,6 +1917,10 @@ class _AuditVisitor:
         cur = env.copy()
         for gen in generators:
             self._visit_expr(gen.iter, cur)
+            iter_reads_attr = _node_reads_module_attr(
+                gen.iter, cur.var_reads_module_attr
+            )
+            iter_reads_unguarded = _node_reads_unguarded_attr(gen.iter, cur)
             iter_key = _expr_key(gen.iter)
             elem_facts: set[str] | None = None
             if iter_key is not None:
@@ -1564,8 +1932,8 @@ class _AuditVisitor:
             self._bind_one_target(
                 gen.target,
                 cur,
-                rhs_reads_attr=False,
-                rhs_reads_unguarded_attr=False,
+                rhs_reads_attr=iter_reads_attr,
+                rhs_reads_unguarded_attr=iter_reads_unguarded,
                 layout_promise=None,
                 elem_facts=elem_facts,
                 rhs_key=None,
@@ -1576,6 +1944,13 @@ class _AuditVisitor:
                 cur = cur.apply(pos)
         for elt in elts:
             self._visit_expr(elt, cur)
+        # PEP 572: walrus targets inside a comprehension bind in the enclosing scope.
+        for name in _named_expr_targets(comp_node):
+            env.invalidate(name)
+            if cur.var_unguarded_attr.get(name):
+                env.var_unguarded_attr[name] = True
+            if cur.var_reads_module_attr.get(name):
+                env.var_reads_module_attr[name] = True
 
     def _check_attr_read(self, node: ast.Attribute, env: _GuardEnv) -> None:
         attr = node.attr
@@ -1759,25 +2134,60 @@ class _AuditVisitor:
                         return
 
 
+def _walk_assigned_names(root: ast.AST, names: set[str]) -> None:
+    for node in ast.walk(root):
+        if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(
+            node.ctx, (ast.Store, ast.Del)
+        ):
+            key = _expr_key(node)
+            if key is not None:
+                names.add(key)
+        elif (
+            isinstance(
+                node,
+                (
+                    ast.MatchAs,
+                    ast.MatchStar,
+                    ast.ExceptHandler,
+                    ast.FunctionDef,
+                    ast.AsyncFunctionDef,
+                    ast.ClassDef,
+                ),
+            )
+            and node.name
+        ):
+            names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.asname:
+                    names.add(alias.asname)
+                elif alias.name != "*":
+                    names.add(alias.name.split(".", 1)[0])
+
+
 def _assigned_names(stmts: Sequence[ast.stmt]) -> set[str]:
     names: set[str] = set()
     for stmt in stmts:
-        for node in ast.walk(stmt):
-            if isinstance(node, ast.Name) and isinstance(
-                node.ctx, (ast.Store, ast.Del)
-            ):
-                names.add(node.id)
-            elif isinstance(node, ast.Attribute) and isinstance(
-                node.ctx, (ast.Store, ast.Del)
-            ):
-                key = _expr_key(node)
-                if key is not None:
-                    names.add(key)
-            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
-                names.add(node.name)
-            elif isinstance(node, ast.MatchMapping) and node.rest:
-                names.add(node.rest)
+        _walk_assigned_names(stmt, names)
     return names
+
+
+def _node_assigned_names(node: ast.AST) -> set[str]:
+    names: set[str] = set()
+    _walk_assigned_names(node, names)
+    return names
+
+
+def _named_expr_targets(node: ast.AST) -> set[str]:
+    return {
+        sub.target.id
+        for sub in ast.walk(node)
+        if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name)
+    }
 
 
 def _allow_entry_matches(entry: AllowEntry, finding: Finding) -> bool:
