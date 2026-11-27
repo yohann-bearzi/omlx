@@ -3711,9 +3711,9 @@ def test_prefill_forward_returns_none_without_metal(monkeypatch):
     ineligible (False) and neither entry point touches a kernel."""
     from mlx_vlm.models.qwen4_exp import hc_fused
 
+    module = _module(4)
     monkeypatch.setattr(mx.metal, "is_available", lambda: False)
     monkeypatch.setattr(hc_fused, "_EPS_CACHE", {})
-    module = _module(4)
     assert hc_fused.fused_forward(module, mx.zeros((1, 2, WIDTH), mx.bfloat16)) is None
     assert hc_fused._EPS_CACHE == {}
     assert (
