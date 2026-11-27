@@ -656,9 +656,9 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     monkeypatch.setattr(vs, "_PATCHED", False)
     if not vs.apply_qwen35_verify_sdpa_split_patch():
         pytest.skip("verify-split patch unavailable")
-    from omlx.patches import qwen35_verify_qmm
-
-    qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=False)
+    assert vs._PATCHED is True
+    # Keep the process-global verify arming out of this test.
+    monkeypatch.setattr(vs, "is_row_exact_armed", lambda: False)
     calls = []
 
     def spy(q, k, v, scale):
@@ -687,6 +687,12 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     # Other row heights and head layouts are not the 3-row 24q/2kv route.
     k2 = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
     v2 = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    q2 = mx.random.normal((1, 24, 2, 256)).astype(mx.bfloat16)
+    seam(q2, k2, v2, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []  # 2 rows: the tuned chunked critical path (kills <=3).
+    q32 = mx.random.normal((1, 32, 3, 256)).astype(mx.bfloat16)
+    seam(q32, k2, v2, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []  # 32q/2kv (122B): not this route (kills >=24).
     q4 = mx.random.normal((1, 24, 4, 256)).astype(mx.bfloat16)
     seam(q4, k2, v2, cache=KVCache(), scale=0.0625, mask=None)
     assert calls == []
@@ -704,11 +710,8 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     monkeypatch.setattr(vs, "row_exact_causal_sdpa", spy_row_exact)
     k = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
     v = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
-    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
-    try:
-        out = seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
-    finally:
-        qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=True)
+    monkeypatch.setattr(vs, "is_row_exact_armed", lambda: True)
+    out = seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
     assert out is not None and calls == [] and len(row_exact) == 1
 
 
@@ -730,3 +733,17 @@ def test_short_verify_route_restores_seam():
         assert q35_lang._qwen3_5_left_padded_attention is before
         assert q35_lang.__dict__.get("_omlx_verify_attention", missing) is before_flag
         assert vs._PATCHED is False
+
+
+def test_short_verify_route_preserves_global_arming():
+    """The route test must not mutate the process-global verify arming."""
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        before = qwen35_verify_qmm.is_row_exact_armed()
+        with pytest.MonkeyPatch.context() as mp:
+            test_short_verify_routes_three_rows_to_short_causal_kernel(mp)
+        assert qwen35_verify_qmm.is_row_exact_armed() is before
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=True)
