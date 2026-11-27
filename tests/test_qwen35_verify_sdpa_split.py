@@ -684,6 +684,16 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     seam(q, k4, v4, cache=KVCache(), scale=0.0625, mask=None)
     assert calls == []
 
+    # Other row heights and head layouts are not the 3-row 24q/2kv route.
+    k2 = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    v2 = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    q4 = mx.random.normal((1, 24, 4, 256)).astype(mx.bfloat16)
+    seam(q4, k2, v2, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []
+    q16 = mx.random.normal((1, 16, 3, 256)).astype(mx.bfloat16)
+    seam(q16, k2, v2, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []
+
     # Row-exact mode takes precedence over the short path.
     row_exact = []
 

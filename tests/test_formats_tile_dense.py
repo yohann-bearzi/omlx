@@ -741,8 +741,9 @@ def test_three_row_stacked_gdn_projection_selects_measured_m5_route():
 
 
 def test_three_row_stacked_gdn_projection_three_rows_hold_c2(monkeypatch):
-    """The measured 3-row Dot route holds C2 against nn.QuantizedLinear and its
-    per-row calls (row-exact to rounding, not bitwise)."""
+    """The measured 3-row Dot output and the three single-row calls each hold
+    C2 against the FP32 reference on the dequantized weights (bar from
+    nn.QuantizedLinear); not bitwise."""
     if not mx.metal.is_available():
         pytest.skip("requires Metal")
     from omlx.formats import tuning

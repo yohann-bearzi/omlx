@@ -35,9 +35,9 @@ the splits in a second launch. ``_wide_causal_sdpa`` stages its
 probabilities and its value tile in FP32 (C1.2); the tensor-op path keeps
 them in the input dtype.
 
-Three-row verify blocks of the Flash-Next dense geometry (24 query / 2 KV
-heads, at most 256 keys) use ``_short_causal_sdpa``: one launch over the
-exact bottom-right causal window.
+Three-row verify blocks of the Qwen3.8-Flash-Next (qwen4_exp) geometry
+(24 query / 2 KV heads, at most 256 keys) use ``_short_causal_sdpa``: one
+launch over the exact bottom-right causal window.
 
 MTP draft chains attend through ``ChainKVCache``: chain rows stay in a short
 tail next to the head's cache, and ``prefix_tail_attention`` reads both.
@@ -1116,7 +1116,7 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                         # differently.
                         out = row_exact_causal_sdpa(queries, keys, values, scale, limit)
                     elif (
-                        # Flash-Next dense verify geometry (24 query / 2 KV
+                        # Qwen3.8-Flash-Next verify geometry (24 query / 2 KV
                         # heads, <= 256 keys): one short causal launch; the 27B
                         # dense 24/4 layout and every other shape fall through
                         # to the generic paths.
