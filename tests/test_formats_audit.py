@@ -1986,11 +1986,16 @@ def test_catches_real_unported_misreaders():
     hc_lines = {f.line for f in hc_report.findings}
     assert {661, 702, 728}.issubset(hc_lines)
 
-    # 2. inkling2/dspark.py
+    # 2. inkling2/dspark.py (line numbers move with upstream refactors; the
+    #    fold reads its head weights unguarded at least twice)
     dspark = REPO_ROOT / "omlx/patches/inkling2/dspark.py"
     dspark_report = scan_paths([dspark])
-    dspark_lines = {f.line for f in dspark_report.findings}
-    assert {205, 206}.issubset(dspark_lines)
+    fold_weights = [
+        f
+        for f in dspark_report.findings
+        if f.scope.endswith(".fold") and f.rule == "unguarded-weight"
+    ]
+    assert len(fold_weights) >= 2
 
     # 3. raon1_mini/raon1_mini_model.py
     raon = REPO_ROOT / "omlx/patches/raon1_mini/raon1_mini_model.py"
