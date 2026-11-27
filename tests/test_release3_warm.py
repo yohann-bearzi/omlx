@@ -701,6 +701,48 @@ def test_tile_dense_unbounded_wide_tail(monkeypatch):
     assert ("wide", mx.bfloat16, 256, 256, 5, True, 0) in wide_metals
 
 
+def test_tile_dense_wide_warm_specs_covers_exact_5_and_7(monkeypatch):
+    """LOW-1: load-time warming proves the wide EXACT_ROWS 5 and 7 modes."""
+    from omlx.formats import tile_dense
+
+    fmt = affine.AffineFormat()
+    with testing.verified("qwen4_exp"):
+        layer, _ = _quantized_format_linear(fmt, 256, 256, 4, 64, mx.bfloat16, seed=81)
+
+    real_plan = tile_dense.build_plan(layer, tensor_units=False)
+    assert real_plan is not None
+    wide = tile_dense.DenseTilePolicy(backend="wide")
+    sched = (tile_dense.DenseRoute(16, "wide", wide),)
+    plan = tile_dense.DensePlan(
+        face=real_plan.face,
+        operands=real_plan.operands,
+        proof=real_plan.proof,
+        said=real_plan.said,
+        k=real_plan.k,
+        n=real_plan.n,
+        bits=real_plan.bits,
+        group_size=real_plan.group_size,
+        schedule=sched,
+        schedules={mx.bfloat16: sched},
+        row_limit=real_plan.row_limit,
+        binding=real_plan.binding,
+    )
+    monkeypatch.setattr(tile_dense, "build_plan", lambda _l, **_kw: plan)
+
+    instances, proofs = tile_dense.warm_specs(layer, (mx.bfloat16,), tensor_units=False)
+    by_metal = {}
+    for inst, entries in proofs.items():
+        for _proof, metal in entries:
+            if isinstance(metal, tuple) and metal[0] == "wide":
+                by_metal[metal] = inst
+    five = ("wide", mx.bfloat16, 256, 256, 5, False, 5)
+    seven = ("wide", mx.bfloat16, 256, 256, 4, True, 7)
+    assert five in by_metal, sorted(by_metal)
+    assert seven in by_metal, sorted(by_metal)
+    assert instances[by_metal[five]]().grid == (32, 2, 1)
+    assert instances[by_metal[seven]]().grid == (64, 2, 1)
+
+
 def test_moe_verify_gather_warm_tasks_holds_no_arrays():
     """LOW 7: moe_verify_gather.warm_tasks closures must not retain mx.array weights."""
     import gc

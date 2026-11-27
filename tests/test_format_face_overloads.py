@@ -1527,9 +1527,8 @@ _OQEL_15_DIGESTS = {
 # Captured on release/3 (7e230438), re-pinned on release/4 (ae0d75e5a) for
 # plugin ffe1ca64, then re-pinned 2026-11-26 for the tile rule-4 fix, and again
 # on wip/5 (caa449d7f, with the rule-4 plugin 5fd72d9 staged) for D83: the
-# retile changes the three wide builders under each table policy, so the tile
-# faces' emitted wide sources move too (120 of the 123 builder records are
-# unchanged from 158201534). These 123 builder records include the gather and routed
+# retile changes 3 wide builder records per policy; the 15 face digests and
+# the other 120 builder records stay as at caa449d7f. These 123 builder records include the gather and routed
 # patch sources, which the release-2 fixes changed (moe_verify_gather,
 # qwen35_moe_routed_decode, qwen35_moe_router). A base change re-pins this
 # snapshot; the emission itself is pinned by the face digests inside this
@@ -1765,7 +1764,7 @@ def test_every_oqel_plugin_face_emits_the_a6480a5_metal(monkeypatch, selects):
     re-pinned release/4 (ffe1ca64) + tile rule-4 fix Metal at construction:
     the 12 dot faces and 108 dot builders stay byte-identical to ffe1ca64
     while the 3 tile faces and 15 tile builders reflect the row-scale read
-    moving from Runs(...) into params()."""
+    moving from Runs(...) into params(), and D83's three wide builders."""
     face_mod, codebook = _oqel()
     face_mod.dot.cache_clear()
     face_mod.tile.cache_clear()

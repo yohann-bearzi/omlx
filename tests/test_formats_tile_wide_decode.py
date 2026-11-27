@@ -51,9 +51,14 @@ def test_wide_decode_geometry(monkeypatch, rows, vectors, tiles, exact_rows):
         assert launches[-1]["grid"] == args["grid"]
 
 
-@pytest.mark.skipif(
-    not __import__("importlib").util.find_spec("mlx"), reason="requires MLX (CPU)"
-)
+def test_exact_rows_emit_fixed_first_vec8():
+    """5 and 7 rows take the exact sources: one V=5 tile and the 4+3 split,
+    with Vec8 reads behind a fixed first row."""
+    assert "omlx_wide<T, K, N, 5, false, 0>" in tile_wide._SOURCE
+    assert "omlx_wide<T, K, N, 3, false, 4>" in tile_wide._SOURCE
+    assert "FIXED_FIRST >= 0" in tile_wide._HEADER
+
+
 @pytest.mark.parametrize("rows", [5, 7])
 def test_wide_exact_rows_odd_offset_writes_every_row_once(rows):
     import mlx.core as mx
