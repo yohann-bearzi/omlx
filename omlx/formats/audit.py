@@ -448,11 +448,10 @@ def _mlx_op_name(
 class _FactsDelta:
     recv_facts: dict[str, set[str]]
     seq_guards: dict[str, set[str]]
-    scope_ops: bool = False
 
     @classmethod
     def empty(cls) -> _FactsDelta:
-        return cls({}, {}, False)
+        return cls({}, {})
 
     def merge(self, other: _FactsDelta) -> _FactsDelta:
         recv: dict[str, set[str]] = {k: set(v) for k, v in self.recv_facts.items()}
@@ -461,7 +460,7 @@ class _FactsDelta:
         seq: dict[str, set[str]] = {k: set(v) for k, v in self.seq_guards.items()}
         for k, v in other.seq_guards.items():
             seq.setdefault(k, set()).update(v)
-        return _FactsDelta(recv, seq, self.scope_ops or other.scope_ops)
+        return _FactsDelta(recv, seq)
 
 
 @dataclass
@@ -471,11 +470,11 @@ class _GuardEnv:
     layout_vars: dict[str, tuple[str, frozenset[str]]]
     seq_aliases: dict[str, str]
     var_reads_module_attr: dict[str, bool]
-    scope_ops_guarded: bool = False
+    var_unguarded_attr: dict[str, bool]
 
     @classmethod
     def empty(cls) -> _GuardEnv:
-        return cls({}, {}, {}, {}, {}, False)
+        return cls({}, {}, {}, {}, {}, {})
 
     def copy(self) -> _GuardEnv:
         return _GuardEnv(
@@ -484,7 +483,7 @@ class _GuardEnv:
             layout_vars=dict(self.layout_vars),
             seq_aliases=dict(self.seq_aliases),
             var_reads_module_attr=dict(self.var_reads_module_attr),
-            scope_ops_guarded=self.scope_ops_guarded,
+            var_unguarded_attr=dict(self.var_unguarded_attr),
         )
 
     def apply(self, delta: _FactsDelta) -> _GuardEnv:
@@ -496,8 +495,6 @@ class _GuardEnv:
             aliased = out.seq_aliases.get(k)
             if aliased is not None:
                 out.seq_guards.setdefault(aliased, set()).update(v)
-        if delta.scope_ops:
-            out.scope_ops_guarded = True
         return out
 
     def invalidate(self, var_name: str) -> None:
@@ -511,6 +508,7 @@ class _GuardEnv:
         self.layout_vars.pop(var_name, None)
         self.seq_aliases.pop(var_name, None)
         self.var_reads_module_attr.pop(var_name, None)
+        self.var_unguarded_attr.pop(var_name, None)
 
     def has_attr_guard(self, recv_key: str, attr: str) -> bool:
         facts = self.recv_facts.get(recv_key)
@@ -523,13 +521,13 @@ class _GuardEnv:
         return attr == "weight" and "dense" in facts
 
     def has_op_guard(self, recv_key: str | None = None) -> bool:
-        if self.scope_ops_guarded:
-            return True
         if recv_key is not None:
             facts = self.recv_facts.get(recv_key)
-            if facts and (facts & {"affine", "quantized", "non_format"}):
-                return True
-        return False
+            return bool(facts and (facts & {"affine", "quantized", "non_format"}))
+        return any(
+            f & {"affine", "quantized", "non_format"}
+            for f in (*self.recv_facts.values(), *self.seq_guards.values())
+        )
 
 
 def _is_none_const(node: ast.AST) -> bool:
@@ -588,7 +586,7 @@ def _extract_facts(
             seq_attr, facts = layout_info
             seq_key = f"self.{seq_attr}"
             return (
-                _FactsDelta({}, {seq_key: set(facts)}, scope_ops=True),
+                _FactsDelta({}, {seq_key: set(facts)}),
                 _FactsDelta.empty(),
             )
         return _FactsDelta.empty(), _FactsDelta.empty()
@@ -597,7 +595,7 @@ def _extract_facts(
         recv = _expr_key(expr.value)
         if recv is not None:
             return (
-                _FactsDelta({recv: {"affine"}}, {}, scope_ops=True),
+                _FactsDelta({recv: {"affine"}}, {}),
                 _FactsDelta.empty(),
             )
         return _FactsDelta.empty(), _FactsDelta.empty()
@@ -620,7 +618,7 @@ def _extract_facts(
                 if attr_node.value == "fmt":
                     return (
                         _FactsDelta.empty(),
-                        _FactsDelta({recv: {"non_format"}}, {}, scope_ops=True),
+                        _FactsDelta({recv: {"non_format"}}, {}),
                     )
         elif fname == "isinstance" and len(expr.args) == 2:
             arg0, arg1 = expr.args
@@ -640,13 +638,13 @@ def _extract_facts(
                 if q_cls and not f_cls:
                     # Soundness: neg is EMPTY (FormatLinear lands in else).
                     return (
-                        _FactsDelta({recv: {"quantized"}}, {}, scope_ops=True),
+                        _FactsDelta({recv: {"quantized"}}, {}),
                         _FactsDelta.empty(),
                     )
                 if f_cls and not q_cls:
                     return (
                         _FactsDelta.empty(),
-                        _FactsDelta({recv: {"non_format"}}, {}, scope_ops=True),
+                        _FactsDelta({recv: {"non_format"}}, {}),
                     )
                 if d_cls and not q_cls and not f_cls:
                     return (
@@ -671,9 +669,8 @@ def _extract_facts(
                             and isinstance(gen.elt.args[param_idx], ast.Name)
                             and gen.elt.args[param_idx].id == comp.target.id
                         ):
-                            ops = bool(facts & {"affine", "quantized", "non_format"})
                             return (
-                                _FactsDelta({}, {seq_key: set(facts)}, scope_ops=ops),
+                                _FactsDelta({}, {seq_key: set(facts)}),
                                 _FactsDelta.empty(),
                             )
         elif isinstance(expr.func, ast.Name) and expr.func.id in info.pred_facts:
@@ -681,9 +678,8 @@ def _extract_facts(
             if param_idx < len(expr.args):
                 recv = _expr_key(expr.args[param_idx])
                 if recv is not None:
-                    ops = bool(facts & {"affine", "quantized", "non_format"})
                     return (
-                        _FactsDelta({recv: set(facts)}, {}, scope_ops=ops),
+                        _FactsDelta({recv: set(facts)}, {}),
                         _FactsDelta.empty(),
                     )
         return _FactsDelta.empty(), _FactsDelta.empty()
@@ -722,9 +718,7 @@ def _extract_facts(
                             else (delta, _FactsDelta.empty())
                         )
                     if g_attr == "fmt":
-                        delta = _FactsDelta(
-                            {g_recv: {"non_format"}}, {}, scope_ops=True
-                        )
+                        delta = _FactsDelta({g_recv: {"non_format"}}, {})
                         return (
                             (delta, _FactsDelta.empty())
                             if is_pos
@@ -738,7 +732,7 @@ def _extract_facts(
                     elif isinstance(a, ast.Attribute) and a.attr == "mode":
                         mode_recv = _expr_key(a.value)
                     if mode_recv is not None:
-                        delta = _FactsDelta({mode_recv: {"affine"}}, {}, scope_ops=True)
+                        delta = _FactsDelta({mode_recv: {"affine"}}, {})
                         return (
                             (delta, _FactsDelta.empty())
                             if is_pos
@@ -789,6 +783,22 @@ def _is_falsy_return(stmt: ast.stmt) -> bool:
     return isinstance(stmt.value, ast.Constant) and not bool(stmt.value.value)
 
 
+def _has_non_falsy_return(node: ast.AST) -> bool:
+    return any(
+        isinstance(s, ast.Return) and not _is_falsy_return(s) for s in ast.walk(node)
+    )
+
+
+def _qualifying_seq(env: _GuardEnv) -> tuple[str, frozenset[str]] | None:
+    for seq_key, facts in env.seq_guards.items():
+        if seq_key.startswith("self.") and (
+            facts & {"affine", "quantized", "non_format"}
+            or {"weight", "scales", "biases"}.issubset(facts)
+        ):
+            return seq_key.split(".", 1)[1], frozenset(facts)
+    return None
+
+
 def _analyze_predicate_fn(
     fn: ast.FunctionDef | ast.AsyncFunctionDef,
     base_info: _FileInfo,
@@ -796,11 +806,14 @@ def _analyze_predicate_fn(
     params = [a.arg for a in fn.args.posonlyargs] + [a.arg for a in fn.args.args]
     if not params:
         return None
+    param_set = set(params)
     env = _GuardEnv.empty()
     body = fn.body
     start = 1 if body and _is_docstring_stmt(body[0]) else 0
     for stmt in body[start:]:
-        if isinstance(stmt, ast.Return) and stmt.value is not None:
+        if isinstance(stmt, ast.Return):
+            if _is_falsy_return(stmt) or stmt.value is None:
+                return None
             pos, _ = _extract_facts(stmt.value, base_info, env)
             env = env.apply(pos)
             for idx, pname in enumerate(params):
@@ -812,10 +825,13 @@ def _analyze_predicate_fn(
             isinstance(stmt, ast.If)
             and _always_exits(stmt.body)
             and not stmt.orelse
-            and all(_is_falsy_return(s) for s in stmt.body if isinstance(s, ast.Return))
+            and not _has_non_falsy_return(stmt)
         ):
             _, neg = _extract_facts(stmt.test, base_info, env)
             env = env.apply(neg)
+            continue
+        if _has_non_falsy_return(stmt) or (_assigned_names([stmt]) & param_set):
+            return None
     return None
 
 
@@ -843,22 +859,31 @@ def _analyze_layout_method(
                 and isinstance(stmt.value.value, ast.Name)
                 and stmt.value.value.id == "self"
             ):
+                env.invalidate(t.id)
                 env.seq_aliases[t.id] = f"self.{stmt.value.attr}"
-        elif isinstance(stmt, ast.If) and _always_exits(stmt.body) and not stmt.orelse:
-            if any(_is_falsy_return(s) for s in stmt.body):
-                _, neg = _extract_facts(stmt.test, info, env)
-                env = env.apply(neg)
-        elif isinstance(stmt, ast.Return) and not _is_falsy_return(stmt):
+            else:
+                for name in _assigned_names([stmt]):
+                    env.invalidate(name)
+        elif (
+            isinstance(stmt, ast.If)
+            and _always_exits(stmt.body)
+            and not stmt.orelse
+            and not _has_non_falsy_return(stmt)
+        ):
+            _, neg = _extract_facts(stmt.test, info, env)
+            env = env.apply(neg)
+        elif isinstance(stmt, ast.Return):
+            if not _is_falsy_return(stmt):
+                if _qualifying_seq(env) is None:
+                    return None
+                saw_truthy_return = True
+        elif _has_non_falsy_return(stmt):
+            if _qualifying_seq(env) is None:
+                return None
             saw_truthy_return = True
     if not saw_truthy_return:
         return None
-    for seq_key, facts in env.seq_guards.items():
-        if seq_key.startswith("self.") and (
-            facts & {"affine", "quantized", "non_format"}
-            or {"weight", "scales", "biases"}.issubset(facts)
-        ):
-            return seq_key.split(".", 1)[1], frozenset(facts)
-    return None
+    return _qualifying_seq(env)
 
 
 def _collect_file_info(tree: ast.Module) -> _FileInfo:
@@ -972,9 +997,47 @@ def _node_reads_module_attr(node: ast.AST, var_reads: dict[str, bool]) -> bool:
             sl = sub.slice
             if isinstance(sl, ast.Constant) and sl.value in _MODULE_TENSOR_ATTRS:
                 return True
+        _, g_attr, _ = _getattr_target(sub)
+        if g_attr in _MODULE_TENSOR_ATTRS:
+            return True
         if isinstance(sub, ast.Name) and var_reads.get(sub.id, False):
             return True
     return False
+
+
+def _node_reads_unguarded_attr(node: ast.AST, env: _GuardEnv) -> bool:
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr in _TENSOR_ATTR_TO_RULE:
+            recv = _expr_key(sub.value)
+            if recv is None or not env.has_op_guard(recv):
+                return True
+        elif isinstance(sub, ast.Subscript):
+            sl = sub.slice
+            if (
+                isinstance(sl, ast.Constant)
+                and isinstance(sl.value, str)
+                and sl.value in _TENSOR_ATTR_TO_RULE
+                and _tail_name(sub.value) not in _PLAIN_DICT_NAMES
+            ):
+                recv = _expr_key(sub.value)
+                if recv is None or not env.has_op_guard(recv):
+                    return True
+        elif isinstance(sub, ast.Call):
+            g_recv, g_attr, _ = _getattr_target(sub)
+            if g_attr in _TENSOR_ATTR_TO_RULE and (
+                g_recv is None or not env.has_op_guard(g_recv)
+            ):
+                return True
+        elif isinstance(sub, ast.Name) and env.var_unguarded_attr.get(sub.id, False):
+            return True
+    return False
+
+
+def _call_has_unguarded_arg(call: ast.Call, env: _GuardEnv) -> bool:
+    return any(
+        _node_reads_unguarded_attr(arg, env)
+        for arg in [*call.args, *(kw.value for kw in call.keywords)]
+    )
 
 
 def _call_references_kv_cache(call: ast.Call) -> bool:
@@ -1087,6 +1150,9 @@ class _AuditVisitor:
             if value is not None
             else False
         )
+        rhs_reads_unguarded_attr = (
+            _node_reads_unguarded_attr(value, out) if value is not None else False
+        )
         # Check if RHS is a layout guard call `self.<method>(...)`.
         layout_promise: tuple[str, frozenset[str]] | None = None
         if (
@@ -1118,6 +1184,7 @@ class _AuditVisitor:
                 target,
                 out,
                 rhs_reads_attr=rhs_reads_attr,
+                rhs_reads_unguarded_attr=rhs_reads_unguarded_attr,
                 layout_promise=layout_promise,
                 elem_facts=elem_facts,
                 rhs_key=rhs_key,
@@ -1130,6 +1197,7 @@ class _AuditVisitor:
         env: _GuardEnv,
         *,
         rhs_reads_attr: bool,
+        rhs_reads_unguarded_attr: bool,
         layout_promise: tuple[str, frozenset[str]] | None,
         elem_facts: set[str] | None,
         rhs_key: str | None,
@@ -1138,6 +1206,8 @@ class _AuditVisitor:
             env.invalidate(target.id)
             if rhs_reads_attr:
                 env.var_reads_module_attr[target.id] = True
+            if rhs_reads_unguarded_attr:
+                env.var_unguarded_attr[target.id] = True
             if layout_promise is not None:
                 env.layout_vars[target.id] = layout_promise
             if elem_facts:
@@ -1155,6 +1225,7 @@ class _AuditVisitor:
                     elt,
                     env,
                     rhs_reads_attr=rhs_reads_attr,
+                    rhs_reads_unguarded_attr=rhs_reads_unguarded_attr,
                     layout_promise=None,
                     elem_facts=None,
                     rhs_key=None,
@@ -1164,6 +1235,7 @@ class _AuditVisitor:
                 target.value,
                 env,
                 rhs_reads_attr=rhs_reads_attr,
+                rhs_reads_unguarded_attr=rhs_reads_unguarded_attr,
                 layout_promise=None,
                 elem_facts=None,
                 rhs_key=None,
@@ -1182,6 +1254,9 @@ class _AuditVisitor:
                         f"{recv_key or '<expr>'}.{target.attr}",
                         f"unguarded write to '.{target.attr}' on possible format layer",
                     )
+            key = _expr_key(target)
+            if key is not None:
+                env.invalidate(key)
         elif isinstance(target, ast.Subscript):
             self._visit_expr(target.value, env)
             self._visit_expr(target.slice, env)
@@ -1228,9 +1303,10 @@ class _AuditVisitor:
         if isinstance(stmt, ast.AugAssign):
             self._visit_expr(stmt.value, env)
             self._visit_expr(stmt.target, env)
-            if isinstance(stmt.target, ast.Name):
+            key = _expr_key(stmt.target)
+            if key is not None:
                 out = env.copy()
-                out.invalidate(stmt.target.id)
+                out.invalidate(key)
                 return out
             return env
 
@@ -1276,31 +1352,37 @@ class _AuditVisitor:
                     facts = loop_env.seq_guards.get(loop_env.seq_aliases[iter_key])
                 if facts:
                     elem_facts = set(facts)
+            for name in _assigned_names(stmt.body):
+                loop_env.invalidate(name)
             self._bind_one_target(
                 stmt.target,
                 loop_env,
                 rhs_reads_attr=False,
+                rhs_reads_unguarded_attr=False,
                 layout_promise=None,
                 elem_facts=elem_facts,
                 rhs_key=None,
             )
             self._visit_block(stmt.body, loop_env)
-            if stmt.orelse:
-                self._visit_block(stmt.orelse, env.copy())
             out = env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
+            if stmt.orelse:
+                self._visit_block(stmt.orelse, out.copy())
             return out
 
         if isinstance(stmt, ast.While):
-            self._visit_expr(stmt.test, env)
-            pos, _ = _extract_facts(stmt.test, self.info, env)
-            self._visit_block(stmt.body, env.apply(pos))
-            if stmt.orelse:
-                self._visit_block(stmt.orelse, env.copy())
+            while_env = env.copy()
+            for name in _assigned_names(stmt.body):
+                while_env.invalidate(name)
+            self._visit_expr(stmt.test, while_env)
+            pos, _ = _extract_facts(stmt.test, self.info, while_env)
+            self._visit_block(stmt.body, while_env.apply(pos))
             out = env.copy()
             for name in _assigned_names([stmt]):
                 out.invalidate(name)
+            if stmt.orelse:
+                self._visit_block(stmt.orelse, out.copy())
             return out
 
         if isinstance(stmt, (ast.With, ast.AsyncWith)):
@@ -1312,13 +1394,14 @@ class _AuditVisitor:
                         item.optional_vars,
                         with_env,
                         rhs_reads_attr=False,
+                        rhs_reads_unguarded_attr=False,
                         layout_promise=None,
                         elem_facts=None,
                         rhs_key=None,
                     )
             return self._visit_block(stmt.body, with_env)
 
-        if isinstance(stmt, ast.Try):
+        if isinstance(stmt, (ast.Try, ast.TryStar)):
             self._visit_block(stmt.body, env.copy())
             for handler in stmt.handlers:
                 if handler.type is not None:
@@ -1355,10 +1438,30 @@ class _AuditVisitor:
         if isinstance(stmt, ast.Delete):
             out = env.copy()
             for target in stmt.targets:
-                if isinstance(target, ast.Name):
-                    out.invalidate(target.id)
-                else:
+                if not isinstance(target, ast.Name):
                     self._visit_expr(target, out)
+                key = _expr_key(target)
+                if key is not None:
+                    out.invalidate(key)
+            return out
+
+        if isinstance(stmt, ast.Match):
+            self._visit_expr(stmt.subject, env)
+            for case in stmt.cases:
+                c_env = env.copy()
+                for pnode in ast.walk(case.pattern):
+                    if isinstance(pnode, (ast.MatchAs, ast.MatchStar)) and pnode.name:
+                        c_env.invalidate(pnode.name)
+                    elif isinstance(pnode, ast.MatchMapping) and pnode.rest:
+                        c_env.invalidate(pnode.rest)
+                if case.guard is not None:
+                    self._visit_expr(case.guard, c_env)
+                    pos, _ = _extract_facts(case.guard, self.info, c_env)
+                    c_env = c_env.apply(pos)
+                self._visit_block(case.body, c_env)
+            out = env.copy()
+            for name in _assigned_names([stmt]):
+                out.invalidate(name)
             return out
 
         for child in ast.iter_child_nodes(stmt):
@@ -1462,6 +1565,7 @@ class _AuditVisitor:
                 gen.target,
                 cur,
                 rhs_reads_attr=False,
+                rhs_reads_unguarded_attr=False,
                 layout_promise=None,
                 elem_facts=elem_facts,
                 rhs_key=None,
@@ -1551,7 +1655,9 @@ class _AuditVisitor:
         )
         if op is None:
             return
-        if env.has_op_guard() or _call_has_guarded_arg(node, env):
+        if not _call_has_unguarded_arg(node, env) and (
+            env.has_op_guard() or _call_has_guarded_arg(node, env)
+        ):
             return
         has_mod_attr = any(
             _node_reads_module_attr(arg, env.var_reads_module_attr)
@@ -1657,8 +1763,20 @@ def _assigned_names(stmts: Sequence[ast.stmt]) -> set[str]:
     names: set[str] = set()
     for stmt in stmts:
         for node in ast.walk(stmt):
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            if isinstance(node, ast.Name) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
                 names.add(node.id)
+            elif isinstance(node, ast.Attribute) and isinstance(
+                node.ctx, (ast.Store, ast.Del)
+            ):
+                key = _expr_key(node)
+                if key is not None:
+                    names.add(key)
+            elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+                names.add(node.name)
+            elif isinstance(node, ast.MatchMapping) and node.rest:
+                names.add(node.rest)
     return names
 
 
@@ -1963,11 +2081,11 @@ def _parse_allow_arg(spec: str) -> AllowEntry:
     rule = "*"
     if "=" in head:
         head, rule = head.rsplit("=", 1)
-        rule = rule.strip() or "*"
+        rule = rule.strip()
     scope = "*"
     if ":" in head:
         head, scope = head.rsplit(":", 1)
-        scope = scope.strip() or "*"
+        scope = scope.strip()
     try:
         return AllowEntry(
             path=head.strip(), rule=rule, scope=scope, reason=reason.strip()

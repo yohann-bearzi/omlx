@@ -133,7 +133,7 @@ Not yet:
 - Distributed serving (cluster, tensor and pipeline parallel), custom `model_file` models, external drafters, and embedding, reranking and audio readers refuse format checkpoints. MoE expert offload keeps every expert resident.
 - Formats whose product is not row by row over blocks of inputs need a new kind of face ([Add to the contract](quant-formats.md#add-to-the-contract)).
 
-## Developer tooling: audit and debug CLIs
+## Developer tooling: audit CLI
 
 `python -m omlx.formats.audit <paths...>` statically scans Python sources for hand-written reads that bypass the format interface: `.weight`, `.scales` and `.biases` on a layer, `mx.quantized_matmul`, `mx.dequantize`, `mx.gather_qmm`, and exact `type(x) is QuantizedLinear` comparisons. A hit is a place where a family's code would misread a format layer; the scan is the check a family port runs before it is declared supported. The scanner is pure Python (it imports no `mlx`), so it also runs on an MLX-free host as `python omlx/formats/audit.py <paths...>`.
 

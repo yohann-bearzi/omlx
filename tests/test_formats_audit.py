@@ -223,6 +223,237 @@ def f(m, other):
         ("unguarded-scales", 6)
     ]
 
+    # 5. Attribute reassignment / delete / aug-assign invalidates prior attr guards.
+    attr_reassign_src = """
+import mlx.nn as nn
+class C:
+    def f(self, other):
+        if isinstance(self.proj, nn.QuantizedLinear):
+            self.proj = other
+            return self.proj.weight
+        return None
+
+    def g(self, other):
+        if isinstance(self.proj, nn.QuantizedLinear):
+            del self.proj
+            return self.proj.weight
+        return None
+
+    def h(self, other):
+        if isinstance(self.proj, nn.QuantizedLinear):
+            self.proj += other
+            return self.proj.weight
+        return None
+"""
+    attr_report = scan_source(attr_reassign_src)
+    assert [(f.rule, f.line) for f in attr_report.findings] == [
+        ("unguarded-weight", 7),
+        ("unguarded-weight", 13),
+        ("unguarded-weight", 19),
+    ]
+
+    # 6. Local reassignment clears op guards (no sticky scope_ops_guarded).
+    op_reassign_src = """
+import mlx.core as mx
+import mlx.nn as nn
+def f(m, other, x):
+    if isinstance(m, nn.QuantizedLinear):
+        m = other
+        return mx.quantized_matmul(x, m.weight, m.scales, m.biases)
+    return x
+"""
+    op_reassign_rules = _rules(op_reassign_src)
+    assert "unguarded-quantized-matmul" in op_reassign_rules
+    assert "unguarded-weight" in op_reassign_rules
+
+    # 7. Guarding receiver `a` must not silence ops on unguarded receiver `b`.
+    cross_recv_src = """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, x, s, bi):
+    if not isinstance(a, nn.QuantizedLinear):
+        return None
+    w = getattr(b, "weight", None)
+    return mx.quantized_matmul(x, w, s, bi)
+"""
+    cross_report = scan_source(cross_recv_src)
+    assert [(f.rule, f.line) for f in cross_report.findings] == [
+        ("unguarded-quantized-matmul", 8)
+    ]
+
+
+def test_scans_match_and_trystar_bodies():
+    match_src = """
+def f(k, m):
+    match k:
+        case 1:
+            return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(match_src)
+
+    trystar_src = """
+def f(m):
+    try:
+        return m.scales
+    except* ValueError:
+        return m.biases
+"""
+    trystar_rules = _rules(trystar_src)
+    assert "unguarded-scales" in trystar_rules
+    assert "unguarded-biases" in trystar_rules
+
+    shadow_src = """
+import mlx.nn as nn
+def f(m, x):
+    if isinstance(m, nn.QuantizedLinear):
+        match x:
+            case m:
+                return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(shadow_src)
+
+    # Guarded case via match guard stays clean; post-match binding invalidates guard.
+    match_guard_src = """
+import mlx.nn as nn
+def f(m, x):
+    match x:
+        case y if isinstance(y, nn.QuantizedLinear):
+            _ = y.weight
+    if isinstance(m, nn.QuantizedLinear):
+        match x:
+            case [*m]:
+                pass
+        return m.scales
+    return None
+"""
+    mg_report = scan_source(match_guard_src)
+    assert [(f.rule, f.line) for f in mg_report.findings] == [("unguarded-scales", 11)]
+
+
+def test_early_truthy_return_does_not_guard():
+    pred_src = """
+import mlx.core as mx
+import mlx.nn as nn
+from omlx.formats.linear import FormatLinear
+
+def is_qf(m):
+    if isinstance(m, FormatLinear):
+        return True
+    return isinstance(m, nn.QuantizedLinear)
+
+def f(m, x):
+    if is_qf(m):
+        return mx.quantized_matmul(x, m.weight, m.scales, m.biases)
+    return x
+"""
+    pred_rules = _rules(pred_src)
+    assert "unguarded-weight" in pred_rules
+    assert "unguarded-quantized-matmul" in pred_rules
+
+    layout_src = """
+import mlx.core as mx
+
+def _is_aff(s):
+    return getattr(s, "mode", None) == "affine"
+
+class BadSharded:
+    def _uniform_affine_layout(self):
+        shards = self.shards
+        if self.fast:
+            return (1, 1)
+        if not shards or not all(_is_aff(s) for s in shards):
+            return False
+        return (2, 2)
+
+    def run(self, x):
+        layout = self._uniform_affine_layout()
+        if layout:
+            first = self.shards[0]
+            return mx.quantized_matmul(x, first.weight, first.scales, first.biases)
+        return x
+"""
+    layout_rules = _rules(layout_src)
+    assert "unguarded-weight" in layout_rules
+    assert "unguarded-quantized-matmul" in layout_rules
+
+    reassign_pred_src = """
+import mlx.nn as nn
+
+def bad_reassign(m, other):
+    if not isinstance(m, nn.QuantizedLinear):
+        return False
+    m = other
+    return True
+
+def f(m, other):
+    if bad_reassign(m, other):
+        return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(reassign_pred_src)
+
+    nested_pred_src = """
+import mlx.nn as nn
+
+def is_nested_qf(m, flag):
+    if not isinstance(m, nn.QuantizedLinear):
+        if flag:
+            return True
+        else:
+            return False
+    return True
+
+def f(m, flag):
+    if is_nested_qf(m, flag):
+        return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(nested_pred_src)
+
+
+def test_getattr_dequantize_and_loop_backedge_reassignment():
+    getattr_deq_src = """
+import mlx.core as mx
+def f(layer, s, b):
+    w = getattr(layer, "weight", None)
+    return mx.dequantize(w, s, b, mode="affine")
+"""
+    assert "unguarded-dequantize" in _rules(getattr_deq_src)
+
+    for_backedge_src = """
+import mlx.nn as nn
+def f(m, xs):
+    if isinstance(m, nn.QuantizedLinear):
+        for o in xs:
+            _ = m.weight
+            m = o
+"""
+    assert "unguarded-weight" in _rules(for_backedge_src)
+
+    while_backedge_src = """
+import mlx.nn as nn
+def f(m, other, cond):
+    if isinstance(m, nn.QuantizedLinear):
+        while cond:
+            _ = m.weight
+            m = other
+"""
+    assert "unguarded-weight" in _rules(while_backedge_src)
+
+    loop_else_src = """
+import mlx.nn as nn
+def f(m, xs):
+    if isinstance(m, nn.QuantizedLinear):
+        for o in xs:
+            m = o
+        else:
+            return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(loop_else_src)
+
 
 def test_pragmas_allow_and_fail_closed(tmp_path):
     # Same-line pragma suppresses matching rule only; non-matching rule stays reported.
@@ -543,6 +774,14 @@ def test_cli_missing_path_and_bad_allow_exit_2(tmp_path, capsys):
     assert main([str(tmp_path), "--allow", "foo.py=bogus-rule::reason"]) == 2
     assert "--allow" in capsys.readouterr().err
 
+    for bad_spec in (
+        "clean.py=::reason",
+        "clean.py:=unguarded-weight::reason",
+        "clean.py: ::reason",
+    ):
+        assert main([str(tmp_path), "--allow", bad_spec]) == 2
+        assert "--allow" in capsys.readouterr().err
+
     with pytest.raises(SystemExit) as exc_info:
         main([str(tmp_path), "--format", "yaml"])
     assert exc_info.value.code == 2
@@ -597,6 +836,8 @@ def test_cli_standalone_script_invocation(tmp_path):
 
 def test_plugin_overview_docs_cover_audit_cli_and_pragmas():
     page = (REPO_ROOT / "docs/quant-format-plugins.md").read_text(encoding="utf-8")
+    assert "## Developer tooling: audit CLI" in page
+    assert "audit and debug CLIs" not in page
     for token in (
         "python -m omlx.formats.audit",
         "assert_no_unguarded_readers",
