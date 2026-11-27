@@ -8,11 +8,14 @@ caches (Rule 14).
 
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
+import math
 import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -23,14 +26,18 @@ from . import (
     Codes,
     Dot,
     QuantFormat,
+    Table,
     Tile,
     affine,
     kernels,
     linear,
     testing,
     tile_dense,
+    tile_gather,
+    tile_wide,
     transforms,
     tuning,
+    verify_skeleton,
 )
 from .linear import FormatEmbedding, FormatLinear, FormatSwitchLinear
 from .tuning import DenseTilePolicy, MmaTilePolicy, MsgTilePolicy
@@ -644,9 +651,12 @@ def _diagnose_builtin_face_decline(
                 return f"affine codes: unsupported group_size={gs}"
             if k <= 0 or k % gs:
                 return f"affine codes: k={k} not divisible by group_size={gs}"
-            if isinstance(w, mx.array) and isinstance(s, mx.array):
-                if min(w.size, s.size) < 8:
-                    return "affine codes: tensor size < 8"
+            if (
+                isinstance(w, mx.array)
+                and isinstance(s, mx.array)
+                and min(w.size, s.size) < 8
+            ):
+                return "affine codes: tensor size < 8"
     return f"format {mode!r}.{name}() returned None for (k={k}, n={n})"
 
 
@@ -930,13 +940,14 @@ def _trace_route_candidates(
                     reasons.append(
                         f"post-filter: dot unavailable or bound={bound} > 16"
                     )
-            elif route_name in ("mma_tile", "msg_tile"):
-                if not pol.is_legal(actual_face, k, n, bound, chip, dtype):
-                    reasons.append(
-                        _policy_illegality_reason(
-                            pol, actual_face, k, n, bound, chip, dtype
-                        )
+            elif route_name in ("mma_tile", "msg_tile") and not pol.is_legal(
+                actual_face, k, n, bound, chip, dtype
+            ):
+                reasons.append(
+                    _policy_illegality_reason(
+                        pol, actual_face, k, n, bound, chip, dtype
                     )
+                )
 
         accepted = not reasons
         rec = {
@@ -1995,4 +2006,1050 @@ def format_explain(result: ExplainResult, *, as_json: bool = False) -> str:
                 f"{probe.shape_scope}, {probe.rows_bucket}): "
                 f"{status}" + (f" ({why})" if why else "")
             )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2 — dump_metal standalone Metal emitter
+# ---------------------------------------------------------------------------
+
+_METAL_TYPE_NAMES: dict[mx.Dtype, str] = {
+    mx.bfloat16: "bfloat16_t",
+    mx.float16: "half",
+    mx.float32: "float",
+    mx.uint32: "uint32_t",
+    mx.int32: "int32_t",
+    mx.uint16: "uint16_t",
+    mx.int16: "int16_t",
+    mx.uint8: "uint8_t",
+    mx.int8: "int8_t",
+    mx.uint64: "uint64_t",
+    mx.int64: "int64_t",
+    mx.bool_: "bool",
+}
+
+_THREAD_ATTR_SPECS: tuple[tuple[str, str], ...] = (
+    ("thread_position_in_grid", "uint3"),
+    ("thread_position_in_threadgroup", "uint3"),
+    ("threadgroup_position_in_grid", "uint3"),
+    ("threadgroups_per_grid", "uint3"),
+    ("threads_per_threadgroup", "uint3"),
+    ("threads_per_grid", "uint3"),
+    ("thread_index_in_threadgroup", "uint"),
+    ("thread_index_in_simdgroup", "uint"),
+    ("simdgroup_index_in_threadgroup", "uint"),
+    ("simdgroups_per_threadgroup", "uint"),
+)
+
+
+@dataclass(frozen=True)
+class MetalSection:
+    name: str
+    start_line: int
+    end_line: int
+    sha256: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class LaunchGeometry:
+    grid: tuple[int, int, int]
+    threadgroup: tuple[int, int, int]
+    threadgroups: tuple[int, int, int]
+    template: tuple[tuple[str, str | int | bool], ...]
+    input_names: tuple[str, ...]
+    output_names: tuple[str, ...]
+    input_specs: tuple[tuple[str, str, tuple[int, ...], str], ...]
+    output_specs: tuple[tuple[str, str, tuple[int, ...]], ...]
+    staged_table_bytes: int
+    split_k: int | None
+    k_part: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+@dataclass(frozen=True)
+class DumpMetalResult:
+    kernel_name: str
+    route: str
+    backend: str
+    mode: str
+    bits: int
+    group_size: int
+    k: int
+    n: int
+    rows: int
+    experts: int | None
+    dtype: str
+    chip: str
+    tensor_units: bool
+    table_mode: str
+    face_key: str
+    face_digest: str
+    skeleton_digest: str | None
+    policy_repr: str | None
+    launch: LaunchGeometry
+    raw_header: str
+    raw_source: str
+    raw_digest: str
+    metal: str
+    metal_digest: str
+    sections: tuple[MetalSection, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+class _TargetTables(kernels.Tables):
+    """Local mirror of ``kernels.Tables`` with explicit target ``selects`` flag."""
+
+    def __init__(self, *, selects: bool) -> None:
+        super().__init__()
+        self._selects = selects
+
+    def add(self, table: Table) -> str:
+        if not isinstance(table, Table):
+            raise TypeError(f"expected a Table, got {type(table).__name__}")
+        at = self._at.get(table)
+        if at is None:
+            size = kernels._bytes((*self._at, table))
+            if size > formats.TABLE_BYTES:
+                raise ValueError(
+                    f"table {table.name!r}: the kernel's tables would hold {size} "
+                    f"bytes; a kernel holds at most {formats.TABLE_BYTES}"
+                )
+            metal, bits = kernels._METAL[table.dtype]
+            n = len(table.values)
+            if n <= kernels._SELECT_VALUES and self._selects:
+                self._values = True
+                past = kernels._PAST.get(table.dtype, 0)
+                words = [*table.bits, *(past,) * (kernels._SELECT_VALUES - n)]
+                values = ", ".join(f"as_type<{metal}>({bits}({w:#x}u))" for w in words)
+            else:
+                run = self._by_type.setdefault(metal, [])
+                values = f"omlx_tg_{metal} + {sum(len(t.values) for t in run)}"
+                run.append(table)
+            at = f"omlx_table<{metal}, {n}>{{{values}}}"
+            self._at[table] = at
+        return at
+
+
+def _make_matrices(
+    face: Dot | Tile,
+    *,
+    target_selects: bool,
+    unrolled: bool = False,
+    unroll_pairs: bool = False,
+) -> kernels.Matrices:
+    """Build a local ``kernels.Matrices`` without mutating host globals."""
+    matrices = kernels.Matrices(unrolled=unrolled, unroll_pairs=unroll_pairs)
+    has_small = any(
+        len(t.values) <= kernels._SELECT_VALUES for t in getattr(face, "tables", ())
+    )
+    if has_small and target_selects != kernels._small_tables_as_selects():
+        matrices._tables = _TargetTables(selects=target_selects)
+    return matrices
+
+
+def _metal_type(dtype: mx.Dtype) -> str:
+    name = _METAL_TYPE_NAMES.get(dtype)
+    if name is None:
+        raise ValueError(f"unsupported Metal element dtype {dtype!r}")
+    return name
+
+
+def _format_template_arg(value: Any) -> str:
+    # bool must be checked strictly before int (bool is a subclass of int).
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, mx.Dtype):
+        return _metal_type(value)
+    raise TypeError(f"unsupported Metal template value {value!r}")
+
+
+def _template_param_decl(name: str, value: Any) -> str:
+    if isinstance(value, mx.Dtype):
+        return f"typename {name}"
+    if isinstance(value, bool):
+        return f"bool {name}"
+    if isinstance(value, int):
+        return f"int {name}"
+    raise TypeError(f"unsupported Metal template value {value!r}")
+
+
+def _template_record_value(value: Any) -> str | int | bool:
+    if isinstance(value, mx.Dtype):
+        return _metal_type(value)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return int(value)
+    return str(value)
+
+
+def _addr_space(shape: tuple[int, ...]) -> str:
+    if len(shape) == 0:
+        return "scalar"
+    if math.prod(shape) < 8:
+        return "constant"
+    return "device"
+
+
+def _inline_mlx_utils_preamble() -> str:
+    """Flatten MLX's ``utils.h`` preamble for standalone Metal compilation."""
+    root = Path(mx.__file__).parent / "include"
+    utils_rel = "mlx/backend/metal/kernels/utils.h"
+    if not (root / utils_rel).is_file():
+        raise RuntimeError(f"MLX Metal headers not found under {root}")
+    seen: set[Path] = set()
+
+    def expand(rel: str) -> str:
+        path = root / rel
+        if path in seen:
+            return ""
+        seen.add(path)
+        out: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith('#include "mlx/') and stripped.endswith('"'):
+                out.append(expand(stripped[len('#include "') : -1]))
+            elif stripped != "#pragma once":
+                out.append(line)
+        return "\n".join(out)
+
+    head = (
+        "#include <metal_stdlib>\n"
+        "#include <metal_simdgroup_matrix>\n"
+        "#ifndef METAL_FUNC\n"
+        "#define METAL_FUNC inline\n"
+        "#endif\n"
+        "using namespace metal;\n"
+    )
+    return head + expand(utils_rel)
+
+
+def _assemble_standalone_metal(
+    *,
+    kernel_name: str,
+    route: str,
+    mode: str,
+    bits: int,
+    group_size: int,
+    k: int,
+    n: int,
+    rows: int,
+    chip: str,
+    table_mode: str,
+    policy_repr: str | None,
+    raw_digest: str,
+    raw_source: str,
+    mlx_route_headers: str,
+    face_header: str,
+    skeleton_header: str,
+    matrix_declarations: str,
+    skeleton_body: str,
+    template: list[tuple[str, Any]],
+    launch: LaunchGeometry,
+    include_mlx_preamble: bool,
+) -> tuple[str, tuple[MetalSection, ...]]:
+    body_sha = hashlib.sha256(raw_source.encode()).hexdigest()
+    banner_lines = [
+        f"// oMLX Standalone Metal Dump — {kernel_name}",
+        f"// route={route} mode={mode} bits={bits} group_size={group_size} "
+        f"k={k} n={n} rows={rows} chip={chip} tables={table_mode}",
+        f"// policy={policy_repr or 'none'}",
+        f"// emitted_sha256={raw_digest}",
+        f"// body_sha256={body_sha}",
+        f"// grid={launch.grid} threadgroup={launch.threadgroup} "
+        f"threadgroups={launch.threadgroups}",
+        f"// template={list(launch.template)}",
+        f"// inputs={list(launch.input_names)} outputs={list(launch.output_names)}",
+        f"// staged_tables={launch.staged_table_bytes}B "
+        f"split_k={launch.split_k} k_part={launch.k_part}",
+    ]
+
+    lines: list[str] = [*banner_lines, ""]
+    sections: list[MetalSection] = []
+
+    def add_section(sec_name: str, content: str) -> None:
+        start_line = len(lines) + 1
+        lines.append(f"// >>> OMLX_SECTION: {sec_name} >>>")
+        sec_lines = content.splitlines()
+        lines.extend(sec_lines)
+        end_line = len(lines) + 1
+        lines.append(f"// <<< OMLX_SECTION: {sec_name} <<<")
+        sec_sha = hashlib.sha256("\n".join(sec_lines).encode()).hexdigest()
+        sections.append(MetalSection(sec_name, start_line, end_line, sec_sha))
+
+    if include_mlx_preamble:
+        add_section("mlx_preamble", _inline_mlx_utils_preamble())
+    if mlx_route_headers:
+        add_section("mlx_route_headers", mlx_route_headers)
+    add_section("face", face_header)
+    add_section("skeleton_header", skeleton_header)
+
+    # Build templated [[kernel]] entry point matching MLX buffer binding rules.
+    params: list[str] = []
+    buf_idx = 0
+    for in_name, mtype, _shape, space in launch.input_specs:
+        if space == "scalar":
+            params.append(
+                f"    const constant {mtype}& {in_name} [[buffer({buf_idx})]]"
+            )
+        elif space == "constant":
+            params.append(
+                f"    const constant {mtype}* {in_name} [[buffer({buf_idx})]]"
+            )
+        else:
+            params.append(f"    const device {mtype}* {in_name} [[buffer({buf_idx})]]")
+        buf_idx += 1
+    for out_name, mtype, _shape in launch.output_specs:
+        params.append(f"    device {mtype}* {out_name} [[buffer({buf_idx})]]")
+        buf_idx += 1
+
+    # Conditional shape / strides / ndim bindings scanned from raw_source.
+    for in_name in launch.input_names:
+        if re.search(rf"\b{re.escape(in_name)}_shape\b", raw_source):
+            params.append(
+                f"    const constant int* {in_name}_shape [[buffer({buf_idx})]]"
+            )
+            buf_idx += 1
+        if re.search(rf"\b{re.escape(in_name)}_strides\b", raw_source):
+            params.append(
+                f"    const constant int64_t* {in_name}_strides [[buffer({buf_idx})]]"
+            )
+            buf_idx += 1
+        if re.search(rf"\b{re.escape(in_name)}_ndim\b", raw_source):
+            params.append(
+                f"    const constant int& {in_name}_ndim [[buffer({buf_idx})]]"
+            )
+            buf_idx += 1
+
+    for attr_name, attr_type in _THREAD_ATTR_SPECS:
+        if re.search(rf"\b{attr_name}\b", raw_source):
+            params.append(f"    {attr_type} {attr_name} [[{attr_name}]]")
+
+    t_decls = ", ".join(_template_param_decl(tn, tv) for tn, tv in template)
+    t_args = ", ".join(_format_template_arg(tv) for _, tv in template)
+    tmpl_fn = f"{kernel_name}_tmpl"
+
+    entry_start = len(lines) + 1
+    lines.append("// >>> OMLX_SECTION: kernel_entry >>>")
+    if t_decls:
+        lines.append(f"template <{t_decls}>")
+    lines.append(f"[[kernel]] void {tmpl_fn}(")
+    for idx, param in enumerate(params):
+        comma = "," if idx < len(params) - 1 else ""
+        lines.append(f"{param}{comma}")
+    lines.append(") {")
+
+    add_section("matrix_declarations", matrix_declarations)
+    add_section("skeleton_body", skeleton_body)
+
+    lines.append("}")
+    if t_args:
+        lines.append(
+            f'template [[host_name("{kernel_name}")]] [[kernel]] '
+            f"decltype({tmpl_fn}<{t_args}>) {tmpl_fn}<{t_args}>;"
+        )
+    entry_end = len(lines) + 1
+    lines.append("// <<< OMLX_SECTION: kernel_entry <<<")
+
+    entry_body = "\n".join(lines[entry_start : entry_end - 1])
+    entry_sec = MetalSection(
+        "kernel_entry",
+        entry_start,
+        entry_end,
+        hashlib.sha256(entry_body.encode()).hexdigest(),
+    )
+    # Place kernel_entry ahead of its nested sections for predictable order.
+    insert_at = len(sections) - 2
+    sections.insert(insert_at, entry_sec)
+
+    return "\n".join(lines) + "\n", tuple(sections)
+
+
+def _operand_specs(
+    layer: Any, prefix: str, face: Dot | Tile
+) -> list[tuple[str, str, tuple[int, ...], str]]:
+    packed_key = linear.packed_name(layer)
+    arr_names = (packed_key, *face.tensors)
+    in_names = (f"{prefix}_weight", *(f"{prefix}_{t}" for t in face.tensors))
+    specs: list[tuple[str, str, tuple[int, ...], str]] = []
+    for in_name, layer_key in zip(in_names, arr_names, strict=True):
+        arr = layer[layer_key]
+        shape = tuple(int(d) for d in arr.shape)
+        specs.append((in_name, _metal_type(arr.dtype), shape, _addr_space(shape)))
+    return specs
+
+
+def dump_metal(
+    layer: FormatLinear | FormatSwitchLinear,
+    *,
+    rows: int = 1,
+    dtype: str | mx.Dtype = mx.bfloat16,
+    chip: str | None = None,
+    tensor_units: bool | None = None,
+    route: str | None = None,
+    sorted_indices: bool = True,
+    per_row: int = 1,
+    input_ndim: int = 3,
+    include_mlx_preamble: bool = True,
+) -> DumpMetalResult:
+    """Emit exact, self-contained Metal source and launch geometry for ``layer``.
+
+    Pure and read-only (Rule 14): never mutates ``layer.__dict__``,
+    ``kernels._FACE_KERNELS``, ``kernels._PROOFS``, or host table-mode globals.
+    """
+    if not isinstance(layer, (FormatLinear, FormatSwitchLinear)):
+        raise TypeError(
+            "dump_metal expects FormatLinear or FormatSwitchLinear, "
+            f"not {type(layer).__name__}"
+        )
+    layer.refuse_placeholders()
+    _check_positive_int("rows", rows)
+    _check_positive_int("per_row", per_row)
+    if type(input_ndim) is not int or input_ndim not in (2, 3):
+        raise ValueError(f"input_ndim must be 2 or 3, not {input_ndim!r}")
+    if not isinstance(sorted_indices, bool):
+        raise TypeError(
+            f"sorted_indices must be a bool, not {type(sorted_indices).__name__}"
+        )
+    if not isinstance(include_mlx_preamble, bool):
+        raise TypeError(
+            "include_mlx_preamble must be a bool, "
+            f"not {type(include_mlx_preamble).__name__}"
+        )
+
+    dt = parse_dtype(dtype)
+    chip_id, arch, gpu_cores, gpu_gen, tu = _resolve_chip(chip, tensor_units)
+    target_selects = kernels._selects_for(arch)
+    table_mode = "selects" if target_selects else "staged"
+
+    is_switch = isinstance(layer, FormatSwitchLinear)
+    k, n = layer.input_dims, layer.output_dims
+    experts = layer.num_experts if is_switch else None
+
+    # Resolve route (auto via explain if route is None, or validate forced route).
+    scheduled_policy: Any = None
+    if route is not None:
+        if not isinstance(route, str) or route not in DUMP_ROUTES:
+            raise ValueError(
+                f"unknown dump route {route!r}; valid routes are {DUMP_ROUTES}"
+            )
+        chosen_route = route
+    else:
+        exp = explain(
+            layer,
+            rows=(rows,),
+            dtype=dt,
+            chip=chip_id,
+            tensor_units=tu,
+            sorted_indices=sorted_indices,
+            input_ndim=input_ndim,
+        )
+        rt = exp.row_traces[0]
+        chosen_route = rt.selected_route
+        if chosen_route in ("mlx", "decode", "switch_decode"):
+            valid = (
+                ("switch_dot", "switch_tile_steel", "switch_tile_nax")
+                if is_switch
+                else ("dot", "dot_shared", "steel", "nax", "wide", "mma", "msg")
+            )
+            raise ValueError(
+                f"layer selected non-custom-Metal route {chosen_route!r} for "
+                f"rows={rows} dtype={_dtype_label(dt)} chip={chip_id}; "
+                f"pass an explicit route override from {valid}"
+            )
+
+    # Validate layer kind matches route kind.
+    switch_routes = ("switch_dot", "switch_tile_steel", "switch_tile_nax")
+    if is_switch and chosen_route not in switch_routes:
+        raise ValueError(
+            f"route {chosen_route!r} is a dense route and cannot be used with "
+            f"FormatSwitchLinear (valid: {switch_routes})"
+        )
+    if not is_switch and chosen_route in switch_routes:
+        raise ValueError(
+            f"route {chosen_route!r} is a switch route and cannot be used with "
+            "FormatLinear"
+        )
+
+    face_objs, _ = _probe_faces(layer, dt)
+    dot_face: Dot | None = face_objs["dot"]
+    tile_face: Tile | None = face_objs["tile"]
+
+    # If auto-selected on dense layer, recover the exact scheduled policy.
+    if (
+        not is_switch
+        and route is None
+        and tile_face is not None
+        and dt
+        in (
+            mx.float16,
+            mx.bfloat16,
+        )
+    ):
+        dot_ok = (
+            dot_face is not None
+            and k >= 8
+            and not (n % 8 != 0 and dot_face.vpt < 1)
+            and dot_face.exact_for(dt)
+        )
+        sched = tile_dense._build_schedule(
+            layer,
+            tile_face,
+            dt,
+            tensor_units=tu,
+            chip=chip_id,
+            dot_ok=dot_ok,
+        )
+        scheduled_policy = tile_dense._route_for_rows(sched, rows).policy
+
+    x_shape = (
+        (rows, 1, k) if is_switch else ((1, rows, k) if input_ndim == 3 else (rows, k))
+    )
+    out_shape_default = (*x_shape[:-1], n)
+    mtype_x = _metal_type(dt)
+
+    mlx_route_headers = ""
+    skeleton_header = ""
+    skeleton_body = ""
+    skeleton_digest: str | None = None
+    policy_repr: str | None = None
+    split_k_val: int | None = None
+    k_part_val: int | None = None
+    output_names: tuple[str, ...] = ("y",)
+    out_specs: list[tuple[str, str, tuple[int, ...]]] = [
+        ("y", mtype_x, out_shape_default)
+    ]
+
+    if chosen_route == "dot":
+        if dot_face is None or not dot_face.exact_for(dt) or k < 8 or n % 8 != 0:
+            raise ValueError(
+                f"route 'dot' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, dtype={_dtype_label(dt)})"
+            )
+        face: Dot | Tile = dot_face
+        backend = "dot"
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("m", face)])
+        kernel_name = f"omlx_format_linear_{face.key}"
+        skeleton_header = kernels.STORE_ROWS
+        skeleton_body = linear._SOURCE.replace("__MATRIX__", "0").replace(
+            "__X_ROW__", "pair"
+        )
+        template: list[tuple[str, Any]] = [("T", dt), ("K_SIZE", k), ("N_SIZE", n)]
+        grid = (32, 2 * rows, n // 8)
+        threadgroup = (32, 2, 1)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "m", face),
+        ]
+
+    elif chosen_route == "dot_shared":
+        if dot_face is None or not dot_face.exact_for(dt) or k < 8 or dot_face.vpt < 1:
+            raise ValueError(
+                f"route 'dot_shared' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, dtype={_dtype_label(dt)})"
+            )
+        face = dot_face
+        backend = "dot"
+        unrolled = kernels.unrolled_tile_ok(face.vpt, linear._SHARED_RPS, 1)
+        matrices = _make_matrices(
+            face, target_selects=target_selects, unrolled=unrolled
+        )
+        input_names = tuple(["x", *matrices.add("m", face, shared=True)])
+        kernel_name = f"omlx_format_linear_rows_{face.key}"
+        skeleton_header = kernels.STORE_ROWS
+        skeleton_body = linear._SHARED_SOURCE
+        group = _group_for_chip(rows, face.vpt, n, gpu_gen, gpu_cores)
+        template = [
+            ("T", dt),
+            ("K_SIZE", k),
+            ("N_SIZE", n),
+            ("ROWS", group),
+            ("VPT", face.vpt),
+        ]
+        grid = (32, 2 * (rows // group), -(-n // linear._SHARED_TILE))
+        threadgroup = (32, 2, 1)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "m", face),
+        ]
+
+    elif chosen_route in ("steel", "nax"):
+        if chosen_route == "nax" and not tu:
+            raise ValueError(
+                f"route 'nax' requires tensor units (unavailable on chip {chip_id})"
+            )
+        if tile_face is None or not tile_face.exact_for(dt):
+            raise ValueError(
+                f"route {chosen_route!r} requires a tile face exact for "
+                f"{_dtype_label(dt)}"
+            )
+        face = tile_face
+        backend = chosen_route
+        if (
+            isinstance(scheduled_policy, DenseTilePolicy)
+            and scheduled_policy.backend == chosen_route
+        ):
+            pol = scheduled_policy
+        elif chosen_route == "nax":
+            pol = tile_dense._default_nax_policy(layer.bits, rows, n, k)
+        else:
+            pol = tile_dense._default_steel_policy(rows, n, k)
+        if not pol.is_legal(face, k, n, rows, chip_id, dt, tail=True):
+            raise ValueError(
+                f"route {chosen_route!r} policy {pol!r} is illegal for "
+                f"(k={k}, n={n}, rows={rows}, chip={chip_id})"
+            )
+        eff = tile_dense._effective_policy(pol, k, n)
+        policy_repr = repr(eff)
+        mlx_hdr = (
+            tile_dense._nax_headers()
+            if chosen_route == "nax"
+            else tile_dense._steel_headers()
+        )
+        if mlx_hdr is None:
+            raise RuntimeError(f"MLX {chosen_route} headers unavailable")
+        mlx_route_headers = mlx_hdr
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("w", face)])
+        skeleton_digest = tuning.skeleton_digest("dense_tile")
+        split_k_val, k_part_val = tile_dense._split_k_geometry(k, eff.bk, eff.split_k)
+        n_cols = (n + eff.bn - 1) // eff.bn
+        n_rows = (rows + eff.bm - 1) // eff.bm
+        out_shape = (split_k_val, rows, n) if split_k_val > 1 else out_shape_default
+        out_dtype = mx.float32 if split_k_val > 1 else dt
+        out_specs = [("y", _metal_type(out_dtype), out_shape)]
+
+        if chosen_route == "nax":
+            kernel_name = f"omlx_nax_dense_{face.key}"
+            skeleton_header = tile_dense._NAX_HEADER
+            skeleton_body = tile_dense._NAX_SOURCE
+            staged = matrices.staged_bytes
+            if staged:
+                skeleton_body = skeleton_body.replace(
+                    "PAD / sizeof(T)];",
+                    f"(PAD > {staged} ? PAD - {staged} : 0) / sizeof(T)];",
+                )
+            even_tn = (eff.bn // (16 * eff.wn)) % 2 == 0
+            sched = (
+                1
+                if (eff.sched == "db" and eff.align_n and k % eff.bk == 0 and even_tn)
+                else 0
+            )
+            gx = eff.gx
+            if gx > 0:
+                gx_eff = min(gx, n_rows)
+                tg_x = gx_eff
+                tg_y = ((n_rows + gx_eff - 1) // gx_eff) * n_cols
+            else:
+                tg_x = n_cols
+                tg_y = n_rows
+            template = [
+                ("T", dt),
+                ("K", k),
+                ("BM", eff.bm),
+                ("BN", eff.bn),
+                ("BK", eff.bk),
+                ("WM", eff.wm),
+                ("WN", eff.wn),
+                ("ALIGN_N", eff.align_n),
+                ("SCHED", sched),
+                ("GX", gx),
+                ("PAD", eff.pad_bytes),
+                ("SPLIT_K", split_k_val),
+                ("K_PART", k_part_val),
+            ]
+            grid = (tg_x * 32, tg_y * eff.wn, eff.wm * split_k_val)
+            threadgroup = (32, eff.wn, eff.wm)
+        else:
+            kernel_name = f"omlx_steel_dense_{face.key}"
+            skeleton_header = tile_dense._STEEL_HEADER
+            skeleton_body = tile_dense._STEEL_SOURCE
+            tgp = eff.wm * eff.wn * 32
+            cache_p = eff.param_staging is tuning.ParamStaging.GROUP_STEPS_COUNTER
+            template = [
+                ("T", dt),
+                ("K", k),
+                ("BM", eff.bm),
+                ("BN", eff.bn),
+                ("BK", eff.bk),
+                ("WM", eff.wm),
+                ("WN", eff.wn),
+                ("ALIGN_N", eff.align_n),
+                ("VEC_STORE", eff.vec_store),
+                ("CACHE_P", cache_p),
+                ("X_NREADS", eff.x_nreads),
+                ("SPLIT_K", split_k_val),
+                ("K_PART", k_part_val),
+            ]
+            grid = (tgp * n_cols, n_rows, split_k_val)
+            threadgroup = (tgp, 1, 1)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "w", face),
+        ]
+
+    elif chosen_route == "wide":
+        if (
+            tile_face is None
+            or not tile_face.exact_for(dt)
+            or k % 8 != 0
+            or kernels.table_bytes(tile_face) > 32768
+        ):
+            raise ValueError(
+                f"route 'wide' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, dtype={_dtype_label(dt)})"
+            )
+        face = tile_face
+        backend = "wide"
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("w", face)])
+        kernel_name = f"omlx_format_linear_wide_{face.key}"
+        skeleton_header = tile_wide._HEADER
+        skeleton_body = tile_wide._SOURCE
+        tiles = (rows + 4) // 5
+        vectors = (rows + tiles - 1) // tiles
+        partial_m = rows % vectors != 0
+        template = [
+            ("T", dt),
+            ("K", k),
+            ("N", n),
+            ("V", vectors),
+            ("PARTIAL_M", partial_m),
+        ]
+        grid = (32 * tiles, 2 * ((n + 7) // 8), 1)
+        threadgroup = (32, 2, 1)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "w", face),
+        ]
+
+    elif chosen_route == "mma":
+        if tile_face is None or not tile_face.exact_for(dt):
+            raise ValueError(
+                f"route 'mma' requires a tile face exact for {_dtype_label(dt)}"
+            )
+        face = tile_face
+        backend = "mma"
+        m_pad = ((rows + 7) // 8) * 8
+        pol = (
+            scheduled_policy
+            if isinstance(scheduled_policy, MmaTilePolicy)
+            else MmaTilePolicy()
+        )
+        if not pol.is_legal(face, k, n, m_pad, chip_id, dt):
+            raise ValueError(
+                f"route 'mma' policy {pol!r} is illegal for "
+                f"(k={k}, n={n}, m={m_pad}, chip={chip_id})"
+            )
+        policy_repr = repr(pol)
+        skeleton_digest = tuning.skeleton_digest("mma_tile")
+        ops = verify_skeleton.tile_mma_ops(face, policy=pol)
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("w", face), "N_size"])
+        kernel_name = f"omlx_fl_mma_rt{m_pad // 8}_k{k}_{face.key}"
+        skeleton_header = ops.header
+        skeleton_body = verify_skeleton.emit_mma_source(ops, m_pad // 8, k)
+        template = [("T", dt)]
+        grid = (32 * pol.nsg, n // pol.bn, 1)
+        threadgroup = (32 * pol.nsg, 1, 1)
+        input_specs = [
+            ("x", mtype_x, (m_pad, k), _addr_space((m_pad, k))),
+            *_operand_specs(layer, "w", face),
+            ("N_size", "uint32_t", (), "scalar"),
+        ]
+        out_specs = [("y", mtype_x, (m_pad, n))]
+
+    elif chosen_route == "msg":
+        if tile_face is None or not tile_face.exact_for(dt) or not (1 <= rows <= 8):
+            raise ValueError(
+                f"route 'msg' requires 1 <= rows <= 8 and tile face exact for "
+                f"{_dtype_label(dt)}"
+            )
+        face = tile_face
+        backend = "msg"
+        m_pad = 4 if rows <= 4 else 6 if rows <= 6 else 8
+        pol = (
+            scheduled_policy
+            if isinstance(scheduled_policy, MsgTilePolicy)
+            else MsgTilePolicy()
+        )
+        if not pol.is_legal(face, k, n, m_pad, chip_id, dt):
+            raise ValueError(
+                f"route 'msg' policy {pol!r} is illegal for "
+                f"(k={k}, n={n}, m={m_pad}, chip={chip_id})"
+            )
+        policy_repr = repr(pol)
+        skeleton_digest = tuning.skeleton_digest("msg_tile")
+        lt = getattr(pol.load_lifetime, "value", pol.load_lifetime) or "batch"
+        ops = verify_skeleton.msg_tile_ops(face, m_pad, pol.nsg, lt)
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("w", face), "N_size"])
+        kernel_name = f"omlx_vk_m{m_pad}_nsg{pol.nsg}_{lt}_{face.key}"
+        skeleton_header = ""
+        skeleton_body = verify_skeleton.emit_msg_source(ops)
+        template = [("T", dt), ("K", k)]
+        cols = 4 * pol.nsg
+        grid = (32 * pol.nsg, (n + cols - 1) // cols, 1)
+        threadgroup = (32 * pol.nsg, 1, 1)
+        input_specs = [
+            ("x", mtype_x, (m_pad, k), _addr_space((m_pad, k))),
+            *_operand_specs(layer, "w", face),
+            ("N_size", "uint32_t", (), "scalar"),
+        ]
+        out_specs = [("y", mtype_x, (m_pad, n))]
+
+    elif chosen_route == "switch_dot":
+        if dot_face is None or not dot_face.exact_for(dt) or k < 8 or n % 8 != 0:
+            raise ValueError(
+                f"route 'switch_dot' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, dtype={_dtype_label(dt)})"
+            )
+        face = dot_face
+        backend = "dot"
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("m", face), "rhs"])
+        kernel_name = f"omlx_format_switch_linear_{face.key}"
+        skeleton_header = kernels.STORE_ROWS
+        skeleton_body = linear._STACKED + linear._SOURCE.replace(
+            "__MATRIX__", "rhs[pair]"
+        ).replace("__X_ROW__", "pair / uint(PAIRS_PER_ROW)")
+        pairs = rows * per_row
+        template = [
+            ("T", dt),
+            ("K_SIZE", k),
+            ("N_SIZE", n),
+            ("PAIRS_PER_ROW", per_row),
+        ]
+        grid = (32, 2 * pairs, n // 8)
+        threadgroup = (32, 2, 1)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "m", face),
+            ("rhs", "uint32_t", (pairs,), _addr_space((pairs,))),
+        ]
+        out_specs = [("y", mtype_x, (pairs, n))]
+
+    elif chosen_route == "switch_tile_steel":
+        if (
+            tile_face is None
+            or not tile_face.exact_for(dt)
+            or k % 32 != 0
+            or n <= 0
+            or not experts
+        ):
+            raise ValueError(
+                f"route 'switch_tile_steel' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, experts={experts}, dtype={_dtype_label(dt)})"
+            )
+        face = tile_face
+        backend = "steel"
+        mlx_hdr = tile_gather._headers()
+        if mlx_hdr is None:
+            raise RuntimeError("MLX steel headers unavailable")
+        mlx_route_headers = mlx_hdr
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(["x", *matrices.add("w", face), "offsets", "meta"])
+        kernel_name = f"omlx_steel_gather_{face.key}"
+        skeleton_header = tile_gather._HEADER
+        skeleton_body = tile_gather._SOURCE
+        policy_repr = "SteelGather(BM=16, BN=32, BK=32)"
+        template = [("T", dt), ("K", k), ("ALIGN_N", n % 32 == 0)]
+        grid = (
+            64 * ((n + 31) // 32),
+            (rows + 15) // 16 + min(experts, rows),
+            1,
+        )
+        threadgroup = (64, 1, 1)
+        offsets_shape = (max(8, experts),)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "w", face),
+            ("offsets", "int32_t", offsets_shape, _addr_space(offsets_shape)),
+            ("meta", "int32_t", (3,), "constant"),
+        ]
+        out_specs = [("y", mtype_x, (rows, 1, n))]
+
+    else:  # switch_tile_nax
+        if not tu:
+            raise ValueError(
+                f"route 'switch_tile_nax' requires tensor units "
+                f"(unavailable on chip {chip_id})"
+            )
+        if (
+            tile_face is None
+            or not tile_face.exact_for(dt)
+            or not experts
+            or experts > nax._MAX_EXPERTS
+            or n % 32 != 0
+            or k % 32 != 0
+        ):
+            raise ValueError(
+                f"route 'switch_tile_nax' is illegal for {layer.mode} "
+                f"(k={k}, n={n}, experts={experts}, dtype={_dtype_label(dt)})"
+            )
+        face = tile_face
+        backend = "nax"
+        mlx_hdr = nax._read_mlx_headers(nax._MLX_MM_HEADERS)
+        if mlx_hdr is None:
+            raise RuntimeError("MLX NAX headers unavailable")
+        mlx_route_headers = mlx_hdr
+        suffix, body_src, extra = nax._FACE_KINDS["plain"]
+        matrices = _make_matrices(face, target_selects=target_selects)
+        input_names = tuple(
+            ["x", *matrices.add("w", face), "tiles", "tile_count", "params", *extra]
+        )
+        kernel_name = f"omlx_gqmm_{face.key}{suffix}"
+        skeleton_header = nax._MM_HEADER + nax._FACE_HEADER
+        skeleton_body = body_src
+        staged = matrices.staged_bytes
+        if staged:
+            skeleton_body = skeleton_body.replace(
+                "PAD / sizeof(T)];",
+                f"(PAD > {staged} ? PAD - {staged} : 0) / sizeof(T)];",
+            )
+        plan = nax.face_plan(rows, experts, k, n)
+        policy_repr = repr(plan)
+        max_tiles = (rows + plan.bm - 1) // plan.bm + min(experts, rows)
+        g = nax._grid(n, max_tiles, plan)
+        grid = g["grid"]
+        threadgroup = g["threadgroup"]
+        template = [
+            ("T", dt),
+            ("K", k),
+            ("SCHED", int(plan.sched)),
+            ("ALIGN_N", n % nax._BN == 0),
+            ("BM", plan.bm),
+            ("BK", plan.bk),
+            ("GX", plan.gx),
+            ("PAD", plan.pad),
+        ]
+        tiles_shape = (max_tiles * 4,)
+        input_specs = [
+            ("x", mtype_x, x_shape, _addr_space(x_shape)),
+            *_operand_specs(layer, "w", face),
+            ("tiles", "uint32_t", tiles_shape, _addr_space(tiles_shape)),
+            ("tile_count", "uint32_t", (1,), "constant"),
+            ("params", "int32_t", (1,), "constant"),
+        ]
+        out_specs = [("y", mtype_x, (rows, 1, n))]
+
+    face_header = matrices.header
+    matrix_declarations = matrices.declarations
+    raw_header = mlx_route_headers + face_header + skeleton_header
+    raw_source = matrix_declarations + skeleton_body
+    raw_digest = hashlib.sha256(
+        f"{kernel_name}\0{raw_header}\0{raw_source}".encode()
+    ).hexdigest()
+
+    threadgroups = (
+        (grid[0] + threadgroup[0] - 1) // threadgroup[0],
+        (grid[1] + threadgroup[1] - 1) // threadgroup[1],
+        (grid[2] + threadgroup[2] - 1) // threadgroup[2],
+    )
+    launch = LaunchGeometry(
+        grid=grid,
+        threadgroup=threadgroup,
+        threadgroups=threadgroups,
+        template=tuple((tn, _template_record_value(tv)) for tn, tv in template),
+        input_names=input_names,
+        output_names=output_names,
+        input_specs=tuple(input_specs),
+        output_specs=tuple(out_specs),
+        staged_table_bytes=int(matrices.staged_bytes),
+        split_k=split_k_val,
+        k_part=k_part_val,
+    )
+
+    metal, sections = _assemble_standalone_metal(
+        kernel_name=kernel_name,
+        route=chosen_route,
+        mode=layer.mode,
+        bits=int(layer.bits),
+        group_size=int(layer.group_size),
+        k=int(k),
+        n=int(n),
+        rows=int(rows),
+        chip=chip_id,
+        table_mode=table_mode,
+        policy_repr=policy_repr,
+        raw_digest=raw_digest,
+        raw_source=raw_source,
+        mlx_route_headers=mlx_route_headers,
+        face_header=face_header,
+        skeleton_header=skeleton_header,
+        matrix_declarations=matrix_declarations,
+        skeleton_body=skeleton_body,
+        template=template,
+        launch=launch,
+        include_mlx_preamble=include_mlx_preamble,
+    )
+    metal_digest = hashlib.sha256(metal.encode()).hexdigest()
+
+    return DumpMetalResult(
+        kernel_name=kernel_name,
+        route=chosen_route,
+        backend=backend,
+        mode=layer.mode,
+        bits=int(layer.bits),
+        group_size=int(layer.group_size),
+        k=int(k),
+        n=int(n),
+        rows=int(rows),
+        experts=experts,
+        dtype=_dtype_label(dt),
+        chip=chip_id,
+        tensor_units=tu,
+        table_mode=table_mode,
+        face_key=face.key,
+        face_digest=tuning.face_digest(face),
+        skeleton_digest=skeleton_digest,
+        policy_repr=policy_repr,
+        launch=launch,
+        raw_header=raw_header,
+        raw_source=raw_source,
+        raw_digest=raw_digest,
+        metal=metal,
+        metal_digest=metal_digest,
+        sections=sections,
+    )
+
+
+def format_dump_metal_summary(result: DumpMetalResult, *, as_json: bool = False) -> str:
+    """Format a ``DumpMetalResult`` summary (metadata, launch geometry, digests)."""
+    if as_json:
+        summary = {k: v for k, v in result.to_dict().items() if k != "metal"}
+        return json.dumps(summary, indent=2, sort_keys=True)
+    lg = result.launch
+    lines = [
+        f"Kernel: {result.kernel_name} (route={result.route}, "
+        f"backend={result.backend}, face={result.face_key})",
+        f"Layer: mode={result.mode} bits={result.bits} gs={result.group_size} "
+        f"k={result.k} n={result.n} rows={result.rows}"
+        + (f" experts={result.experts}" if result.experts is not None else ""),
+        f"Target: chip={result.chip} tensor_units={result.tensor_units} "
+        f"dtype={result.dtype} tables={result.table_mode}",
+        f"Launch: grid={lg.grid} threadgroup={lg.threadgroup} "
+        f"threadgroups={lg.threadgroups} staged_tables={lg.staged_table_bytes}B",
+        f"Template: {list(lg.template)}",
+        f"Digests: raw_digest={result.raw_digest}",
+        f"         metal_digest={result.metal_digest}",
+        f"         face_digest={result.face_digest} "
+        f"skeleton_digest={result.skeleton_digest}",
+        "Sections:",
+    ]
+    for sec in result.sections:
+        lines.append(
+            f"  - {sec.name}: lines {sec.start_line}-{sec.end_line} "
+            f"sha256={sec.sha256[:12]}"
+        )
     return "\n".join(lines)

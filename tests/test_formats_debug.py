@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import shutil
 import subprocess
 import sys
 import types
@@ -23,12 +25,16 @@ from omlx.formats import (
     affine,
     debug,
     kernels,
+    linear,
     testing,
     tile_dense,
+    tile_gather,
+    tile_wide,
     transforms,
     tuning,
 )
 from omlx.formats.linear import FormatEmbedding, FormatLinear
+from omlx.patches import m5_gather_qmm_nax as nax
 
 
 class _TabledToyFormat(QuantFormat):
@@ -538,3 +544,412 @@ def test_rule28_no_hot_path_import_and_rule30_no_env_vars():
                         f"Rule 30 violation: import {alias.name} in "
                         f"{debug_path}:{node.lineno}"
                     )
+
+
+# ---------------------------------------------------------------------------
+# Milestone 2 — dump_metal tests
+# ---------------------------------------------------------------------------
+
+
+class _StagedTabledToyFormat(QuantFormat):
+    """Plugin format with a 16-entry Table (always staged on M3 and M5)."""
+
+    mode = "fmtdebug_staged_toy"
+    codes_name = "qcodes"
+    tensors = ("qscale",)
+    contract = 1
+
+    def layout(self, k: int, n: int, bits: int, group_size: int):
+        if k <= 0 or n <= 0 or bits != 4 or group_size != 64 or k % 64 != 0:
+            return None
+        return {
+            "qcodes": ((n, k // 8), mx.uint32),
+            "qscale": ((n, k // 64), None),
+        }
+
+    def tile(self, layer, k: int, n: int) -> Tile | None:
+        if k % 64 != 0 or layer.bits != 4 or layer.group_size != 64:
+            return None
+        s_dt = layer["qscale"].dtype
+        if s_dt not in (mx.bfloat16, mx.float16):
+            return None
+        mtype = "bfloat16_t" if s_dt == mx.bfloat16 else "float16_t"
+        suffix = "bf16" if s_dt == mx.bfloat16 else "fp16"
+        tbl = Table("lut16", mx.float32, tuple(float(i) * 0.125 for i in range(16)))
+        src = f"""
+namespace omlx_fmtdebug_staged_{suffix} {{
+struct Tile {{
+  static constant constexpr int CONTRACT = 1;
+  const device uint8_t* codes;
+  const device {mtype}* scales;
+  omlx_table<float, 16> lut16;
+  template <int K>
+  struct Runs {{
+    static constant constexpr int RUN = 8;
+    static constant constexpr int GROUP = 64;
+    struct P {{
+      float s;
+      omlx_table<float, 16> tbl;
+    }};
+    using Codes = uint32_t;
+    const device uint32_t* c;
+    const device {mtype}* sc;
+    omlx_table<float, 16> tbl;
+    Runs(Tile m, size_t row)
+        : c((const device uint32_t*)(m.codes + row * (K / 2))),
+          sc(m.scales + row * (K / 64)),
+          tbl(m.lut16) {{}}
+    P params(int g) const {{ return {{float(sc[g]), tbl}}; }}
+    Codes fetch(int run) const {{ return c[run]; }}
+    __OMLX_READ_WEIGHT__ {{
+      return p.s * p.tbl[(q >> (4 * i)) & 15u];
+    }}
+  }};
+}};
+}}
+"""
+        return Tile(
+            key=f"fmtdebug_staged_{suffix}",
+            source=src,
+            type=f"omlx_fmtdebug_staged_{suffix}::Tile",
+            tensors=("qscale",),
+            dtypes=(s_dt,),
+            tables=(tbl,),
+            reads=TileReads(),
+        )
+
+    def decode(self, tensors, bits: int, group_size: int) -> mx.array:
+        q = tensors["qcodes"]
+        return mx.zeros((*q.shape[:-2], q.shape[-2], q.shape[-1] * 8), dtype=mx.float32)
+
+
+_STAGED_TOY_FMT = _StagedTabledToyFormat()
+
+
+def test_dump_metal_byte_identical_to_live_emitters(monkeypatch):
+    captured: list[dict] = []
+    real_mk = mx.fast.metal_kernel
+
+    def spy_mk(**kwargs):
+        captured.append(dict(kwargs))
+        return real_mk(**kwargs)
+
+    dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    switch = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256, experts=4)
+    staged_dense = debug.make_layer(
+        _STAGED_TOY_FMT, bits=4, group_size=64, k=256, n=256
+    )
+    staged_switch = debug.make_layer(
+        _STAGED_TOY_FMT, bits=4, group_size=64, k=256, n=256, experts=4
+    )
+
+    dot_face = formats._checked_face(dense.fmt, dense, 256, 256, Dot, "dot")
+    tile_face = formats._checked_face(dense.fmt, dense, 256, 256, Tile, "tile")
+    sw_dot = formats._checked_face(switch.fmt, switch, 256, 256, Dot, "dot")
+    sw_tile = formats._checked_face(switch.fmt, switch, 256, 256, Tile, "tile")
+    st_tile = formats._checked_face(
+        staged_dense.fmt, staged_dense, 256, 256, Tile, "tile"
+    )
+    st_sw_tile = formats._checked_face(
+        staged_switch.fmt, staged_switch, 256, 256, Tile, "tile"
+    )
+    assert all(
+        f is not None
+        for f in (dot_face, tile_face, sw_dot, sw_tile, st_tile, st_sw_tile)
+    )
+
+    # Clear live caches inside monkeypatch scope so spy_mk captures every route.
+    monkeypatch.setattr(mx.fast, "metal_kernel", spy_mk)
+    monkeypatch.setattr(kernels, "_FACE_KERNELS", {})
+    monkeypatch.setattr(nax, "_kernels", {})
+
+    def _capture(fn):
+        captured.clear()
+        fn()
+        assert len(captured) == 1, f"expected 1 metal_kernel call, got {len(captured)}"
+        return captured[0]
+
+    # 1. dot
+    linear._kernel.cache_clear()
+    cap_dot = _capture(lambda: linear._kernel(dot_face, False))
+    res_dot = debug.dump_metal(dense, rows=1, route="dot", chip="applegpu_g15d_c80")
+
+    # 2. dot_shared
+    linear._shared_kernel.cache_clear()
+    cap_sh = _capture(lambda: linear._shared_kernel(dot_face))
+    res_sh = debug.dump_metal(
+        dense, rows=2, route="dot_shared", chip="applegpu_g15d_c80"
+    )
+
+    # 3. steel
+    tile_dense._build.cache_clear()
+    cap_steel = _capture(lambda: tile_dense._build(tile_face, "steel"))
+    res_steel = debug.dump_metal(
+        dense, rows=32, route="steel", chip="applegpu_g15d_c80"
+    )
+
+    # 4. nax (affine)
+    tile_dense._build.cache_clear()
+    cap_nax = _capture(lambda: tile_dense._build(tile_face, "nax"))
+    res_nax = debug.dump_metal(dense, rows=32, route="nax", chip="applegpu_g17s_c40")
+
+    # 4b. nax with 16-entry staged Table (verifies PAD subtraction!)
+    tile_dense._build.cache_clear()
+    cap_nax_tbl = _capture(lambda: tile_dense._build(st_tile, "nax"))
+    res_nax_tbl = debug.dump_metal(
+        staged_dense, rows=32, route="nax", chip="applegpu_g17s_c40"
+    )
+    assert res_nax_tbl.launch.staged_table_bytes == 64
+    assert "(PAD > 64 ? PAD - 64 : 0) / sizeof(T)];" in res_nax_tbl.raw_source
+
+    # 5. wide
+    cap_wide = _capture(lambda: tile_wide.kernel(tile_face))
+    res_wide = debug.dump_metal(dense, rows=4, route="wide", chip="applegpu_g15d_c80")
+
+    # 6. mma
+    mma_pol = tuning.MmaTilePolicy()
+    cap_mma = _capture(
+        lambda: tile_dense._mma_msg_spec(tile_face, "mma", 256, 256, 8, mma_pol)
+    )
+    res_mma = debug.dump_metal(dense, rows=4, route="mma", chip="applegpu_g15d_c80")
+
+    # 7. msg
+    msg_pol = tuning.MsgTilePolicy()
+    cap_msg = _capture(
+        lambda: tile_dense._mma_msg_spec(tile_face, "msg", 256, 256, 4, msg_pol)
+    )
+    res_msg = debug.dump_metal(dense, rows=4, route="msg", chip="applegpu_g15d_c80")
+
+    # 8. switch_dot
+    linear._kernel.cache_clear()
+    cap_sw_dot = _capture(lambda: linear._kernel(sw_dot, True))
+    res_sw_dot = debug.dump_metal(
+        switch, rows=4, route="switch_dot", chip="applegpu_g15d_c80"
+    )
+
+    # 9. switch_tile_steel
+    tile_gather._build.cache_clear()
+    cap_sw_steel = _capture(lambda: tile_gather._build(sw_tile))
+    res_sw_steel = debug.dump_metal(
+        switch, rows=32, route="switch_tile_steel", chip="applegpu_g15d_c80"
+    )
+
+    # 10. switch_tile_nax (affine + staged Table PAD subtraction)
+    cap_sw_nax = _capture(lambda: nax._face_kernel(sw_tile, "plain"))
+    res_sw_nax = debug.dump_metal(
+        switch, rows=32, route="switch_tile_nax", chip="applegpu_g17s_c40"
+    )
+    cap_sw_nax_tbl = _capture(lambda: nax._face_kernel(st_sw_tile, "plain"))
+    res_sw_nax_tbl = debug.dump_metal(
+        staged_switch, rows=32, route="switch_tile_nax", chip="applegpu_g17s_c40"
+    )
+    assert "(PAD > 64 ? PAD - 64 : 0) / sizeof(T)];" in res_sw_nax_tbl.raw_source
+
+    pairs = [
+        ("dot", res_dot, cap_dot),
+        ("dot_shared", res_sh, cap_sh),
+        ("steel", res_steel, cap_steel),
+        ("nax", res_nax, cap_nax),
+        ("nax_tabled", res_nax_tbl, cap_nax_tbl),
+        ("wide", res_wide, cap_wide),
+        ("mma", res_mma, cap_mma),
+        ("msg", res_msg, cap_msg),
+        ("switch_dot", res_sw_dot, cap_sw_dot),
+        ("switch_tile_steel", res_sw_steel, cap_sw_steel),
+        ("switch_tile_nax", res_sw_nax, cap_sw_nax),
+        ("switch_tile_nax_tabled", res_sw_nax_tbl, cap_sw_nax_tbl),
+    ]
+    for label, res, cap in pairs:
+        assert res.kernel_name == cap["name"], label
+        assert res.raw_header == cap["header"], label
+        assert res.raw_source == cap["source"], label
+        assert res.launch.input_names == tuple(cap["input_names"]), label
+        assert res.launch.output_names == tuple(cap["output_names"]), label
+        expected_raw = hashlib.sha256(
+            f"{res.kernel_name}\0{res.raw_header}\0{res.raw_source}".encode()
+        ).hexdigest()
+        assert res.raw_digest == expected_raw, label
+
+    # Cross-chip small-table selects vs staged (without mutating globals).
+    small_layer = debug.make_layer(_TOY_FMT, bits=4, group_size=64, k=256, n=256)
+    res_m3_small = debug.dump_metal(
+        small_layer, rows=32, route="steel", chip="applegpu_g15d_c80"
+    )
+    res_m5_small = debug.dump_metal(
+        small_layer, rows=32, route="nax", chip="applegpu_g17s_c40"
+    )
+    assert res_m3_small.table_mode == "selects"
+    assert res_m3_small.launch.staged_table_bytes == 0
+    assert "SELECTS" not in res_m3_small.raw_header
+    assert "bool VALUES = (N <= 4 && true)" in res_m3_small.raw_header
+    assert res_m5_small.table_mode == "staged"
+    assert res_m5_small.launch.staged_table_bytes == 16
+    assert "bool VALUES = (N <= 4 && false)" in res_m5_small.raw_header
+
+
+def test_dump_metal_section_markers_and_deterministic_digests():
+    dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    d1 = debug.dump_metal(dense, rows=32, route="steel", chip="applegpu_g15d_c80")
+    d2 = debug.dump_metal(dense, rows=32, route="steel", chip="applegpu_g15d_c80")
+    assert d1.raw_digest == d2.raw_digest
+    assert d1.metal_digest == d2.metal_digest
+    assert len(d1.raw_digest) == 64
+    assert len(d1.metal_digest) == 64
+
+    lines = d1.metal.splitlines()
+    sec_names = [s.name for s in d1.sections]
+    for expected in (
+        "mlx_preamble",
+        "mlx_route_headers",
+        "face",
+        "skeleton_header",
+        "kernel_entry",
+        "matrix_declarations",
+        "skeleton_body",
+    ):
+        assert expected in sec_names, sec_names
+
+    for sec in d1.sections:
+        assert lines[sec.start_line - 1] == f"// >>> OMLX_SECTION: {sec.name} >>>"
+        assert lines[sec.end_line - 1] == f"// <<< OMLX_SECTION: {sec.name} <<<"
+        body = "\n".join(lines[sec.start_line : sec.end_line - 1])
+        assert sec.sha256 == hashlib.sha256(body.encode()).hexdigest()
+
+    # Check template formatting puts bool as true/false (not 1/0).
+    assert "true" in d1.metal or "false" in d1.metal
+    assert "w_weight_shape" in d1.metal
+    assert "const constant int* w_weight_shape" in d1.metal
+
+    # Summary formatting (text + JSON).
+    txt = debug.format_dump_metal_summary(d1, as_json=False)
+    assert d1.kernel_name in txt and d1.raw_digest in txt
+    parsed = json.loads(debug.format_dump_metal_summary(d1, as_json=True))
+    assert parsed["raw_digest"] == d1.raw_digest
+    assert parsed["metal_digest"] == d1.metal_digest
+
+    # Rule 20: tile_dense.source_digest() unchanged and tuning.stale_entries() empty.
+    from omlx.patches import qwen35_moe_routed_decode as routed
+
+    routed._ensure_tuning_registered()
+    assert (
+        tile_dense.source_digest()
+        == "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
+    )
+    assert tuning.stale_entries() == []
+
+
+def _has_xcrun_metal() -> bool:
+    if shutil.which("xcrun") is None:
+        return False
+    proc = subprocess.run(
+        ["xcrun", "-sdk", "macosx", "--find", "metal"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+@pytest.mark.skipif(
+    not _has_xcrun_metal(),
+    reason="requires xcrun -sdk macosx metal toolchain",
+)
+def test_dump_metal_standalone_compiles_with_xcrun_metal(tmp_path):
+    dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    switch = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256, experts=4)
+    cases = [
+        ("dot", dense, 1),
+        ("dot_shared", dense, 2),
+        ("steel", dense, 32),
+        ("wide", dense, 4),
+        ("mma", dense, 4),
+        ("msg", dense, 4),
+        ("switch_dot", switch, 4),
+        ("switch_tile_steel", switch, 32),
+    ]
+    for route, layer, rows in cases:
+        dumped = debug.dump_metal(
+            layer, rows=rows, route=route, chip="applegpu_g15d_c80"
+        )
+        src_file = tmp_path / f"{route}.metal"
+        src_file.write_text(dumped.metal, encoding="utf-8")
+        proc = subprocess.run(
+            [
+                "xcrun",
+                "-sdk",
+                "macosx",
+                "metal",
+                "-x",
+                "metal",
+                "-std=metal4.0",
+                "-c",
+                str(src_file),
+                "-o",
+                "/dev/null",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert (
+            proc.returncode == 0
+        ), f"xcrun metal failed for route={route}:\n{proc.stderr}"
+
+
+def test_dump_metal_fail_closed_and_pure():
+    dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    switch = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256, experts=4)
+
+    # Purity check: dump_metal must not touch layer.__dict__, _FACE_KERNELS, _PROOFS.
+    dict_before = dict(dense.__dict__)
+    fk_before = dict(kernels._FACE_KERNELS)
+    proofs_before = dict(kernels._PROOFS)
+    _ = debug.dump_metal(dense, rows=32, route="steel", chip="applegpu_g15d_c80")
+    assert dict(dense.__dict__) == dict_before
+    assert dict(kernels._FACE_KERNELS) == fk_before
+    assert dict(kernels._PROOFS) == proofs_before
+
+    # Auto-selected mlx route (M3 C7 row 1 3-D) refuses without --route override.
+    c7_layer = debug.make_layer("affine", bits=4, group_size=64, k=2560, n=2560)
+    with pytest.raises(ValueError, match="mlx"):
+        debug.dump_metal(c7_layer, rows=1, chip="applegpu_g15d_c80", input_ndim=3)
+
+    # Auto-selected decode route (fp32 rows=32) refuses without --route override.
+    with pytest.raises(ValueError, match="decode"):
+        debug.dump_metal(dense, rows=32, dtype="fp32", chip="applegpu_g15d_c80")
+
+    # Unknown route refuses.
+    with pytest.raises(ValueError, match="unknown"):
+        debug.dump_metal(dense, rows=1, route="not_a_route", chip="applegpu_g15d_c80")
+
+    # Illegal forced routes refuse.
+    ragged = debug.make_layer("affine", bits=4, group_size=64, k=256, n=260)
+    with pytest.raises(ValueError):
+        debug.dump_metal(ragged, rows=1, route="dot", chip="applegpu_g15d_c80")
+    with pytest.raises(ValueError):
+        debug.dump_metal(dense, rows=32, route="nax", chip="applegpu_g15d_c80")
+    with pytest.raises(ValueError):
+        debug.dump_metal(dense, rows=1, route="switch_dot", chip="applegpu_g15d_c80")
+    with pytest.raises(ValueError):
+        debug.dump_metal(switch, rows=32, route="steel", chip="applegpu_g15d_c80")
+    with pytest.raises(ValueError):
+        debug.dump_metal(dense, rows=0, route="dot", chip="applegpu_g15d_c80")
+    with pytest.raises(ValueError):
+        debug.dump_metal(switch, rows=1, per_row=0, route="switch_dot")
+
+    # Placeholder layer refuses.
+    with testing.verified("qwen4_exp"):
+        ph = FormatLinear(
+            "affine",
+            4,
+            64,
+            256,
+            {
+                "weight": mx.zeros((64, 32), dtype=mx.uint32),
+                "scales": mx.zeros((64, 4), dtype=mx.bfloat16),
+                "biases": mx.zeros((64, 4), dtype=mx.bfloat16),
+            },
+            placeholders=True,
+        )
+    with pytest.raises(ValueError, match="placeholder"):
+        debug.dump_metal(ph, rows=1, route="dot", chip="applegpu_g15d_c80")
