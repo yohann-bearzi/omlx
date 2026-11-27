@@ -1199,6 +1199,13 @@ def test_flash_next_all_affine_prefill_shapes_route_at_construction_without_deco
     p_o = tile_dense.build_plan(o_proj, tensor_units=False, chip="applegpu_g15d_c80")
     for r in (17, 24):
         assert tile_dense.policy_for(p_o, r, mx.bfloat16).backend == "mlx"
+    _, o_proj_fp16 = _layer(2560, 6144, 8, 64, mx.float16)
+    p_o16 = tile_dense.build_plan(
+        o_proj_fp16, tensor_units=False, chip="applegpu_g15d_c80"
+    )
+    for r in (17, 24):
+        assert tile_dense.policy_for(p_o16, r, mx.float16).backend == "steel"
+        assert tile_dense.policy_for(p_o16, r, mx.float16).split_k == 12
     p48_m5 = tile_dense.build_plan(in_proj, tensor_units=True, chip="applegpu_g17s_c40")
     assert tile_dense.policy_for(p48_m5, 32, mx.bfloat16).backend == "wide"
     assert tile_dense.policy_for(p48_m5, 128, mx.bfloat16).split_k == 40
