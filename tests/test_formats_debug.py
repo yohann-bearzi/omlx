@@ -251,6 +251,7 @@ def test_explain_decline_reasons_and_stale_tuning_entry(tmp_path, monkeypatch):
     res_fp32 = debug.explain(
         layer, rows=(1, 32), dtype="fp32", chip="applegpu_g15d_c80"
     )
+    assert res_fp32.schedule_summary == ()
     assert res_fp32.row_traces[0].selected_route == "mlx"
     assert res_fp32.row_traces[1].selected_route == "decode"
     assert any(
@@ -1518,6 +1519,7 @@ def test_cli_bench_gpu_json(capsys):
     assert rc == 0
     result = json.loads(capsys.readouterr().out)
     assert result["c2_pass"] is True
+    assert result["layer_rel_l2_fp32"] > 0.0
     assert result["layer_median_us"] > 0
 
 
@@ -1665,3 +1667,283 @@ def test_cli_subprocess_smoke_and_final_invariants():
         == "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
     )
     assert tuning.stale_entries() == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-land review fixes (pre-fmtdebug-ef1e42377)
+# ---------------------------------------------------------------------------
+
+
+def test_dump_metal_buffer_indices_match_mlx():
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    dumped = debug.dump_metal(layer, rows=32, route="steel", chip="applegpu_g15d_c80")
+    expected_bindings = [
+        "const device bfloat16_t* x [[buffer(0)]]",
+        "const constant int* x_shape [[buffer(1)]]",
+        "const constant int& x_ndim [[buffer(2)]]",
+        "const device uint32_t* w_weight [[buffer(3)]]",
+        "const constant int* w_weight_shape [[buffer(4)]]",
+        "const device bfloat16_t* w_scales [[buffer(5)]]",
+        "const device bfloat16_t* w_biases [[buffer(6)]]",
+        "device bfloat16_t* y [[buffer(7)]]",
+    ]
+    positions = []
+    for binding in expected_bindings:
+        pos = dumped.metal.find(binding)
+        assert pos != -1, f"missing binding {binding!r} in:\n{dumped.metal[-1500:]}"
+        positions.append(pos)
+    assert positions == sorted(positions), "buffer bindings out of MLX order"
+
+    # 0-d scalar input (N_size on mma) must never emit _shape/_strides/_ndim.
+    mma_dump = debug.dump_metal(layer, rows=4, route="mma", chip="applegpu_g15d_c80")
+    assert "N_size_shape" not in mma_dump.metal
+    assert "N_size_ndim" not in mma_dump.metal
+    assert "const constant uint32_t& N_size [[buffer(" in mma_dump.metal
+
+
+def test_dump_metal_forced_route_matches_auto_tuned_policy():
+    layer_2560 = debug.make_layer("affine", bits=4, group_size=64, k=2560, n=2560)
+    auto = debug.dump_metal(layer_2560, rows=48, chip="applegpu_g15d_c80")
+    forced = debug.dump_metal(
+        layer_2560, rows=48, chip="applegpu_g15d_c80", route="steel"
+    )
+    assert auto.route == "steel"
+    assert forced.policy_repr == auto.policy_repr
+    assert forced.launch.template == auto.launch.template
+    assert forced.launch.grid == auto.launch.grid
+    assert forced.launch.threadgroup == auto.launch.threadgroup
+    assert forced.raw_digest == auto.raw_digest
+
+
+def test_cli_bench_uses_realistic_weights(monkeypatch, capsys):
+    cli = _cli()
+    seen: list[tuple[int | None, bool | None]] = []
+    real_make_layer = debug.make_layer
+
+    def spy_make_layer(*args, **kwargs):
+        seen.append((kwargs.get("seed"), kwargs.get("realistic_weights")))
+        return real_make_layer(*args, **kwargs)
+
+    monkeypatch.setattr(debug, "make_layer", spy_make_layer)
+    monkeypatch.setattr(debug, "bench", lambda *a, **kw: object())
+    monkeypatch.setattr(debug, "format_bench", lambda res, as_json=False: "{}")
+
+    rc = cli.main(
+        [
+            "bench",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--units",
+            "2",
+            "--seed",
+            "7",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "{}"
+    assert seen == [(7, True), (8, True)]
+
+
+class _SignFlipNoInverseFormat(QuantFormat):
+    """Toy format with sign-flip InputTransform and inverse_weight=None."""
+
+    mode = "fmtdebug_signflip_no_inv"
+    codes_name = "qcodes"
+    tensors = ("qscale",)
+    shared_tensors = ("qsigns",)
+    contract = 1
+
+    def layout(self, k: int, n: int, bits: int, group_size: int):
+        if k <= 0 or n <= 0 or bits != 4 or group_size != 64 or k % 64 != 0:
+            return None
+        return {
+            "qcodes": ((n, k // 8), mx.uint32),
+            "qscale": ((n, k // 64), None),
+            "qsigns": ((k,), None),
+        }
+
+    def input_transform(self, layer):
+        return transforms.InputTransform(
+            version=transforms.TRANSFORM_VERSION,
+            kind="sign_flip",
+            tensors=("qsigns",),
+            block=64,
+            apply=lambda x, s: x * s.astype(x.dtype),
+            inverse_weight=None,
+        )
+
+    def decode(self, tensors, bits: int, group_size: int) -> mx.array:
+        q = tensors["qcodes"]
+        s = tensors["qscale"].astype(mx.float32)
+        n = q.shape[-2]
+        k = q.shape[-1] * 8
+        shifts = mx.arange(0, 32, 4, dtype=mx.uint32)
+        mask = mx.array(0xF, dtype=mx.uint32)
+        nibbles = ((q[..., None] >> shifts) & mask).astype(mx.float32)
+        vals = (nibbles.reshape(*q.shape[:-2], n, k) - 7.5) / 7.5
+        scales_exp = mx.repeat(s, 64, axis=-1)
+        return vals * scales_exp
+
+
+def test_bench_transform_without_inverse_weight_skips_baseline():
+    layer = debug.make_layer(
+        _SignFlipNoInverseFormat(),
+        bits=4,
+        group_size=64,
+        k=128,
+        n=128,
+        seed=3,
+        realistic_weights=True,
+    )
+    layer["qsigns"] = mx.full((128,), -1.0, dtype=mx.bfloat16)
+
+    bases, base_bits, base_gs, note = debug._resolve_baselines(
+        (layer,), None, mx.bfloat16
+    )
+    assert (bases, base_bits, base_gs) == (None, None, None)
+    assert note is not None and "inverse_weight" in note
+
+    with pytest.raises(ValueError, match="inverse_weight"):
+        debug._make_mlx_baseline(
+            layer, dtype=mx.bfloat16, baseline_gs=64, exact_affine=False
+        )
+
+    if mx.metal.is_available():
+        res = debug.bench(
+            layer, rows=2, dtype=mx.bfloat16, chain_len=2, rounds=2, warmup=0
+        )
+        assert res.baseline_available is False
+        assert res.baseline_rel_l2_fp32 is None
+        assert res.c2_threshold is None
+        assert res.layer_finite is True
+        assert res.c2_pass is True
+        assert res.baseline_note is not None and "inverse_weight" in res.baseline_note
+
+
+def test_warm_report_dispatch_runs_for_single_layer_and_sequence(monkeypatch):
+    dispatched: list[nn.Module] = []
+
+    def fake_warm_dispatch(model, **kwargs):
+        dispatched.append(model)
+
+    monkeypatch.setattr(mx.metal, "is_available", lambda: True)
+    monkeypatch.setattr(kernels, "warm", lambda instances: ())
+    monkeypatch.setattr(kernels, "warm_proofs", lambda tasks: ())
+    monkeypatch.setattr(linear, "warm_model_dispatch", fake_warm_dispatch)
+
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=True, warm_dispatch=True)
+    debug.warm_report([layer], dtypes=(mx.bfloat16,), compile=True, warm_dispatch=True)
+
+    assert len(dispatched) == 2
+    assert dispatched[0] is layer
+    assert isinstance(dispatched[1], nn.Module)
+    assert any(mod is layer for _, mod in dispatched[1].named_modules())
+
+
+class _AllDtypesTileToyFormat(_TabledToyFormat):
+    """Toy format whose Tile face sets dtypes=() so tile_exact is True for fp32."""
+
+    mode = "fmtdebug_all_dtypes_tile_toy"
+
+    def tile(self, layer, k: int, n: int) -> Tile | None:
+        base = super().tile(layer, k, n)
+        if base is None:
+            return None
+        return Tile(
+            key=f"{base.key}_alldt",
+            source=base.source,
+            type=base.type,
+            tensors=base.tensors,
+            dtypes=(),
+            tables=base.tables,
+            reads=base.reads,
+        )
+
+
+def test_explain_inexact_dtype_has_empty_schedule():
+    bf16_layer = debug.make_layer(
+        "affine", bits=4, group_size=64, k=256, n=256, dtype=mx.bfloat16
+    )
+    res_fp16 = debug.explain(
+        bf16_layer, rows=(32,), dtype="fp16", chip="applegpu_g15d_c80"
+    )
+    assert res_fp16.schedule_summary == ()
+    assert res_fp16.row_traces[0].selected_route == "decode"
+
+    # When Tile.dtypes == (), tile_exact is True for fp32, yet tile_dense still
+    # requires float16/bfloat16 so schedule_summary must remain empty.
+    all_dt_layer = debug.make_layer(
+        _AllDtypesTileToyFormat(),
+        bits=4,
+        group_size=64,
+        k=256,
+        n=256,
+        dtype=mx.bfloat16,
+    )
+    res_fp32 = debug.explain(
+        all_dt_layer, rows=(32,), dtype="fp32", chip="applegpu_g15d_c80"
+    )
+    tile_trace = next(f for f in res_fp32.faces if f.kind == "tile")
+    assert tile_trace.available is True
+    assert tile_trace.exact_for_dtype is True
+    assert res_fp32.schedule_summary == ()
+
+
+def test_warm_report_attributes_steel_on_nax_host(tmp_path, monkeypatch):
+    chip = tuning.current_chip()
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-2048",
+            },
+            "face_sha256": tuning.face_digest(face),
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-26T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 32,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 8,
+            },
+            "exactness": "bitwise",
+        }
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    monkeypatch.setattr(linear, "_nax_host", lambda: True)
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        rep = debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
+        names = [p.kernel_name for p in rep.pipelines]
+        assert any(name.startswith("omlx_steel_dense_") for name in names), names
+        assert all(name != "omlx_unknown_kernel" for name in names), names
+    finally:
+        tuning.reset_cache()

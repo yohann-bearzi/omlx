@@ -18,8 +18,6 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-import mlx.nn as nn
-
 from omlx.formats import debug
 
 _ROWS_DEFAULT = ",".join(str(rows) for rows in debug.DEFAULT_EXPLAIN_ROWS)
@@ -256,6 +254,7 @@ def _run(args: argparse.Namespace) -> int:
                 dtype=args.dtype,
                 bias=args.bias,
                 seed=args.seed + unit,
+                realistic_weights=True,
                 plugin=args.plugin,
             )
             for unit in range(args.units)
@@ -298,14 +297,8 @@ def _run(args: argparse.Namespace) -> int:
             )
             for index, (n, k) in enumerate(shapes)
         ]
-        target: Sequence | nn.Module = layers
-        if args.warm_dispatch:
-            bag = nn.Module()
-            for index, layer in enumerate(layers):
-                setattr(bag, f"layer_{index}", layer)
-            target = bag
         report = debug.warm_report(
-            target,
+            layers,
             dtypes=(
                 _parse_str_list(args.dtypes, "--dtypes")
                 if args.dtypes is not None

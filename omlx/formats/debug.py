@@ -1890,7 +1890,7 @@ def explain(
             )
     else:
         cells = None
-        if tile_face is not None and dt in (mx.float16, mx.bfloat16):
+        if tile_face is not None and tile_exact and dt in (mx.float16, mx.bfloat16):
             cells, schedule_summary = _build_traced_schedule(
                 layer,
                 tile_face,
@@ -2293,7 +2293,7 @@ def _assemble_standalone_metal(
     # Build templated [[kernel]] entry point matching MLX buffer binding rules.
     params: list[str] = []
     buf_idx = 0
-    for in_name, mtype, _shape, space in launch.input_specs:
+    for in_name, mtype, shape, space in launch.input_specs:
         if space == "scalar":
             params.append(
                 f"    const constant {mtype}& {in_name} [[buffer({buf_idx})]]"
@@ -2305,27 +2305,26 @@ def _assemble_standalone_metal(
         else:
             params.append(f"    const device {mtype}* {in_name} [[buffer({buf_idx})]]")
         buf_idx += 1
+        if shape:
+            if re.search(rf"\b{re.escape(in_name)}_shape\b", raw_source):
+                params.append(
+                    f"    const constant int* {in_name}_shape [[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
+            if re.search(rf"\b{re.escape(in_name)}_strides\b", raw_source):
+                params.append(
+                    f"    const constant int64_t* {in_name}_strides "
+                    f"[[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
+            if re.search(rf"\b{re.escape(in_name)}_ndim\b", raw_source):
+                params.append(
+                    f"    const constant int& {in_name}_ndim [[buffer({buf_idx})]]"
+                )
+                buf_idx += 1
     for out_name, mtype, _shape in launch.output_specs:
         params.append(f"    device {mtype}* {out_name} [[buffer({buf_idx})]]")
         buf_idx += 1
-
-    # Conditional shape / strides / ndim bindings scanned from raw_source.
-    for in_name in launch.input_names:
-        if re.search(rf"\b{re.escape(in_name)}_shape\b", raw_source):
-            params.append(
-                f"    const constant int* {in_name}_shape [[buffer({buf_idx})]]"
-            )
-            buf_idx += 1
-        if re.search(rf"\b{re.escape(in_name)}_strides\b", raw_source):
-            params.append(
-                f"    const constant int64_t* {in_name}_strides [[buffer({buf_idx})]]"
-            )
-            buf_idx += 1
-        if re.search(rf"\b{re.escape(in_name)}_ndim\b", raw_source):
-            params.append(
-                f"    const constant int& {in_name}_ndim [[buffer({buf_idx})]]"
-            )
-            buf_idx += 1
 
     for attr_name, attr_type in _THREAD_ATTR_SPECS:
         if re.search(rf"\b{attr_name}\b", raw_source):
@@ -2481,17 +2480,8 @@ def dump_metal(
     dot_face: Dot | None = face_objs["dot"]
     tile_face: Tile | None = face_objs["tile"]
 
-    # If auto-selected on dense layer, recover the exact scheduled policy.
-    if (
-        not is_switch
-        and route is None
-        and tile_face is not None
-        and dt
-        in (
-            mx.float16,
-            mx.bfloat16,
-        )
-    ):
+    # Recover the exact scheduled policy on dense layers (auto or forced route).
+    if not is_switch and tile_face is not None and dt in (mx.float16, mx.bfloat16):
         dot_ok = (
             dot_face is not None
             and k >= 8
@@ -3264,10 +3254,14 @@ def _make_mlx_baseline(
         ql["scales"] = layer["scales"]
         ql["biases"] = layer["biases"]
     else:
-        w_plain, fallback = _plain_weight_fp32(layer)
-        w_src = w_plain if w_plain is not None else fallback[0]
+        w_plain, _ = _plain_weight_fp32(layer)
+        if w_plain is None:
+            raise ValueError(
+                "input transform has no inverse_weight; plain-basis MLX "
+                "baseline unavailable"
+            )
         q, scales, biases = mx.quantize(
-            w_src.astype(dtype),
+            w_plain.astype(dtype),
             group_size=baseline_gs,
             bits=layer.bits,
             mode="affine",
@@ -3343,6 +3337,15 @@ def _resolve_baselines(
             None,
             None,
             f"no legal MLX affine group_size in (64, 32, 128) divides k={k}",
+        )
+
+    if _plain_weight_fp32(first)[0] is None:
+        return (
+            None,
+            None,
+            None,
+            "input transform has no inverse_weight; plain-basis MLX baseline "
+            "unavailable",
         )
 
     bases = tuple(
@@ -3745,10 +3748,10 @@ def _register_raw_names_for_layer(
     if not is_switch:
         tile_face = formats.tile(layer, k, n)
         if tile_face is not None:
-            backend = "nax" if tensor_units else "steel"
-            mm = tile_dense._build(tile_face, backend)
-            if mm is not None:
-                raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
+            for backend in ("nax", "steel") if tensor_units else ("steel",):
+                mm = tile_dense._build(tile_face, backend)
+                if mm is not None:
+                    raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
 
 
 def _format_proof_task_template(metal: Any) -> tuple[tuple[str, str | int | bool], ...]:
@@ -3819,6 +3822,7 @@ def warm_report(
     layers: list[FormatLinear | FormatSwitchLinear] = []
     seen_ids: set[int] = set()
     if isinstance(target, (FormatLinear, FormatSwitchLinear)):
+        model = target
         layers.append(target)
     elif isinstance(target, nn.Module):
         model = target
@@ -3971,10 +3975,15 @@ def warm_report(
                 raise first_err
             compile_ms = (time.perf_counter() - t_comp0) * 1000.0
 
-            if warm_dispatch and model is not None:
+            if warm_dispatch:
+                dispatch_model = model
+                if dispatch_model is None:
+                    dispatch_model = nn.Module()
+                    for idx, lyr in enumerate(layers):
+                        setattr(dispatch_model, f"layer_{idx}", lyr)
                 t_disp0 = time.perf_counter()
                 linear.warm_model_dispatch(
-                    model,
+                    dispatch_model,
                     dtypes=explicit_dtypes,
                     prefill_lengths=tuple(prefill_lengths),
                     decode_batch_sizes=tuple(decode_batch_sizes),
