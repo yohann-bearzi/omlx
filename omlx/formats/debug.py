@@ -2732,15 +2732,8 @@ def dump_metal(
         skeleton_header = tile_wide._HEADER
         skeleton_body = tile_wide._SOURCE
         tiles = (rows + 4) // 5
-        vectors = (rows + tiles - 1) // tiles
-        partial_m = rows % vectors != 0
-        template = [
-            ("T", dt),
-            ("K", k),
-            ("N", n),
-            ("V", vectors),
-            ("PARTIAL_M", partial_m),
-        ]
+        # Mirror the live builder's template (single source of truth).
+        template = tile_wide.template(dt, k, n, *tile_wide.layout(rows))
         grid = (32 * tiles, 2 * ((n + 7) // 8), 1)
         threadgroup = (32, 2, 1)
         input_specs = [

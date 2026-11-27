@@ -791,6 +791,7 @@ def test_dump_metal_byte_identical_to_live_emitters(monkeypatch):
 
 def test_dump_metal_section_markers_and_deterministic_digests():
     dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    digest_before = tile_dense.source_digest()
     d1 = debug.dump_metal(dense, rows=32, route="steel", chip="applegpu_g15d_c80")
     d2 = debug.dump_metal(dense, rows=32, route="steel", chip="applegpu_g15d_c80")
     assert d1.raw_digest == d2.raw_digest
@@ -829,14 +830,12 @@ def test_dump_metal_section_markers_and_deterministic_digests():
     assert parsed["raw_digest"] == d1.raw_digest
     assert parsed["metal_digest"] == d1.metal_digest
 
-    # Rule 20: tile_dense.source_digest() unchanged and tuning.stale_entries() empty.
+    # Rule 20: dump_metal leaves the pinned dense skeleton source unchanged.
     from omlx.patches import qwen35_moe_routed_decode as routed
+    from tests.test_formats_tile_dense_parity import _DENSE_DIGEST
 
     routed._ensure_tuning_registered()
-    assert (
-        tile_dense.source_digest()
-        == "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
-    )
+    assert tile_dense.source_digest() == digest_before == _DENSE_DIGEST
     assert tuning.stale_entries() == []
 
 
@@ -1660,12 +1659,10 @@ def test_cli_subprocess_smoke_and_final_invariants():
 
     # Rule 20: Metal emission sources and tuning tables are unchanged.
     from omlx.patches import qwen35_moe_routed_decode as routed
+    from tests.test_formats_tile_dense_parity import _DENSE_DIGEST
 
     routed._ensure_tuning_registered()
-    assert (
-        tile_dense.source_digest()
-        == "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
-    )
+    assert tile_dense.source_digest() == _DENSE_DIGEST
     assert tuning.stale_entries() == []
 
 
