@@ -2708,8 +2708,8 @@ def dump_metal(
         out_specs = [("y", _metal_type(out_dtype), out_shape)]
 
         if chosen_route == "nax":
-            kernel_name = f"omlx_nax_dense_{face.key}"
-            skeleton_header = tile_dense._NAX_HEADER
+            prefix, skeleton_header = tile_dense._nax_body(eff.interleaved_weights)
+            kernel_name = f"{prefix}_{face.key}"
             skeleton_body = tile_dense._NAX_SOURCE
             staged = matrices.staged_bytes
             if staged:

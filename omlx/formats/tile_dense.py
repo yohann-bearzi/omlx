@@ -337,6 +337,14 @@ using namespace metal;
 namespace omlx_nax_dense {
 using namespace mlx::steel;
 
+#ifdef OMLX_INTERLEAVED_WEIGHTS
+// Group the eight-code runs of 16 output channels contiguously for NAX B reads.
+template <int BK>
+METAL_FUNC int interleaved_offset(int row, int k) {
+  return (row / 16) * (16 * BK) + (k / 8) * (16 * 8) + (row % 16) * 8 + k % 8;
+}
+#endif
+
 template <
     typename T,
     typename F,
@@ -403,7 +411,11 @@ struct NaxWeightLoader {
   METAL_FUNC void store_run_(threadgroup T* dst, omlx_ints<I...>) const thread {
     vec<T, R::RUN> v;
     ((v[I] = static_cast<T>(R::weight(p[r / kRPG], codes[r], int(I)))), ...);
+#ifdef OMLX_INTERLEAVED_WEIGHTS
+    *(threadgroup vec<T, R::RUN>*)(dst + interleaved_offset<BK>(row, col + r * R::RUN)) = v;
+#else
     *(threadgroup vec<T, R::RUN>*)(dst + r * R::RUN) = v;
+#endif
   }
 
   template <int... Rn>
@@ -424,7 +436,11 @@ struct NaxWeightLoader {
   }
 
   METAL_FUNC void store_words(threadgroup T* Ws, const int k_valid) const thread {
+#ifdef OMLX_INTERLEAVED_WEIGHTS
+    store_(omlx_iota<kRuns>(), Ws, k_valid);
+#else
     store_(omlx_iota<kRuns>(), Ws + row * kBKP + col, k_valid);
+#endif
   }
 
   METAL_FUNC void store(threadgroup T* Ws) const thread {
@@ -968,7 +984,11 @@ METAL_FUNC void prefetch_tile(
         for (short h = 0; h < 2; ++h)
           next[f][h] = load_activation<T, 4>(xp[h] + next_k + 16 * f);
       }
+#ifdef OMLX_INTERLEAVED_WEIGHTS
+      const threadgroup T* weights = ws + (step & 1) * tile_size;
+#else
       const threadgroup T* weights = ws + (step & 1) * tile_size + sc.y * STRIDE + sc.x;
+#endif
       STEEL_PRAGMA_UNROLL
       for (short f = 0; f < fragments; ++f) {
         BaseNAXFrag::dtype_frag_t<T> a;
@@ -984,8 +1004,13 @@ METAL_FUNC void prefetch_tile(
           for (short col = 0; col < 2; ++col) {
             STEEL_PRAGMA_UNROLL
             for (short h = 0; h < 2; ++h) {
+#ifdef OMLX_INTERLEAVED_WEIGHTS
+              const vec<T, 4> v = *(const threadgroup vec<T, 4>*)(
+                  weights + interleaved_offset<BK>(sc.y + (j + col) * 16 + h * 8, sc.x + 16 * f));
+#else
               const vec<T, 4> v = *(const threadgroup vec<T, 4>*)(
                   weights + ((j + col) * 16 + h * 8) * STRIDE + 16 * f);
+#endif
               STEEL_PRAGMA_UNROLL
               for (short c = 0; c < 4; ++c) b[col][h * 4 + c] = v[c];
             }
@@ -1121,11 +1146,21 @@ class DensePlan(NamedTuple):
     binding: kernels.ProofBinding
 
 
+def _nax_body(interleaved_weights: bool):
+    if interleaved_weights:
+        return (
+            "omlx_nax_interleaved_dense",
+            "#define OMLX_INTERLEAVED_WEIGHTS 1\n" + _NAX_HEADER,
+        )
+    return "omlx_nax_dense", _NAX_HEADER
+
+
 @cache
-def _build(face: Tile, backend: str):
+def _build(face: Tile, backend: str, interleaved_weights: bool = False):
     if backend == "nax":
         header = _nax_headers()
-        body_hdr, body_src, prefix = _NAX_HEADER, _NAX_SOURCE, "omlx_nax_dense"
+        prefix, body_hdr = _nax_body(interleaved_weights)
+        body_src = _NAX_SOURCE
     elif backend == "steel":
         header = _steel_headers()
         body_hdr, body_src, prefix = _STEEL_HEADER, _STEEL_SOURCE, "omlx_steel_dense"
@@ -1156,7 +1191,7 @@ def _build(face: Tile, backend: str):
 def _kernel(face: Tile, policy: DenseTilePolicy):
     """Build (once) the unified steel or NAX dense kernel for ``face``."""
     with _lock:
-        return _build(face, policy.backend)
+        return _build(face, policy.backend, policy.interleaved_weights)
 
 
 @cache
@@ -1201,9 +1236,10 @@ def source_digest() -> str:
     (owner rule 20)."""
     digest = hashlib.sha256()
     count = 0
-    for backend, body_hdr, body_src in (
-        ("steel", _STEEL_HEADER, _STEEL_SOURCE),
-        ("nax", _NAX_HEADER, _NAX_SOURCE),
+    for prefix, body_hdr, body_src in (
+        ("omlx_steel_dense", _STEEL_HEADER, _STEEL_SOURCE),
+        (*_nax_body(False), _NAX_SOURCE),
+        (*_nax_body(True), _NAX_SOURCE),
     ):
         for bits in (2, 3, 4, 8):
             for gs in (32, 64, 128):
@@ -1212,7 +1248,7 @@ def source_digest() -> str:
                     matrices = kernels.Matrices()
                     matrices.add("w", face)
                     for part in (
-                        f"omlx_{backend}_dense_{face.key}",
+                        f"{prefix}_{face.key}",
                         matrices.header + body_hdr,
                         matrices.declarations + body_src,
                     ):
@@ -1330,21 +1366,37 @@ def _default_nax_policy(bits: int, rows: int, n: int, k: int) -> DenseTilePolicy
                 "nax", 64, 32, 64, 4, 1, split_k=split, sched="prefetch"
             )
         if n == 2048:
+            if rows <= 224:
+                return DenseTilePolicy(
+                    "nax",
+                    32,
+                    32,
+                    64,
+                    2,
+                    1,
+                    gx=32,
+                    sched="prefetch",
+                    row_pad=0,
+                    interleaved_weights=True,
+                )
             bm, bn = (128, 64) if rows <= 256 else (64, 32)
             return DenseTilePolicy(
                 "nax", bm, bn, 64, bm // 16, 1, gx=32, sched="prefetch"
             )
+        if rows <= 320:
+            return DenseTilePolicy(
+                "nax",
+                64,
+                64,
+                64,
+                4,
+                1,
+                sched="prefetch",
+                row_pad=0,
+                interleaved_weights=True,
+            )
         return DenseTilePolicy(
-            "nax",
-            64,
-            64,
-            64,
-            4,
-            1,
-            sched="prefetch",
-            row_pad=8 if rows <= 256 else 16,
-            gx=2 if rows <= 256 else 32,
-            pad_bytes=3072 if rows <= 256 else 4096,
+            "nax", 64, 64, 64, 4, 1, sched="prefetch", row_pad=16, gx=32, pad_bytes=4096
         )
     align_n = n % 64 == 0
     align_k64 = k % 64 == 0

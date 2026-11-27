@@ -8,6 +8,7 @@ import json
 import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from threading import Barrier
 
@@ -79,7 +80,7 @@ def _dot(array: mx.array) -> str:
     return buf.getvalue()
 
 
-_DENSE_DIGEST = "49 ca2bba46333e5a1689ec7640a9936d2f4a9b9610c753f5f124b204a5c7d9a16d"
+_DENSE_DIGEST = "73 c6661bdc1737938cd0aae10ef194a34bc8d37db090cd526f265ee6bbf5c98e84"
 
 
 def test_dense_skeleton_source_digest_is_pinned():
@@ -1958,3 +1959,41 @@ def test_m5_register_tile_accepts_unaligned_float16_activations():
             )
             out = tile_dense._launch(kernel, policy, x, plan.operands)
             _assert_c2(out, stock(x), x, stock)
+
+
+@needs_nax
+def test_flash_q4_prefill_interleaves_weight_runs():
+    width = 2560
+    stock, layer = _layer(width, width, 4, 64)
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    for rows in (224, 256, 320):
+        policy = tile_dense.policy_for(plan, rows, mx.bfloat16)
+        assert policy.sched == "prefetch" and policy.interleaved_weights
+        row_major = replace(policy, row_pad=8, interleaved_weights=False)
+        kernel = tile_dense._kernel(plan.face, policy)
+        x = _x((rows, width), seed=rows + 51)
+        result = tile_dense._launch(kernel, policy, x, plan.operands)
+        assert _same_bits(
+            result,
+            tile_dense._launch(
+                tile_dense._kernel(plan.face, row_major), row_major, x, plan.operands
+            ),
+        )
+        _assert_c2(result, stock(x), x, stock)
+
+
+@needs_nax
+def test_35b_q4_intermediate_prefill_uses_two_simdgroups():
+    width = 2048
+    stock, layer = _layer(width, width, 4, 64)
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    for rows in (129, 160, 192, 224):
+        policy = tile_dense.policy_for(plan, rows, mx.bfloat16)
+        assert (policy.bm, policy.bn, policy.wm) == (32, 32, 2)
+        assert policy.interleaved_weights
+        assert policy.is_legal(plan.face, width, width, rows, "applegpu_g17s_c40")
+        x = _x((rows, width), seed=rows + 61)
+        kernel = tile_dense._kernel(plan.face, policy)
+        _assert_c2(
+            tile_dense._launch(kernel, policy, x, plan.operands), stock(x), x, stock
+        )

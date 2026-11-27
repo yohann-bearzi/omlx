@@ -14,7 +14,7 @@
         "k": 2048
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -40,7 +40,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -65,7 +65,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -90,7 +90,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -115,7 +115,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -140,7 +140,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -159,7 +159,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -178,7 +178,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -197,7 +197,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -216,7 +216,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -235,7 +235,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -254,7 +254,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -273,7 +273,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -292,7 +292,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -311,7 +311,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -330,7 +330,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -349,7 +349,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -368,7 +368,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -387,7 +387,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -406,7 +406,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -432,7 +432,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -458,7 +458,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -483,7 +483,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -508,7 +508,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -527,7 +527,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -546,7 +546,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -565,7 +565,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -584,7 +584,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -603,7 +603,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -622,7 +622,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -641,7 +641,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -660,7 +660,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -679,7 +679,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -698,7 +698,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -724,7 +724,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -750,7 +750,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -776,7 +776,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -802,7 +802,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -828,7 +828,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -854,7 +854,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -873,7 +873,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -892,7 +892,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -919,7 +919,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -946,7 +946,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -965,7 +965,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -984,7 +984,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1003,7 +1003,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1022,7 +1022,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1048,7 +1048,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1074,7 +1074,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1099,7 +1099,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1124,7 +1124,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1150,7 +1150,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1176,7 +1176,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1195,7 +1195,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1214,7 +1214,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1233,7 +1233,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1252,7 +1252,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1271,7 +1271,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1290,7 +1290,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1309,7 +1309,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1328,7 +1328,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1354,7 +1354,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1380,7 +1380,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1399,7 +1399,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1418,7 +1418,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1444,7 +1444,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1470,7 +1470,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1496,7 +1496,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1522,7 +1522,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1541,7 +1541,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1560,7 +1560,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1579,7 +1579,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1598,7 +1598,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1617,7 +1617,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1636,7 +1636,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1655,7 +1655,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1674,7 +1674,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1693,7 +1693,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1712,7 +1712,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1731,7 +1731,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1750,7 +1750,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1769,7 +1769,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1788,7 +1788,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1807,7 +1807,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1826,7 +1826,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T21:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1852,7 +1852,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T21:35:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -1878,7 +1878,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1904,7 +1904,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1930,7 +1930,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1949,7 +1949,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1968,7 +1968,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -1987,7 +1987,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-22T23:35:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2006,7 +2006,7 @@
         "k": 2048
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2028,7 +2028,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2050,7 +2050,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2072,7 +2072,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2094,7 +2094,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2116,7 +2116,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2138,7 +2138,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2160,7 +2160,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2182,7 +2182,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T09:45:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2204,7 +2204,7 @@
         "k": 2048
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-23T10:48:00Z",
       "exactness": "bitwise",
       "params": {
@@ -2226,7 +2226,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2264,7 +2264,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2283,7 +2283,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2302,7 +2302,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2321,7 +2321,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2340,7 +2340,7 @@
         "k": 10240
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -2364,7 +2364,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2402,7 +2402,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2421,7 +2421,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2459,7 +2459,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2478,7 +2478,7 @@
         "k": 640
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2517,7 +2517,7 @@
         "k": 640
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2556,7 +2556,7 @@
         "k": 640
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2575,7 +2575,7 @@
         "k": 6144
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2613,7 +2613,7 @@
         "k": 6144
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2670,7 +2670,7 @@
         "k": 6144
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2727,7 +2727,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2765,7 +2765,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2821,7 +2821,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2840,7 +2840,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -2863,7 +2863,7 @@
         "k": 320
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2882,7 +2882,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2918,7 +2918,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2971,7 +2971,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -2990,7 +2990,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3013,7 +3013,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3051,7 +3051,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3104,7 +3104,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3123,7 +3123,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3146,7 +3146,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3184,7 +3184,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3241,7 +3241,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3260,7 +3260,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3283,7 +3283,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3302,7 +3302,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3325,7 +3325,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3399,7 +3399,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3418,7 +3418,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3441,7 +3441,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3479,7 +3479,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3498,7 +3498,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3517,7 +3517,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3536,7 +3536,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3555,7 +3555,7 @@
         "k": 10240
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -3579,7 +3579,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3617,7 +3617,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3636,7 +3636,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3674,7 +3674,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3693,7 +3693,7 @@
         "k": 640
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3732,7 +3732,7 @@
         "k": 640
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3771,7 +3771,7 @@
         "k": 640
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3790,7 +3790,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3809,7 +3809,7 @@
         "k": 6144
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3847,7 +3847,7 @@
         "k": 6144
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3904,7 +3904,7 @@
         "k": 6144
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3961,7 +3961,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -3999,7 +3999,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4055,7 +4055,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4074,7 +4074,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4097,7 +4097,7 @@
         "k": 320
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4116,7 +4116,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4152,7 +4152,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4205,7 +4205,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4224,7 +4224,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4247,7 +4247,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4285,7 +4285,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4338,7 +4338,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4357,7 +4357,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4380,7 +4380,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4418,7 +4418,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4475,7 +4475,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4494,7 +4494,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4517,7 +4517,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4536,7 +4536,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4559,7 +4559,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4633,7 +4633,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4652,7 +4652,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-24T09:46:29Z",
       "exactness": "bitwise",
       "params": {
@@ -4675,7 +4675,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4694,7 +4694,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4713,7 +4713,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4732,7 +4732,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4751,7 +4751,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4770,7 +4770,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4789,7 +4789,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4808,7 +4808,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4827,7 +4827,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4846,7 +4846,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4865,7 +4865,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4884,7 +4884,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4903,7 +4903,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4922,7 +4922,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4941,7 +4941,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4960,7 +4960,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -4979,7 +4979,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -4998,7 +4998,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5017,7 +5017,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5036,7 +5036,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5055,7 +5055,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5074,7 +5074,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5093,7 +5093,7 @@
         "k": 2048
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5112,7 +5112,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5131,7 +5131,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5150,7 +5150,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5169,7 +5169,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5188,7 +5188,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5207,7 +5207,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5226,7 +5226,7 @@
         "k": 640
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5245,7 +5245,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5264,7 +5264,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5303,7 +5303,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5341,7 +5341,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5360,7 +5360,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5379,7 +5379,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5398,7 +5398,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5417,7 +5417,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5436,7 +5436,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5455,7 +5455,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5513,7 +5513,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5532,7 +5532,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5551,7 +5551,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5589,7 +5589,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5608,7 +5608,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5627,7 +5627,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5646,7 +5646,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5682,7 +5682,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5701,7 +5701,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5720,7 +5720,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5739,7 +5739,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5762,7 +5762,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5781,7 +5781,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5800,7 +5800,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -5855,7 +5855,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5874,7 +5874,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5893,7 +5893,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5912,7 +5912,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5935,7 +5935,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -5954,7 +5954,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -5973,7 +5973,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T04:13:33Z",
       "exactness": "bitwise",
       "params": {
@@ -6031,7 +6031,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6050,7 +6050,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6069,7 +6069,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6088,7 +6088,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6111,7 +6111,7 @@
         "k": 2048
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6130,7 +6130,7 @@
         "k": 2048
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6149,7 +6149,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6187,7 +6187,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6226,7 +6226,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6264,7 +6264,7 @@
         "k": 2560
       },
       "face_sha256": "4a0c3435cd16",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6283,7 +6283,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6302,7 +6302,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6321,7 +6321,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6340,7 +6340,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6359,7 +6359,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6378,7 +6378,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6397,7 +6397,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6416,7 +6416,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6435,7 +6435,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6454,7 +6454,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6473,7 +6473,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6492,7 +6492,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6511,7 +6511,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6530,7 +6530,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6549,7 +6549,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6568,7 +6568,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6587,7 +6587,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6606,7 +6606,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6625,7 +6625,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6644,7 +6644,7 @@
         "k": 2048
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6663,7 +6663,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6682,7 +6682,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6701,7 +6701,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6720,7 +6720,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6739,7 +6739,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6758,7 +6758,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6777,7 +6777,7 @@
         "k": 640
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6796,7 +6796,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6815,7 +6815,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6854,7 +6854,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6892,7 +6892,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6911,7 +6911,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6930,7 +6930,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6949,7 +6949,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -6968,7 +6968,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -6987,7 +6987,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7006,7 +7006,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7064,7 +7064,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7083,7 +7083,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7102,7 +7102,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7140,7 +7140,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7159,7 +7159,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7178,7 +7178,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7197,7 +7197,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7233,7 +7233,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7252,7 +7252,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7271,7 +7271,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7290,7 +7290,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7313,7 +7313,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7332,7 +7332,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7351,7 +7351,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7406,7 +7406,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7425,7 +7425,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7444,7 +7444,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7463,7 +7463,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7486,7 +7486,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7505,7 +7505,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7524,7 +7524,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7582,7 +7582,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7601,7 +7601,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7620,7 +7620,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7639,7 +7639,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:53:36Z",
       "exactness": "bitwise",
       "params": {
@@ -7662,7 +7662,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7688,7 +7688,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7714,7 +7714,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7740,7 +7740,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7766,7 +7766,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7792,7 +7792,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7818,7 +7818,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7844,7 +7844,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7870,7 +7870,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7896,7 +7896,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7922,7 +7922,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7948,7 +7948,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -7974,7 +7974,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8000,7 +8000,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8026,7 +8026,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8052,7 +8052,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8078,7 +8078,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8104,7 +8104,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8130,7 +8130,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8156,7 +8156,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8182,7 +8182,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -8201,7 +8201,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -8220,7 +8220,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8246,7 +8246,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8272,7 +8272,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8298,7 +8298,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8324,7 +8324,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8350,7 +8350,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8376,7 +8376,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8402,7 +8402,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8428,7 +8428,7 @@
         "k": 10240
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8454,7 +8454,7 @@
         "k": 10240
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8480,7 +8480,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -8499,7 +8499,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -8518,7 +8518,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8544,7 +8544,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8570,7 +8570,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8596,7 +8596,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8622,7 +8622,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8647,7 +8647,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8672,7 +8672,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8699,7 +8699,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8726,7 +8726,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8745,7 +8745,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8764,7 +8764,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8790,7 +8790,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8816,7 +8816,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8842,7 +8842,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8868,7 +8868,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8894,7 +8894,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8920,7 +8920,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8946,7 +8946,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8972,7 +8972,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -8999,7 +8999,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9026,7 +9026,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9053,7 +9053,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9080,7 +9080,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9106,7 +9106,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9132,7 +9132,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9158,7 +9158,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9184,7 +9184,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9209,7 +9209,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9234,7 +9234,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9260,7 +9260,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9286,7 +9286,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9312,7 +9312,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9338,7 +9338,7 @@
         "k": 2560
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9365,7 +9365,7 @@
         "k": 2560
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9392,7 +9392,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9418,7 +9418,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9444,7 +9444,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9470,7 +9470,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9496,7 +9496,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9522,7 +9522,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9548,7 +9548,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9574,7 +9574,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9600,7 +9600,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9627,7 +9627,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9654,7 +9654,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9681,7 +9681,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9708,7 +9708,7 @@
         "k": 640
       },
       "face_sha256": "48aecdb4a3ee",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9735,7 +9735,7 @@
         "k": 640
       },
       "face_sha256": "8d6a646e003a",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9762,7 +9762,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9788,7 +9788,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9814,7 +9814,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9840,7 +9840,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9866,7 +9866,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9892,7 +9892,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9918,7 +9918,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9944,7 +9944,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9970,7 +9970,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -9997,7 +9997,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10024,7 +10024,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10051,7 +10051,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10078,7 +10078,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10105,7 +10105,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10132,7 +10132,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10158,7 +10158,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10184,7 +10184,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10210,7 +10210,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10236,7 +10236,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10262,7 +10262,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10288,7 +10288,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10314,7 +10314,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10340,7 +10340,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10366,7 +10366,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10392,7 +10392,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10419,7 +10419,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10446,7 +10446,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10473,7 +10473,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10500,7 +10500,7 @@
         "k": 6144
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10527,7 +10527,7 @@
         "k": 6144
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10554,7 +10554,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10580,7 +10580,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10606,7 +10606,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10632,7 +10632,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10658,7 +10658,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10684,7 +10684,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10710,7 +10710,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10736,7 +10736,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10762,7 +10762,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10788,7 +10788,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10814,7 +10814,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10840,7 +10840,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10866,7 +10866,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10893,7 +10893,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10920,7 +10920,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10947,7 +10947,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -10974,7 +10974,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11001,7 +11001,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11028,7 +11028,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11055,7 +11055,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11082,7 +11082,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11108,7 +11108,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11134,7 +11134,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11153,7 +11153,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11172,7 +11172,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11191,7 +11191,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11210,7 +11210,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11229,7 +11229,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11248,7 +11248,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11267,7 +11267,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11286,7 +11286,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11305,7 +11305,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "bitwise",
       "params": {
@@ -11324,7 +11324,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11349,7 +11349,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11374,7 +11374,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11399,7 +11399,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11424,7 +11424,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11449,7 +11449,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11474,7 +11474,7 @@
         "k": 320
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11499,7 +11499,7 @@
         "k": 320
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11524,7 +11524,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11550,7 +11550,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11576,7 +11576,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11602,7 +11602,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11628,7 +11628,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11654,7 +11654,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11680,7 +11680,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11705,7 +11705,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11730,7 +11730,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11756,7 +11756,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11782,7 +11782,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11809,7 +11809,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11836,7 +11836,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11863,7 +11863,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11890,7 +11890,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11917,7 +11917,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11944,7 +11944,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11971,7 +11971,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -11998,7 +11998,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12025,7 +12025,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12052,7 +12052,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12078,7 +12078,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12104,7 +12104,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12130,7 +12130,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12156,7 +12156,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12182,7 +12182,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12208,7 +12208,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12235,7 +12235,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12262,7 +12262,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12289,7 +12289,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12316,7 +12316,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12343,7 +12343,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12370,7 +12370,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12397,7 +12397,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12424,7 +12424,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12451,7 +12451,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12478,7 +12478,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12504,7 +12504,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12530,7 +12530,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12556,7 +12556,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12582,7 +12582,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12607,7 +12607,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12632,7 +12632,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12658,7 +12658,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12684,7 +12684,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12709,7 +12709,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12734,7 +12734,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12761,7 +12761,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12788,7 +12788,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12814,7 +12814,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12840,7 +12840,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12867,7 +12867,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12894,7 +12894,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12921,7 +12921,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12948,7 +12948,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12975,7 +12975,7 @@
         "k": 2560
       },
       "face_sha256": "5ff31f90a32e",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-26T21:33:11Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -12994,7 +12994,7 @@
         "k": 2560
       },
       "face_sha256": "2c7c53f3b7ff",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-25T06:33:53Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13345,7 +13345,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13370,7 +13370,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13395,7 +13395,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13421,7 +13421,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13447,7 +13447,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13473,7 +13473,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13499,7 +13499,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13519,12 +13519,40 @@
         "dtype": "bf16",
         "bits": 4,
         "group": 64,
-        "rows_bucket": "129-256",
+        "rows_bucket": "129-224",
         "n": 2048,
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
+      "measured_at": "2026-11-27T19:40:00Z",
+      "exactness": "rule17_fp32",
+      "params": {
+        "backend": "nax",
+        "bm": 32,
+        "bn": 32,
+        "bk": 64,
+        "wm": 2,
+        "wn": 1,
+        "sched": "prefetch",
+        "gx": 32,
+        "row_pad": 0,
+        "interleaved_weights": true
+      }
+    },
+    {
+      "key": {
+        "route": "dense_tile",
+        "face_id": "affine_tile_b4g64_bf16",
+        "dtype": "bf16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "225-256",
+        "n": 2048,
+        "k": 2048
+      },
+      "face_sha256": "cfee226ee192",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13550,7 +13578,7 @@
         "k": 2048
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13576,7 +13604,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13601,7 +13629,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13626,7 +13654,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13652,7 +13680,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13678,7 +13706,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13704,7 +13732,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13730,7 +13758,7 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {
@@ -13755,8 +13783,8 @@
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
-      "measured_at": "2026-11-27T17:55:00Z",
+      "skeleton_sha256": "002b9a5d7231",
+      "measured_at": "2026-11-27T19:22:00Z",
       "exactness": "rule17_fp32",
       "params": {
         "backend": "nax",
@@ -13766,8 +13794,8 @@
         "wm": 4,
         "wn": 1,
         "sched": "prefetch",
-        "gx": 2,
-        "pad_bytes": 3072
+        "interleaved_weights": true,
+        "row_pad": 0
       }
     },
     {
@@ -13777,12 +13805,39 @@
         "dtype": "bf16",
         "bits": 4,
         "group": 64,
-        "rows_bucket": "257-512",
+        "rows_bucket": "257-320",
         "n": 2560,
         "k": 2560
       },
       "face_sha256": "cfee226ee192",
-      "skeleton_sha256": "57b7477ba18f",
+      "skeleton_sha256": "002b9a5d7231",
+      "measured_at": "2026-11-27T19:22:00Z",
+      "exactness": "rule17_fp32",
+      "params": {
+        "backend": "nax",
+        "bm": 64,
+        "bn": 64,
+        "bk": 64,
+        "wm": 4,
+        "wn": 1,
+        "sched": "prefetch",
+        "row_pad": 0,
+        "interleaved_weights": true
+      }
+    },
+    {
+      "key": {
+        "route": "dense_tile",
+        "face_id": "affine_tile_b4g64_bf16",
+        "dtype": "bf16",
+        "bits": 4,
+        "group": 64,
+        "rows_bucket": "321-512",
+        "n": 2560,
+        "k": 2560
+      },
+      "face_sha256": "cfee226ee192",
+      "skeleton_sha256": "002b9a5d7231",
       "measured_at": "2026-11-27T17:55:00Z",
       "exactness": "rule17_fp32",
       "params": {

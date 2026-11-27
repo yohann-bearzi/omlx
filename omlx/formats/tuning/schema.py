@@ -98,6 +98,7 @@ class DenseTilePolicy:
     gx: int = 0
     sched: Literal["seg", "db", "register", "prefetch"] = "seg"
     row_pad: int = 8
+    interleaved_weights: bool = False
 
     def is_legal(
         self,
@@ -139,7 +140,7 @@ class DenseTilePolicy:
                 return False
         if min(self.bm, self.bn, self.bk, self.wm, self.wn) < 1:
             return False
-        if self.sched != "prefetch" and self.row_pad != 8:
+        if self.sched != "prefetch" and (self.row_pad != 8 or self.interleaved_weights):
             return False
         if self.sched in ("register", "prefetch"):
             if (
@@ -170,10 +171,14 @@ class DenseTilePolicy:
             if not (
                 self.bm == 16 * self.wm
                 and self.wn == 1
-                and self.wm in (4, 8)
+                and self.wm in (2, 4, 8)
                 and self.bn in (32, 64)
                 and self.bk == 64
-                and self.row_pad in (8, 16)
+                and (
+                    self.row_pad == 0
+                    if self.interleaved_weights
+                    else self.row_pad in (8, 16)
+                )
             ):
                 return False
             return (
