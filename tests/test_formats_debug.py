@@ -789,6 +789,21 @@ def test_dump_metal_byte_identical_to_live_emitters(monkeypatch):
     assert "bool VALUES = (N <= 4 && false)" in res_m5_small.raw_header
 
 
+def test_dump_metal_wide_template_matches_live_layout():
+    dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    for rows in (4, 5, 7, 9):
+        dumped = debug.dump_metal(
+            dense, rows=rows, route="wide", chip="applegpu_g15d_c80"
+        )
+        expected = tuple(
+            (tn, debug._template_record_value(tv))
+            for tn, tv in tile_wide.template(
+                mx.bfloat16, 256, 256, *tile_wide.layout(rows)
+            )
+        )
+        assert dumped.launch.template == expected, f"rows={rows}"
+
+
 def test_dump_metal_section_markers_and_deterministic_digests():
     dense = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
     digest_before = tile_dense.source_digest()
@@ -863,6 +878,8 @@ def test_dump_metal_standalone_compiles_with_xcrun_metal(tmp_path):
         ("dot_shared", dense, 2),
         ("steel", dense, 32),
         ("wide", dense, 4),
+        ("wide", dense, 5),
+        ("wide", dense, 7),
         ("mma", dense, 4),
         ("msg", dense, 4),
         ("switch_dot", switch, 4),
@@ -872,7 +889,7 @@ def test_dump_metal_standalone_compiles_with_xcrun_metal(tmp_path):
         dumped = debug.dump_metal(
             layer, rows=rows, route=route, chip="applegpu_g15d_c80"
         )
-        src_file = tmp_path / f"{route}.metal"
+        src_file = tmp_path / f"{route}_{rows}.metal"
         src_file.write_text(dumped.metal, encoding="utf-8")
         proc = subprocess.run(
             [
@@ -894,7 +911,7 @@ def test_dump_metal_standalone_compiles_with_xcrun_metal(tmp_path):
         )
         assert (
             proc.returncode == 0
-        ), f"xcrun metal failed for route={route}:\n{proc.stderr}"
+        ), f"xcrun metal failed for route={route} rows={rows}:\n{proc.stderr}"
 
 
 def test_dump_metal_fail_closed_and_pure():
@@ -2214,7 +2231,8 @@ def test_warm_report_registers_dense_names_under_tile_dense_lock(monkeypatch):
     debug._register_raw_names_for_layer(layer, tensor_units=True, raw_name_map=raw_map)
     assert [b for b, _ in build_calls] == ["nax", "steel"]
     assert all(held for _, held in build_calls), build_calls
-    assert tracker.enters == 2 and tracker.exits == 2 and tracker.depth == 0
+    # 2 tile_dense._build calls + 1 tile_dense._splitk_accum_kernel call.
+    assert tracker.enters == 3 and tracker.exits == 3 and tracker.depth == 0
 
     build_calls.clear()
     debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
@@ -2424,3 +2442,368 @@ def test_resolve_baselines_mixed_transform_sequence_and_no_redundant_decode(
     assert bases_ok is not None and len(bases_ok) == 1
     assert (bits_ok, gs_ok) == (4, 64)
     assert decode_calls == [id(layer_inv)]
+
+
+# ---------------------------------------------------------------------------
+# Pre-land review follow-ups (pre-fmtdebug-b6ef1b212)
+# ---------------------------------------------------------------------------
+
+
+def test_warm_report_names_splitk_accum_kernel(tmp_path, monkeypatch):
+    chip = tuning.current_chip()
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-2048",
+            },
+            "face_sha256": tuning.face_digest(face),
+            "skeleton_sha256": tuning.skeleton_digest("dense_tile"),
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 32,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 8,
+                "split_k": 2,
+            },
+            "exactness": "bitwise",
+        }
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        rep = debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
+        names = [p.kernel_name for p in rep.pipelines]
+        assert "omlx_dense_splitk_accum" in names, names
+        assert all(n != "omlx_unknown_kernel" for n in names), names
+    finally:
+        tuning.reset_cache()
+
+
+def test_dump_metal_forced_nax_finds_entry_behind_other_backend(tmp_path, monkeypatch):
+    chip = "applegpu_g17s_c40"
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    face_sha = tuning.face_digest(face)
+    skel_sha = tuning.skeleton_digest("dense_tile")
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 32,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 8,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "seg",
+                "gx": 32,
+            },
+            "exactness": "bitwise",
+        },
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        dumped = debug.dump_metal(layer, rows=20, route="nax", chip=chip)
+        assert dict(dumped.launch.template)["GX"] == 32
+    finally:
+        tuning.reset_cache()
+
+
+def test_dump_metal_forced_dense_skips_illegal_and_stale_entries(tmp_path, monkeypatch):
+    chip = "applegpu_g17s_c40"
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    face_sha = tuning.face_digest(face)
+    skel_sha = tuning.skeleton_digest("dense_tile")
+    # 1. Auto selects steel (20-20); higher-rank 20-20 nax entries have either
+    #    stale skeleton/face digests or illegal pad_bytes (weight_bytes=9216 +
+    #    pad_bytes=25000 > 32768). Forced nax must skip all three and select
+    #    the lower-rank legal 17-24 nax entry (gx=32).
+    entries = [
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "steel",
+                "bm": 32,
+                "bn": 32,
+                "bk": 32,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "x_nreads": 8,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": "0" * 64,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "seg",
+                "gx": 4,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": "f" * 64,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "seg",
+                "gx": 8,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "20-20",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "seg",
+                "gx": 16,
+                "pad_bytes": 25000,
+            },
+            "exactness": "bitwise",
+        },
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "17-24",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "seg",
+                "gx": 32,
+            },
+            "exactness": "bitwise",
+        },
+        # 2. Entry legal for table_face (0 table_bytes: 18432 + 14304 = 32736
+        #    <= 32768) but illegal for an actual_face carrying 64 table_bytes
+        #    (32800 > 32768).
+        {
+            "key": {
+                "route": "dense_tile",
+                "face_id": face.key,
+                "dtype": "bf16",
+                "bits": 4,
+                "group": 64,
+                "n": 256,
+                "k": 256,
+                "rows_bucket": "25-32",
+            },
+            "face_sha256": face_sha,
+            "skeleton_sha256": skel_sha,
+            "measured_at": "2026-11-27T00:00:00Z",
+            "params": {
+                "backend": "nax",
+                "bm": 32,
+                "bn": 64,
+                "bk": 64,
+                "wm": 2,
+                "wn": 2,
+                "align_n": True,
+                "sched": "db",
+                "gx": 24,
+                "pad_bytes": 14304,
+            },
+            "exactness": "bitwise",
+        },
+    ]
+    v1 = tmp_path / "v1"
+    v1.mkdir()
+    (v1 / f"{chip}.json").write_text(
+        json.dumps({"schema_version": 1, "chip": chip, "entries": entries})
+    )
+    monkeypatch.setattr(tuning, "_TABLE_DIRS", [v1])
+    monkeypatch.setattr(tuning, "_EXTRA_DIRS", [])
+    tuning.reset_cache()
+    try:
+        layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+        dumped = debug.dump_metal(layer, rows=20, route="nax", chip=chip)
+        assert dict(dumped.launch.template)["GX"] == 32
+
+        # Direct actual_face vs table_face check: 64-byte table pushes tg over 32 KiB.
+        big_face = Tile(
+            key="fmtdebug_big_table_bf16",
+            source=face.source,
+            type=face.type,
+            tensors=face.tensors,
+            dtypes=face.dtypes,
+            tables=(Table("lut", mx.float32, tuple(float(i) for i in range(16))),),
+            reads=face.reads,
+        )
+        assert (
+            debug._lookup_forced_dense_policy(
+                face,
+                face,
+                backend="nax",
+                dtype=mx.bfloat16,
+                bits=4,
+                group=64,
+                n=256,
+                k=256,
+                rows=32,
+                chip=chip,
+            )
+            is not None
+        )
+        assert (
+            debug._lookup_forced_dense_policy(
+                face,
+                big_face,
+                backend="nax",
+                dtype=mx.bfloat16,
+                bits=4,
+                group=64,
+                n=256,
+                k=256,
+                rows=32,
+                chip=chip,
+            )
+            is None
+        )
+    finally:
+        tuning.reset_cache()

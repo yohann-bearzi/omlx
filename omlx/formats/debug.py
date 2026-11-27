@@ -2384,6 +2384,72 @@ def _operand_specs(
     return specs
 
 
+def _lookup_forced_dense_policy(
+    table_face: Tile,
+    actual_face: Tile,
+    *,
+    backend: str,
+    dtype: mx.Dtype,
+    bits: int,
+    group: int,
+    n: int,
+    k: int,
+    rows: int,
+    chip: str,
+) -> DenseTilePolicy | None:
+    """Find the highest-rank legal ``DenseTilePolicy`` for a forced backend."""
+    table = tuning._index_for_chip(chip)
+    if not table.entries:
+        return None
+    skeleton = tuning.skeleton_digest("dense_tile")
+    if skeleton is None:
+        return None
+    dtype_name = tuning._dtype_name(dtype)
+    candidates = (
+        table.by_key.get(("dense_tile", dtype_name, bits, group), ())
+        if table.by_key
+        else table.entries
+    )
+    if not candidates:
+        return None
+    query = tuning._Query(
+        route="dense_tile",
+        face_key=table_face.key,
+        profile=tuning.table_profile(table_face),
+        dtype=dtype_name,
+        bits=bits,
+        group=group,
+        n=n,
+        k=k,
+        rows=rows,
+        rows_bucket=tuning.rows_bucket("dense_tile", rows),
+        n_bucket=tuning._n_bucket(n),
+        k_bucket=tuning._k_bucket(k),
+    )
+    digest: str | None = None
+    best_rank = (0, 0)
+    best_params: DenseTilePolicy | None = None
+    for entry in candidates:
+        params = entry.params
+        if not isinstance(params, DenseTilePolicy) or params.backend != backend:
+            continue
+        rank = tuning._matches(entry, query)
+        if rank[0] == 0 or rank <= best_rank:
+            continue
+        if entry.skeleton_sha256 != skeleton:
+            continue
+        if entry.key.get("face_id") == table_face.key:
+            if digest is None:
+                digest = tuning.face_digest(table_face)
+            if entry.face_sha256 != digest:
+                continue
+        if not params.is_legal(actual_face, k, n, rows, chip, dtype, tail=True):
+            continue
+        best_rank = rank
+        best_params = params
+    return best_params
+
+
 def dump_metal(
     layer: FormatLinear | FormatSwitchLinear,
     *,
@@ -2595,9 +2661,10 @@ def dump_metal(
             pol = scheduled_policy
         else:
             cand = (
-                tuning.lookup(
-                    "dense_tile",
+                _lookup_forced_dense_policy(
                     forced_table_face,
+                    face,
+                    backend=chosen_route,
                     dtype=dt,
                     bits=layer.bits,
                     group=layer.group_size,
@@ -2609,11 +2676,7 @@ def dump_metal(
                 if forced_table_face is not None
                 else None
             )
-            if (
-                isinstance(cand, DenseTilePolicy)
-                and cand.backend == chosen_route
-                and cand.is_legal(face, k, n, rows, chip_id, dt, tail=True)
-            ):
+            if cand is not None:
                 pol = cand
             elif chosen_route == "nax":
                 pol = tile_dense._default_nax_policy(layer.bits, rows, n, k)
@@ -3819,6 +3882,9 @@ def _register_raw_names_for_layer(
                     mm = tile_dense._build(tile_face, backend)
                 if mm is not None:
                     raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
+            raw_name_map[id(tile_dense._splitk_accum_kernel())] = (
+                "omlx_dense_splitk_accum"
+            )
 
 
 def _format_proof_task_template(metal: Any) -> tuple[tuple[str, str | int | bool], ...]:
