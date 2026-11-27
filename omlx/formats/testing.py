@@ -1190,6 +1190,8 @@ def _ctor_rows_args(face, operands, k, rows, dtype, codes_name="weight"):
         return _weight_rows_args(face, operands, k, rows, dtype, codes_name)
     if not (isinstance(k, int) and not isinstance(k, bool) and 0 < k < 1 << 31):
         raise ValueError(f"k={k} is not a positive int below 2^31")
+    if k % 8:
+        raise ValueError(f"k={k} is not one run or more of 8 inputs")
     # Reuse the shared operand/row/dtype validation with a valid multiple-of-8 k.
     rows, operands = _weight_rows_args(face, operands, 8, rows, dtype, codes_name)
     return rows, operands
@@ -1204,8 +1206,9 @@ def check_constructor_reads(
     *,
     codes_name: str = "weight",
 ) -> None:
-    """Check rule 4: ``face``'s cursor constructor (``Runs(m, row)`` or
-    ``Lanes(m, row, lane)``) computes pointers only and reads no operand data.
+    """Check the constructor part of rule 4: ``face``'s cursor constructor
+    (``Runs(m, row)`` or ``Lanes(m, row, lane)``) computes pointers only and
+    reads no operand data.
 
     For each operand in ``(codes_name, *face.tensors)``, the probe constructs a
     cursor while a writable copy of that operand holds alternate values, then
@@ -1213,9 +1216,12 @@ def check_constructor_reads(
     and compares the early cursor's outputs against a fresh cursor's. A
     constructor that read the operand captured the alternate values and fails
     with an ``AssertionError`` naming the face and every offending member.
-    Operands must be non-degenerate (each operand must affect at least one
-    output on the probed rows), or a ``ValueError`` is raised so the check
-    never fails open.
+    K is an int, one run or more of 8 inputs below 2^31: a Dot face's
+    ``Lanes<K>::VPT`` may exceed 8, and a format's ``dot()`` gives a K that is
+    a multiple of its group size, so the probe's Metal static assert is a
+    backstop for a directly built toy face. Operands must be non-degenerate
+    (each operand must affect at least one output on the probed rows), or a
+    ``ValueError`` is raised so the check never fails open.
     """
     if not isinstance(face, (Dot, Tile, Codes)):
         raise ValueError(f"{face!r} is not a Dot, Tile, or Codes face")

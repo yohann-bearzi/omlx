@@ -458,12 +458,47 @@ def test_check_constructor_reads_refuses_invalid_arguments():
         testing.check_constructor_reads(
             face, operands[:2], 64, [0], mx.float32, codes_name="packed_bytes"
         )
-    # Dot accepts non-multiple-of-8 positive ints but still refuses bool/<=0.
+    # Dot refuses bool/<=0/2^31 and k that is not one run or more of 8.
     dot = _dot_toy("ctor_dot_args")
     dot_ops, _, _ = _dot_matrix(8, 64)
     for bad_k in (0, -1, True, False, 1 << 31):
         with pytest.raises(ValueError, match="is not a positive int below 2\\^31"):
             testing.check_constructor_reads(dot, dot_ops, bad_k, [0], mx.float32)
+    for bad_k in (1, 4, 12):
+        with pytest.raises(ValueError, match="is not one run or more of 8 inputs"):
+            testing.check_constructor_reads(dot, dot_ops, bad_k, [0], mx.float32)
+
+
+def test_dot_rejects_non_multiple_of_8_k():
+    """A Dot k the Metal static assert would refuse (k % Lanes<K>::VPT) is a
+    ValueError before the probe compiles: k = 1 is not one run of 8."""
+    dot = _dot_toy("ctor_dot_k1")
+    dot_ops, _, _ = _dot_matrix(8, 64)
+    with pytest.raises(ValueError, match="k=1 is not one run or more of 8 inputs"):
+        testing.check_constructor_reads(dot, dot_ops, 1, [0], mx.float32)
+
+
+def test_docs_scope_rule4_to_constructor():
+    page = _PAGE
+    assert (
+        "The constructor part of rule 4 is what "
+        "`omlx.formats.testing.check_constructor_reads` checks"
+    ) in page
+    assert (
+        "Rule 4 is what `omlx.formats.testing.check_constructor_reads` checks"
+    ) not in page
+
+
+def test_metal_mark_on_thread_safe_not_dot_k_validation():
+    assert metal.mark in getattr(
+        test_check_constructor_reads_is_thread_safe, "pytestmark", []
+    )
+    assert metal.mark not in getattr(
+        test_dot_rejects_non_multiple_of_8_k, "pytestmark", []
+    )
+    assert metal.mark not in getattr(
+        test_docs_scope_rule4_to_constructor, "pytestmark", []
+    )
 
 
 @metal
