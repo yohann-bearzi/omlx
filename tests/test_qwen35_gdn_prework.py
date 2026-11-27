@@ -1719,8 +1719,17 @@ def test_qwen4_short_verify_commits_second_row_without_repeating_verify(
     expected_tx.commit([2])
 
     monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", True)
+    prefix_calls = []
+    real_prefix = prework_mod._qwen4_prefix_state
+
+    def spy_prefix(*args, **kwargs):
+        prefix_calls.append(args[7])
+        return real_prefix(*args, **kwargs)
+
+    monkeypatch.setattr(prework_mod, "_qwen4_prefix_state", spy_prefix)
     actual, cache, tx = _verify_block(module, *inputs, row_exact=False)
     tx.commit([2])
+    assert prefix_calls == [2]
     assert _same(expected, actual)
     assert _same(expected_cache[0], cache[0])
     assert _same(expected_cache[1], cache[1])

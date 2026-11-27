@@ -678,6 +678,11 @@ def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
     v = mx.random.normal((1, 2, 257, 256)).astype(mx.bfloat16)
     seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
     assert calls == []
+    # The 27B dense 24/4 layout (4 KV heads) is not this route.
+    k4 = mx.random.normal((1, 4, 256, 256)).astype(mx.bfloat16)
+    v4 = mx.random.normal((1, 4, 256, 256)).astype(mx.bfloat16)
+    seam(q, k4, v4, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []
 
     # Row-exact mode takes precedence over the short path.
     row_exact = []
@@ -701,7 +706,17 @@ def test_short_verify_route_restores_seam():
     """The seam test re-applies the split patch under a monkeypatch context;
     afterwards the seam must be the one installed before the test."""
     q35_lang = pytest.importorskip("mlx_vlm.models.qwen3_5.language")
-    before = q35_lang._qwen3_5_left_padded_attention
-    with pytest.MonkeyPatch.context() as mp:
-        test_short_verify_routes_three_rows_to_short_causal_kernel(mp)
-    assert q35_lang._qwen3_5_left_padded_attention is before
+    from omlx.patches import qwen35_verify_sdpa_split as vs
+
+    missing = object()
+    with pytest.MonkeyPatch.context() as outer:
+        # Force the state a fresh process has, so a leak is visible in any order.
+        outer.setattr(q35_lang, "_omlx_verify_attention", False, raising=False)
+        outer.setattr(vs, "_PATCHED", False)
+        before = q35_lang._qwen3_5_left_padded_attention
+        before_flag = q35_lang.__dict__.get("_omlx_verify_attention", missing)
+        with pytest.MonkeyPatch.context() as mp:
+            test_short_verify_routes_three_rows_to_short_causal_kernel(mp)
+        assert q35_lang._qwen3_5_left_padded_attention is before
+        assert q35_lang.__dict__.get("_omlx_verify_attention", missing) is before_flag
+        assert vs._PATCHED is False

@@ -740,7 +740,7 @@ def test_three_row_stacked_gdn_projection_selects_measured_m5_route():
     ]
 
 
-def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows(monkeypatch):
+def test_three_row_stacked_gdn_projection_three_rows_hold_c2(monkeypatch):
     """The measured 3-row Dot route holds C2 against nn.QuantizedLinear and its
     per-row calls (row-exact to rounding, not bitwise)."""
     if not mx.metal.is_available():
