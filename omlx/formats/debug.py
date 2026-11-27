@@ -13,12 +13,15 @@ import importlib
 import json
 import math
 import re
+import statistics
+import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from .. import formats
 from ..patches import m5_gather_qmm_nax as nax
@@ -224,22 +227,15 @@ def _make_synthetic_tensors(
                 "oqh_biases": biases,
                 "oqh_signs": signs,
             }
-        # Uniform row-scale quantization matching OqhFormat.decode.
-        max_level = (1 << bits) - 1
-        center = max_level / 2.0
-        w_f32 = w_rot.astype(mx.float32)
-        row_max = mx.maximum(mx.max(mx.abs(w_f32), axis=-1), 1e-6)
-        rscale = (row_max / center).astype(dtype)
-        levels = mx.clip(
-            mx.round(w_f32 / rscale[..., None].astype(mx.float32) + center),
-            0,
-            max_level,
-        ).astype(mx.uint32)
-        # Pack via mx.quantize on affine with scale=1, bias=0 -> exact packed codes.
-        # Use manual bit packing into uint32 words of k * bits // 32.
-        q_packed, _, _ = mx.quantize(
-            levels.astype(mx.float32), group_size=32, bits=bits, mode="affine"
-        )
+        # Random uint32 words hold uniform codes in [0, 2**bits - 1] with
+        # mean = center; scale each row by a small positive rscale.
+        q_shape = (*prefix, *layout["weight"][0])
+        r_shape = (*prefix, *layout["rscale"][0])
+        k_lo, k_hi, k_rs = mx.random.split(key_w, 3)
+        lo = mx.random.randint(0, 1 << 16, shape=q_shape, key=k_lo, dtype=mx.uint32)
+        hi = mx.random.randint(0, 1 << 16, shape=q_shape, key=k_hi, dtype=mx.uint32)
+        q_packed = lo | (hi << 16)
+        rscale = mx.random.uniform(0.02, 0.12, shape=r_shape, key=k_rs).astype(dtype)
         return {"weight": q_packed, "rscale": rscale, "oqh_signs": signs}
 
     tensors: dict[str, mx.array] = {}
@@ -3052,4 +3048,607 @@ def format_dump_metal_summary(result: DumpMetalResult, *, as_json: bool = False)
             f"  - {sec.name}: lines {sec.start_line}-{sec.end_line} "
             f"sha256={sec.sha256[:12]}"
         )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Commit 3 — bench (Rule-31 chained + C2 fp32_ref + memory delta)
+# ---------------------------------------------------------------------------
+
+_MLX_QUANT_BITS = (2, 3, 4, 5, 6, 8)
+_MLX_QUANT_GROUPS = (32, 64, 128)
+
+
+@dataclass(frozen=True)
+class BenchResult:
+    mode: str
+    bits: int
+    group_size: int
+    k: int
+    n: int
+    rows: int
+    dtype: str
+    chip: str
+    route: str
+    backend: str
+    chain_len: int
+    units: int
+    rounds: int
+    warmup: int
+    layer_median_us: float
+    layer_p25_us: float
+    layer_p75_us: float
+    baseline_available: bool
+    baseline_bits: int | None
+    baseline_group_size: int | None
+    baseline_note: str | None
+    baseline_median_us: float | None
+    baseline_p25_us: float | None
+    baseline_p75_us: float | None
+    ratio_of_medians: float | None
+    paired_balanced_ratio: float | None
+    position_factor: float | None
+    layer_finite: bool
+    layer_rel_l2_fp32: float
+    layer_max_abs_fp32: float
+    baseline_rel_l2_fp32: float | None
+    c2_threshold: float | None
+    c2_pass: bool
+    bitwise_equal_baseline: bool | None
+    weight_bytes_layer: int
+    weight_bytes_baseline: int | None
+    weight_bytes_delta: int | None
+    peak_memory_layer_bytes: int
+    peak_memory_baseline_bytes: int | None
+    peak_memory_delta_bytes: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return _json_safe(asdict(self))
+
+
+def _fit_chain(y: mx.array, k: int, norm_w: mx.array) -> mx.array:
+    """Project output width ``N`` back to input width ``K`` + RMS norm (Rule 31)."""
+    n = y.shape[-1]
+    if n >= k:
+        z = y[..., :k]
+    else:
+        reps = -(-k // n)
+        z = mx.concatenate([y] * reps, axis=-1)[..., :k]
+    return mx.fast.rms_norm(z.astype(norm_w.dtype), norm_w, 1e-6)
+
+
+def _both_orders(
+    base: Sequence[float],
+    new: Sequence[float],
+    new_first: Sequence[bool],
+    units: int,
+) -> tuple[list[float], list[float]]:
+    """Balanced paired geometric-mean ratios and position factors (ab_common)."""
+    ratios: list[float] = []
+    positions: list[float] = []
+    for start in range(0, len(base) - units + 1, 2 * units):
+        for u in range(units):
+            i, j = start + u, start + u + units
+            if j >= len(base):
+                break
+            if new_first[i] == new_first[j]:
+                raise ValueError(
+                    f"samples {i} and {j} ran the same order: "
+                    f"expected alternating orders across {units} units"
+                )
+            ratios.append(((new[i] / base[i]) * (new[j] / base[j])) ** 0.5)
+            k_idx, m_idx = (i, j) if new_first[i] else (j, i)
+            positions.append(
+                ((base[k_idx] / new[k_idx]) * (new[m_idx] / base[m_idx])) ** 0.5
+            )
+    return ratios, positions
+
+
+def _rel_l2(y: mx.array, ref: mx.array) -> float:
+    """``||y - ref||_2 / max(||ref||_2, 1e-30)`` in float32."""
+    y32 = y.astype(mx.float32).reshape(-1)
+    ref32 = ref.astype(mx.float32).reshape(-1)
+    num = mx.linalg.norm(y32 - ref32)
+    den = mx.maximum(mx.linalg.norm(ref32), 1e-30)
+    return float((num / den).item())
+
+
+def _finite(y: mx.array) -> bool:
+    return bool(mx.all(mx.isfinite(y.astype(mx.float32))).item())
+
+
+def _c2_check(
+    layer_out: mx.array, base_out: mx.array | None, ref: mx.array
+) -> tuple[bool, float, float, float | None, float | None, bool]:
+    """Contract C2 FP32 check: finite and ``rel_l2 <= 1.05 * base + 1e-6``."""
+    is_fin = _finite(layer_out)
+    rl = _rel_l2(layer_out, ref)
+    max_abs = float(
+        mx.max(mx.abs(layer_out.astype(mx.float32) - ref.astype(mx.float32))).item()
+    )
+    if base_out is None:
+        return is_fin, rl, max_abs, None, None, bool(is_fin and math.isfinite(rl))
+    rb = _rel_l2(base_out, ref)
+    threshold = 1.05 * rb + 1e-6
+    passed = bool(is_fin and math.isfinite(rl) and rl <= threshold)
+    return is_fin, rl, max_abs, rb, threshold, passed
+
+
+def _plain_weight_fp32(layer: FormatLinear) -> tuple[mx.array | None, Any]:
+    """Decode ``layer`` weights in float32 plain basis.
+
+    Returns ``(w_plain_fp32, fallback_tx_bound)`` where ``w_plain_fp32`` is
+    ``None`` only when an ``InputTransform`` has no ``inverse_weight`` callable.
+    """
+    if layer.mode == "affine":
+        w = mx.dequantize(
+            layer["weight"],
+            layer["scales"].astype(mx.float32),
+            layer["biases"].astype(mx.float32),
+            group_size=layer.group_size,
+            bits=layer.bits,
+            mode="affine",
+        ).astype(mx.float32)
+    else:
+        w = layer._decoded().astype(mx.float32)
+
+    if formats._declares_input_transform(layer.fmt):
+        bound = formats._bound_transform(layer.fmt, layer, transforms)
+        if bound is not None:
+            tx, tx_tensors = bound
+            if tx.inverse_weight is not None:
+                return tx.inverse_weight(w, *tx_tensors).astype(mx.float32), None
+            return None, (w, tx, tx_tensors)
+    return w, None
+
+
+def _fp32_reference(layer: FormatLinear, x: mx.array) -> mx.array:
+    w_plain, fallback = _plain_weight_fp32(layer)
+    x32 = x.astype(mx.float32)
+    if w_plain is not None:
+        ref = x32 @ w_plain.T
+    else:
+        w_rot, tx, tx_tensors = fallback
+        x_rot = tx.apply(x32, *tx_tensors).astype(mx.float32)
+        ref = x_rot @ w_rot.T
+    if "bias" in layer:
+        ref = ref + layer["bias"].astype(mx.float32)
+    return ref
+
+
+def _raw_bits_equal(a: mx.array, b: mx.array) -> bool:
+    if a.shape != b.shape or a.dtype != b.dtype:
+        return False
+    if a.dtype in (mx.bfloat16, mx.float16):
+        return bool(mx.array_equal(a.view(mx.uint16), b.view(mx.uint16)).item())
+    return bool(mx.array_equal(a, b).item())
+
+
+def _layer_weight_bytes(layer: FormatLinear) -> int:
+    total = 0
+    for val in dict.values(layer):
+        if isinstance(val, mx.array):
+            total += int(val.nbytes)
+    return total
+
+
+def _baseline_weight_bytes(base: nn.QuantizedLinear) -> int:
+    total = 0
+    for name in ("weight", "scales", "biases", "bias"):
+        arr = base.get(name)
+        if isinstance(arr, mx.array):
+            total += int(arr.nbytes)
+    return total
+
+
+def _make_mlx_baseline(
+    layer: FormatLinear,
+    *,
+    dtype: mx.Dtype,
+    baseline_gs: int,
+    exact_affine: bool,
+) -> nn.QuantizedLinear:
+    k, n = layer.input_dims, layer.output_dims
+    has_bias = "bias" in layer
+    ql = nn.QuantizedLinear(
+        k,
+        n,
+        bias=has_bias,
+        group_size=baseline_gs,
+        bits=layer.bits,
+        mode="affine",
+    )
+    if exact_affine:
+        ql["weight"] = layer["weight"]
+        ql["scales"] = layer["scales"]
+        ql["biases"] = layer["biases"]
+    else:
+        w_plain, fallback = _plain_weight_fp32(layer)
+        w_src = w_plain if w_plain is not None else fallback[0]
+        q, scales, biases = mx.quantize(
+            w_src.astype(dtype),
+            group_size=baseline_gs,
+            bits=layer.bits,
+            mode="affine",
+        )
+        ql["weight"] = q
+        ql["scales"] = scales
+        ql["biases"] = biases
+    if has_bias:
+        ql["bias"] = layer["bias"]
+    return ql
+
+
+def _resolve_baselines(
+    layers: tuple[FormatLinear, ...],
+    explicit: nn.QuantizedLinear | Sequence[nn.QuantizedLinear] | None,
+    dtype: mx.Dtype,
+) -> tuple[tuple[nn.QuantizedLinear, ...] | None, int | None, int | None, str | None]:
+    first = layers[0]
+    k = first.input_dims
+    if explicit is not None:
+        base_list = (
+            (explicit,) if isinstance(explicit, nn.QuantizedLinear) else tuple(explicit)
+        )
+        if len(base_list) != len(layers):
+            raise ValueError(
+                f"baselines length ({len(base_list)}) must match layers length "
+                f"({len(layers)})"
+            )
+        for idx, b in enumerate(base_list):
+            if not isinstance(b, nn.QuantizedLinear):
+                raise TypeError(
+                    f"baselines[{idx}] must be nn.QuantizedLinear, "
+                    f"not {type(b).__name__}"
+                )
+        b0 = base_list[0]
+        return (
+            base_list,
+            int(b0.bits),
+            int(b0.group_size),
+            "caller-supplied nn.QuantizedLinear baseline",
+        )
+
+    if first.bits not in _MLX_QUANT_BITS:
+        return (
+            None,
+            None,
+            None,
+            f"MLX nn.QuantizedLinear does not support bits={first.bits}",
+        )
+
+    if (
+        first.mode == "affine"
+        and first.group_size in _MLX_QUANT_GROUPS
+        and k % first.group_size == 0
+    ):
+        bases = tuple(
+            _make_mlx_baseline(
+                layer, dtype=dtype, baseline_gs=first.group_size, exact_affine=True
+            )
+            for layer in layers
+        )
+        return bases, int(first.bits), int(first.group_size), "exact affine weights"
+
+    # Nearest legal MLX group_size: prefer layer.group_size if legal, else 64->32->128.
+    candidates = [first.group_size] if first.group_size in _MLX_QUANT_GROUPS else []
+    for gs in (64, 32, 128):
+        if gs not in candidates:
+            candidates.append(gs)
+    chosen_gs = next((gs for gs in candidates if k % gs == 0), None)
+    if chosen_gs is None:
+        return (
+            None,
+            None,
+            None,
+            f"no legal MLX affine group_size in (64, 32, 128) divides k={k}",
+        )
+
+    bases = tuple(
+        _make_mlx_baseline(
+            layer, dtype=dtype, baseline_gs=chosen_gs, exact_affine=False
+        )
+        for layer in layers
+    )
+    if chosen_gs != first.group_size:
+        note = (
+            f"non-MLX group_size={first.group_size}; compared against MLX affine "
+            f"bits={first.bits} group_size={chosen_gs}"
+        )
+    else:
+        note = (
+            f"re-quantized {first.mode} plain weights to MLX affine "
+            f"bits={first.bits} group_size={chosen_gs}"
+        )
+    return bases, int(first.bits), int(chosen_gs), note
+
+
+def _percentile(values: list[float], frac: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return 0.0
+    pos = frac * (len(ordered) - 1)
+    lo = int(math.floor(pos))
+    hi = min(len(ordered) - 1, lo + 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
+def _measure_peak_working_bytes(fn, x: mx.array) -> int:
+    mx.clear_cache()
+    mx.reset_peak_memory()
+    active = int(mx.get_active_memory())
+    out = fn(x)
+    mx.eval(out)
+    peak = int(mx.get_peak_memory())
+    del out
+    mx.clear_cache()
+    return max(0, peak - active)
+
+
+def bench(
+    layers: FormatLinear | Sequence[FormatLinear],
+    *,
+    rows: int = 1,
+    dtype: str | mx.Dtype = mx.bfloat16,
+    chain_len: int = 16,
+    rounds: int = 40,
+    warmup: int = 5,
+    seed: int = 0,
+    baselines: nn.QuantizedLinear | Sequence[nn.QuantizedLinear] | None = None,
+    input_ndim: int = 3,
+) -> BenchResult:
+    """Rule-31 chained micro-benchmark with C2 FP32 check and memory delta."""
+    if not mx.metal.is_available():
+        raise RuntimeError("debug.bench requires an available Metal GPU")
+
+    layer_list = (layers,) if isinstance(layers, FormatLinear) else tuple(layers)
+    if not layer_list:
+        raise ValueError("layers must be a FormatLinear or non-empty sequence")
+    for idx, layer in enumerate(layer_list):
+        if not isinstance(layer, FormatLinear):
+            raise TypeError(
+                f"layers[{idx}] must be FormatLinear, not {type(layer).__name__}"
+            )
+        layer.refuse_placeholders()
+
+    first = layer_list[0]
+    for idx, layer in enumerate(layer_list[1:], start=1):
+        if (
+            layer.input_dims != first.input_dims
+            or layer.output_dims != first.output_dims
+            or layer.mode != first.mode
+            or layer.bits != first.bits
+            or layer.group_size != first.group_size
+        ):
+            raise ValueError(
+                f"layers[{idx}] shape/format mismatch with layers[0]: "
+                f"({layer.mode}, {layer.bits}b, g{layer.group_size}, "
+                f"k={layer.input_dims}, n={layer.output_dims}) != "
+                f"({first.mode}, {first.bits}b, g{first.group_size}, "
+                f"k={first.input_dims}, n={first.output_dims})"
+            )
+
+    _check_positive_int("rows", rows)
+    _check_positive_int("chain_len", chain_len)
+    if type(rounds) is not int or rounds < 2 or rounds % 2 != 0:
+        raise ValueError(f"rounds must be an even int >= 2, not {rounds!r}")
+    if type(warmup) is not int or warmup < 0:
+        raise ValueError(f"warmup must be a non-negative int, not {warmup!r}")
+    if type(seed) is not int:
+        raise ValueError(f"seed must be an int, not {seed!r}")
+    if type(input_ndim) is not int or input_ndim not in (2, 3):
+        raise ValueError(f"input_ndim must be 2 or 3, not {input_ndim!r}")
+
+    dt = parse_dtype(dtype)
+    k, n = int(first.input_dims), int(first.output_dims)
+    units = len(layer_list)
+
+    exp = explain(first, rows=(rows,), dtype=dt, input_ndim=input_ndim)
+    rt = exp.row_traces[0]
+    chip_id = exp.chip
+
+    base_list, base_bits, base_gs, base_note = _resolve_baselines(
+        layer_list, baselines, dt
+    )
+    baseline_available = base_list is not None
+
+    x_shape = (1, rows, k) if input_ndim == 3 else (rows, k)
+    norm_w = mx.ones((k,), dtype=dt)
+    xs = tuple(
+        (mx.random.normal(x_shape, key=mx.random.key(seed + u)) * 0.5).astype(dt)
+        for u in range(units)
+    )
+    mx.eval(norm_w, *xs)
+
+    def run_chain(side_layers, start_u: int, x0: mx.array) -> mx.array:
+        cur = x0
+        for j in range(chain_len):
+            y = side_layers[(start_u + j) % units](cur)
+            cur = _fit_chain(y, k, norm_w) if j + 1 < chain_len else y
+        mx.eval(cur)
+        return cur
+
+    # C2 accuracy + bitwise check on unit 0 before timing loop.
+    layer_y0 = layer_list[0](xs[0])
+    mx.eval(layer_y0)
+    ref_y0 = _fp32_reference(layer_list[0], xs[0])
+    mx.eval(ref_y0)
+    base_y0: mx.array | None = None
+    bitwise_eq: bool | None = None
+    if base_list is not None:
+        base_y0 = base_list[0](xs[0])
+        mx.eval(base_y0)
+        if first.mode == "affine" and base_gs == first.group_size:
+            bitwise_eq = _raw_bits_equal(layer_y0, base_y0)
+
+    (
+        layer_finite,
+        layer_rel_l2,
+        layer_max_abs,
+        base_rel_l2,
+        c2_threshold,
+        c2_pass,
+    ) = _c2_check(layer_y0, base_y0, ref_y0)
+
+    # Paired alternating-order chained timing (Rule 31).
+    layer_samples: list[float] = []
+    base_samples: list[float] = []
+    order_flags: list[bool] = []
+
+    for r in range(warmup + rounds):
+        new_first = r % 2 == 0
+        # One untimed pre-call per side per round to stabilize command queue.
+        if new_first:
+            run_chain(layer_list, 0, xs[0])
+            if base_list is not None:
+                run_chain(base_list, 0, xs[0])
+        else:
+            if base_list is not None:
+                run_chain(base_list, 0, xs[0])
+            run_chain(layer_list, 0, xs[0])
+
+        for u in range(units):
+            if new_first:
+                t0 = time.perf_counter()
+                run_chain(layer_list, u, xs[u])
+                t_layer = (time.perf_counter() - t0) * 1e6 / chain_len
+                if base_list is not None:
+                    t1 = time.perf_counter()
+                    run_chain(base_list, u, xs[u])
+                    t_base = (time.perf_counter() - t1) * 1e6 / chain_len
+            else:
+                if base_list is not None:
+                    t1 = time.perf_counter()
+                    run_chain(base_list, u, xs[u])
+                    t_base = (time.perf_counter() - t1) * 1e6 / chain_len
+                t0 = time.perf_counter()
+                run_chain(layer_list, u, xs[u])
+                t_layer = (time.perf_counter() - t0) * 1e6 / chain_len
+
+            if r >= warmup:
+                layer_samples.append(t_layer)
+                order_flags.append(new_first)
+                if base_list is not None:
+                    base_samples.append(t_base)
+
+    layer_med = float(statistics.median(layer_samples))
+    layer_p25 = _percentile(layer_samples, 0.25)
+    layer_p75 = _percentile(layer_samples, 0.75)
+
+    base_med: float | None = None
+    base_p25: float | None = None
+    base_p75: float | None = None
+    ratio_med: float | None = None
+    balanced_ratio: float | None = None
+    pos_factor: float | None = None
+    if base_list is not None:
+        base_med = float(statistics.median(base_samples))
+        base_p25 = _percentile(base_samples, 0.25)
+        base_p75 = _percentile(base_samples, 0.75)
+        ratio_med = layer_med / base_med if base_med > 0 else None
+        ratios, positions = _both_orders(
+            base_samples, layer_samples, order_flags, units
+        )
+        if ratios:
+            balanced_ratio = float(statistics.median(ratios))
+            pos_factor = float(statistics.median(positions))
+
+    w_bytes_layer = _layer_weight_bytes(layer_list[0])
+    w_bytes_base = (
+        _baseline_weight_bytes(base_list[0]) if base_list is not None else None
+    )
+    w_bytes_delta = w_bytes_layer - w_bytes_base if w_bytes_base is not None else None
+
+    peak_layer = _measure_peak_working_bytes(layer_list[0], xs[0])
+    peak_base = (
+        _measure_peak_working_bytes(base_list[0], xs[0])
+        if base_list is not None
+        else None
+    )
+    peak_delta = peak_layer - peak_base if peak_base is not None else None
+
+    return BenchResult(
+        mode=first.mode,
+        bits=int(first.bits),
+        group_size=int(first.group_size),
+        k=k,
+        n=n,
+        rows=rows,
+        dtype=_dtype_label(dt),
+        chip=chip_id,
+        route=rt.selected_route,
+        backend=rt.selected_backend,
+        chain_len=chain_len,
+        units=units,
+        rounds=rounds,
+        warmup=warmup,
+        layer_median_us=layer_med,
+        layer_p25_us=layer_p25,
+        layer_p75_us=layer_p75,
+        baseline_available=baseline_available,
+        baseline_bits=base_bits,
+        baseline_group_size=base_gs,
+        baseline_note=base_note,
+        baseline_median_us=base_med,
+        baseline_p25_us=base_p25,
+        baseline_p75_us=base_p75,
+        ratio_of_medians=ratio_med,
+        paired_balanced_ratio=balanced_ratio,
+        position_factor=pos_factor,
+        layer_finite=layer_finite,
+        layer_rel_l2_fp32=layer_rel_l2,
+        layer_max_abs_fp32=layer_max_abs,
+        baseline_rel_l2_fp32=base_rel_l2,
+        c2_threshold=c2_threshold,
+        c2_pass=c2_pass,
+        bitwise_equal_baseline=bitwise_eq,
+        weight_bytes_layer=w_bytes_layer,
+        weight_bytes_baseline=w_bytes_base,
+        weight_bytes_delta=w_bytes_delta,
+        peak_memory_layer_bytes=peak_layer,
+        peak_memory_baseline_bytes=peak_base,
+        peak_memory_delta_bytes=peak_delta,
+    )
+
+
+def format_bench(result: BenchResult, *, as_json: bool = False) -> str:
+    """Format a ``BenchResult`` as human-readable text or JSON."""
+    if as_json:
+        return json.dumps(result.to_dict(), indent=2, sort_keys=True)
+    lines = [
+        f"Bench: mode={result.mode} bits={result.bits} gs={result.group_size} "
+        f"k={result.k} n={result.n} rows={result.rows} dtype={result.dtype}",
+        f"Target: chip={result.chip} route={result.route} ({result.backend}) "
+        f"chain_len={result.chain_len} units={result.units} "
+        f"rounds={result.rounds} warmup={result.warmup}",
+        f"Timing (layer): median={result.layer_median_us:.2f} us "
+        f"(p25={result.layer_p25_us:.2f}, p75={result.layer_p75_us:.2f})",
+    ]
+    if result.baseline_available and result.baseline_median_us is not None:
+        lines.append(
+            f"Timing (base):  median={result.baseline_median_us:.2f} us "
+            f"(bits={result.baseline_bits}, gs={result.baseline_group_size}, "
+            f"{result.baseline_note})"
+        )
+        lines.append(
+            f"Ratio: paired_balanced={result.paired_balanced_ratio:.4f} "
+            f"median_ratio={result.ratio_of_medians:.4f} "
+            f"position_factor={result.position_factor:.4f}"
+        )
+    else:
+        lines.append(f"Baseline: unavailable ({result.baseline_note})")
+    c2_status = "PASS" if result.c2_pass else "FAIL"
+    lines.append(
+        f"C2 FP32 ({c2_status}): finite={result.layer_finite} "
+        f"layer_rel_l2={result.layer_rel_l2_fp32:.6g} "
+        f"max_abs={result.layer_max_abs_fp32:.6g} "
+        f"base_rel_l2={result.baseline_rel_l2_fp32} "
+        f"threshold={result.c2_threshold}"
+    )
+    lines.append(
+        f"Memory: weight={result.weight_bytes_layer} B "
+        f"(delta={result.weight_bytes_delta} B), "
+        f"peak_working={result.peak_memory_layer_bytes} B "
+        f"(delta={result.peak_memory_delta_bytes} B)"
+    )
     return "\n".join(lines)

@@ -953,3 +953,198 @@ def test_dump_metal_fail_closed_and_pure():
         )
     with pytest.raises(ValueError, match="placeholder"):
         debug.dump_metal(ph, rows=1, route="dot", chip="applegpu_g15d_c80")
+
+
+# ---------------------------------------------------------------------------
+# Milestone 3 Commit 3 — bench (Rule-31 chained + C2 fp32_ref + memory delta)
+# ---------------------------------------------------------------------------
+
+
+class _Group16ToyFormat(QuantFormat):
+    """Toy format with non-MLX group_size=16 to test baseline fallback."""
+
+    mode = "fmtdebug_g16_toy"
+    codes_name = "qcodes"
+    tensors = ("qscale",)
+    contract = 1
+
+    def layout(self, k: int, n: int, bits: int, group_size: int):
+        if k <= 0 or n <= 0 or bits != 4 or group_size != 16 or k % 16 != 0:
+            return None
+        return {
+            "qcodes": ((n, k // 8), mx.uint32),
+            "qscale": ((n, k // 16), None),
+        }
+
+    def decode(self, tensors, bits: int, group_size: int) -> mx.array:
+        q = tensors["qcodes"]
+        s = tensors["qscale"].astype(mx.float32)
+        n = q.shape[-2]
+        words = q.shape[-1]
+        k = words * 8
+        # Unpack 8 nibbles per uint32 word, centered around 7.5.
+        shifts = mx.arange(0, 32, 4, dtype=mx.uint32)
+        mask = mx.array(0xF, dtype=mx.uint32)
+        nibbles = ((q[..., None] >> shifts) & mask).astype(mx.float32)
+        vals = (nibbles.reshape(*q.shape[:-2], n, k) - 7.5) / 7.5
+        scales_exp = mx.repeat(s, 16, axis=-1)
+        return vals * scales_exp
+
+
+def test_bench_math_helpers_cpu():
+    # Exact balanced pair geometric mean and position factor.
+    base = [10.0, 20.0, 12.0, 24.0]
+    new = [5.0, 10.0, 6.0, 12.0]
+    first = [True, True, False, False]
+    ratios, positions = debug._both_orders(base, new, first, units=2)
+    assert len(ratios) == 2
+    assert pytest.approx(ratios[0], rel=1e-9) == 0.5
+    assert pytest.approx(ratios[1], rel=1e-9) == 0.5
+    assert pytest.approx(positions[0], rel=1e-9) == 1.0
+    assert pytest.approx(positions[1], rel=1e-9) == 1.0
+
+    # Same-order pair must fail closed with ValueError.
+    with pytest.raises(ValueError, match="same order"):
+        debug._both_orders([10.0, 10.0], [5.0, 5.0], [True, True], units=1)
+
+    # _rel_l2 exact and zero-ref safe.
+    ref = mx.array([3.0, 4.0], dtype=mx.float32)
+    got = mx.array([3.0, 5.0], dtype=mx.float32)
+    assert pytest.approx(debug._rel_l2(got, ref), rel=1e-6) == 0.2
+    assert (
+        debug._rel_l2(
+            mx.zeros((4,), dtype=mx.float32), mx.zeros((4,), dtype=mx.float32)
+        )
+        == 0.0
+    )
+
+    # C2 threshold boundary: 1.05 * base + 1e-6, plus NaN fails closed.
+    base_y = mx.array([3.0, 4.1], dtype=mx.float32)  # rel_l2 = 0.02
+    good_y = mx.array([3.0, 4.104], dtype=mx.float32)  # rel_l2 = 0.0208 <= 0.021001
+    bad_y = mx.array([3.0, 4.2], dtype=mx.float32)  # rel_l2 = 0.04 > 0.021001
+    nan_y = mx.array([float("nan"), 4.0], dtype=mx.float32)
+
+    fin, rl, _, rb, thr, passed = debug._c2_check(good_y, base_y, ref)
+    assert fin is True
+    assert rb is not None and thr is not None
+    assert pytest.approx(thr, rel=1e-6) == 1.05 * rb + 1e-6
+    assert rl <= thr and passed is True
+
+    _, _, _, _, _, passed_bad = debug._c2_check(bad_y, base_y, ref)
+    assert passed_bad is False
+
+    fin_nan, _, _, _, _, passed_nan = debug._c2_check(nan_y, base_y, ref)
+    assert fin_nan is False
+    assert passed_nan is False
+
+
+def test_bench_fail_closed_validation(monkeypatch):
+    l1 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
+    l2 = debug.make_layer("affine", bits=4, group_size=64, k=256, n=512)
+
+    with pytest.raises(ValueError):
+        debug.bench([], rows=1, rounds=4)
+    with pytest.raises(ValueError):
+        debug.bench([l1, l2], rows=1, rounds=4)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=1, rounds=3)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=1, rounds=0)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=1, chain_len=0, rounds=4)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=0, rounds=4)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=1, warmup=-1, rounds=4)
+    with pytest.raises(ValueError):
+        debug.bench(l1, rows=1, input_ndim=4, rounds=4)
+
+    monkeypatch.setattr(mx.metal, "is_available", lambda: False)
+    with pytest.raises(RuntimeError, match="Metal"):
+        debug.bench(l1, rows=1, rounds=4)
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal GPU")
+def test_bench_gpu_affine_square_and_rectangular():
+    shapes = [
+        (256, 256, 1),
+        (256, 256, 64),
+        (256, 512, 4),  # n > k (slice in fit_chain)
+        (256, 128, 4),  # n < k (repeat-concat in fit_chain)
+    ]
+    for k, n, rows in shapes:
+        layers = [
+            debug.make_layer(
+                "affine",
+                bits=4,
+                group_size=64,
+                k=k,
+                n=n,
+                seed=i,
+                realistic_weights=True,
+            )
+            for i in range(2)
+        ]
+        res = debug.bench(
+            layers, rows=rows, dtype=mx.bfloat16, chain_len=4, rounds=4, warmup=1
+        )
+        assert res.c2_pass is True, (k, n, rows, res)
+        assert res.layer_finite is True
+        assert res.layer_median_us > 0
+        assert res.baseline_available is True
+        assert res.baseline_median_us is not None and res.baseline_median_us > 0
+        assert res.paired_balanced_ratio is not None and res.paired_balanced_ratio > 0
+        assert res.weight_bytes_delta == 0
+        assert res.peak_memory_layer_bytes >= 0
+        parsed = json.loads(debug.format_bench(res, as_json=True))
+        assert parsed["c2_pass"] is True
+        assert parsed["k"] == k and parsed["n"] == n
+        assert "c2_pass" in debug.format_bench(res, as_json=False).lower() or (
+            "PASS" in debug.format_bench(res, as_json=False)
+        )
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal GPU")
+def test_bench_gpu_oqh_transform_and_non_mlx_group_size():
+    # oqh with InputTransform active: C2 reference must apply inverse_weight!
+    oqh_layers = [
+        debug.make_layer(
+            "oqh",
+            bits=4,
+            group_size=128,
+            k=256,
+            n=256,
+            seed=10 + i,
+            realistic_weights=True,
+        )
+        for i in range(2)
+    ]
+    res_oqh = debug.bench(
+        oqh_layers, rows=4, dtype=mx.bfloat16, chain_len=4, rounds=4, warmup=1
+    )
+    assert res_oqh.layer_finite is True
+    assert res_oqh.layer_rel_l2_fp32 < 0.25, res_oqh
+    assert res_oqh.baseline_available is True
+    assert res_oqh.c2_pass is True, res_oqh
+
+    # Toy plugin with non-MLX group_size=16 -> fallback baseline_group_size=64 + note.
+    g16_fmt = _Group16ToyFormat()
+    g16_layers = [
+        debug.make_layer(
+            g16_fmt,
+            bits=4,
+            group_size=16,
+            k=256,
+            n=128,
+            seed=20 + i,
+            realistic_weights=True,
+        )
+        for i in range(2)
+    ]
+    res_g16 = debug.bench(
+        g16_layers, rows=4, dtype=mx.bfloat16, chain_len=4, rounds=4, warmup=1
+    )
+    assert res_g16.layer_finite is True
+    assert res_g16.baseline_available is True
+    assert res_g16.baseline_group_size == 64
+    assert res_g16.baseline_note is not None and "64" in res_g16.baseline_note
