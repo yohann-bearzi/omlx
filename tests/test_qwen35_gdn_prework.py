@@ -1704,6 +1704,31 @@ def test_qwen4_short_verify_commits_first_row_without_repeating_verify(
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_short_verify_commits_second_row_without_repeating_verify(
+    monkeypatch, qwen4_verify, dtype
+):
+    """A 3-row verify block committed after two rows replays the second
+    recurrent state bitwise against the recorded per-step states."""
+    rows = 3
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 11, dtype)
+    inputs = _verify_inputs(rows, 43, dtype)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", False)
+    expected, expected_cache, expected_tx = _verify_block(
+        module, *inputs, row_exact=False
+    )
+    expected_tx.commit([2])
+
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", True)
+    actual, cache, tx = _verify_block(module, *inputs, row_exact=False)
+    tx.commit([2])
+    assert _same(expected, actual)
+    assert _same(expected_cache[0], cache[0])
+    assert _same(expected_cache[1], cache[1])
+    assert qwen4_verify == [rows, rows]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 # One block per in-projection geometry: the two-row tile, then two, one and
 # three rows per threadgroup.
 @pytest.mark.parametrize("rows", [2, 4, 5, 9])

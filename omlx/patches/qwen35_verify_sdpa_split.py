@@ -35,6 +35,10 @@ the splits in a second launch. ``_wide_causal_sdpa`` stages its
 probabilities and its value tile in FP32 (C1.2); the tensor-op path keeps
 them in the input dtype.
 
+Three-row verify blocks of the Qwen3.5/3.6 dense geometry (24 query / 2 KV
+heads, at most 256 keys) use ``_short_causal_sdpa``: one launch over the
+exact bottom-right causal window.
+
 MTP draft chains attend through ``ChainKVCache``: chain rows stay in a short
 tail next to the head's cache, and ``prefix_tail_attention`` reads both.
 """
@@ -72,8 +76,10 @@ def _log_engaged(q_len: int) -> None:
 
 
 # One threadgroup owns a query row and head. Each SIMD group streams a
-# different subsequence of causal keys. For a short cache the partial softmax
-# vectors fit in threadgroup memory, so their reduction needs no second launch.
+# different subsequence of causal keys. The per-group partial softmax sums fit
+# in threadgroup memory (they are bounded by the key-block walk, not by
+# kv_len); the 256-key short-path limit is a performance choice, not a
+# capacity one.
 _SHORT_CAUSAL_SOURCE = """
     constexpr uint simds = 8;
     const uint lane = thread_index_in_simdgroup;
@@ -1110,6 +1116,9 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                         # differently.
                         out = row_exact_causal_sdpa(queries, keys, values, scale, limit)
                     elif (
+                        # Qwen3.5/3.6 dense verify geometry (24 query / 2 KV
+                        # heads, <= 256 keys): one short causal launch; every
+                        # other shape falls through to the generic paths.
                         q_len == 3
                         and keys.shape[:2] == (1, 2)
                         and keys.shape[2] <= 256

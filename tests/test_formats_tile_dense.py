@@ -740,13 +740,16 @@ def test_three_row_stacked_gdn_projection_selects_measured_m5_route():
     ]
 
 
-def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows():
-    """The measured 3-row Dot route is row-exact: its output equals the three
-    single-row calls bitwise and holds C2 against nn.QuantizedLinear."""
+def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows(monkeypatch):
+    """The measured 3-row Dot route holds C2 against nn.QuantizedLinear and its
+    per-row calls (row-exact to rounding, not bitwise)."""
     if not mx.metal.is_available():
         pytest.skip("requires Metal")
     from omlx.formats import tuning
 
+    # Pin the host chip to the measured M5 so FormatLinear.__call__ itself
+    # takes the Dot plan (the local plan below only proves the route table).
+    monkeypatch.setattr(tuning, "current_chip", lambda: "applegpu_g17s_c40")
     tuning.reset_cache()
     k, n, gs = 2560, 16480, 64
     layer = _stacked_gdn_layer(mx.bfloat16)
@@ -760,7 +763,16 @@ def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows():
     assert tile_dense.route_for(plan, 3, mx.bfloat16).backend == "dot"
     x3 = mx.random.normal((3, 1, k), dtype=mx.bfloat16)
     mx.eval(x3)
+    dot_rows = []
+    real_dot_rows = FormatLinear._dot_rows
+
+    def spy(self, kept, x, bias):
+        dot_rows.append(x.shape)
+        return real_dot_rows(self, kept, x, bias)
+
+    monkeypatch.setattr(FormatLinear, "_dot_rows", spy)
     got = layer(x3)
+    assert dot_rows == [x3.shape]
     per_row = mx.concatenate([layer(x3[i : i + 1]) for i in range(3)], axis=0)
     mx.eval(got, per_row)
 

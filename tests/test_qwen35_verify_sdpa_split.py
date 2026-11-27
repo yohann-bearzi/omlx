@@ -628,3 +628,58 @@ def test_three_row_short_verify_attention_against_fp32(dtype, keys):
 
     assert result.shape == q.shape and result.dtype == dtype
     assert rel_l2(result) <= 1.05 * rel_l2(old) + 1e-6
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+def test_short_verify_routes_three_rows_to_short_causal_kernel(monkeypatch):
+    """The verify seam itself (not just the kernel) must route a 3-row
+    24q/2kv attention with <=256 keys to _short_causal_sdpa, and must not
+    for 257 keys."""
+    from mlx_vlm.models.qwen3_5 import language as q35_lang
+
+    from omlx.patches import qwen35_verify_sdpa_split as vs
+
+    # Re-apply the split patch so the seam under test is its wrapper (the
+    # module remembers a prior application from other tests).
+    monkeypatch.setattr(vs, "_PATCHED", False)
+    if not vs.apply_qwen35_verify_sdpa_split_patch():
+        pytest.skip("verify-split patch unavailable")
+    from omlx.patches import qwen35_verify_qmm
+
+    qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=False)
+    calls = []
+
+    def spy(q, k, v, scale):
+        calls.append(k.shape)
+        return mx.zeros_like(q)
+
+    monkeypatch.setattr(vs, "_short_causal_sdpa", spy)
+    mx.random.seed(1201)
+    q = mx.random.normal((1, 24, 3, 256)).astype(mx.bfloat16)
+    seam = q35_lang._qwen3_5_left_padded_attention
+    k = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    out = seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
+    assert out is not None and calls == [(1, 2, 256, 256)]
+    calls.clear()
+    k = mx.random.normal((1, 2, 257, 256)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, 257, 256)).astype(mx.bfloat16)
+    seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
+    assert calls == []
+
+    # Row-exact mode takes precedence over the short path.
+    row_exact = []
+
+    def spy_row_exact(q, k, v, scale, limit, mask=None):
+        row_exact.append(limit)
+        return mx.zeros_like(q)
+
+    monkeypatch.setattr(vs, "row_exact_causal_sdpa", spy_row_exact)
+    k = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    v = mx.random.normal((1, 2, 256, 256)).astype(mx.bfloat16)
+    qwen35_verify_qmm.set_verify_qmm_armed(True, row_exact=True)
+    try:
+        out = seam(q, k, v, cache=KVCache(), scale=0.0625, mask=None)
+    finally:
+        qwen35_verify_qmm.set_verify_qmm_armed(False, row_exact=True)
+    assert out is not None and calls == [] and len(row_exact) == 1
