@@ -109,7 +109,7 @@ def _compare(layer, packed, x, monkeypatch, *, expected=None, mlx_route=False):
 
 @pytest.mark.parametrize("dtype", [mx.float16, mx.bfloat16])
 @pytest.mark.parametrize("bits", [2, 3, 4, 8])
-@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6])
+@pytest.mark.parametrize("rows", [2, 3, 4, 5, 6, 7])
 def test_wide_rows_match_the_stock_oracle_on_a_plugin_face(
     rows, bits, dtype, build_layer, monkeypatch
 ):
