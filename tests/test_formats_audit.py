@@ -1981,33 +1981,40 @@ def test_zero_false_positives_on_ported_qwen4_exp():
 
 
 def test_catches_real_unported_misreaders():
+    # Upstream refactors (0.7.4 vs 0.8.4) move the line numbers; these
+    # (scope, rule, symbol) triples are identical on both trees.
     # 1. hc_prefill_nax.py (unallowlisted)
     hc_report = scan_paths([HC_PREFILL_NAX])
-    hc_lines = {f.line for f in hc_report.findings}
-    assert {661, 702, 728}.issubset(hc_lines)
+    assert {
+        ("norm_inject", "unguarded-weight", "inject.weight"),
+        ("down_silu", "unguarded-weight", "down.weight"),
+        ("up_tail", "unguarded-weight", "up.weight"),
+    }.issubset({(f.scope, f.rule, f.symbol) for f in hc_report.findings})
 
-    # 2. inkling2/dspark.py (line numbers move with upstream refactors; the
-    #    fold reads its head weights unguarded at least twice)
+    # 2. inkling2/dspark.py (the lm_head.weight read is pinned by symbol)
     dspark = REPO_ROOT / "omlx/patches/inkling2/dspark.py"
     dspark_report = scan_paths([dspark])
-    fold_weights = [
-        f
-        for f in dspark_report.findings
-        if f.scope.endswith(".fold") and f.rule == "unguarded-weight"
-    ]
-    assert len(fold_weights) >= 2
+    assert {
+        ("Inkling2MarkovHead.fold", "unguarded-weight", "lm_head.weight"),
+        ("Inkling2MarkovHead.fold", "unguarded-weight", "self.hidden_out.weight"),
+    }.issubset({(f.scope, f.rule, f.symbol) for f in dspark_report.findings})
 
     # 3. raon1_mini/raon1_mini_model.py
     raon = REPO_ROOT / "omlx/patches/raon1_mini/raon1_mini_model.py"
     raon_report = scan_paths([raon])
-    raon_lines = {f.line for f in raon_report.findings}
-    assert {948, 961, 1618}.issubset(raon_lines)
+    assert {
+        ("_share_parts", "unguarded-weight", "m.weight"),
+        ("_project", "unguarded-quantized-matmul", "quantized_matmul"),
+        ("MergedSwitchGLU._half", "unguarded-weight", "gu['weight']"),
+    }.issubset({(f.scope, f.rule, f.symbol) for f in raon_report.findings})
 
     # 4. deepseek_v4/verify_qmv.py
     verify_qmv = REPO_ROOT / "omlx/patches/deepseek_v4/verify_qmv.py"
     vq_report = scan_paths([verify_qmv])
-    vq_lines = {f.line for f in vq_report.findings}
-    assert {550, 594}.issubset(vq_lines)
+    assert {
+        ("dense_eligible", "unguarded-weight", "module.weight"),
+        ("dspark_head_gemv", "unguarded-weight", "module.weight"),
+    }.issubset({(f.scope, f.rule, f.symbol) for f in vq_report.findings})
 
 
 def test_audit_module_has_zero_mlx_imports():
