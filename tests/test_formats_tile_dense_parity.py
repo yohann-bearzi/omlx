@@ -1809,9 +1809,7 @@ def test_dense_splitk_accum_thread_safe():
 
 
 def test_deferred79_fused_splitk_winning_cells_routed_and_pass_c2(monkeypatch):
-    """DEFERRED 79: the 12 winning fused split-K cells (2 M5 Max + 10 M3 Ultra)
-    resolve to their measured policies, FN_k_proj M=128 stays mlx on M3 Ultra,
-    v1 tables stay fresh, and every host winning cell passes C2 in bf16/fp16."""
+    """The split-K wins common to both dtypes route as measured and pass C2."""
     tuning.reset_cache()
     assert tuning.stale_entries() == []
 
@@ -1822,7 +1820,6 @@ def test_deferred79_fused_splitk_winning_cells_routed_and_pass_c2(monkeypatch):
     m3_wins = [
         (512, 2560, 8, 64, 33, "steel", 20),
         (512, 2560, 8, 64, 512, "steel", 4),
-        (2560, 6144, 8, 64, 17, "steel", 12),
         (2560, 6144, 8, 64, 64, "steel", 6),
         (48, 2560, 8, 64, 512, "steel", 8),
         (48, 2560, 8, 64, 2048, "steel", 5),
@@ -1888,3 +1885,26 @@ def test_deferred79_fused_splitk_winning_cells_routed_and_pass_c2(monkeypatch):
             want = quantized(x)
             mx.eval(got, want)
             _assert_c2(got, want, x, quantized)
+
+
+@pytest.mark.skipif(
+    tuning.current_chip() != "applegpu_g15d_c80", reason="needs the M3 Ultra table"
+)
+def test_m3_flash_next_output_projection_prose_prefill(monkeypatch):
+    """The oQh gate prefills 24 rows before comparing serial and window logits."""
+    monkeypatch.setattr(FormatLinear, "_decoded", _no_decode)
+    for dtype in (mx.bfloat16, mx.float16):
+        quantized, layer = _layer(2560, 6144, 8, 64, dtype)
+        with testing.fresh_proofs():
+            plan = layer._dense_tile(layer._keep())
+            assert plan is not None
+            for rows in (17, 24):
+                route = tile_dense.route_for(plan, rows, dtype)
+                x = _x((1, rows, 6144), dtype=dtype, seed=rows + 2560)
+                got, want = layer(x), quantized(x)
+                if dtype == mx.bfloat16:
+                    assert _same_bits(got, want)
+                    assert route.backend == "mlx"
+                else:
+                    assert route.backend == "steel" and route.policy.split_k == 12
+                    _assert_c2(got, want, x, quantized)
