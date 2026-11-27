@@ -8,13 +8,8 @@ from contextlib import nullcontext
 from threading import Barrier
 
 import mlx.core as mx
+import mlx.nn as nn
 import pytest
-
-from omlx.formats import testing, tile_dense
-from omlx.formats.linear import FormatLinear
-from omlx.patches import m5_gather_qmm_nax as nax
-from omlx.patches.format_load import loading
-from tests.test_formats_linear import _composed, _pair, _x
 from tests.test_formats_tile_prefill import (
     _stack,
     _tile_toy,
@@ -22,6 +17,12 @@ from tests.test_formats_tile_prefill import (
     needs_steel,
 )
 from tests.test_formats_tile_prefill import toy as toy
+
+from omlx.formats import testing, tile_dense
+from omlx.formats.linear import FormatLinear
+from omlx.patches import m5_gather_qmm_nax as nax
+from omlx.patches.format_load import loading
+from tests.test_formats_linear import _composed, _pair, _x
 from tests.test_qwen35_moe_routed_decode import _same_bits
 
 
@@ -528,9 +529,10 @@ def test_steel_dense_grid_limit_uses_the_number_of_rows(monkeypatch):
 
 @needs_steel
 def test_failed_dense_steel_proof_leaves_the_sorted_stack_available(toy, monkeypatch):
+    from tests.test_formats_tile_prefill import _TILE, _rows, _want
+
     from omlx.formats import tile_gather
     from omlx.formats.linear import FormatSwitchLinear
-    from tests.test_formats_tile_prefill import _TILE, _rows, _want
 
     k, n = 256, 64
     fmt = toy(_tile_toy("separate_steel_proofs"))
@@ -686,24 +688,95 @@ def test_policy_for_return_annotation_includes_mma_and_msg():
     assert "rows >= 2" in (tile_dense.__doc__ or "")
 
 
+def _stacked_gdn_layer(dtype):
+    k, n, bits, gs = 2560, 16480, 8, 64
+    return FormatLinear(
+        "affine",
+        bits,
+        gs,
+        k,
+        {
+            "weight": mx.zeros((n, k * bits // 32), mx.uint32),
+            "scales": mx.zeros((n, k // gs), dtype),
+            "biases": mx.zeros((n, k // gs), dtype),
+        },
+    )
+
+
 def test_three_row_stacked_gdn_projection_selects_measured_m5_route():
-    from types import SimpleNamespace
+    from omlx.formats import tuning
 
-    from omlx.formats import affine
+    tuning.reset_cache()
+    layer = _stacked_gdn_layer(mx.bfloat16)
+    m5 = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    routes = [tile_dense.route_for(m5, n, mx.bfloat16) for n in (2, 3, 4)]
+    assert [route.backend for route in routes] == ["mlx", "dot", "mlx"]
+    assert routes[1].policy == tuning.DenseTilePolicy("dot")
 
-    layer = SimpleNamespace(
-        input_dims=2560, output_dims=16480, bits=8, group_size=64, mode="affine"
+    # build_plan's dot_ok gate: with no Dot face the shape falls back to MLX.
+    no_dot = tile_dense.build_plan(
+        layer, tensor_units=True, chip="applegpu_g17s_c40", dot_face=None
     )
-    dtype = mx.bfloat16
-    schedule = tile_dense._build_schedule(
-        layer,
-        affine.tile_face(8, 64, dtype),
-        dtype,
-        tensor_units=True,
-        chip="applegpu_g17s_c40",
-    )
-    assert [tile_dense._route_for_rows(schedule, n).backend for n in (2, 3, 4)] == [
+    assert [
+        tile_dense.route_for(no_dot, n, mx.bfloat16).backend for n in (2, 3, 4)
+    ] == ["mlx", "mlx", "mlx"]
+
+    # The entry is M5-only: M3 Ultra keeps MLX at every row.
+    m3 = tile_dense.build_plan(layer, tensor_units=False, chip="applegpu_g15d_c80")
+    assert [tile_dense.route_for(m3, n, mx.bfloat16).backend for n in (2, 3, 4)] == [
         "mlx",
-        "dot",
+        "mlx",
         "mlx",
     ]
+
+    # The measured entry is bf16 only; an fp16 layer stays on MLX (pinned).
+    fp16 = tile_dense.build_plan(
+        _stacked_gdn_layer(mx.float16), tensor_units=True, chip="applegpu_g17s_c40"
+    )
+    assert [tile_dense.route_for(fp16, n, mx.float16).backend for n in (2, 3, 4)] == [
+        "mlx",
+        "mlx",
+        "mlx",
+    ]
+
+
+def test_three_row_stacked_gdn_projection_three_rows_equal_single_rows():
+    """The measured 3-row Dot route is row-exact: its output equals the three
+    single-row calls bitwise and holds C2 against nn.QuantizedLinear."""
+    if not mx.metal.is_available():
+        pytest.skip("requires Metal")
+    from omlx.formats import tuning
+
+    tuning.reset_cache()
+    k, n, gs = 2560, 16480, 64
+    layer = _stacked_gdn_layer(mx.bfloat16)
+    mx.random.seed(61)
+    dense = nn.Linear(k, n, bias=False)
+    dense.set_dtype(mx.bfloat16)
+    quantized = dense.to_quantized(group_size=gs, bits=8)
+    mx.eval(quantized.parameters())
+    layer.update(quantized.parameters())
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    assert tile_dense.route_for(plan, 3, mx.bfloat16).backend == "dot"
+    x3 = mx.random.normal((3, 1, k), dtype=mx.bfloat16)
+    mx.eval(x3)
+    got = layer(x3)
+    per_row = mx.concatenate([layer(x3[i : i + 1]) for i in range(3)], axis=0)
+    mx.eval(got, per_row)
+
+    # Contract C2 (rule 33): a reordered 3-row route is judged against the FP32
+    # reference on the same dequantized weights; the per-row calls sit at the
+    # same bar (row-exact to rounding, not bitwise).
+    w32 = mx.dequantize(
+        quantized["weight"],
+        quantized["scales"].astype(mx.float32),
+        quantized["biases"].astype(mx.float32),
+        group_size=gs,
+        bits=8,
+    ).astype(mx.float32)
+    ref = x3.astype(mx.float32) @ w32.T
+    base = quantized(x3).astype(mx.float32)
+    rel = lambda a: float(mx.linalg.norm(a - ref) / mx.linalg.norm(ref))  # noqa: E731
+    bar = 1.05 * rel(base) + 1e-6
+    assert rel(got.astype(mx.float32)) <= bar
+    assert rel(per_row.astype(mx.float32)) <= bar

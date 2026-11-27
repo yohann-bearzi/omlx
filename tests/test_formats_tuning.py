@@ -2639,3 +2639,31 @@ def test_in_tree_routed_down_entries_and_skeleton(monkeypatch):
         )
         is None
     )
+
+
+def test_m5_b8g64_three_row_entry_grouped_with_small_rows():
+    """The measured (16480, 2560, 3-3) M5 entry sits with the small-row
+    b8g64_bf16 dense_tile entries, not in the 2026-11-22 prefill block."""
+    import json
+    from pathlib import Path
+
+    path = Path(tuning.__file__).with_name("v1") / "applegpu_g17s_c40.json"
+    entries = json.loads(path.read_text())["entries"]
+
+    def index(pred):
+        hits = [i for i, entry in enumerate(entries) if pred(entry["key"])]
+        assert len(hits) == 1, hits
+        return hits[0]
+
+    three = index(
+        lambda key: key.get("n") == 16480
+        and key.get("k") == 2560
+        and key.get("rows_bucket") == "3-3"
+    )
+    small = index(
+        lambda key: key.get("n") == 12288
+        and key.get("k") == 2560
+        and key.get("rows_bucket") == "13-16"
+        and key.get("dtype") == "bf16"
+    )
+    assert three > small
