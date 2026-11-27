@@ -1871,6 +1871,118 @@ def _qwen4_verify(plan, inputs, cache):
     return out(gated) if steps >= 2 else out_rows(gated)
 
 
+# A partial commit needs the recurrent state only. Each SIMD group owns one
+# value row. Keys are normalized once per tile, then each lane updates its
+# four adjacent FP32 state elements in the forward step's reduction order.
+_QWEN4_REPLAY_HEADER = _QWEN4_DECODE_HEADER + """
+    template <typename T, uint C, uint P>
+    inline T omlx_replay_channel(
+        const device T* proj, const device T* history, const device T* weights,
+        uint channel, uint t
+    ) {
+        float sum = 0.0f;
+        for (uint tap = 0; tap < 3; ++tap) {
+            uint src = t + tap;
+            T value = src < 3 ? history[src * C + channel]
+                              : proj[(src - 3) * P + channel];
+            sum += float(value) * float(weights[channel * 4 + tap]);
+        }
+        sum += float(proj[t * P + channel]) * float(weights[channel * 4 + 3]);
+        T conv = T(sum);
+        auto y = 1 / (1 + metal::precise::exp(metal::abs(conv)));
+        return conv * T(conv < T(0) ? y : 1 - y);
+    }
+"""
+
+
+@functools.cache
+def _qwen4_prefix_state_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_qwen4_gdn_prefix_state",
+        input_names=["proj", "conv", "weights", "A_log", "dt_bias", "start"],
+        output_names=["out"],
+        header=_QWEN4_REPLAY_HEADER,
+        source="""
+            const uint lane = thread_index_in_simdgroup;
+            const uint sg = simdgroup_index_in_threadgroup;
+            const uint hv = threadgroup_position_in_grid.z;
+            const uint dv = threadgroup_position_in_grid.y * TILE + sg;
+            constexpr uint P = C + HV * DV + 2 * HV;
+            constexpr uint B = C + HV * DV;
+            const uint address = (hv * DV + dv) * DK + lane * 4;
+            float4 state = *((const device float4*)(start + address));
+            threadgroup T keys[S][DK], values[S][TILE], betas[S];
+            threadgroup float decay[S];
+            if (sg < S) {
+                const uint t = sg;
+                const uint first = HK * DK + (hv / (HV / HK)) * DK + lane * 4;
+                T key[4], sum = T(0);
+                for (uint i = 0; i < 4; ++i) {
+                    key[i] = omlx_replay_channel<T, C, P>(
+                        proj, conv, weights, first + i, t);
+                    sum = T(float(sum) + float(T(float(key[i]) * float(key[i]))));
+                }
+                T norm = T(float(T(omlx_l2_row_sum(sum))) + float(T(1e-6f)));
+                T inv = T(metal::precise::rsqrt(float(norm)));
+                for (uint i = 0; i < 4; ++i)
+                    keys[t][lane * 4 + i] = T(float(key[i]) * float(inv));
+                if (lane < TILE) {
+                    uint c = 2 * HK * DK + hv * DV
+                             + threadgroup_position_in_grid.y * TILE + lane;
+                    values[t][lane] = omlx_replay_channel<T, C, P>(
+                        proj, conv, weights, c, t);
+                }
+                if (lane == 0) {
+                    T b = proj[t * P + B + hv];
+                    auto y = 1 / (1 + metal::precise::exp(metal::abs(b)));
+                    betas[t] = T(b < T(0) ? y : 1 - y);
+                    T a = T(float(proj[t * P + B + HV + hv]) + float(dt_bias[hv]));
+                    float rate = metal::precise::exp(float(A_log[hv]));
+                    decay[t] = metal::precise::exp(-rate * float(omlx_softplus(a)));
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint t = 0; t < S; ++t) {
+                state *= decay[t];
+                float4 key;
+                float dot = 0;
+                for (uint i = 0; i < 4; ++i) {
+                    key[i] = float(keys[t][lane * 4 + i]);
+                    dot += state[i] * key[i];
+                }
+                for (uint stride = 1; stride < 32; stride *= 2)
+                    dot += simd_shuffle_xor(dot, stride);
+                float delta = (float(values[t][sg]) - dot) * float(betas[t]);
+                state = fma(key, float4(delta), state);
+            }
+            *((device float4*)(out + address)) = state;
+        """,
+    )
+
+
+def _qwen4_prefix_state(proj, conv, weights, a_log, dt_bias, start, hk, keep):
+    """Replay only the key/value recurrence of the accepted short prefix."""
+    tile = 8  # One SIMD group per value row, eight rows per threadgroup.
+    _, hv, dv, dk = start.shape
+    return _qwen4_prefix_state_kernel()(
+        inputs=[proj, conv, weights, a_log, dt_bias, start],
+        template=[
+            ("T", proj.dtype),
+            ("HK", hk),
+            ("HV", hv),
+            ("DK", dk),
+            ("DV", dv),
+            ("C", conv.shape[-1]),
+            ("S", keep),
+            ("TILE", tile),
+        ],
+        grid=(32, dv, hv),
+        threadgroup=(32, tile, 1),
+        output_shapes=[start.shape],
+        output_dtypes=[mx.float32],
+    )[0]
+
+
 def _qwen4_state_after(
     proj,
     conv_state,
@@ -1891,6 +2003,10 @@ def _qwen4_state_after(
     the fused step on those rows, whose last state is the block's state
     after row ``keep - 1`` bit for bit (row t's arithmetic does not depend
     on the block length)."""
+    if proj.shape[1] in (2, 3) and 0 < keep < proj.shape[1]:
+        return _qwen4_prefix_state(
+            proj, conv_state, conv_w, A_log, dt_bias, state, hk, keep
+        )
     return qwen4_verify_step_fused(
         proj[:, :keep],
         conv_state,

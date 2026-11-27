@@ -596,3 +596,35 @@ def test_wide_causal_sdpa_keeps_probabilities_in_fp32(dtype):
     assert got.shape == ref.shape
     tolerance = 5e-2 if dtype == mx.bfloat16 else 5e-3
     assert mx.abs(got - ref).max().item() <= tolerance
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+@pytest.mark.parametrize("keys", [3, 7, 129, 256])
+def test_three_row_short_verify_attention_against_fp32(dtype, keys):
+    mx.random.seed(419 + keys)
+
+    def strided(heads, length):
+        array = mx.random.normal((1, heads, length + 17, 512)).astype(dtype)
+        return array[:, :, :length, 1::2]
+
+    q, k, v = strided(24, 3), strided(2, keys), strided(2, keys)
+    scale = HD**-0.5
+    kv = mx.repeat(k.astype(mx.float32), 12, axis=1)
+    scores = (q.astype(mx.float32) @ kv.swapaxes(-1, -2)) * scale
+    visible = mx.arange(keys)[None, :] <= mx.arange(keys - 3, keys)[:, None]
+    probs = mx.softmax(mx.where(visible, scores, -mx.inf), axis=-1)
+    reference = probs @ mx.repeat(v.astype(mx.float32), 12, axis=1)
+    old = (
+        _wide_causal_sdpa(q, mx.contiguous(k), mx.contiguous(v), scale)
+        if keys >= 8
+        else _chunked_causal_sdpa(q, k, v, scale, limit=2)
+    )
+    result = vs._short_causal_sdpa(q, k, v, scale)
+
+    def rel_l2(output):
+        error = mx.linalg.norm(output.astype(mx.float32) - reference)
+        return (error / mx.linalg.norm(reference)).item()
+
+    assert result.shape == q.shape and result.dtype == dtype
+    assert rel_l2(result) <= 1.05 * rel_l2(old) + 1e-6

@@ -1680,6 +1680,29 @@ def test_qwen4_fused_verify_equals_per_op_verify_and_rollback(
 
 
 @pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("rows", [2, 3])
+@pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
+def test_qwen4_short_verify_commits_first_row_without_repeating_verify(
+    monkeypatch, qwen4_verify, rows, dtype
+):
+    module = _real_qwen4_decode_module(((8, 64),) * 4, 11, dtype)
+    inputs = _verify_inputs(rows, 41, dtype)
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", False)
+    expected, expected_cache, expected_tx = _verify_block(
+        module, *inputs, row_exact=False
+    )
+    expected_tx.commit([1])
+
+    monkeypatch.setattr(prework_mod, "_QWEN4_VERIFY_DEFERRED_STATES", True)
+    actual, cache, tx = _verify_block(module, *inputs, row_exact=False)
+    tx.commit([1])
+    assert _same(expected, actual)
+    assert _same(expected_cache[0], cache[0])
+    assert _same(expected_cache[1], cache[1])
+    assert qwen4_verify == [rows, rows]
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
 @pytest.mark.parametrize("dtype", [mx.bfloat16, mx.float16])
 # One block per in-projection geometry: the two-row tile, then two, one and
 # three rows per threadgroup.

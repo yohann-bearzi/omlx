@@ -71,6 +71,93 @@ def _log_engaged(q_len: int) -> None:
         )
 
 
+# One threadgroup owns a query row and head. Each SIMD group streams a
+# different subsequence of causal keys. For a short cache the partial softmax
+# vectors fit in threadgroup memory, so their reduction needs no second launch.
+_SHORT_CAUSAL_SOURCE = """
+    constexpr uint simds = 8;
+    const uint lane = thread_index_in_simdgroup;
+    const uint group = simdgroup_index_in_threadgroup;
+    const uint head = threadgroup_position_in_grid.y;
+    const uint row = threadgroup_position_in_grid.z;
+    const int end = k_shape[2] - ROWS + int(row) + 1;
+    const device T* query = q + head * q_strides[1] + row * q_strides[2];
+    const device T* keys = k + (head / GQA) * k_strides[1];
+    const device T* values = v + (head / GQA) * v_strides[1];
+
+    float qv[8], numerator[8] = {};
+    for (uint i = 0; i < 8; ++i)
+        qv[i] = float(query[(lane * 8 + i) * q_strides[3]]) * float(scale);
+    float maximum = -INFINITY;
+    float denominator = 0.0f;
+    for (int key = int(group); key < end; key += simds) {
+        float score = 0.0f;
+        for (uint i = 0; i < 8; ++i) {
+            uint channel = lane * 8 + i;
+            score += qv[i] * float(keys[key * k_strides[2] + channel * k_strides[3]]);
+        }
+        score = simd_sum(score);
+        float next = max(maximum, score);
+        float rescale = fast::exp(maximum - next);
+        float prob = fast::exp(score - next);
+        for (uint i = 0; i < 8; ++i) {
+            float value = float(values[key * v_strides[2] + (lane*8+i) * v_strides[3]]);
+            numerator[i] = numerator[i] * rescale + prob * value;
+        }
+        denominator = denominator * rescale + prob;
+        maximum = next;
+    }
+
+    threadgroup float partial[simds][256];
+    threadgroup float maxima[simds], sums[simds];
+    if (lane == 0) {
+        maxima[group] = maximum;
+        sums[group] = denominator;
+    }
+    for (uint i = 0; i < 8; ++i)
+        partial[group][lane * 8 + i] = numerator[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint channel = group * 32 + lane;
+    float peak = -INFINITY;
+    for (uint j = 0; j < simds; ++j) peak = max(peak, maxima[j]);
+    float weighted = 0.0f, total = 0.0f;
+    for (uint j = 0; j < simds; ++j) {
+        float weight = fast::exp(maxima[j] - peak);
+        total += sums[j] * weight;
+        weighted += partial[j][channel] * weight;
+    }
+    out[(head * ROWS + row) * 256 + channel] = T(weighted / total);
+"""
+
+
+@functools.cache
+def _short_causal_kernel():
+    return mx.fast.metal_kernel(
+        name="omlx_verify_attn_short_causal",
+        input_names=["q", "k", "v", "scale"],
+        output_names=["out"],
+        source=_SHORT_CAUSAL_SOURCE,
+        ensure_row_contiguous=False,
+    )
+
+
+def _short_causal_sdpa(queries, keys, values, scale):
+    _, heads, rows, _ = queries.shape
+    return _short_causal_kernel()(
+        inputs=[queries, keys, values, mx.array(scale, dtype=mx.float32).reshape(())],
+        template=[
+            ("T", queries.dtype),
+            ("ROWS", rows),
+            ("GQA", heads // keys.shape[1]),
+        ],
+        grid=(256, heads, rows),
+        threadgroup=(256, 1, 1),
+        output_shapes=[queries.shape],
+        output_dtypes=[queries.dtype],
+    )[0]
+
+
 def _chunked_causal_sdpa(queries, keys, values, scale, limit: int):
     q_len = queries.shape[-2]
     kv_len = keys.shape[-2]
@@ -1022,6 +1109,15 @@ def apply_qwen35_verify_sdpa_split_patch() -> bool:
                         # the tile kernels below round probabilities
                         # differently.
                         out = row_exact_causal_sdpa(queries, keys, values, scale, limit)
+                    elif (
+                        q_len == 3
+                        and keys.shape[:2] == (1, 2)
+                        and keys.shape[2] <= 256
+                        and queries.shape[1] == 24
+                        and getattr(values, "shape", None) == keys.shape
+                        and values.dtype == keys.dtype
+                    ):
+                        out = _short_causal_sdpa(queries, keys, values, scale)
                     elif (
                         q_len <= _WIDE_MAX_ROWS
                         and keys.shape[-2] >= _GQA_MIN_KEYS
