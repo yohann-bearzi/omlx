@@ -453,6 +453,15 @@ class _FactsDelta:
     def empty(cls) -> _FactsDelta:
         return cls({}, {})
 
+    def invalidate(self, var_name: str) -> None:
+        prefix = f"{var_name}."
+        for key in list(self.recv_facts):
+            if key == var_name or key.startswith(prefix):
+                del self.recv_facts[key]
+        for key in list(self.seq_guards):
+            if key == var_name or key.startswith(prefix):
+                del self.seq_guards[key]
+
     def merge(self, other: _FactsDelta) -> _FactsDelta:
         recv: dict[str, set[str]] = {k: set(v) for k, v in self.recv_facts.items()}
         for k, v in other.recv_facts.items():
@@ -497,7 +506,13 @@ class _GuardEnv:
                 out.seq_guards.setdefault(aliased, set()).update(v)
         return out
 
-    def invalidate(self, var_name: str) -> None:
+    def invalidate(self, var_name: str, *, keep_taint: bool = False) -> None:
+        if var_name == "*":
+            self.recv_facts.clear()
+            self.seq_guards.clear()
+            self.layout_vars.clear()
+            self.seq_aliases.clear()
+            return
         prefix = f"{var_name}."
         for key in list(self.recv_facts):
             if key == var_name or key.startswith(prefix):
@@ -522,8 +537,9 @@ class _GuardEnv:
                 or target.startswith(prefix)
             ):
                 del self.seq_aliases[key]
-        self.var_reads_module_attr.pop(var_name, None)
-        self.var_unguarded_attr.pop(var_name, None)
+        if not keep_taint:
+            self.var_reads_module_attr.pop(var_name, None)
+            self.var_unguarded_attr.pop(var_name, None)
 
     def merge_taint_from(self, other: _GuardEnv) -> None:
         for var_name, flag in other.var_unguarded_attr.items():
@@ -614,21 +630,41 @@ def _extract_facts(
     if isinstance(expr, ast.BoolOp):
         if isinstance(expr.op, ast.And):
             pos = _FactsDelta.empty()
-            cur = env
+            cur = env.copy()
             for val in expr.values:
                 v_pos, _ = _extract_facts(val, info, cur)
+                for name in _named_expr_targets(val):
+                    pos.invalidate(name)
+                    v_pos.invalidate(name)
+                    cur.invalidate(name)
                 pos = pos.merge(v_pos)
                 cur = cur.apply(v_pos)
             return pos, _FactsDelta.empty()
         if isinstance(expr.op, ast.Or):
             neg = _FactsDelta.empty()
-            cur = env
+            cur = env.copy()
             for val in expr.values:
                 _, v_neg = _extract_facts(val, info, cur)
+                for name in _named_expr_targets(val):
+                    neg.invalidate(name)
+                    v_neg.invalidate(name)
+                    cur.invalidate(name)
                 neg = neg.merge(v_neg)
                 cur = cur.apply(v_neg)
             return _FactsDelta.empty(), neg
 
+    pos, neg = _extract_leaf_facts(expr, info, env)
+    for name in _named_expr_targets(expr):
+        pos.invalidate(name)
+        neg.invalidate(name)
+    return pos, neg
+
+
+def _extract_leaf_facts(
+    expr: ast.AST,
+    info: _FileInfo,
+    env: _GuardEnv,
+) -> tuple[_FactsDelta, _FactsDelta]:
     if isinstance(expr, ast.Name):
         # Local layout guard variable (e.g. `layout = self._uniform_affine_layout()`).
         layout_info = env.layout_vars.get(expr.id)
@@ -707,6 +743,8 @@ def _extract_facts(
                 comp = gen.generators[0]
                 if (
                     isinstance(comp.target, ast.Name)
+                    and not comp.ifs
+                    and not comp.is_async
                     and isinstance(gen.elt, ast.Call)
                     and isinstance(gen.elt.func, ast.Name)
                 ):
@@ -1388,7 +1426,8 @@ class _AuditVisitor:
             for alias in stmt.names:
                 if alias.asname:
                     out.invalidate(alias.asname)
-                elif alias.name != "*":
+                else:
+                    # Includes "*" from star-imports, handled by invalidate("*").
                     out.invalidate(alias.name.split(".", 1)[0])
             return out
 
@@ -1435,7 +1474,10 @@ class _AuditVisitor:
             cur = env.copy()
             self._visit_expr(stmt.test, cur)
             if stmt.msg is not None:
-                self._visit_expr(stmt.msg, cur.copy())
+                msg_env = cur.copy()
+                self._visit_expr(stmt.msg, msg_env)
+                for sink in self._taint_sinks:
+                    sink.merge_taint_from(msg_env)
             pos, _ = _extract_facts(stmt.test, self.info, cur)
             return cur.apply(pos)
 
@@ -1660,9 +1702,9 @@ class _AuditVisitor:
                 if is_trystar:
                     # PEP 654: multiple except* handlers may run in sequence.
                     if handler.name:
-                        handler_base.invalidate(handler.name)
+                        handler_base.invalidate(handler.name, keep_taint=True)
                     for name in h_body_assigned:
-                        handler_base.invalidate(name)
+                        handler_base.invalidate(name, keep_taint=True)
                     handler_base.merge_taint_from(h_taint)
 
             orelse_taint: _GuardEnv | None = None
@@ -1772,14 +1814,14 @@ class _AuditVisitor:
                     # PEP 634 commits pattern bindings before evaluating the guard,
                     # so a failing guard still leaves those names rebound for later cases.
                     for name in bound:
-                        running_env.invalidate(name)
+                        running_env.invalidate(name, keep_taint=True)
                         if subj_reads_attr:
                             running_env.var_reads_module_attr[name] = True
                         if subj_reads_unguarded:
                             running_env.var_unguarded_attr[name] = True
                     self._visit_expr(case.guard, c_env)
                     for name in _node_assigned_names(case.guard):
-                        running_env.invalidate(name)
+                        running_env.invalidate(name, keep_taint=True)
                     running_env.merge_taint_from(c_env)
                     pos, _ = _extract_facts(case.guard, self.info, c_env)
                     c_env = c_env.apply(pos)
@@ -1823,7 +1865,7 @@ class _AuditVisitor:
                 for val in expr.values:
                     self._visit_expr(val, cur)
                     for name in _named_expr_targets(val):
-                        env.invalidate(name)
+                        env.invalidate(name, keep_taint=True)
                     env.merge_taint_from(cur)
                     pos, _ = _extract_facts(val, self.info, cur)
                     cur = cur.apply(pos)
@@ -1833,7 +1875,7 @@ class _AuditVisitor:
                 for val in expr.values:
                     self._visit_expr(val, cur)
                     for name in _named_expr_targets(val):
-                        env.invalidate(name)
+                        env.invalidate(name, keep_taint=True)
                     env.merge_taint_from(cur)
                     _, neg = _extract_facts(val, self.info, cur)
                     cur = cur.apply(neg)
@@ -1915,7 +1957,15 @@ class _AuditVisitor:
         env: _GuardEnv,
     ) -> None:
         cur = env.copy()
-        for gen in generators:
+        body_walrus: set[str] = set()
+        for idx, gen in enumerate(generators):
+            if idx > 0:
+                body_walrus |= _named_expr_targets(gen.iter)
+            for if_clause in gen.ifs:
+                body_walrus |= _named_expr_targets(if_clause)
+        for elt in elts:
+            body_walrus |= _named_expr_targets(elt)
+        for idx, gen in enumerate(generators):
             self._visit_expr(gen.iter, cur)
             iter_reads_attr = _node_reads_module_attr(
                 gen.iter, cur.var_reads_module_attr
@@ -1929,6 +1979,9 @@ class _AuditVisitor:
                     facts = cur.seq_guards.get(cur.seq_aliases[iter_key])
                 if facts:
                     elem_facts = set(facts)
+            if idx == 0:
+                for name in body_walrus:
+                    cur.invalidate(name, keep_taint=True)
             self._bind_one_target(
                 gen.target,
                 cur,
@@ -1946,7 +1999,7 @@ class _AuditVisitor:
             self._visit_expr(elt, cur)
         # PEP 572: walrus targets inside a comprehension bind in the enclosing scope.
         for name in _named_expr_targets(comp_node):
-            env.invalidate(name)
+            env.invalidate(name, keep_taint=True)
             if cur.var_unguarded_attr.get(name):
                 env.var_unguarded_attr[name] = True
             if cur.var_reads_module_attr.get(name):
@@ -2165,7 +2218,8 @@ def _walk_assigned_names(root: ast.AST, names: set[str]) -> None:
             for alias in node.names:
                 if alias.asname:
                     names.add(alias.asname)
-                elif alias.name != "*":
+                else:
+                    # Includes "*" from star-imports, handled by invalidate("*").
                     names.add(alias.name.split(".", 1)[0])
 
 

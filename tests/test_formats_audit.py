@@ -181,6 +181,22 @@ class NonFormatSharded:
             first = self.shards[0]
             return mx.quantized_matmul(x, first.weight, first.scales, first.biases)
         return x
+
+    def run_lazy_not(self, x, layout=None):
+        if not layout:
+            layout = self._non_format_layout()
+        if layout:
+            first = self.shards[0]
+            return mx.quantized_matmul(x, first.weight, first.scales, first.biases)
+        return x
+
+    def run_lazy_eq_none(self, x, layout=None):
+        if layout == None:
+            layout = self._non_format_layout()
+        if layout:
+            first = self.shards[0]
+            return mx.quantized_matmul(x, first.weight, first.scales, first.biases)
+        return x
 """
     report = scan_source(source)
     assert report.ok
@@ -1149,6 +1165,447 @@ def f(a, b, m, other, xs, x, s, bi, ctx):
     nc_rules = _rules(nested_combo_src)
     assert "unguarded-weight" in nc_rules
     assert "unguarded-quantized-matmul" in nc_rules
+
+
+def test_walrus_after_guard_in_boolop_does_not_leak():
+    # HIGH-1: walrus rebinding after a guard in ast.And leaks stale guard if not invalidated.
+    and_leak_src = """
+import mlx.nn as nn
+def f(m, other):
+    if isinstance(m, nn.QuantizedLinear) and (m := other):
+        return m.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(and_leak_src)
+
+    # ast.Or equivalent: early-return neg path must not keep stale guard on rebound m.
+    or_leak_src = """
+import mlx.nn as nn
+def f(m, other):
+    if not isinstance(m, nn.QuantizedLinear) or not (m := other):
+        return None
+    return m.weight
+"""
+    assert "unguarded-weight" in _rules(or_leak_src)
+
+    # Guard AFTER walrus in ast.And / ast.Or remains clean (0 findings).
+    safe_src = """
+import mlx.nn as nn
+def f_and(m, other):
+    if (m := other) and isinstance(m, nn.QuantizedLinear):
+        return m.weight
+    return None
+
+def f_or(m, other):
+    if not (m := other) or not isinstance(m, nn.QuantizedLinear):
+        return None
+    return m.weight
+"""
+    safe_report = scan_source(safe_src)
+    assert safe_report.ok
+    assert safe_report.findings == ()
+
+    # Dotted receiver (self.proj) and seq_guards (self.shards) invalidated by `(self := other)`.
+    dotted_and_seq_src = """
+import mlx.core as mx
+import mlx.nn as nn
+
+def _is_aff(s):
+    return getattr(s, "mode", None) == "affine"
+
+class C:
+    def _uniform_affine_layout(self):
+        shards = self.shards
+        if not shards or not all(_is_aff(s) for s in shards):
+            return False
+        return (1, 1)
+
+    def f_attr_and(self, other):
+        if isinstance(self.proj, nn.QuantizedLinear) and (self := other):
+            return self.proj.weight
+        return None
+
+    def f_attr_or(self, other):
+        if not isinstance(self.proj, nn.QuantizedLinear) or not (self := other):
+            return None
+        return self.proj.weight
+
+    def f_seq_and(self, other):
+        layout = self._uniform_affine_layout()
+        if layout and (self := other):
+            first = self.shards[0]
+            return first.weight
+        return None
+
+    def f_seq_or(self, other):
+        layout = self._uniform_affine_layout()
+        if not layout or not (self := other):
+            return None
+        first = self.shards[0]
+        return first.weight
+
+    def f_all_seq_and(self, shards, other):
+        if all(_is_aff(s) for s in shards) and (shards := other):
+            first = shards[0]
+            return first.weight
+        return None
+
+    def f_all_self_seq_or(self, other):
+        if not all(_is_aff(s) for s in self.shards) or not (self := other):
+            return None
+        first = self.shards[0]
+        return first.weight
+"""
+    ds_report = scan_source(dotted_and_seq_src)
+    assert [(f.scope, f.rule) for f in ds_report.findings] == [
+        ("C.f_attr_and", "unguarded-weight"),
+        ("C.f_attr_or", "unguarded-weight"),
+        ("C.f_seq_and", "unguarded-weight"),
+        ("C.f_seq_or", "unguarded-weight"),
+        ("C.f_all_seq_and", "unguarded-weight"),
+        ("C.f_all_self_seq_or", "unguarded-weight"),
+    ]
+
+    # Leaf expression containing walrus (evaluated after checked target) must not guard.
+    leaf_walrus_src = """
+import mlx.nn as nn
+def f_isinstance(m, other):
+    if isinstance(m, (nn.QuantizedLinear, (m := other))):
+        return m.weight
+    return None
+
+def f_getattr_mode(m, other):
+    if getattr(m, "mode", (m := other)) == "affine":
+        return m.weight
+    return None
+"""
+    lw_report = scan_source(leaf_walrus_src)
+    assert [(f.scope, f.rule) for f in lw_report.findings] == [
+        ("f_isinstance", "unguarded-weight"),
+        ("f_getattr_mode", "unguarded-weight"),
+    ]
+
+
+def test_walrus_boolop_neighbour_positions():
+    # Every test/guard position that calls _extract_facts: While, Assert, IfExp,
+    # Match guard, Comprehension if/back-edge, and nested BoolOp.
+    flagged_src = """
+import mlx.nn as nn
+
+def f_while(m, other):
+    while isinstance(m, nn.QuantizedLinear) and (m := other):
+        return m.weight
+    return None
+
+def f_assert(m, other):
+    assert isinstance(m, nn.QuantizedLinear) and (m := other)
+    return m.weight
+
+def f_ifexp_and(m, other):
+    return m.weight if (isinstance(m, nn.QuantizedLinear) and (m := other)) else None
+
+def f_ifexp_or(m, other):
+    return None if (not isinstance(m, nn.QuantizedLinear) or not (m := other)) else m.weight
+
+def f_match_guard(x, other):
+    match x:
+        case y if isinstance(y, nn.QuantizedLinear) and (y := other):
+            return y.weight
+    return None
+
+def f_comp_if(m, other, xs):
+    return [m.weight for _ in xs if isinstance(m, nn.QuantizedLinear) and (m := other)]
+
+def f_comp_backedge(m, other, xs):
+    if isinstance(m, nn.QuantizedLinear):
+        return [(m.weight, (m := other)) for _ in xs]
+    return []
+
+def f_nested_boolop(m, other):
+    return (isinstance(m, nn.QuantizedLinear) and (m := other)) and m.weight
+"""
+    flagged_report = scan_source(flagged_src)
+    assert [(f.scope, f.rule) for f in flagged_report.findings] == [
+        ("f_while", "unguarded-weight"),
+        ("f_assert", "unguarded-weight"),
+        ("f_ifexp_and", "unguarded-weight"),
+        ("f_ifexp_or", "unguarded-weight"),
+        ("f_match_guard", "unguarded-weight"),
+        ("f_comp_if", "unguarded-weight"),
+        ("f_comp_backedge", "unguarded-weight"),
+        ("f_nested_boolop", "unguarded-weight"),
+    ]
+
+    # Filtered all(...) generator must not certify the whole sequence.
+    filtered_all_src = """
+import mlx.core as mx
+def _is_aff(s):
+    return getattr(s, "mode", None) == "affine"
+
+def f_filtered_all(shards, flag):
+    if all(_is_aff(s) for s in shards if flag):
+        first = shards[0]
+        return first.weight
+    return None
+"""
+    assert "unguarded-weight" in _rules(filtered_all_src)
+
+    # Safe walrus-before-guard equivalents stay clean (0 findings).
+    safe_neighbours_src = """
+import mlx.nn as nn
+
+def s_while(m, other):
+    while (m := other) and isinstance(m, nn.QuantizedLinear):
+        return m.weight
+    return None
+
+def s_assert(m, other):
+    assert (m := other) and isinstance(m, nn.QuantizedLinear)
+    return m.weight
+
+def s_ifexp(m, other):
+    return m.weight if ((m := other) and isinstance(m, nn.QuantizedLinear)) else None
+
+def s_match_guard(x, other):
+    match x:
+        case _ if (m := other) and isinstance(m, nn.QuantizedLinear):
+            return m.weight
+    return None
+
+def s_comp_if(m, other, xs):
+    return [m.weight for _ in xs if (m := other) and isinstance(m, nn.QuantizedLinear)]
+"""
+    sn_report = scan_source(safe_neighbours_src)
+    assert sn_report.ok
+    assert sn_report.findings == ()
+
+
+def test_conditional_rebind_preserves_prior_taint():
+    # HIGH-2: all four arbiter snippets + BoolOp(Or), TryStar body, Match guard walrus,
+    # dequantize(mode="affine"), and For/While/With/Try/IfExp conditional rebinds.
+    snippets = {
+        "boolop_and": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        if cond and (w := 0):
+            pass
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "boolop_or": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        if cond or (w := 0):
+            pass
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "comprehension": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        _ = [(w := 0) for _ in xs]
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "trystar_as": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, x, s, bi, work):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        try:
+            work()
+        except* ValueError as w:
+            pass
+        except* TypeError:
+            return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "trystar_body": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, x, s, bi, work):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        try:
+            work()
+        except* ValueError as w:
+            w = 0
+        except* TypeError:
+            return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "comp_backedge_taint": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        _ = [(mx.quantized_matmul(x, w, s, bi), (w := 0)) for _ in xs]
+    return x
+""",
+        "try_assert_msg_taint": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = 0
+        try:
+            assert False, (w := getattr(b, "weight", None))
+        except AssertionError:
+            return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "match_pattern": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, k, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        match k:
+            case [w] if False:
+                pass
+            case _:
+                return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "match_guard_walrus": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, k, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        match k:
+            case 1 if (w := 0):
+                pass
+            case _:
+                return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "for_rebind": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, xs, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        for _ in xs:
+            w = 0
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "while_or_walrus_in_body": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        while cond or (w := 0):
+            return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "with_rebind": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, ctx, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        with ctx():
+            w = 0
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "try_rebind": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, work, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        try:
+            work()
+            w = 0
+        except ValueError:
+            return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+        "ifexp_rebind": """
+import mlx.core as mx
+import mlx.nn as nn
+def f(a, b, cond, x, s, bi):
+    if isinstance(a, nn.QuantizedLinear):
+        w = getattr(b, "weight", None)
+        _ = (w := 0) if cond else 1
+        return mx.quantized_matmul(x, w, s, bi)
+    return x
+""",
+    }
+    for name, src in snippets.items():
+        assert "unguarded-quantized-matmul" in _rules(
+            src
+        ), f"{name} lost var_unguarded_attr taint"
+
+    # Also verify var_reads_module_attr survives conditional rebind for mode="affine".
+    deq_snippets = {
+        "boolop_and_deq": """
+import mlx.core as mx
+def f(layer, cond, s, b):
+    w = getattr(layer, "weight", None)
+    if cond and (w := 0):
+        pass
+    return mx.dequantize(w, s, b, mode="affine")
+""",
+        "comp_deq": """
+import mlx.core as mx
+def f(layer, xs, s, b):
+    w = getattr(layer, "weight", None)
+    _ = [(w := 0) for _ in xs]
+    return mx.dequantize(w, s, b, mode="affine")
+""",
+    }
+    for name, src in deq_snippets.items():
+        assert "unguarded-dequantize" in _rules(
+            src
+        ), f"{name} lost var_reads_module_attr taint"
+
+
+def test_module_star_import_invalidates_guards():
+    # LOW-1: straight-line module-level `from q import *` invalidates guards.
+    straight_src = """
+import mlx.nn as nn
+if isinstance(m, nn.QuantizedLinear):
+    from q import *
+    _ = m.weight
+"""
+    assert "unguarded-weight" in _rules(straight_src)
+
+    # Conditional module-level `from q import *` invalidates guards after `if`.
+    cond_src = """
+import mlx.nn as nn
+if isinstance(m, nn.QuantizedLinear):
+    if cond:
+        from q import *
+    _ = m.weight
+"""
+    assert "unguarded-weight" in _rules(cond_src)
+
+    # Star import must not erase pre-existing taint on local/module vars.
+    taint_src = """
+import mlx.core as mx
+import mlx.nn as nn
+if isinstance(a, nn.QuantizedLinear):
+    w = getattr(b, "weight", None)
+    from q import *
+    _ = mx.dequantize(w, s, bi, mode="affine")
+"""
+    assert "unguarded-dequantize" in _rules(taint_src)
 
 
 def test_pragmas_allow_and_fail_closed(tmp_path):
