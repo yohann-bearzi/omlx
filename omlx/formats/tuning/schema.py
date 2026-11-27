@@ -96,7 +96,8 @@ class DenseTilePolicy:
     vec_store: bool = False
     pad_bytes: int = 0
     gx: int = 0
-    sched: Literal["seg", "db"] = "seg"
+    sched: Literal["seg", "db", "register", "prefetch"] = "seg"
+    row_pad: int = 8
 
     def is_legal(
         self,
@@ -138,6 +139,49 @@ class DenseTilePolicy:
                 return False
         if min(self.bm, self.bn, self.bk, self.wm, self.wn) < 1:
             return False
+        if self.sched != "prefetch" and self.row_pad != 8:
+            return False
+        if self.sched in ("register", "prefetch"):
+            if (
+                self.backend != "nax"
+                or not self.align_n
+                or n % self.bn
+                or self.split_k < 1
+                or k % (self.bk * self.split_k)
+                or self.gx < 0
+                or self.pad_bytes < 0
+                or self.x_nreads != 4
+                or self.param_staging is not ParamStaging.GROUP_STEPS_COUNTER
+                or self.vec_store
+                or _elem_bytes(dtype) != 2
+            ):
+                return False
+            if self.sched == "register":
+                return (
+                    self.bm in (8, 16)
+                    and self.bn in (16, 32)
+                    and self.bk in (64, 128)
+                    and self.wm == 8
+                    and self.wn == self.split_k == 1
+                    and self.gx == self.pad_bytes == 0
+                    and 8 * self.bm * self.bn * 4 + kernels.table_bytes(face)
+                    <= _THREADGROUP_BYTES
+                )
+            if not (
+                self.bm == 16 * self.wm
+                and self.wn == 1
+                and self.wm in (4, 8)
+                and self.bn in (32, 64)
+                and self.bk == 64
+                and self.row_pad in (8, 16)
+            ):
+                return False
+            return (
+                4 * self.bn * (self.bk + self.row_pad)
+                + self.pad_bytes
+                + kernels.table_bytes(face)
+                <= _THREADGROUP_BYTES
+            )
         if self.bk not in _BKS or self.bm % 16 or self.bn % 16:
             return False
         # A simdgroup computes a fragment of BM/wm rows and BN/wn columns:
@@ -359,7 +403,7 @@ _DOT_MAX_ROWS = 16
 _ROUTED_WINDOW_COALESCE = ("none", "folded", "unfolded")
 _ROUTED_DOWN_MODES = ("fused", "split")
 _ROUTED_DOWN_RPS = (4, 8)
-_SCHEDS = ("seg", "db")
+_SCHEDS = ("seg", "db", "register", "prefetch")
 _CHIP_GEN_RE = re.compile(r"^applegpu_g(\d+)([a-z]?)(?:_|$)")
 _BKS = (32, 64, 128)
 _X_NREADS = (4, 8)

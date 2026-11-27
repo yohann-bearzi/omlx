@@ -2717,37 +2717,7 @@ def dump_metal(
                     "PAD / sizeof(T)];",
                     f"(PAD > {staged} ? PAD - {staged} : 0) / sizeof(T)];",
                 )
-            even_tn = (eff.bn // (16 * eff.wn)) % 2 == 0
-            sched = (
-                1
-                if (eff.sched == "db" and eff.align_n and k % eff.bk == 0 and even_tn)
-                else 0
-            )
-            gx = eff.gx
-            if gx > 0:
-                gx_eff = min(gx, n_rows)
-                tg_x = gx_eff
-                tg_y = ((n_rows + gx_eff - 1) // gx_eff) * n_cols
-            else:
-                tg_x = n_cols
-                tg_y = n_rows
-            template = [
-                ("T", dt),
-                ("K", k),
-                ("BM", eff.bm),
-                ("BN", eff.bn),
-                ("BK", eff.bk),
-                ("WM", eff.wm),
-                ("WN", eff.wn),
-                ("ALIGN_N", eff.align_n),
-                ("SCHED", sched),
-                ("GX", gx),
-                ("PAD", eff.pad_bytes),
-                ("SPLIT_K", split_k_val),
-                ("K_PART", k_part_val),
-            ]
-            grid = (tg_x * 32, tg_y * eff.wn, eff.wm * split_k_val)
-            threadgroup = (32, eff.wn, eff.wm)
+            template, grid, threadgroup = tile_dense._nax_spec(eff, k, n, rows, dt)
         else:
             kernel_name = f"omlx_steel_dense_{face.key}"
             skeleton_header = tile_dense._STEEL_HEADER

@@ -344,7 +344,8 @@ template <
     int BN,
     int BK,
     int LT,
-    bool ALIGN_N>
+    bool ALIGN_N,
+    int STRIDE = BK + 16 / sizeof(T)>
 struct NaxWeightLoader {
   using R = typename F::template Runs<K>;
   using P = typename R::P;
@@ -355,7 +356,7 @@ struct NaxWeightLoader {
   static constant constexpr int kGV = kVPT < R::GROUP ? kVPT : R::GROUP;
   static constant constexpr int kNG = kVPT / kGV;
   static constant constexpr int kRPG = kGV / R::RUN;
-  static constant constexpr int kBKP = BK + 16 / sizeof(T);
+  static constant constexpr int kBKP = STRIDE;
   static_assert(LT % BN == 0 && BK % kTPR == 0, "nax loader tile split");
   static_assert(kRuns * R::RUN == kVPT && kNG * kRPG == kRuns, "nax group split");
 
@@ -816,6 +817,189 @@ METAL_FUNC void dense_nax(
   }
 }
 
+// An eight-code run fills one lane of a 16 x BN x 32 cooperative operation.
+// All lanes apply the same K permutation to both operands. Eight SIMD groups
+// cover disjoint K blocks and reduce FP32 fragments before the output cast.
+template <typename T, int K, int BM, int BN, int BK, bool COMPENSATE, typename F>
+METAL_FUNC void register_tile(
+    const F w, const device T* x, device T* y, int rows, int n,
+    threadgroup float4* partials, uint3 group, uint sg, uint lane) {
+  using R = typename F::template Runs<K>;
+  constexpr int tiles = BN / 16, WK = 8, values = BK / 4;
+  static_assert(BM == 8 || BM == 16, "one row fragment");
+  constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
+      16, BN, 32, false, true, true,
+      mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate);
+  mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
+  auto a = op.template get_left_input_cooperative_tensor<T, T, float>();
+  auto b = op.template get_right_input_cooperative_tensor<T, T, float>();
+  auto residual = op.template get_right_input_cooperative_tensor<T, T, float>();
+  auto acc = op.template get_destination_cooperative_tensor<
+      metal::remove_addrspace_t<decltype(a)>, metal::remove_addrspace_t<decltype(b)>, float>();
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < 8 * tiles; ++i) acc[i] = 0.f;
+
+  const short2 sc = BaseNAXFrag::get_coord();
+  const int row0 = group.y * BM, col0 = group.x * BN;
+  const int live = min(BM, rows - row0);
+  const int lane_offset = (sc.x / 4) * values;
+  for (int kb = int(sg) * BK; kb < K; kb += WK * BK) {
+    const int k = kb + lane_offset;
+    typename R::Codes codes[2 * tiles][values / R::RUN];
+    constexpr short groups = (values + R::GROUP - 1) / R::GROUP;
+    typename R::P params[2 * tiles][groups];
+    STEEL_PRAGMA_UNROLL
+    for (short h = 0; h < 2 * tiles; ++h) {
+      const R reader(w, size_t(col0 + 8 * h + sc.y));
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < values / R::RUN; ++i)
+        codes[h][i] = reader.fetch(k / R::RUN + i);
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < groups; ++i)
+        params[h][i] = reader.params(k / R::GROUP + i);
+    }
+    STEEL_PRAGMA_UNROLL
+    for (short run = 0; run < values / R::RUN; ++run) {
+      STEEL_PRAGMA_UNROLL
+      for (short h = 0; h < 2; ++h) {
+        const int row = 8 * h + sc.y;
+        const vec<T, 8> xv = (8 * h < BM && row < live)
+            ? *(const device vec<T, 8>*)(x + size_t(row0 + row) * K + k + run * 8)
+            : vec<T, 8>(0);
+        STEEL_PRAGMA_UNROLL
+        for (short i = 0; i < 8; ++i) {
+          const short e = (i / 4) * 8 + h * 4 + i % 4;
+          a[e] = xv[i];
+          STEEL_PRAGMA_UNROLL
+          for (short j = 0; j < tiles; ++j) {
+            const short wr = 2 * j + h;
+            const short slot = (i / 4 * tiles + j) * 8 + h * 4 + i % 4;
+            const float weight = R::weight(params[wr][run * 8 / R::GROUP], codes[wr][run], i);
+            const T high = T(weight);
+            b[slot] = high;
+            if constexpr (COMPENSATE) residual[slot] = T(weight - float(high));
+          }
+        }
+      }
+      op.run(a, b, acc);
+      if constexpr (COMPENSATE) op.run(a, residual, acc);
+    }
+  }
+
+  STEEL_PRAGMA_UNROLL
+  for (short h = 0; h < BM / 8; ++h) {
+    STEEL_PRAGMA_UNROLL
+    for (short j = 0; j < tiles; ++j) {
+      float4 v;
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < 4; ++i) v[i] = acc[8 * j + 4 * h + i];
+      partials[(sg * BM + h * 8 + sc.y) * (BN / 4) + j * 4 + sc.x / 4] = v;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint v = sg * 32 + lane;
+  if (v < uint(live * (BN / 4))) {
+    float4 sum = 0;
+    STEEL_PRAGMA_UNROLL
+    for (short i = 0; i < WK; ++i) sum += partials[i * BM * (BN / 4) + v];
+    *(device vec<T, 4>*)(y + size_t(row0 + v / (BN / 4)) * n + col0 + (v % (BN / 4)) * 4) =
+        vec<T, 4>(sum);
+  }
+}
+
+// Each SIMD group owns 16 rows and the full width of the threadgroup tile.
+// Keep two generations of A in registers. Dequantize the prefetched packed
+// weights into the alternate shared buffer while the current tile is in use.
+template <typename T, typename U, int K, int BM, int BN, int BK, int WM,
+          int STRIDE, int SPLIT_K, typename F>
+METAL_FUNC void prefetch_tile(
+    const F w, const device T* x, device U* y, int rows, int n,
+    threadgroup T* ws, uint3 group, uint sg, uint lane) {
+  constexpr int blocks = K / (SPLIT_K * BK), tile_size = BN * STRIDE;
+  constexpr int threads = WM * 32;
+  constexpr short fragments = BK / 16;
+  const int row0 = int(group.y) * BM, col0 = int(group.x) * BN;
+  const int tile_rows = min(BM, rows - row0);
+  const int live = min(16, tile_rows - int(sg) * 16);
+  const short2 sc = BaseNAXFrag::get_coord();
+  const int start = int(group.z) * blocks;
+  NaxWeightLoader<T, F, K, BN, BK, threads, true, STRIDE> reader(
+      w, size_t(col0), BN, sg * 32 + lane);
+  const device T* xp[2];
+  STEEL_PRAGMA_UNROLL
+  for (short h = 0; h < 2; ++h) {
+    const int r = int(sg) * 16 + h * 8 + int(sc.y);
+    const int row = min(r, tile_rows - 1);
+    xp[h] = x + size_t(row0 + row) * K + start * BK + sc.x;
+  }
+
+  NAXTile<float, 1, BN / 16> d;
+  d.clear();
+  vec<T, 4> current[fragments][2], next[fragments][2];
+  reader.fetch(start);
+  reader.store(ws);
+  if (live > 0) {
+    STEEL_PRAGMA_UNROLL
+    for (short f = 0; f < fragments; ++f) {
+      STEEL_PRAGMA_UNROLL
+      for (short h = 0; h < 2; ++h)
+        current[f][h] = *(const device vec<T, 4>*)(xp[h] + 16 * f);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  STEEL_PRAGMA_NO_UNROLL
+  for (int step = 0; step < blocks; ++step) {
+    const bool more = step + 1 < blocks;
+    if (more) reader.fetch(start + step + 1);
+    if (live > 0) {
+      const int next_k = (step + int(more)) * BK;
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < fragments; ++f) {
+        STEEL_PRAGMA_UNROLL
+        for (short h = 0; h < 2; ++h)
+          next[f][h] = *(const device vec<T, 4>*)(xp[h] + next_k + 16 * f);
+      }
+      const threadgroup T* weights = ws + (step & 1) * tile_size + sc.y * STRIDE + sc.x;
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < fragments; ++f) {
+        BaseNAXFrag::dtype_frag_t<T> a;
+        STEEL_PRAGMA_UNROLL
+        for (short h = 0; h < 2; ++h) {
+          STEEL_PRAGMA_UNROLL
+          for (short c = 0; c < 4; ++c) a[h * 4 + c] = current[f][h][c];
+        }
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < BN / 16; j += 2) {
+          BaseNAXFrag::dtype_frag_t<T> b[2];
+          STEEL_PRAGMA_UNROLL
+          for (short col = 0; col < 2; ++col) {
+            STEEL_PRAGMA_UNROLL
+            for (short h = 0; h < 2; ++h) {
+              const vec<T, 4> v = *(const threadgroup vec<T, 4>*)(
+                  weights + ((j + col) * 16 + h * 8) * STRIDE + 16 * f);
+              STEEL_PRAGMA_UNROLL
+              for (short c = 0; c < 4; ++c) b[col][h * 4 + c] = v[c];
+            }
+          }
+          BaseNAXFrag::mma(d.frag_at(0, j), d.frag_at(0, j + 1),
+              a, metal::bool_constant<false>{}, b[0], b[1], metal::bool_constant<true>{});
+        }
+      }
+      STEEL_PRAGMA_UNROLL
+      for (short f = 0; f < fragments; ++f) {
+        STEEL_PRAGMA_UNROLL
+        for (short h = 0; h < 2; ++h) current[f][h] = next[f][h];
+      }
+    }
+    if (more) reader.store(ws + ((step + 1) & 1) * tile_size);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (live > 0) {
+    device U* out = y + (size_t(group.z) * rows + row0 + sg * 16) * n + col0;
+    d.store_rows(out, n, live);
+  }
+}
+
 }  // namespace omlx_nax_dense
 """
 
@@ -824,14 +1008,48 @@ _NAX_SOURCE = """
     for (int d = 0; d < x_ndim - 1; ++d) {
       rows *= x_shape[d];
     }
-    constexpr int kBKP = BK + 16 / sizeof(T);
-    threadgroup T Ws[(SCHED == 1 ? 2 : 1) * BN * kBKP + PAD / sizeof(T)];
-    omlx_nax_dense::dense_nax<
-        T, metal::conditional_t<(SPLIT_K > 1), float, T>,
-        K, BM, BN, BK, WM, WN, ALIGN_N, SCHED, GX, SPLIT_K, K_PART>(
-        x, w, y, rows, int(w_weight_shape[0]), Ws,
-        threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
-        thread_index_in_simdgroup);
+    if constexpr (SCHED == 2) {
+      threadgroup float4 partials[8 * BM * (BN / 4)];
+      if constexpr (omlx_tile_face<decltype(w), K>::value) {
+        // Upstream's unaligned few-row matvec decodes weights in FP32.
+        // Retain the rounding residual for that input layout.
+        if (BM == 8 && rows < 8 &&
+            (!__builtin_is_aligned(x, 16) || !__builtin_is_aligned(w_weight, 16))) {
+          omlx_nax_dense::register_tile<T, K, BM, BN, BK, true>(
+              w, x, y, rows, int(w_weight_shape[0]), partials, threadgroup_position_in_grid,
+              simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        } else {
+          omlx_nax_dense::register_tile<T, K, BM, BN, BK, false>(
+              w, x, y, rows, int(w_weight_shape[0]), partials, threadgroup_position_in_grid,
+              simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+        }
+      }
+    } else if constexpr (SCHED == 3) {
+      constexpr int stride = BK + ROW_PAD;
+      threadgroup T ws[2 * BN * stride + PAD / sizeof(T)];
+      uint3 gid = threadgroup_position_in_grid;
+      if constexpr (GX > 0) {
+        const uint cols = uint(w_weight_shape[0]) / BN;
+        const uint m = gid.y / cols * GX + gid.x;
+        gid = uint3(gid.y % cols, m, gid.z);
+        if (m * BM >= uint(rows)) return;
+      }
+      if constexpr (omlx_tile_face<decltype(w), K>::value) {
+        omlx_nax_dense::prefetch_tile<
+            T, metal::conditional_t<(SPLIT_K > 1), float, T>, K, BM, BN, BK,
+            WM, stride, SPLIT_K>(w, x, y, rows, int(w_weight_shape[0]), ws,
+                gid, simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
+      }
+    } else {
+      constexpr int kBKP = BK + 16 / sizeof(T);
+      threadgroup T Ws[(SCHED == 1 ? 2 : 1) * BN * kBKP + PAD / sizeof(T)];
+      omlx_nax_dense::dense_nax<
+          T, metal::conditional_t<(SPLIT_K > 1), float, T>,
+          K, BM, BN, BK, WM, WN, ALIGN_N, SCHED, GX, SPLIT_K, K_PART>(
+          x, w, y, rows, int(w_weight_shape[0]), Ws,
+          threadgroup_position_in_grid, simdgroup_index_in_threadgroup,
+          thread_index_in_simdgroup);
+    }
 """
 
 
@@ -1086,6 +1304,39 @@ def _default_steel_policy(rows: int, n: int, k: int) -> DenseTilePolicy:
 
 def _default_nax_policy(bits: int, rows: int, n: int, k: int) -> DenseTilePolicy:
     """Measured M5 Max (applegpu_g17s) NAX parity floor."""
+    if bits == 4 and n == k and n in (2048, 2560) and 4 <= rows <= 512:
+        if rows <= 16:
+            return DenseTilePolicy(
+                "nax",
+                8 if rows <= 8 else 16,
+                32 if n == 2048 and rows > 8 else 16,
+                128 if n == 2048 else 64,
+                8,
+                1,
+                sched="register",
+            )
+        if rows <= 128:
+            split = 2 if rows <= 64 else 1
+            return DenseTilePolicy(
+                "nax", 64, 32, 64, 4, 1, split_k=split, sched="prefetch"
+            )
+        if n == 2048:
+            bm, bn = (128, 64) if rows <= 256 else (64, 32)
+            return DenseTilePolicy(
+                "nax", bm, bn, 64, bm // 16, 1, gx=32, sched="prefetch"
+            )
+        return DenseTilePolicy(
+            "nax",
+            64,
+            64,
+            64,
+            4,
+            1,
+            sched="prefetch",
+            row_pad=8 if rows <= 256 else 16,
+            gx=2 if rows <= 256 else 32,
+            pad_bytes=3072 if rows <= 256 else 4096,
+        )
     align_n = n % 64 == 0
     align_k64 = k % 64 == 0
     if rows <= 32:
@@ -1177,9 +1428,9 @@ def _resolve_cell(
     """One schedule bucket's route, resolved from the DATA once (rule 28).
 
     Measured entries win across dense_tile, mma_tile, and msg_tile (ranked by
-    tuning.match_rank); an unmeasured bucket below 17 rows takes MLX's own
-    matmul for an affine face, the format-generic wide route for a plugin when
-    legal, else the Dot plan; never the prefill default tiles (review 3 H4).
+    tuning.match_rank). At the measured M5 q4 widths the register schedule
+    also serves faces without a table entry. Other small buckets retain
+    their affine, wide, or Dot fallback.
     """
     k, n = layer.input_dims, layer.output_dims
     bound = sample if hi is None else hi
@@ -1252,6 +1503,12 @@ def _resolve_cell(
             ),
         )
         return DenseRoute(hi, backend, chosen)
+    if tensor_units and 4 <= lo <= bound <= 16:
+        default = _default_nax_policy(layer.bits, sample, n, k)
+        if default.sched == "register" and default.is_legal(
+            face, k, n, bound, chip, dtype
+        ):
+            return DenseRoute(hi, "nax", default)
     if hi is not None and hi <= 16:
         # Rule 28 / lead H4: unmeasured below-17 rows take MLX's matmul for
         # an affine face, the format-generic wide route for a plugin when
@@ -1456,6 +1713,45 @@ def _split_k_geometry(k: int, bk: int, requested: int) -> tuple[int, int]:
     return (k + k_part - 1) // k_part, k_part
 
 
+def _nax_spec(policy, k, n, rows, dtype):
+    bm, bn, bk = policy.bm, policy.bn, policy.bk
+    wm, wn = policy.wm, policy.wn
+    aligned = policy.align_n and n % bn == 0
+    split, part = _split_k_geometry(k, bk, policy.split_k)
+    sched = {"seg": 0, "db": 1, "register": 2, "prefetch": 3}[policy.sched]
+    if sched == 1 and (not aligned or k % bk or (bn // (16 * wn)) % 2):
+        sched = 0
+    n_rows, n_cols = (rows + bm - 1) // bm, (n + bn - 1) // bn
+    gx = policy.gx
+    if gx:
+        x = min(gx, n_rows)
+        y = (n_rows + x - 1) // x * n_cols
+    else:
+        x, y = n_cols, n_rows
+    if sched in (2, 3):
+        threads = 32 * wm
+        grid, tg = (x * threads, y, split), (threads, 1, 1)
+    else:
+        grid, tg = (x * 32, y * wn, wm * split), (32, wn, wm)
+    template = [
+        ("T", dtype),
+        ("K", k),
+        ("BM", bm),
+        ("BN", bn),
+        ("BK", bk),
+        ("WM", wm),
+        ("WN", wn),
+        ("ALIGN_N", aligned),
+        ("SCHED", sched),
+        ("GX", gx),
+        ("PAD", policy.pad_bytes),
+        ("SPLIT_K", split),
+        ("K_PART", part),
+        ("ROW_PAD", policy.row_pad),
+    ]
+    return template, grid, tg
+
+
 def _launch(mm, policy: DenseTilePolicy, x: mx.array, operands: tuple) -> mx.array:
     """Launch the unified steel or NAX dense kernel with zero meta/params."""
     k = x.shape[-1]
@@ -1470,38 +1766,13 @@ def _launch(mm, policy: DenseTilePolicy, x: mx.array, operands: tuple) -> mx.arr
     n_rows = (rows + bm - 1) // bm
 
     if policy.backend == "nax":
-        even_tn = (bn // (16 * wn)) % 2 == 0
-        sched = (
-            1 if (policy.sched == "db" and align_n and k % bk == 0 and even_tn) else 0
-        )
-        split_k, k_part = _split_k_geometry(k, bk, policy.split_k)
-        gx = policy.gx
-        if gx > 0:
-            gx_eff = min(gx, n_rows)
-            tg_x = gx_eff
-            tg_y = ((n_rows + gx_eff - 1) // gx_eff) * n_cols
-        else:
-            tg_x = n_cols
-            tg_y = n_rows
+        template, grid, threadgroup = _nax_spec(policy, k, n, rows, dtype)
+        split_k, _ = _split_k_geometry(k, bk, policy.split_k)
         out = mm(
             inputs=[x, *operands],
-            template=[
-                ("T", dtype),
-                ("K", k),
-                ("BM", bm),
-                ("BN", bn),
-                ("BK", bk),
-                ("WM", wm),
-                ("WN", wn),
-                ("ALIGN_N", align_n),
-                ("SCHED", sched),
-                ("GX", gx),
-                ("PAD", policy.pad_bytes),
-                ("SPLIT_K", split_k),
-                ("K_PART", k_part),
-            ],
-            grid=(tg_x * 32, tg_y * wn, wm * split_k),
-            threadgroup=(32, wn, wm),
+            template=template,
+            grid=grid,
+            threadgroup=threadgroup,
             output_shapes=[(split_k, rows, n) if split_k > 1 else out_shape],
             output_dtypes=[mx.float32 if split_k > 1 else dtype],
         )[0]
@@ -1565,6 +1836,8 @@ def _metal_key(plan, x, policy) -> tuple:
 
 
 def _effective_policy(policy: DenseTilePolicy, k: int, n: int) -> DenseTilePolicy:
+    if policy.sched in ("prefetch", "register"):
+        return policy
     align_n = policy.align_n and (n % policy.bn == 0)
     even_tn = policy.backend == "nax" and (policy.bn // (16 * policy.wn)) % 2 == 0
     sched_eff = (
@@ -1886,42 +2159,9 @@ def warm_specs(
             )
             out_dtype = mx.float32 if split_k > 1 else dtype
             if eff.backend == "nax":
-                even_tn = (bn // (16 * wn)) % 2 == 0
-                sched = (
-                    1
-                    if (
-                        eff.sched == "db"
-                        and eff.align_n
-                        and plan.k % bk == 0
-                        and even_tn
-                    )
-                    else 0
+                template, grid, threadgroup = _nax_spec(
+                    eff, plan.k, stand_n, stand_rows, dtype
                 )
-                gx = eff.gx
-                if gx > 0:
-                    gx_eff = min(gx, n_rows)
-                    tg_x = gx_eff
-                    tg_y = ((n_rows + gx_eff - 1) // gx_eff) * n_cols
-                else:
-                    tg_x = n_cols
-                    tg_y = n_rows
-                template = [
-                    ("T", dtype),
-                    ("K", plan.k),
-                    ("BM", bm),
-                    ("BN", bn),
-                    ("BK", bk),
-                    ("WM", wm),
-                    ("WN", wn),
-                    ("ALIGN_N", eff.align_n),
-                    ("SCHED", sched),
-                    ("GX", gx),
-                    ("PAD", eff.pad_bytes),
-                    ("SPLIT_K", split_k),
-                    ("K_PART", k_part),
-                ]
-                grid = (tg_x * 32, tg_y * wn, wm * split_k)
-                threadgroup = (32, wn, wm)
             else:
                 tgp = wm * wn * 32
                 cache_p = eff.param_staging is ParamStaging.GROUP_STEPS_COUNTER

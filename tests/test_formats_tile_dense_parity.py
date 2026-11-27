@@ -79,7 +79,7 @@ def _dot(array: mx.array) -> str:
     return buf.getvalue()
 
 
-_DENSE_DIGEST = "49 da633342e9652f26f704405bce666bf2ac84512898a0ddc1890eea6bb05473e7"
+_DENSE_DIGEST = "49 e7a95a88fb60ed5685a812e25fb58c7bb4c43c883d030c68b1cc64a6e9109401"
 
 
 def test_dense_skeleton_source_digest_is_pinned():
@@ -1116,9 +1116,9 @@ def test_in_tree_tuning_tables_serve_m3_m5_gate2_shapes_and_44_52_rows_range():
     p512_m5 = tile_dense.policy_for(plan_m5, 512, mx.bfloat16)
     assert (p512_m5.backend, p512_m5.bm, p512_m5.bn, p512_m5.bk, p512_m5.gx) == (
         "nax",
-        128,
+        64,
         32,
-        128,
+        64,
         32,
     )
 
@@ -1926,3 +1926,19 @@ def test_m3_output_projection_17_24_bf16_mlx_fp16_steel(monkeypatch):
                 else:
                     assert route.backend == "steel" and route.policy.split_k == 12
                     _assert_c2(got, want, x, quantized)
+
+
+@needs_nax
+@pytest.mark.parametrize("width", (2048, 2560))
+def test_m5_square_q4_registered_and_prefill_tiles(width):
+    stock, layer = _layer(width, width, 4, 64)
+    plan = tile_dense.build_plan(layer, tensor_units=True, chip="applegpu_g17s_c40")
+    for rows in (4, 8, 16, 33, 64, 128, 256, 512):
+        policy = tile_dense.policy_for(plan, rows, mx.bfloat16)
+        assert isinstance(policy, tuning.DenseTilePolicy) and policy.backend == "nax"
+        assert policy.sched == ("register" if rows <= 16 else "prefetch")
+        kernel = tile_dense._kernel(plan.face, policy)
+        for offset in (0, 1):
+            x = _x((rows * width + offset,))[offset:].reshape(rows, width)
+            out = tile_dense._launch(kernel, policy, x, plan.operands)
+            _assert_c2(out, stock(x), x, stock)
