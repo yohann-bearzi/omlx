@@ -2217,11 +2217,11 @@ def test_warm_report_registers_dense_names_under_tile_dense_lock(monkeypatch):
 
     tracker = _TrackingLock()
     real_build = tile_dense._build
-    build_calls: list[tuple[str, bool]] = []
+    build_calls: list[tuple[str, bool, bool]] = []
 
-    def spy_build(face, backend):
-        build_calls.append((backend, tracker.depth > 0))
-        return real_build(face, backend)
+    def spy_build(face, backend, interleaved_weights=False):
+        build_calls.append((backend, interleaved_weights, tracker.depth > 0))
+        return real_build(face, backend, interleaved_weights)
 
     monkeypatch.setattr(tile_dense, "_lock", tracker)
     monkeypatch.setattr(tile_dense, "_build", spy_build)
@@ -2229,15 +2229,19 @@ def test_warm_report_registers_dense_names_under_tile_dense_lock(monkeypatch):
     layer = debug.make_layer("affine", bits=4, group_size=64, k=256, n=256)
     raw_map: dict[int, str] = {}
     debug._register_raw_names_for_layer(layer, tensor_units=True, raw_name_map=raw_map)
-    assert [b for b, _ in build_calls] == ["nax", "steel"]
-    assert all(held for _, held in build_calls), build_calls
-    # 2 tile_dense._build calls + 1 tile_dense._splitk_accum_kernel call.
-    assert tracker.enters == 3 and tracker.exits == 3 and tracker.depth == 0
+    assert [(b, iw) for b, iw, _ in build_calls] == [
+        ("nax", False),
+        ("nax", True),
+        ("steel", False),
+    ]
+    assert all(held for _, _, held in build_calls), build_calls
+    # 3 tile_dense._build calls (nax, interleaved nax, steel) + 1 _splitk_accum_kernel.
+    assert tracker.enters == 4 and tracker.exits == 4 and tracker.depth == 0
 
     build_calls.clear()
     debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
     assert len(build_calls) >= 1
-    assert all(held for _, held in build_calls), build_calls
+    assert all(held for _, _, held in build_calls), build_calls
     assert tracker.depth == 0
 
 
@@ -2807,3 +2811,92 @@ def test_dump_metal_forced_dense_skips_illegal_and_stale_entries(tmp_path, monke
         )
     finally:
         tuning.reset_cache()
+
+
+def test_tile_dense_build_normalizes_interleaved_default_and_2arg_spy(monkeypatch):
+    face = affine.tile_face(4, 64, mx.bfloat16)
+    steel_2 = tile_dense._build(face, "steel")
+    assert steel_2 is not None
+    assert tile_dense._build(face, "steel", False) is steel_2
+    assert tile_dense._build(face, "steel", interleaved_weights=False) is steel_2
+    assert tile_dense._build(face, "steel", True) is steel_2
+    assert (
+        tile_dense._kernel(face, tuning.DenseTilePolicy("steel", 32, 32, 32)) is steel_2
+    )
+
+    nax_2 = tile_dense._build(face, "nax")
+    if nax_2 is not None:
+        assert tile_dense._build(face, "nax", False) is nax_2
+        assert tile_dense._build(face, "nax", interleaved_weights=False) is nax_2
+        nax_il = tile_dense._build(face, "nax", True)
+        assert nax_il is not None and nax_il is not nax_2
+        assert tile_dense._build(face, "nax", interleaved_weights=True) is nax_il
+        reg_pol = tuning.DenseTilePolicy("nax", 8, 16, 64, 8, 1, sched="register")
+        il_pol = tuning.DenseTilePolicy(
+            "nax",
+            64,
+            64,
+            64,
+            4,
+            1,
+            sched="prefetch",
+            row_pad=0,
+            interleaved_weights=True,
+        )
+        assert tile_dense._kernel(face, reg_pol) is nax_2
+        assert tile_dense._kernel(face, il_pol) is nax_il
+
+    # A 2-argument _build spy must match non-interleaved _kernel calls.
+    seen: list[str] = []
+    real_build = tile_dense._build
+
+    def spy_2arg(f, backend):
+        seen.append(backend)
+        return real_build(f, backend)
+
+    monkeypatch.setattr(tile_dense, "_build", spy_2arg)
+    assert (
+        tile_dense._kernel(face, tuning.DenseTilePolicy("steel", 32, 32, 32)) is steel_2
+    )
+    if nax_2 is not None:
+        reg_pol = tuning.DenseTilePolicy("nax", 8, 16, 64, 8, 1, sched="register")
+        assert tile_dense._kernel(face, reg_pol) is nax_2
+        assert seen == ["steel", "nax"]
+    else:
+        assert seen == ["steel"]
+
+
+def test_warm_report_and_explain_name_register_and_interleaved_nax_kernels(
+    monkeypatch,
+):
+    chip = "applegpu_g17s_c40"
+    layer = debug.make_layer("affine", bits=4, group_size=64, k=2560, n=2560)
+    tile_face = formats.tile(layer, 2560, 2560)
+    assert tile_face is not None
+
+    exp = debug.explain(layer, rows=(4, 8, 256), dtype=mx.bfloat16, chip=chip)
+    by_rows = {t.rows: t for t in exp.row_traces}
+    assert by_rows[4].selected_backend == "nax"
+    assert by_rows[4].kernel_name == f"omlx_nax_dense_{tile_face.key}"
+    assert by_rows[8].selected_backend == "nax"
+    assert by_rows[8].kernel_name == f"omlx_nax_dense_{tile_face.key}"
+    assert by_rows[256].selected_backend == "nax"
+    assert by_rows[256].kernel_name == f"omlx_nax_interleaved_dense_{tile_face.key}"
+
+    oqh_layer = debug.make_layer("oqh", bits=4, group_size=128, k=2560, n=2560)
+    oqh_face = formats.tile(oqh_layer, 2560, 2560)
+    assert oqh_face is not None
+    oqh_exp = debug.explain(oqh_layer, rows=(4,), dtype=mx.bfloat16, chip=chip)
+    oqh_t = oqh_exp.row_traces[0]
+    assert oqh_t.selected_backend == "nax"
+    assert oqh_t.decision_source == "parity_default"
+    assert oqh_t.kernel_name == f"omlx_nax_dense_{oqh_face.key}"
+
+    if tile_dense._nax_headers() is not None:
+        monkeypatch.setattr(linear, "_nax_host", lambda: True)
+        monkeypatch.setattr(tuning, "current_chip", lambda: chip)
+        rep = debug.warm_report(layer, dtypes=(mx.bfloat16,), compile=False)
+        names = [p.kernel_name for p in rep.pipelines]
+        assert f"omlx_nax_dense_{tile_face.key}" in names, names
+        assert f"omlx_nax_interleaved_dense_{tile_face.key}" in names, names
+        assert all(n != "omlx_unknown_kernel" for n in names), names

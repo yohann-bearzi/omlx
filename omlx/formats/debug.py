@@ -1081,6 +1081,21 @@ def _trace_resolve_cell(
             declines,
         )
 
+    if tensor_units and 4 <= lo <= bound <= 16:
+        default = tile_dense._default_nax_policy(layer.bits, sample, n, k)
+        if default.sched == "register":
+            if default.is_legal(face, k, n, bound, chip, dtype):
+                return (
+                    tile_dense.DenseRoute(hi, "nax", default),
+                    "parity_default",
+                    tuple(all_probes),
+                    declines,
+                )
+            declines.append(
+                f"short-row nax default {default!r} illegal: "
+                + _policy_illegality_reason(default, face, k, n, bound, chip, dtype)
+            )
+
     if hi is not None and hi <= 16:
         if layer.mode == "affine":
             return (
@@ -1467,12 +1482,17 @@ def _explain_dense_row(
         if route.backend in ("steel", "nax"):
             eff = tile_dense._effective_policy(route.policy, k, n)
             split_k, _ = tile_dense._split_k_geometry(k, eff.bk, eff.split_k)
+            prefix = (
+                tile_dense._nax_body(eff.interleaved_weights)[0]
+                if route.backend == "nax"
+                else "omlx_steel_dense"
+            )
             return RowRouteTrace(
                 rows=r,
                 schedule_bucket=bucket,
                 selected_route=route.backend,
                 selected_backend=route.backend,
-                kernel_name=f"omlx_{route.backend}_dense_{tile_face.key}",
+                kernel_name=f"{prefix}_{tile_face.key}",
                 policy_repr=repr(route.policy),
                 effective_policy_repr=repr(eff),
                 split_k=split_k,
@@ -3847,11 +3867,24 @@ def _register_raw_names_for_layer(
     if not is_switch:
         tile_face = formats.tile(layer, k, n)
         if tile_face is not None:
-            for backend in ("nax", "steel") if tensor_units else ("steel",):
+            variants: tuple[tuple[str, bool, str], ...] = (
+                (
+                    ("nax", False, tile_dense._nax_body(False)[0]),
+                    ("nax", True, tile_dense._nax_body(True)[0]),
+                    ("steel", False, "omlx_steel_dense"),
+                )
+                if tensor_units
+                else (("steel", False, "omlx_steel_dense"),)
+            )
+            for backend, interleaved, prefix in variants:
                 with tile_dense._lock:
-                    mm = tile_dense._build(tile_face, backend)
+                    mm = (
+                        tile_dense._build(tile_face, backend, True)
+                        if interleaved
+                        else tile_dense._build(tile_face, backend)
+                    )
                 if mm is not None:
-                    raw_name_map[id(mm)] = f"omlx_{backend}_dense_{tile_face.key}"
+                    raw_name_map[id(mm)] = f"{prefix}_{tile_face.key}"
             raw_name_map[id(tile_dense._splitk_accum_kernel())] = (
                 "omlx_dense_splitk_accum"
             )

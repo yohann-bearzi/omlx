@@ -1155,8 +1155,7 @@ def _nax_body(interleaved_weights: bool):
     return "omlx_nax_dense", _NAX_HEADER
 
 
-@cache
-def _build(face: Tile, backend: str, interleaved_weights: bool = False):
+def _build_impl(face: Tile, backend: str, interleaved_weights: bool = False):
     if backend == "nax":
         header = _nax_headers()
         prefix, body_hdr = _nax_body(interleaved_weights)
@@ -1188,10 +1187,29 @@ def _build(face: Tile, backend: str, interleaved_weights: bool = False):
     )
 
 
+_build_cached = cache(_build_impl)
+
+
+def _build(face: Tile, backend: str, interleaved_weights: bool = False):
+    """Build (once) the steel or NAX dense kernel with normalized cache keys."""
+    return _build_cached(
+        face,
+        backend,
+        bool(interleaved_weights) if backend == "nax" else False,
+    )
+
+
+_build.__wrapped__ = _build_impl
+_build.cache_clear = _build_cached.cache_clear
+_build.cache_info = _build_cached.cache_info
+
+
 def _kernel(face: Tile, policy: DenseTilePolicy):
     """Build (once) the unified steel or NAX dense kernel for ``face``."""
     with _lock:
-        return _build(face, policy.backend, policy.interleaved_weights)
+        if policy.backend == "nax" and policy.interleaved_weights:
+            return _build(face, policy.backend, True)
+        return _build(face, policy.backend)
 
 
 @cache
