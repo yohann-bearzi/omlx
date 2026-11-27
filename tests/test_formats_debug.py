@@ -1313,3 +1313,355 @@ def test_warm_report_gpu_compiles_once_and_zero_runtime_proofs():
         y = layers[0](x)
         mx.eval(y)
         assert kernels.proof_count() == cnt_before
+
+
+# ---------------------------------------------------------------------------
+# Milestone 4 Commit 5 — python -m omlx.formats CLI tests
+# ---------------------------------------------------------------------------
+
+
+def _cli():
+    from omlx.formats import __main__ as cli
+
+    return cli
+
+
+def test_cli_help_lists_all_five_subcommands(capsys):
+    cli = _cli()
+    rc = cli.main(["--help"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    for name in ("explain", "dump-metal", "bench", "warm-report", "audit"):
+        assert name in out
+
+
+def test_cli_explain_and_dump_metal_and_warm_report_dry_run_json(
+    tmp_path, capsys, monkeypatch
+):
+    cli = _cli()
+
+    # Validation errors exit 2 with a message on stderr.
+    rc = cli.main(
+        [
+            "explain",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "0",
+            "--json",
+        ]
+    )
+    assert rc == 2
+    assert "python -m omlx.formats" in capsys.readouterr().err
+
+    # Runtime errors exit 1.
+    def boom(*args, **kwargs):
+        raise RuntimeError("synthetic runtime failure")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(debug, "bench", boom)
+        rc = cli.main(
+            [
+                "bench",
+                "--mode",
+                "affine",
+                "--bits",
+                "4",
+                "--group-size",
+                "64",
+                "--k",
+                "256",
+                "--n",
+                "256",
+            ]
+        )
+        assert rc == 1
+    assert "synthetic runtime failure" in capsys.readouterr().err
+
+    rc = cli.main(
+        [
+            "explain",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "1,32",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    explained = json.loads(capsys.readouterr().out)
+    assert explained["mode"] == "affine"
+    assert [row["rows"] for row in explained["row_traces"]] == [1, 32]
+
+    out_path = tmp_path / "affine-dot.metal"
+    rc = cli.main(
+        [
+            "dump-metal",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "1",
+            "--route",
+            "dot",
+            "--out",
+            str(out_path),
+            "--json",
+        ]
+    )
+    assert rc == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["kernel_name"].startswith("omlx_")
+    assert len(summary["raw_digest"]) == 64
+    dumped = out_path.read_text(encoding="utf-8")
+    assert "// >>> OMLX_SECTION: kernel_entry >>>" in dumped
+
+    # Without --out or --json the raw .metal source goes to stdout.
+    rc = cli.main(
+        [
+            "dump-metal",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "1",
+            "--route",
+            "dot",
+            "--no-preamble",
+        ]
+    )
+    assert rc == 0
+    raw = capsys.readouterr().out
+    assert "// >>> OMLX_SECTION: kernel_entry >>>" in raw
+    assert "[[kernel]]" in raw
+
+    rc = cli.main(
+        [
+            "warm-report",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--shapes",
+            "256x256,256x256",
+            "--dry-run",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["compile_executed"] is False
+    assert report["layers_scanned"] == 2
+
+
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal GPU")
+def test_cli_bench_gpu_json(capsys):
+    cli = _cli()
+    rc = cli.main(
+        [
+            "bench",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "1",
+            "--units",
+            "2",
+            "--rounds",
+            "4",
+            "--chain-len",
+            "4",
+            "--warmup",
+            "1",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["c2_pass"] is True
+    assert result["layer_median_us"] > 0
+
+
+def test_cli_lazy_audit_dispatch(monkeypatch, capsys):
+    # Importing the CLI does not eagerly import the parallel lane's audit module.
+    code = (
+        "import sys; import omlx.formats.__main__ as cli; "
+        "assert 'omlx.formats.audit' not in sys.modules"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    cli = _cli()
+
+    def missing(name):
+        raise ModuleNotFoundError(
+            f"No module named {name!r}", name="omlx.formats.audit"
+        )
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(cli, "importlib", types.SimpleNamespace(import_module=missing))
+        rc = cli.main(["audit", "--help"])
+        assert rc == 2
+        assert "not available in this build" in capsys.readouterr().err
+
+    # A missing dependency *inside* the audit module must propagate, never be
+    # reported as "audit is not available".
+    def import_time_inner_missing(name):
+        raise ModuleNotFoundError("inner_dep", name="inner_dep")
+
+    with monkeypatch.context() as patcher:
+        patcher.setattr(
+            cli,
+            "importlib",
+            types.SimpleNamespace(import_module=import_time_inner_missing),
+        )
+        with pytest.raises(ModuleNotFoundError) as excinfo:
+            cli.main(["audit", "omlx/"])
+        assert excinfo.value.name == "inner_dep"
+
+    calls: list[list[str]] = []
+    fake = types.ModuleType("omlx.formats.audit")
+
+    def fake_main(argv):
+        calls.append(list(argv))
+        return 7
+
+    fake.main = fake_main  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "omlx.formats.audit", fake)
+    assert cli.main(["audit", "--help", "omlx/", "--strict"]) == 7
+    assert calls == [["--help", "omlx/", "--strict"]]
+
+    def raise_system_exit(argv):
+        raise SystemExit(3)
+
+    fake.main = raise_system_exit  # type: ignore[attr-defined]
+    assert cli.main(["audit", "omlx/"]) == 3
+
+    def raise_inner_missing(argv):
+        raise ModuleNotFoundError("inner_dep", name="inner_dep")
+
+    fake.main = raise_inner_missing  # type: ignore[attr-defined]
+    with pytest.raises(ModuleNotFoundError) as excinfo:
+        cli.main(["audit", "omlx/"])
+    assert excinfo.value.name == "inner_dep"
+
+
+def _assert_no_env_reads(path: Path) -> None:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in ("environ", "getenv"):
+            pytest.fail(f"Rule 30 violation: .{node.attr} in {path}:{node.lineno}")
+        if isinstance(node, ast.Name) and node.id in ("environ", "getenv"):
+            pytest.fail(f"Rule 30 violation: {node.id} in {path}:{node.lineno}")
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name in ("environ", "getenv"):
+                    pytest.fail(
+                        f"Rule 30 violation: import {alias.name} in "
+                        f"{path}:{node.lineno}"
+                    )
+
+
+def test_cli_subprocess_smoke_and_final_invariants():
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "omlx.formats",
+            "explain",
+            "--mode",
+            "affine",
+            "--bits",
+            "4",
+            "--group-size",
+            "64",
+            "--k",
+            "256",
+            "--n",
+            "256",
+            "--rows",
+            "1,32",
+            "--json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["mode"] == "affine"
+    assert [row["rows"] for row in payload["row_traces"]] == [1, 32]
+
+    # Rule 28: runtime modules import neither the debug API nor the CLI.
+    code = (
+        "import sys; "
+        "import omlx.formats, omlx.formats.linear, omlx.formats.tile_dense, "
+        "omlx.formats.kernels; "
+        "assert 'omlx.formats.debug' not in sys.modules; "
+        "assert 'omlx.formats.__main__' not in sys.modules"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+
+    # Rule 30: zero os.environ / os.getenv in either debug module.
+    _assert_no_env_reads(Path(debug.__file__))
+    _assert_no_env_reads(Path(_cli().__file__))
+
+    # Rule 20: Metal emission sources and tuning tables are unchanged.
+    from omlx.patches import qwen35_moe_routed_decode as routed
+
+    routed._ensure_tuning_registered()
+    assert (
+        tile_dense.source_digest()
+        == "48 895530b5126b4c0bef2de690245c34cdea1c5fb5b19bbfba85413d9d064b0898"
+    )
+    assert tuning.stale_entries() == []

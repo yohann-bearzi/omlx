@@ -336,6 +336,11 @@ PATH_DECISIONS = {
     ),
     "omlx/formats/__init__.py": (OWN, "the format face builder itself"),
     "omlx/formats/affine.py": (OWN, "the affine format's own implementation"),
+    "omlx/formats/debug.py": (
+        OWN,
+        "tests/test_formats_debug.py: the debug tool reads layers' own tensors "
+        "and builds MLX baselines; it is never imported by a runtime module",
+    ),
     "omlx/formats/oqh.py": (OWN, "the built-in oQh formats' own implementation"),
     "omlx/formats/kernels.py": (OWN, "the format kernel builders"),
     "omlx/formats/tile_dense.py": (
@@ -735,6 +740,42 @@ EXPECTED = {
     ("omlx/formats/affine.py", "AffineFormat.codes"): ("read bits", "read group_size"),
     ("omlx/formats/affine.py", "AffineFormat.dot"): ("read bits", "read group_size"),
     ("omlx/formats/affine.py", "AffineFormat.tile"): ("read bits", "read group_size"),
+    ("omlx/formats/debug.py", "_TargetTables.add"): ("read bits",),
+    ("omlx/formats/debug.py", "_baseline_weight_bytes"): ("QuantizedLinear",),
+    ("omlx/formats/debug.py", "_diagnose_builtin_face_decline"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/debug.py", "_make_mlx_baseline"): (
+        "QuantizedLinear",
+        "quantize-call quantize",
+        "read bits",
+    ),
+    ("omlx/formats/debug.py", "_make_synthetic_tensors"): ("quantize-call quantize",),
+    ("omlx/formats/debug.py", "_plain_weight_fp32"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/debug.py", "_resolve_baselines"): (
+        "QuantizedLinear",
+        "isinstance QuantizedLinear",
+    ),
+    ("omlx/formats/debug.py", "_trace_resolve_cell"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/debug.py", "_trace_route_candidates"): (
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/debug.py", "bench"): (
+        "QuantizedLinear",
+        "read bits",
+        "read group_size",
+    ),
+    ("omlx/formats/debug.py", "dump_metal"): ("read bits", "read group_size"),
+    ("omlx/formats/debug.py", "explain"): ("read bits", "read group_size"),
+    ("omlx/formats/debug.py", "warm_report"): ("read bits", "read group_size"),
     ("omlx/formats/kernels.py", "Tables.add"): ("read bits",),
     ("omlx/formats/kernels.py", "Tables.header"): ("read bits",),
     ("omlx/formats/linear.py", "FormatLinear._bind_one_row_mlx_fast"): (
