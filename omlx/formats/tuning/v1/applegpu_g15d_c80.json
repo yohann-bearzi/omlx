@@ -6897,10 +6897,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {
@@ -6935,10 +6935,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {
@@ -7068,10 +7068,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {
@@ -7106,7 +7106,7 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
         "backend": "wide"
@@ -7258,10 +7258,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {
@@ -7391,7 +7391,7 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
         "backend": "wide"
@@ -7579,10 +7579,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {
@@ -7710,10 +7710,10 @@
       },
       "face_sha256": "5ff31f90a32e",
       "skeleton_sha256": "9b34afd024e9",
-      "measured_at": "2026-11-25T08:09:46Z",
+      "measured_at": "2026-11-27T04:18:01Z",
       "exactness": "bitwise",
       "params": {
-        "backend": "mlx"
+        "backend": "wide"
       }
     },
     {

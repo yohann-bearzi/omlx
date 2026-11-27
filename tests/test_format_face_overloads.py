@@ -1505,9 +1505,9 @@ _AFFINE_ALL_DIGEST = (
     "231 6521521ab3c3d0c88af7700c6ea9935406e8a05596fc7119e0e3f252f99f60c8"
 )
 # The decode-pair builder record left with its route (rule 29): 318 -> 294
-# records; re-pinned 2026-11-23 with the C7 fold fix.
+# records. D83 changes the 24 wide builders.
 _AFFINE_WIDE_AND_SG8_DIGEST = (
-    "294 33470545c646d84daff7c4a1eba73dedbe0c67cab6563826f6dd1974c4b8ad9c"
+    "294 c1b4756be9374fb1c07214657a5d25f825f222659834bf5dafea08af1bd28245"
 )
 # Re-pinned on wip/a1-a13 together with the 219 affine records: the A13
 # unrolled shared block adds three _Pragma("clang loop unroll(full)") lines
@@ -1521,23 +1521,22 @@ _AFFINE_WIDE_AND_SG8_DIGEST = (
 # row-scale read moved from Runs(...) into params()), while all 12 dot faces
 # stay byte-identical to ffe1ca64 (10/15 faces byte-identical to dd9ad49).
 _OQEL_15_DIGESTS = {
-    False: "15 c7ae4734ac4d883916baa19bc7982bd46b56eac783b6ff820b5e906f4943468f",
-    True: "15 b25d69588287e8d65f61bf0acdede92b6d48f22a1d8a41fe90c6c3223fafb3f3",
+    False: "15 09f2ad2093050f4e807bcc404881a865feadf636ce490a90ba3e2ba873d43c88",
+    True: "15 e80731a752d7b44834087416c4de22b1781d43a5c9e66025575fc8679bc81685",
 }
 # Captured on release/3 (7e230438), re-pinned on release/4 (ae0d75e5a) for
-# plugin ffe1ca64 (18/123 dot builders moved for oqel_b4p / oqel_b4ptc3abe200),
-# then re-pinned 2026-11-26 for the tile rule-4 fix on top of ffe1ca64: only
-# the 15 tile builder records (3 faces x gather/wide/gqmm 3 kinds) moved with
-# the tile rule-4 read; all 108 dot builder records stay byte-identical to
-# ffe1ca64 (90/123 builders byte-identical to dd9ad49). These 123 builder
-# records include the gather and routed patch sources, which the release-2
-# fixes changed (moe_verify_gather, qwen35_moe_routed_decode,
-# qwen35_moe_router). A base change re-pins this snapshot; the emission itself
-# is pinned by the face digests inside this test, which also cover the emitted
-# read signatures.
+# plugin ffe1ca64, then re-pinned 2026-11-26 for the tile rule-4 fix, and again
+# on the release-4 freeze tree (1255ad808..caa449d7f) for D83: the retile
+# changes the three wide builders under each table policy, so the tile faces'
+# emitted wide sources move too (the other 111 builder records stay as the
+# release-3 baseline). These 123 builder records include the gather and routed
+# patch sources, which the release-2 fixes changed (moe_verify_gather,
+# qwen35_moe_routed_decode, qwen35_moe_router). A base change re-pins this
+# snapshot; the emission itself is pinned by the face digests inside this
+# test, which also cover the emitted read signatures.
 _OQEL_BUILDER_DIGESTS = {
-    False: "123 a60bfd40da805d96c268c25d188e4feae7c53a81a9e8e4e4a7416bea643b0f5b",
-    True: "123 3de850066f915d383d408c1926e829241cb5591aa4387cc6277a4d0094501445",
+    False: "123 863a583a61729a85277e56a88cbf8ad58ff10ed0b5dabe587c624d674d1006b1",
+    True: "123 fe8ee803d5ffa35647c52e25fecb48dc8ff98b66e99ef5bbc35a328191c25103",
 }
 
 

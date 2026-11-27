@@ -1731,25 +1731,19 @@ def warm_specs(
                 )
                 wide_shapes = tuple(s for s, _ in wide_ops)
                 hi_row = min(hi, 64) if hi is not None else max(bucket_lo + 4, 32)
-                modes = set()
-                for rows in range(max(2, bucket_lo), hi_row + 1):
-                    tiles = (rows + 4) // 5
-                    vectors = (rows + tiles - 1) // tiles
-                    modes.add((vectors, rows % vectors != 0))
-                for vectors, partial_m in sorted(modes):
-                    rows = 2 * vectors - 1 if partial_m else vectors
-                    tiles = (rows + 4) // 5
+                modes = {
+                    tile_wide.layout(rows)
+                    for rows in range(max(2, bucket_lo), hi_row + 1)
+                }
+                for vectors, partial_m, exact_rows in sorted(modes):
+                    rows = exact_rows or (2 * vectors - 1 if partial_m else vectors)
+                    tiles = (rows + vectors - 1) // vectors
+                    metal = (dtype, plan.k, plan.n, vectors, partial_m, exact_rows)
                     inst = kernels.planned(
                         mm_wide,
                         (((rows, plan.k), dtype), *wide_ops),
                         [dtype],
-                        template=[
-                            ("T", dtype),
-                            ("K", plan.k),
-                            ("N", plan.n),
-                            ("V", vectors),
-                            ("PARTIAL_M", partial_m),
-                        ],
+                        template=tile_wide.template(*metal),
                     )
                     in_shapes = ((rows, plan.k), *wide_shapes)
                     out_shapes = ((rows, plan.n),)
@@ -1769,7 +1763,7 @@ def warm_specs(
                     proofs.setdefault(inst, []).append(
                         (
                             plan.proof,
-                            ("wide", dtype, plan.k, plan.n, vectors, partial_m),
+                            ("wide", *metal),
                         )
                     )
                 continue

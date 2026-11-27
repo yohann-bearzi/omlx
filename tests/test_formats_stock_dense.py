@@ -780,6 +780,7 @@ def test_wide_masks_the_last_input_group_and_output_pack():
             ("N", n),
             ("V", 1),
             ("PARTIAL_M", False),
+            ("EXACT_ROWS", 0),
         ],
         grid=(32, 4, 1),
         threadgroup=(32, 2, 1),

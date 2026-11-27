@@ -697,8 +697,8 @@ def test_tile_dense_unbounded_wide_tail(monkeypatch):
         for _proof, metal in entries
         if isinstance(metal, tuple) and metal[0] == "wide"
     }
-    assert ("wide", mx.bfloat16, 256, 256, 5, False) in wide_metals
-    assert ("wide", mx.bfloat16, 256, 256, 5, True) in wide_metals
+    assert ("wide", mx.bfloat16, 256, 256, 5, False, 0) in wide_metals
+    assert ("wide", mx.bfloat16, 256, 256, 5, True, 0) in wide_metals
 
 
 def test_moe_verify_gather_warm_tasks_holds_no_arrays():
